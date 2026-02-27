@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from datetime import datetime, timedelta, timezone
 
-from grid_optimizer.backtest import run_backtest
+from grid_optimizer.backtest import build_per_grid_notionals, run_backtest
 from grid_optimizer.optimize import optimize_grid_count
 from grid_optimizer.types import Candle
 
@@ -29,6 +29,34 @@ def _make_candles(ohlc: list[tuple[float, float, float, float]]) -> list[Candle]
 
 
 class BacktestTests(unittest.TestCase):
+    def test_all_allocation_modes_sum_to_total(self) -> None:
+        modes = [
+            "equal",
+            "equal_qty",
+            "linear",
+            "linear_reverse",
+            "quadratic",
+            "quadratic_reverse",
+            "geometric",
+            "geometric_reverse",
+            "center_heavy",
+            "edge_heavy",
+        ]
+        price_levels = [90 + i * 2 for i in range(8)]
+        for mode in modes:
+            with self.subTest(mode=mode):
+                notionals = build_per_grid_notionals(1000, 7, mode, price_levels=price_levels)
+                self.assertEqual(len(notionals), 7)
+                self.assertAlmostEqual(sum(notionals), 1000, places=6)
+
+    def test_equal_qty_has_constant_base_qty(self) -> None:
+        levels = [100, 110, 120, 130, 140]
+        notionals = build_per_grid_notionals(1000, 4, "equal_qty", price_levels=levels)
+        qty = [notionals[i] / levels[i] for i in range(4)]
+        self.assertAlmostEqual(qty[0], qty[1], places=8)
+        self.assertAlmostEqual(qty[1], qty[2], places=8)
+        self.assertAlmostEqual(qty[2], qty[3], places=8)
+
     def test_run_backtest_basic_cycle(self) -> None:
         candles = _make_candles(
             [
@@ -73,6 +101,10 @@ class BacktestTests(unittest.TestCase):
         )
         self.assertGreater(result.per_grid_notionals[0], result.per_grid_notionals[-1])
         self.assertAlmostEqual(sum(result.per_grid_notionals), 1000, places=6)
+
+    def test_reverse_allocation_more_size_at_higher_price(self) -> None:
+        notionals = build_per_grid_notionals(1000, 5, "linear_reverse")
+        self.assertLess(notionals[0], notionals[-1])
 
     def test_optimize_grid_count_has_candidate(self) -> None:
         candles = _make_candles(

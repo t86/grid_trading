@@ -45,6 +45,13 @@ class BacktestResult:
     max_capital_usage: float
     realized_pnl: float
     unrealized_pnl: float
+    start_time: datetime
+    end_time: datetime
+    start_price: float
+    end_price: float
+    underlying_return: float
+    equity_curve: list[float] | None = None
+    capital_usage_curve: list[float] | None = None
     trades: list[Trade] | None = None
 
 

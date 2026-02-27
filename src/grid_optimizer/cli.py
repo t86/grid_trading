@@ -5,6 +5,7 @@ import json
 import math
 from pathlib import Path
 
+from .backtest import supported_allocation_modes
 from .data import load_or_fetch_candles
 from .optimize import min_step_ratio_for_cost, optimize_grid_count
 
@@ -18,6 +19,7 @@ def _float(value: float) -> str:
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    supported_modes = ",".join(supported_allocation_modes())
     parser = argparse.ArgumentParser(description="Arithmetic long-grid optimizer for BTC/ETH perpetuals.")
     parser.add_argument("--symbol", type=str, default="BTCUSDT", help="e.g., BTCUSDT or ETHUSDT")
     parser.add_argument("--min-price", type=float, required=True, help="Grid lower bound")
@@ -39,7 +41,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "--allocation-modes",
         type=str,
         default="equal,linear",
-        help="Comma-separated modes to optimize, e.g. equal,linear",
+        help=f"Comma-separated modes to optimize. Supported: {supported_modes}",
     )
     parser.add_argument(
         "--objective",
@@ -221,6 +223,13 @@ def main() -> None:
     allocation_modes = [x.strip().lower() for x in args.allocation_modes.split(",") if x.strip()]
     if not allocation_modes:
         raise SystemExit("allocation modes cannot be empty")
+    supported_set = set(supported_allocation_modes())
+    unknown = [x for x in allocation_modes if x not in supported_set]
+    if unknown:
+        raise SystemExit(
+            f"unsupported allocation modes: {','.join(unknown)}; "
+            f"supported: {','.join(sorted(supported_set))}"
+        )
 
     candles = load_or_fetch_candles(
         symbol=args.symbol,

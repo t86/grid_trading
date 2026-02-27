@@ -5,6 +5,29 @@ from statistics import mean
 
 from .types import BacktestResult, Candle, Trade
 
+GEOMETRIC_RATIO = 1.15
+
+ALLOCATION_MODE_DESCRIPTIONS: dict[str, str] = {
+    "equal": "每格等额分配",
+    "equal_qty": "每格等数量（名义随价格变化）",
+    "linear": "越低价越多（线性递增）",
+    "linear_reverse": "越高价越多（线性反向）",
+    "quadratic": "越低价越多（平方递增）",
+    "quadratic_reverse": "越高价越多（平方反向）",
+    "geometric": "越低价越多（几何递增）",
+    "geometric_reverse": "越高价越多（几何反向）",
+    "center_heavy": "中间格子更多，两端更少",
+    "edge_heavy": "两端格子更多，中间更少",
+}
+
+
+def allocation_mode_descriptions() -> dict[str, str]:
+    return dict(ALLOCATION_MODE_DESCRIPTIONS)
+
+
+def supported_allocation_modes() -> list[str]:
+    return list(ALLOCATION_MODE_DESCRIPTIONS.keys())
+
 
 def build_grid_levels(min_price: float, max_price: float, n: int) -> list[float]:
     if n <= 0:
@@ -37,6 +60,7 @@ def build_per_grid_notionals(
     total_buy_notional: float,
     n: int,
     allocation_mode: str,
+    price_levels: list[float] | None = None,
 ) -> list[float]:
     if total_buy_notional <= 0:
         raise ValueError("total_buy_notional must be > 0")
@@ -44,16 +68,43 @@ def build_per_grid_notionals(
         raise ValueError("n must be > 0")
 
     mode = allocation_mode.lower().strip()
+    center = (n - 1) / 2.0
+    weights: list[float]
+
     if mode == "equal":
-        return [total_buy_notional / n] * n
-
-    if mode in {"linear", "linear_increase"}:
+        weights = [1.0] * n
+    elif mode == "equal_qty":
+        if price_levels is None or len(price_levels) != n + 1:
+            raise ValueError("equal_qty mode requires price_levels with length n+1")
+        # Equal base-asset quantity => per-grid notional proportional to price.
+        weights = [float(price_levels[i]) for i in range(n)]
+    elif mode in {"linear", "linear_increase"}:
         # For long grids, lower price levels get larger allocation.
-        weights = [n - i for i in range(n)]
-        total_weight = n * (n + 1) / 2
-        return [total_buy_notional * (weight / total_weight) for weight in weights]
+        weights = [float(n - i) for i in range(n)]
+    elif mode == "linear_reverse":
+        weights = [float(i + 1) for i in range(n)]
+    elif mode == "quadratic":
+        weights = [float((n - i) ** 2) for i in range(n)]
+    elif mode == "quadratic_reverse":
+        weights = [float((i + 1) ** 2) for i in range(n)]
+    elif mode == "geometric":
+        weights = [GEOMETRIC_RATIO ** (n - i - 1) for i in range(n)]
+    elif mode == "geometric_reverse":
+        weights = [GEOMETRIC_RATIO ** i for i in range(n)]
+    elif mode == "center_heavy":
+        weights = [1.0 / (abs(i - center) + 1.0) for i in range(n)]
+    elif mode == "edge_heavy":
+        weights = [abs(i - center) + 1.0 for i in range(n)]
+    else:
+        raise ValueError(
+            f"Unsupported allocation_mode: {allocation_mode}. "
+            f"Supported: {', '.join(supported_allocation_modes())}"
+        )
 
-    raise ValueError(f"Unsupported allocation_mode: {allocation_mode}")
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        raise ValueError(f"invalid weights for allocation_mode: {allocation_mode}")
+    return [total_buy_notional * (weight / total_weight) for weight in weights]
 
 
 def _intrabar_path(candle: Candle) -> list[float]:
@@ -78,6 +129,7 @@ def run_backtest(
     fee_rate: float = 0.0002,
     slippage: float = 0.0,
     capture_trades: bool = False,
+    capture_curves: bool = False,
 ) -> BacktestResult:
     if len(candles) < 1:
         raise ValueError("Need at least 1 candle for backtest")
@@ -86,7 +138,10 @@ def run_backtest(
 
     levels = build_grid_levels(min_price=min_price, max_price=max_price, n=n)
     per_grid_notionals = build_per_grid_notionals(
-        total_buy_notional=total_buy_notional, n=n, allocation_mode=allocation_mode
+        total_buy_notional=total_buy_notional,
+        n=n,
+        allocation_mode=allocation_mode,
+        price_levels=levels,
     )
     per_grid_qty = [per_grid_notionals[i] / levels[i] for i in range(n)]
 
@@ -186,6 +241,11 @@ def run_backtest(
         equity_series.append(realized_pnl + unrealized - total_fees)
 
     final_price = candles[-1].close
+    start_price = candles[0].open
+    start_time = candles[0].open_time
+    end_time = candles[-1].close_time
+    underlying_return = (final_price / start_price - 1.0) if start_price > 0 else 0.0
+
     unrealized_end = 0.0
     for i in range(n):
         if open_qty[i] > 0.0:
@@ -236,5 +296,12 @@ def run_backtest(
         max_capital_usage=max_capital_usage,
         realized_pnl=realized_pnl,
         unrealized_pnl=unrealized_end,
+        start_time=start_time,
+        end_time=end_time,
+        start_price=start_price,
+        end_price=final_price,
+        underlying_return=underlying_return,
+        equity_curve=equity_series if capture_curves else None,
+        capital_usage_curve=capital_usage_series if capture_curves else None,
         trades=trades,
     )

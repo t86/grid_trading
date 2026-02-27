@@ -10,14 +10,22 @@ Strategy assumptions (V1):
   - Crossing up to next line: close that grid long.
 - Per-side fee defaults to `0.0002` (万二), applied to each fill.
 - `total_buy_notional` is the total notional fully deployed if price reaches `min_price`.
-- Allocation modes:
+- Allocation modes (complete list in current system):
   - `equal`: equal notional per grid.
+  - `equal_qty`: equal base-asset quantity per grid (closer to exchange quantity grid behavior).
   - `linear`: lower price grids get larger notional (linearly).
+  - `linear_reverse`: higher price grids get larger notional (linearly).
+  - `quadratic`: lower price grids get larger notional (quadratic).
+  - `quadratic_reverse`: higher price grids get larger notional (quadratic).
+  - `geometric`: lower price grids get larger notional (geometric ratio).
+  - `geometric_reverse`: higher price grids get larger notional (geometric ratio).
+  - `center_heavy`: middle grids get larger notional.
+  - `edge_heavy`: edge grids get larger notional.
 
 ## Install / Run
 
 ```bash
-cd /Volumes/WORK/binance/wangge
+cd <repo>
 python3 -m pip install -e .
 ```
 
@@ -70,7 +78,7 @@ PYTHONPATH=src python3 -m grid_optimizer.cli --symbol ETHUSDT --min-price 3000 -
 Start the local web UI:
 
 ```bash
-cd /Volumes/WORK/binance/wangge
+cd <repo>
 PYTHONPATH=src python3 -m grid_optimizer.web --host 127.0.0.1 --port 8787
 ```
 
@@ -83,9 +91,31 @@ http://127.0.0.1:8787
 You can input parameters in browser and run optimization directly.
 
 Web UI notes:
+- Supports two modes:
+  - `优化模式`: search best `N` and allocation mode in a range.
+  - `固定参数模式`: input `min/max/fixed_n/per_grid_notional` and backtest directly.
+- Allocation modes are now checkbox multi-select; you can combine any subset.
+- Optimization runs as async jobs with progress bar + ETA in UI.
+- Layer generator supports:
+  - `拟合当前方案`: segment-fit per-grid buy amount with error metrics (MAPE/MAE).
+  - `递减覆盖（币安数量模式）`: nested-coverage layers for quantity-based exchange grids.
+  - `分层组合回测 vs 当前方案` side-by-side metrics comparison.
 - Click any row in `Top 候选` to switch the active plan and immediately view that candidate's per-grid buy plan.
 - Candle cache is stored locally in `data/<SYMBOL>_<INTERVAL>.csv` (for example: `data/BTCUSDT_1m.csv`).
 - Minute-level cache is reused across different lookback windows, so first run is slower and later runs are much faster.
+
+## Deploy (Oracle Always Free)
+
+This repository includes automatic deployment to Oracle VM through GitHub Actions:
+
+- Workflow: `.github/workflows/deploy-oracle.yml`
+- Remote installer: `deploy/oracle/install_or_update.sh`
+- Full guide: `deploy/oracle/README.md`
+
+Required GitHub secrets:
+- `ORACLE_HOST`
+- `ORACLE_USER`
+- `ORACLE_SSH_KEY`
 
 ## Output
 

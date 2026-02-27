@@ -1,0 +1,86 @@
+name: Deploy to Oracle Always Free
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure SSH
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_SSH_KEY: ${{ secrets.ORACLE_SSH_KEY }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${ORACLE_HOST}" ] || [ -z "${ORACLE_USER}" ] || [ -z "${ORACLE_SSH_KEY}" ]; then
+            echo "Missing required secrets: ORACLE_HOST / ORACLE_USER / ORACLE_SSH_KEY" >&2
+            exit 1
+          fi
+          PORT="${ORACLE_PORT:-22}"
+          mkdir -p ~/.ssh
+          printf "%s\n" "${ORACLE_SSH_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -p "${PORT}" "${ORACLE_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Prepare remote directory
+        id: prep
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+          ORACLE_APP_DIR: ${{ secrets.ORACLE_APP_DIR }}
+        run: |
+          set -euo pipefail
+          PORT="${ORACLE_PORT:-22}"
+          APP_DIR="${ORACLE_APP_DIR:-}"
+          if [ -z "${APP_DIR}" ]; then
+            APP_DIR="/home/${ORACLE_USER}/grid_trading"
+          fi
+          ssh -p "${PORT}" "${ORACLE_USER}@${ORACLE_HOST}" "mkdir -p '${APP_DIR}'"
+          echo "app_dir=${APP_DIR}" >> "${GITHUB_OUTPUT}"
+
+      - name: Sync code to Oracle
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+          APP_DIR: ${{ steps.prep.outputs.app_dir }}
+        run: |
+          set -euo pipefail
+          PORT="${ORACLE_PORT:-22}"
+          rsync -az --delete \
+            --exclude ".git/" \
+            --exclude "data/" \
+            --exclude "output/" \
+            -e "ssh -p ${PORT}" \
+            ./ "${ORACLE_USER}@${ORACLE_HOST}:${APP_DIR}/"
+
+      - name: Install/Update service on Oracle
+        env:
+          ORACLE_HOST: ${{ secrets.ORACLE_HOST }}
+          ORACLE_USER: ${{ secrets.ORACLE_USER }}
+          ORACLE_PORT: ${{ secrets.ORACLE_PORT }}
+          APP_DIR: ${{ steps.prep.outputs.app_dir }}
+          GRID_WEB_PORT: ${{ secrets.GRID_WEB_PORT }}
+          SERVICE_NAME: ${{ secrets.SERVICE_NAME }}
+        run: |
+          set -euo pipefail
+          PORT="${ORACLE_PORT:-22}"
+          WEB_PORT="${GRID_WEB_PORT:-8787}"
+          SVC_NAME="${SERVICE_NAME:-grid-web}"
+          ssh -p "${PORT}" "${ORACLE_USER}@${ORACLE_HOST}" \
+            "cd '${APP_DIR}' && chmod +x deploy/oracle/install_or_update.sh && \
+             APP_DIR='${APP_DIR}' SERVICE_NAME='${SVC_NAME}' SERVICE_USER='${ORACLE_USER}' \
+             GRID_WEB_HOST='0.0.0.0' GRID_WEB_PORT='${WEB_PORT}' \
+             bash deploy/oracle/install_or_update.sh"
+

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 
 from .backtest import run_backtest
 from .types import Candle, OptimizationResult
@@ -10,7 +11,7 @@ def min_step_ratio_for_cost(fee_rate: float, slippage: float = 0.0, funding_buff
     return 2 * fee_rate + 2 * slippage + funding_buffer
 
 
-def _objective_value(result, objective: str) -> float:
+def objective_value(result, objective: str) -> float:
     mode = objective.strip().lower()
     if mode == "calmar":
         if math.isfinite(result.calmar):
@@ -42,6 +43,7 @@ def optimize_grid_count(
     min_trade_count: int = 0,
     min_avg_capital_usage: float = 0.0,
     top_k: int = 5,
+    progress_callback: Callable[[dict], None] | None = None,
 ) -> OptimizationResult:
     if n_min <= 0 or n_max <= 0:
         raise ValueError("n_min and n_max must be > 0")
@@ -68,16 +70,40 @@ def optimize_grid_count(
     tested = 0
     skipped_by_cost = 0
     candidates = []
+    total_candidates = (n_max - n_min + 1) * len(normalized_modes)
+    processed = 0
+    if progress_callback:
+        progress_callback(
+            {
+                "processed": 0,
+                "total": total_candidates,
+                "n": None,
+                "mode": None,
+                "status": "started",
+            }
+        )
 
     for n in range(n_min, n_max + 1):
         step = (max_price - min_price) / n
         step_ratio = step / mid_price
         if step_ratio <= min_ratio:
             skipped_by_cost += 1
+            processed += len(normalized_modes)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "processed": processed,
+                        "total": total_candidates,
+                        "n": n,
+                        "mode": None,
+                        "status": "skipped_cost",
+                    }
+                )
             continue
 
         for mode in normalized_modes:
             tested += 1
+            processed += 1
             result = run_backtest(
                 candles=candles,
                 min_price=min_price,
@@ -90,11 +116,41 @@ def optimize_grid_count(
                 capture_trades=False,
             )
             if result.trade_count < min_trade_count:
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "processed": processed,
+                            "total": total_candidates,
+                            "n": n,
+                            "mode": mode,
+                            "status": "filtered",
+                        }
+                    )
                 continue
             if result.avg_capital_usage < min_avg_capital_usage:
+                if progress_callback:
+                    progress_callback(
+                        {
+                            "processed": processed,
+                            "total": total_candidates,
+                            "n": n,
+                            "mode": mode,
+                            "status": "filtered",
+                        }
+                    )
                 continue
-            result.score = _objective_value(result, objective)
+            result.score = objective_value(result, objective)
             candidates.append(result)
+            if progress_callback:
+                progress_callback(
+                    {
+                        "processed": processed,
+                        "total": total_candidates,
+                        "n": n,
+                        "mode": mode,
+                        "status": "tested",
+                    }
+                )
 
     if not candidates:
         return OptimizationResult(best=None, top_results=[], skipped_by_cost=skipped_by_cost, tested=tested)
