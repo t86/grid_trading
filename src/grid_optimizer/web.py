@@ -14,11 +14,31 @@ from statistics import mean
 from typing import Any
 
 from .backtest import run_backtest, supported_allocation_modes
-from .data import cache_file_path, load_or_fetch_candles
+from .data import cache_file_path, list_futures_symbols, load_or_fetch_candles
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+SYMBOLS_LOCK = threading.Lock()
+SYMBOLS_TTL_SECONDS = 900
+DEFAULT_SYMBOLS = [
+    "BTCUSDT",
+    "ETHUSDT",
+    "SOLUSDT",
+    "BNBUSDT",
+    "XRPUSDT",
+    "DOGEUSDT",
+    "ADAUSDT",
+    "LTCUSDT",
+    "LINKUSDT",
+    "TRXUSDT",
+    "AVAXUSDT",
+    "DOTUSDT",
+]
+SYMBOLS_CACHE: dict[str, Any] = {
+    "symbols": list(DEFAULT_SYMBOLS),
+    "updated_at": 0.0,
+}
 
 HTML_PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -629,6 +649,7 @@ HTML_PAGE = """<!doctype html>
     const layerNCapEl = document.getElementById("layer_n_cap");
     const startTimeEl = document.getElementById("start_time");
     const endTimeEl = document.getElementById("end_time");
+    const symbolEl = document.getElementById("symbol");
     const layerManualFields = Array.from(document.querySelectorAll(".layer-manual-field"));
     const layerBudgetFields = Array.from(document.querySelectorAll(".layer-budget-field"));
     const layerTargetStepFields = Array.from(document.querySelectorAll(".layer-target-step-field"));
@@ -770,6 +791,36 @@ HTML_PAGE = """<!doctype html>
       const start = new Date(end.getTime() - 3 * 24 * 3600 * 1000);
       startTimeEl.value = toLocalDatetimeValue(start);
       endTimeEl.value = toLocalDatetimeValue(end);
+    }
+
+    function applySymbolOptions(symbols) {
+      if (!symbolEl || !Array.isArray(symbols) || !symbols.length) return;
+      const previous = String(symbolEl.value || "").trim().toUpperCase();
+      symbolEl.innerHTML = symbols.map((s) => `<option value="${s}">${s}</option>`).join("");
+      if (previous && symbols.includes(previous)) {
+        symbolEl.value = previous;
+      } else if (symbols.includes("BTCUSDT")) {
+        symbolEl.value = "BTCUSDT";
+      } else {
+        symbolEl.value = symbols[0];
+      }
+    }
+
+    async function loadSymbols() {
+      try {
+        const resp = await fetch("/api/symbols");
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          throw new Error(data.error || `请求失败(${resp.status})`);
+        }
+        const symbols = Array.isArray(data.symbols) ? data.symbols : [];
+        if (symbols.length) {
+          applySymbolOptions(symbols);
+          setStatus(`已加载 ${symbols.length} 个可交易合约币种。`);
+        }
+      } catch (_) {
+        // Keep default static options when symbol API is unavailable.
+      }
     }
 
     function readForm() {
@@ -1585,6 +1636,7 @@ HTML_PAGE = """<!doctype html>
     calcModeEl.addEventListener("change", applyCalcModeUI);
     applyCalcModeUI();
     initDateRangeDefaults();
+    loadSymbols();
     renderRangeSuggestions([]);
 
     suggestBody.addEventListener("click", (e) => {
@@ -1785,6 +1837,34 @@ def _series_max_drawdown(nav: list[float]) -> float:
         if dd > max_dd:
             max_dd = dd
     return max_dd
+
+
+def _load_symbol_list(refresh: bool = False) -> tuple[list[str], str]:
+    now = time.time()
+    with SYMBOLS_LOCK:
+        cached = SYMBOLS_CACHE.get("symbols") or []
+        updated_at = float(SYMBOLS_CACHE.get("updated_at", 0.0))
+        if not refresh and cached and (now - updated_at) <= SYMBOLS_TTL_SECONDS:
+            return list(cached), "cache"
+
+    try:
+        symbols = list_futures_symbols(
+            quote_asset="USDT",
+            contract_type="PERPETUAL",
+            only_trading=True,
+        )
+        if not symbols:
+            raise RuntimeError("No symbols returned from Binance futures exchangeInfo")
+        with SYMBOLS_LOCK:
+            SYMBOLS_CACHE["symbols"] = list(symbols)
+            SYMBOLS_CACHE["updated_at"] = now
+        return symbols, "binance"
+    except Exception:
+        with SYMBOLS_LOCK:
+            cached = SYMBOLS_CACHE.get("symbols") or []
+        if cached:
+            return list(cached), "stale_cache"
+        return list(DEFAULT_SYMBOLS), "fallback"
 
 
 def _percentile(sorted_values: list[float], p: float) -> float:
@@ -2803,6 +2883,18 @@ class _Handler(BaseHTTPRequestHandler):
         if self.path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
             return
+        if self.path == "/api/symbols":
+            symbols, source = _load_symbol_list(refresh=False)
+            self._send_json(
+                {
+                    "ok": True,
+                    "symbols": symbols,
+                    "count": len(symbols),
+                    "source": source,
+                },
+                status=HTTPStatus.OK,
+            )
+            return
         if self.path.startswith("/api/job/"):
             job_id = self.path.split("/api/job/", 1)[1].strip()
             if not job_id:
@@ -2837,6 +2929,13 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if self.path == "/api/health":
+            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            return
+        if self.path == "/api/symbols":
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("Content-Type", "application/json; charset=utf-8")

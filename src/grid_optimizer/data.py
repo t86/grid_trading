@@ -6,6 +6,7 @@ import re
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
@@ -13,6 +14,7 @@ from .types import Candle
 
 FUTURES_KLINE_URL = "https://fapi.binance.com/fapi/v1/klines"
 FUTURES_AGG_TRADES_URL = "https://fapi.binance.com/fapi/v1/aggTrades"
+FUTURES_EXCHANGE_INFO_URL = "https://fapi.binance.com/fapi/v1/exchangeInfo"
 DEFAULT_TIMEOUT_SECONDS = 30
 
 
@@ -172,7 +174,7 @@ def fetch_futures_1s_candles(
     return candles
 
 
-def _http_get_json(url: str, params: dict[str, str | int]) -> list:
+def _http_get_payload(url: str, params: dict[str, str | int]) -> Any:
     query = urlencode(params)
     request = Request(
         f"{url}?{query}",
@@ -184,11 +186,78 @@ def _http_get_json(url: str, params: dict[str, str | int]) -> list:
     with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
         payload = response.read().decode("utf-8")
     data = json.loads(payload)
-    if isinstance(data, dict):
+    if (
+        isinstance(data, dict)
+        and "code" in data
+        and "msg" in data
+        and "symbols" not in data
+    ):
         code = data.get("code", "unknown")
         msg = data.get("msg", "unknown error")
         raise RuntimeError(f"Binance API error {code}: {msg}")
     return data
+
+
+def _http_get_json(url: str, params: dict[str, str | int]) -> list:
+    data = _http_get_payload(url, params)
+    if not isinstance(data, list):
+        raise RuntimeError(f"Unexpected response type from Binance: {type(data).__name__}")
+    return data
+
+
+def fetch_futures_exchange_info() -> dict[str, Any]:
+    data = _http_get_payload(FUTURES_EXCHANGE_INFO_URL, {})
+    if not isinstance(data, dict):
+        raise RuntimeError(f"Unexpected exchangeInfo type: {type(data).__name__}")
+    return data
+
+
+def _filter_futures_symbols(
+    exchange_info: dict[str, Any],
+    quote_asset: str | None = "USDT",
+    contract_type: str | None = "PERPETUAL",
+    only_trading: bool = True,
+) -> list[str]:
+    raw_symbols = exchange_info.get("symbols", [])
+    if not isinstance(raw_symbols, list):
+        raise ValueError("exchange_info.symbols must be a list")
+
+    quote = quote_asset.upper().strip() if quote_asset else ""
+    ctype = contract_type.upper().strip() if contract_type else ""
+    symbols: list[str] = []
+    for item in raw_symbols:
+        if not isinstance(item, dict):
+            continue
+        symbol = str(item.get("symbol", "")).upper().strip()
+        if not symbol:
+            continue
+        status = str(item.get("status", "")).upper().strip()
+        current_quote = str(item.get("quoteAsset", "")).upper().strip()
+        current_contract = str(item.get("contractType", "")).upper().strip()
+
+        if only_trading and status != "TRADING":
+            continue
+        if quote and current_quote != quote:
+            continue
+        if ctype and current_contract != ctype:
+            continue
+        symbols.append(symbol)
+
+    return sorted(set(symbols))
+
+
+def list_futures_symbols(
+    quote_asset: str | None = "USDT",
+    contract_type: str | None = "PERPETUAL",
+    only_trading: bool = True,
+) -> list[str]:
+    exchange_info = fetch_futures_exchange_info()
+    return _filter_futures_symbols(
+        exchange_info=exchange_info,
+        quote_asset=quote_asset,
+        contract_type=contract_type,
+        only_trading=only_trading,
+    )
 
 
 def fetch_futures_klines(

@@ -98,6 +98,7 @@ Web UI notes:
 - Supports explicit backtest window with `开始时间` and `结束时间` (instead of only lookback days).
 - Supports `目标交易量（成交额）` and `competition_volume` objective for Binance competition-style ranking.
 - Supports `智能建议 min/max` button to auto-reverse-engineer candidate price ranges for competition goals.
+- Symbol dropdown auto-loads all `TRADING` USDⓈ-M `PERPETUAL` symbols from Binance Futures `exchangeInfo` (with local cache fallback).
 - `最大投入金额` is used as strategy capital upper bound in optimization mode.
 - Allocation modes are now checkbox multi-select; you can combine any subset.
 - Optimization runs as async jobs with progress bar + ETA in UI.
