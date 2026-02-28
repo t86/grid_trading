@@ -6,6 +6,7 @@ import math
 import threading
 import time
 import uuid
+from datetime import datetime, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections.abc import Callable
@@ -286,8 +287,8 @@ HTML_PAGE = """<!doctype html>
 <body>
   <div class="wrap">
     <section class="card header">
-      <h1>BTC / ETH 合约网格策略测算器</h1>
-      <p>等差做多网格 · 双边手续费万二（0.02%） · 支持 equal / linear 分配优化</p>
+      <h1>币安合约交易赛网格策略回测器</h1>
+      <p>目标：在指定时间区间内尽可能提高成交量，同时把回撤和损失控制到更低。</p>
     </section>
 
     <section class="card">
@@ -297,6 +298,16 @@ HTML_PAGE = """<!doctype html>
           <select id="symbol">
             <option value="BTCUSDT">BTCUSDT</option>
             <option value="ETHUSDT">ETHUSDT</option>
+            <option value="SOLUSDT">SOLUSDT</option>
+            <option value="BNBUSDT">BNBUSDT</option>
+            <option value="XRPUSDT">XRPUSDT</option>
+            <option value="DOGEUSDT">DOGEUSDT</option>
+            <option value="ADAUSDT">ADAUSDT</option>
+            <option value="LTCUSDT">LTCUSDT</option>
+            <option value="LINKUSDT">LINKUSDT</option>
+            <option value="TRXUSDT">TRXUSDT</option>
+            <option value="AVAXUSDT">AVAXUSDT</option>
+            <option value="DOTUSDT">DOTUSDT</option>
           </select>
         </div>
         <div class="field">
@@ -315,8 +326,12 @@ HTML_PAGE = """<!doctype html>
           <input id="max_price" type="number" step="0.0001" value="130000" />
         </div>
         <div class="field optimize-only">
-          <label>到最低价总买入量（名义）</label>
+          <label>最大投入金额（上限）</label>
           <input id="total_buy_notional" type="number" step="0.0001" value="10000" />
+        </div>
+        <div class="field optimize-only">
+          <label>目标交易量（成交额）</label>
+          <input id="target_trade_volume" type="number" step="0.0001" value="500000" />
         </div>
         <div class="field fixed-only">
           <label>固定格子数 N</label>
@@ -328,8 +343,16 @@ HTML_PAGE = """<!doctype html>
         </div>
 
         <div class="field">
-          <label>回看天数</label>
-          <input id="lookback_days" type="number" step="1" value="365" />
+          <label>开始时间</label>
+          <input id="start_time" type="datetime-local" />
+        </div>
+        <div class="field">
+          <label>结束时间</label>
+          <input id="end_time" type="datetime-local" />
+        </div>
+        <div class="field">
+          <label>回看天数（未填时间时生效）</label>
+          <input id="lookback_days" type="number" step="1" value="7" />
         </div>
         <div class="field">
           <label>K线周期</label>
@@ -337,6 +360,7 @@ HTML_PAGE = """<!doctype html>
             <option value="1h">1h</option>
             <option value="4h">4h</option>
             <option value="1m">1m</option>
+            <option value="1s">1s</option>
           </select>
         </div>
         <div class="field optimize-only">
@@ -379,6 +403,7 @@ HTML_PAGE = """<!doctype html>
         <div class="field">
           <label>目标函数</label>
           <select id="objective">
+            <option value="competition_volume">competition_volume（交易赛推荐）</option>
             <option value="calmar">calmar（收益/回撤）</option>
             <option value="net_profit">net_profit（净收益）</option>
             <option value="total_return">total_return（总收益率）</option>
@@ -400,8 +425,12 @@ HTML_PAGE = """<!doctype html>
 
         <div class="actions">
           <button id="run_btn" type="submit">开始测算</button>
+          <button id="suggest_btn" type="button" class="optimize-only">智能建议 min/max</button>
           <button id="csv_btn" type="button" disabled>下载当前买入计划 CSV</button>
           <span id="status" class="msg">等待输入参数。</span>
+        </div>
+        <div class="actions optimize-only">
+          <span id="suggest_status" class="msg">可先点击“智能建议 min/max”，再进行正式测算。</span>
         </div>
         <div id="progress_box" class="progress-box">
           <div class="progress-track">
@@ -410,7 +439,32 @@ HTML_PAGE = """<!doctype html>
           <div id="progress_text" class="progress-text">进度 0.0% · ETA --</div>
         </div>
       </form>
-      <p class="hint">提示：固定参数模式下，你输入 N 和每格买入金额即可直接回测；分钟级数据会本地缓存复用。</p>
+      <p class="hint">提示：优先使用“交易赛推荐”目标函数；支持 `1s` 级别数据（由成交明细聚合并本地缓存）。</p>
+    </section>
+
+    <section class="card optimize-only">
+      <h3>智能区间建议（交易赛）</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>建议 min_price</th>
+              <th>建议 max_price</th>
+              <th>推荐 N</th>
+              <th>推荐模式</th>
+              <th>成交额</th>
+              <th>目标达成率</th>
+              <th>净收益</th>
+              <th>最大回撤</th>
+              <th>成交数</th>
+              <th>说明</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="suggest_tbody"></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card">
@@ -433,6 +487,8 @@ HTML_PAGE = """<!doctype html>
               <th>年化</th>
               <th>最大回撤</th>
               <th>成交数</th>
+              <th>成交额</th>
+              <th>目标达成率</th>
               <th>手续费</th>
             </tr>
           </thead>
@@ -550,7 +606,10 @@ HTML_PAGE = """<!doctype html>
     const form = document.getElementById("form");
     const statusEl = document.getElementById("status");
     const runBtn = document.getElementById("run_btn");
+    const suggestBtn = document.getElementById("suggest_btn");
     const csvBtn = document.getElementById("csv_btn");
+    const suggestStatusEl = document.getElementById("suggest_status");
+    const suggestBody = document.getElementById("suggest_tbody");
     const summaryEl = document.getElementById("summary");
     const formulaEl = document.getElementById("pnl_formula");
     const topBody = document.getElementById("top_tbody");
@@ -568,6 +627,8 @@ HTML_PAGE = """<!doctype html>
     const layerTotalNEl = document.getElementById("layer_total_n_budget");
     const layerTargetStepPctEl = document.getElementById("layer_target_step_pct");
     const layerNCapEl = document.getElementById("layer_n_cap");
+    const startTimeEl = document.getElementById("start_time");
+    const endTimeEl = document.getElementById("end_time");
     const layerManualFields = Array.from(document.querySelectorAll(".layer-manual-field"));
     const layerBudgetFields = Array.from(document.querySelectorAll(".layer-budget-field"));
     const layerTargetStepFields = Array.from(document.querySelectorAll(".layer-target-step-field"));
@@ -581,6 +642,7 @@ HTML_PAGE = """<!doctype html>
     let latestPlanRows = [];
     let latestTopCandidates = [];
     let latestCandleCount = 0;
+    let latestRangeSuggestions = [];
     let latestLayerRows = [];
     let latestComparison = null;
     let selectedTopIndex = 0;
@@ -606,6 +668,11 @@ HTML_PAGE = """<!doctype html>
     function setStatus(text, isError = false) {
       statusEl.textContent = text;
       statusEl.className = isError ? "msg error" : "msg";
+    }
+
+    function setSuggestStatus(text, isError = false) {
+      suggestStatusEl.textContent = text;
+      suggestStatusEl.className = isError ? "msg error" : "msg";
     }
 
     function setLayerStatus(text, isError = false) {
@@ -682,6 +749,29 @@ HTML_PAGE = """<!doctype html>
       setGroupVisible(fixedOnlyFields, !isOptimize);
     }
 
+    function toLocalDatetimeValue(dateObj) {
+      const offsetMs = dateObj.getTimezoneOffset() * 60 * 1000;
+      const local = new Date(dateObj.getTime() - offsetMs);
+      return local.toISOString().slice(0, 16);
+    }
+
+    function isoFromInput(inputEl) {
+      const raw = String(inputEl && inputEl.value ? inputEl.value : "").trim();
+      if (!raw) return "";
+      const parsed = new Date(raw);
+      if (Number.isNaN(parsed.getTime())) return "";
+      return parsed.toISOString();
+    }
+
+    function initDateRangeDefaults() {
+      if (!startTimeEl || !endTimeEl) return;
+      if (String(startTimeEl.value || "").trim() && String(endTimeEl.value || "").trim()) return;
+      const end = new Date();
+      const start = new Date(end.getTime() - 3 * 24 * 3600 * 1000);
+      startTimeEl.value = toLocalDatetimeValue(start);
+      endTimeEl.value = toLocalDatetimeValue(end);
+    }
+
     function readForm() {
       const checkedModes = Array.from(
         document.querySelectorAll('input[name="allocation_mode"]:checked')
@@ -692,8 +782,11 @@ HTML_PAGE = """<!doctype html>
         min_price: Number(document.getElementById("min_price").value),
         max_price: Number(document.getElementById("max_price").value),
         total_buy_notional: Number(document.getElementById("total_buy_notional").value),
+        target_trade_volume: Number(document.getElementById("target_trade_volume").value),
         fixed_n: Number(document.getElementById("fixed_n").value),
         fixed_per_grid_notional: Number(document.getElementById("fixed_per_grid_notional").value),
+        start_time: isoFromInput(startTimeEl),
+        end_time: isoFromInput(endTimeEl),
         lookback_days: Number(document.getElementById("lookback_days").value),
         interval: document.getElementById("interval").value.trim(),
         n_min: Number(document.getElementById("n_min").value),
@@ -1176,6 +1269,7 @@ HTML_PAGE = """<!doctype html>
         { key: "max_drawdown", label: "最大回撤", type: "pct", preferLower: true },
         { key: "calmar", label: "Calmar", type: "num", preferLower: false },
         { key: "trade_count", label: "成交数", type: "int", preferLower: false, neutral: true },
+        { key: "trade_volume", label: "成交额", type: "num", preferLower: false },
         { key: "total_fees", label: "手续费", type: "num", preferLower: true },
         { key: "avg_capital_usage", label: "平均资金占用", type: "pct", preferLower: false, neutral: true },
         { key: "realized_pnl", label: "已实现收益", type: "num", preferLower: false },
@@ -1236,6 +1330,9 @@ HTML_PAGE = """<!doctype html>
         ["最大回撤", fmtPct(best.max_drawdown)],
         ["年化收益", fmtPct(best.annualized_return)],
         ["成交数", best.trade_count],
+        ["成交额", fmtNum(best.trade_volume)],
+        ["目标成交额", fmtNum(best.target_trade_volume)],
+        ["目标达成率", fmtPct(best.volume_coverage)],
         ["平均资金占用", fmtPct(best.avg_capital_usage)],
         ["K线数量", candleCount]
       ];
@@ -1259,7 +1356,29 @@ HTML_PAGE = """<!doctype html>
           <td>${fmtPct(x.annualized_return)}</td>
           <td>${fmtPct(x.max_drawdown)}</td>
           <td>${x.trade_count}</td>
+          <td>${fmtNum(x.trade_volume)}</td>
+          <td>${fmtPct(x.volume_coverage)}</td>
           <td>${fmtNum(x.total_fees)}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderRangeSuggestions(rows) {
+      latestRangeSuggestions = rows;
+      suggestBody.innerHTML = rows.map((x, idx) => `
+        <tr>
+          <td>${idx + 1}</td>
+          <td>${fmtNum(x.min_price)}</td>
+          <td>${fmtNum(x.max_price)}</td>
+          <td>${x.recommended_n}</td>
+          <td>${x.recommended_mode}</td>
+          <td>${fmtNum(x.trade_volume)}</td>
+          <td>${fmtPct(x.volume_coverage)}</td>
+          <td>${fmtNum(x.net_profit)}</td>
+          <td>${fmtPct(x.max_drawdown)}</td>
+          <td>${x.trade_count}</td>
+          <td>${x.reason}</td>
+          <td><button type="button" data-suggest-idx="${idx}">应用</button></td>
         </tr>
       `).join("");
     }
@@ -1376,6 +1495,8 @@ HTML_PAGE = """<!doctype html>
       const payload = readForm();
       const req = {
         symbol: payload.symbol,
+        start_time: payload.start_time,
+        end_time: payload.end_time,
         lookback_days: payload.lookback_days,
         interval: payload.interval,
         fee_rate: payload.fee_rate,
@@ -1401,6 +1522,7 @@ HTML_PAGE = """<!doctype html>
           max_drawdown: baseline.max_drawdown,
           calmar: baseline.calmar,
           trade_count: baseline.trade_count,
+          trade_volume: baseline.trade_volume,
           total_fees: baseline.total_fees,
           avg_capital_usage: baseline.avg_capital_usage,
           realized_pnl: baseline.realized_pnl,
@@ -1462,6 +1584,57 @@ HTML_PAGE = """<!doctype html>
     });
     calcModeEl.addEventListener("change", applyCalcModeUI);
     applyCalcModeUI();
+    initDateRangeDefaults();
+    renderRangeSuggestions([]);
+
+    suggestBody.addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-suggest-idx]");
+      if (!btn) return;
+      const idx = Number(btn.dataset.suggestIdx);
+      if (Number.isNaN(idx) || idx < 0 || idx >= latestRangeSuggestions.length) return;
+      const picked = latestRangeSuggestions[idx];
+      document.getElementById("min_price").value = String(Number(picked.min_price.toFixed(8)));
+      document.getElementById("max_price").value = String(Number(picked.max_price.toFixed(8)));
+      setStatus(
+        `已应用智能建议区间：min=${fmtNum(picked.min_price)}，max=${fmtNum(picked.max_price)}，建议N=${picked.recommended_n}。`
+      );
+    });
+
+    suggestBtn.addEventListener("click", async () => {
+      const payload = readForm();
+      if (payload.calc_mode !== "optimize") {
+        setSuggestStatus("固定参数模式不需要区间建议，请切换到优化模式。", true);
+        return;
+      }
+      suggestBtn.disabled = true;
+      setSuggestStatus("正在计算区间建议，请稍候...");
+      try {
+        const resp = await fetch("/api/suggest_range", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          throw new Error(data.error || `请求失败(${resp.status})`);
+        }
+        const suggestions = data.suggestions || [];
+        renderRangeSuggestions(suggestions);
+        if (!suggestions.length) {
+          setSuggestStatus("未生成可用建议，请放宽参数（例如降低目标成交额或放宽N范围）。", true);
+          return;
+        }
+        const best = suggestions[0];
+        setSuggestStatus(
+          `已生成 ${suggestions.length} 组建议。首选达成率=${fmtPct(best.volume_coverage)}，成交额=${fmtNum(best.trade_volume)}。`
+        );
+      } catch (err) {
+        renderRangeSuggestions([]);
+        setSuggestStatus(`区间建议失败：${err.message}`, true);
+      } finally {
+        suggestBtn.disabled = false;
+      }
+    });
 
     async function pollJob(jobId, token) {
       while (token === currentPollToken) {
@@ -1487,6 +1660,14 @@ HTML_PAGE = """<!doctype html>
     form.addEventListener("submit", async (e) => {
       e.preventDefault();
       const payload = readForm();
+      if (payload.start_time && payload.end_time) {
+        const startMs = new Date(payload.start_time).getTime();
+        const endMs = new Date(payload.end_time).getTime();
+        if (Number.isFinite(startMs) && Number.isFinite(endMs) && startMs >= endMs) {
+          setStatus("测算失败：开始时间必须早于结束时间。", true);
+          return;
+        }
+      }
       currentPollToken += 1;
       const token = currentPollToken;
       runBtn.disabled = true;
@@ -1526,6 +1707,11 @@ HTML_PAGE = """<!doctype html>
         const cacheLabel = data.data.cache_file ? ` 缓存：${data.data.cache_file}` : "";
         if (payload.calc_mode === "fixed") {
           setStatus(`完成：固定参数回测已完成。${cacheLabel}`);
+        } else if (payload.objective === "competition_volume") {
+          const best = latestTopCandidates[0];
+          setStatus(
+            `完成：已按交易赛目标排序，Top1达成率=${fmtPct(best.volume_coverage)}，成交额=${fmtNum(best.trade_volume)}。${cacheLabel}`
+          );
         } else {
           setStatus(`完成：默认显示最优候选。${cacheLabel}`);
         }
@@ -1563,6 +1749,22 @@ def _safe_int(value: Any, name: str) -> int:
     return number
 
 
+def _parse_optional_datetime(value: Any, name: str) -> datetime | None:
+    if value is None:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    cleaned = raw.replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(cleaned)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an ISO datetime string") from exc
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
 def _safe_metric(value: float) -> float | None:
     if isinstance(value, float) and not math.isfinite(value):
         return None
@@ -1585,16 +1787,311 @@ def _series_max_drawdown(nav: list[float]) -> float:
     return max_dd
 
 
+def _percentile(sorted_values: list[float], p: float) -> float:
+    if not sorted_values:
+        raise ValueError("sorted_values cannot be empty")
+    if p <= 0:
+        return sorted_values[0]
+    if p >= 1:
+        return sorted_values[-1]
+    idx = p * (len(sorted_values) - 1)
+    low = int(math.floor(idx))
+    high = int(math.ceil(idx))
+    if low == high:
+        return sorted_values[low]
+    frac = idx - low
+    return sorted_values[low] * (1.0 - frac) + sorted_values[high] * frac
+
+
+def _sample_n_values(n_min: int, n_max: int, max_count: int = 16) -> list[int]:
+    if n_min <= 0 or n_max <= 0 or n_min > n_max:
+        raise ValueError("invalid n range")
+    span = n_max - n_min + 1
+    if span <= max_count:
+        return list(range(n_min, n_max + 1))
+    values = {n_min, n_max}
+    steps = max_count - 2
+    for i in range(1, steps + 1):
+        ratio = i / (steps + 1)
+        n = int(round(n_min + ratio * (n_max - n_min)))
+        values.add(max(n_min, min(n_max, n)))
+    return sorted(values)
+
+
+def _build_candidate_ranges(candles: list[Any]) -> list[tuple[float, float, str]]:
+    low_prices = sorted(float(x.low) for x in candles)
+    high_prices = sorted(float(x.high) for x in candles)
+    close_prices = sorted(float(x.close) for x in candles)
+    last_close = float(candles[-1].close)
+    mid_close = _percentile(close_prices, 0.5)
+
+    raw_ranges: list[tuple[float, float, str]] = []
+    quantile_pairs = [
+        (0.01, 0.99),
+        (0.03, 0.97),
+        (0.05, 0.95),
+        (0.10, 0.90),
+        (0.15, 0.85),
+        (0.20, 0.80),
+        (0.25, 0.75),
+    ]
+    for low_q, high_q in quantile_pairs:
+        mn = _percentile(low_prices, low_q)
+        mx = _percentile(high_prices, high_q)
+        raw_ranges.append((mn, mx, f"quantile_{int(low_q * 100)}_{int(high_q * 100)}"))
+
+    widths = [0.02, 0.03, 0.05, 0.08, 0.12, 0.18]
+    for width in widths:
+        raw_ranges.append(
+            (
+                max(0.0000001, last_close * (1.0 - width)),
+                last_close * (1.0 + width),
+                f"last_close_{int(width * 100)}pct",
+            )
+        )
+        raw_ranges.append(
+            (
+                max(0.0000001, mid_close * (1.0 - width)),
+                mid_close * (1.0 + width),
+                f"mid_close_{int(width * 100)}pct",
+            )
+        )
+
+    dedup: dict[tuple[float, float], tuple[float, float, str]] = {}
+    for mn, mx, tag in raw_ranges:
+        if mn <= 0 or mx <= mn:
+            continue
+        if (mx - mn) / ((mx + mn) / 2.0) < 0.004:
+            continue
+        key = (round(mn, 6), round(mx, 6))
+        dedup[key] = (mn, mx, tag)
+
+    ranges = sorted(dedup.values(), key=lambda x: x[1] - x[0])
+    return ranges[:16]
+
+
+def _competition_sort_key(
+    trade_volume: float,
+    target_trade_volume: float,
+    net_profit: float,
+    max_drawdown: float,
+) -> tuple[float, float, float, float, float, float]:
+    if target_trade_volume > 0:
+        meets_target = 1.0 if trade_volume >= target_trade_volume else 0.0
+        coverage = min(1.0, trade_volume / target_trade_volume)
+    else:
+        meets_target = 1.0
+        coverage = 1.0
+    loss = max(0.0, -net_profit)
+    profit = max(0.0, net_profit)
+    return (
+        meets_target,
+        coverage,
+        -loss,
+        profit,
+        trade_volume,
+        -max_drawdown,
+    )
+
+
+def _normalize_suggest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "BTCUSDT")).upper().strip()
+    lookback_days = _safe_int(payload.get("lookback_days", 7), "lookback_days")
+    start_time = _parse_optional_datetime(payload.get("start_time"), "start_time")
+    end_time = _parse_optional_datetime(payload.get("end_time"), "end_time")
+    interval = str(payload.get("interval", "1m")).strip()
+    total_buy_notional = _safe_float(payload.get("total_buy_notional", 0), "total_buy_notional")
+    target_trade_volume = _safe_float(payload.get("target_trade_volume", 0.0), "target_trade_volume")
+    n_min = _safe_int(payload.get("n_min", 5), "n_min")
+    n_max = _safe_int(payload.get("n_max", 200), "n_max")
+    fee_rate = _safe_float(payload.get("fee_rate", 0.0002), "fee_rate")
+    slippage = _safe_float(payload.get("slippage", 0.0), "slippage")
+    funding_buffer = _safe_float(payload.get("funding_buffer", 0.0), "funding_buffer")
+    min_trade_count = _safe_int(payload.get("min_trade_count", 0), "min_trade_count")
+    min_avg_capital_usage = _safe_float(
+        payload.get("min_avg_capital_usage", 0.0), "min_avg_capital_usage"
+    )
+    top_k = _safe_int(payload.get("top_k", 5), "top_k")
+    refresh = bool(payload.get("refresh", False))
+
+    raw_modes = payload.get("allocation_modes", "equal,linear")
+    if isinstance(raw_modes, str):
+        allocation_modes = [x.strip().lower() for x in raw_modes.split(",") if x.strip()]
+    elif isinstance(raw_modes, list):
+        allocation_modes = [str(x).strip().lower() for x in raw_modes if str(x).strip()]
+    else:
+        raise ValueError("allocation_modes must be string or list")
+
+    if total_buy_notional <= 0:
+        raise ValueError("total_buy_notional must be > 0")
+    if target_trade_volume < 0:
+        raise ValueError("target_trade_volume must be >= 0")
+    if start_time is not None and end_time is not None and start_time >= end_time:
+        raise ValueError("start_time must be earlier than end_time")
+    if start_time is None and end_time is None and lookback_days <= 0:
+        raise ValueError("lookback_days must be > 0")
+    if (start_time is None or end_time is None) and lookback_days <= 0:
+        raise ValueError("lookback_days must be > 0 when only one boundary time is provided")
+    if n_min <= 0 or n_max <= 0 or n_min > n_max:
+        raise ValueError("invalid n range")
+    if fee_rate < 0 or slippage < 0 or funding_buffer < 0:
+        raise ValueError("fee/slippage/funding_buffer must be >= 0")
+    if min_trade_count < 0:
+        raise ValueError("min_trade_count must be >= 0")
+    if min_avg_capital_usage < 0 or min_avg_capital_usage > 1:
+        raise ValueError("min_avg_capital_usage must be in [0,1]")
+    if top_k <= 0:
+        raise ValueError("top_k must be > 0")
+    if not allocation_modes:
+        raise ValueError("allocation_modes cannot be empty")
+    supported = set(supported_allocation_modes())
+    unknown = [x for x in allocation_modes if x not in supported]
+    if unknown:
+        raise ValueError(
+            f"unsupported allocation_modes: {','.join(unknown)}; "
+            f"supported: {','.join(sorted(supported))}"
+        )
+
+    return {
+        "symbol": symbol,
+        "lookback_days": lookback_days,
+        "start_time": start_time,
+        "end_time": end_time,
+        "interval": interval,
+        "total_buy_notional": total_buy_notional,
+        "target_trade_volume": target_trade_volume,
+        "n_min": n_min,
+        "n_max": n_max,
+        "fee_rate": fee_rate,
+        "slippage": slippage,
+        "funding_buffer": funding_buffer,
+        "min_trade_count": min_trade_count,
+        "min_avg_capital_usage": min_avg_capital_usage,
+        "allocation_modes": allocation_modes,
+        "top_k": min(10, top_k),
+        "refresh": refresh,
+    }
+
+
+def _range_reason(coverage: float, net_profit: float) -> str:
+    if coverage >= 1.0 and net_profit >= 0:
+        return "达成目标且净收益为正"
+    if coverage >= 1.0 and net_profit < 0:
+        return "达成目标，优先控制损失"
+    if coverage < 1.0 and net_profit >= 0:
+        return "未达目标但净收益为正，可继续加密"
+    return "优先提升成交额，亏损可控"
+
+
+def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
+    cache_path = str(cache_file_path(params["symbol"], params["interval"], cache_dir="data"))
+    candles = load_or_fetch_candles(
+        symbol=params["symbol"],
+        interval=params["interval"],
+        lookback_days=params["lookback_days"],
+        cache_dir="data",
+        refresh=params["refresh"],
+        start_time=params["start_time"],
+        end_time=params["end_time"],
+    )
+    if len(candles) < 10:
+        raise ValueError("Not enough candle data for range suggestion")
+
+    range_candidates = _build_candidate_ranges(candles)
+    if not range_candidates:
+        raise ValueError("Unable to build candidate ranges from current data")
+    n_values = _sample_n_values(params["n_min"], params["n_max"], max_count=16)
+
+    suggestions: list[dict[str, Any]] = []
+    for mn, mx, tag in range_candidates:
+        optimization = optimize_grid_count(
+            candles=candles,
+            min_price=mn,
+            max_price=mx,
+            total_buy_notional=params["total_buy_notional"],
+            n_min=n_values[0],
+            n_max=n_values[-1],
+            n_values=n_values,
+            fee_rate=params["fee_rate"],
+            slippage=params["slippage"],
+            funding_buffer=params["funding_buffer"],
+            allocation_modes=params["allocation_modes"],
+            objective="competition_volume",
+            target_trade_volume=params["target_trade_volume"],
+            min_trade_count=params["min_trade_count"],
+            min_avg_capital_usage=params["min_avg_capital_usage"],
+            top_k=1,
+        )
+        if optimization.best is None:
+            continue
+
+        best = optimization.best
+        if params["target_trade_volume"] > 0:
+            coverage = best.trade_volume / params["target_trade_volume"]
+        else:
+            coverage = 1.0
+        width_pct = (mx - mn) / ((mx + mn) / 2.0) if (mx + mn) > 0 else 0.0
+        suggestions.append(
+            {
+                "min_price": mn,
+                "max_price": mx,
+                "range_width_pct": width_pct,
+                "recommended_n": best.n,
+                "recommended_mode": best.allocation_mode,
+                "trade_volume": best.trade_volume,
+                "volume_coverage": coverage,
+                "net_profit": best.net_profit,
+                "max_drawdown": best.max_drawdown,
+                "trade_count": best.trade_count,
+                "total_fees": best.total_fees,
+                "source": tag,
+                "reason": _range_reason(coverage=coverage, net_profit=best.net_profit),
+            }
+        )
+
+    suggestions = sorted(
+        suggestions,
+        key=lambda x: _competition_sort_key(
+            trade_volume=float(x["trade_volume"]),
+            target_trade_volume=float(params["target_trade_volume"]),
+            net_profit=float(x["net_profit"]),
+            max_drawdown=float(x["max_drawdown"]),
+        ),
+        reverse=True,
+    )[: params["top_k"]]
+
+    return {
+        "ok": True,
+        "suggestions": suggestions,
+        "data": {
+            "candles": len(candles),
+            "cache_file": cache_path,
+            "symbol": params["symbol"],
+            "interval": params["interval"],
+            "start_time": candles[0].open_time.isoformat(),
+            "end_time": candles[-1].close_time.isoformat(),
+            "n_samples": n_values,
+            "range_candidates": len(range_candidates),
+        },
+    }
+
+
 def _normalize_compare_payload(payload: dict[str, Any]) -> dict[str, Any]:
     symbol = str(payload.get("symbol", "BTCUSDT")).upper().strip()
     lookback_days = _safe_int(payload.get("lookback_days", 365), "lookback_days")
+    start_time = _parse_optional_datetime(payload.get("start_time"), "start_time")
+    end_time = _parse_optional_datetime(payload.get("end_time"), "end_time")
     interval = str(payload.get("interval", "1h")).strip()
     fee_rate = _safe_float(payload.get("fee_rate", 0.0002), "fee_rate")
     slippage = _safe_float(payload.get("slippage", 0.0), "slippage")
     refresh = bool(payload.get("refresh", False))
 
-    if lookback_days <= 0:
+    if start_time is not None and end_time is not None and start_time >= end_time:
+        raise ValueError("start_time must be earlier than end_time")
+    if start_time is None and end_time is None and lookback_days <= 0:
         raise ValueError("lookback_days must be > 0")
+    if (start_time is None or end_time is None) and lookback_days <= 0:
+        raise ValueError("lookback_days must be > 0 when only one boundary time is provided")
     if fee_rate < 0 or slippage < 0:
         raise ValueError("fee_rate/slippage must be >= 0")
 
@@ -1652,6 +2149,7 @@ def _normalize_compare_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "annualized_return",
         "max_drawdown",
         "calmar",
+        "trade_volume",
         "total_fees",
         "avg_capital_usage",
         "realized_pnl",
@@ -1668,6 +2166,8 @@ def _normalize_compare_payload(payload: dict[str, Any]) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "lookback_days": lookback_days,
+        "start_time": start_time,
+        "end_time": end_time,
         "interval": interval,
         "fee_rate": fee_rate,
         "slippage": slippage,
@@ -1685,6 +2185,8 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
         lookback_days=params["lookback_days"],
         cache_dir="data",
         refresh=params["refresh"],
+        start_time=params["start_time"],
+        end_time=params["end_time"],
     )
     if not candles:
         raise ValueError("No candle data")
@@ -1696,6 +2198,7 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
     net_profit = 0.0
     total_fees = 0.0
     trade_count = 0
+    trade_volume = 0.0
     realized_pnl = 0.0
     unrealized_pnl = 0.0
     layer_total_n = 0
@@ -1717,6 +2220,7 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
         net_profit += result.net_profit
         total_fees += result.total_fees
         trade_count += result.trade_count
+        trade_volume += result.trade_volume
         realized_pnl += result.realized_pnl
         unrealized_pnl += result.unrealized_pnl
         layer_total_n += layer["n"]
@@ -1764,6 +2268,7 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
         "max_drawdown": max_drawdown,
         "calmar": _safe_metric(calmar),
         "trade_count": trade_count,
+        "trade_volume": trade_volume,
         "total_fees": total_fees,
         "avg_capital_usage": avg_capital_usage,
         "max_capital_usage": max_capital_usage,
@@ -1785,6 +2290,7 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
         "max_drawdown",
         "calmar",
         "trade_count",
+        "trade_volume",
         "total_fees",
         "avg_capital_usage",
         "realized_pnl",
@@ -1812,6 +2318,8 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
             "symbol": params["symbol"],
             "interval": params["interval"],
             "lookback_days": params["lookback_days"],
+            "start_time": candles[0].open_time.isoformat(),
+            "end_time": candles[-1].close_time.isoformat(),
         },
     }
 
@@ -1877,12 +2385,15 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("fixed_per_grid_notional", 0), "fixed_per_grid_notional"
     )
     lookback_days = _safe_int(payload.get("lookback_days", 365), "lookback_days")
+    start_time = _parse_optional_datetime(payload.get("start_time"), "start_time")
+    end_time = _parse_optional_datetime(payload.get("end_time"), "end_time")
     interval = str(payload.get("interval", "1h")).strip()
     n_min = _safe_int(payload.get("n_min", 5), "n_min")
     n_max = _safe_int(payload.get("n_max", 200), "n_max")
     fee_rate = _safe_float(payload.get("fee_rate", 0.0002), "fee_rate")
     slippage = _safe_float(payload.get("slippage", 0.0), "slippage")
     funding_buffer = _safe_float(payload.get("funding_buffer", 0.0), "funding_buffer")
+    target_trade_volume = _safe_float(payload.get("target_trade_volume", 0.0), "target_trade_volume")
     top_k = _safe_int(payload.get("top_k", 5), "top_k")
     refresh = bool(payload.get("refresh", False))
 
@@ -1895,7 +2406,13 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("allocation_modes must be string or list")
 
     objective = str(payload.get("objective", "calmar")).strip().lower()
-    if objective not in {"calmar", "net_profit", "total_return", "annualized_return"}:
+    if objective not in {
+        "calmar",
+        "net_profit",
+        "total_return",
+        "annualized_return",
+        "competition_volume",
+    }:
         raise ValueError("unsupported objective")
     min_trade_count = _safe_int(payload.get("min_trade_count", 0), "min_trade_count")
     min_avg_capital_usage = _safe_float(
@@ -1904,14 +2421,20 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
     if min_price >= max_price:
         raise ValueError("min_price must be less than max_price")
-    if lookback_days <= 0:
+    if start_time is not None and end_time is not None and start_time >= end_time:
+        raise ValueError("start_time must be earlier than end_time")
+    if start_time is None and end_time is None and lookback_days <= 0:
         raise ValueError("lookback_days must be > 0")
+    if (start_time is None or end_time is None) and lookback_days <= 0:
+        raise ValueError("lookback_days must be > 0 when only one boundary time is provided")
     if fee_rate < 0 or slippage < 0 or funding_buffer < 0:
         raise ValueError("fee/slippage/funding_buffer must be >= 0")
     if min_trade_count < 0:
         raise ValueError("min_trade_count must be >= 0")
     if min_avg_capital_usage < 0 or min_avg_capital_usage > 1:
         raise ValueError("min_avg_capital_usage must be in [0,1]")
+    if target_trade_volume < 0:
+        raise ValueError("target_trade_volume must be >= 0")
 
     if calc_mode == "optimize":
         if total_buy_notional <= 0:
@@ -1950,12 +2473,15 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "fixed_n": fixed_n,
         "fixed_per_grid_notional": fixed_per_grid_notional,
         "lookback_days": lookback_days,
+        "start_time": start_time,
+        "end_time": end_time,
         "interval": interval,
         "n_min": n_min,
         "n_max": n_max,
         "fee_rate": fee_rate,
         "slippage": slippage,
         "funding_buffer": funding_buffer,
+        "target_trade_volume": target_trade_volume,
         "allocation_modes": allocation_modes,
         "objective": objective,
         "min_trade_count": min_trade_count,
@@ -1976,9 +2502,16 @@ def _run_optimizer(
         lookback_days=params["lookback_days"],
         cache_dir="data",
         refresh=params["refresh"],
+        start_time=params["start_time"],
+        end_time=params["end_time"],
     )
 
     def _candidate_payload(item) -> dict[str, Any]:
+        target_trade_volume = params["target_trade_volume"]
+        if target_trade_volume > 0:
+            volume_coverage = item.trade_volume / target_trade_volume
+        else:
+            volume_coverage = 1.0
         plan_rows = []
         for idx in range(item.n):
             plan_rows.append(
@@ -2001,6 +2534,9 @@ def _run_optimizer(
             "calmar": _safe_metric(item.calmar),
             "total_fees": item.total_fees,
             "trade_count": item.trade_count,
+            "trade_volume": item.trade_volume,
+            "target_trade_volume": target_trade_volume,
+            "volume_coverage": volume_coverage,
             "win_rate": item.win_rate,
             "avg_capital_usage": item.avg_capital_usage,
             "max_capital_usage": item.max_capital_usage,
@@ -2033,7 +2569,11 @@ def _run_optimizer(
             progress_callback(
                 {"processed": 1, "total": 1, "status": "tested", "n": params["fixed_n"], "mode": "equal"}
             )
-        fixed_result.score = objective_value(fixed_result, params["objective"])
+        fixed_result.score = objective_value(
+            fixed_result,
+            params["objective"],
+            target_trade_volume=params["target_trade_volume"],
+        )
 
         if fixed_result.trade_count < params["min_trade_count"]:
             return {
@@ -2049,6 +2589,7 @@ def _run_optimizer(
                     "objective": params["objective"],
                     "min_trade_count": params["min_trade_count"],
                     "min_avg_capital_usage": params["min_avg_capital_usage"],
+                    "target_trade_volume": params["target_trade_volume"],
                     "min_step_ratio_for_cost": min_step_ratio_for_cost(
                         fee_rate=params["fee_rate"],
                         slippage=params["slippage"],
@@ -2072,6 +2613,7 @@ def _run_optimizer(
                     "objective": params["objective"],
                     "min_trade_count": params["min_trade_count"],
                     "min_avg_capital_usage": params["min_avg_capital_usage"],
+                    "target_trade_volume": params["target_trade_volume"],
                     "min_step_ratio_for_cost": min_step_ratio_for_cost(
                         fee_rate=params["fee_rate"],
                         slippage=params["slippage"],
@@ -2098,6 +2640,7 @@ def _run_optimizer(
             funding_buffer=params["funding_buffer"],
             allocation_modes=params["allocation_modes"],
             objective=params["objective"],
+            target_trade_volume=params["target_trade_volume"],
             min_trade_count=params["min_trade_count"],
             min_avg_capital_usage=params["min_avg_capital_usage"],
             top_k=params["top_k"],
@@ -2118,6 +2661,7 @@ def _run_optimizer(
                     "objective": params["objective"],
                     "min_trade_count": params["min_trade_count"],
                     "min_avg_capital_usage": params["min_avg_capital_usage"],
+                    "target_trade_volume": params["target_trade_volume"],
                     "min_step_ratio_for_cost": min_step_ratio_for_cost(
                         fee_rate=params["fee_rate"],
                         slippage=params["slippage"],
@@ -2141,6 +2685,8 @@ def _run_optimizer(
             "cache_file": cache_path,
             "calc_mode": params["calc_mode"],
             "total_buy_notional": params["total_buy_notional"],
+            "start_time": candles[0].open_time.isoformat(),
+            "end_time": candles[-1].close_time.isoformat(),
         },
         "search": {
             "mode": params["calc_mode"],
@@ -2149,6 +2695,7 @@ def _run_optimizer(
             "objective": params["objective"],
             "min_trade_count": params["min_trade_count"],
             "min_avg_capital_usage": params["min_avg_capital_usage"],
+            "target_trade_volume": params["target_trade_volume"],
             "min_step_ratio_for_cost": min_step_ratio_for_cost(
                 fee_rate=params["fee_rate"],
                 slippage=params["slippage"],
@@ -2300,7 +2847,7 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path not in {"/api/optimize", "/api/layer_compare"}:
+        if self.path not in {"/api/optimize", "/api/layer_compare", "/api/suggest_range"}:
             self._send_json({"ok": False, "error": "Not Found"}, status=HTTPStatus.NOT_FOUND)
             return
 
@@ -2343,6 +2890,23 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 result = _run_layer_compare(params)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:  # pragma: no cover
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(result, status=200)
+            return
+
+        if self.path == "/api/suggest_range":
+            try:
+                params = _normalize_suggest_payload(payload)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            try:
+                result = _run_range_suggestion(params)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return

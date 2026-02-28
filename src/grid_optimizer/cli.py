@@ -31,7 +31,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Total notional to be fully deployed when price reaches min-price",
     )
     parser.add_argument("--lookback-days", type=int, default=365)
-    parser.add_argument("--interval", type=str, default="1h", help="Binance kline interval, e.g. 1h/4h")
+    parser.add_argument(
+        "--interval",
+        type=str,
+        default="1h",
+        help="Binance interval, e.g. 1s (aggTrades), 1m, 1h, 4h",
+    )
     parser.add_argument("--n-min", type=int, default=5)
     parser.add_argument("--n-max", type=int, default=200)
     parser.add_argument("--fee-rate", type=float, default=0.0002, help="Per-side fee rate, default 0.0002")
@@ -47,8 +52,14 @@ def _build_parser() -> argparse.ArgumentParser:
         "--objective",
         type=str,
         default="calmar",
-        choices=["calmar", "net_profit", "total_return", "annualized_return"],
+        choices=["calmar", "net_profit", "total_return", "annualized_return", "competition_volume"],
         help="Optimization objective",
+    )
+    parser.add_argument(
+        "--target-trade-volume",
+        type=float,
+        default=0.0,
+        help="Target traded notional for competition_volume objective",
     )
     parser.add_argument(
         "--min-trade-count",
@@ -80,6 +91,7 @@ def _print_header(args: argparse.Namespace, candle_count: int) -> None:
     print(f"Slippage (per side): {_pct(args.slippage)}")
     print(f"Allocation modes: {args.allocation_modes}")
     print(f"Objective: {args.objective}")
+    print(f"Target trade volume: {_float(args.target_trade_volume)}")
     print(f"Min trade count filter: {args.min_trade_count}")
     print(f"Min avg capital usage filter: {_pct(args.min_avg_capital_usage)}")
     print("Trigger model: intrabar high/low path")
@@ -89,13 +101,13 @@ def _print_header(args: argparse.Namespace, candle_count: int) -> None:
 
 def _print_top_results(top_results) -> None:
     print("=== Top Candidates (by objective) ===")
-    print("N\tMode\tScore\tNetProfit\tAnnualized\tMaxDD\tTrades\tFees")
+    print("N\tMode\tScore\tNetProfit\tAnnualized\tMaxDD\tTrades\tTradeVolume\tFees")
     for item in top_results:
         score_str = f"{item.score:.4f}" if math.isfinite(item.score) else "INF"
         print(
             f"{item.n}\t{item.allocation_mode}\t{score_str}\t{_float(item.net_profit)}\t"
             f"{_pct(item.annualized_return)}\t{_pct(item.max_drawdown)}\t"
-            f"{item.trade_count}\t{_float(item.total_fees)}"
+            f"{item.trade_count}\t{_float(item.trade_volume)}\t{_float(item.total_fees)}"
         )
     print("")
 
@@ -111,6 +123,7 @@ def _print_best_detail(best) -> None:
     print(f"Max drawdown: {_pct(best.max_drawdown)}")
     print(f"Total fees: {_float(best.total_fees)}")
     print(f"Trade count: {best.trade_count}")
+    print(f"Trade volume: {_float(best.trade_volume)}")
     print(f"Win rate (closed grid legs): {_pct(best.win_rate)}")
     print(f"Avg capital usage: {_pct(best.avg_capital_usage)}")
     print(f"Max capital usage: {_pct(best.max_capital_usage)}")
@@ -146,6 +159,7 @@ def _build_report_payload(args: argparse.Namespace, optimization, best, candle_c
             "funding_buffer": args.funding_buffer,
             "allocation_modes": [x.strip() for x in args.allocation_modes.split(",") if x.strip()],
             "objective": args.objective,
+            "target_trade_volume": args.target_trade_volume,
             "min_trade_count": args.min_trade_count,
             "min_avg_capital_usage": args.min_avg_capital_usage,
         },
@@ -169,6 +183,7 @@ def _build_report_payload(args: argparse.Namespace, optimization, best, candle_c
             "max_drawdown": best.max_drawdown,
             "total_fees": best.total_fees,
             "trade_count": best.trade_count,
+            "trade_volume": best.trade_volume,
             "win_rate": best.win_rate,
             "avg_capital_usage": best.avg_capital_usage,
             "max_capital_usage": best.max_capital_usage,
@@ -186,6 +201,7 @@ def _build_report_payload(args: argparse.Namespace, optimization, best, candle_c
                 "max_drawdown": item.max_drawdown,
                 "total_fees": item.total_fees,
                 "trade_count": item.trade_count,
+                "trade_volume": item.trade_volume,
             }
             for item in optimization.top_results
         ],
@@ -220,6 +236,8 @@ def main() -> None:
         raise SystemExit("--min-trade-count must be >= 0")
     if args.min_avg_capital_usage < 0 or args.min_avg_capital_usage > 1:
         raise SystemExit("--min-avg-capital-usage must be in [0, 1]")
+    if args.target_trade_volume < 0:
+        raise SystemExit("--target-trade-volume must be >= 0")
     allocation_modes = [x.strip().lower() for x in args.allocation_modes.split(",") if x.strip()]
     if not allocation_modes:
         raise SystemExit("allocation modes cannot be empty")
@@ -252,6 +270,7 @@ def main() -> None:
         funding_buffer=args.funding_buffer,
         allocation_modes=allocation_modes,
         objective=args.objective,
+        target_trade_volume=args.target_trade_volume,
         min_trade_count=args.min_trade_count,
         min_avg_capital_usage=args.min_avg_capital_usage,
         top_k=args.top_k,

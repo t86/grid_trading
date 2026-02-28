@@ -153,12 +153,13 @@ def run_backtest(
     wins = 0
     closed_trades = 0
     fill_count = 0
+    traded_notional = 0.0
     capital_usage_series: list[float] = []
     equity_series: list[float] = []
     trades: list[Trade] | None = [] if capture_trades else None
 
     def _record_buy(i: int, fill_price: float, ts) -> None:
-        nonlocal total_fees, fill_count
+        nonlocal total_fees, fill_count, traded_notional
         qty = per_grid_qty[i]
         notional = fill_price * qty
         fee = notional * fee_rate
@@ -167,6 +168,7 @@ def run_backtest(
         entry_price[i] = fill_price
         total_fees += fee
         fill_count += 1
+        traded_notional += notional
 
         if trades is not None:
             trades.append(
@@ -182,7 +184,7 @@ def run_backtest(
             )
 
     def _record_sell(i: int, fill_price: float, ts) -> None:
-        nonlocal realized_pnl, total_fees, closed_trades, wins, fill_count
+        nonlocal realized_pnl, total_fees, closed_trades, wins, fill_count, traded_notional
         qty = open_qty[i]
         notional = fill_price * qty
         fee = notional * fee_rate
@@ -194,6 +196,7 @@ def run_backtest(
         if pnl > 0:
             wins += 1
         fill_count += 1
+        traded_notional += notional
 
         if trades is not None:
             trades.append(
@@ -291,6 +294,7 @@ def run_backtest(
         calmar=calmar,
         score=score,
         trade_count=fill_count,
+        trade_volume=traded_notional,
         win_rate=win_rate,
         avg_capital_usage=avg_capital_usage,
         max_capital_usage=max_capital_usage,

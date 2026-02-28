@@ -62,6 +62,7 @@ Objective options:
 - `net_profit`: maximize absolute net profit
 - `total_return`: maximize total return
 - `annualized_return`: maximize annualized return
+- `competition_volume`: for trading competitions, prioritize target traded notional first, then smaller loss / higher profit
 
 Activity filters:
 - `--min-trade-count`: require minimum number of fills
@@ -94,6 +95,10 @@ Web UI notes:
 - Supports two modes:
   - `优化模式`: search best `N` and allocation mode in a range.
   - `固定参数模式`: input `min/max/fixed_n/per_grid_notional` and backtest directly.
+- Supports explicit backtest window with `开始时间` and `结束时间` (instead of only lookback days).
+- Supports `目标交易量（成交额）` and `competition_volume` objective for Binance competition-style ranking.
+- Supports `智能建议 min/max` button to auto-reverse-engineer candidate price ranges for competition goals.
+- `最大投入金额` is used as strategy capital upper bound in optimization mode.
 - Allocation modes are now checkbox multi-select; you can combine any subset.
 - Optimization runs as async jobs with progress bar + ETA in UI.
 - Layer generator supports:
@@ -103,6 +108,7 @@ Web UI notes:
 - Click any row in `Top 候选` to switch the active plan and immediately view that candidate's per-grid buy plan.
 - Candle cache is stored locally in `data/<SYMBOL>_<INTERVAL>.csv` (for example: `data/BTCUSDT_1m.csv`).
 - Minute-level cache is reused across different lookback windows, so first run is slower and later runs are much faster.
+- `1s` interval is supported by aggregating Binance Futures `aggTrades` into 1-second OHLC candles, with local CSV cache reuse.
 
 ## Deploy (Oracle Always Free)
 
@@ -120,7 +126,7 @@ Required GitHub secrets:
 ## Output
 
 - Best `N`
-- Top-N candidates (score/net profit/drawdown/fees/trade count)
+- Top-N candidates (score/net profit/drawdown/fees/trade count/trade volume/target coverage)
 - Per-grid plan (`buy_price`, `sell_price`, `buy_notional`, `qty`)
 - Optional JSON report and CSV plan
 

@@ -40,6 +40,7 @@ class BacktestResult:
     calmar: float
     score: float
     trade_count: int
+    trade_volume: float
     win_rate: float
     avg_capital_usage: float
     max_capital_usage: float

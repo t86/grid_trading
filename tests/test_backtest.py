@@ -4,6 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from grid_optimizer.backtest import build_per_grid_notionals, run_backtest
+from grid_optimizer.data import parse_interval_ms
 from grid_optimizer.optimize import optimize_grid_count
 from grid_optimizer.types import Candle
 
@@ -77,6 +78,7 @@ class BacktestTests(unittest.TestCase):
             slippage=0.0,
         )
         self.assertGreater(result.trade_count, 0)
+        self.assertGreater(result.trade_volume, 0)
         self.assertGreater(result.total_fees, 0)
         self.assertEqual(len(result.per_grid_qty), 4)
         self.assertAlmostEqual(sum(result.per_grid_notionals), 1000, places=6)
@@ -132,6 +134,68 @@ class BacktestTests(unittest.TestCase):
         self.assertIsNotNone(opt.best)
         self.assertGreater(len(opt.top_results), 0)
         self.assertIn(opt.best.allocation_mode, {"equal", "linear"})
+
+    def test_competition_objective_prioritizes_trade_volume(self) -> None:
+        candles = _make_candles(
+            [
+                (100, 120, 80, 110),
+                (110, 120, 80, 90),
+                (90, 120, 80, 110),
+                (110, 120, 80, 90),
+                (90, 120, 80, 110),
+                (110, 120, 80, 90),
+            ]
+        )
+        opt = optimize_grid_count(
+            candles=candles,
+            min_price=80,
+            max_price=120,
+            total_buy_notional=1000,
+            n_min=2,
+            n_max=12,
+            fee_rate=0.0002,
+            slippage=0.0,
+            allocation_modes=["equal"],
+            objective="competition_volume",
+            target_trade_volume=100_000_000,
+            top_k=5,
+        )
+        self.assertIsNotNone(opt.best)
+        top_volumes = [x.trade_volume for x in opt.top_results]
+        self.assertAlmostEqual(opt.best.trade_volume, max(top_volumes), places=8)
+
+    def test_optimize_with_discrete_n_values(self) -> None:
+        candles = _make_candles(
+            [
+                (100, 103, 97, 101),
+                (101, 104, 98, 102),
+                (102, 104, 99, 100),
+                (100, 103, 96, 97),
+                (97, 101, 95, 100),
+                (100, 105, 98, 104),
+            ]
+        )
+        n_values = [3, 7, 11]
+        opt = optimize_grid_count(
+            candles=candles,
+            min_price=90,
+            max_price=110,
+            total_buy_notional=1000,
+            n_min=2,
+            n_max=20,
+            n_values=n_values,
+            fee_rate=0.0002,
+            slippage=0.0,
+            allocation_modes=["equal"],
+            objective="net_profit",
+            top_k=2,
+        )
+        self.assertIsNotNone(opt.best)
+        self.assertIn(opt.best.n, n_values)
+        self.assertEqual(opt.tested, len(n_values))
+
+    def test_parse_interval_supports_1s(self) -> None:
+        self.assertEqual(parse_interval_ms("1s"), 1000)
 
 
 if __name__ == "__main__":
