@@ -91,6 +91,9 @@ http://127.0.0.1:8787
 
 You can input parameters in browser and run optimization directly.
 
+Competition guide:
+- `TRADE_COMPETITION_GUIDE.md` (Chinese): end-to-end playbook for competition settings, parameter tuning, and result interpretation.
+
 Web UI notes:
 - Supports two modes:
   - `优化模式`: search best `N` and allocation mode in a range.
