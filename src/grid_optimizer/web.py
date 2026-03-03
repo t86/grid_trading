@@ -473,6 +473,8 @@ HTML_PAGE = """<!doctype html>
               <th>建议 max_price</th>
               <th>推荐 N</th>
               <th>推荐模式</th>
+              <th>单格价差</th>
+              <th>每格买入额(均/最小/最大)</th>
               <th>成交额</th>
               <th>目标达成率</th>
               <th>净收益</th>
@@ -1423,6 +1425,8 @@ HTML_PAGE = """<!doctype html>
           <td>${fmtNum(x.max_price)}</td>
           <td>${x.recommended_n}</td>
           <td>${x.recommended_mode}</td>
+          <td>${fmtPct(x.step_pct)}</td>
+          <td>${fmtNum(x.avg_per_grid_notional)} / ${fmtNum(x.min_per_grid_notional)} / ${fmtNum(x.max_per_grid_notional)}</td>
           <td>${fmtNum(x.trade_volume)}</td>
           <td>${fmtPct(x.volume_coverage)}</td>
           <td>${fmtNum(x.net_profit)}</td>
@@ -1647,8 +1651,13 @@ HTML_PAGE = """<!doctype html>
       const picked = latestRangeSuggestions[idx];
       document.getElementById("min_price").value = String(Number(picked.min_price.toFixed(8)));
       document.getElementById("max_price").value = String(Number(picked.max_price.toFixed(8)));
+      document.getElementById("n_min").value = String(picked.recommended_n);
+      document.getElementById("n_max").value = String(picked.recommended_n);
+      for (const checkbox of document.querySelectorAll('input[name="allocation_mode"]')) {
+        checkbox.checked = checkbox.value === picked.recommended_mode;
+      }
       setStatus(
-        `已应用智能建议区间：min=${fmtNum(picked.min_price)}，max=${fmtNum(picked.max_price)}，建议N=${picked.recommended_n}。`
+        `已应用智能建议：min=${fmtNum(picked.min_price)}，max=${fmtNum(picked.max_price)}，N=${picked.recommended_n}，mode=${picked.recommended_mode}。点击“开始测算”可查看每格买入计划。`
       );
     });
 
@@ -1974,6 +1983,39 @@ def _competition_sort_key(
     )
 
 
+def _mode_preference_score(mode: str) -> float:
+    # Competition-style volume seeking with uncertain direction:
+    # prefer more direction-neutral distribution modes.
+    order = {
+        "equal_qty": 6.0,
+        "equal": 5.5,
+        "center_heavy": 5.0,
+        "edge_heavy": 4.6,
+        "linear_reverse": 4.0,
+        "linear": 3.8,
+        "geometric_reverse": 3.4,
+        "geometric": 3.2,
+        "quadratic_reverse": 3.0,
+        "quadratic": 2.8,
+    }
+    return order.get(mode.strip().lower(), 0.0)
+
+
+def _ordered_suggestion_modes(modes: list[str]) -> list[str]:
+    dedup: list[str] = []
+    for mode in modes:
+        cleaned = mode.strip().lower()
+        if cleaned and cleaned not in dedup:
+            dedup.append(cleaned)
+    if not dedup:
+        return dedup
+    return sorted(
+        dedup,
+        key=lambda x: (_mode_preference_score(x), x),
+        reverse=True,
+    )
+
+
 def _normalize_suggest_payload(payload: dict[str, Any]) -> dict[str, Any]:
     symbol = str(payload.get("symbol", "BTCUSDT")).upper().strip()
     lookback_days = _safe_int(payload.get("lookback_days", 7), "lookback_days")
@@ -2047,20 +2089,21 @@ def _normalize_suggest_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "funding_buffer": funding_buffer,
         "min_trade_count": min_trade_count,
         "min_avg_capital_usage": min_avg_capital_usage,
-        "allocation_modes": allocation_modes,
+        "allocation_modes": _ordered_suggestion_modes(allocation_modes),
         "top_k": min(10, top_k),
         "refresh": refresh,
     }
 
 
-def _range_reason(coverage: float, net_profit: float) -> str:
+def _range_reason(coverage: float, net_profit: float, mode: str) -> str:
+    mode_hint = "中性分配" if _mode_preference_score(mode) >= 5.0 else "方向性分配"
     if coverage >= 1.0 and net_profit >= 0:
-        return "达成目标且净收益为正"
+        return f"达成目标且净收益为正（{mode_hint}）"
     if coverage >= 1.0 and net_profit < 0:
-        return "达成目标，优先控制损失"
+        return f"达成目标，优先控制损失（{mode_hint}）"
     if coverage < 1.0 and net_profit >= 0:
-        return "未达目标但净收益为正，可继续加密"
-    return "优先提升成交额，亏损可控"
+        return f"未达目标但净收益为正，可继续加密（{mode_hint}）"
+    return f"优先提升成交额，亏损可控（{mode_hint}）"
 
 
 def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
@@ -2100,17 +2143,39 @@ def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
             target_trade_volume=params["target_trade_volume"],
             min_trade_count=params["min_trade_count"],
             min_avg_capital_usage=params["min_avg_capital_usage"],
-            top_k=1,
+            top_k=max(10, len(params["allocation_modes"])),
         )
-        if optimization.best is None:
+        if not optimization.top_results:
             continue
 
-        best = optimization.best
+        ranked_candidates = sorted(
+            optimization.top_results,
+            key=lambda item: (
+                _competition_sort_key(
+                    trade_volume=float(item.trade_volume),
+                    target_trade_volume=float(params["target_trade_volume"]),
+                    net_profit=float(item.net_profit),
+                    max_drawdown=float(item.max_drawdown),
+                ),
+                _mode_preference_score(item.allocation_mode),
+            ),
+            reverse=True,
+        )
+        best = ranked_candidates[0]
         if params["target_trade_volume"] > 0:
             coverage = best.trade_volume / params["target_trade_volume"]
         else:
             coverage = 1.0
         width_pct = (mx - mn) / ((mx + mn) / 2.0) if (mx + mn) > 0 else 0.0
+        mid = (mn + mx) / 2.0
+        step_pct = ((mx - mn) / best.n) / mid if mid > 0 and best.n > 0 else 0.0
+        min_grid_notional = min(best.per_grid_notionals) if best.per_grid_notionals else 0.0
+        max_grid_notional = max(best.per_grid_notionals) if best.per_grid_notionals else 0.0
+        avg_grid_notional = (
+            sum(best.per_grid_notionals) / len(best.per_grid_notionals)
+            if best.per_grid_notionals
+            else 0.0
+        )
         suggestions.append(
             {
                 "min_price": mn,
@@ -2118,6 +2183,10 @@ def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
                 "range_width_pct": width_pct,
                 "recommended_n": best.n,
                 "recommended_mode": best.allocation_mode,
+                "step_pct": step_pct,
+                "avg_per_grid_notional": avg_grid_notional,
+                "min_per_grid_notional": min_grid_notional,
+                "max_per_grid_notional": max_grid_notional,
                 "trade_volume": best.trade_volume,
                 "volume_coverage": coverage,
                 "net_profit": best.net_profit,
@@ -2125,7 +2194,11 @@ def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
                 "trade_count": best.trade_count,
                 "total_fees": best.total_fees,
                 "source": tag,
-                "reason": _range_reason(coverage=coverage, net_profit=best.net_profit),
+                "reason": _range_reason(
+                    coverage=coverage,
+                    net_profit=best.net_profit,
+                    mode=best.allocation_mode,
+                ),
             }
         )
 
