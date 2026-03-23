@@ -1,0 +1,717 @@
+from __future__ import annotations
+
+from argparse import Namespace
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from unittest.mock import patch
+
+from grid_optimizer.loop_runner import (
+    _apply_synthetic_trade_fill,
+    apply_excess_inventory_reduce_only,
+    apply_hedge_position_controls,
+    apply_hedge_position_notional_caps,
+    apply_inventory_tiering,
+    apply_max_position_notional_cap,
+    apply_position_controls,
+    assess_auto_regime,
+    assess_market_guard,
+    build_effective_runner_args,
+    execute_plan_report,
+    resolve_neutral_hourly_scale,
+    resolve_auto_regime_profile,
+    update_synthetic_order_refs,
+)
+from grid_optimizer.semi_auto_plan import build_static_binance_grid_plan
+from grid_optimizer.types import Candle
+
+
+class LoopRunnerTests(unittest.TestCase):
+    def test_build_static_binance_grid_plan_splits_orders_by_current_price(self) -> None:
+        bootstrap = build_static_binance_grid_plan(
+            strategy_direction="long",
+            grid_level_mode="arithmetic",
+            min_price=10.0,
+            max_price=14.0,
+            n=4,
+            total_grid_notional=400.0,
+            neutral_anchor_price=None,
+            bid_price=11.99,
+            ask_price=12.01,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+        )
+        target_qty = float(bootstrap["target_base_qty"])
+        self.assertGreater(target_qty, 0.0)
+
+        live = build_static_binance_grid_plan(
+            strategy_direction="long",
+            grid_level_mode="arithmetic",
+            min_price=10.0,
+            max_price=14.0,
+            n=4,
+            total_grid_notional=400.0,
+            neutral_anchor_price=None,
+            bid_price=11.99,
+            ask_price=12.01,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            current_long_qty=target_qty,
+            current_short_qty=0.0,
+        )
+
+        self.assertGreater(len(live["buy_orders"]), 0)
+        self.assertGreater(len(live["sell_orders"]), 0)
+        nearest_sell = min(item["price"] for item in live["sell_orders"])
+        self.assertAlmostEqual(nearest_sell, 13.0, places=8)
+
+    def test_apply_synthetic_trade_fill_tracks_virtual_long_and_short_books(self) -> None:
+        ledger = {
+            "virtual_long_qty": 0.0,
+            "virtual_long_avg_price": 0.0,
+            "virtual_short_qty": 0.0,
+            "virtual_short_avg_price": 0.0,
+        }
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "100", "price": "1.20"},
+                order_ref={"role": "entry_long"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_long_qty"], 100.0)
+        self.assertAlmostEqual(ledger["virtual_long_avg_price"], 1.20)
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "40", "price": "1.25"},
+                order_ref={"role": "entry_short"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_short_qty"], 40.0)
+        self.assertAlmostEqual(ledger["virtual_short_avg_price"], 1.25)
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "30", "price": "1.28"},
+                order_ref={"role": "take_profit_long"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_long_qty"], 70.0)
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "10", "price": "1.18"},
+                order_ref={"role": "take_profit_short"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_short_qty"], 30.0)
+
+    def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+            update_synthetic_order_refs(
+                state_path=state_path,
+                strategy_mode="synthetic_neutral",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "entry_short",
+                                "side": "SELL",
+                                "position_side": "BOTH",
+                            },
+                            "response": {
+                                "orderId": 12345,
+                                "clientOrderId": "gx-test",
+                            },
+                        }
+                    ]
+                },
+            )
+            payload = state_path.read_text(encoding="utf-8")
+            self.assertIn("synthetic_order_refs", payload)
+            self.assertIn("12345", payload)
+
+    def test_apply_hedge_position_controls_can_pause_long_or_short_side_independently(self) -> None:
+        plan = {
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 1.20, "qty": 10, "notional": 12.0, "role": "bootstrap_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.21, "qty": 10, "notional": 12.1, "role": "bootstrap_short", "position_side": "SHORT"},
+            ],
+            "buy_orders": [
+                {"side": "BUY", "price": 1.19, "qty": 10, "notional": 11.9, "role": "entry_long", "position_side": "LONG"},
+                {"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.23, "qty": 10, "notional": 12.3, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=500,
+            current_short_qty=450,
+            mid_price=1.0,
+            pause_long_position_notional=400.0,
+            pause_short_position_notional=400.0,
+            min_mid_price_for_buys=None,
+        )
+
+        self.assertTrue(result["long_paused"])
+        self.assertTrue(result["short_paused"])
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+
+    def test_apply_hedge_position_notional_caps_trim_long_and_short_entries(self) -> None:
+        plan = {
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 1.0, "qty": 50, "notional": 50.0, "role": "bootstrap_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.0, "qty": 50, "notional": 50.0, "role": "bootstrap_short", "position_side": "SHORT"},
+            ],
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 50, "notional": 49.5, "role": "entry_long", "position_side": "LONG"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 50, "notional": 50.5, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_notional_caps(
+            plan=plan,
+            current_long_notional=470.0,
+            current_short_notional=480.0,
+            max_long_position_notional=500.0,
+            max_short_position_notional=500.0,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(result["buy_cap_applied"])
+        self.assertTrue(result["short_cap_applied"])
+        self.assertAlmostEqual(result["buy_budget_notional"], 30.0)
+        self.assertAlmostEqual(result["short_budget_notional"], 20.0)
+        self.assertAlmostEqual(result["planned_buy_notional"], 30.0)
+        self.assertAlmostEqual(result["planned_short_notional"], 20.0)
+        self.assertEqual(len(plan["buy_orders"]), 0)
+        self.assertEqual(len(plan["sell_orders"]), 0)
+        self.assertAlmostEqual(plan["bootstrap_orders"][0]["notional"], 30.0)
+        self.assertAlmostEqual(plan["bootstrap_orders"][1]["notional"], 20.0)
+
+    def test_apply_position_controls_pauses_buys_when_position_notional_is_too_large(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 100, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 100, "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "price": 0.051, "qty": 100, "role": "take_profit"}],
+        }
+
+        result = apply_position_controls(
+            plan=plan,
+            current_long_qty=4000,
+            mid_price=0.05,
+            pause_buy_position_notional=180.0,
+            min_mid_price_for_buys=None,
+        )
+
+        self.assertTrue(result["buy_paused"])
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_apply_position_controls_pauses_buys_below_floor_price(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 100, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 100, "role": "entry"}],
+            "sell_orders": [],
+        }
+
+        result = apply_position_controls(
+            plan=plan,
+            current_long_qty=0,
+            mid_price=0.0495,
+            pause_buy_position_notional=None,
+            min_mid_price_for_buys=0.0500,
+        )
+
+        self.assertTrue(result["buy_paused"])
+        self.assertEqual(len(result["pause_reasons"]), 1)
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+
+    def test_apply_position_controls_keeps_buys_when_within_limits(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 100, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 100, "role": "entry"}],
+            "sell_orders": [],
+        }
+
+        result = apply_position_controls(
+            plan=plan,
+            current_long_qty=1000,
+            mid_price=0.05,
+            pause_buy_position_notional=180.0,
+            min_mid_price_for_buys=0.0490,
+        )
+
+        self.assertFalse(result["buy_paused"])
+        self.assertEqual(len(plan["bootstrap_orders"]), 1)
+        self.assertEqual(len(plan["buy_orders"]), 1)
+
+    def test_apply_excess_inventory_reduce_only_pauses_long_entries_when_over_target_base(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 100, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 100, "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "price": 0.051, "qty": 100, "role": "take_profit"}],
+        }
+
+        result = apply_excess_inventory_reduce_only(
+            plan=plan,
+            strategy_mode="one_way_long",
+            current_long_qty=1200,
+            current_short_qty=0,
+            target_base_qty=1000,
+            enabled=True,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["direction"], "long")
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_apply_position_controls_respects_external_market_guard_pause(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 100, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 100, "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "price": 0.051, "qty": 100, "role": "take_profit"}],
+        }
+
+        result = apply_position_controls(
+            plan=plan,
+            current_long_qty=0,
+            mid_price=0.05,
+            pause_buy_position_notional=180.0,
+            min_mid_price_for_buys=None,
+            external_buy_pause=True,
+            external_pause_reasons=["1m_extreme_down_candle amp=0.80% ret=-0.40%"],
+        )
+
+        self.assertTrue(result["buy_paused"])
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(result["pause_reasons"], ["1m_extreme_down_candle amp=0.80% ret=-0.40%"])
+
+    @patch("grid_optimizer.loop_runner.assess_auto_regime")
+    def test_resolve_neutral_hourly_scale_caches_per_hour_bucket(self, mock_assess_auto_regime) -> None:
+        now = datetime(2026, 3, 19, 10, 25, tzinfo=timezone.utc)
+        mock_assess_auto_regime.return_value = {
+            "available": True,
+            "regime": "defensive",
+            "reason": "60m ret=-3.5%",
+            "metrics": {"window_60m": {"return_ratio": -0.035}},
+        }
+        state: dict[str, object] = {}
+
+        first = resolve_neutral_hourly_scale(
+            state=state,
+            symbol="OPNUSDT",
+            enabled=True,
+            stable_scale=1.0,
+            transition_scale=0.85,
+            defensive_scale=0.65,
+            stable_15m_max_amplitude_ratio=0.02,
+            stable_60m_max_amplitude_ratio=0.05,
+            stable_60m_return_floor_ratio=-0.01,
+            defensive_15m_amplitude_ratio=0.035,
+            defensive_60m_amplitude_ratio=0.08,
+            defensive_15m_return_ratio=-0.015,
+            defensive_60m_return_ratio=-0.03,
+            now=now,
+        )
+        second = resolve_neutral_hourly_scale(
+            state=state,
+            symbol="OPNUSDT",
+            enabled=True,
+            stable_scale=1.0,
+            transition_scale=0.85,
+            defensive_scale=0.65,
+            stable_15m_max_amplitude_ratio=0.02,
+            stable_60m_max_amplitude_ratio=0.05,
+            stable_60m_return_floor_ratio=-0.01,
+            defensive_15m_amplitude_ratio=0.035,
+            defensive_60m_amplitude_ratio=0.08,
+            defensive_15m_return_ratio=-0.015,
+            defensive_60m_return_ratio=-0.03,
+            now=now + timedelta(minutes=10),
+        )
+
+        self.assertAlmostEqual(first["scale"], 0.65)
+        self.assertEqual(first["regime"], "defensive")
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
+        self.assertEqual(mock_assess_auto_regime.call_count, 1)
+
+    def test_apply_max_position_notional_cap_trims_buy_side_to_remaining_budget(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 2000, "notional": 100.0, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 1000, "notional": 49.0, "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "price": 0.051, "qty": 1000, "notional": 51.0, "role": "take_profit"}],
+        }
+
+        result = apply_max_position_notional_cap(
+            plan=plan,
+            current_long_notional=910.0,
+            max_position_notional=1000.0,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(result["cap_applied"])
+        self.assertAlmostEqual(result["buy_budget_notional"], 90.0)
+        self.assertAlmostEqual(result["planned_buy_notional"], 90.0)
+        self.assertEqual(len(plan["bootstrap_orders"]), 1)
+        self.assertAlmostEqual(plan["bootstrap_orders"][0]["qty"], 1800.0)
+        self.assertAlmostEqual(plan["bootstrap_orders"][0]["notional"], 90.0)
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_apply_max_position_notional_cap_keeps_orders_when_under_cap(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 1000, "notional": 50.0, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 1000, "notional": 49.0, "role": "entry"}],
+            "sell_orders": [],
+        }
+
+        result = apply_max_position_notional_cap(
+            plan=plan,
+            current_long_notional=800.0,
+            max_position_notional=1000.0,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertFalse(result["cap_applied"])
+        self.assertAlmostEqual(result["buy_budget_notional"], 200.0)
+        self.assertAlmostEqual(result["planned_buy_notional"], 99.0)
+        self.assertEqual(len(plan["bootstrap_orders"]), 1)
+        self.assertEqual(len(plan["buy_orders"]), 1)
+
+    def test_apply_max_position_notional_cap_drops_buy_orders_when_budget_is_below_exchange_minimum(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 1000, "notional": 50.0, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 1000, "notional": 49.0, "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "price": 0.051, "qty": 1000, "notional": 51.0, "role": "take_profit"}],
+        }
+
+        result = apply_max_position_notional_cap(
+            plan=plan,
+            current_long_notional=998.0,
+            max_position_notional=1000.0,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(result["cap_applied"])
+        self.assertAlmostEqual(result["buy_budget_notional"], 2.0)
+        self.assertAlmostEqual(result["planned_buy_notional"], 0.0)
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_apply_inventory_tiering_keeps_base_profile_below_threshold(self) -> None:
+        result = apply_inventory_tiering(
+            current_long_notional=580.0,
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=70.0,
+            base_position_notional=420.0,
+            tier_start_notional=600.0,
+            tier_end_notional=750.0,
+            tier_buy_levels=4,
+            tier_sell_levels=12,
+            tier_per_order_notional=70.0,
+            tier_base_position_notional=280.0,
+        )
+
+        self.assertTrue(result["enabled"])
+        self.assertFalse(result["active"])
+        self.assertEqual(result["effective_buy_levels"], 8)
+        self.assertEqual(result["effective_sell_levels"], 8)
+        self.assertAlmostEqual(result["effective_base_position_notional"], 420.0)
+
+    def test_apply_inventory_tiering_interpolates_between_base_and_tier_targets(self) -> None:
+        result = apply_inventory_tiering(
+            current_long_notional=675.0,
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=70.0,
+            base_position_notional=420.0,
+            tier_start_notional=600.0,
+            tier_end_notional=750.0,
+            tier_buy_levels=4,
+            tier_sell_levels=12,
+            tier_per_order_notional=70.0,
+            tier_base_position_notional=280.0,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertAlmostEqual(result["ratio"], 0.5)
+        self.assertEqual(result["effective_buy_levels"], 6)
+        self.assertEqual(result["effective_sell_levels"], 10)
+        self.assertAlmostEqual(result["effective_per_order_notional"], 70.0)
+        self.assertAlmostEqual(result["effective_base_position_notional"], 350.0)
+
+    def test_apply_inventory_tiering_hits_tier_profile_at_upper_bound(self) -> None:
+        result = apply_inventory_tiering(
+            current_long_notional=760.0,
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=70.0,
+            base_position_notional=420.0,
+            tier_start_notional=600.0,
+            tier_end_notional=750.0,
+            tier_buy_levels=4,
+            tier_sell_levels=12,
+            tier_per_order_notional=70.0,
+            tier_base_position_notional=280.0,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertAlmostEqual(result["ratio"], 1.0)
+        self.assertEqual(result["effective_buy_levels"], 4)
+        self.assertEqual(result["effective_sell_levels"], 12)
+        self.assertAlmostEqual(result["effective_base_position_notional"], 280.0)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_handles_optional_synthetic_fields(self, mock_validate_plan_report, mock_book_tickers) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": False,
+            "errors": ["plan contains no actions to execute"],
+            "actions": {"place_count": 0, "cancel_count": 0},
+        }
+        mock_book_tickers.return_value = [{"bid_price": "1.0000", "ask_price": "1.0002"}]
+
+        args = Namespace(
+            symbol="OPNUSDT",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=True,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/opnusdt_loop_latest_plan.json",
+            apply=False,
+            margin_type="KEEP",
+            leverage=2,
+            maker_retries=2,
+        )
+        plan_report = {
+            "symbol": "OPNUSDT",
+            "strategy_mode": "one_way_long",
+            "mid_price": 1.0001,
+            "step_price": 0.0001,
+            "inventory_tier": None,
+            "synthetic_ledger": None,
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["idle"])
+        self.assertEqual(report["plan_snapshot"]["inventory_tier"], {})
+        self.assertEqual(report["plan_snapshot"]["synthetic_ledger"], {})
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_market_guard_flags_extreme_down_candle(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.return_value = [
+            Candle(
+                open_time=now - timedelta(minutes=2),
+                close_time=now - timedelta(minutes=1, seconds=1),
+                open=0.0500,
+                high=0.0502,
+                low=0.0497,
+                close=0.0498,
+            ),
+            Candle(
+                open_time=now - timedelta(minutes=1),
+                close_time=now - timedelta(seconds=1),
+                open=0.0500,
+                high=0.05025,
+                low=0.04970,
+                close=0.04980,
+            ),
+        ]
+
+        result = assess_market_guard(
+            symbol="NIGHTUSDT",
+            buy_pause_amp_trigger_ratio=0.0075,
+            buy_pause_down_return_trigger_ratio=-0.0035,
+            freeze_shift_abs_return_trigger_ratio=0.0035,
+            now=now,
+        )
+
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["available"])
+        self.assertTrue(result["buy_pause_active"])
+        self.assertTrue(result["shift_frozen"])
+        self.assertAlmostEqual(result["return_ratio"], -0.004)
+        self.assertGreater(result["amplitude_ratio"], 0.01)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_market_guard_ignores_small_candle(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.return_value = [
+            Candle(
+                open_time=now - timedelta(minutes=1),
+                close_time=now - timedelta(seconds=1),
+                open=0.0500,
+                high=0.0501,
+                low=0.04995,
+                close=0.05002,
+            ),
+        ]
+
+        result = assess_market_guard(
+            symbol="NIGHTUSDT",
+            buy_pause_amp_trigger_ratio=0.0075,
+            buy_pause_down_return_trigger_ratio=-0.0035,
+            freeze_shift_abs_return_trigger_ratio=0.005,
+            now=now,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertFalse(result["buy_pause_active"])
+        self.assertFalse(result["shift_frozen"])
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_auto_regime_prefers_defensive_when_recent_drop_and_amp_expand(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc)
+        candles: list[Candle] = []
+        base = now - timedelta(minutes=60)
+        prices = [
+            (1.00, 1.005, 0.998, 1.002),
+            (1.002, 1.004, 0.996, 0.999),
+            (0.999, 1.000, 0.992, 0.994),
+            (0.994, 0.996, 0.987, 0.989),
+            (0.989, 0.992, 0.983, 0.985),
+            (0.985, 0.987, 0.977, 0.979),
+            (0.979, 0.982, 0.972, 0.975),
+            (0.975, 0.978, 0.969, 0.972),
+            (0.972, 0.975, 0.968, 0.970),
+            (0.970, 0.972, 0.965, 0.968),
+            (0.968, 0.971, 0.963, 0.966),
+            (0.966, 0.969, 0.960, 0.962),
+        ]
+        for index, (open_, high, low, close) in enumerate(prices):
+            open_time = base + timedelta(minutes=5 * index)
+            candles.append(
+                Candle(
+                    open_time=open_time,
+                    close_time=open_time + timedelta(minutes=5),
+                    open=open_,
+                    high=high,
+                    low=low,
+                    close=close,
+                )
+            )
+        mock_fetch_futures_klines.return_value = candles
+
+        result = assess_auto_regime(
+            symbol="OPNUSDT",
+            stable_15m_max_amplitude_ratio=0.02,
+            stable_60m_max_amplitude_ratio=0.05,
+            stable_60m_return_floor_ratio=-0.01,
+            defensive_15m_amplitude_ratio=0.035,
+            defensive_60m_amplitude_ratio=0.08,
+            defensive_15m_return_ratio=-0.015,
+            defensive_60m_return_ratio=-0.03,
+            now=now,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["regime"], "defensive")
+        self.assertEqual(result["candidate_profile"], "volatility_defensive_v1")
+
+    def test_resolve_auto_regime_profile_switches_after_confirm_cycles(self) -> None:
+        state = {}
+        first = resolve_auto_regime_profile(
+            state=state,
+            regime_report={"regime": "defensive", "candidate_profile": "volatility_defensive_v1", "reason": "drop"},
+            confirm_cycles=2,
+            now=datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(first["active_profile"], "volume_long_v4")
+        self.assertEqual(first["pending_count"], 1)
+        second = resolve_auto_regime_profile(
+            state=state,
+            regime_report={"regime": "defensive", "candidate_profile": "volatility_defensive_v1", "reason": "drop"},
+            confirm_cycles=2,
+            now=datetime(2026, 3, 18, 10, 5, tzinfo=timezone.utc),
+        )
+        self.assertEqual(second["active_profile"], "volatility_defensive_v1")
+        self.assertTrue(second["switched"])
+
+    def test_build_effective_runner_args_applies_defensive_profile_and_retunes_step(self) -> None:
+        args = Namespace(
+            strategy_profile="adaptive_volatility_v1",
+            strategy_mode="one_way_long",
+            symbol="OPNUSDT",
+            step_price=0.0002,
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=70.0,
+            base_position_notional=420.0,
+            up_trigger_steps=6,
+            down_trigger_steps=4,
+            shift_steps=4,
+            pause_buy_position_notional=750.0,
+            max_position_notional=900.0,
+            buy_pause_amp_trigger_ratio=0.0075,
+            buy_pause_down_return_trigger_ratio=-0.0035,
+            freeze_shift_abs_return_trigger_ratio=0.005,
+            inventory_tier_start_notional=600.0,
+            inventory_tier_end_notional=750.0,
+            inventory_tier_buy_levels=4,
+            inventory_tier_sell_levels=12,
+            inventory_tier_per_order_notional=70.0,
+            inventory_tier_base_position_notional=280.0,
+        )
+
+        effective = build_effective_runner_args(
+            args=args,
+            active_profile="volatility_defensive_v1",
+            symbol_info={"tick_size": 0.0001},
+            bid_price=0.2668,
+            ask_price=0.2670,
+            mid_price=0.2669,
+        )
+
+        self.assertEqual(effective.buy_levels, 4)
+        self.assertEqual(effective.sell_levels, 12)
+        self.assertEqual(effective.max_position_notional, 420.0)
+        self.assertGreaterEqual(effective.step_price, 0.0004)
+
+
+if __name__ == "__main__":
+    unittest.main()
