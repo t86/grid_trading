@@ -2943,6 +2943,10 @@ HTML_PAGE = """<!doctype html>
           <label>最大投入资金（名义 / quote）</label>
           <input id="total_buy_notional" type="number" step="0.0001" value="10000" />
         </div>
+        <div class="field optimize-only">
+          <label>目标成交额（交易赛）</label>
+          <input id="target_trade_volume" type="number" step="0.0001" value="500000" />
+        </div>
         <div class="field fixed-only">
           <label>固定格子数 N</label>
           <input id="fixed_n" type="number" step="1" value="20" />
@@ -3042,6 +3046,7 @@ HTML_PAGE = """<!doctype html>
             <option value="net_profit">net_profit（净收益）</option>
             <option value="total_return">total_return（总收益率）</option>
             <option value="annualized_return">annualized_return（年化）</option>
+            <option value="competition_volume">competition_volume（交易赛推荐）</option>
           </select>
         </div>
         <div class="field optimize-only">
@@ -3059,8 +3064,12 @@ HTML_PAGE = """<!doctype html>
 
         <div class="actions">
           <button id="run_btn" type="submit">开始测算</button>
+          <button id="suggest_btn" type="button" class="optimize-only">智能建议 min/max</button>
           <button id="csv_btn" type="button" disabled>下载当前买入计划 CSV</button>
           <span id="status" class="msg">等待输入参数。</span>
+        </div>
+        <div class="actions optimize-only">
+          <span id="suggest_status" class="msg">可先点击“智能建议 min/max”，再进行正式测算。</span>
         </div>
         <div id="progress_box" class="progress-box">
           <div class="progress-track">
@@ -3069,7 +3078,34 @@ HTML_PAGE = """<!doctype html>
           <div id="progress_text" class="progress-text">进度 0.0% · ETA --</div>
         </div>
       </form>
-      <p class="hint">提示：合约模式默认采用“启动预建仓”；现货 V1 不自动预建底仓，只会先挂当前价下方买单，买到后再补对应卖单。K线和资金费率按 交易对(+周期) 缓存到本地，选择不同时间区间会复用缓存并按需增量拉取；秒级K线(如1s)单次区间最多31天。</p>
+      <p class="hint">提示：合约模式默认采用“启动预建仓”；现货 V1 不自动预建底仓，只会先挂当前价下方买单，买到后再补对应卖单。K线和资金费率按 交易对(+周期) 缓存到本地，选择不同时间区间会复用缓存并按需增量拉取；秒级K线(如1s)单次区间最多31天。交易赛场景优先使用 `competition_volume` 与“智能建议 min/max”。</p>
+    </section>
+
+    <section class="card optimize-only">
+      <h3>智能区间建议（交易赛）</h3>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>建议 min_price</th>
+              <th>建议 max_price</th>
+              <th>推荐 N</th>
+              <th>推荐模式</th>
+              <th>单格价差</th>
+              <th>每格买入额(均/最小/最大)</th>
+              <th>成交额</th>
+              <th>目标达成率</th>
+              <th>净收益</th>
+              <th>最大回撤</th>
+              <th>成交数</th>
+              <th>说明</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="suggest_tbody"></tbody>
+        </table>
+      </div>
     </section>
 
     <section class="card">
@@ -3240,6 +3276,8 @@ HTML_PAGE = """<!doctype html>
               <th>年化</th>
               <th>最大回撤</th>
               <th>成交数</th>
+              <th>成交额</th>
+              <th>目标达成率</th>
               <th>手续费</th>
               <th id="top_funding_header">资金费收益</th>
             </tr>
@@ -3396,7 +3434,9 @@ HTML_PAGE = """<!doctype html>
     const form = document.getElementById("form");
     const statusEl = document.getElementById("status");
     const runBtn = document.getElementById("run_btn");
+    const suggestBtn = document.getElementById("suggest_btn");
     const csvBtn = document.getElementById("csv_btn");
+    const suggestStatusEl = document.getElementById("suggest_status");
     const rankRunBtn = document.getElementById("rank_run_btn");
     const rankAutoBtn = document.getElementById("rank_auto_btn");
     const rankStatusEl = document.getElementById("rank_status");
@@ -3422,6 +3462,7 @@ HTML_PAGE = """<!doctype html>
     const previewLeverageEl = document.getElementById("preview_leverage");
     const summaryEl = document.getElementById("summary");
     const formulaEl = document.getElementById("pnl_formula");
+    const suggestBody = document.getElementById("suggest_tbody");
     const topBody = document.getElementById("top_tbody");
     const planBody = document.getElementById("plan_tbody");
     const planOverviewEl = document.getElementById("plan_overview");
@@ -3467,6 +3508,7 @@ HTML_PAGE = """<!doctype html>
 
     let latestPlanRows = [];
     let latestTopCandidates = [];
+    let latestRangeSuggestions = [];
     let latestCandleCount = 0;
     let latestExpectedCandleCount = 0;
     let latestCandleCoverage = null;
@@ -3704,6 +3746,11 @@ HTML_PAGE = """<!doctype html>
       statusEl.className = isError ? "msg error" : "msg";
     }
 
+    function setSuggestStatus(text, isError = false) {
+      suggestStatusEl.textContent = text;
+      suggestStatusEl.className = isError ? "msg error" : "msg";
+    }
+
     function setLayerStatus(text, isError = false) {
       layerStatusEl.textContent = text;
       layerStatusEl.className = isError ? "msg error" : "msg";
@@ -3895,6 +3942,7 @@ HTML_PAGE = """<!doctype html>
         max_price: Number(document.getElementById("max_price").value),
         total_buy_notional: Number(document.getElementById("total_buy_notional").value),
         max_buy_notional: Number(document.getElementById("total_buy_notional").value),
+        target_trade_volume: Number(document.getElementById("target_trade_volume").value),
         fixed_n: Number(document.getElementById("fixed_n").value),
         fixed_buy_unit: fixedBuyUnit,
         fixed_per_grid_notional: fixedBuyUnit === "notional" ? fixedBuyValue : 0,
@@ -4745,6 +4793,9 @@ HTML_PAGE = """<!doctype html>
       const gridModeText = gridModeMap[String(best.grid_level_mode || "").toLowerCase()] || String(best.grid_level_mode || "等差");
       const endPrice = Number(best.end_price);
       const baseRefPrice = capitalBaseReferencePrice(best);
+      const grossTradeNotional = Number(best.gross_trade_notional ?? best.trade_volume ?? 0);
+      const targetTradeVolume = Number(best.target_trade_volume ?? 0);
+      const volumeCoverage = Number(best.volume_coverage ?? (targetTradeVolume > 0 ? grossTradeNotional / targetTradeVolume : 1));
       const items = isSpot
         ? [
             ["市场", "现货 V1（单向做多）"],
@@ -4769,6 +4820,9 @@ HTML_PAGE = """<!doctype html>
             ["最大回撤", fmtPct(best.max_drawdown)],
             ["年化收益", fmtPct(best.annualized_return)],
             ["成交数", best.trade_count],
+            ["成交额", fmtMoney(grossTradeNotional, endPrice)],
+            ["目标成交额", fmtMoney(targetTradeVolume, endPrice)],
+            ["目标达成率", fmtPct(volumeCoverage)],
             ["平均资金占用", fmtPct(best.avg_capital_usage)],
             ["K线数量", candleCount],
             ["K线覆盖率", fmtPct(latestCandleCoverage)],
@@ -4797,6 +4851,9 @@ HTML_PAGE = """<!doctype html>
             ["最大回撤", fmtPct(best.max_drawdown)],
             ["年化收益", fmtPct(best.annualized_return)],
             ["成交数", best.trade_count],
+            ["成交额", fmtMoney(grossTradeNotional, endPrice)],
+            ["目标成交额", fmtMoney(targetTradeVolume, endPrice)],
+            ["目标达成率", fmtPct(volumeCoverage)],
             ["平均资金占用", fmtPct(best.avg_capital_usage)],
             ["K线数量", candleCount],
             ["K线覆盖率", fmtPct(latestCandleCoverage)],
@@ -4836,8 +4893,32 @@ HTML_PAGE = """<!doctype html>
           <td>${fmtPct(x.annualized_return)}</td>
           <td>${fmtPct(x.max_drawdown)}</td>
           <td>${x.trade_count}</td>
+          <td>${fmtMoney(x.gross_trade_notional ?? x.trade_volume, x.end_price)}</td>
+          <td>${fmtPct(x.volume_coverage)}</td>
           <td>${fmtMoney(x.total_fees, x.end_price)}</td>
           ${isSpot ? "" : `<td>${fmtMoney(x.funding_pnl, x.end_price)}</td>`}
+        </tr>
+      `).join("");
+    }
+
+    function renderRangeSuggestions(rows) {
+      latestRangeSuggestions = Array.isArray(rows) ? rows : [];
+      suggestBody.innerHTML = latestRangeSuggestions.map((x, idx) => `
+        <tr>
+          <td>${idx + 1}</td>
+          <td>${fmtNum(x.min_price)}</td>
+          <td>${fmtNum(x.max_price)}</td>
+          <td>${x.recommended_n}</td>
+          <td>${x.recommended_mode}</td>
+          <td>${fmtPct(x.step_pct)}</td>
+          <td>${fmtMoney(x.avg_per_grid_notional)} / ${fmtMoney(x.min_per_grid_notional)} / ${fmtMoney(x.max_per_grid_notional)}</td>
+          <td>${fmtMoney(x.gross_trade_notional ?? x.trade_volume, x.max_price)}</td>
+          <td>${fmtPct(x.volume_coverage)}</td>
+          <td>${fmtMoney(x.net_profit, x.max_price)}</td>
+          <td>${fmtPct(x.max_drawdown)}</td>
+          <td>${x.trade_count}</td>
+          <td>${x.reason || "-"}</td>
+          <td><button type="button" data-suggest-idx="${idx}">应用</button></td>
         </tr>
       `).join("");
     }
@@ -5327,8 +5408,75 @@ HTML_PAGE = """<!doctype html>
     applyMainSecondIntervalLimit(false);
     applyRankSecondIntervalLimit(false);
     loadSymbols();
+    renderRangeSuggestions([]);
     clearFunding(getSelectedMarketType() === "spot" ? "现货模式无资金费。" : "等待测算结果。");
     clearGridPreview();
+
+    if (suggestBtn) {
+      suggestBody.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-suggest-idx]");
+        if (!btn) return;
+        const idx = Number(btn.dataset.suggestIdx);
+        if (Number.isNaN(idx) || idx < 0 || idx >= latestRangeSuggestions.length) return;
+        const picked = latestRangeSuggestions[idx];
+        document.getElementById("min_price").value = String(Number(picked.min_price.toFixed(8)));
+        document.getElementById("max_price").value = String(Number(picked.max_price.toFixed(8)));
+        document.getElementById("n_min").value = String(picked.recommended_n);
+        document.getElementById("n_max").value = String(picked.recommended_n);
+        for (const checkbox of document.querySelectorAll('input[name="allocation_mode"]')) {
+          checkbox.checked = checkbox.value === picked.recommended_mode;
+        }
+        setStatus(
+          `已应用智能建议：min=${fmtNum(picked.min_price)}，max=${fmtNum(picked.max_price)}，N=${picked.recommended_n}，mode=${picked.recommended_mode}。点击“开始测算”可查看每格买入计划。`
+        );
+      });
+
+      suggestBtn.addEventListener("click", async () => {
+        const payload = readForm();
+        if (payload.calc_mode !== "optimize") {
+          setSuggestStatus("固定参数模式不需要区间建议，请切换到优化模式。", true);
+          return;
+        }
+        const rangeErr = validateSecondIntervalRange(
+          payload.start_time,
+          payload.end_time,
+          payload.interval,
+          "区间建议"
+        );
+        if (rangeErr) {
+          setSuggestStatus(rangeErr, true);
+          return;
+        }
+        suggestBtn.disabled = true;
+        setSuggestStatus("正在计算区间建议，请稍候...");
+        try {
+          const resp = await fetch("/api/suggest_range", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) {
+            throw new Error(data.error || `请求失败(${resp.status})`);
+          }
+          const suggestions = Array.isArray(data.suggestions) ? data.suggestions : [];
+          renderRangeSuggestions(suggestions);
+          if (!suggestions.length) {
+            setSuggestStatus("未生成可用建议，请放宽参数（例如降低目标成交额或放宽N范围）。", true);
+            return;
+          }
+          const best = suggestions[0];
+          setSuggestStatus(
+            `已生成 ${suggestions.length} 组建议。首选达成率=${fmtPct(best.volume_coverage)}，成交额=${fmtMoney(best.gross_trade_notional ?? best.trade_volume, best.max_price)}。`
+          );
+        } catch (err) {
+          renderRangeSuggestions([]);
+          setSuggestStatus(`区间建议失败：${err.message}`, true);
+        } finally {
+          suggestBtn.disabled = false;
+        }
+      });
+    }
 
     async function pollJob(jobId, token) {
       while (token === currentPollToken) {
@@ -5418,6 +5566,11 @@ HTML_PAGE = """<!doctype html>
           : "";
         if (payload.calc_mode === "fixed") {
           setStatus(`完成：固定参数回测已完成。${coverageLabel}${cacheLabel}${fundingLabel}`);
+        } else if (payload.objective === "competition_volume") {
+          const best = latestTopCandidates[0];
+          setStatus(
+            `完成：已按交易赛目标排序，Top1达成率=${fmtPct(best.volume_coverage)}，成交额=${fmtMoney(best.gross_trade_notional ?? best.trade_volume, best.end_price)}。${coverageLabel}${cacheLabel}${fundingLabel}`
+          );
         } else {
           setStatus(`完成：默认显示最优候选。${coverageLabel}${cacheLabel}${fundingLabel}`);
         }
@@ -10192,6 +10345,154 @@ def _safe_metric(value: float) -> float | None:
     return value
 
 
+def _percentile(values: list[float], ratio: float) -> float:
+    if not values:
+        raise ValueError("values cannot be empty")
+    clipped = min(max(float(ratio), 0.0), 1.0)
+    if len(values) == 1:
+        return float(values[0])
+    position = clipped * (len(values) - 1)
+    left = int(math.floor(position))
+    right = int(math.ceil(position))
+    if left == right:
+        return float(values[left])
+    weight = position - left
+    return float(values[left]) * (1.0 - weight) + float(values[right]) * weight
+
+
+def _sample_n_values(n_min: int, n_max: int, max_count: int = 16) -> list[int]:
+    if n_min <= 0 or n_max <= 0 or n_min > n_max:
+        raise ValueError("invalid n range")
+    if max_count <= 0:
+        raise ValueError("max_count must be > 0")
+    if n_max - n_min + 1 <= max_count:
+        return list(range(n_min, n_max + 1))
+    values = {n_min, n_max}
+    steps = max_count - 2
+    for index in range(1, steps + 1):
+        ratio = index / (steps + 1)
+        sampled = int(round(n_min + ratio * (n_max - n_min)))
+        values.add(max(n_min, min(n_max, sampled)))
+    return sorted(values)
+
+
+def _build_candidate_ranges(candles: list[Candle]) -> list[tuple[float, float, str]]:
+    low_prices = sorted(float(item.low) for item in candles)
+    high_prices = sorted(float(item.high) for item in candles)
+    close_prices = sorted(float(item.close) for item in candles)
+    last_close = float(candles[-1].close)
+    median_close = _percentile(close_prices, 0.5)
+
+    raw_ranges: list[tuple[float, float, str]] = []
+    for low_q, high_q in (
+        (0.01, 0.99),
+        (0.03, 0.97),
+        (0.05, 0.95),
+        (0.10, 0.90),
+        (0.15, 0.85),
+        (0.20, 0.80),
+        (0.25, 0.75),
+    ):
+        raw_ranges.append(
+            (
+                _percentile(low_prices, low_q),
+                _percentile(high_prices, high_q),
+                f"quantile_{int(low_q * 100)}_{int(high_q * 100)}",
+            )
+        )
+
+    for width in (0.02, 0.03, 0.05, 0.08, 0.12, 0.18):
+        raw_ranges.append(
+            (
+                max(0.0000001, last_close * (1.0 - width)),
+                last_close * (1.0 + width),
+                f"last_close_{int(width * 100)}pct",
+            )
+        )
+        raw_ranges.append(
+            (
+                max(0.0000001, median_close * (1.0 - width)),
+                median_close * (1.0 + width),
+                f"median_close_{int(width * 100)}pct",
+            )
+        )
+
+    deduped: dict[tuple[float, float], tuple[float, float, str]] = {}
+    for min_price, max_price, tag in raw_ranges:
+        if min_price <= 0 or max_price <= min_price:
+            continue
+        mid = (min_price + max_price) / 2.0
+        if mid <= 0:
+            continue
+        if (max_price - min_price) / mid < 0.004:
+            continue
+        key = (round(min_price, 6), round(max_price, 6))
+        deduped[key] = (min_price, max_price, tag)
+
+    return sorted(deduped.values(), key=lambda item: item[1] - item[0])[:16]
+
+
+def _competition_sort_key(
+    *,
+    trade_volume: float,
+    target_trade_volume: float,
+    net_profit: float,
+    max_drawdown: float,
+) -> tuple[float, float, float, float, float, float]:
+    if target_trade_volume > 0:
+        meets_target = 1.0 if trade_volume >= target_trade_volume else 0.0
+        coverage = min(1.0, trade_volume / target_trade_volume)
+    else:
+        meets_target = 1.0
+        coverage = 1.0
+    loss = max(0.0, -net_profit)
+    profit = max(0.0, net_profit)
+    return (
+        meets_target,
+        coverage,
+        -loss,
+        profit,
+        trade_volume,
+        -max_drawdown,
+    )
+
+
+def _mode_preference_score(mode: str) -> float:
+    order = {
+        "equal_qty": 6.0,
+        "equal": 5.5,
+        "center_heavy": 5.0,
+        "edge_heavy": 4.6,
+        "linear_reverse": 4.0,
+        "linear": 3.8,
+        "geometric_reverse": 3.4,
+        "geometric": 3.2,
+        "quadratic_reverse": 3.0,
+        "quadratic": 2.8,
+    }
+    return order.get(mode.strip().lower(), 0.0)
+
+
+def _ordered_suggestion_modes(modes: list[str]) -> list[str]:
+    deduped: list[str] = []
+    for mode in modes:
+        cleaned = mode.strip().lower()
+        if cleaned and cleaned not in deduped:
+            deduped.append(cleaned)
+    return sorted(deduped, key=lambda item: (_mode_preference_score(item), item), reverse=True)
+
+
+def _range_reason(coverage: float, net_profit: float, mode: str) -> str:
+    mode_hint = "中性分配" if _mode_preference_score(mode) >= 5.0 else "方向性分配"
+    if coverage >= 1.0 and net_profit >= 0:
+        return f"达成目标且净收益为正（{mode_hint}）"
+    if coverage >= 1.0 and net_profit < 0:
+        return f"达成目标，优先控制损失（{mode_hint}）"
+    if coverage < 1.0 and net_profit >= 0:
+        return f"未达目标但净收益为正，可继续加密（{mode_hint}）"
+    return f"优先提升成交额，亏损可控（{mode_hint}）"
+
+
 def _load_market_symbols(
     *,
     market_type: str,
@@ -12397,6 +12698,9 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
     fee_rate = _safe_float(payload.get("fee_rate", 0.0002), "fee_rate")
     slippage = _safe_float(payload.get("slippage", 0.0), "slippage")
     funding_buffer = _safe_float(payload.get("funding_buffer", 0.0), "funding_buffer")
+    target_trade_volume = _safe_float(
+        payload.get("target_trade_volume", 0.0), "target_trade_volume"
+    )
     top_k = _safe_int(payload.get("top_k", 5), "top_k")
     refresh = bool(payload.get("refresh", False))
 
@@ -12409,7 +12713,14 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("allocation_modes must be string or list")
 
     objective = str(payload.get("objective", "calmar")).strip().lower()
-    if objective not in {"calmar", "net_profit", "total_return", "annualized_return"}:
+    if objective not in {
+        "calmar",
+        "net_profit",
+        "total_return",
+        "annualized_return",
+        "gross_trade_notional",
+        "competition_volume",
+    }:
         raise ValueError("unsupported objective")
     min_trade_count = _safe_int(payload.get("min_trade_count", 0), "min_trade_count")
     min_avg_capital_usage = _safe_float(
@@ -12427,6 +12738,8 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("min_trade_count must be >= 0")
     if min_avg_capital_usage < 0 or min_avg_capital_usage > 1:
         raise ValueError("min_avg_capital_usage must be in [0,1]")
+    if target_trade_volume < 0:
+        raise ValueError("target_trade_volume must be >= 0")
     if strategy_direction not in set(supported_strategy_directions()):
         raise ValueError(
             f"unsupported strategy_direction: {strategy_direction}; "
@@ -12513,12 +12826,196 @@ def _normalize_payload(payload: dict[str, Any]) -> dict[str, Any]:
         "fee_rate": fee_rate,
         "slippage": slippage,
         "funding_buffer": funding_buffer,
+        "target_trade_volume": target_trade_volume,
         "allocation_modes": allocation_modes,
         "objective": objective,
         "min_trade_count": min_trade_count,
         "min_avg_capital_usage": min_avg_capital_usage,
         "top_k": top_k,
         "refresh": refresh,
+    }
+
+
+def _normalize_suggest_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    params = _normalize_payload(payload)
+    if params["calc_mode"] != "optimize":
+        raise ValueError("suggest_range only supports optimize mode")
+    params["allocation_modes"] = _ordered_suggestion_modes(params["allocation_modes"])
+    params["top_k"] = min(10, max(1, params["top_k"]))
+    return params
+
+
+def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
+    cache_path = str(
+        cache_file_path(
+            params["symbol"],
+            params["interval"],
+            cache_dir="data",
+            contract_type=params.get("contract_type") or "usdm",
+            market_type=params["market_type"],
+        )
+    )
+    funding_cache_path = (
+        str(
+            funding_cache_file_path(
+                params["symbol"],
+                cache_dir="data",
+                contract_type=params.get("contract_type") or "usdm",
+                market_type=params["market_type"],
+            )
+        )
+        if params["include_funding"] and params["market_type"] == "futures"
+        else None
+    )
+    candles = load_or_fetch_candles(
+        symbol=params["symbol"],
+        interval=params["interval"],
+        start_time=params["start_time"],
+        end_time=params["end_time"],
+        cache_dir="data",
+        contract_type=params.get("contract_type") or "usdm",
+        market_type=params["market_type"],
+        refresh=params["refresh"],
+    )
+    funding_rates = (
+        load_or_fetch_funding_rates(
+            symbol=params["symbol"],
+            start_time=params["start_time"],
+            end_time=params["end_time"],
+            cache_dir="data",
+            contract_type=params.get("contract_type") or "usdm",
+            market_type=params["market_type"],
+            refresh=params["refresh"],
+        )
+        if params["include_funding"] and params["market_type"] == "futures"
+        else []
+    )
+    if len(candles) < 10:
+        raise ValueError("Not enough candle data for range suggestion")
+
+    range_candidates = _build_candidate_ranges(candles)
+    if not range_candidates:
+        raise ValueError("Unable to build candidate ranges from current data")
+    n_values = _sample_n_values(params["n_min"], params["n_max"], max_count=16)
+
+    suggestions: list[dict[str, Any]] = []
+    for min_price, max_price, source in range_candidates:
+        optimization = optimize_grid_count(
+            candles=candles,
+            min_price=min_price,
+            max_price=max_price,
+            total_buy_notional=params["total_buy_notional"],
+            n_min=n_values[0],
+            n_max=n_values[-1],
+            n_values=n_values,
+            grid_level_mode=params["grid_level_mode"],
+            strategy_direction=params["strategy_direction"],
+            fee_rate=params["fee_rate"],
+            slippage=params["slippage"],
+            funding_buffer=params["funding_buffer"],
+            allocation_modes=params["allocation_modes"],
+            objective="competition_volume",
+            target_trade_volume=params["target_trade_volume"],
+            min_trade_count=params["min_trade_count"],
+            min_avg_capital_usage=params["min_avg_capital_usage"],
+            top_k=max(10, len(params["allocation_modes"])),
+            funding_rates=funding_rates,
+            bootstrap_positions=params["market_type"] != "spot",
+        )
+        if not optimization.top_results:
+            continue
+
+        ranked_candidates = sorted(
+            optimization.top_results,
+            key=lambda item: (
+                _competition_sort_key(
+                    trade_volume=float(item.gross_trade_notional),
+                    target_trade_volume=float(params["target_trade_volume"]),
+                    net_profit=float(item.net_profit),
+                    max_drawdown=float(item.max_drawdown),
+                ),
+                _mode_preference_score(item.allocation_mode),
+            ),
+            reverse=True,
+        )
+        best = ranked_candidates[0]
+        gross_trade_notional = float(best.gross_trade_notional)
+        target_trade_volume = float(params["target_trade_volume"])
+        volume_coverage = (
+            gross_trade_notional / target_trade_volume if target_trade_volume > 0 else 1.0
+        )
+        if params["grid_level_mode"] == "geometric" and min_price > 0 and best.n > 0:
+            step_pct = (max_price / min_price) ** (1.0 / best.n) - 1.0
+        else:
+            mid_price = (min_price + max_price) / 2.0
+            step_pct = ((max_price - min_price) / best.n) / mid_price if mid_price > 0 and best.n > 0 else 0.0
+        min_grid_notional = min(best.per_grid_notionals) if best.per_grid_notionals else 0.0
+        max_grid_notional = max(best.per_grid_notionals) if best.per_grid_notionals else 0.0
+        avg_grid_notional = (
+            sum(best.per_grid_notionals) / len(best.per_grid_notionals)
+            if best.per_grid_notionals
+            else 0.0
+        )
+        suggestions.append(
+            {
+                "min_price": min_price,
+                "max_price": max_price,
+                "range_width_pct": ((max_price - min_price) / ((max_price + min_price) / 2.0))
+                if (max_price + min_price) > 0
+                else 0.0,
+                "recommended_n": best.n,
+                "recommended_mode": best.allocation_mode,
+                "step_pct": step_pct,
+                "avg_per_grid_notional": avg_grid_notional,
+                "min_per_grid_notional": min_grid_notional,
+                "max_per_grid_notional": max_grid_notional,
+                "gross_trade_notional": gross_trade_notional,
+                "trade_volume": gross_trade_notional,
+                "target_trade_volume": target_trade_volume,
+                "volume_coverage": volume_coverage,
+                "net_profit": best.net_profit,
+                "max_drawdown": best.max_drawdown,
+                "trade_count": best.trade_count,
+                "total_fees": best.total_fees,
+                "source": source,
+                "reason": _range_reason(
+                    coverage=volume_coverage,
+                    net_profit=best.net_profit,
+                    mode=best.allocation_mode,
+                ),
+            }
+        )
+
+    suggestions = sorted(
+        suggestions,
+        key=lambda item: _competition_sort_key(
+            trade_volume=float(item["gross_trade_notional"]),
+            target_trade_volume=float(params["target_trade_volume"]),
+            net_profit=float(item["net_profit"]),
+            max_drawdown=float(item["max_drawdown"]),
+        ),
+        reverse=True,
+    )[: params["top_k"]]
+
+    return {
+        "ok": True,
+        "suggestions": suggestions,
+        "data": {
+            "candles": len(candles),
+            "cache_file": cache_path,
+            "funding_cache_file": funding_cache_path,
+            "funding_events": len(funding_rates),
+            "symbol": params["symbol"],
+            "market_type": params["market_type"],
+            "contract_type": params["contract_type"],
+            "interval": params["interval"],
+            "strategy_direction": params["strategy_direction"],
+            "grid_level_mode": params["grid_level_mode"],
+            "start_time": params["start_time"].isoformat(),
+            "end_time": params["end_time"].isoformat(),
+            "include_funding": params["include_funding"],
+            "target_trade_volume": params["target_trade_volume"],
+        },
     }
 
 
@@ -12576,6 +13073,9 @@ def _run_optimizer(
     candle_coverage = (len(candles) / expected_candles) if expected_candles > 0 else 1.0
 
     def _candidate_payload(item) -> dict[str, Any]:
+        target_trade_volume = float(params["target_trade_volume"])
+        gross_trade_notional = float(item.gross_trade_notional)
+        volume_coverage = gross_trade_notional / target_trade_volume if target_trade_volume > 0 else 1.0
         plan_rows = []
         for idx in range(item.n):
             plan_rows.append(
@@ -12605,6 +13105,10 @@ def _run_optimizer(
             "funding_pnl": item.funding_pnl,
             "funding_event_count": item.funding_event_count,
             "trade_count": item.trade_count,
+            "gross_trade_notional": gross_trade_notional,
+            "trade_volume": gross_trade_notional,
+            "target_trade_volume": target_trade_volume,
+            "volume_coverage": volume_coverage,
             "win_rate": item.win_rate,
             "avg_capital_usage": item.avg_capital_usage,
             "max_capital_usage": item.max_capital_usage,
@@ -12651,7 +13155,11 @@ def _run_optimizer(
             progress_callback(
                 {"processed": 1, "total": 1, "status": "tested", "n": params["fixed_n"], "mode": fixed_mode}
             )
-        fixed_result.score = objective_value(fixed_result, params["objective"])
+        fixed_result.score = objective_value(
+            fixed_result,
+            params["objective"],
+            target_trade_volume=params["target_trade_volume"],
+        )
 
         if fixed_result.trade_count < params["min_trade_count"]:
             return {
@@ -12678,6 +13186,7 @@ def _run_optimizer(
                     "tested": 1,
                     "skipped_by_cost": 0,
                     "objective": params["objective"],
+                    "target_trade_volume": params["target_trade_volume"],
                     "min_trade_count": params["min_trade_count"],
                     "min_avg_capital_usage": params["min_avg_capital_usage"],
                     "min_step_ratio_for_cost": min_step_ratio_for_cost(
@@ -12714,6 +13223,7 @@ def _run_optimizer(
                     "tested": 1,
                     "skipped_by_cost": 0,
                     "objective": params["objective"],
+                    "target_trade_volume": params["target_trade_volume"],
                     "min_trade_count": params["min_trade_count"],
                     "min_avg_capital_usage": params["min_avg_capital_usage"],
                     "min_step_ratio_for_cost": min_step_ratio_for_cost(
@@ -12744,6 +13254,7 @@ def _run_optimizer(
             funding_buffer=params["funding_buffer"],
             allocation_modes=params["allocation_modes"],
             objective=params["objective"],
+            target_trade_volume=params["target_trade_volume"],
             min_trade_count=params["min_trade_count"],
             min_avg_capital_usage=params["min_avg_capital_usage"],
             top_k=params["top_k"],
@@ -12777,6 +13288,7 @@ def _run_optimizer(
                     "tested": optimization.tested,
                     "skipped_by_cost": optimization.skipped_by_cost,
                     "objective": params["objective"],
+                    "target_trade_volume": params["target_trade_volume"],
                     "min_trade_count": params["min_trade_count"],
                     "min_avg_capital_usage": params["min_avg_capital_usage"],
                     "min_step_ratio_for_cost": min_step_ratio_for_cost(
@@ -12812,6 +13324,7 @@ def _run_optimizer(
             "grid_level_mode": params["grid_level_mode"],
             "calc_mode": params["calc_mode"],
             "total_buy_notional": params["total_buy_notional"],
+            "target_trade_volume": params["target_trade_volume"],
             "start_time": params["start_time"].isoformat(),
             "end_time": params["end_time"].isoformat(),
         },
@@ -12820,6 +13333,7 @@ def _run_optimizer(
             "tested": tested,
             "skipped_by_cost": skipped_by_cost,
             "objective": params["objective"],
+            "target_trade_volume": params["target_trade_volume"],
             "min_trade_count": params["min_trade_count"],
             "min_avg_capital_usage": params["min_avg_capital_usage"],
             "min_step_ratio_for_cost": min_step_ratio_for_cost(
@@ -13419,6 +13933,7 @@ class _Handler(BaseHTTPRequestHandler):
             "/api/runner/presets/update_grid",
             "/api/runner/presets/delete_grid",
             "/api/layer_compare",
+            "/api/suggest_range",
             "/api/funding_breakdown",
             "/api/market_rankings",
             "/api/basis_monitor",
@@ -13538,6 +14053,23 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 result = _run_layer_compare(params)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:  # pragma: no cover
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(result, status=200)
+            return
+
+        if path == "/api/suggest_range":
+            try:
+                params = _normalize_suggest_payload(payload)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            try:
+                result = _run_range_suggestion(params)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return

@@ -4,7 +4,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 
 from grid_optimizer.backtest import build_grid_levels, build_per_grid_notionals, run_backtest
-from grid_optimizer.optimize import optimize_grid_count
+from grid_optimizer.optimize import objective_value, optimize_grid_count
 from grid_optimizer.types import Candle, FundingRate
 
 
@@ -29,6 +29,24 @@ def _make_candles(ohlc: list[tuple[float, float, float, float]]) -> list[Candle]
 
 
 class BacktestTests(unittest.TestCase):
+    def test_competition_volume_objective_value_uses_target_coverage(self) -> None:
+        result = type(
+            "Result",
+            (),
+            {
+                "calmar": 0.0,
+                "annualized_return": 0.0,
+                "net_profit": -10.0,
+                "total_return": -0.01,
+                "gross_trade_notional": 7500.0,
+            },
+        )()
+        self.assertAlmostEqual(
+            objective_value(result, "competition_volume", target_trade_volume=10000.0),
+            0.75,
+            places=8,
+        )
+
     def test_build_grid_levels_geometric_ratios_are_consistent(self) -> None:
         levels = build_grid_levels(1000, 2000, 4, grid_level_mode="geometric")
         self.assertEqual(len(levels), 5)
@@ -232,6 +250,37 @@ class BacktestTests(unittest.TestCase):
         self.assertIsNotNone(opt.best)
         assert opt.best is not None
         self.assertAlmostEqual(opt.best.score, opt.best.gross_trade_notional, places=8)
+
+    def test_optimize_grid_count_competition_objective_uses_target_trade_volume(self) -> None:
+        candles = _make_candles(
+            [
+                (100, 103, 97, 102),
+                (102, 105, 96, 98),
+                (98, 104, 95, 103),
+                (103, 106, 99, 100),
+            ]
+        )
+        opt = optimize_grid_count(
+            candles=candles,
+            min_price=90,
+            max_price=110,
+            total_buy_notional=1000,
+            n_min=2,
+            n_max=8,
+            fee_rate=0.0002,
+            slippage=0.0,
+            allocation_modes=["equal"],
+            objective="competition_volume",
+            target_trade_volume=10000.0,
+            top_k=3,
+        )
+        self.assertIsNotNone(opt.best)
+        assert opt.best is not None
+        self.assertAlmostEqual(
+            opt.best.score,
+            opt.best.gross_trade_notional / 10000.0,
+            places=8,
+        )
 
     def test_optimize_grid_count_neutral_anchor_price_controls_side_split(self) -> None:
         candles = _make_candles(

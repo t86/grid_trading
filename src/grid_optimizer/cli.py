@@ -93,8 +93,21 @@ def _build_parser() -> argparse.ArgumentParser:
         "--objective",
         type=str,
         default="calmar",
-        choices=["calmar", "net_profit", "total_return", "annualized_return", "gross_trade_notional"],
+        choices=[
+            "calmar",
+            "net_profit",
+            "total_return",
+            "annualized_return",
+            "gross_trade_notional",
+            "competition_volume",
+        ],
         help="Optimization objective",
+    )
+    parser.add_argument(
+        "--target-trade-volume",
+        type=float,
+        default=0.0,
+        help="Optional target traded notional for competition_volume objective",
     )
     parser.add_argument(
         "--neutral-anchor-price",
@@ -139,6 +152,8 @@ def _print_header(args: argparse.Namespace, candle_count: int) -> None:
     print(f"Strategy direction: {args.strategy_direction}")
     print(f"Grid level mode: {args.grid_level_mode}")
     print(f"Objective: {args.objective}")
+    if args.target_trade_volume > 0:
+        print(f"Target trade volume: {_float(args.target_trade_volume)}")
     if args.strategy_direction == "neutral" and args.neutral_anchor_price is not None:
         print(f"Neutral anchor price: {_float(args.neutral_anchor_price)}")
     print(f"Min trade count filter: {args.min_trade_count}")
@@ -161,7 +176,7 @@ def _print_top_results(top_results) -> None:
     print("")
 
 
-def _print_best_detail(best) -> None:
+def _print_best_detail(best, target_trade_volume: float = 0.0) -> None:
     print("=== Best Grid ===")
     print(f"Best N: {best.n}")
     print(f"Best allocation mode: {best.allocation_mode}")
@@ -170,6 +185,8 @@ def _print_best_detail(best) -> None:
         print(f"Neutral anchor price: {_float(best.neutral_anchor_price)}")
     print(f"Objective score: {best.score:.4f}")
     print(f"Gross traded notional: {_float(best.gross_trade_notional)}")
+    if target_trade_volume > 0:
+        print(f"Target volume coverage: {_pct(best.gross_trade_notional / target_trade_volume)}")
     print(f"Turnover multiple: {best.turnover_multiple:.2f}x")
     print(f"Net profit: {_float(best.net_profit)}")
     print(f"Total return: {_pct(best.total_return)}")
@@ -223,6 +240,7 @@ def _build_report_payload(args: argparse.Namespace, optimization, best, candle_c
             "strategy_direction": args.strategy_direction,
             "grid_level_mode": args.grid_level_mode,
             "objective": args.objective,
+            "target_trade_volume": args.target_trade_volume,
             "neutral_anchor_price": args.neutral_anchor_price,
             "min_trade_count": args.min_trade_count,
             "min_avg_capital_usage": args.min_avg_capital_usage,
@@ -245,6 +263,12 @@ def _build_report_payload(args: argparse.Namespace, optimization, best, candle_c
             "neutral_anchor_price": best.neutral_anchor_price,
             "score": best.score,
             "gross_trade_notional": best.gross_trade_notional,
+            "target_trade_volume": args.target_trade_volume,
+            "volume_coverage": (
+                best.gross_trade_notional / args.target_trade_volume
+                if args.target_trade_volume > 0
+                else 1.0
+            ),
             "turnover_multiple": best.turnover_multiple,
             "net_profit": best.net_profit,
             "total_return": best.total_return,
@@ -273,6 +297,12 @@ def _build_report_payload(args: argparse.Namespace, optimization, best, candle_c
                 "strategy_direction": item.strategy_direction,
                 "score": item.score,
                 "gross_trade_notional": item.gross_trade_notional,
+                "target_trade_volume": args.target_trade_volume,
+                "volume_coverage": (
+                    item.gross_trade_notional / args.target_trade_volume
+                    if args.target_trade_volume > 0
+                    else 1.0
+                ),
                 "turnover_multiple": item.turnover_multiple,
                 "net_profit": item.net_profit,
                 "annualized_return": item.annualized_return,
@@ -318,6 +348,8 @@ def main() -> None:
         raise SystemExit("--min-trade-count must be >= 0")
     if args.min_avg_capital_usage < 0 or args.min_avg_capital_usage > 1:
         raise SystemExit("--min-avg-capital-usage must be in [0, 1]")
+    if args.target_trade_volume < 0:
+        raise SystemExit("--target-trade-volume must be >= 0")
     if args.neutral_anchor_price is not None and args.neutral_anchor_price <= 0:
         raise SystemExit("--neutral-anchor-price must be > 0")
     if args.market_type == "spot":
@@ -398,6 +430,7 @@ def main() -> None:
         funding_buffer=args.funding_buffer,
         allocation_modes=allocation_modes,
         objective=args.objective,
+        target_trade_volume=args.target_trade_volume,
         min_trade_count=args.min_trade_count,
         min_avg_capital_usage=args.min_avg_capital_usage,
         neutral_anchor_price=args.neutral_anchor_price,
@@ -414,7 +447,7 @@ def main() -> None:
     best = optimization.best
 
     _print_top_results(optimization.top_results)
-    _print_best_detail(best)
+    _print_best_detail(best, target_trade_volume=args.target_trade_volume)
 
     if args.report_json:
         report_path = Path(args.report_json)

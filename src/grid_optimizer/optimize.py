@@ -11,7 +11,7 @@ def min_step_ratio_for_cost(fee_rate: float, slippage: float = 0.0, funding_buff
     return 2 * fee_rate + 2 * slippage + funding_buffer
 
 
-def objective_value(result, objective: str) -> float:
+def objective_value(result, objective: str, target_trade_volume: float = 0.0) -> float:
     mode = objective.strip().lower()
     if mode == "calmar":
         if math.isfinite(result.calmar):
@@ -25,9 +25,33 @@ def objective_value(result, objective: str) -> float:
         return result.annualized_return
     if mode == "gross_trade_notional":
         return result.gross_trade_notional
+    if mode == "competition_volume":
+        if target_trade_volume <= 0:
+            return result.gross_trade_notional
+        return result.gross_trade_notional / target_trade_volume
     raise ValueError(
         "Unsupported objective. Use one of: "
-        "calmar, net_profit, total_return, annualized_return, gross_trade_notional"
+        "calmar, net_profit, total_return, annualized_return, gross_trade_notional, competition_volume"
+    )
+
+
+def _competition_sort_key(result, target_trade_volume: float) -> tuple[float, float, float, float, float, float]:
+    trade_volume = float(result.gross_trade_notional)
+    if target_trade_volume > 0:
+        meets_target = 1.0 if trade_volume >= target_trade_volume else 0.0
+        coverage = min(1.0, trade_volume / target_trade_volume)
+    else:
+        meets_target = 1.0
+        coverage = 1.0
+    loss = max(0.0, -float(result.net_profit))
+    profit = max(0.0, float(result.net_profit))
+    return (
+        meets_target,
+        coverage,
+        -loss,
+        profit,
+        trade_volume,
+        -float(result.max_drawdown),
     )
 
 
@@ -56,6 +80,7 @@ def optimize_grid_count(
     total_buy_notional: float,
     n_min: int,
     n_max: int,
+    n_values: list[int] | None = None,
     grid_level_mode: str = "arithmetic",
     strategy_direction: str = "long",
     fee_rate: float = 0.0002,
@@ -63,6 +88,7 @@ def optimize_grid_count(
     funding_buffer: float = 0.0,
     allocation_modes: list[str] | None = None,
     objective: str = "calmar",
+    target_trade_volume: float = 0.0,
     min_trade_count: int = 0,
     min_avg_capital_usage: float = 0.0,
     neutral_anchor_price: float | None = None,
@@ -71,14 +97,23 @@ def optimize_grid_count(
     bootstrap_positions: bool = True,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> OptimizationResult:
-    if n_min <= 0 or n_max <= 0:
-        raise ValueError("n_min and n_max must be > 0")
-    if n_min > n_max:
-        raise ValueError("n_min must be <= n_max")
+    n_candidates: list[int]
+    if n_values is not None:
+        n_candidates = sorted({int(value) for value in n_values if int(value) > 0})
+        if not n_candidates:
+            raise ValueError("n_values must contain positive integers")
+    else:
+        if n_min <= 0 or n_max <= 0:
+            raise ValueError("n_min and n_max must be > 0")
+        if n_min > n_max:
+            raise ValueError("n_min must be <= n_max")
+        n_candidates = list(range(n_min, n_max + 1))
     if min_trade_count < 0:
         raise ValueError("min_trade_count must be >= 0")
     if min_avg_capital_usage < 0:
         raise ValueError("min_avg_capital_usage must be >= 0")
+    if target_trade_volume < 0:
+        raise ValueError("target_trade_volume must be >= 0")
 
     min_ratio = min_step_ratio_for_cost(
         fee_rate=fee_rate, slippage=slippage, funding_buffer=funding_buffer
@@ -95,7 +130,7 @@ def optimize_grid_count(
     tested = 0
     skipped_by_cost = 0
     candidates = []
-    total_candidates = (n_max - n_min + 1) * len(normalized_modes)
+    total_candidates = len(n_candidates) * len(normalized_modes)
     processed = 0
     if progress_callback:
         progress_callback(
@@ -108,7 +143,7 @@ def optimize_grid_count(
             }
         )
 
-    for n in range(n_min, n_max + 1):
+    for n in n_candidates:
         step_ratio = _step_ratio_for_cost_filter(
             min_price=min_price,
             max_price=max_price,
@@ -173,7 +208,11 @@ def optimize_grid_count(
                         }
                     )
                 continue
-            result.score = objective_value(result, objective)
+            result.score = objective_value(
+                result,
+                objective,
+                target_trade_volume=target_trade_volume,
+            )
             candidates.append(result)
             if progress_callback:
                 progress_callback(
@@ -189,11 +228,18 @@ def optimize_grid_count(
     if not candidates:
         return OptimizationResult(best=None, top_results=[], skipped_by_cost=skipped_by_cost, tested=tested)
 
-    def _sort_key(item) -> tuple[float, float]:
-        score = item.score if math.isfinite(item.score) else -1e12
-        return (score, item.net_profit)
+    if objective == "competition_volume":
+        sorted_results = sorted(
+            candidates,
+            key=lambda item: _competition_sort_key(item, target_trade_volume),
+            reverse=True,
+        )
+    else:
+        def _sort_key(item) -> tuple[float, float]:
+            score = item.score if math.isfinite(item.score) else -1e12
+            return (score, item.net_profit)
 
-    sorted_results = sorted(candidates, key=_sort_key, reverse=True)
+        sorted_results = sorted(candidates, key=_sort_key, reverse=True)
     top_results = sorted_results[: max(1, top_k)]
     best = top_results[0]
 

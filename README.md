@@ -84,6 +84,7 @@ Objective options:
 - `total_return`: maximize total return
 - `annualized_return`: maximize annualized return
 - `gross_trade_notional`: maximize cumulative filled notional, useful for volume-focused competitions
+- `competition_volume`: prioritize target traded notional first, then smaller loss / higher profit
 
 Neutral-grid note:
 - `--strategy-direction neutral` defaults the anchor to the first candle open.
@@ -115,6 +116,9 @@ http://127.0.0.1:8787
 ```
 
 You can input parameters in browser and run optimization directly.
+
+Competition guide:
+- [TRADE_COMPETITION_GUIDE.md](TRADE_COMPETITION_GUIDE.md): Chinese guide for competition-oriented settings, smart range suggestions, and result interpretation.
 
 ## Dry Run Executor
 
