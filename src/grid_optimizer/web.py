@@ -11902,8 +11902,6 @@ def _run_funding_breakdown(params: dict[str, Any]) -> dict[str, Any]:
         cache_dir="data",
         contract_type=params["contract_type"],
         refresh=params["refresh"],
-        start_time=params["start_time"],
-        end_time=params["end_time"],
     )
     funding_rates = (
         load_or_fetch_funding_rates(
@@ -13067,8 +13065,6 @@ def _run_optimizer(
         contract_type=params.get("contract_type") or "usdm",
         market_type=params["market_type"],
         refresh=params["refresh"],
-        start_time=params["start_time"],
-        end_time=params["end_time"],
     )
     funding_rates = (
         load_or_fetch_funding_rates(

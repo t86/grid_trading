@@ -282,7 +282,6 @@ def run_backtest(
     wins = 0
     closed_trades = 0
     fill_count = 0
-    traded_notional = 0.0
     capital_usage_series: list[float] = []
     equity_series: list[float] = []
     trades: list[Trade] | None = [] if capture_trades else None
@@ -567,7 +566,7 @@ def run_backtest(
         calmar=calmar,
         score=score,
         trade_count=fill_count,
-        trade_volume=traded_notional,
+        trade_volume=gross_trade_notional,
         win_rate=win_rate,
         avg_capital_usage=avg_capital_usage,
         max_capital_usage=max_capital_usage,
