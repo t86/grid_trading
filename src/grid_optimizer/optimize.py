@@ -4,7 +4,7 @@ import math
 from collections.abc import Callable
 
 from .backtest import run_backtest
-from .types import Candle, OptimizationResult
+from .types import Candle, FundingRate, OptimizationResult
 
 
 def min_step_ratio_for_cost(fee_rate: float, slippage: float = 0.0, funding_buffer: float = 0.0) -> float:
@@ -23,9 +23,30 @@ def objective_value(result, objective: str) -> float:
         return result.total_return
     if mode == "annualized_return":
         return result.annualized_return
+    if mode == "gross_trade_notional":
+        return result.gross_trade_notional
     raise ValueError(
-        "Unsupported objective. Use one of: calmar, net_profit, total_return, annualized_return"
+        "Unsupported objective. Use one of: "
+        "calmar, net_profit, total_return, annualized_return, gross_trade_notional"
     )
+
+
+def _step_ratio_for_cost_filter(
+    min_price: float,
+    max_price: float,
+    n: int,
+    grid_level_mode: str,
+) -> float:
+    mode = grid_level_mode.strip().lower()
+    if mode == "arithmetic":
+        mid_price = (min_price + max_price) / 2.0
+        if mid_price <= 0:
+            return 0.0
+        step = (max_price - min_price) / n
+        return step / mid_price
+    if mode == "geometric":
+        return (max_price / min_price) ** (1.0 / n) - 1.0
+    raise ValueError("grid_level_mode must be arithmetic or geometric")
 
 
 def optimize_grid_count(
@@ -35,6 +56,8 @@ def optimize_grid_count(
     total_buy_notional: float,
     n_min: int,
     n_max: int,
+    grid_level_mode: str = "arithmetic",
+    strategy_direction: str = "long",
     fee_rate: float = 0.0002,
     slippage: float = 0.0,
     funding_buffer: float = 0.0,
@@ -42,7 +65,10 @@ def optimize_grid_count(
     objective: str = "calmar",
     min_trade_count: int = 0,
     min_avg_capital_usage: float = 0.0,
+    neutral_anchor_price: float | None = None,
     top_k: int = 5,
+    funding_rates: list[FundingRate] | None = None,
+    bootstrap_positions: bool = True,
     progress_callback: Callable[[dict], None] | None = None,
 ) -> OptimizationResult:
     if n_min <= 0 or n_max <= 0:
@@ -54,7 +80,6 @@ def optimize_grid_count(
     if min_avg_capital_usage < 0:
         raise ValueError("min_avg_capital_usage must be >= 0")
 
-    mid_price = (min_price + max_price) / 2.0
     min_ratio = min_step_ratio_for_cost(
         fee_rate=fee_rate, slippage=slippage, funding_buffer=funding_buffer
     )
@@ -84,8 +109,12 @@ def optimize_grid_count(
         )
 
     for n in range(n_min, n_max + 1):
-        step = (max_price - min_price) / n
-        step_ratio = step / mid_price
+        step_ratio = _step_ratio_for_cost_filter(
+            min_price=min_price,
+            max_price=max_price,
+            n=n,
+            grid_level_mode=grid_level_mode,
+        )
         if step_ratio <= min_ratio:
             skipped_by_cost += 1
             processed += len(normalized_modes)
@@ -110,9 +139,14 @@ def optimize_grid_count(
                 max_price=max_price,
                 n=n,
                 total_buy_notional=total_buy_notional,
+                grid_level_mode=grid_level_mode,
                 allocation_mode=mode,
+                strategy_direction=strategy_direction,
+                neutral_anchor_price=neutral_anchor_price,
                 fee_rate=fee_rate,
                 slippage=slippage,
+                funding_rates=funding_rates,
+                bootstrap_positions=bootstrap_positions,
                 capture_trades=False,
             )
             if result.trade_count < min_trade_count:

@@ -1,5 +1,5 @@
-"""Grid optimizer package for arithmetic long-grid strategy."""
+"""Grid optimizer package for directional arithmetic/geometric grid strategies."""
 
-from .types import BacktestResult, Candle, OptimizationResult
+from .types import BacktestResult, Candle, FundingEvent, FundingRate, OptimizationResult
 
-__all__ = ["BacktestResult", "Candle", "OptimizationResult"]
+__all__ = ["BacktestResult", "Candle", "FundingEvent", "FundingRate", "OptimizationResult"]

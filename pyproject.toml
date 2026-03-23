@@ -8,11 +8,17 @@ version = "0.1.0"
 description = "Arithmetic long-grid optimizer for BTC/ETH perpetual strategies."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = []
+dependencies = ["requests>=2.31"]
 
 [project.scripts]
 grid-opt = "grid_optimizer.cli:main"
+grid-competition-report = "grid_optimizer.competition_report:main"
 grid-web = "grid_optimizer.web:main"
+grid-dry-run = "grid_optimizer.dry_run:main"
+grid-live-check = "grid_optimizer.live_check:main"
+grid-semi-auto-plan = "grid_optimizer.semi_auto_plan:main"
+grid-submit-plan = "grid_optimizer.submit_plan:main"
+grid-loop-runner = "grid_optimizer.loop_runner:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
