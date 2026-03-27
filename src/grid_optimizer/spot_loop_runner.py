@@ -76,9 +76,120 @@ def _new_metrics() -> dict[str, Any]:
         "buy_count": 0,
         "sell_count": 0,
         "recent_trades": [],
+        "hourly_buckets": {},
         "first_trade_time_ms": 0,
         "last_trade_time_ms": 0,
     }
+
+
+def _floor_hour_ms(ts_ms: int) -> int:
+    if ts_ms <= 0:
+        return 0
+    return (int(ts_ms) // 3_600_000) * 3_600_000
+
+
+def _empty_hourly_bucket(hour_start_ms: int) -> dict[str, Any]:
+    return {
+        "hour_start_ms": int(hour_start_ms),
+        "gross_notional": 0.0,
+        "buy_notional": 0.0,
+        "sell_notional": 0.0,
+        "trade_count": 0,
+        "buy_count": 0,
+        "sell_count": 0,
+        "realized_pnl": 0.0,
+        "commission": 0.0,
+        "funding_fee": 0.0,
+    }
+
+
+def _normalize_hourly_buckets(raw: Any) -> dict[str, dict[str, Any]]:
+    if not isinstance(raw, dict):
+        return {}
+    normalized: dict[str, dict[str, Any]] = {}
+    for key, value in raw.items():
+        if not isinstance(value, dict):
+            continue
+        hour_start_ms = _floor_hour_ms(_safe_int(value.get("hour_start_ms") or key))
+        if hour_start_ms <= 0:
+            continue
+        bucket = _empty_hourly_bucket(hour_start_ms)
+        bucket["gross_notional"] = _safe_float(value.get("gross_notional"))
+        bucket["buy_notional"] = _safe_float(value.get("buy_notional"))
+        bucket["sell_notional"] = _safe_float(value.get("sell_notional"))
+        bucket["trade_count"] = _safe_int(value.get("trade_count"))
+        bucket["buy_count"] = _safe_int(value.get("buy_count"))
+        bucket["sell_count"] = _safe_int(value.get("sell_count"))
+        bucket["realized_pnl"] = _safe_float(value.get("realized_pnl"))
+        bucket["commission"] = _safe_float(value.get("commission"))
+        bucket["funding_fee"] = _safe_float(value.get("funding_fee"))
+        normalized[str(hour_start_ms)] = bucket
+    return normalized
+
+
+def _prune_hourly_buckets(metrics: dict[str, Any], *, keep_hours: int = 24 * 14) -> None:
+    cutoff_ms = _floor_hour_ms(int(time.time() * 1000)) - max(int(keep_hours), 1) * 3_600_000
+    raw = _normalize_hourly_buckets(metrics.get("hourly_buckets"))
+    metrics["hourly_buckets"] = {
+        key: value
+        for key, value in raw.items()
+        if int(key) >= cutoff_ms
+    }
+
+
+def _record_hourly_bucket(
+    *,
+    metrics: dict[str, Any],
+    trade_time_ms: int,
+    side: str,
+    notional: float,
+    commission_quote: float,
+    realized_pnl: float,
+) -> None:
+    hour_start_ms = _floor_hour_ms(trade_time_ms)
+    if hour_start_ms <= 0:
+        return
+    buckets = _normalize_hourly_buckets(metrics.get("hourly_buckets"))
+    bucket = dict(buckets.get(str(hour_start_ms), _empty_hourly_bucket(hour_start_ms)))
+    bucket["gross_notional"] = _safe_float(bucket.get("gross_notional")) + max(float(notional), 0.0)
+    bucket["trade_count"] = _safe_int(bucket.get("trade_count")) + 1
+    bucket["realized_pnl"] = _safe_float(bucket.get("realized_pnl")) + float(realized_pnl)
+    bucket["commission"] = _safe_float(bucket.get("commission")) + max(float(commission_quote), 0.0)
+    normalized_side = str(side).upper().strip()
+    if normalized_side == "BUY":
+        bucket["buy_notional"] = _safe_float(bucket.get("buy_notional")) + max(float(notional), 0.0)
+        bucket["buy_count"] = _safe_int(bucket.get("buy_count")) + 1
+    elif normalized_side == "SELL":
+        bucket["sell_notional"] = _safe_float(bucket.get("sell_notional")) + max(float(notional), 0.0)
+        bucket["sell_count"] = _safe_int(bucket.get("sell_count")) + 1
+    buckets[str(hour_start_ms)] = bucket
+    metrics["hourly_buckets"] = buckets
+    _prune_hourly_buckets(metrics)
+
+
+def _backfill_hourly_buckets_from_recent_trades(metrics: dict[str, Any]) -> None:
+    recent_trades = metrics.get("recent_trades")
+    if not isinstance(recent_trades, list):
+        metrics["hourly_buckets"] = {}
+        return
+    metrics["hourly_buckets"] = {}
+    for item in recent_trades:
+        if not isinstance(item, dict):
+            continue
+        trade_time_ms = _safe_int(item.get("time"))
+        price = _safe_float(item.get("price"))
+        qty = _safe_float(item.get("qty"))
+        notional = _safe_float(item.get("notional")) if _safe_float(item.get("notional")) > 0 else price * qty
+        if trade_time_ms <= 0 or notional <= 0:
+            continue
+        _record_hourly_bucket(
+            metrics=metrics,
+            trade_time_ms=trade_time_ms,
+            side=str(item.get("side", "")),
+            notional=notional,
+            commission_quote=_safe_float(item.get("commission_quote", item.get("commission"))),
+            realized_pnl=_safe_float(item.get("realized_pnl", item.get("realizedPnl"))),
+        )
 
 
 def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) -> dict[str, Any]:
@@ -119,6 +230,11 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
         metrics["commission_raw_by_asset"] = {}
     if not isinstance(metrics.get("recent_trades"), list):
         metrics["recent_trades"] = []
+    metrics["hourly_buckets"] = _normalize_hourly_buckets(metrics.get("hourly_buckets"))
+    if not metrics["hourly_buckets"] and metrics.get("recent_trades"):
+        _backfill_hourly_buckets_from_recent_trades(metrics)
+    else:
+        _prune_hourly_buckets(metrics)
 
     cells = state["cells"]
     if not isinstance(cells, dict):
@@ -204,6 +320,37 @@ def _oldest_inventory_age_minutes(lots: list[dict[str, Any]]) -> float:
         return 0.0
     oldest_ms = min(buy_times)
     return max((time.time() * 1000 - oldest_ms) / 60_000.0, 0.0)
+
+
+def _idle_trade_seconds(state: dict[str, Any]) -> float:
+    metrics = state.get("metrics")
+    metrics_last_trade_ms = _safe_int(metrics.get("last_trade_time_ms")) if isinstance(metrics, dict) else 0
+    state_last_trade_ms = _safe_int(state.get("last_trade_time_ms"))
+    last_trade_ms = max(metrics_last_trade_ms, state_last_trade_ms)
+    if last_trade_ms <= 0:
+        return float("inf")
+    return max(time.time() * 1000 - last_trade_ms, 0.0) / 1000.0
+
+
+def _reset_inventory_lot_ages(lots: list[dict[str, Any]], *, now_ms: int | None = None) -> list[dict[str, Any]]:
+    stamped_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    reset_lots: list[dict[str, Any]] = []
+    for lot in lots:
+        if not isinstance(lot, dict):
+            continue
+        qty = max(_safe_float(lot.get("qty")), 0.0)
+        cost_quote = max(_safe_float(lot.get("cost_quote")), 0.0)
+        if qty <= EPSILON:
+            continue
+        reset_lots.append(
+            {
+                "qty": qty,
+                "cost_quote": cost_quote,
+                "buy_time_ms": stamped_ms,
+                "tag": str(lot.get("tag", "") or ""),
+            }
+        )
+    return reset_lots
 
 
 def _consume_inventory_lots(lots: list[dict[str, Any]], qty_to_consume: float) -> tuple[list[dict[str, Any]], float]:
@@ -386,6 +533,14 @@ def _record_trade_metrics(
         if _safe_int(metrics.get("first_trade_time_ms")) <= 0:
             metrics["first_trade_time_ms"] = trade_time_ms
         metrics["last_trade_time_ms"] = max(_safe_int(metrics.get("last_trade_time_ms")), trade_time_ms)
+        _record_hourly_bucket(
+            metrics=metrics,
+            trade_time_ms=trade_time_ms,
+            side=side,
+            notional=notional,
+            commission_quote=commission_quote,
+            realized_pnl=realized_pnl,
+        )
     _append_recent_trade(
         metrics,
         {
@@ -865,6 +1020,20 @@ def _build_volume_shift_desired_orders(
     soft_limit = max(_safe_float(config.get("inventory_soft_limit_notional")), 0.0)
     hard_limit = max(_safe_float(config.get("inventory_hard_limit_notional")), soft_limit)
     recycle_age_minutes = max(_safe_float(config.get("inventory_recycle_age_minutes")), 0.0)
+    exited_recycle_on_soft_limit = False
+    last_mode = str(state.get("last_mode", "") or "").strip().lower()
+    if (
+        last_mode == "recycle"
+        and recycle_age_minutes > 0
+        and soft_limit > 0
+        and inventory_qty > EPSILON
+        and inventory_notional <= soft_limit
+        and oldest_age_minutes >= recycle_age_minutes
+    ):
+        lots = _reset_inventory_lot_ages(lots)
+        state["inventory_lots"] = lots
+        oldest_age_minutes = 0.0
+        exited_recycle_on_soft_limit = True
     mode, buy_paused, pause_reasons = _resolve_volume_shift_mode(
         inventory_notional=inventory_notional,
         soft_limit=soft_limit,
@@ -873,6 +1042,10 @@ def _build_volume_shift_desired_orders(
         recycle_age_minutes=recycle_age_minutes,
         market_guard=market_guard,
     )
+    if exited_recycle_on_soft_limit:
+        pause_reasons = [*pause_reasons, "recycle_exit_below_soft_limit"]
+    if exited_recycle_on_soft_limit and inventory_qty > EPSILON and mode == "attack":
+        mode = "defense"
     state["last_mode"] = mode
 
     if mode == "attack":
@@ -899,15 +1072,37 @@ def _build_volume_shift_desired_orders(
     step_size = symbol_info.get("step_size")
     min_qty = symbol_info.get("min_qty")
     min_notional = symbol_info.get("min_notional")
+    idle_buy1_after_seconds = max(_safe_float(config.get("idle_buy1_after_seconds")), 0.0)
+    idle_buy1_levels = max(_safe_int(config.get("idle_buy1_levels")), 0)
+    idle_trade_seconds = _idle_trade_seconds(state)
+    idle_buy1_active = (
+        mode == "attack"
+        and not buy_paused
+        and idle_buy1_levels > 0
+        and (idle_buy1_after_seconds <= 0 or idle_trade_seconds >= idle_buy1_after_seconds)
+    )
 
     buy_prices = _band_prices(center_price=center_price, levels=buy_levels, band_ratio=band_ratio, tick_size=tick_size, side="BUY")
     sell_prices = _band_prices(center_price=max(center_price, mid_price), levels=sell_levels, band_ratio=band_ratio * (0.5 if mode == "recycle" else 1.0), tick_size=tick_size, side="SELL")
+    if idle_buy1_active and bid_price > 0 and buy_prices:
+        bid_anchor = _round_order_price(bid_price, tick_size, "BUY")
+        tick_value = float(tick_size) if tick_size is not None else 0.0
+        adjusted_buy_prices: list[float] = []
+        for idx, raw_price in enumerate(buy_prices, start=1):
+            price = raw_price
+            if idx <= idle_buy1_levels:
+                candidate = bid_anchor - max(idx - 1, 0) * tick_value if tick_value > 0 else bid_anchor
+                price = _round_order_price(max(candidate, 0.0), tick_size, "BUY")
+                price = min(price, bid_anchor)
+            adjusted_buy_prices.append(price)
+        buy_prices = adjusted_buy_prices
 
     desired: list[dict[str, Any]] = []
     target_cap = max(hard_limit, per_order_notional)
     if target_cap <= 0:
         target_cap = max(inventory_notional, 0.0)
     running_inventory_notional = inventory_notional
+    idle_force_cap_notional = max((soft_limit if soft_limit > 0 else hard_limit) - running_inventory_notional, 0.0)
     for idx, price in enumerate(buy_prices, start=1):
         if buy_paused:
             break
@@ -915,6 +1110,8 @@ def _build_volume_shift_desired_orders(
             continue
         target_notional = target_cap * (idx / max(len(buy_prices), 1))
         gap_notional = max(target_notional - running_inventory_notional, 0.0)
+        if idle_buy1_active and idx <= idle_buy1_levels and gap_notional <= EPSILON and idle_force_cap_notional > EPSILON:
+            gap_notional = min(per_order_notional, idle_force_cap_notional)
         order_notional = min(gap_notional, per_order_notional)
         if order_notional <= 0:
             continue
@@ -930,15 +1127,21 @@ def _build_volume_shift_desired_orders(
         )
         if order:
             desired.append(order)
-            running_inventory_notional += order["qty"] * price
+            order_notional_used = order["qty"] * price
+            running_inventory_notional += order_notional_used
+            if idle_buy1_active and idx <= idle_buy1_levels:
+                idle_force_cap_notional = max(idle_force_cap_notional - order_notional_used, 0.0)
 
     available_sell_qty = inventory_qty
     recycle_loss_tolerance_ratio = max(_safe_float(config.get("inventory_recycle_loss_tolerance_ratio")), 0.0)
     recycle_min_profit_ratio = max(_safe_float(config.get("inventory_recycle_min_profit_ratio")), 0.0)
+    attack_sell_loss_tolerance_ratio = max(_safe_float(config.get("attack_sell_loss_tolerance_ratio")), 0.0)
+    attack_sell_tight_levels = max(_safe_int(config.get("attack_sell_tight_levels")), 0)
     if available_sell_qty > EPSILON and sell_prices:
         per_sell_qty = available_sell_qty / len(sell_prices)
         min_recycle_price = inventory_avg_cost * (1.0 - recycle_loss_tolerance_ratio) if inventory_avg_cost > 0 else 0.0
         normal_profit_floor = inventory_avg_cost * (1.0 + recycle_min_profit_ratio) if inventory_avg_cost > 0 else 0.0
+        attack_loss_floor = inventory_avg_cost * (1.0 - attack_sell_loss_tolerance_ratio) if inventory_avg_cost > 0 else 0.0
         for idx, raw_price in enumerate(sell_prices, start=1):
             if available_sell_qty <= EPSILON:
                 break
@@ -951,9 +1154,15 @@ def _build_volume_shift_desired_orders(
                 role = "defense_sell"
                 price = max(ask_price, min(raw_price, max(normal_profit_floor, ask_price)))
             else:
-                if normal_profit_floor > 0:
-                    price = max(raw_price, normal_profit_floor)
-                price = max(price, ask_price)
+                if attack_sell_tight_levels > 0 and idx <= attack_sell_tight_levels:
+                    tight_anchor = ask_price
+                    if tick_size is not None:
+                        tight_anchor = ask_price + max(idx - 1, 0) * float(tick_size)
+                    price = max(ask_price, attack_loss_floor, min(raw_price, tight_anchor))
+                else:
+                    if normal_profit_floor > 0:
+                        price = max(raw_price, normal_profit_floor)
+                    price = max(price, ask_price)
             order_qty = min(available_sell_qty, per_sell_qty if idx < len(sell_prices) else available_sell_qty)
             order = _normalize_order(
                 side="SELL",
@@ -988,6 +1197,8 @@ def _build_volume_shift_desired_orders(
         "effective_buy_levels": buy_levels,
         "effective_sell_levels": sell_levels,
         "effective_per_order_notional": per_order_notional,
+        "idle_trade_seconds": idle_trade_seconds,
+        "idle_buy1_active": idle_buy1_active,
     }
     return desired, controls
 
@@ -1314,6 +1525,8 @@ def main() -> None:
     parser.add_argument("--attack-buy-levels", type=int, default=14)
     parser.add_argument("--attack-sell-levels", type=int, default=22)
     parser.add_argument("--attack-per-order-notional", type=float, default=20.0)
+    parser.add_argument("--attack-sell-loss-tolerance-ratio", type=float, default=0.0)
+    parser.add_argument("--attack-sell-tight-levels", type=int, default=0)
     parser.add_argument("--defense-buy-levels", type=int, default=8)
     parser.add_argument("--defense-sell-levels", type=int, default=20)
     parser.add_argument("--defense-per-order-notional", type=float, default=12.0)
@@ -1329,6 +1542,8 @@ def main() -> None:
     parser.add_argument("--inventory-recycle-loss-tolerance-ratio", type=float, default=0.006)
     parser.add_argument("--inventory-recycle-min-profit-ratio", type=float, default=0.001)
     parser.add_argument("--max-single-cycle-new-orders", type=int, default=8)
+    parser.add_argument("--idle-buy1-after-seconds", type=float, default=15.0)
+    parser.add_argument("--idle-buy1-levels", type=int, default=1)
 
     args = parser.parse_args()
 

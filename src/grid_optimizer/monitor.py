@@ -235,6 +235,8 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--buy-pause-amp-trigger-ratio",
             "--buy-pause-down-return-trigger-ratio",
             "--freeze-shift-abs-return-trigger-ratio",
+            "--short-cover-pause-amp-trigger-ratio",
+            "--short-cover-pause-down-return-trigger-ratio",
             "--inventory-tier-start-notional",
             "--inventory-tier-end-notional",
             "--inventory-tier-per-order-notional",
@@ -256,6 +258,8 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--max-new-orders",
             "--inventory-tier-buy-levels",
             "--inventory-tier-sell-levels",
+            "--short-cover-lift-trigger-steps",
+            "--short-cover-lift-shift-steps",
         }:
             try:
                 config[key] = int(next_token)

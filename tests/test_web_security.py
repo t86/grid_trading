@@ -7,7 +7,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.web import (
+    COMPETITION_BOARD_PAGE,
     MONITOR_PAGE,
+    SPOT_RUNNER_PAGE,
+    STRATEGY_BACKTEST_PAGE,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
     _delete_custom_grid_runner_preset,
@@ -24,6 +27,7 @@ from grid_optimizer.web import (
     _runner_preset_summaries,
     _save_runner_control_config,
     _start_runner_process,
+    _stop_runner_process,
     _update_custom_grid_runner_preset,
     _uses_legacy_runner,
 )
@@ -47,6 +51,28 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_monitor_page_contains_custom_grid_startup_inventory_text(self) -> None:
         self.assertIn("现价启动底仓", MONITOR_PAGE)
+
+    def test_competition_board_page_contains_forecast_panel(self) -> None:
+        self.assertIn("次日榜单预测", COMPETITION_BOARD_PAGE)
+        self.assertIn("预计下一天交易量", COMPETITION_BOARD_PAGE)
+
+    def test_monitor_page_contains_stop_cleanup_controls(self) -> None:
+        self.assertIn("停止时撤销全部委托", MONITOR_PAGE)
+        self.assertIn("停止时按买一/卖一平仓", MONITOR_PAGE)
+
+    def test_spot_runner_page_contains_parameter_editor(self) -> None:
+        self.assertIn("应用参数并重启", SPOT_RUNNER_PAGE)
+        self.assertIn("spot_runner_params_editor", SPOT_RUNNER_PAGE)
+
+    def test_strategy_backtest_page_exists(self) -> None:
+        self.assertIn("策略回测实验室", STRATEGY_BACKTEST_PAGE)
+        self.assertIn("/api/optimize", STRATEGY_BACKTEST_PAGE)
+        self.assertIn("读取当前运行策略", STRATEGY_BACKTEST_PAGE)
+        self.assertIn("一键带入回测", STRATEGY_BACKTEST_PAGE)
+        self.assertIn("实盘当前参数", STRATEGY_BACKTEST_PAGE)
+        self.assertIn("回测当前参数", STRATEGY_BACKTEST_PAGE)
+        self.assertIn("保存并重启策略", STRATEGY_BACKTEST_PAGE)
+        self.assertIn("live_config_editor", STRATEGY_BACKTEST_PAGE)
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")
@@ -95,6 +121,38 @@ class WebSecurityTests(unittest.TestCase):
             self.assertFalse(_uses_legacy_runner("NIGHTUSDT"))
             self.assertEqual(_runner_service_name_for_symbol("NIGHTUSDT"), "grid-loop@NIGHTUSDT.service")
 
+    @patch("grid_optimizer.web._execute_stop_actions")
+    @patch("grid_optimizer.web._runner_service_available", return_value=False)
+    @patch("grid_optimizer.web._uses_legacy_runner", return_value=False)
+    @patch("grid_optimizer.web._read_runner_process_for_symbol", return_value={"is_running": False, "pid": None})
+    def test_stop_runner_process_can_return_post_stop_summary(
+        self,
+        _mock_runner,
+        _mock_legacy,
+        _mock_service_available,
+        mock_stop_actions,
+    ) -> None:
+        mock_stop_actions.return_value = {
+            "cancel_open_orders_requested": True,
+            "close_all_positions_requested": True,
+            "cancel_success_count": 2,
+            "cancel_attempted_count": 2,
+            "close_submitted_count": 1,
+            "close_attempted_count": 1,
+            "warnings": [],
+            "cancel_errors": [],
+            "close_errors": [],
+        }
+        result = _stop_runner_process(
+            "NIGHTUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+        )
+        self.assertTrue(result["already_stopped"])
+        self.assertEqual(result["symbol"], "NIGHTUSDT")
+        self.assertEqual(result["post_stop_actions"]["cancel_success_count"], 2)
+        self.assertEqual(result["post_stop_actions"]["close_submitted_count"], 1)
+
     def test_runner_preset_payload_applies_volume_neutral_target_profile(self) -> None:
         payload = _runner_preset_payload("volume_neutral_target_v1", {"symbol": "OPNUSDT"})
         self.assertEqual(payload["strategy_profile"], "volume_neutral_target_v1")
@@ -109,6 +167,71 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["neutral_band1_target_ratio"], 0.20)
         self.assertAlmostEqual(payload["neutral_band2_target_ratio"], 0.50)
         self.assertAlmostEqual(payload["neutral_band3_target_ratio"], 1.00)
+
+    def test_runner_preset_payload_applies_aggressive_short_profile(self) -> None:
+        payload = _runner_preset_payload("volume_short_v1_aggressive", {"symbol": "OPNUSDT"})
+        self.assertEqual(payload["strategy_profile"], "volume_short_v1_aggressive")
+        self.assertEqual(payload["strategy_mode"], "one_way_short")
+        self.assertAlmostEqual(payload["step_price"], 0.00002)
+        self.assertAlmostEqual(payload["per_order_notional"], 70.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 420.0)
+        self.assertEqual(payload["up_trigger_steps"], 3)
+        self.assertEqual(payload["down_trigger_steps"], 4)
+        self.assertEqual(payload["shift_steps"], 3)
+        self.assertAlmostEqual(payload["sleep_seconds"], 10.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 900.0)
+        self.assertAlmostEqual(payload["inventory_tier_start_notional"], 600.0)
+        self.assertEqual(payload["inventory_tier_buy_levels"], 12)
+        self.assertEqual(payload["inventory_tier_sell_levels"], 4)
+        self.assertAlmostEqual(payload["short_cover_pause_amp_trigger_ratio"], 0.0055)
+        self.assertAlmostEqual(payload["short_cover_pause_down_return_trigger_ratio"], -0.0025)
+
+    def test_runner_preset_payload_applies_conservative_short_profile(self) -> None:
+        payload = _runner_preset_payload("volume_short_v1_conservative", {"symbol": "NIGHTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "volume_short_v1_conservative")
+        self.assertEqual(payload["strategy_mode"], "one_way_short")
+        self.assertAlmostEqual(payload["per_order_notional"], 45.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 180.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 600.0)
+        self.assertAlmostEqual(payload["inventory_tier_start_notional"], 300.0)
+        self.assertEqual(payload["inventory_tier_buy_levels"], 10)
+        self.assertEqual(payload["inventory_tier_sell_levels"], 4)
+        self.assertAlmostEqual(payload["short_cover_pause_amp_trigger_ratio"], 0.0045)
+        self.assertAlmostEqual(payload["short_cover_pause_down_return_trigger_ratio"], -0.002)
+
+    def test_runner_preset_payload_applies_aggressive_quasi_neutral_profile(self) -> None:
+        payload = _runner_preset_payload("defensive_quasi_neutral_aggressive_v1", {"symbol": "ROBOUSDT"})
+        self.assertEqual(payload["strategy_profile"], "defensive_quasi_neutral_aggressive_v1")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertAlmostEqual(payload["step_price"], 0.00001)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 16)
+        self.assertAlmostEqual(payload["per_order_notional"], 180.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 300.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 1200.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 1500.0)
+        self.assertAlmostEqual(payload["inventory_tier_start_notional"], 800.0)
+        self.assertEqual(payload["inventory_tier_buy_levels"], 6)
+        self.assertEqual(payload["inventory_tier_sell_levels"], 18)
+        self.assertAlmostEqual(payload["sleep_seconds"], 5.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+
+    def test_runner_preset_payload_uses_symbol_specific_runtime_paths(self) -> None:
+        payload = _runner_preset_payload(
+            "volume_short_v1_conservative",
+            {
+                "symbol": "NIGHTUSDT",
+                "state_path": "output/night_large_state.json",
+                "plan_json": "output/night_loop_latest_plan.json",
+                "submit_report_json": "output/night_loop_latest_submit.json",
+                "summary_jsonl": "output/night_loop_events.jsonl",
+            },
+        )
+        expected = _default_runtime_paths_for_symbol("NIGHTUSDT")
+        self.assertEqual(payload["state_path"], expected["state_path"])
+        self.assertEqual(payload["plan_json"], expected["plan_json"])
+        self.assertEqual(payload["submit_report_json"], expected["submit_report_json"])
+        self.assertEqual(payload["summary_jsonl"], expected["summary_jsonl"])
 
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
@@ -376,6 +499,10 @@ class WebSecurityTests(unittest.TestCase):
                 "shift_steps": 2,
                 "pause_short_position_notional": 260.0,
                 "max_short_position_notional": 300.0,
+                "short_cover_pause_amp_trigger_ratio": 0.0055,
+                "short_cover_pause_down_return_trigger_ratio": -0.0025,
+                "short_cover_lift_trigger_steps": 3,
+                "short_cover_lift_shift_steps": 2,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -396,6 +523,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("one_way_short", command)
         self.assertIn("--pause-short-position-notional", command)
         self.assertIn("--max-short-position-notional", command)
+        self.assertIn("--short-cover-pause-amp-trigger-ratio", command)
+        self.assertIn("--short-cover-pause-down-return-trigger-ratio", command)
+        self.assertIn("--short-cover-lift-trigger-steps", command)
+        self.assertIn("--short-cover-lift-shift-steps", command)
 
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:
@@ -658,6 +789,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('value="OPNUSDT"', MONITOR_PAGE)
         self.assertIn('value="ROBOUSDT"', MONITOR_PAGE)
         self.assertIn('value="KATUSDT"', MONITOR_PAGE)
+        self.assertIn('value="BARDUSDT"', MONITOR_PAGE)
         self.assertIn("小时损益拆解", MONITOR_PAGE)
         self.assertIn('id="hourly_body"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_name"', MONITOR_PAGE)

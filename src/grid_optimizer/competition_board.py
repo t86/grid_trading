@@ -12,17 +12,23 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Callable
 from typing import Any
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import requests
 
 CACHE_PATH = Path("output/competition_board_cache.json")
 ENTRIES_PATH = Path("output/competition_board_entries.json")
+HISTORY_DIR_PATH = Path("output/competition_board_history")
+HISTORY_INDEX_PATH = Path("output/competition_board_history_index.json")
 CACHE_TTL_SECONDS = 1800
 
 _CACHE_LOCK = threading.Lock()
 _REFRESH_LOCK = threading.Lock()
 _MEMORY_CACHE: dict[str, Any] = {"loaded_at": 0.0, "data": None}
+_HISTORY_SCHEDULER_LOCK = threading.Lock()
+_HISTORY_SCHEDULER_STARTED = False
 
 
 @dataclass(frozen=True)
@@ -35,13 +41,6 @@ class CompetitionSource:
 
 
 COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
-    CompetitionSource(
-        slug="spot_sahara",
-        symbol="SAHARA",
-        market="spot",
-        label="SAHARA 现货交易竞赛",
-        url="https://www.binance.com/zh-CN/activity/trading-competition/spot-altcoin-festival-wave-SAHARA",
-    ),
     CompetitionSource(
         slug="spot_kat",
         symbol="KAT",
@@ -91,35 +90,16 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         label="NIGHT 合约交易挑战赛",
         url="https://www.binance.com/zh-CN/activity/trading-competition/futures-night-challenge-2?ref=YEK2JZJT",
     ),
+    CompetitionSource(
+        slug="futures_bard",
+        symbol="BARD",
+        market="futures",
+        label="BARD 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-bard-challenge2?ref=YEK2JZJT",
+    ),
 )
 
 STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
-    "spot_sahara": {
-        "boards": [
-            {
-                "tabLabel": "默认",
-                "resourceId": 46372,
-                "metricField": "tradingVolume",
-                "metricLabel": "交易量 (USD)",
-                "rewardUnit": "SAHARA",
-                "leaderboardUnit": "USD",
-                "leaderboardUnitTitle": "交易量",
-                "rankingType": "CUSTOMIZED",
-                "competitionType": "SPOT",
-                "activityPeriodText": "2026/03/18 07:00 - 2026/03/25 07:00",
-                "activityEndAt": "2026-03-25T07:00:00+08:00",
-                "maxRows": 5000,
-                "bodyExcerpt": """
-累计现货交易量至少 500 USD，方可参与排行榜奖励。
-奖励结构
-第 1 - 200 名
-平分 1,600,000 SAHARA
-第 201 - 5000 名
-平分 2,400,000 SAHARA
-""",
-            }
-        ]
-    },
     "spot_kat": {
         "boards": [
             {
@@ -376,6 +356,49 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分 2,000,000 NIGHT
 """,
             }
+        ]
+    },
+    "futures_bard": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛 - 第一阶段",
+                "resourceId": 47457,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BARD",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/03/26 18:00 - 2026/04/05 07:59",
+                "activityEndAt": "2026-04-05T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/03/26 18:00 - 2026/04/05 07:59
+累计 BARD U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+本阶段奖池 500,000 BARD
+活动页当前展示为按交易量排名参与榜单分配，具体名次奖励结构以 Binance 活动页实时说明为准。
+""",
+            },
+            {
+                "tabLabel": "交易量挑战赛 - 第二阶段",
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BARD",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/05 08:00 - 2026/04/15 07:59",
+                "activityEndAt": "2026-04-15T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/05 08:00 - 2026/04/15 07:59
+累计 BARD U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+本阶段奖池 500,000 BARD
+活动页当前展示为按交易量排名参与榜单分配，具体名次奖励结构以 Binance 活动页实时说明为准。
+""",
+            },
         ]
     },
 }
@@ -1033,6 +1056,916 @@ def _write_json_file(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _competition_board_tz() -> timezone | ZoneInfo:
+    tz_name = str(os.environ.get("GRID_COMPETITION_BOARD_TZ", "Asia/Shanghai")).strip() or "Asia/Shanghai"
+    try:
+        return ZoneInfo(tz_name)
+    except ZoneInfoNotFoundError:
+        return timezone.utc
+
+
+def _competition_board_local_now() -> datetime:
+    return datetime.now(_competition_board_tz())
+
+
+def _competition_board_local_date_text(*, when: datetime | None = None) -> str:
+    probe = when.astimezone(_competition_board_tz()) if when is not None else _competition_board_local_now()
+    return probe.date().isoformat()
+
+
+def _parse_iso_datetime(value: str) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _local_datetime_text(value: str) -> str:
+    probe = _parse_iso_datetime(value)
+    if probe is None:
+        return ""
+    localized = probe.astimezone(_competition_board_tz())
+    return f"{localized.year}/{localized.month}/{localized.day} {localized.strftime('%H:%M:%S')}"
+
+
+def _board_history_granularity(board: dict[str, Any]) -> str:
+    explicit = str(board.get("history_granularity", "")).strip().lower()
+    if explicit in {"daily", "hourly"}:
+        return explicit
+    updated_at = _parse_iso_datetime(str(board.get("updated_at_utc", "")).strip())
+    return "hourly" if updated_at is not None else "daily"
+
+
+def _board_history_capture_key(board: dict[str, Any]) -> str:
+    granularity = _board_history_granularity(board)
+    updated_at = _parse_iso_datetime(str(board.get("updated_at_utc", "")).strip())
+    if updated_at is not None:
+        localized = updated_at.astimezone(_competition_board_tz())
+        if granularity == "hourly":
+            return localized.strftime("%Y-%m-%d %H:00")
+        return localized.strftime("%Y-%m-%d")
+    return _competition_board_local_date_text()
+
+
+def _history_file_name(board_key: str, capture_key: str) -> str:
+    return f"{_sanitize_key(capture_key)}__{_sanitize_key(board_key)}.json"
+
+
+def _history_file_path(board_key: str, capture_key: str) -> Path:
+    return HISTORY_DIR_PATH / _history_file_name(board_key, capture_key)
+
+
+def _load_history_index() -> dict[str, Any]:
+    payload = _read_json_file(HISTORY_INDEX_PATH, {})
+    if not isinstance(payload, dict):
+        return {"updated_at_utc": "", "boards": {}}
+    boards = payload.get("boards", {})
+    if not isinstance(boards, dict):
+        boards = {}
+    normalized_boards: dict[str, list[dict[str, Any]]] = {}
+    for board_key, records in boards.items():
+        if not isinstance(records, list):
+            continue
+        clean_records: list[dict[str, Any]] = []
+        for item in records:
+            if not isinstance(item, dict):
+                continue
+            capture_key = str(item.get("capture_key", item.get("capture_date", ""))).strip()
+            relative_path = str(item.get("path", "")).strip()
+            if not capture_key or not relative_path:
+                continue
+            clean_records.append(
+                {
+                    "capture_key": capture_key,
+                    "capture_label": str(item.get("capture_label", capture_key)).strip() or capture_key,
+                    "capture_date": str(item.get("capture_date", capture_key.split(" ", 1)[0])).strip(),
+                    "capture_granularity": str(item.get("capture_granularity", "daily")).strip() or "daily",
+                    "captured_at_utc": str(item.get("captured_at_utc", "")).strip(),
+                    "path": relative_path,
+                    "label": str(item.get("label", "")).strip(),
+                    "updated_text": str(item.get("updated_text", "")).strip(),
+                    "updated_at_utc": str(item.get("updated_at_utc", "")).strip(),
+                    "eligible_user_count": _safe_int(item.get("eligible_user_count")) or 0,
+                    "current_floor_value_text": str(item.get("current_floor_value_text", "")).strip(),
+                }
+            )
+        clean_records.sort(key=lambda item: item["capture_key"], reverse=True)
+        normalized_boards[str(board_key)] = clean_records
+    return {
+        "updated_at_utc": str(payload.get("updated_at_utc", "")).strip(),
+        "boards": normalized_boards,
+    }
+
+
+def _save_history_index(payload: dict[str, Any]) -> None:
+    payload = dict(payload)
+    payload["updated_at_utc"] = _now_iso()
+    boards = payload.get("boards", {})
+    if not isinstance(boards, dict):
+        boards = {}
+    normalized_boards: dict[str, list[dict[str, Any]]] = {}
+    for board_key, records in boards.items():
+        if not isinstance(records, list):
+            continue
+        normalized_records = [item for item in records if isinstance(item, dict)]
+        normalized_records.sort(key=lambda item: str(item.get("capture_key", item.get("capture_date", ""))), reverse=True)
+        normalized_boards[str(board_key)] = normalized_records
+    payload["boards"] = normalized_boards
+    _write_json_file(HISTORY_INDEX_PATH, payload)
+
+
+def _expected_board_keys() -> list[str]:
+    board_keys: list[str] = []
+    for source in COMPETITION_SOURCES:
+        hinted = _hinted_boards_for_source(source)
+        if hinted is None:
+            board_keys.append(f"{source.slug}:default")
+            continue
+        _, board_metas = hinted
+        for board_meta in board_metas:
+            tab_label = str(board_meta.get("tabLabel", "默认")).strip() or "默认"
+            board_keys.append(f"{source.slug}:{_sanitize_key(tab_label)}")
+    return sorted(set(board_keys))
+
+
+def _first_segment_cutoff(board: dict[str, Any]) -> float | None:
+    segments = board.get("segments", [])
+    if not isinstance(segments, list) or not segments:
+        return None
+    first = segments[0]
+    if not isinstance(first, dict):
+        return None
+    return _safe_float(first.get("cutoff_value"))
+
+
+def _load_history_board_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(record, dict):
+        return None
+    payload = _read_json_file(Path(str(record.get("path", "")).strip()), {})
+    if not isinstance(payload, dict):
+        return None
+    board = payload.get("board")
+    return board if isinstance(board, dict) else None
+
+
+def _history_compare_meta_for_board(board: dict[str, Any], records: list[dict[str, Any]]) -> dict[str, Any]:
+    if not isinstance(board, dict) or not isinstance(records, list):
+        return {}
+    current_capture_key = _board_history_capture_key(board)
+    baseline_record = next(
+        (
+            item
+            for item in records
+            if str(item.get("capture_key", item.get("capture_date", ""))).strip() != current_capture_key
+        ),
+        None,
+    )
+    if baseline_record is None:
+        return {}
+    baseline_board = _load_history_board_from_record(baseline_record)
+    if baseline_board is None:
+        return {}
+    granularity = _board_history_granularity(board)
+    floor_current = _safe_float(board.get("current_floor_value"))
+    floor_previous = _safe_float(baseline_board.get("current_floor_value"))
+    eligible_current = _safe_int(board.get("eligible_user_count"))
+    eligible_previous = _safe_int(baseline_board.get("eligible_user_count"))
+    segment_current = _first_segment_cutoff(board)
+    segment_previous = _first_segment_cutoff(baseline_board)
+    current_updated_text = str(board.get("updated_text", "")).strip() or _local_datetime_text(str(board.get("updated_at_utc", "")).strip())
+    previous_updated_text = (
+        str(baseline_board.get("updated_text", "")).strip()
+        or _local_datetime_text(str(baseline_board.get("updated_at_utc", "")).strip())
+        or str(baseline_record.get("updated_text", "")).strip()
+    )
+    return {
+        "title": "上一档 vs 当前" if granularity == "hourly" else "前一日 vs 当前日",
+        "granularity": granularity,
+        "current_capture_key": current_capture_key,
+        "previous_capture_key": str(baseline_record.get("capture_key", baseline_record.get("capture_date", ""))).strip(),
+        "current_updated_text": current_updated_text,
+        "previous_updated_text": previous_updated_text,
+        "floor_current": floor_current,
+        "floor_previous": floor_previous,
+        "floor_current_text": str(board.get("current_floor_value_text", "")).strip() or "-",
+        "floor_previous_text": str(baseline_board.get("current_floor_value_text", "")).strip() or "-",
+        "floor_delta": None if floor_current is None or floor_previous is None else floor_current - floor_previous,
+        "eligible_current": eligible_current,
+        "eligible_previous": eligible_previous,
+        "eligible_delta": (
+            None if eligible_current is None or eligible_previous is None else eligible_current - eligible_previous
+        ),
+        "segment_current": segment_current,
+        "segment_previous": segment_previous,
+        "segment_current_text": (
+            str((board.get("segments") or [{}])[0].get("cutoff_value_text", "")).strip()
+            if isinstance(board.get("segments"), list) and board.get("segments")
+            else "-"
+        ),
+        "segment_previous_text": (
+            str((baseline_board.get("segments") or [{}])[0].get("cutoff_value_text", "")).strip()
+            if isinstance(baseline_board.get("segments"), list) and baseline_board.get("segments")
+            else "-"
+        ),
+        "segment_delta": (
+            None if segment_current is None or segment_previous is None else segment_current - segment_previous
+        ),
+    }
+
+
+def _board_history_meta_map() -> dict[str, dict[str, Any]]:
+    index = _load_history_index()
+    meta_by_board: dict[str, dict[str, Any]] = {}
+    for board_key, records in (index.get("boards") or {}).items():
+        if not isinstance(records, list):
+            continue
+        capture_dates = [
+            str(item.get("capture_key", item.get("capture_date", ""))).strip()
+            for item in records
+            if str(item.get("capture_key", item.get("capture_date", ""))).strip()
+        ]
+        latest = records[0] if records else None
+        meta_by_board[str(board_key)] = {
+            "history_dates": capture_dates,
+            "history_capture_count": len(capture_dates),
+            "latest_history_date": capture_dates[0] if capture_dates else "",
+            "latest_history_updated_text": str((latest or {}).get("updated_text", "")).strip(),
+            "latest_history_captured_at_utc": str((latest or {}).get("captured_at_utc", "")).strip(),
+        }
+    return meta_by_board
+
+
+def _attach_history_meta(snapshot: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        return snapshot
+    boards = snapshot.get("boards", [])
+    if not isinstance(boards, list):
+        return snapshot
+    history_index = _load_history_index()
+    history_boards = history_index.get("boards", {}) if isinstance(history_index, dict) else {}
+    meta_by_board = _board_history_meta_map()
+    for board in boards:
+        if not isinstance(board, dict):
+            continue
+        history_meta = meta_by_board.get(str(board.get("board_key", "")).strip(), {})
+        board["history_dates"] = list(history_meta.get("history_dates", []))
+        board["history_capture_count"] = int(history_meta.get("history_capture_count", 0) or 0)
+        board["latest_history_date"] = str(history_meta.get("latest_history_date", "")).strip()
+        board["latest_history_updated_text"] = str(history_meta.get("latest_history_updated_text", "")).strip()
+        board["latest_history_captured_at_utc"] = str(history_meta.get("latest_history_captured_at_utc", "")).strip()
+        records = list((history_boards.get(str(board.get("board_key", "")).strip(), []) if isinstance(history_boards, dict) else []))
+        board["history_compare"] = _history_compare_meta_for_board(board, records)
+    return snapshot
+
+
+def archive_competition_board_history(
+    snapshot: dict[str, Any],
+    *,
+    capture_date: str | None = None,
+    capture_keys_by_board: dict[str, str] | None = None,
+    board_keys: list[str] | None = None,
+) -> dict[str, Any]:
+    if not isinstance(snapshot, dict):
+        raise ValueError("snapshot must be a dict")
+    boards = snapshot.get("boards", [])
+    if not isinstance(boards, list):
+        raise ValueError("snapshot.boards must be a list")
+    normalized_capture_date = str(capture_date or "").strip()
+    if normalized_capture_date and not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?: \d{2}:00)?", normalized_capture_date):
+        raise ValueError("capture_date must be YYYY-MM-DD or YYYY-MM-DD HH:00")
+    wanted_keys = {str(item).strip() for item in (board_keys or []) if str(item).strip()}
+    per_board_capture_keys = {
+        str(key).strip(): str(value).strip()
+        for key, value in (capture_keys_by_board or {}).items()
+        if str(key).strip() and str(value).strip()
+    }
+    index = _load_history_index()
+    boards_index = index.setdefault("boards", {})
+    created: list[str] = []
+    skipped: list[str] = []
+    captured_at_utc = _now_iso()
+    for board in boards:
+        if not isinstance(board, dict):
+            continue
+        board_key = str(board.get("board_key", "")).strip()
+        if not board_key:
+            continue
+        if wanted_keys and board_key not in wanted_keys:
+            continue
+        board_capture_key = per_board_capture_keys.get(board_key) or normalized_capture_date or _board_history_capture_key(board)
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}(?: \d{2}:00)?", board_capture_key):
+            skipped.append(board_key)
+            continue
+        capture_granularity = "hourly" if " " in board_capture_key else "daily"
+        capture_label = board_capture_key
+        existing_records = boards_index.setdefault(board_key, [])
+        if any(str(item.get("capture_key", item.get("capture_date", ""))).strip() == board_capture_key for item in existing_records):
+            skipped.append(board_key)
+            continue
+        history_path = _history_file_path(board_key, board_capture_key)
+        record_payload = {
+            "board_key": board_key,
+            "capture_key": board_capture_key,
+            "capture_label": capture_label,
+            "capture_date": board_capture_key.split(" ", 1)[0],
+            "capture_granularity": capture_granularity,
+            "captured_at_utc": captured_at_utc,
+            "snapshot_generated_at_utc": str(snapshot.get("generated_at_utc", "")).strip(),
+            "board": board,
+        }
+        _write_json_file(history_path, record_payload)
+        relative_path = history_path.as_posix()
+        existing_records = [
+            item
+            for item in existing_records
+            if str(item.get("capture_key", item.get("capture_date", ""))).strip() != board_capture_key
+        ]
+        existing_records.append(
+            {
+                "capture_key": board_capture_key,
+                "capture_label": capture_label,
+                "capture_date": board_capture_key.split(" ", 1)[0],
+                "capture_granularity": capture_granularity,
+                "captured_at_utc": captured_at_utc,
+                "path": relative_path,
+                "label": str(board.get("label", "")).strip(),
+                "updated_text": str(board.get("updated_text", "")).strip(),
+                "updated_at_utc": str(board.get("updated_at_utc", "")).strip(),
+                "eligible_user_count": int(board.get("eligible_user_count", 0) or 0),
+                "current_floor_value_text": str(board.get("current_floor_value_text", "")).strip(),
+            }
+        )
+        existing_records.sort(key=lambda item: str(item.get("capture_key", item.get("capture_date", ""))), reverse=True)
+        boards_index[board_key] = existing_records
+        created.append(board_key)
+    _save_history_index(index)
+    _attach_history_meta(snapshot)
+    with _CACHE_LOCK:
+        cached = _MEMORY_CACHE.get("data")
+        if isinstance(cached, dict):
+            _attach_history_meta(cached)
+    return {
+        "capture_date": normalized_capture_date,
+        "created_board_keys": created,
+        "skipped_board_keys": skipped,
+        "capture_keys_by_board": per_board_capture_keys,
+    }
+
+
+def load_competition_board_history(board_key: str, *, capture_date: str | None = None) -> dict[str, Any]:
+    normalized_key = str(board_key or "").strip()
+    if not normalized_key:
+        raise ValueError("board_key is required")
+    index = _load_history_index()
+    records = list((index.get("boards") or {}).get(normalized_key, []))
+    available_dates = [
+        str(item.get("capture_key", item.get("capture_date", ""))).strip()
+        for item in records
+        if str(item.get("capture_key", item.get("capture_date", ""))).strip()
+    ]
+    selected_date = str(capture_date or "").strip()
+    if not selected_date and available_dates:
+        selected_date = available_dates[0]
+    selected_record = next(
+        (
+            item
+            for item in records
+            if str(item.get("capture_key", item.get("capture_date", ""))).strip() == selected_date
+        ),
+        None,
+    )
+    history_payload = None
+    if selected_record is not None:
+        history_payload = _read_json_file(Path(str(selected_record.get("path", "")).strip()), {})
+        if not isinstance(history_payload, dict):
+            history_payload = None
+    return {
+        "board_key": normalized_key,
+        "available_dates": available_dates,
+        "selected_date": selected_date,
+        "record": selected_record,
+        "history": history_payload,
+    }
+
+
+def _rank_cutoff_snapshot(board: dict[str, Any], targets: list[int]) -> dict[str, dict[str, Any]]:
+    rows = board.get("rows", [])
+    if not isinstance(rows, list):
+        return {}
+    row_by_rank = {
+        int(item.get("rank", 0) or 0): item
+        for item in rows
+        if isinstance(item, dict) and int(item.get("rank", 0) or 0) > 0
+    }
+    cutoffs: dict[str, dict[str, Any]] = {}
+    for rank in targets:
+        row = row_by_rank.get(int(rank))
+        if not isinstance(row, dict):
+            continue
+        value = _safe_float(row.get("value"))
+        cutoffs[str(rank)] = {
+            "rank": int(rank),
+            "value": value,
+            "value_text": str(row.get("value_text", "")).strip() or (f"{value:,.2f}" if value is not None else "-"),
+            "name": str(row.get("name", "")).strip() or "-",
+        }
+    return cutoffs
+
+
+def load_competition_board_trend(board_key: str, *, granularity: str = "daily") -> dict[str, Any]:
+    normalized_key = str(board_key or "").strip()
+    normalized_granularity = str(granularity or "daily").strip().lower() or "daily"
+    if not normalized_key:
+        raise ValueError("board_key is required")
+    if normalized_granularity != "daily":
+        raise ValueError("granularity must be daily")
+
+    index = _load_history_index()
+    records = list((index.get("boards") or {}).get(normalized_key, []))
+    grouped_records: dict[str, dict[str, Any]] = {}
+    for record in records:
+        if not isinstance(record, dict):
+            continue
+        capture_date = str(record.get("capture_date", "")).strip() or str(record.get("capture_key", "")).strip().split(" ", 1)[0]
+        if not capture_date:
+            continue
+        existing = grouped_records.get(capture_date)
+        current_key = str(record.get("capture_key", record.get("capture_date", ""))).strip()
+        existing_key = str((existing or {}).get("capture_key", (existing or {}).get("capture_date", ""))).strip()
+        if existing is None or current_key > existing_key:
+            grouped_records[capture_date] = record
+
+    rank_targets = [1, 5, 20, 50, 200]
+    points: list[dict[str, Any]] = []
+    board_label = ""
+    metric_label = ""
+    for capture_date in sorted(grouped_records):
+        record = grouped_records[capture_date]
+        board = _load_history_board_from_record(record)
+        if not isinstance(board, dict):
+            continue
+        if not board_label:
+            board_label = str(board.get("label", "")).strip()
+        if not metric_label:
+            metric_label = str(board.get("metric_label", "")).strip() or "当前数值"
+        eligible_metric_total = _safe_float(board.get("eligible_metric_total"))
+        current_floor_value = _safe_float(board.get("current_floor_value"))
+        updated_text = (
+            str(board.get("updated_text", "")).strip()
+            or _local_datetime_text(str(board.get("updated_at_utc", "")).strip())
+            or str(record.get("updated_text", "")).strip()
+        )
+        points.append(
+            {
+                "date": capture_date,
+                "capture_key": str(record.get("capture_key", capture_date)).strip() or capture_date,
+                "updated_text": updated_text,
+                "eligible_metric_total": eligible_metric_total,
+                "eligible_metric_total_text": (
+                    str(board.get("eligible_metric_total_text", "")).strip()
+                    or (f"{eligible_metric_total:,.2f}" if eligible_metric_total is not None else "-")
+                ),
+                "eligible_user_count": _safe_int(board.get("eligible_user_count")) or 0,
+                "current_floor_value": current_floor_value,
+                "current_floor_value_text": str(board.get("current_floor_value_text", "")).strip() or "-",
+                "rank_cutoffs": _rank_cutoff_snapshot(board, rank_targets),
+            }
+        )
+
+    return {
+        "board_key": normalized_key,
+        "label": board_label or str((records[0] if records else {}).get("label", "")).strip() or normalized_key,
+        "metric_label": metric_label or "当前数值",
+        "granularity": normalized_granularity,
+        "rank_targets": rank_targets,
+        "points": points,
+    }
+
+
+def _trend_point_delta(points: list[dict[str, Any]], getter: Callable[[dict[str, Any]], float | None]) -> tuple[float, float]:
+    if not points:
+        return 0.0, 1.0
+    latest = getter(points[-1])
+    previous = getter(points[-2]) if len(points) >= 2 else latest
+    earlier = getter(points[-3]) if len(points) >= 3 else previous
+    latest_val = float(latest or 0.0)
+    previous_val = float(previous or 0.0)
+    earlier_val = float(earlier or previous_val)
+    delta_1 = latest_val - previous_val
+    delta_2 = previous_val - earlier_val
+    weighted = 0.65 * delta_1 + 0.35 * delta_2
+    baseline = abs(delta_2) if abs(delta_2) > 1e-9 else abs(delta_1) if abs(delta_1) > 1e-9 else 1.0
+    acceleration = max(0.5, min(3.0, abs(delta_1) / baseline))
+    return weighted, acceleration
+
+
+def _forecast_stage_multiplier(days_remaining: float | None, acceleration: float, scenario: str) -> float:
+    if days_remaining is None:
+        stage_factor = 1.0
+    elif days_remaining <= 1.0:
+        stage_factor = max(1.35, min(2.40, acceleration * 1.15))
+    elif days_remaining <= 2.0:
+        stage_factor = max(1.10, min(1.60, 1.0 + (acceleration - 1.0) * 0.50))
+    else:
+        stage_factor = 1.0
+    scenario_factor = {
+        "conservative": 0.85,
+        "base": 1.00,
+        "aggressive": 1.20,
+    }.get(str(scenario).strip().lower(), 1.0)
+    return stage_factor * scenario_factor
+
+
+def _forecast_days_remaining(board: dict[str, Any], *, now: datetime | None = None) -> float | None:
+    end_at = _parse_iso_datetime(str(board.get("activity_end_at", "")).strip())
+    if end_at is None:
+        return None
+    probe = now or datetime.now(timezone.utc)
+    if probe.tzinfo is None:
+        probe = probe.replace(tzinfo=timezone.utc)
+    return max(0.0, (end_at.astimezone(timezone.utc) - probe.astimezone(timezone.utc)).total_seconds() / 86400.0)
+
+
+def _enforce_cutoff_monotonicity(cutoffs: dict[str, dict[str, Any]]) -> dict[str, dict[str, Any]]:
+    ordered = [1, 5, 20, 50, 200]
+    previous_value: float | None = None
+    for rank in ordered:
+        item = cutoffs.get(str(rank))
+        if not isinstance(item, dict):
+            continue
+        value = _safe_float(item.get("value"))
+        if value is None:
+            continue
+        if previous_value is not None and value > previous_value:
+            value = previous_value
+            item["value"] = value
+            item["value_text"] = f"{value:,.2f}"
+        previous_value = value
+    return cutoffs
+
+
+def _interpolate_rank_delta(
+    rank: int,
+    rank_delta_map: dict[int, float],
+    *,
+    floor_rank: int,
+    floor_delta: float,
+) -> float:
+    anchors: list[tuple[int, float]] = sorted(rank_delta_map.items())
+    if floor_rank > 0:
+        anchors.append((floor_rank, floor_delta))
+    anchors = sorted({int(anchor_rank): float(anchor_delta) for anchor_rank, anchor_delta in anchors}.items())
+    if not anchors:
+        return 0.0
+    if rank <= anchors[0][0]:
+        return anchors[0][1]
+    for index in range(len(anchors) - 1):
+        left_rank, left_delta = anchors[index]
+        right_rank, right_delta = anchors[index + 1]
+        if left_rank <= rank <= right_rank:
+            if right_rank == left_rank:
+                return left_delta
+            weight = (rank - left_rank) / float(right_rank - left_rank)
+            return left_delta + (right_delta - left_delta) * weight
+    return anchors[-1][1]
+
+
+def _predicted_board_for_projection(
+    board: dict[str, Any],
+    scenario_cutoffs: dict[str, dict[str, Any]],
+    total_delta: float,
+) -> dict[str, Any]:
+    predicted = dict(board)
+    current_rows = board.get("rows", [])
+    if not isinstance(current_rows, list):
+        current_rows = []
+    rank_delta_map: dict[int, float] = {}
+    for key, item in scenario_cutoffs.items():
+        if not isinstance(item, dict):
+            continue
+        rank_value = _safe_int(key)
+        delta = _safe_float(item.get("delta"))
+        if rank_value is None or delta is None:
+            continue
+        rank_delta_map[int(rank_value)] = float(delta)
+    floor_rank = int(board.get("last_rank_fetched", len(current_rows)) or len(current_rows) or 200)
+    floor_delta = _safe_float((scenario_cutoffs.get("floor") or {}).get("delta")) or 0.0
+    predicted_rows: list[dict[str, Any]] = []
+    for row in current_rows:
+        if not isinstance(row, dict):
+            continue
+        rank = int(row.get("rank", 0) or 0)
+        current_value = _safe_float(row.get("value")) or 0.0
+        delta = _interpolate_rank_delta(rank, rank_delta_map, floor_rank=floor_rank, floor_delta=floor_delta)
+        next_value = max(0.0, current_value + delta)
+        predicted_rows.append(
+            {
+                **row,
+                "value": next_value,
+                "value_text": f"{next_value:,.2f}",
+            }
+        )
+    predicted["rows"] = predicted_rows
+    predicted["top_rows"] = predicted_rows[:10]
+    predicted["tail_rows"] = predicted_rows[-10:]
+    predicted_total = max(0.0, (_safe_float(board.get("eligible_metric_total")) or 0.0) + total_delta)
+    predicted["eligible_metric_total"] = predicted_total
+    predicted["eligible_metric_total_text"] = f"{predicted_total:,.2f}"
+    floor_item = scenario_cutoffs.get("floor") or {}
+    floor_value = _safe_float(floor_item.get("value"))
+    if floor_value is not None:
+        predicted["current_floor_value"] = floor_value
+        predicted["current_floor_value_text"] = f"{floor_value:,.2f}"
+    return predicted
+
+
+def _find_entry_for_board(
+    board_key: str,
+    *,
+    entry_id: str | None = None,
+    name: str | None = None,
+    entries: list[dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
+    normalized_entries = _normalize_entries(entries or _load_entries())
+    normalized_board_key = str(board_key or "").strip()
+    normalized_entry_id = str(entry_id or "").strip()
+    normalized_name = str(name or "").strip().casefold()
+    if normalized_entry_id:
+        return next((item for item in normalized_entries if item.get("id") == normalized_entry_id), None)
+    if normalized_name:
+        return next(
+            (
+                item
+                for item in normalized_entries
+                if item.get("board_key") == normalized_board_key and str(item.get("name", "")).strip().casefold() == normalized_name
+            ),
+            None,
+        )
+    return None
+
+
+def _forecast_board_with_entry(
+    board: dict[str, Any],
+    trend: dict[str, Any],
+    *,
+    next_day_volume: float,
+    entry: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    points = list(trend.get("points", [])) if isinstance(trend, dict) else []
+    total_delta, total_acceleration = _trend_point_delta(points, lambda item: _safe_float(item.get("eligible_metric_total")))
+    floor_delta, floor_acceleration = _trend_point_delta(points, lambda item: _safe_float(item.get("current_floor_value")))
+    days_remaining = _forecast_days_remaining(board, now=now)
+    rank_targets = [1, 5, 20, 50, 200]
+    rank_base_deltas: dict[int, float] = {}
+    rank_accelerations: dict[int, float] = {}
+    for rank in rank_targets:
+        rank_delta, rank_acc = _trend_point_delta(
+            points,
+            lambda item, key=str(rank): _safe_float(((item.get("rank_cutoffs") or {}).get(key) or {}).get("value")),
+        )
+        rank_base_deltas[rank] = rank_delta
+        rank_accelerations[rank] = rank_acc
+
+    predicted_entry = None
+    if entry is not None:
+        current_value = _safe_float(entry.get("value")) or 0.0
+        predicted_entry = {
+            **entry,
+            "current_value": current_value,
+            "predicted_value": current_value + float(next_day_volume),
+            "next_day_volume": float(next_day_volume),
+        }
+
+    scenarios: dict[str, Any] = {}
+    for scenario in ("conservative", "base", "aggressive"):
+        total_multiplier = _forecast_stage_multiplier(days_remaining, total_acceleration, scenario)
+        scenario_total_delta = max(0.0, total_delta * total_multiplier)
+        scenario_cutoffs: dict[str, dict[str, Any]] = {}
+        for rank in rank_targets:
+            current_cutoff = _safe_float(next((row.get("value") for row in (board.get("rows") or []) if int(row.get("rank", 0) or 0) == rank), None))
+            if current_cutoff is None:
+                current_cutoff = _safe_float((((points[-1].get("rank_cutoffs") or {}) if points else {}).get(str(rank), {}) or {}).get("value")) or 0.0
+            rank_multiplier = _forecast_stage_multiplier(days_remaining, rank_accelerations.get(rank, 1.0), scenario)
+            predicted_value = max(0.0, current_cutoff + rank_base_deltas.get(rank, 0.0) * rank_multiplier)
+            scenario_cutoffs[str(rank)] = {
+                "rank": rank,
+                "value": predicted_value,
+                "value_text": f"{predicted_value:,.2f}",
+                "delta": predicted_value - current_cutoff,
+            }
+        current_floor = _safe_float(board.get("current_floor_value")) or 0.0
+        floor_multiplier = _forecast_stage_multiplier(days_remaining, floor_acceleration, scenario)
+        predicted_floor = max(0.0, current_floor + floor_delta * floor_multiplier)
+        scenario_cutoffs["floor"] = {
+            "rank": int(board.get("last_rank_fetched", len(board.get("rows", []))) or len(board.get("rows", [])) or 200),
+            "value": predicted_floor,
+            "value_text": f"{predicted_floor:,.2f}",
+            "delta": predicted_floor - current_floor,
+        }
+        _enforce_cutoff_monotonicity(scenario_cutoffs)
+        predicted_board = _predicted_board_for_projection(board, scenario_cutoffs, scenario_total_delta)
+        scenario_payload: dict[str, Any] = {
+            "predicted_total": predicted_board["eligible_metric_total"],
+            "predicted_total_text": predicted_board["eligible_metric_total_text"],
+            "cutoffs": scenario_cutoffs,
+        }
+        if predicted_entry is not None:
+            scenario_payload["projected_entry"] = _entry_projection(
+                {
+                    "id": str(predicted_entry.get("id", "")).strip() or "forecast_entry",
+                    "board_key": str(board.get("board_key", "")).strip(),
+                    "name": str(predicted_entry.get("name", "用户")).strip() or "用户",
+                    "value": float(predicted_entry["predicted_value"]),
+                    "note": str(predicted_entry.get("note", "")).strip(),
+                    "updated_at_utc": _now_iso(),
+                },
+                predicted_board,
+            )
+        scenarios[scenario] = scenario_payload
+
+    return {
+        "board_key": str(board.get("board_key", "")).strip(),
+        "board_label": str(board.get("label", "")).strip(),
+        "metric_label": str(board.get("metric_label", "")).strip() or "当前数值",
+        "days_remaining": days_remaining,
+        "next_day_volume": float(next_day_volume),
+        "entry": predicted_entry,
+        "scenarios": scenarios,
+        "notes": [
+            "预测基于最近两天榜单增量加权外推，并叠加比赛阶段尾盘因子。",
+            "最后一天或倒数第二天会自动放大预测，适合 OPN / ROBO 这类尾盘冲量明显的合约赛。",
+        ],
+    }
+
+
+def build_competition_board_forecast(
+    board_key: str,
+    *,
+    next_day_volume: float,
+    entry_id: str | None = None,
+    name: str | None = None,
+    refresh: bool = False,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    normalized_key = str(board_key or "").strip()
+    if not normalized_key:
+        raise ValueError("board_key is required")
+    volume = _safe_float(next_day_volume)
+    if volume is None or volume < 0:
+        raise ValueError("next_day_volume must be a non-negative number")
+    snapshot = build_competition_board_snapshot(refresh=refresh)
+    boards = snapshot.get("boards", [])
+    board = next((item for item in boards if isinstance(item, dict) and str(item.get("board_key", "")).strip() == normalized_key), None)
+    if board is None:
+        raise ValueError("board_key not found")
+    trend = load_competition_board_trend(normalized_key, granularity="daily")
+    entry = _find_entry_for_board(normalized_key, entry_id=entry_id, name=name)
+    return _forecast_board_with_entry(board, trend, next_day_volume=volume, entry=entry, now=now)
+
+
+def capture_daily_competition_board_history(*, capture_date: str | None = None) -> dict[str, Any]:
+    normalized_capture_date = str(capture_date or _competition_board_local_date_text()).strip()
+    existing_index = _load_history_index()
+    boards_index = existing_index.get("boards", {}) if isinstance(existing_index, dict) else {}
+    missing_board_keys = [
+        board_key
+        for board_key in _expected_board_keys()
+        if not any(
+            str(item.get("capture_date", "")).strip() == normalized_capture_date
+            for item in (boards_index.get(board_key, []) if isinstance(boards_index, dict) else [])
+        )
+    ]
+    if not missing_board_keys:
+        return {
+            "capture_date": normalized_capture_date,
+            "status": "skipped_already_captured",
+            "created_board_keys": [],
+            "missing_board_keys": [],
+        }
+    snapshot = build_competition_board_snapshot(refresh=True)
+    archive_result = archive_competition_board_history(
+        snapshot,
+        capture_date=normalized_capture_date,
+        board_keys=missing_board_keys,
+    )
+    remaining_board_keys = [
+        board_key
+        for board_key in missing_board_keys
+        if board_key not in set(archive_result["created_board_keys"])
+    ]
+    return {
+        "capture_date": normalized_capture_date,
+        "status": "captured" if archive_result["created_board_keys"] else "no_new_boards",
+        "created_board_keys": archive_result["created_board_keys"],
+        "skipped_board_keys": archive_result["skipped_board_keys"],
+        "missing_board_keys": remaining_board_keys,
+        "generated_at_utc": str(snapshot.get("generated_at_utc", "")).strip(),
+    }
+
+
+def capture_due_competition_board_history() -> dict[str, Any]:
+    snapshot = build_competition_board_snapshot(refresh=True)
+    index = _load_history_index()
+    boards_index = index.get("boards", {}) if isinstance(index, dict) else {}
+    board_capture_keys: dict[str, str] = {}
+    missing_board_keys: list[str] = []
+    for board in snapshot.get("boards", []):
+        if not isinstance(board, dict):
+            continue
+        board_key = str(board.get("board_key", "")).strip()
+        if not board_key:
+            continue
+        capture_key = _board_history_capture_key(board)
+        board_capture_keys[board_key] = capture_key
+        records = boards_index.get(board_key, []) if isinstance(boards_index, dict) else []
+        exists = any(
+            str(item.get("capture_key", item.get("capture_date", ""))).strip() == capture_key
+            for item in records
+            if isinstance(item, dict)
+        )
+        if not exists:
+            missing_board_keys.append(board_key)
+    if not missing_board_keys:
+        return {
+            "status": "skipped_no_new_update_slot",
+            "created_board_keys": [],
+            "skipped_board_keys": sorted(board_capture_keys),
+            "missing_board_keys": [],
+            "board_capture_keys": board_capture_keys,
+            "generated_at_utc": str(snapshot.get("generated_at_utc", "")).strip(),
+        }
+    archive_result = archive_competition_board_history(
+        snapshot,
+        board_keys=missing_board_keys,
+        capture_keys_by_board={key: board_capture_keys[key] for key in missing_board_keys},
+    )
+    remaining_board_keys = [
+        board_key
+        for board_key in missing_board_keys
+        if board_key not in set(archive_result["created_board_keys"])
+    ]
+    return {
+        "status": "captured" if archive_result["created_board_keys"] else "no_new_boards",
+        "created_board_keys": archive_result["created_board_keys"],
+        "skipped_board_keys": archive_result["skipped_board_keys"],
+        "missing_board_keys": remaining_board_keys,
+        "board_capture_keys": board_capture_keys,
+        "generated_at_utc": str(snapshot.get("generated_at_utc", "")).strip(),
+    }
+
+
+def _competition_history_check_interval_seconds() -> int:
+    raw = str(os.environ.get("GRID_COMPETITION_HISTORY_INTERVAL_SECONDS", "600")).strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        value = 600
+    return max(60, value)
+
+
+def _competition_history_scheduler_enabled() -> bool:
+    raw = str(os.environ.get("GRID_COMPETITION_HISTORY_SCHEDULER", "1")).strip().lower()
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _competition_history_scheduler_loop() -> None:
+    last_attempt_bucket = ""
+    while True:
+        try:
+            now = _competition_board_local_now()
+            bucket = now.strftime("%Y-%m-%d %H:%M")
+            bucket = bucket[:-1] + "0"
+            if bucket != last_attempt_bucket:
+                last_attempt_bucket = bucket
+                result = capture_due_competition_board_history()
+                print(
+                    "[competition_board_history_scheduler]",
+                    f"bucket={bucket}",
+                    f"status={result.get('status')}",
+                    f"created={len(result.get('created_board_keys', []))}",
+                )
+        except Exception as exc:  # pragma: no cover
+            print("[competition_board_history_scheduler]", f"error={type(exc).__name__}: {exc}")
+        time.sleep(_competition_history_check_interval_seconds())
+
+
+def start_competition_board_history_scheduler() -> bool:
+    global _HISTORY_SCHEDULER_STARTED
+    if not _competition_history_scheduler_enabled():
+        return False
+    with _HISTORY_SCHEDULER_LOCK:
+        if _HISTORY_SCHEDULER_STARTED:
+            return False
+        worker = threading.Thread(target=_competition_history_scheduler_loop, daemon=True)
+        worker.start()
+        _HISTORY_SCHEDULER_STARTED = True
+        return True
+
+
 def _load_entries() -> list[dict[str, Any]]:
     payload = _read_json_file(ENTRIES_PATH, [])
     if not isinstance(payload, list):
@@ -1284,11 +2217,13 @@ def _refresh_competition_data() -> dict[str, Any]:
         "entries": _project_entries_for_boards(boards),
         "errors": scrape_errors,
     }
+    _attach_history_meta(payload)
     _write_json_file(CACHE_PATH, payload)
     return payload
 
 
 def _remember_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    _attach_history_meta(snapshot)
     with _CACHE_LOCK:
         _MEMORY_CACHE["loaded_at"] = time.time()
         _MEMORY_CACHE["data"] = snapshot
@@ -1317,6 +2252,7 @@ def _load_cached_snapshot(*, max_age_seconds: float | None) -> dict[str, Any] | 
 
     if isinstance(file_payload.get("boards"), list):
         file_payload["entries"] = _project_entries_for_boards(file_payload["boards"])
+    _attach_history_meta(file_payload)
     return _remember_snapshot(file_payload)
 
 
@@ -1447,10 +2383,42 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       border-color: var(--brand);
       color: #fff;
     }
+    button.secondary {
+      background: #fff;
+      border-color: var(--line);
+      color: var(--text);
+    }
     button.danger {
       background: #fff2f2;
       border-color: #efc6c6;
       color: var(--bad);
+    }
+    .entry-actions { display: flex; gap: 8px; align-items: center; }
+    .entry-editing-meta { margin-top: 8px; color: var(--warn); font-weight: 700; }
+    .row-actions { display: flex; gap: 8px; justify-content: flex-end; }
+    .cutline-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+      gap: 10px;
+      margin: 12px 0 14px;
+    }
+    .cutline-chip {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: linear-gradient(180deg, rgba(255,255,255,0.95), rgba(248,244,236,0.95));
+      padding: 10px 12px;
+      min-width: 0;
+    }
+    .cutline-chip .label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .cutline-chip .value {
+      font-size: 18px;
+      font-weight: 800;
+      line-height: 1.2;
+      word-break: break-word;
     }
     .meta, .msg { font-size: 13px; color: var(--muted); }
     .msg.error { color: var(--bad); font-weight: 700; }
@@ -1484,11 +2452,16 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       overflow: hidden;
       box-shadow: 0 18px 40px rgba(17, 24, 39, 0.06);
       transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
+      cursor: pointer;
     }
     .board-card:hover {
       transform: translateY(-3px);
       box-shadow: 0 22px 48px rgba(17, 24, 39, 0.10);
       border-color: #d5ccb9;
+    }
+    .board-card:focus-visible {
+      outline: 2px solid rgba(11, 111, 104, 0.35);
+      outline-offset: 2px;
     }
     .board-head {
       display: grid;
@@ -1581,6 +2554,76 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     .pill.good { background: #e7f7ef; color: var(--good); border-color: #c4ead4; }
     .pill.warn { background: #fff5e8; color: var(--warn); border-color: #f5d3a4; }
     .pill.bad { background: #fceaea; color: var(--bad); border-color: #f2c6c3; }
+    .board-submeta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      align-items: center;
+    }
+    .history-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      min-height: 26px;
+      padding: 0 10px;
+      border-radius: 999px;
+      background: #f6f1e6;
+      color: #6e5832;
+      border: 1px solid #e7d9bc;
+      font-size: 12px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .history-hint {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .compare-inline {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .compare-inline-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 10px 12px;
+      background: #fff;
+      min-width: 0;
+    }
+    .compare-inline-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 8px;
+      align-items: center;
+      margin-bottom: 6px;
+    }
+    .compare-inline-title {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .compare-inline-badge {
+      font-size: 11px;
+      font-weight: 700;
+      color: #6e5832;
+      background: #f6f1e6;
+      border: 1px solid #e7d9bc;
+      border-radius: 999px;
+      padding: 2px 8px;
+      white-space: nowrap;
+    }
+    .compare-inline-value {
+      font-size: 15px;
+      font-weight: 800;
+      line-height: 1.35;
+    }
+    .compare-inline-delta {
+      margin-top: 6px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .compare-inline-delta.up { color: var(--good); }
+    .compare-inline-delta.down { color: var(--bad); }
+    .compare-inline-delta.flat { color: var(--muted); }
     .board-meta {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -1624,13 +2667,184 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       font-size: 13px;
       text-align: center;
     }
+    .history-modal {
+      position: fixed;
+      inset: 0;
+      display: none;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background: rgba(17, 24, 39, 0.44);
+      z-index: 40;
+    }
+    .history-modal.open { display: flex; }
+    .history-dialog {
+      width: min(1180px, calc(100vw - 32px));
+      max-height: calc(100vh - 48px);
+      overflow: auto;
+      border-radius: 18px;
+      border: 1px solid var(--line);
+      background: linear-gradient(180deg, #fffefb 0%, #f8f4ea 100%);
+      box-shadow: 0 30px 90px rgba(17, 24, 39, 0.22);
+      padding: 18px;
+      display: grid;
+      gap: 14px;
+    }
+    .history-head {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+      justify-content: space-between;
+    }
+    .history-head h3 {
+      margin: 0;
+      font-size: 22px;
+    }
+    .history-head p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .history-date-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .history-date-btn {
+      height: 34px;
+      padding: 0 12px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: #5c564a;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .history-date-btn.active {
+      background: var(--brand);
+      border-color: var(--brand);
+      color: #fff;
+    }
+    .history-grid {
+      display: grid;
+      gap: 12px;
+    }
+    .compare-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .compare-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: #fff;
+    }
+    .compare-card .label {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .compare-card .value {
+      font-size: 16px;
+      font-weight: 800;
+      line-height: 1.35;
+    }
+    .compare-card .delta {
+      margin-top: 6px;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .delta.up { color: var(--good); }
+    .delta.down { color: var(--bad); }
+    .delta.flat { color: var(--muted); }
+    .trend-grid {
+      display: grid;
+      gap: 14px;
+    }
+    .trend-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      background: #fff;
+      padding: 14px;
+      min-width: 0;
+    }
+    .trend-card h4 {
+      margin: 0 0 6px;
+      font-size: 16px;
+    }
+    .trend-card p {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.5;
+    }
+    .trend-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      margin-bottom: 8px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .trend-legend span {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+    .trend-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+    .trend-chart {
+      width: 100%;
+      min-height: 280px;
+      overflow-x: auto;
+    }
+    .trend-chart svg {
+      width: 100%;
+      min-width: 760px;
+      height: 280px;
+      display: block;
+    }
+    .trend-axis-label {
+      font-size: 11px;
+      fill: #857b69;
+    }
+    .trend-grid-line {
+      stroke: #e9e1d2;
+      stroke-width: 1;
+    }
+    .trend-series-line {
+      fill: none;
+      stroke-width: 2.5;
+      stroke-linecap: round;
+      stroke-linejoin: round;
+    }
+    .trend-series-point {
+      stroke: #fff;
+      stroke-width: 2;
+    }
+    .trend-table-wrap {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+    }
+    .trend-table {
+      min-width: 880px;
+      table-layout: auto;
+    }
     @media (max-width: 1180px) {
-      .kpi-grid, .board-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .kpi-grid, .board-meta, .compare-grid, .compare-inline { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .board-grid, .two-cols { grid-template-columns: 1fr; }
       .event-strip { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
-      .kpi-grid, .board-meta { grid-template-columns: 1fr; }
+      .kpi-grid, .board-meta, .compare-grid, .compare-inline { grid-template-columns: 1fr; }
       .toolbar label { min-width: 100%; }
       .board-head { grid-template-columns: 1fr; }
       .pill { justify-self: start; }
@@ -1673,8 +2887,12 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         <label>备注
           <input id="entry_note" type="text" placeholder="例如 主号 / 子号 / API号" />
         </label>
-        <button id="entry_save_btn" class="primary">保存录入</button>
+        <div class="entry-actions">
+          <button id="entry_save_btn" class="primary">保存录入</button>
+          <button id="entry_cancel_btn" class="secondary" type="button" hidden>取消编辑</button>
+        </div>
       </div>
+      <div id="entry_editing_meta" class="entry-editing-meta" hidden></div>
       <p class="meta">现货页按“交易量 (USD)”估算；合约页按榜单实际统计字段估算，例如“交易量 (USDT)”。</p>
       <div class="table-wrap">
         <table class="entries-table">
@@ -1697,6 +2915,28 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
+      <h2 style="margin:0 0 12px;">次日榜单预测</h2>
+      <div class="toolbar">
+        <label>榜单
+          <select id="forecast_board"></select>
+        </label>
+        <label>关联录入用户（可选）
+          <select id="forecast_entry"></select>
+        </label>
+        <label>预计下一天交易量
+          <input id="forecast_next_volume" type="number" step="0.01" min="0" placeholder="例如 500000" />
+        </label>
+        <div class="entry-actions">
+          <button id="forecast_run_btn" class="primary">预测</button>
+        </div>
+      </div>
+      <p class="meta">基于最近两天榜单总量和关键名次门槛的变化做情景预测。最后一天会自动放大增量，适合 OPN / ROBO 这类尾盘冲量明显的比赛。</p>
+      <div id="forecast_body">
+        <div class="empty">先选择榜单并输入预计下一天交易量。</div>
+      </div>
+    </section>
+
+    <section class="card">
       <h2 style="margin:0 0 12px;">现货交易赛</h2>
       <div id="spot_boards" class="board-grid"></div>
     </section>
@@ -1705,6 +2945,38 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       <h2 style="margin:0 0 12px;">合约交易赛</h2>
       <div id="futures_boards" class="board-grid"></div>
     </section>
+
+    <section class="card">
+      <h2 style="margin:0 0 12px;">已结束交易赛</h2>
+      <div id="ended_boards" class="board-grid"></div>
+    </section>
+  </div>
+
+  <div id="history_modal" class="history-modal" aria-hidden="true">
+    <div class="history-dialog">
+      <div class="history-head">
+        <div>
+          <h3 id="history_title">日榜历史</h3>
+          <p id="history_meta">点击日期查看该日抓取到的排行榜快照。</p>
+        </div>
+        <button id="history_close_btn" type="button">关闭</button>
+      </div>
+      <div id="history_dates" class="history-date-list"></div>
+      <div id="history_body" class="history-grid"></div>
+    </div>
+  </div>
+
+  <div id="trend_modal" class="history-modal" aria-hidden="true">
+    <div class="history-dialog">
+      <div class="history-head">
+        <div>
+          <h3 id="trend_title">按天趋势</h3>
+          <p id="trend_meta">按天查看交易赛总量和关键排名分数线的变化。</p>
+        </div>
+        <button id="trend_close_btn" type="button">关闭</button>
+      </div>
+      <div id="trend_body" class="trend-grid"></div>
+    </div>
   </div>
 
   <script>
@@ -1714,15 +2986,37 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     const summaryEl = document.getElementById("summary");
     const spotBoardsEl = document.getElementById("spot_boards");
     const futuresBoardsEl = document.getElementById("futures_boards");
+    const endedBoardsEl = document.getElementById("ended_boards");
     const entryBoardEl = document.getElementById("entry_board");
     const entryNameEl = document.getElementById("entry_name");
     const entryValueEl = document.getElementById("entry_value");
     const entryNoteEl = document.getElementById("entry_note");
     const entrySaveBtn = document.getElementById("entry_save_btn");
+    const entryCancelBtn = document.getElementById("entry_cancel_btn");
+    const entryEditingMetaEl = document.getElementById("entry_editing_meta");
     const entriesBody = document.getElementById("entries_body");
+    const forecastBoardEl = document.getElementById("forecast_board");
+    const forecastEntryEl = document.getElementById("forecast_entry");
+    const forecastNextVolumeEl = document.getElementById("forecast_next_volume");
+    const forecastRunBtn = document.getElementById("forecast_run_btn");
+    const forecastBodyEl = document.getElementById("forecast_body");
+    const historyModalEl = document.getElementById("history_modal");
+    const historyTitleEl = document.getElementById("history_title");
+    const historyMetaEl = document.getElementById("history_meta");
+    const historyDatesEl = document.getElementById("history_dates");
+    const historyBodyEl = document.getElementById("history_body");
+    const historyCloseBtn = document.getElementById("history_close_btn");
+    const trendModalEl = document.getElementById("trend_modal");
+    const trendTitleEl = document.getElementById("trend_title");
+    const trendMetaEl = document.getElementById("trend_meta");
+    const trendBodyEl = document.getElementById("trend_body");
+    const trendCloseBtn = document.getElementById("trend_close_btn");
     const apiBase = `${window.location.protocol}//${window.location.host}`;
 
     let snapshot = null;
+    let historyState = { boardKey: "", selectedDate: "", loading: false };
+    let trendState = { boardKey: "", loading: false };
+    let editingEntryId = "";
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -1773,6 +3067,14 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       };
     }
 
+    function boardHasEnded(board) {
+      const value = board && board.activity_end_at ? String(board.activity_end_at) : "";
+      if (!value) return false;
+      const end = new Date(value);
+      if (Number.isNaN(end.getTime())) return false;
+      return end.getTime() <= Date.now();
+    }
+
     function countdownMarkup(board) {
       const countdown = countdownState(board.activity_end_at);
       return `
@@ -1784,6 +3086,13 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
           <div class="sub">${escapeHtml(countdown.sub)}</div>
         </div>
       `;
+    }
+
+    function historyPillMarkup(board) {
+      if (Array.isArray(board.history_dates) && board.history_dates.length) {
+        return `<span class="history-pill">历史已归档 ${escapeHtml(board.latest_history_date || board.history_dates[0])}</span>`;
+      }
+      return `<span class="history-pill">待归档日榜</span>`;
     }
 
     function updateCountdownPanels() {
@@ -1816,15 +3125,67 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       return `<span class="pill ${board.market === "spot" ? "good" : "warn"}">${threshold}</span>`;
     }
 
+    function compareDeltaText(value, digits = 2, suffix = "") {
+      const number = Number(value);
+      if (!Number.isFinite(number)) return { text: "缺少对比样本", cls: "flat" };
+      if (number === 0) return { text: `0${suffix}`, cls: "flat" };
+      return {
+        text: `${number > 0 ? "+" : ""}${fmtNum(number, digits)}${suffix}`,
+        cls: number > 0 ? "up" : "down",
+      };
+    }
+
+    function boardCompareMarkup(board) {
+      const compare = board && board.history_compare ? board.history_compare : null;
+      if (!compare || !compare.previous_capture_key) return "";
+      const previousBadge = compare.previous_updated_text || compare.previous_capture_key || "-";
+      const floorDelta = compareDeltaText(compare.floor_delta);
+      const eligibleDelta = compareDeltaText(compare.eligible_delta, 0, " 人");
+      const segmentDelta = compareDeltaText(compare.segment_delta);
+      return `
+        <div>
+          <div class="meta" style="margin-bottom:8px;">${escapeHtml(compare.title || "上一档对比")}</div>
+          <div class="compare-inline">
+            <div class="compare-inline-card">
+              <div class="compare-inline-head">
+                <div class="compare-inline-title">最低上榜值</div>
+                <span class="compare-inline-badge">${escapeHtml(previousBadge)}</span>
+              </div>
+              <div class="compare-inline-value">${escapeHtml(compare.floor_previous_text || "-")} → ${escapeHtml(compare.floor_current_text || "-")}</div>
+              <div class="compare-inline-delta ${escapeHtml(floorDelta.cls)}">${escapeHtml(floorDelta.text)}</div>
+            </div>
+            <div class="compare-inline-card">
+              <div class="compare-inline-head">
+                <div class="compare-inline-title">合格人数</div>
+                <span class="compare-inline-badge">${escapeHtml(previousBadge)}</span>
+              </div>
+              <div class="compare-inline-value">${escapeHtml(Number(compare.eligible_previous || 0).toLocaleString())} → ${escapeHtml(Number(compare.eligible_current || 0).toLocaleString())}</div>
+              <div class="compare-inline-delta ${escapeHtml(eligibleDelta.cls)}">${escapeHtml(eligibleDelta.text)}</div>
+            </div>
+            <div class="compare-inline-card">
+              <div class="compare-inline-head">
+                <div class="compare-inline-title">首档门槛</div>
+                <span class="compare-inline-badge">${escapeHtml(previousBadge)}</span>
+              </div>
+              <div class="compare-inline-value">${escapeHtml(compare.segment_previous_text || "-")} → ${escapeHtml(compare.segment_current_text || "-")}</div>
+              <div class="compare-inline-delta ${escapeHtml(segmentDelta.cls)}">${escapeHtml(segmentDelta.text)}</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
     function renderSummary(data) {
       const boards = Array.isArray(data.boards) ? data.boards : [];
       const entryCount = Array.isArray(data.entries) ? data.entries.length : 0;
       const totalBoards = boards.length;
       const totalUsers = boards.reduce((acc, item) => acc + Number(item.eligible_user_count || 0), 0);
+      const endedCount = boards.filter((item) => boardHasEnded(item)).length;
       const rows = [
         { label: "榜单数", value: totalBoards },
         { label: "参赛样本总数", value: totalUsers.toLocaleString() },
         { label: "录入人数", value: entryCount },
+        { label: "已结束榜单", value: endedCount },
         { label: "最近生成时间", value: fmtDate(data.generated_at_utc) },
       ];
       summaryEl.innerHTML = rows.map((item) => `
@@ -1893,9 +3254,194 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       `;
     }
 
+    function keyCutlinesMarkup(board) {
+      const rows = Array.isArray(board.rows) ? board.rows : [];
+      if (!rows.length) return "";
+      const targets = [1, 2, 3, 4, 5, 20, 50, 200];
+      const rowByRank = new Map(rows.map((item) => [Number(item.rank), item]));
+      const items = targets
+        .map((rank) => {
+          const row = rowByRank.get(rank);
+          if (!row) return "";
+          return `
+            <div class="cutline-chip">
+              <div class="label">第 ${escapeHtml(rank)} 名分数线</div>
+              <div class="value">${escapeHtml(row.value_text || "-")}</div>
+            </div>
+          `;
+        })
+        .filter(Boolean);
+      if (!items.length) return "";
+      return `
+        <div>
+          <div class="meta" style="margin-bottom:8px;">关键分数线</div>
+          <div class="cutline-grid">${items.join("")}</div>
+        </div>
+      `;
+    }
+
+    function renderTrendChart(points, series, { logScale = false } = {}) {
+      const width = 920;
+      const height = 280;
+      const pad = { top: 18, right: 20, bottom: 46, left: 66 };
+      const chartWidth = width - pad.left - pad.right;
+      const chartHeight = height - pad.top - pad.bottom;
+      const validSeries = series
+        .map((item) => ({
+          ...item,
+          values: points.map((point) => Number(item.pick(point))),
+        }))
+        .filter((item) => item.values.some((value) => Number.isFinite(value) && value > (logScale ? 0 : -Infinity)));
+      if (!validSeries.length) {
+        return `<div class="empty">历史归档还不够，暂时画不出趋势图。</div>`;
+      }
+      const allValues = validSeries
+        .flatMap((item) => item.values)
+        .filter((value) => Number.isFinite(value) && value > (logScale ? 0 : -Infinity));
+      if (!allValues.length) {
+        return `<div class="empty">缺少有效数值。</div>`;
+      }
+      const transformValue = (value) => {
+        if (!Number.isFinite(value)) return NaN;
+        if (logScale) {
+          return value > 0 ? Math.log10(value) : NaN;
+        }
+        return value;
+      };
+      const minRaw = Math.min(...allValues);
+      const maxRaw = Math.max(...allValues);
+      const minValue = transformValue(logScale ? Math.max(minRaw, 1) : 0);
+      const maxValue = transformValue(maxRaw);
+      const span = maxValue - minValue || 1;
+      const x = (index) => {
+        if (points.length <= 1) return pad.left + chartWidth / 2;
+        return pad.left + (chartWidth * index) / (points.length - 1);
+      };
+      const y = (value) => {
+        const transformed = transformValue(value);
+        if (!Number.isFinite(transformed)) return NaN;
+        return pad.top + chartHeight - ((transformed - minValue) / span) * chartHeight;
+      };
+      const gridLines = Array.from({ length: 4 }, (_, index) => {
+        const ratio = index / 3;
+        const yPos = pad.top + chartHeight * ratio;
+        const value = maxValue - span * ratio;
+        const labelRaw = logScale ? 10 ** value : value;
+        return `
+          <line class="trend-grid-line" x1="${pad.left}" y1="${yPos}" x2="${width - pad.right}" y2="${yPos}" />
+          <text class="trend-axis-label" x="${pad.left - 10}" y="${yPos + 4}" text-anchor="end">${escapeHtml(fmtNum(labelRaw, 0))}</text>
+        `;
+      }).join("");
+      const xLabels = points.map((point, index) => `
+        <text class="trend-axis-label" x="${x(index)}" y="${height - 14}" text-anchor="middle">${escapeHtml(point.date.slice(5))}</text>
+      `).join("");
+      const lines = validSeries.map((item) => {
+        const coords = item.values
+          .map((value, index) => {
+            const yPos = y(value);
+            return Number.isFinite(yPos) ? `${x(index)},${yPos}` : "";
+          })
+          .filter(Boolean)
+          .join(" ");
+        const circles = item.values.map((value, index) => {
+          const yPos = y(value);
+          if (!Number.isFinite(yPos)) return "";
+          return `<circle class="trend-series-point" cx="${x(index)}" cy="${yPos}" r="4" fill="${item.color}" />`;
+        }).join("");
+        return `
+          <polyline class="trend-series-line" points="${coords}" stroke="${item.color}" />
+          ${circles}
+        `;
+      }).join("");
+      return `
+        <div class="trend-legend">
+          ${validSeries.map((item) => `<span><i class="trend-dot" style="background:${escapeHtml(item.color)};"></i>${escapeHtml(item.name)}</span>`).join("")}
+        </div>
+        <div class="trend-chart">
+          <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none" aria-hidden="true">
+            ${gridLines}
+            ${lines}
+            ${xLabels}
+          </svg>
+        </div>
+      `;
+    }
+
+    function renderTrendTable(trend) {
+      const points = Array.isArray(trend && trend.points) ? trend.points : [];
+      if (!points.length) {
+        return `<div class="empty">还没有足够的按天归档数据。</div>`;
+      }
+      return `
+        <div class="trend-table-wrap">
+          <table class="trend-table">
+            <thead>
+              <tr>
+                <th>日期</th>
+                <th class="num">总交易量</th>
+                <th class="num">1名</th>
+                <th class="num">5名</th>
+                <th class="num">20名</th>
+                <th class="num">50名</th>
+                <th class="num">200名</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${points.map((point) => `
+                <tr>
+                  <td>${escapeHtml(point.date)}<br /><span class="meta">${escapeHtml(point.updated_text || "-")}</span></td>
+                  <td class="num">${escapeHtml(point.eligible_metric_total_text || "-")}</td>
+                  <td class="num">${escapeHtml(((point.rank_cutoffs || {})["1"] || {}).value_text || "-")}</td>
+                  <td class="num">${escapeHtml(((point.rank_cutoffs || {})["5"] || {}).value_text || "-")}</td>
+                  <td class="num">${escapeHtml(((point.rank_cutoffs || {})["20"] || {}).value_text || "-")}</td>
+                  <td class="num">${escapeHtml(((point.rank_cutoffs || {})["50"] || {}).value_text || "-")}</td>
+                  <td class="num">${escapeHtml(((point.rank_cutoffs || {})["200"] || {}).value_text || "-")}</td>
+                </tr>
+              `).join("")}
+            </tbody>
+          </table>
+        </div>
+      `;
+    }
+
+    function renderTrendContent(trend) {
+      const points = Array.isArray(trend && trend.points) ? trend.points : [];
+      if (!points.length) {
+        trendBodyEl.innerHTML = `<div class="empty">还没有足够的日级归档数据。</div>`;
+        return;
+      }
+      const totalSeries = [
+        { name: trend.metric_label || "总量", color: "#0b6f68", pick: (point) => point.eligible_metric_total },
+      ];
+      const cutoffSeries = [
+        { name: "1名", color: "#b42318", pick: (point) => ((point.rank_cutoffs || {})["1"] || {}).value },
+        { name: "5名", color: "#d97706", pick: (point) => ((point.rank_cutoffs || {})["5"] || {}).value },
+        { name: "20名", color: "#0f7b45", pick: (point) => ((point.rank_cutoffs || {})["20"] || {}).value },
+        { name: "50名", color: "#2563eb", pick: (point) => ((point.rank_cutoffs || {})["50"] || {}).value },
+        { name: "200名", color: "#7c3aed", pick: (point) => ((point.rank_cutoffs || {})["200"] || {}).value },
+      ];
+      trendBodyEl.innerHTML = `
+        <div class="trend-card">
+          <h4>总交易量按天变化</h4>
+          <p>按每天最后一次归档快照汇总，便于看整场比赛热度和增量变化。</p>
+          ${renderTrendChart(points, totalSeries)}
+        </div>
+        <div class="trend-card">
+          <h4>关键排名分数线按天变化</h4>
+          <p>展示第 1 / 5 / 20 / 50 / 200 名的门槛变化。为了同时容纳高位和低位，图表使用对数尺度。</p>
+          ${renderTrendChart(points, cutoffSeries, { logScale: true })}
+        </div>
+        <div class="trend-card">
+          <h4>每日明细</h4>
+          <p>表格里可以直接查看每天的总交易量和关键排名分数线。</p>
+          ${renderTrendTable(trend)}
+        </div>
+      `;
+    }
+
     function renderBoard(board) {
       return `
-        <article class="board-card">
+        <article class="board-card" data-board-key="${escapeHtml(board.board_key)}" tabindex="0" role="button" aria-label="查看 ${escapeHtml(board.label)} 的历史榜单">
           <div class="board-head">
             <div>
               <h3>${escapeHtml(board.label)}</h3>
@@ -1903,6 +3449,12 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             </div>
             ${boardPill(board)}
           </div>
+          <div class="board-submeta">
+            ${historyPillMarkup(board)}
+            <span class="history-hint">点击卡片查看按日期归档的日榜数据</span>
+            <button type="button" class="secondary" data-trend-board-key="${escapeHtml(board.board_key)}">按天趋势</button>
+          </div>
+          ${boardCompareMarkup(board)}
           <div class="event-strip">
             <div class="event-panel">
               <div class="label">活动周期</div>
@@ -1911,6 +3463,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             </div>
             ${countdownMarkup(board)}
           </div>
+          ${keyCutlinesMarkup(board)}
           <div class="board-meta">
             <div class="mini">
               <div class="label">榜单更新时间</div>
@@ -1946,18 +3499,174 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
 
     function renderBoards() {
       const boards = Array.isArray(snapshot && snapshot.boards) ? snapshot.boards : [];
-      const spot = boards.filter((item) => item.market === "spot");
-      const futures = boards.filter((item) => item.market === "futures");
+      const activeBoards = boards.filter((item) => !boardHasEnded(item));
+      const endedBoards = boards.filter((item) => boardHasEnded(item));
+      const spot = activeBoards.filter((item) => item.market === "spot");
+      const futures = activeBoards.filter((item) => item.market === "futures");
       spotBoardsEl.innerHTML = spot.length ? spot.map(renderBoard).join("") : `<div class="empty">暂无现货榜单。</div>`;
       futuresBoardsEl.innerHTML = futures.length ? futures.map(renderBoard).join("") : `<div class="empty">暂无合约榜单。</div>`;
+      endedBoardsEl.innerHTML = endedBoards.length ? endedBoards.map(renderBoard).join("") : `<div class="empty">当前没有已结束榜单。</div>`;
       updateCountdownPanels();
     }
 
     function renderEntryBoardOptions() {
       const boards = Array.isArray(snapshot && snapshot.boards) ? snapshot.boards : [];
+      const currentValue = entryBoardEl.value.trim();
       entryBoardEl.innerHTML = boards.map((item) => `
         <option value="${escapeHtml(item.board_key)}">${escapeHtml(item.label)} · ${escapeHtml(item.metric_label || "当前数值")}</option>
       `).join("");
+      if (currentValue && boards.some((item) => item.board_key === currentValue)) {
+        entryBoardEl.value = currentValue;
+      }
+    }
+
+    function renderForecastBoardOptions() {
+      const boards = Array.isArray(snapshot && snapshot.boards) ? snapshot.boards : [];
+      const currentValue = forecastBoardEl.value.trim();
+      forecastBoardEl.innerHTML = boards.map((item) => `
+        <option value="${escapeHtml(item.board_key)}">${escapeHtml(item.label)} · ${escapeHtml(item.metric_label || "当前数值")}</option>
+      `).join("");
+      if (currentValue && boards.some((item) => item.board_key === currentValue)) {
+        forecastBoardEl.value = currentValue;
+      }
+    }
+
+    function renderForecastEntryOptions() {
+      const entries = Array.isArray(snapshot && snapshot.entries) ? snapshot.entries : [];
+      const boardKey = forecastBoardEl.value.trim();
+      const currentValue = forecastEntryEl.value.trim();
+      const boardEntries = entries.filter((item) => String(item.board_key || "") === boardKey);
+      forecastEntryEl.innerHTML = `
+        <option value="">不关联录入用户</option>
+        ${boardEntries.map((item) => `
+          <option value="${escapeHtml(item.id || "")}">${escapeHtml(item.name || "-")} · 当前 ${escapeHtml(item.value_text || "-")}</option>
+        `).join("")}
+      `;
+      if (currentValue && boardEntries.some((item) => String(item.id || "") === currentValue)) {
+        forecastEntryEl.value = currentValue;
+      }
+    }
+
+    function renderForecastScenario(title, payload, metricLabel, nextDayVolume) {
+      const cutoffs = payload && payload.cutoffs ? payload.cutoffs : {};
+      const projectedEntry = payload && payload.projected_entry ? payload.projected_entry : null;
+      return `
+        <div class="card" style="padding:14px;">
+          <div class="board-head">
+            <div>
+              <h3 style="margin:0;">${escapeHtml(title)}</h3>
+              <p>预测次日总量 ${escapeHtml(payload.predicted_total_text || "-")} ${escapeHtml(metricLabel || "")}</p>
+            </div>
+          </div>
+          <div class="cutline-grid">
+            ${["1", "5", "20", "50", "200"].map((rank) => {
+              const item = cutoffs[rank] || {};
+              const delta = Number(item.delta || 0);
+              const cls = delta > 0 ? "up" : delta < 0 ? "down" : "flat";
+              const prefix = delta > 0 ? "+" : "";
+              return `
+                <div class="cutline-chip">
+                  <div class="label">第 ${escapeHtml(rank)} 名门槛</div>
+                  <div class="value">${escapeHtml(item.value_text || "-")}</div>
+                  <div class="compare-inline-delta ${escapeHtml(cls)}">${escapeHtml(prefix + fmtNum(delta, 2))}</div>
+                </div>
+              `;
+            }).join("")}
+          </div>
+          ${projectedEntry ? `
+            <div class="compare-inline">
+              <div class="compare-inline-card">
+                <div class="compare-inline-head">
+                  <div class="compare-inline-title">预测累计量</div>
+                  <span class="compare-inline-badge">${escapeHtml(projectedEntry.name || "用户")}</span>
+                </div>
+                <div class="compare-inline-value">${escapeHtml(projectedEntry.value_text || "-")}</div>
+                <div class="compare-inline-delta flat">次日新增 ${escapeHtml(fmtNum(nextDayVolume, 2))}</div>
+              </div>
+              <div class="compare-inline-card">
+                <div class="compare-inline-head">
+                  <div class="compare-inline-title">预测排名</div>
+                  <span class="compare-inline-badge">${escapeHtml(projectedEntry.segment_label || "-")}</span>
+                </div>
+                <div class="compare-inline-value">${escapeHtml(projectedEntry.projected_rank_text || projectedEntry.projected_rank || "-")}</div>
+                <div class="compare-inline-delta flat">差前一名 ${escapeHtml(projectedEntry.gap_to_next_text || "-")}</div>
+              </div>
+              <div class="compare-inline-card">
+                <div class="compare-inline-head">
+                  <div class="compare-inline-title">预测奖励</div>
+                  <span class="compare-inline-badge">${escapeHtml(projectedEntry.board_label || "-")}</span>
+                </div>
+                <div class="compare-inline-value">${escapeHtml(projectedEntry.projected_reward || "-")}</div>
+                <div class="compare-inline-delta flat">${escapeHtml(projectedEntry.note || "按当前录入推演")}</div>
+              </div>
+            </div>
+          ` : `<div class="meta">未关联录入用户，本情景仅展示榜单总量和关键门槛预测。</div>`}
+        </div>
+      `;
+    }
+
+    function renderForecastResult(result) {
+      const scenarios = result && result.scenarios ? result.scenarios : {};
+      const notes = Array.isArray(result && result.notes) ? result.notes : [];
+      const entry = result && result.entry ? result.entry : null;
+      forecastBodyEl.innerHTML = `
+        <div class="card" style="padding:14px; margin-bottom:12px;">
+          <div class="board-head">
+            <div>
+              <h3 style="margin:0;">${escapeHtml(result.board_label || result.board_key || "次日榜单预测")}</h3>
+              <p>预计下一天交易量 ${escapeHtml(fmtNum(result.next_day_volume, 2))} ${escapeHtml(result.metric_label || "")} · 剩余 ${result.days_remaining === null || result.days_remaining === undefined ? "-" : escapeHtml(fmtNum(result.days_remaining, 2))} 天</p>
+            </div>
+            ${entry ? `<span class="history-pill">关联用户：${escapeHtml(entry.name || "-")}</span>` : `<span class="history-pill">仅门槛预测</span>`}
+          </div>
+          ${notes.length ? `<div class="meta">${notes.map((item) => escapeHtml(item)).join(" · ")}</div>` : ""}
+        </div>
+        <div class="board-grid">
+          ${renderForecastScenario("保守情景", scenarios.conservative || {}, result.metric_label || "", result.next_day_volume || 0)}
+          ${renderForecastScenario("基准情景", scenarios.base || {}, result.metric_label || "", result.next_day_volume || 0)}
+        </div>
+        <div class="board-grid" style="margin-top:12px;">
+          ${renderForecastScenario("激进情景", scenarios.aggressive || {}, result.metric_label || "", result.next_day_volume || 0)}
+        </div>
+      `;
+    }
+
+    function setEntryEditingState(entry = null) {
+      editingEntryId = entry && entry.id ? String(entry.id) : "";
+      const isEditing = Boolean(editingEntryId);
+      entrySaveBtn.textContent = isEditing ? "更新录入" : "保存录入";
+      entryCancelBtn.hidden = !isEditing;
+      if (isEditing) {
+        entryEditingMetaEl.hidden = false;
+        entryEditingMetaEl.textContent = `正在编辑：${entry.board_label || "-"} / ${entry.name || "-"}`;
+      } else {
+        entryEditingMetaEl.hidden = true;
+        entryEditingMetaEl.textContent = "";
+      }
+    }
+
+    function resetEntryForm() {
+      const firstBoardKey = entryBoardEl.options.length ? String(entryBoardEl.options[0].value || "") : "";
+      setEntryEditingState(null);
+      entryBoardEl.value = firstBoardKey;
+      entryNameEl.value = "";
+      entryValueEl.value = "";
+      entryNoteEl.value = "";
+    }
+
+    function startEditingEntry(entryId) {
+      const entries = Array.isArray(snapshot && snapshot.entries) ? snapshot.entries : [];
+      const entry = entries.find((item) => String(item.id) === String(entryId));
+      if (!entry) {
+        setStatus("未找到要编辑的录入记录。", true);
+        return;
+      }
+      renderEntryBoardOptions();
+      entryBoardEl.value = entry.board_key || "";
+      entryNameEl.value = entry.name || "";
+      entryValueEl.value = Number.isFinite(Number(entry.value)) ? String(entry.value) : "";
+      entryNoteEl.value = entry.note || "";
+      setEntryEditingState(entry);
+      entryNameEl.focus();
     }
 
     function renderEntries() {
@@ -1982,14 +3691,230 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
           <td>${escapeHtml(item.projected_reward || "-")}</td>
           <td class="num">${escapeHtml(item.gap_to_next_text || "-")}</td>
           <td>${escapeHtml(item.note || "-")}</td>
-          <td><button class="danger" data-delete-id="${escapeHtml(item.id)}">删除</button></td>
+          <td>
+            <div class="row-actions">
+              <button class="secondary" data-edit-id="${escapeHtml(item.id)}">编辑</button>
+              <button class="danger" data-delete-id="${escapeHtml(item.id)}">删除</button>
+            </div>
+          </td>
         </tr>
       `).join("");
+      entriesBody.querySelectorAll("button[data-edit-id]").forEach((btn) => {
+        btn.addEventListener("click", () => {
+          startEditingEntry(btn.dataset.editId || "");
+        });
+      });
       entriesBody.querySelectorAll("button[data-delete-id]").forEach((btn) => {
         btn.addEventListener("click", async () => {
           await saveEntry({ action: "delete", entry_id: btn.dataset.deleteId });
+          if ((btn.dataset.deleteId || "") === editingEntryId) {
+            resetEntryForm();
+          }
+          setStatus("录入已删除。");
         });
       });
+    }
+
+    function deltaMarkup(currentValue, previousValue, digits = 2, suffix = "") {
+      const currentNum = Number(currentValue);
+      const previousNum = Number(previousValue);
+      if (!Number.isFinite(currentNum) || !Number.isFinite(previousNum)) {
+        return `<div class="delta flat">缺少前一日数据</div>`;
+      }
+      const diff = currentNum - previousNum;
+      const level = diff > 0 ? "up" : diff < 0 ? "down" : "flat";
+      const prefix = diff > 0 ? "+" : "";
+      return `<div class="delta ${level}">${prefix}${fmtNum(diff, digits)}${suffix}</div>`;
+    }
+
+    function renderHistoryCompare(board, previousBoard, meta = {}, previousMeta = {}) {
+      if (!board) return "";
+      if (!previousBoard) {
+        return `
+          <div class="card" style="padding:14px;">
+            <div class="meta">前一日 vs 当前日</div>
+            <div class="empty">当前日期之前还没有归档历史，暂时无法对比。</div>
+          </div>
+        `;
+      }
+      return `
+        <div class="card" style="padding:14px;">
+          <div class="board-head">
+            <div>
+              <h3 style="margin:0;">前一日 vs 当前日</h3>
+              <p>${escapeHtml(previousMeta.capture_date || "-")} 对比 ${escapeHtml(meta.capture_date || "-")}</p>
+            </div>
+          </div>
+          <div class="compare-grid">
+            <div class="compare-card">
+              <div class="label">最低上榜值变化</div>
+              <div class="value">${escapeHtml(previousBoard.current_floor_value_text || "-")} → ${escapeHtml(board.current_floor_value_text || "-")}</div>
+              ${deltaMarkup(board.current_floor_value, previousBoard.current_floor_value)}
+            </div>
+            <div class="compare-card">
+              <div class="label">合格人数变化</div>
+              <div class="value">${escapeHtml(Number(previousBoard.eligible_user_count || 0).toLocaleString())} → ${escapeHtml(Number(board.eligible_user_count || 0).toLocaleString())}</div>
+              ${deltaMarkup(board.eligible_user_count, previousBoard.eligible_user_count, 0, " 人")}
+            </div>
+            <div class="compare-card">
+              <div class="label">门槛榜段末位变化</div>
+              <div class="value">${escapeHtml((previousBoard.segments && previousBoard.segments[0] && previousBoard.segments[0].cutoff_value_text) || "-")} → ${escapeHtml((board.segments && board.segments[0] && board.segments[0].cutoff_value_text) || "-")}</div>
+              ${deltaMarkup(
+                board.segments && board.segments[0] ? board.segments[0].cutoff_value : NaN,
+                previousBoard.segments && previousBoard.segments[0] ? previousBoard.segments[0].cutoff_value : NaN
+              )}
+            </div>
+            <div class="compare-card">
+              <div class="label">榜单更新时间变化</div>
+              <div class="value">${escapeHtml(previousBoard.updated_text || "-")} → ${escapeHtml(board.updated_text || "-")}</div>
+              <div class="delta flat">用于判断官方榜单是否已推进</div>
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function renderHistoryBoard(board, meta = {}, previousBoard = null, previousMeta = {}) {
+      if (!board) {
+        historyBodyEl.innerHTML = `<div class="empty">该日期没有归档数据。</div>`;
+        return;
+      }
+      const capturedAt = meta.captured_at_utc ? fmtDate(meta.captured_at_utc) : "-";
+      historyBodyEl.innerHTML = `
+        ${renderHistoryCompare(board, previousBoard, meta, previousMeta)}
+        <div class="card" style="padding:14px;">
+          <div class="board-head">
+            <div>
+              <h3 style="margin:0;">${escapeHtml(board.label || board.base_label || "历史日榜")}</h3>
+              <p>归档日期：${escapeHtml(meta.capture_date || "-")} · 抓取时间：${escapeHtml(capturedAt)}</p>
+            </div>
+            ${boardPill(board)}
+          </div>
+          <div class="board-meta">
+            <div class="mini">
+              <div class="label">榜单更新时间</div>
+              <div class="value">${escapeHtml(board.updated_text || fmtDate(board.updated_at_utc))}</div>
+            </div>
+            <div class="mini">
+              <div class="label">合格人数</div>
+              <div class="value">${escapeHtml(Number(board.eligible_user_count || 0).toLocaleString())}</div>
+            </div>
+            <div class="mini">
+              <div class="label">${board.rows_truncated ? "当日奖励区末位值" : "当日最低上榜值"}</div>
+              <div class="value">${escapeHtml(board.current_floor_value_text || "-")}</div>
+            </div>
+            <div class="mini">
+              <div class="label">榜单字段</div>
+              <div class="value">${escapeHtml(board.metric_label || "-")}</div>
+            </div>
+          </div>
+          <div class="two-cols">
+            <div>
+              <div class="meta" style="margin-bottom:8px;">当日奖励段与门槛</div>
+              ${segmentRows(board)}
+            </div>
+            <div>
+              <div class="meta" style="margin-bottom:8px;">当日前十</div>
+              ${topRows(board)}
+            </div>
+          </div>
+        </div>
+      `;
+    }
+
+    function closeHistoryModal() {
+      historyModalEl.classList.remove("open");
+      historyModalEl.setAttribute("aria-hidden", "true");
+      historyBodyEl.innerHTML = "";
+      historyDatesEl.innerHTML = "";
+      historyState = { boardKey: "", selectedDate: "", loading: false };
+    }
+
+    function closeTrendModal() {
+      trendModalEl.classList.remove("open");
+      trendModalEl.setAttribute("aria-hidden", "true");
+      trendBodyEl.innerHTML = "";
+      trendState = { boardKey: "", loading: false };
+    }
+
+    async function openBoardHistory(boardKey, captureDate = "") {
+      if (!boardKey) return;
+      historyState = { boardKey, selectedDate: captureDate, loading: true };
+      historyModalEl.classList.add("open");
+      historyModalEl.setAttribute("aria-hidden", "false");
+      historyTitleEl.textContent = "日榜历史";
+      historyMetaEl.textContent = "正在加载归档数据...";
+      historyDatesEl.innerHTML = "";
+      historyBodyEl.innerHTML = `<div class="empty">正在加载该交易赛的历史快照...</div>`;
+      try {
+        const url = captureDate
+          ? `${apiBase}/api/competition_board_history?board_key=${encodeURIComponent(boardKey)}&date=${encodeURIComponent(captureDate)}`
+          : `${apiBase}/api/competition_board_history?board_key=${encodeURIComponent(boardKey)}`;
+        const resp = await fetch(url);
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          throw new Error(data.error || `请求失败(${resp.status})`);
+        }
+        const payload = data.history || {};
+        const board = payload.history && payload.history.board ? payload.history.board : null;
+        const meta = payload.record || {};
+        const dateList = Array.isArray(payload.available_dates) ? payload.available_dates : [];
+        const currentIndex = dateList.indexOf(payload.selected_date);
+        const previousDate = currentIndex >= 0 ? dateList[currentIndex + 1] || "" : "";
+        let previousBoard = null;
+        let previousMeta = {};
+        if (previousDate) {
+          const previousResp = await fetch(`${apiBase}/api/competition_board_history?board_key=${encodeURIComponent(boardKey)}&date=${encodeURIComponent(previousDate)}`);
+          const previousData = await previousResp.json();
+          if (previousResp.ok && previousData.ok) {
+            const previousPayload = previousData.history || {};
+            previousBoard = previousPayload.history && previousPayload.history.board ? previousPayload.history.board : null;
+            previousMeta = previousPayload.record || {};
+          }
+        }
+        historyState = { boardKey, selectedDate: payload.selected_date || "", loading: false };
+        historyTitleEl.textContent = board && board.label ? `${board.label} 日榜历史` : "日榜历史";
+        historyMetaEl.textContent = dateList && dateList.length
+          ? `已归档 ${dateList.length} 天，点击日期可切换查看每日榜单快照，并对比前一日门槛变化。`
+          : "还没有归档到历史日榜。";
+        historyDatesEl.innerHTML = dateList.map((dateText) => `
+          <button type="button" class="history-date-btn ${dateText === payload.selected_date ? "active" : ""}" data-history-date="${escapeHtml(dateText)}">
+            ${escapeHtml(dateText)}
+          </button>
+        `).join("");
+        historyDatesEl.querySelectorAll("button[data-history-date]").forEach((btn) => {
+          btn.addEventListener("click", () => openBoardHistory(boardKey, btn.dataset.historyDate || ""));
+        });
+        renderHistoryBoard(board, meta, previousBoard, previousMeta);
+      } catch (err) {
+        historyMetaEl.textContent = "历史数据加载失败。";
+        historyBodyEl.innerHTML = `<div class="empty">${escapeHtml(err.message || "加载失败")}</div>`;
+      }
+    }
+
+    async function openBoardTrend(boardKey) {
+      if (!boardKey) return;
+      trendState = { boardKey, loading: true };
+      trendModalEl.classList.add("open");
+      trendModalEl.setAttribute("aria-hidden", "false");
+      trendTitleEl.textContent = "按天趋势";
+      trendMetaEl.textContent = "正在加载按天趋势数据...";
+      trendBodyEl.innerHTML = `<div class="empty">正在整理该交易赛的按天趋势...</div>`;
+      try {
+        const resp = await fetch(`${apiBase}/api/competition_board_trend?board_key=${encodeURIComponent(boardKey)}&granularity=daily`);
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          throw new Error(data.error || `请求失败(${resp.status})`);
+        }
+        const trend = data.trend || {};
+        trendState = { boardKey, loading: false };
+        trendTitleEl.textContent = `${trend.label || boardKey} 按天趋势`;
+        trendMetaEl.textContent = `按日聚合每个自然日最后一次归档快照，展示总交易量与关键排名门槛变化。`;
+        renderTrendContent(trend);
+      } catch (err) {
+        trendMetaEl.textContent = "趋势数据加载失败。";
+        trendBodyEl.innerHTML = `<div class="empty">${escapeHtml(err.message || "加载失败")}</div>`;
+      }
     }
 
     function updateSnapshotMeta() {
@@ -2013,6 +3938,8 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         renderSummary(snapshot);
         renderBoards();
         renderEntryBoardOptions();
+        renderForecastBoardOptions();
+        renderForecastEntryOptions();
         renderEntries();
         updateSnapshotMeta();
         setStatus(`完成：现货 ${snapshot.markets.spot.length} 个榜单，合约 ${snapshot.markets.futures.length} 个榜单。`);
@@ -2037,6 +3964,8 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         if (data.snapshot) {
           snapshot = data.snapshot;
           renderSummary(snapshot);
+          renderForecastBoardOptions();
+          renderForecastEntryOptions();
           renderEntries();
           updateSnapshotMeta();
         } else {
@@ -2049,25 +3978,116 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     }
 
     refreshBtn.addEventListener("click", () => loadSnapshot(true));
+    historyCloseBtn.addEventListener("click", closeHistoryModal);
+    trendCloseBtn.addEventListener("click", closeTrendModal);
+    historyModalEl.addEventListener("click", (event) => {
+      if (event.target === historyModalEl) {
+        closeHistoryModal();
+      }
+    });
+    trendModalEl.addEventListener("click", (event) => {
+      if (event.target === trendModalEl) {
+        closeTrendModal();
+      }
+    });
+    document.addEventListener("keydown", (event) => {
+      if (event.key === "Escape" && historyModalEl.classList.contains("open")) {
+        closeHistoryModal();
+      }
+      if (event.key === "Escape" && trendModalEl.classList.contains("open")) {
+        closeTrendModal();
+      }
+    });
+    function bindBoardHistoryEvents(container) {
+      container.addEventListener("click", (event) => {
+        const card = event.target.closest(".board-card[data-board-key]");
+        if (!card || event.target.closest("a, button")) return;
+        openBoardHistory(card.dataset.boardKey || "");
+      });
+      container.addEventListener("keydown", (event) => {
+        const card = event.target.closest(".board-card[data-board-key]");
+        if (!card) return;
+        if (event.key === "Enter" || event.key === " ") {
+          event.preventDefault();
+          openBoardHistory(card.dataset.boardKey || "");
+        }
+      });
+    }
+    function bindBoardTrendButtons(container) {
+      container.addEventListener("click", (event) => {
+        const button = event.target.closest("button[data-trend-board-key]");
+        if (!button) return;
+        event.preventDefault();
+        event.stopPropagation();
+        openBoardTrend(button.dataset.trendBoardKey || "");
+      });
+    }
+    bindBoardHistoryEvents(spotBoardsEl);
+    bindBoardHistoryEvents(futuresBoardsEl);
+    bindBoardHistoryEvents(endedBoardsEl);
+    bindBoardTrendButtons(spotBoardsEl);
+    bindBoardTrendButtons(futuresBoardsEl);
+    bindBoardTrendButtons(endedBoardsEl);
     entrySaveBtn.addEventListener("click", async () => {
       const boardKey = entryBoardEl.value.trim();
       const name = entryNameEl.value.trim();
       const value = Number(entryValueEl.value);
       const note = entryNoteEl.value.trim();
+      const isEditing = Boolean(editingEntryId);
       if (!boardKey || !name || !Number.isFinite(value) || value < 0) {
         setStatus("请完整填写榜单、姓名和当前数值。", true);
         return;
       }
       entrySaveBtn.disabled = true;
-      setStatus("正在保存录入...");
+      entryCancelBtn.disabled = true;
+      setStatus(isEditing ? "正在更新录入..." : "正在保存录入...");
       try {
-        await saveEntry({ action: "upsert", board_key: boardKey, name, value, note });
-        entryNameEl.value = "";
-        entryValueEl.value = "";
-        entryNoteEl.value = "";
-        setStatus("录入已保存。");
+        await saveEntry({ action: "upsert", id: editingEntryId || undefined, board_key: boardKey, name, value, note });
+        resetEntryForm();
+        setStatus(isEditing ? "录入已更新。" : "录入已保存。");
       } finally {
         entrySaveBtn.disabled = false;
+        entryCancelBtn.disabled = false;
+      }
+    });
+    entryCancelBtn.addEventListener("click", () => {
+      resetEntryForm();
+      setStatus("已取消编辑。");
+    });
+    forecastBoardEl.addEventListener("change", () => {
+      renderForecastEntryOptions();
+    });
+    forecastRunBtn.addEventListener("click", async () => {
+      const boardKey = forecastBoardEl.value.trim();
+      const nextDayVolume = Number(forecastNextVolumeEl.value);
+      const entryId = forecastEntryEl.value.trim();
+      if (!boardKey || !Number.isFinite(nextDayVolume) || nextDayVolume < 0) {
+        setStatus("请先选择榜单并填写预计下一天交易量。", true);
+        return;
+      }
+      forecastRunBtn.disabled = true;
+      forecastBodyEl.innerHTML = `<div class="empty">正在预测次日榜单变化...</div>`;
+      try {
+        const resp = await fetch(`${apiBase}/api/competition_forecast`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            board_key: boardKey,
+            next_day_volume: nextDayVolume,
+            entry_id: entryId || undefined,
+          }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) {
+          throw new Error(data.error || `请求失败(${resp.status})`);
+        }
+        renderForecastResult(data.forecast || {});
+        setStatus("次日榜单预测已更新。");
+      } catch (err) {
+        forecastBodyEl.innerHTML = `<div class="empty">${escapeHtml(err.message || "预测失败")}</div>`;
+        setStatus(`预测失败：${err.message}`, true);
+      } finally {
+        forecastRunBtn.disabled = false;
       }
     });
 

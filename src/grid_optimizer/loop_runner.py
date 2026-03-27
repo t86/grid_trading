@@ -296,6 +296,11 @@ def _is_short_entry_order(order: dict[str, Any]) -> bool:
     return role in {"bootstrap_short", "entry_short"}
 
 
+def _is_short_take_profit_order(order: dict[str, Any]) -> bool:
+    role = _order_role(order)
+    return role in {"take_profit_short"}
+
+
 def _is_synthetic_neutral_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "synthetic_neutral"
 
@@ -865,12 +870,106 @@ def apply_hedge_position_controls(
     }
 
 
+def apply_short_cover_pause(
+    *,
+    plan: dict[str, Any],
+    current_short_qty: float,
+    active: bool,
+    reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    pause_reasons = list(reasons or [])
+    short_cover_paused = bool(active) and max(float(current_short_qty), 0.0) > 0
+    if short_cover_paused:
+        plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_short_take_profit_order(item)]
+    return {
+        "short_cover_paused": short_cover_paused,
+        "short_cover_pause_reasons": pause_reasons if short_cover_paused else [],
+    }
+
+
+def apply_short_cover_lift(
+    *,
+    plan: dict[str, Any],
+    current_short_qty: float,
+    short_paused: bool,
+    mid_price: float,
+    center_price: float,
+    step_price: float,
+    bid_price: float,
+    tick_size: float | None,
+    trigger_steps: int | None,
+    shift_steps: int | None,
+) -> dict[str, Any]:
+    result = {
+        "short_cover_lift_active": False,
+        "short_cover_lift_steps": 0,
+        "short_cover_lift_reasons": [],
+    }
+    safe_trigger_steps = max(int(trigger_steps or 0), 0)
+    safe_shift_steps = max(int(shift_steps or 0), 0)
+    safe_step_price = max(float(step_price), 0.0)
+    if (
+        not short_paused
+        or max(float(current_short_qty), 0.0) <= 0.0
+        or safe_trigger_steps <= 0
+        or safe_shift_steps <= 0
+        or safe_step_price <= 0
+    ):
+        return result
+
+    drift_steps = (float(mid_price) - float(center_price)) / safe_step_price
+    if drift_steps < float(safe_trigger_steps):
+        return result
+
+    shift_count = max(int(math.floor((drift_steps - safe_trigger_steps) / safe_shift_steps)) + 1, 1)
+    price_delta = shift_count * safe_shift_steps * safe_step_price
+    maker_cap = float(bid_price)
+    if tick_size is not None and float(tick_size) > 0:
+        maker_cap = max(float(bid_price) - float(tick_size), 0.0)
+
+    lifted_count = 0
+    updated_buy_orders: list[dict[str, Any]] = []
+    for item in plan.get("buy_orders", []):
+        if not _is_short_take_profit_order(item):
+            updated_buy_orders.append(item)
+            continue
+        original_price = float(item.get("price", 0.0) or 0.0)
+        desired_price = min(original_price + price_delta, maker_cap)
+        if tick_size is not None and float(tick_size) > 0:
+            desired_price = _round_to_nearest_step(desired_price, tick_size)
+            desired_price = min(desired_price, maker_cap)
+        if desired_price > original_price + 1e-12:
+            lifted_count += 1
+        updated_item = dict(item)
+        updated_item["price"] = float(desired_price)
+        updated_buy_orders.append(updated_item)
+
+    plan["buy_orders"] = updated_buy_orders
+    result.update(
+        {
+            "short_cover_lift_active": lifted_count > 0,
+            "short_cover_lift_steps": shift_count if lifted_count > 0 else 0,
+            "short_cover_lift_reasons": (
+                [
+                    f"short_paused drift_steps={drift_steps:.2f} >= trigger_steps={safe_trigger_steps}",
+                    f"lift_shift_steps={safe_shift_steps}",
+                ]
+                if lifted_count > 0
+                else []
+            ),
+        }
+    )
+    return result
+
+
 def assess_market_guard(
     *,
     symbol: str,
     buy_pause_amp_trigger_ratio: float | None,
     buy_pause_down_return_trigger_ratio: float | None,
     freeze_shift_abs_return_trigger_ratio: float | None,
+    short_cover_pause_amp_trigger_ratio: float | None = None,
+    short_cover_pause_down_return_trigger_ratio: float | None = None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     guard = {
@@ -880,13 +979,17 @@ def assess_market_guard(
                 buy_pause_amp_trigger_ratio,
                 buy_pause_down_return_trigger_ratio,
                 freeze_shift_abs_return_trigger_ratio,
+                short_cover_pause_amp_trigger_ratio,
+                short_cover_pause_down_return_trigger_ratio,
             )
         ),
         "available": False,
         "warning": None,
         "buy_pause_active": False,
+        "short_cover_pause_active": False,
         "shift_frozen": False,
         "buy_pause_reasons": [],
+        "short_cover_pause_reasons": [],
         "shift_freeze_reasons": [],
         "candle": None,
         "return_ratio": 0.0,
@@ -924,6 +1027,7 @@ def assess_market_guard(
     amplitude_ratio = ((high_price / low_price) - 1.0) if low_price > 0 else 0.0
 
     buy_pause_reasons: list[str] = []
+    short_cover_pause_reasons: list[str] = []
     shift_freeze_reasons: list[str] = []
     if (
         buy_pause_amp_trigger_ratio is not None
@@ -934,6 +1038,18 @@ def assess_market_guard(
     ):
         buy_pause_reasons.append(
             "1m_extreme_down_candle "
+            f"amp={amplitude_ratio * 100:.2f}% "
+            f"ret={return_ratio * 100:.2f}%"
+        )
+    if (
+        short_cover_pause_amp_trigger_ratio is not None
+        and short_cover_pause_amp_trigger_ratio > 0
+        and short_cover_pause_down_return_trigger_ratio is not None
+        and amplitude_ratio >= short_cover_pause_amp_trigger_ratio
+        and return_ratio <= short_cover_pause_down_return_trigger_ratio
+    ):
+        short_cover_pause_reasons.append(
+            "1m_short_cover_delay "
             f"amp={amplitude_ratio * 100:.2f}% "
             f"ret={return_ratio * 100:.2f}%"
         )
@@ -951,8 +1067,10 @@ def assess_market_guard(
         {
             "available": True,
             "buy_pause_active": bool(buy_pause_reasons),
+            "short_cover_pause_active": bool(short_cover_pause_reasons),
             "shift_frozen": bool(shift_freeze_reasons),
             "buy_pause_reasons": buy_pause_reasons,
+            "short_cover_pause_reasons": short_cover_pause_reasons,
             "shift_freeze_reasons": shift_freeze_reasons,
             "candle": {
                 "open_time": candle.open_time.isoformat(),
@@ -1645,6 +1763,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         buy_pause_amp_trigger_ratio=effective_args.buy_pause_amp_trigger_ratio,
         buy_pause_down_return_trigger_ratio=effective_args.buy_pause_down_return_trigger_ratio,
         freeze_shift_abs_return_trigger_ratio=effective_args.freeze_shift_abs_return_trigger_ratio,
+        short_cover_pause_amp_trigger_ratio=getattr(effective_args, "short_cover_pause_amp_trigger_ratio", None),
+        short_cover_pause_down_return_trigger_ratio=getattr(effective_args, "short_cover_pause_down_return_trigger_ratio", None),
     )
     center_price = float(state["center_price"])
     shift_moves: list[dict[str, Any]] = []
@@ -2099,17 +2219,19 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         target_base_qty = 0.0
         bootstrap_qty = 0.0
     elif _is_one_way_short_mode(strategy_mode):
-        inventory_tier = {
-            "enabled": False,
-            "active": False,
-            "ratio": 0.0,
-            "start_notional": None,
-            "end_notional": None,
-            "effective_buy_levels": effective_args.buy_levels,
-            "effective_sell_levels": effective_args.sell_levels,
-            "effective_per_order_notional": effective_args.per_order_notional,
-            "effective_base_position_notional": effective_args.base_position_notional,
-        }
+        inventory_tier = apply_inventory_tiering(
+            current_long_notional=current_short_notional,
+            buy_levels=effective_args.buy_levels,
+            sell_levels=effective_args.sell_levels,
+            per_order_notional=effective_args.per_order_notional,
+            base_position_notional=effective_args.base_position_notional,
+            tier_start_notional=effective_args.inventory_tier_start_notional,
+            tier_end_notional=effective_args.inventory_tier_end_notional,
+            tier_buy_levels=effective_args.inventory_tier_buy_levels,
+            tier_sell_levels=effective_args.inventory_tier_sell_levels,
+            tier_per_order_notional=effective_args.inventory_tier_per_order_notional,
+            tier_base_position_notional=effective_args.inventory_tier_base_position_notional,
+        )
         plan = build_short_micro_grid_plan(
             center_price=center_price,
             step_price=effective_args.step_price,
@@ -2144,6 +2266,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             external_long_pause=False,
             external_pause_reasons=[],
         )
+        short_cover_controls = apply_short_cover_pause(
+            plan=plan,
+            current_short_qty=current_short_qty,
+            active=bool(market_guard.get("short_cover_pause_active")),
+            reasons=list(market_guard.get("short_cover_pause_reasons", [])),
+        )
+        short_cover_lift = apply_short_cover_lift(
+            plan=plan,
+            current_short_qty=current_short_qty,
+            short_paused=bool(controls.get("short_paused")),
+            mid_price=mid_price,
+            center_price=center_price,
+            step_price=effective_args.step_price,
+            bid_price=bid_price,
+            tick_size=symbol_info.get("tick_size"),
+            trigger_steps=getattr(effective_args, "short_cover_lift_trigger_steps", None),
+            shift_steps=getattr(effective_args, "short_cover_lift_shift_steps", None),
+        )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
             current_long_notional=0.0,
@@ -2154,6 +2294,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
         )
+        controls.update(short_cover_controls)
+        controls.update(short_cover_lift)
         target_base_qty = 0.0
         bootstrap_qty = 0.0
     else:
@@ -2310,6 +2452,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "pause_reasons": controls["pause_reasons"],
         "short_paused": bool(controls.get("short_paused")),
         "short_pause_reasons": list(controls.get("short_pause_reasons", [])),
+        "short_cover_paused": bool(controls.get("short_cover_paused")),
+        "short_cover_pause_reasons": list(controls.get("short_cover_pause_reasons", [])),
+        "short_cover_lift_active": bool(controls.get("short_cover_lift_active")),
+        "short_cover_lift_steps": int(controls.get("short_cover_lift_steps", 0) or 0),
+        "short_cover_lift_reasons": list(controls.get("short_cover_lift_reasons", [])),
         "buy_cap_applied": cap_controls["cap_applied"],
         "buy_budget_notional": cap_controls["buy_budget_notional"],
         "planned_buy_notional": cap_controls["planned_buy_notional"],
@@ -2393,6 +2540,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "max_position_notional": _safe_float(plan_report.get("max_position_notional")),
             "short_paused": bool(plan_report.get("short_paused")),
             "short_pause_reasons": list(plan_report.get("short_pause_reasons", [])),
+            "short_cover_paused": bool(plan_report.get("short_cover_paused")),
+            "short_cover_pause_reasons": list(plan_report.get("short_cover_pause_reasons", [])),
+            "short_cover_lift_active": bool(plan_report.get("short_cover_lift_active")),
+            "short_cover_lift_steps": int(plan_report.get("short_cover_lift_steps", 0) or 0),
+            "short_cover_lift_reasons": list(plan_report.get("short_cover_lift_reasons", [])),
             "short_cap_applied": bool(plan_report.get("short_cap_applied")),
             "short_budget_notional": _safe_float(plan_report.get("short_budget_notional")),
             "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
@@ -2640,6 +2792,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buy-pause-amp-trigger-ratio", type=float, default=None)
     parser.add_argument("--buy-pause-down-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--freeze-shift-abs-return-trigger-ratio", type=float, default=None)
+    parser.add_argument("--short-cover-pause-amp-trigger-ratio", type=float, default=None)
+    parser.add_argument("--short-cover-pause-down-return-trigger-ratio", type=float, default=None)
+    parser.add_argument("--short-cover-lift-trigger-steps", type=int, default=None)
+    parser.add_argument("--short-cover-lift-shift-steps", type=int, default=None)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -2814,6 +2970,10 @@ def main() -> None:
         raise SystemExit("--buy-pause-down-return-trigger-ratio must be < 0")
     if args.freeze_shift_abs_return_trigger_ratio is not None and args.freeze_shift_abs_return_trigger_ratio <= 0:
         raise SystemExit("--freeze-shift-abs-return-trigger-ratio must be > 0")
+    if args.short_cover_lift_trigger_steps is not None and args.short_cover_lift_trigger_steps <= 0:
+        raise SystemExit("--short-cover-lift-trigger-steps must be > 0")
+    if args.short_cover_lift_shift_steps is not None and args.short_cover_lift_shift_steps <= 0:
+        raise SystemExit("--short-cover-lift-shift-steps must be > 0")
     if args.auto_regime_confirm_cycles <= 0:
         raise SystemExit("--auto-regime-confirm-cycles must be > 0")
     if args.auto_regime_stable_15m_max_amplitude_ratio <= 0 or args.auto_regime_stable_60m_max_amplitude_ratio <= 0:

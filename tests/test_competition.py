@@ -11,11 +11,12 @@ from grid_optimizer.competition import (
 
 
 class CompetitionTests(unittest.TestCase):
-    def test_supported_competition_symbols_include_kat_opn_and_robo(self) -> None:
+    def test_supported_competition_symbols_include_kat_opn_robo_and_bard(self) -> None:
         self.assertEqual(tuple(competition_symbols()), COMPETITION_SYMBOLS)
         self.assertIn("KATUSDT", COMPETITION_SYMBOLS)
         self.assertIn("OPNUSDT", COMPETITION_SYMBOLS)
         self.assertIn("ROBOUSDT", COMPETITION_SYMBOLS)
+        self.assertIn("BARDUSDT", COMPETITION_SYMBOLS)
 
     def test_build_competition_strategy_uses_reference_price_band(self) -> None:
         strategy = build_competition_strategy(reference_price=100.0, profile_key="conservative")

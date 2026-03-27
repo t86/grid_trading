@@ -65,14 +65,14 @@ Competition backtest example:
 ```bash
 cd /Volumes/WORK/binance/wangge
 PYTHONPATH=src python3 -m grid_optimizer.competition_report \
-  --symbols ENSOUSDT,OPNUSDT,ROBOUSDT \
+  --symbols ENSOUSDT,OPNUSDT,ROBOUSDT,BARDUSDT \
   --window-days 3 \
   --refresh \
   --report-json output/competition_3d_report.json
 ```
 
 Notes:
-- Competition templates currently support `ENSOUSDT`, `OPNUSDT`, `ROBOUSDT`.
+- Competition templates currently support `ENSOUSDT`, `OPNUSDT`, `ROBOUSDT`, `KATUSDT`, `BARDUSDT`.
 - Competition backtests default to `1m` candles.
 - `conservative` template uses current close `±3%` with `n=20`.
 - `aggressive` template uses current close `±4%` with `n=25`.

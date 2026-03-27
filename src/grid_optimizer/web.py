@@ -35,14 +35,22 @@ from .backtest import (
 )
 from .competition_board import (
     COMPETITION_BOARD_PAGE,
+    build_competition_board_forecast,
     build_competition_board_snapshot,
     delete_competition_entry,
+    load_competition_board_history,
+    load_competition_board_trend,
+    start_competition_board_history_scheduler,
     upsert_competition_entry,
 )
 from .data import (
     cache_file_path,
+    delete_futures_order,
     delete_spot_order,
+    fetch_futures_account_info_v3,
     fetch_spot_account_info,
+    fetch_futures_open_orders,
+    fetch_futures_position_mode,
     fetch_spot_latest_price,
     fetch_spot_open_orders,
     fetch_spot_symbol_config,
@@ -60,6 +68,7 @@ from .data import (
     fetch_futures_latest_price,
     fetch_futures_premium_index,
     fetch_futures_symbol_config,
+    post_futures_order,
     fetch_recent_funding_records,
     fetch_spot_book_tickers,
     fetch_spot_klines,
@@ -78,6 +87,7 @@ from .data import (
     parse_interval_ms,
     read_latest_cached_close,
 )
+from .dry_run import _round_order_price, _round_order_qty
 from .monitor import (
     RUNNER_CONTROL_PATH,
     RUNNER_LOG_PATH,
@@ -88,6 +98,7 @@ from .monitor import (
     runner_control_path_for_symbol,
     runner_log_path_for_symbol,
     runner_pid_path_for_symbol,
+    summarize_hourly_metrics,
 )
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
 from .types import Candle
@@ -111,7 +122,7 @@ GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
 STABLE_SPOT_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD")
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
-MONITOR_SYMBOL_OPTIONS = ("NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT")
+MONITOR_SYMBOL_OPTIONS = ("NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT", "BARDUSDT")
 CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     "volume_long_v4": {
@@ -202,6 +213,120 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "auto_regime_defensive_60m_amplitude_ratio": 0.08,
             "auto_regime_defensive_15m_return_ratio": -0.015,
             "auto_regime_defensive_60m_return_ratio": -0.03,
+        },
+    },
+    "volume_short_v1": {
+        "label": "量优先做空 v1",
+        "description": "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "step_price": 0.00002,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 70.0,
+            "base_position_notional": 420.0,
+            "up_trigger_steps": 3,
+            "down_trigger_steps": 4,
+            "shift_steps": 3,
+            "pause_short_position_notional": 900.0,
+            "max_short_position_notional": 900.0,
+            "inventory_tier_start_notional": 600.0,
+            "inventory_tier_end_notional": 750.0,
+            "inventory_tier_buy_levels": 12,
+            "inventory_tier_sell_levels": 4,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 280.0,
+            "sleep_seconds": 10.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0055,
+            "short_cover_pause_down_return_trigger_ratio": -0.0025,
+        },
+    },
+    "volume_short_v1_aggressive": {
+        "label": "量优先做空 v1（激进）",
+        "description": "激进空头滚动微网格。沿用 OPN 的高量空头参数，适合明显弱势下跌窗口，优先提升成交量。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "step_price": 0.00002,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 70.0,
+            "base_position_notional": 420.0,
+            "up_trigger_steps": 3,
+            "down_trigger_steps": 4,
+            "shift_steps": 3,
+            "pause_short_position_notional": 900.0,
+            "max_short_position_notional": 900.0,
+            "inventory_tier_start_notional": 600.0,
+            "inventory_tier_end_notional": 750.0,
+            "inventory_tier_buy_levels": 12,
+            "inventory_tier_sell_levels": 4,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 280.0,
+            "sleep_seconds": 10.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0055,
+            "short_cover_pause_down_return_trigger_ratio": -0.0025,
+        },
+    },
+    "volume_short_v1_conservative": {
+        "label": "量优先做空 v1（保守）",
+        "description": "保守空头滚动微网格。更轻底仓、更低单笔和更慢追涨开空，适合 NIGHT 这类偏震荡币种试空。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 45.0,
+            "base_position_notional": 180.0,
+            "up_trigger_steps": 5,
+            "down_trigger_steps": 7,
+            "shift_steps": 3,
+            "pause_short_position_notional": 450.0,
+            "max_short_position_notional": 600.0,
+            "inventory_tier_start_notional": 300.0,
+            "inventory_tier_end_notional": 450.0,
+            "inventory_tier_buy_levels": 10,
+            "inventory_tier_sell_levels": 4,
+            "inventory_tier_per_order_notional": 45.0,
+            "inventory_tier_base_position_notional": 90.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0045,
+            "short_cover_pause_down_return_trigger_ratio": -0.002,
+        },
+    },
+    "defensive_quasi_neutral_aggressive_v1": {
+        "label": "准中性降损激进版",
+        "description": "基于 ROBO 最近实盘运行参数固化出的激进准中性版本。仍以做多为主，但提高卖侧卸仓能力、放宽总上限，适合趋势不明时保量控损。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_long",
+            "step_price": 0.00001,
+            "buy_levels": 8,
+            "sell_levels": 16,
+            "per_order_notional": 180.0,
+            "base_position_notional": 300.0,
+            "up_trigger_steps": 6,
+            "down_trigger_steps": 4,
+            "shift_steps": 4,
+            "pause_buy_position_notional": 1200.0,
+            "max_position_notional": 1500.0,
+            "buy_pause_amp_trigger_ratio": 0.0075,
+            "buy_pause_down_return_trigger_ratio": -0.0035,
+            "freeze_shift_abs_return_trigger_ratio": 0.005,
+            "inventory_tier_start_notional": 800.0,
+            "inventory_tier_end_notional": 1200.0,
+            "inventory_tier_buy_levels": 6,
+            "inventory_tier_sell_levels": 18,
+            "inventory_tier_per_order_notional": 180.0,
+            "inventory_tier_base_position_notional": 180.0,
+            "max_new_orders": 30,
+            "max_total_notional": 5000.0,
+            "sleep_seconds": 5.0,
+            "autotune_symbol_enabled": False,
         },
     },
     "volume_neutral_target_v1": {
@@ -331,10 +456,16 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "down_trigger_steps": 4,
     "shift_steps": 4,
     "pause_buy_position_notional": 750.0,
+    "pause_short_position_notional": None,
     "max_position_notional": 900.0,
+    "max_short_position_notional": None,
     "buy_pause_amp_trigger_ratio": 0.0075,
     "buy_pause_down_return_trigger_ratio": -0.0035,
     "freeze_shift_abs_return_trigger_ratio": 0.005,
+    "short_cover_pause_amp_trigger_ratio": None,
+    "short_cover_pause_down_return_trigger_ratio": None,
+    "short_cover_lift_trigger_steps": None,
+    "short_cover_lift_shift_steps": None,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -608,6 +739,8 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "attack_buy_levels": 14,
     "attack_sell_levels": 22,
     "attack_per_order_notional": 20.0,
+    "attack_sell_loss_tolerance_ratio": 0.0,
+    "attack_sell_tight_levels": 0,
     "defense_buy_levels": 8,
     "defense_sell_levels": 20,
     "defense_per_order_notional": 12.0,
@@ -623,6 +756,8 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "inventory_recycle_loss_tolerance_ratio": 0.006,
     "inventory_recycle_min_profit_ratio": 0.001,
     "max_single_cycle_new_orders": 8,
+    "idle_buy1_after_seconds": 15.0,
+    "idle_buy1_levels": 1,
 }
 
 
@@ -834,27 +969,21 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
     preset = _runner_preset_map(requested_symbol).get(normalized)
     if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
-    carry_fields = {
-        "symbol",
-        "margin_type",
-        "leverage",
-        "max_plan_age_seconds",
-        "max_mid_drift_steps",
-        "maker_retries",
-        "sleep_seconds",
-        "cancel_stale",
-        "apply",
-        "reset_state",
-        "state_path",
-        "plan_json",
-        "submit_report_json",
-        "summary_jsonl",
-    }
     config = dict(RUNNER_DEFAULT_CONFIG)
-    for key in carry_fields:
-        if key in (base_config or {}):
-            config[key] = (base_config or {})[key]
+    runtime_fields = {"state_path", "plan_json", "submit_report_json", "summary_jsonl"}
+    base_payload = dict(base_config or {})
+    for key, value in base_payload.items():
+        if key in runtime_fields:
+            continue
+        config[key] = value
+    symbol = str(config.get("symbol", requested_symbol or RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip()
+    config["symbol"] = symbol or str(RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT")).upper().strip()
+    config.update(_default_runtime_paths_for_symbol(config["symbol"]))
     config.update(preset.get("config", {}))
+    for key, value in base_payload.items():
+        if key in runtime_fields:
+            continue
+        config[key] = value
     if preset.get("kind") == "custom_grid":
         preview_params = dict(preset.get("grid_preview_params") or {})
         preview_summary = dict(preset.get("preview_summary") or {})
@@ -1220,6 +1349,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -1244,6 +1375,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_mid_drift_steps",
         "max_total_notional",
         "sleep_seconds",
+        "custom_grid_min_price",
+        "custom_grid_max_price",
+        "custom_grid_total_notional",
+        "custom_grid_neutral_anchor_price",
+        "fixed_center_roll_trigger_steps",
     }
     int_fields = {
         "buy_levels",
@@ -1258,6 +1394,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "neutral_center_interval_minutes",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
+        "custom_grid_n",
+        "fixed_center_roll_confirm_cycles",
+        "fixed_center_roll_shift_steps",
+        "short_cover_lift_trigger_steps",
+        "short_cover_lift_shift_steps",
     }
     bool_fields = {
         "cancel_stale",
@@ -1269,6 +1410,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "fixed_center_roll_enabled",
         "excess_inventory_reduce_only_enabled",
         "autotune_symbol_enabled",
+        "custom_grid_enabled",
     }
     str_fields = {
         "strategy_profile",
@@ -1279,6 +1421,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "plan_json",
         "submit_report_json",
         "summary_jsonl",
+        "custom_grid_direction",
+        "custom_grid_level_mode",
     }
     noneable_fields = {
         "center_price",
@@ -1290,12 +1434,20 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
+        "short_cover_lift_trigger_steps",
+        "short_cover_lift_shift_steps",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
         "inventory_tier_base_position_notional",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
+        "custom_grid_min_price",
+        "custom_grid_max_price",
+        "custom_grid_total_notional",
+        "custom_grid_neutral_anchor_price",
     }
 
     for key, value in payload.items():
@@ -1325,14 +1477,19 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
 
 
 def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
-    config = _normalize_runner_control_payload(payload)
-    profile = str(config.get("strategy_profile", RUNNER_DEFAULT_CONFIG["strategy_profile"])).strip() or RUNNER_DEFAULT_CONFIG["strategy_profile"]
-    preset = _runner_preset_map(str(config.get("symbol", ""))).get(profile)
+    raw_payload = dict(payload or {})
+    requested_symbol = str(raw_payload.get("symbol", "")).upper().strip()
+    profile = (
+        str(raw_payload.get("strategy_profile", RUNNER_DEFAULT_CONFIG["strategy_profile"])).strip()
+        or RUNNER_DEFAULT_CONFIG["strategy_profile"]
+    )
+    preset = _runner_preset_map(requested_symbol).get(profile)
     if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
     if not preset.get("startable", True):
         raise ValueError(f"{preset.get('label', profile)} 当前是模板预设，页面已展示参数，但还不能直接启动。")
-    resolved = _runner_preset_payload(profile, config)
+    resolved = _runner_preset_payload(profile, raw_payload)
+    resolved = _normalize_runner_control_payload(resolved)
     runtime_paths = _default_runtime_paths_for_symbol(str(resolved.get("symbol", "")))
     for key, value in runtime_paths.items():
         if not str(payload.get(key, "")).strip():
@@ -1438,6 +1595,14 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--buy-pause-down-return-trigger-ratio", str(config["buy_pause_down_return_trigger_ratio"])])
     if config.get("freeze_shift_abs_return_trigger_ratio") is not None:
         command.extend(["--freeze-shift-abs-return-trigger-ratio", str(config["freeze_shift_abs_return_trigger_ratio"])])
+    if config.get("short_cover_pause_amp_trigger_ratio") is not None:
+        command.extend(["--short-cover-pause-amp-trigger-ratio", str(config["short_cover_pause_amp_trigger_ratio"])])
+    if config.get("short_cover_pause_down_return_trigger_ratio") is not None:
+        command.extend(["--short-cover-pause-down-return-trigger-ratio", str(config["short_cover_pause_down_return_trigger_ratio"])])
+    if config.get("short_cover_lift_trigger_steps") is not None:
+        command.extend(["--short-cover-lift-trigger-steps", str(config["short_cover_lift_trigger_steps"])])
+    if config.get("short_cover_lift_shift_steps") is not None:
+        command.extend(["--short-cover-lift-shift-steps", str(config["short_cover_lift_shift_steps"])])
     command.append("--auto-regime-enabled" if config.get("auto_regime_enabled", False) else "--no-auto-regime-enabled")
     if config.get("auto_regime_confirm_cycles") is not None:
         command.extend(["--auto-regime-confirm-cycles", str(config["auto_regime_confirm_cycles"])])
@@ -1556,6 +1721,10 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "buy_pause_amp_trigger_ratio",
             "buy_pause_down_return_trigger_ratio",
             "freeze_shift_abs_return_trigger_ratio",
+            "short_cover_pause_amp_trigger_ratio",
+            "short_cover_pause_down_return_trigger_ratio",
+            "short_cover_lift_trigger_steps",
+            "short_cover_lift_shift_steps",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",
@@ -1666,7 +1835,13 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.0) -> dict[str, Any]:
+def _stop_runner_process(
+    symbol: str | None = None,
+    timeout_seconds: float = 10.0,
+    *,
+    cancel_open_orders: bool = False,
+    close_all_positions: bool = False,
+) -> dict[str, Any]:
     normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
     runner = _read_runner_process_for_symbol(normalized_symbol)
     pid_path = _runner_pid_path(normalized_symbol)
@@ -1688,6 +1863,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 "runner": _read_runner_process_for_symbol(normalized_symbol),
                 "service": RUNNER_LAUNCH_AGENT_LABEL,
                 "symbol": normalized_symbol,
+                "post_stop_actions": _execute_stop_actions(
+                    symbol=normalized_symbol,
+                    cancel_open_orders=cancel_open_orders,
+                    close_all_positions=close_all_positions,
+                ),
             }
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(RUNNER_LAUNCH_AGENT_PATH)], check=False)
         time.sleep(1.0)
@@ -1696,6 +1876,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 pid_path.unlink()
             except OSError:
                 pass
+        post_stop_actions = _execute_stop_actions(
+            symbol=normalized_symbol,
+            cancel_open_orders=cancel_open_orders,
+            close_all_positions=close_all_positions,
+        )
         return {
             "stopped": True,
             "killed": False,
@@ -1703,6 +1888,7 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
             "service": RUNNER_LAUNCH_AGENT_LABEL,
             "launch_agent": str(RUNNER_LAUNCH_AGENT_PATH),
             "symbol": normalized_symbol,
+            "post_stop_actions": post_stop_actions,
         }
     if service_name and _runner_service_available(normalized_symbol):
         active = _run_systemctl(["is-active", "--quiet", service_name], check=False).returncode == 0
@@ -1718,6 +1904,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 "runner": _read_runner_process_for_symbol(normalized_symbol),
                 "service": service_name,
                 "symbol": normalized_symbol,
+                "post_stop_actions": _execute_stop_actions(
+                    symbol=normalized_symbol,
+                    cancel_open_orders=cancel_open_orders,
+                    close_all_positions=close_all_positions,
+                ),
             }
         _run_systemctl(["stop", service_name], check=True)
         time.sleep(1.0)
@@ -1726,12 +1917,18 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 pid_path.unlink()
             except OSError:
                 pass
+        post_stop_actions = _execute_stop_actions(
+            symbol=normalized_symbol,
+            cancel_open_orders=cancel_open_orders,
+            close_all_positions=close_all_positions,
+        )
         return {
             "stopped": True,
             "killed": False,
             "runner": _read_runner_process_for_symbol(normalized_symbol),
             "service": service_name,
             "symbol": normalized_symbol,
+            "post_stop_actions": post_stop_actions,
         }
 
     pid = runner.get("pid")
@@ -1746,6 +1943,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
             "already_stopped": True,
             "runner": _read_runner_process_for_symbol(normalized_symbol),
             "symbol": normalized_symbol,
+            "post_stop_actions": _execute_stop_actions(
+                symbol=normalized_symbol,
+                cancel_open_orders=cancel_open_orders,
+                close_all_positions=close_all_positions,
+            ),
         }
 
     os.kill(int(pid), signal.SIGTERM)
@@ -1758,7 +1960,17 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                     pid_path.unlink()
                 except OSError:
                     pass
-            return {"stopped": True, "killed": False, "runner": probe, "symbol": normalized_symbol}
+            return {
+                "stopped": True,
+                "killed": False,
+                "runner": probe,
+                "symbol": normalized_symbol,
+                "post_stop_actions": _execute_stop_actions(
+                    symbol=normalized_symbol,
+                    cancel_open_orders=cancel_open_orders,
+                    close_all_positions=close_all_positions,
+                ),
+            }
         time.sleep(0.25)
 
     os.kill(int(pid), signal.SIGKILL)
@@ -1768,12 +1980,246 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
             pid_path.unlink()
         except OSError:
             pass
+    post_stop_actions = _execute_stop_actions(
+        symbol=normalized_symbol,
+        cancel_open_orders=cancel_open_orders,
+        close_all_positions=close_all_positions,
+    )
     return {
         "stopped": True,
         "killed": True,
         "runner": _read_runner_process_for_symbol(normalized_symbol),
         "symbol": normalized_symbol,
+        "post_stop_actions": post_stop_actions,
     }
+
+
+def _safe_numeric(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_futures_position(
+    account_info: dict[str, Any],
+    symbol: str,
+    position_side: str | None = None,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_side = str(position_side or "").upper().strip()
+    positions = account_info.get("positions", [])
+    if not isinstance(positions, list):
+        return {}
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol", "")).upper().strip() != normalized_symbol:
+            continue
+        if normalized_side and str(item.get("positionSide", "")).upper().strip() != normalized_side:
+            continue
+        return item
+    return {}
+
+
+def _build_stop_execution_summary(
+    *,
+    symbol: str,
+    cancel_open_orders: bool,
+    close_all_positions: bool,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "cancel_open_orders_requested": bool(cancel_open_orders),
+        "close_all_positions_requested": bool(close_all_positions),
+        "cancel_open_orders_executed": False,
+        "close_all_positions_executed": False,
+        "cancel_attempted_count": 0,
+        "cancel_success_count": 0,
+        "cancel_errors": [],
+        "close_attempted_count": 0,
+        "close_submitted_count": 0,
+        "close_errors": [],
+        "close_orders": [],
+        "warnings": [],
+    }
+
+
+def _cancel_symbol_open_orders(*, symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+    result = {"attempted": 0, "success": 0, "errors": []}
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
+    result["attempted"] = len(open_orders)
+    for order in open_orders:
+        order_id = order.get("orderId")
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order_id) if order_id is not None else None,
+                orig_client_order_id=str(order.get("clientOrderId", "")).strip() or None,
+            )
+            result["success"] += 1
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    "order_id": order_id,
+                    "client_order_id": order.get("clientOrderId"),
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return result
+
+
+def _build_close_order_request(
+    *,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    reduce_only: bool | None,
+    position_side: str | None,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "symbol": symbol,
+        "side": side,
+        "quantity": qty,
+        "price": price,
+        "time_in_force": "IOC",
+    }
+    if reduce_only is not None:
+        request["reduce_only"] = reduce_only
+    if position_side:
+        request["position_side"] = position_side
+    return request
+
+
+def _close_symbol_positions_at_top_of_book(*, symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+    result = {"attempted": 0, "submitted": 0, "orders": [], "errors": [], "warnings": []}
+    symbol_info = fetch_futures_symbol_config(symbol)
+    book = fetch_futures_book_tickers(symbol=symbol)
+    if not book:
+        raise RuntimeError(f"{symbol} 缺少盘口数据，无法按买一/卖一平仓")
+    bid_price = _safe_numeric(book[0].get("bid_price"))
+    ask_price = _safe_numeric(book[0].get("ask_price"))
+    if bid_price <= 0 or ask_price <= 0:
+        raise RuntimeError(f"{symbol} 盘口价格无效，无法按买一/卖一平仓")
+    account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    dual_side = str(position_mode.get("dualSidePosition", "")).strip().lower() in {"true", "1", "yes"}
+
+    orders_to_submit: list[dict[str, Any]] = []
+    tick_size = symbol_info.get("tick_size")
+    step_size = symbol_info.get("step_size")
+    min_qty = symbol_info.get("min_qty")
+    min_notional = symbol_info.get("min_notional")
+
+    def _append_close_order(raw_qty: float, *, side: str, price: float, reduce_only: bool | None, position_side: str | None) -> None:
+        rounded_price = _round_order_price(price, tick_size, side)
+        rounded_qty = _round_order_qty(abs(raw_qty), step_size)
+        if rounded_qty <= 0:
+            result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓数量向下取整后为 0，已跳过")
+            return
+        if min_qty is not None and rounded_qty < float(min_qty):
+            result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓数量低于最小数量，已跳过")
+            return
+        if min_notional is not None and rounded_qty * rounded_price < float(min_notional):
+            result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓名义低于最小下单额，已跳过")
+            return
+        orders_to_submit.append(
+            _build_close_order_request(
+                symbol=symbol,
+                side=side,
+                qty=rounded_qty,
+                price=rounded_price,
+                reduce_only=reduce_only,
+                position_side=position_side,
+            )
+        )
+
+    if dual_side:
+        long_position = _extract_futures_position(account_info, symbol, "LONG")
+        short_position = _extract_futures_position(account_info, symbol, "SHORT")
+        long_qty = _safe_numeric(long_position.get("positionAmt"))
+        short_qty = abs(_safe_numeric(short_position.get("positionAmt")))
+        if long_qty > 0:
+            _append_close_order(long_qty, side="SELL", price=bid_price, reduce_only=None, position_side="LONG")
+        if short_qty > 0:
+            _append_close_order(short_qty, side="BUY", price=ask_price, reduce_only=None, position_side="SHORT")
+    else:
+        both_position = _extract_futures_position(account_info, symbol)
+        position_amt = _safe_numeric(both_position.get("positionAmt"))
+        if position_amt > 0:
+            _append_close_order(position_amt, side="SELL", price=bid_price, reduce_only=True, position_side=None)
+        elif position_amt < 0:
+            _append_close_order(abs(position_amt), side="BUY", price=ask_price, reduce_only=True, position_side=None)
+
+    result["attempted"] = len(orders_to_submit)
+    for order_request in orders_to_submit:
+        try:
+            response = post_futures_order(
+                symbol=order_request["symbol"],
+                side=order_request["side"],
+                quantity=order_request["quantity"],
+                price=order_request["price"],
+                api_key=api_key,
+                api_secret=api_secret,
+                time_in_force=order_request["time_in_force"],
+                reduce_only=order_request.get("reduce_only"),
+                position_side=order_request.get("position_side"),
+            )
+            result["submitted"] += 1
+            result["orders"].append(
+                {
+                    **order_request,
+                    "order_id": response.get("orderId"),
+                    "client_order_id": response.get("clientOrderId"),
+                }
+            )
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    **order_request,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return result
+
+
+def _execute_stop_actions(
+    *,
+    symbol: str,
+    cancel_open_orders: bool,
+    close_all_positions: bool,
+) -> dict[str, Any]:
+    summary = _build_stop_execution_summary(
+        symbol=symbol,
+        cancel_open_orders=cancel_open_orders,
+        close_all_positions=close_all_positions,
+    )
+    if not cancel_open_orders and not close_all_positions:
+        return summary
+    if close_all_positions and not cancel_open_orders:
+        summary["warnings"].append("未勾选撤销委托时直接平仓，旧挂单可能继续成交")
+    creds = load_binance_api_credentials()
+    if not creds:
+        raise RuntimeError("未加载 Binance API 凭据，无法执行撤单/平仓")
+    api_key, api_secret = creds
+    if cancel_open_orders:
+        cancel_result = _cancel_symbol_open_orders(symbol=symbol, api_key=api_key, api_secret=api_secret)
+        summary["cancel_open_orders_executed"] = True
+        summary["cancel_attempted_count"] = cancel_result["attempted"]
+        summary["cancel_success_count"] = cancel_result["success"]
+        summary["cancel_errors"] = cancel_result["errors"]
+    if close_all_positions:
+        close_result = _close_symbol_positions_at_top_of_book(symbol=symbol, api_key=api_key, api_secret=api_secret)
+        summary["close_all_positions_executed"] = True
+        summary["close_attempted_count"] = close_result["attempted"]
+        summary["close_submitted_count"] = close_result["submitted"]
+        summary["close_orders"] = close_result["orders"]
+        summary["close_errors"] = close_result["errors"]
+        summary["warnings"].extend(close_result["warnings"])
+    return summary
 
 
 def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1797,6 +2243,17 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
     attack_per_order_notional = _safe_float(
         payload.get("attack_per_order_notional", SPOT_RUNNER_DEFAULT_CONFIG["attack_per_order_notional"]),
         "attack_per_order_notional",
+    )
+    attack_sell_loss_tolerance_ratio = _safe_float(
+        payload.get(
+            "attack_sell_loss_tolerance_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["attack_sell_loss_tolerance_ratio"],
+        ),
+        "attack_sell_loss_tolerance_ratio",
+    )
+    attack_sell_tight_levels = _safe_int(
+        payload.get("attack_sell_tight_levels", SPOT_RUNNER_DEFAULT_CONFIG["attack_sell_tight_levels"]),
+        "attack_sell_tight_levels",
     )
     defense_buy_levels = _safe_int(payload.get("defense_buy_levels", SPOT_RUNNER_DEFAULT_CONFIG["defense_buy_levels"]), "defense_buy_levels")
     defense_sell_levels = _safe_int(payload.get("defense_sell_levels", SPOT_RUNNER_DEFAULT_CONFIG["defense_sell_levels"]), "defense_sell_levels")
@@ -1864,6 +2321,14 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("max_single_cycle_new_orders", SPOT_RUNNER_DEFAULT_CONFIG["max_single_cycle_new_orders"]),
         "max_single_cycle_new_orders",
     )
+    idle_buy1_after_seconds = _safe_float(
+        payload.get("idle_buy1_after_seconds", SPOT_RUNNER_DEFAULT_CONFIG["idle_buy1_after_seconds"]),
+        "idle_buy1_after_seconds",
+    )
+    idle_buy1_levels = _safe_int(
+        payload.get("idle_buy1_levels", SPOT_RUNNER_DEFAULT_CONFIG["idle_buy1_levels"]),
+        "idle_buy1_levels",
+    )
 
     if grid_level_mode not in set(supported_grid_level_modes()):
         raise ValueError(
@@ -1887,6 +2352,10 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("buy/sell levels must be > 0")
     if attack_per_order_notional <= 0 or defense_per_order_notional <= 0:
         raise ValueError("per_order_notional must be > 0")
+    if attack_sell_loss_tolerance_ratio < 0:
+        raise ValueError("attack_sell_loss_tolerance_ratio must be >= 0")
+    if attack_sell_tight_levels < 0:
+        raise ValueError("attack_sell_tight_levels must be >= 0")
     if inventory_soft_limit_notional <= 0 or inventory_hard_limit_notional <= 0:
         raise ValueError("inventory limits must be > 0")
     if inventory_soft_limit_notional > inventory_hard_limit_notional:
@@ -1895,6 +2364,10 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("center shift params must be > 0")
     if max_single_cycle_new_orders <= 0:
         raise ValueError("max_single_cycle_new_orders must be > 0")
+    if idle_buy1_after_seconds < 0:
+        raise ValueError("idle_buy1_after_seconds must be >= 0")
+    if idle_buy1_levels < 0:
+        raise ValueError("idle_buy1_levels must be >= 0")
     _validate_market_symbol(symbol=symbol, market_type="spot", contract_type=None)
 
     config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
@@ -1916,6 +2389,8 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "attack_buy_levels": attack_buy_levels,
             "attack_sell_levels": attack_sell_levels,
             "attack_per_order_notional": attack_per_order_notional,
+            "attack_sell_loss_tolerance_ratio": attack_sell_loss_tolerance_ratio,
+            "attack_sell_tight_levels": attack_sell_tight_levels,
             "defense_buy_levels": defense_buy_levels,
             "defense_sell_levels": defense_sell_levels,
             "defense_per_order_notional": defense_per_order_notional,
@@ -1931,6 +2406,8 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_loss_tolerance_ratio": inventory_recycle_loss_tolerance_ratio,
             "inventory_recycle_min_profit_ratio": inventory_recycle_min_profit_ratio,
             "max_single_cycle_new_orders": max_single_cycle_new_orders,
+            "idle_buy1_after_seconds": idle_buy1_after_seconds,
+            "idle_buy1_levels": idle_buy1_levels,
         }
     )
     config.update(_default_spot_runtime_paths_for_symbol(symbol))
@@ -1970,6 +2447,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--attack-buy-levels", config.get("attack_buy_levels")),
         ("--attack-sell-levels", config.get("attack_sell_levels")),
         ("--attack-per-order-notional", config.get("attack_per_order_notional")),
+        ("--attack-sell-loss-tolerance-ratio", config.get("attack_sell_loss_tolerance_ratio")),
+        ("--attack-sell-tight-levels", config.get("attack_sell_tight_levels")),
         ("--defense-buy-levels", config.get("defense_buy_levels")),
         ("--defense-sell-levels", config.get("defense_sell_levels")),
         ("--defense-per-order-notional", config.get("defense_per_order_notional")),
@@ -1985,6 +2464,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--inventory-recycle-loss-tolerance-ratio", config.get("inventory_recycle_loss_tolerance_ratio")),
         ("--inventory-recycle-min-profit-ratio", config.get("inventory_recycle_min_profit_ratio")),
         ("--max-single-cycle-new-orders", config.get("max_single_cycle_new_orders")),
+        ("--idle-buy1-after-seconds", config.get("idle_buy1_after_seconds")),
+        ("--idle-buy1-levels", config.get("idle_buy1_levels")),
     ]
     for flag, value in extra_args:
         if value is not None:
@@ -2048,6 +2529,8 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "attack_buy_levels",
             "attack_sell_levels",
             "attack_per_order_notional",
+            "attack_sell_loss_tolerance_ratio",
+            "attack_sell_tight_levels",
             "defense_buy_levels",
             "defense_sell_levels",
             "defense_per_order_notional",
@@ -2063,6 +2546,8 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_loss_tolerance_ratio",
             "inventory_recycle_min_profit_ratio",
             "max_single_cycle_new_orders",
+            "idle_buy1_after_seconds",
+            "idle_buy1_levels",
         }
         config_changed = any(current_config.get(field) != config.get(field) for field in compare_fields)
         if not config_changed:
@@ -2179,6 +2664,250 @@ def _stop_spot_runner_process(
     }
 
 
+def _build_spot_hourly_summary(
+    *,
+    symbol: str,
+    recent_trades: list[dict[str, Any]],
+    hourly_buckets: dict[str, Any] | None,
+    trade_count_total: int,
+) -> tuple[dict[str, Any] | None, str | None]:
+    persisted_buckets: dict[datetime, dict[str, Any]] = {}
+    if isinstance(hourly_buckets, dict):
+        for key, value in hourly_buckets.items():
+            if not isinstance(value, dict):
+                continue
+            try:
+                hour_start_ms = int(value.get("hour_start_ms", key) or 0)
+            except (TypeError, ValueError):
+                hour_start_ms = 0
+            if hour_start_ms <= 0:
+                continue
+            hour_start = datetime.fromtimestamp(hour_start_ms / 1000, tz=timezone.utc).replace(
+                minute=0,
+                second=0,
+                microsecond=0,
+            )
+            try:
+                gross_notional = float(value.get("gross_notional", 0) or 0)
+            except (TypeError, ValueError):
+                gross_notional = 0.0
+            try:
+                buy_notional = float(value.get("buy_notional", 0) or 0)
+            except (TypeError, ValueError):
+                buy_notional = 0.0
+            try:
+                sell_notional = float(value.get("sell_notional", 0) or 0)
+            except (TypeError, ValueError):
+                sell_notional = 0.0
+            try:
+                trade_count = int(value.get("trade_count", 0) or 0)
+            except (TypeError, ValueError):
+                trade_count = 0
+            try:
+                buy_count = int(value.get("buy_count", 0) or 0)
+            except (TypeError, ValueError):
+                buy_count = 0
+            try:
+                sell_count = int(value.get("sell_count", 0) or 0)
+            except (TypeError, ValueError):
+                sell_count = 0
+            try:
+                realized_pnl = float(value.get("realized_pnl", 0) or 0)
+            except (TypeError, ValueError):
+                realized_pnl = 0.0
+            try:
+                commission = abs(float(value.get("commission", 0) or 0))
+            except (TypeError, ValueError):
+                commission = 0.0
+            try:
+                funding_fee = float(value.get("funding_fee", 0) or 0)
+            except (TypeError, ValueError):
+                funding_fee = 0.0
+            persisted_buckets[hour_start] = {
+                "hour_start": hour_start.isoformat(),
+                "gross_notional": gross_notional,
+                "buy_notional": buy_notional,
+                "sell_notional": sell_notional,
+                "trade_count": trade_count,
+                "buy_count": buy_count,
+                "sell_count": sell_count,
+                "realized_pnl": realized_pnl,
+                "commission": commission,
+                "funding_fee": funding_fee,
+                "open_price": 0.0,
+                "close_price": 0.0,
+                "high_price": 0.0,
+                "low_price": 0.0,
+                "return_ratio": 0.0,
+                "amplitude_ratio": 0.0,
+            }
+
+    now = datetime.now(timezone.utc)
+    if persisted_buckets:
+        earliest_bucket = min(persisted_buckets.keys())
+        window_start = min(earliest_bucket, now - timedelta(hours=24))
+        window_start = window_start.replace(minute=0, second=0, microsecond=0)
+        window_end = now + timedelta(minutes=1)
+        candles = fetch_spot_klines(
+            symbol=symbol,
+            interval="1h",
+            start_ms=int(window_start.timestamp() * 1000),
+            end_ms=int(window_end.timestamp() * 1000),
+            limit=72,
+        )
+        rows_by_hour = {
+            hour_start: dict(bucket)
+            for hour_start, bucket in persisted_buckets.items()
+        }
+        for candle in sorted(candles, key=lambda item: item.open_time):
+            hour_start = candle.open_time.replace(minute=0, second=0, microsecond=0)
+            row = rows_by_hour.setdefault(
+                hour_start,
+                {
+                    "hour_start": hour_start.isoformat(),
+                    "gross_notional": 0.0,
+                    "buy_notional": 0.0,
+                    "sell_notional": 0.0,
+                    "trade_count": 0,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "realized_pnl": 0.0,
+                    "commission": 0.0,
+                    "funding_fee": 0.0,
+                    "open_price": 0.0,
+                    "close_price": 0.0,
+                    "high_price": 0.0,
+                    "low_price": 0.0,
+                    "return_ratio": 0.0,
+                    "amplitude_ratio": 0.0,
+                },
+            )
+            row["open_price"] = float(candle.open)
+            row["close_price"] = float(candle.close)
+            row["high_price"] = float(candle.high)
+            row["low_price"] = float(candle.low)
+            row["return_ratio"] = (float(candle.close) / float(candle.open) - 1.0) if float(candle.open) > 0 else 0.0
+            row["amplitude_ratio"] = (float(candle.high) / float(candle.low) - 1.0) if float(candle.low) > 0 else 0.0
+
+        rows: list[dict[str, Any]] = []
+        for hour_start in sorted(rows_by_hour.keys(), reverse=True):
+            row = dict(rows_by_hour[hour_start])
+            gross_notional = float(row.get("gross_notional", 0.0) or 0.0)
+            row["net_after_fees_and_funding"] = (
+                float(row.get("realized_pnl", 0.0) or 0.0)
+                + float(row.get("funding_fee", 0.0) or 0.0)
+            )
+            row["loss_per_10k"] = (
+                row["net_after_fees_and_funding"] / gross_notional * 10000.0
+                if gross_notional > 0
+                else 0.0
+            )
+            rows.append(row)
+
+        limited_rows = rows[:24]
+        return (
+            {
+                "rows": limited_rows,
+                "row_count": len(limited_rows),
+                "available_hours": len(rows),
+                "trade_sample_count": max(sum(int(row.get("trade_count", 0) or 0) for row in rows), 0),
+                "trade_total_count": max(int(trade_count_total), 0),
+                "sample_truncated": False,
+                "source_label": "小时成交基于持久化策略状态",
+            },
+            None,
+        )
+
+    normalized_trades: list[dict[str, Any]] = []
+    for item in recent_trades[-100:]:
+        if not isinstance(item, dict):
+            continue
+        try:
+            trade_time_ms = int(item.get("time", 0) or 0)
+        except (TypeError, ValueError):
+            trade_time_ms = 0
+        try:
+            price = float(item.get("price", 0) or 0)
+        except (TypeError, ValueError):
+            price = 0.0
+        try:
+            qty = float(item.get("qty", 0) or 0)
+        except (TypeError, ValueError):
+            qty = 0.0
+        if trade_time_ms <= 0 or price <= 0 or qty <= 0:
+            continue
+        try:
+            commission = abs(float(item.get("commission_quote", item.get("commission", 0)) or 0))
+        except (TypeError, ValueError):
+            commission = 0.0
+        try:
+            realized_pnl = float(item.get("realized_pnl", item.get("realizedPnl", 0)) or 0)
+        except (TypeError, ValueError):
+            realized_pnl = 0.0
+        normalized_trades.append(
+            {
+                "time": trade_time_ms,
+                "price": price,
+                "qty": qty,
+                "side": str(item.get("side", "")).upper().strip(),
+                "realizedPnl": realized_pnl,
+                "commission": commission,
+            }
+        )
+    if normalized_trades:
+        first_trade_dt = datetime.fromtimestamp(
+            min(int(item["time"]) for item in normalized_trades) / 1000,
+            tz=timezone.utc,
+        )
+        window_start = min(first_trade_dt, now - timedelta(hours=24))
+    else:
+        window_start = now - timedelta(hours=24)
+    window_start = window_start.replace(minute=0, second=0, microsecond=0)
+    window_end = now + timedelta(minutes=1)
+    candles = fetch_spot_klines(
+        symbol=symbol,
+        interval="1h",
+        start_ms=int(window_start.timestamp() * 1000),
+        end_ms=int(window_end.timestamp() * 1000),
+        limit=72,
+    )
+    summary = summarize_hourly_metrics(
+        normalized_trades,
+        [],
+        candles,
+        limit=24,
+    )
+    for row in summary.get("rows", []) or []:
+        if not isinstance(row, dict):
+            continue
+        gross_notional = float(row.get("gross_notional", 0.0) or 0.0)
+        row["net_after_fees_and_funding"] = (
+            float(row.get("realized_pnl", 0.0) or 0.0)
+            + float(row.get("funding_fee", 0.0) or 0.0)
+        )
+        row["loss_per_10k"] = (
+            row["net_after_fees_and_funding"] / gross_notional * 10000.0
+            if gross_notional > 0
+            else 0.0
+        )
+    trade_sample_count = len(normalized_trades)
+    sample_truncated = trade_count_total > trade_sample_count
+    summary["trade_sample_count"] = trade_sample_count
+    summary["trade_total_count"] = max(int(trade_count_total), trade_sample_count)
+    summary["sample_truncated"] = sample_truncated
+    summary["source_label"] = (
+        f"小时成交基于最近 {trade_sample_count} 笔策略成交"
+        if sample_truncated
+        else "小时成交基于当前策略成交记录"
+    )
+    warning = (
+        f"小时损益拆解当前仅覆盖最近 {trade_sample_count} 笔策略成交"
+        if sample_truncated and trade_sample_count > 0
+        else None
+    )
+    return summary, warning
+
+
 def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
     config = _load_spot_runner_control_config(symbol)
     normalized_symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
@@ -2222,6 +2951,9 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
     recent_trades = metrics.get("recent_trades")
     if not isinstance(recent_trades, list):
         recent_trades = []
+    hourly_buckets = metrics.get("hourly_buckets")
+    if not isinstance(hourly_buckets, dict):
+        hourly_buckets = {}
     market_mid_price = None
     if isinstance(latest_event, dict):
         market_mid_price = _float_or_default(latest_event.get("mid_price"), "mid_price")
@@ -2262,6 +2994,7 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
             "recent_trades": recent_trades[-30:],
             "unrealized_pnl": unrealized_pnl,
             "net_pnl_estimate": _float_or_default(metrics.get("realized_pnl"), "realized_pnl") + unrealized_pnl,
+            "scope_label": "",
         },
         "risk_controls": {
             "strategy_mode": str(config.get("strategy_mode", "spot_one_way_long")),
@@ -2281,8 +3014,15 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
         },
         "events": events,
         "latest_event": latest_event,
+        "hourly_summary": None,
         "warnings": [],
     }
+
+    metrics_scope = str(state.get("metrics_scope", "") or "").strip()
+    if metrics_scope == "since_balance_reconcile":
+        scope_label = "成交/收益自最近一次余额对齐后开始统计"
+        snapshot["trade_summary"]["scope_label"] = scope_label
+        snapshot["warnings"].append(scope_label)
 
     try:
         symbol_info = fetch_spot_symbol_config(normalized_symbol)
@@ -2307,6 +3047,18 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
             }
             snapshot["trade_summary"]["unrealized_pnl"] = ((market_mid_price - inventory_avg_cost) * inventory_qty) if inventory_qty > 0 else 0.0
             snapshot["trade_summary"]["net_pnl_estimate"] = snapshot["trade_summary"]["realized_pnl"] + snapshot["trade_summary"]["unrealized_pnl"]
+        try:
+            hourly_summary, hourly_warning = _build_spot_hourly_summary(
+                symbol=normalized_symbol,
+                recent_trades=recent_trades,
+                hourly_buckets=hourly_buckets,
+                trade_count_total=snapshot["trade_summary"]["trade_count"],
+            )
+            snapshot["hourly_summary"] = hourly_summary
+            if hourly_warning:
+                snapshot["warnings"].append(hourly_warning)
+        except Exception as exc:
+            snapshot["warnings"].append(f"hourly_summary_failed: {type(exc).__name__}: {exc}")
         creds = load_binance_api_credentials()
         if creds:
             api_key, api_secret = creds
@@ -2323,10 +3075,17 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
                 "quote_asset": quote_asset,
                 "base_free": base_free,
                 "base_locked": base_locked,
+                "base_total": base_free + base_locked,
                 "quote_free": quote_free,
                 "quote_locked": quote_locked,
+                "quote_total": quote_free + quote_locked,
             }
             snapshot["open_orders"] = strategy_open_orders
+            account_base_total = base_free + base_locked
+            if abs(account_base_total - inventory_qty) > 1e-6:
+                snapshot["warnings"].append(
+                    f"库存口径与账户总持仓暂未完全对齐: 策略={inventory_qty:.8f} 账户={account_base_total:.8f}"
+                )
         else:
             snapshot["warnings"].append("Binance API credentials are missing")
     except Exception as exc:  # pragma: no cover - runtime specific
@@ -3915,6 +4674,15 @@ HTML_PAGE = """<!doctype html>
         min_avg_capital_usage: Number(document.getElementById("min_avg_capital_usage").value),
         top_k: Number(document.getElementById("top_k").value)
       };
+    }
+
+    function extractSpotEditableConfig(config) {
+      const source = config || {};
+      const result = {};
+      SPOT_PARAM_ORDER.forEach((key) => {
+        if (source[key] !== undefined) result[key] = source[key];
+      });
+      return result;
     }
 
     function readRankForm() {
@@ -7115,6 +7883,27 @@ MONITOR_PAGE = """<!doctype html>
       color: #fff;
     }
     .toolbar label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); min-width: 160px; }
+    .toolbar .inline-check {
+      min-width: 220px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      justify-content: center;
+    }
+    .toolbar .inline-check .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .toolbar .inline-check input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+    }
     .toolbar input, .toolbar select {
       height: 38px;
       border-radius: 10px;
@@ -7123,6 +7912,20 @@ MONITOR_PAGE = """<!doctype html>
       background: #fff;
       color: var(--text);
       font-size: 14px;
+    }
+    .config-grid { display: grid; grid-template-columns: 1.1fr 1fr; gap: 12px; }
+    .param-editor {
+      width: 100%;
+      min-height: 360px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      padding: 12px;
+      background: #fff;
+      color: var(--text);
+      font-size: 12px;
+      line-height: 1.5;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      resize: vertical;
     }
     .meta { font-size: 13px; color: var(--muted); }
     .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -7201,6 +8004,7 @@ MONITOR_PAGE = """<!doctype html>
         <a href="/">返回策略测算页</a>
         <a href="/basis">打开现货/合约价差监控</a>
         <a href="/spot_runner">打开现货执行台</a>
+        <a href="/strategy_backtest">打开回测页</a>
         <a href="/rankings">打开排行榜</a>
         <a href="/strategies">打开策略总览</a>
       </div>
@@ -7211,6 +8015,7 @@ MONITOR_PAGE = """<!doctype html>
             <option value="OPNUSDT">OPNUSDT</option>
             <option value="ROBOUSDT">ROBOUSDT</option>
             <option value="KATUSDT">KATUSDT</option>
+            <option value="BARDUSDT">BARDUSDT</option>
           </select>
         </label>
         <label>刷新秒数
@@ -7223,6 +8028,18 @@ MONITOR_PAGE = """<!doctype html>
         <button id="toggle_btn">暂停自动刷新</button>
         <button id="start_strategy_btn" class="primary">启动策略</button>
         <button id="stop_strategy_btn">停止策略</button>
+        <label class="inline-check" title="停止策略后撤销当前交易对全部未成交委托">
+          <span class="check-row">
+            <input id="stop_cancel_orders" type="checkbox" />
+            <span>停止时撤销全部委托</span>
+          </span>
+        </label>
+        <label class="inline-check" title="停止策略后按买一/卖一提交 IOC 平仓单，尽快平掉当前交易对全部仓位">
+          <span class="check-row">
+            <input id="stop_close_positions" type="checkbox" />
+            <span>停止时按买一/卖一平仓</span>
+          </span>
+        </label>
       </div>
       <div id="meta" class="meta">等待首轮数据...</div>
       <div id="strategy_action_meta" class="meta"></div>
@@ -7292,6 +8109,35 @@ MONITOR_PAGE = """<!doctype html>
           </thead>
           <tbody id="custom_grid_preview_body"></tbody>
         </table>
+      </div>
+    </section>
+
+    <section class="card">
+      <div class="panel-title">
+        <h2>策略参数</h2>
+        <div class="tiny">列出当前运行参数，并支持直接编辑后重启当前币种策略</div>
+      </div>
+      <div class="toolbar">
+        <button id="load_running_params_btn">载入当前运行参数</button>
+        <button id="load_preset_params_btn">载入已选预设参数</button>
+        <button id="apply_params_btn" class="primary">应用参数并重启</button>
+      </div>
+      <div id="runner_params_meta" class="meta">先加载监控数据，再决定是用当前运行参数还是已选预设参数作为编辑基线。</div>
+      <div class="config-grid">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>参数</th>
+                <th>当前值</th>
+              </tr>
+            </thead>
+            <tbody id="runner_params_body"></tbody>
+          </table>
+        </div>
+        <div>
+          <textarea id="runner_params_editor" class="param-editor" spellcheck="false"></textarea>
+        </div>
       </div>
     </section>
 
@@ -7440,6 +8286,8 @@ MONITOR_PAGE = """<!doctype html>
     const strategyPresetEl = document.getElementById("strategy_preset");
     const startStrategyBtn = document.getElementById("start_strategy_btn");
     const stopStrategyBtn = document.getElementById("stop_strategy_btn");
+    const stopCancelOrdersEl = document.getElementById("stop_cancel_orders");
+    const stopClosePositionsEl = document.getElementById("stop_close_positions");
     const strategyActionMetaEl = document.getElementById("strategy_action_meta");
     const strategyPresetMetaEl = document.getElementById("strategy_preset_meta");
     const customGridNameEl = document.getElementById("custom_grid_name");
@@ -7458,6 +8306,12 @@ MONITOR_PAGE = """<!doctype html>
     const customGridStatusEl = document.getElementById("custom_grid_status");
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
+    const loadRunningParamsBtn = document.getElementById("load_running_params_btn");
+    const loadPresetParamsBtn = document.getElementById("load_preset_params_btn");
+    const applyParamsBtn = document.getElementById("apply_params_btn");
+    const runnerParamsMetaEl = document.getElementById("runner_params_meta");
+    const runnerParamsBody = document.getElementById("runner_params_body");
+    const runnerParamsEditorEl = document.getElementById("runner_params_editor");
     const LOCAL_STRATEGY_PRESETS = [
       {
         key: "volume_long_v4",
@@ -7478,6 +8332,8 @@ MONITOR_PAGE = """<!doctype html>
           buy_pause_amp_trigger_ratio: 0.0075,
           buy_pause_down_return_trigger_ratio: -0.0035,
           freeze_shift_abs_return_trigger_ratio: 0.005,
+          short_cover_pause_amp_trigger_ratio: 0.0055,
+          short_cover_pause_down_return_trigger_ratio: -0.0025,
           inventory_tier_start_notional: 600.0,
           inventory_tier_end_notional: 750.0,
           inventory_tier_buy_levels: 4,
@@ -7532,6 +8388,8 @@ MONITOR_PAGE = """<!doctype html>
           buy_pause_amp_trigger_ratio: 0.0075,
           buy_pause_down_return_trigger_ratio: -0.0035,
           freeze_shift_abs_return_trigger_ratio: 0.005,
+          short_cover_pause_amp_trigger_ratio: 0.0055,
+          short_cover_pause_down_return_trigger_ratio: -0.0025,
           inventory_tier_start_notional: 600.0,
           inventory_tier_end_notional: 750.0,
           inventory_tier_buy_levels: 4,
@@ -7547,6 +8405,120 @@ MONITOR_PAGE = """<!doctype html>
           auto_regime_defensive_60m_amplitude_ratio: 0.08,
           auto_regime_defensive_15m_return_ratio: -0.015,
           auto_regime_defensive_60m_return_ratio: -0.03,
+        },
+      },
+      {
+        key: "volume_short_v1",
+        label: "量优先做空 v1",
+        description: "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_short",
+          step_price: 0.00002,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 70.0,
+          base_position_notional: 420.0,
+          up_trigger_steps: 3,
+          down_trigger_steps: 4,
+          shift_steps: 3,
+          pause_short_position_notional: 900.0,
+          max_short_position_notional: 900.0,
+          inventory_tier_start_notional: 600.0,
+          inventory_tier_end_notional: 750.0,
+          inventory_tier_buy_levels: 12,
+          inventory_tier_sell_levels: 4,
+          inventory_tier_per_order_notional: 70.0,
+          inventory_tier_base_position_notional: 280.0,
+          sleep_seconds: 10.0,
+        },
+      },
+      {
+        key: "volume_short_v1_aggressive",
+        label: "量优先做空 v1（激进）",
+        description: "激进空头滚动微网格。沿用 OPN 的高量空头参数，适合明显弱势下跌窗口，优先提升成交量。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_short",
+          step_price: 0.00002,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 70.0,
+          base_position_notional: 420.0,
+          up_trigger_steps: 3,
+          down_trigger_steps: 4,
+          shift_steps: 3,
+          pause_short_position_notional: 900.0,
+          max_short_position_notional: 900.0,
+          inventory_tier_start_notional: 600.0,
+          inventory_tier_end_notional: 750.0,
+          inventory_tier_buy_levels: 12,
+          inventory_tier_sell_levels: 4,
+          inventory_tier_per_order_notional: 70.0,
+          inventory_tier_base_position_notional: 280.0,
+          sleep_seconds: 10.0,
+        },
+      },
+      {
+        key: "volume_short_v1_conservative",
+        label: "量优先做空 v1（保守）",
+        description: "保守空头滚动微网格。更轻底仓、更低单笔和更慢追涨开空，适合 NIGHT 这类偏震荡币种试空。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_short",
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 45.0,
+          base_position_notional: 180.0,
+          up_trigger_steps: 5,
+          down_trigger_steps: 7,
+          shift_steps: 3,
+          pause_short_position_notional: 450.0,
+          max_short_position_notional: 600.0,
+          inventory_tier_start_notional: 300.0,
+          inventory_tier_end_notional: 450.0,
+          inventory_tier_buy_levels: 10,
+          inventory_tier_sell_levels: 4,
+          inventory_tier_per_order_notional: 45.0,
+          inventory_tier_base_position_notional: 90.0,
+          short_cover_pause_amp_trigger_ratio: 0.0045,
+          short_cover_pause_down_return_trigger_ratio: -0.002,
+        },
+      },
+      {
+        key: "defensive_quasi_neutral_aggressive_v1",
+        label: "准中性降损激进版",
+        description: "基于 ROBO 最近实盘运行参数固化出的激进准中性版本。仍以做多为主，但提高卖侧卸仓能力、放宽总上限，适合趋势不明时保量控损。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_long",
+          step_price: 0.00001,
+          buy_levels: 8,
+          sell_levels: 16,
+          per_order_notional: 180.0,
+          base_position_notional: 300.0,
+          up_trigger_steps: 6,
+          down_trigger_steps: 4,
+          shift_steps: 4,
+          pause_buy_position_notional: 1200.0,
+          max_position_notional: 1500.0,
+          buy_pause_amp_trigger_ratio: 0.0075,
+          buy_pause_down_return_trigger_ratio: -0.0035,
+          freeze_shift_abs_return_trigger_ratio: 0.005,
+          inventory_tier_start_notional: 800.0,
+          inventory_tier_end_notional: 1200.0,
+          inventory_tier_buy_levels: 6,
+          inventory_tier_sell_levels: 18,
+          inventory_tier_per_order_notional: 180.0,
+          inventory_tier_base_position_notional: 180.0,
+          max_new_orders: 30,
+          max_total_notional: 5000.0,
+          sleep_seconds: 5.0,
+          autotune_symbol_enabled: false,
         },
       },
       {
@@ -7704,12 +8676,206 @@ MONITOR_PAGE = """<!doctype html>
       return preset && preset.custom ? preset : null;
     }
 
+    function formatStopActionSummary(summary) {
+      if (!summary) return "";
+      const parts = [];
+      if (summary.cancel_open_orders_requested) {
+        parts.push(`撤单 ${fmtNum(summary.cancel_success_count || 0, 0)} / ${fmtNum(summary.cancel_attempted_count || 0, 0)}`);
+      }
+      if (summary.close_all_positions_requested) {
+        parts.push(`平仓单 ${fmtNum(summary.close_submitted_count || 0, 0)} / ${fmtNum(summary.close_attempted_count || 0, 0)}`);
+      }
+      if (summary.warnings && summary.warnings.length) {
+        parts.push(`提示: ${summary.warnings.join("；")}`);
+      }
+      if (summary.cancel_errors && summary.cancel_errors.length) {
+        parts.push(`撤单错误 ${summary.cancel_errors.length}`);
+      }
+      if (summary.close_errors && summary.close_errors.length) {
+        parts.push(`平仓错误 ${summary.close_errors.length}`);
+      }
+      return parts.join(" · ");
+    }
+
     function syncCustomGridActionButtons() {
       const selectedCustom = getSelectedCustomPreset();
       const hasCustom = Boolean(selectedCustom);
       customGridLoadBtn.disabled = strategyActionPending || !hasCustom;
       customGridUpdateBtn.disabled = strategyActionPending || !hasCustom;
       customGridDeleteBtn.disabled = strategyActionPending || !hasCustom;
+    }
+
+    const RUNNER_PARAM_LABELS = {
+      strategy_profile: "策略标识",
+      strategy_mode: "策略模式",
+      symbol: "交易对",
+      step_price: "步长",
+      buy_levels: "买格",
+      sell_levels: "卖格",
+      per_order_notional: "单笔名义",
+      base_position_notional: "底仓目标名义",
+      up_trigger_steps: "上移触发格数",
+      down_trigger_steps: "下移触发格数",
+      shift_steps: "每次移动格数",
+      pause_buy_position_notional: "软停买阈值",
+      pause_short_position_notional: "软停空阈值",
+      max_position_notional: "多仓硬上限",
+      max_short_position_notional: "空仓硬上限",
+      buy_pause_amp_trigger_ratio: "分钟停买振幅阈值",
+      buy_pause_down_return_trigger_ratio: "分钟停买跌幅阈值",
+      freeze_shift_abs_return_trigger_ratio: "冻结移轴阈值",
+      short_cover_pause_amp_trigger_ratio: "急跌停回补振幅阈值",
+      short_cover_pause_down_return_trigger_ratio: "急跌停回补跌幅阈值",
+      short_cover_lift_trigger_steps: "停空后回补上抬触发格数",
+      short_cover_lift_shift_steps: "停空后回补上抬步长",
+      inventory_tier_start_notional: "分层起点名义",
+      inventory_tier_end_notional: "分层终点名义",
+      inventory_tier_buy_levels: "分层买格",
+      inventory_tier_sell_levels: "分层卖格",
+      inventory_tier_per_order_notional: "分层单笔名义",
+      inventory_tier_base_position_notional: "分层底仓目标",
+      center_price: "固定中心价",
+      fixed_center_enabled: "固定中心开关",
+      fixed_center_roll_enabled: "固定中心滚动开关",
+      fixed_center_roll_trigger_steps: "固定中心滚动触发格数",
+      fixed_center_roll_confirm_cycles: "固定中心滚动确认轮次",
+      fixed_center_roll_shift_steps: "固定中心滚动步长",
+      excess_inventory_reduce_only_enabled: "超额先减仓",
+      autotune_symbol_enabled: "自动按币种调步长",
+      auto_regime_enabled: "自适应开关",
+      auto_regime_confirm_cycles: "自适应确认轮次",
+      neutral_center_interval_minutes: "中性中心周期(分)",
+      neutral_band1_offset_ratio: "中性档1偏移",
+      neutral_band2_offset_ratio: "中性档2偏移",
+      neutral_band3_offset_ratio: "中性档3偏移",
+      neutral_band1_target_ratio: "中性档1目标",
+      neutral_band2_target_ratio: "中性档2目标",
+      neutral_band3_target_ratio: "中性档3目标",
+      neutral_hourly_scale_enabled: "中性小时缩放",
+      neutral_hourly_scale_stable: "稳定缩放",
+      neutral_hourly_scale_transition: "过渡缩放",
+      neutral_hourly_scale_defensive: "防守缩放",
+      custom_grid_enabled: "自定义网格开关",
+      custom_grid_direction: "自定义方向",
+      custom_grid_level_mode: "自定义网格模式",
+      custom_grid_min_price: "自定义最低价",
+      custom_grid_max_price: "自定义最高价",
+      custom_grid_n: "自定义网格数",
+      custom_grid_total_notional: "自定义总名义",
+      custom_grid_neutral_anchor_price: "中性锚点价",
+      margin_type: "保证金模式",
+      leverage: "杠杆",
+      max_plan_age_seconds: "计划最大年龄(秒)",
+      max_mid_drift_steps: "最大中价漂移格数",
+      maker_retries: "Maker 重试次数",
+      max_new_orders: "单轮最大新单数",
+      max_total_notional: "单轮最大总名义",
+      sleep_seconds: "循环秒数",
+      cancel_stale: "撤陈旧单",
+      apply: "真实执行",
+      reset_state: "启动时重置状态",
+    };
+
+    const RUNNER_PARAM_ORDER = [
+      "strategy_profile", "strategy_mode", "symbol",
+      "step_price", "buy_levels", "sell_levels", "per_order_notional", "base_position_notional",
+      "up_trigger_steps", "down_trigger_steps", "shift_steps",
+      "pause_buy_position_notional", "pause_short_position_notional",
+      "max_position_notional", "max_short_position_notional",
+      "buy_pause_amp_trigger_ratio", "buy_pause_down_return_trigger_ratio", "freeze_shift_abs_return_trigger_ratio",
+      "short_cover_pause_amp_trigger_ratio", "short_cover_pause_down_return_trigger_ratio",
+      "short_cover_lift_trigger_steps", "short_cover_lift_shift_steps",
+      "inventory_tier_start_notional", "inventory_tier_end_notional", "inventory_tier_buy_levels",
+      "inventory_tier_sell_levels", "inventory_tier_per_order_notional", "inventory_tier_base_position_notional",
+      "center_price", "fixed_center_enabled", "fixed_center_roll_enabled",
+      "fixed_center_roll_trigger_steps", "fixed_center_roll_confirm_cycles", "fixed_center_roll_shift_steps",
+      "excess_inventory_reduce_only_enabled", "autotune_symbol_enabled",
+      "auto_regime_enabled", "auto_regime_confirm_cycles",
+      "neutral_center_interval_minutes", "neutral_band1_offset_ratio", "neutral_band2_offset_ratio",
+      "neutral_band3_offset_ratio", "neutral_band1_target_ratio", "neutral_band2_target_ratio",
+      "neutral_band3_target_ratio", "neutral_hourly_scale_enabled", "neutral_hourly_scale_stable",
+      "neutral_hourly_scale_transition", "neutral_hourly_scale_defensive",
+      "custom_grid_enabled", "custom_grid_direction", "custom_grid_level_mode",
+      "custom_grid_min_price", "custom_grid_max_price", "custom_grid_n",
+      "custom_grid_total_notional", "custom_grid_neutral_anchor_price",
+      "margin_type", "leverage", "max_plan_age_seconds", "max_mid_drift_steps",
+      "maker_retries", "max_new_orders", "max_total_notional", "sleep_seconds",
+      "cancel_stale", "apply", "reset_state",
+    ];
+
+    function extractRunnerEditableConfig(rawConfig) {
+      const cfg = rawConfig || {};
+      const result = {};
+      RUNNER_PARAM_ORDER.forEach((key) => {
+        if (Object.prototype.hasOwnProperty.call(cfg, key) && cfg[key] !== undefined) {
+          result[key] = cfg[key];
+        }
+      });
+      return result;
+    }
+
+    function renderRunnerParams(data) {
+      const runnerCfg = (((data || {}).runner || {}).config) || {};
+      const config = extractRunnerEditableConfig(runnerCfg);
+      const keys = Object.keys(config);
+      if (!keys.length) {
+        runnerParamsBody.innerHTML = '<tr><td colspan="2" class="empty">当前还没有可显示的运行参数</td></tr>';
+        return;
+      }
+      runnerParamsBody.innerHTML = keys.map((key) => `
+        <tr>
+          <td>${escapeHtml(RUNNER_PARAM_LABELS[key] || key)}</td>
+          <td>${escapeHtml(typeof config[key] === "object" ? JSON.stringify(config[key]) : String(config[key]))}</td>
+        </tr>
+      `).join("");
+    }
+
+    function loadRunnerParamsIntoEditor(config, sourceLabel) {
+      const payload = extractRunnerEditableConfig(config || {});
+      if (!payload.symbol) payload.symbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      if (!payload.strategy_profile) {
+        const selectedPreset = getPresetByKey(strategyPresetEl.value);
+        payload.strategy_profile = selectedPreset ? selectedPreset.key : ((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
+      }
+      runnerParamsEditorEl.value = JSON.stringify(payload, null, 2);
+      runnerParamsMetaEl.textContent = `${sourceLabel}已载入参数编辑器。修改后点“应用参数并重启”。`;
+    }
+
+    async function applyRunnerParams() {
+      const symbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      let payload = {};
+      try {
+        payload = JSON.parse(runnerParamsEditorEl.value || "{}");
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `参数 JSON 解析失败: ${err}`;
+        return;
+      }
+      payload.symbol = symbol;
+      if (!payload.strategy_profile) {
+        const selectedPreset = getPresetByKey(strategyPresetEl.value);
+        payload.strategy_profile = selectedPreset ? selectedPreset.key : ((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
+      }
+      strategyActionPending = true;
+      startStrategyBtn.disabled = true;
+      stopStrategyBtn.disabled = true;
+      applyParamsBtn.disabled = true;
+      runnerParamsMetaEl.textContent = `正在应用 ${symbol} 参数并重启...`;
+      try {
+        const resp = await fetch("/api/runner/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        runnerParamsMetaEl.textContent = `参数已应用${data.restarted ? "（已重启）" : ""}。`;
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `应用失败: ${err}`;
+      } finally {
+        strategyActionPending = false;
+        applyParamsBtn.disabled = false;
+        await loadMonitor();
+      }
     }
 
     function populatePresetOptions(data) {
@@ -8082,6 +9248,7 @@ MONITOR_PAGE = """<!doctype html>
       startStrategyBtn.disabled = strategyActionPending || Boolean(selectedPreset && !selectedPreset.startable);
       startStrategyBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
       stopStrategyBtn.disabled = strategyActionPending || !Boolean(runner.is_running);
+      applyParamsBtn.disabled = strategyActionPending;
     }
 
     function renderPosition(data) {
@@ -8307,6 +9474,7 @@ MONITOR_PAGE = """<!doctype html>
         latestMonitorData = data;
         populatePresetOptions(data);
         renderCards(data);
+        renderRunnerParams(data);
         renderPosition(data);
         renderOpenOrders(data);
         renderHourlyStats(data);
@@ -8341,7 +9509,11 @@ MONITOR_PAGE = """<!doctype html>
               symbol: selectedSymbol,
               strategy_profile: selectedPreset ? selectedPreset.key : ((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4"),
             }
-          : { symbol: selectedSymbol };
+          : {
+              symbol: selectedSymbol,
+              cancel_open_orders: Boolean(stopCancelOrdersEl && stopCancelOrdersEl.checked),
+              close_all_positions: Boolean(stopClosePositionsEl && stopClosePositionsEl.checked),
+            };
         const resp = await fetch(`/api/runner/${action}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -8351,7 +9523,7 @@ MONITOR_PAGE = """<!doctype html>
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         strategyActionMetaEl.textContent = action === "start"
           ? `策略已启动${data.restarted ? "（已重启应用新配置）" : (data.already_running ? "（已在运行）" : "")}`
-          : `策略已停止${data.already_stopped ? "（原本就未运行）" : ""}`;
+          : `策略已停止${data.already_stopped ? "（原本就未运行）" : ""}${formatStopActionSummary(data.post_stop_actions) ? ` · ${formatStopActionSummary(data.post_stop_actions)}` : ""}`;
       } catch (err) {
         strategyActionMetaEl.textContent = `${action === "start" ? "启动" : "停止"}失败: ${err}`;
       } finally {
@@ -8379,6 +9551,26 @@ MONITOR_PAGE = """<!doctype html>
     });
     startStrategyBtn.addEventListener("click", () => controlStrategy("start"));
     stopStrategyBtn.addEventListener("click", () => controlStrategy("stop"));
+    loadRunningParamsBtn.addEventListener("click", () => {
+      const runnerCfg = ((((latestMonitorData || {}).runner || {}).config) || {});
+      loadRunnerParamsIntoEditor(runnerCfg, "已从当前运行策略");
+    });
+    loadPresetParamsBtn.addEventListener("click", () => {
+      const selectedPreset = getPresetByKey(strategyPresetEl.value);
+      if (!selectedPreset) {
+        runnerParamsMetaEl.textContent = "请先选择一个策略预设。";
+        return;
+      }
+      loadRunnerParamsIntoEditor(
+        {
+          ...(selectedPreset.config || {}),
+          symbol: symbolEl.value.trim().toUpperCase() || "NIGHTUSDT",
+          strategy_profile: selectedPreset.key,
+        },
+        "已从已选预设"
+      );
+    });
+    applyParamsBtn.addEventListener("click", applyRunnerParams);
     refreshSecEl.addEventListener("change", restartTimer);
     strategyPresetEl.addEventListener("change", () => renderPresetMeta(latestMonitorData));
     customGridPreviewBtn.addEventListener("click", runCustomGridPreview);
@@ -8496,6 +9688,25 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     .bad { color: var(--bad); }
     .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
     .table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 12px; }
+    .config-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .param-editor {
+      width: 100%;
+      min-height: 360px;
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: #fff;
+      color: var(--text);
+      font-family: "SFMono-Regular", "JetBrains Mono", monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      resize: vertical;
+    }
     .fields {
       display: grid;
       grid-template-columns: repeat(5, minmax(0, 1fr));
@@ -8533,6 +9744,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       .summary { grid-template-columns: repeat(3, minmax(0, 1fr)); }
       .fields { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .grid-2 { grid-template-columns: 1fr; }
+      .config-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
       .summary, .fields, .preview-summary { grid-template-columns: 1fr; }
@@ -8547,6 +9759,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       <p>隔离于现有合约 runner。支持 `Spot V1 单向做多静态网格` 与 `现货量优先移中心` 两种模式，页面直接展示累计成交额、已实现收益、回收损耗、库存与停买状态。</p>
       <div class="header-links">
         <a href="/">返回测算页</a>
+        <a href="/strategy_backtest">打开回测页</a>
         <a href="/monitor">打开合约实盘监控</a>
         <a href="/basis">打开现货/合约价差监控</a>
         <a href="/spot_strategies">打开现货总览</a>
@@ -8607,6 +9820,9 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         <label>攻击单笔金额
           <input id="attack_per_order_notional" type="number" min="0.01" step="0.01" />
         </label>
+        <label>攻击卖损/贴盘口层
+          <input id="attack_sell_tight_settings" type="text" />
+        </label>
         <label>防守买/卖格
           <input id="defense_levels" type="text" />
         </label>
@@ -8630,6 +9846,30 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         <span id="status" class="meta">等待状态加载...</span>
       </div>
       <p class="hint">说明：现货量优先移中心模式会根据成交和库存动态调整买卖；停止时只撤掉这个 spot runner 自己挂出的单，不会碰你账户里的其他现货委托。</p>
+    </section>
+
+    <section class="card">
+      <h2>策略参数</h2>
+      <div class="toolbar">
+        <button id="load_running_params_btn">载入当前参数</button>
+        <button id="load_form_params_btn">载入表单参数</button>
+        <button id="apply_params_btn" class="primary">应用参数并重启</button>
+      </div>
+      <div id="spot_runner_params_meta" class="meta">等待现货 runner 参数...</div>
+      <div class="config-grid">
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>参数</th>
+                <th>当前值</th>
+              </tr>
+            </thead>
+            <tbody id="spot_runner_params_body"></tbody>
+          </table>
+        </div>
+        <textarea id="spot_runner_params_editor" class="param-editor" spellcheck="false"></textarea>
+      </div>
     </section>
 
     <section class="card">
@@ -8702,6 +9942,30 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
+      <h2>小时损益拆解</h2>
+      <p id="hourly_meta" class="hint">最近 24 小时 · 现货口径下已实现已含手续费，净收益 = 已实现 + 资金费（现货通常为 0）</p>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>小时</th>
+              <th>成交额</th>
+              <th>笔数</th>
+              <th>净收益(现货=已实现)</th>
+              <th>已实现(含手续费)</th>
+              <th>手续费(信息列)</th>
+              <th>资金费</th>
+              <th>小时涨跌</th>
+              <th>小时振幅</th>
+              <th>买/卖成交额</th>
+            </tr>
+          </thead>
+          <tbody id="hourly_body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card">
       <h2>最近循环</h2>
       <div class="table-wrap">
         <table>
@@ -8736,6 +10000,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const gridBandRatioEl = document.getElementById("grid_band_ratio");
     const attackLevelsEl = document.getElementById("attack_levels");
     const attackPerOrderNotionalEl = document.getElementById("attack_per_order_notional");
+    const attackSellTightSettingsEl = document.getElementById("attack_sell_tight_settings");
     const defenseLevelsEl = document.getElementById("defense_levels");
     const defensePerOrderNotionalEl = document.getElementById("defense_per_order_notional");
     const inventoryLimitsEl = document.getElementById("inventory_limits");
@@ -8759,13 +10024,68 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const previewBody = document.getElementById("preview_body");
     const ordersBody = document.getElementById("orders_body");
     const tradesBody = document.getElementById("trades_body");
+    const hourlyMetaEl = document.getElementById("hourly_meta");
+    const hourlyBody = document.getElementById("hourly_body");
     const eventsBody = document.getElementById("events_body");
+    const loadRunningParamsBtn = document.getElementById("load_running_params_btn");
+    const loadFormParamsBtn = document.getElementById("load_form_params_btn");
+    const applyParamsBtn = document.getElementById("apply_params_btn");
+    const spotRunnerParamsMetaEl = document.getElementById("spot_runner_params_meta");
+    const spotRunnerParamsBody = document.getElementById("spot_runner_params_body");
+    const spotRunnerParamsEditorEl = document.getElementById("spot_runner_params_editor");
 
     let latestSnapshot = null;
     let latestPreview = null;
     let timer = null;
     let paused = false;
     let actionPending = false;
+
+    const SPOT_PARAM_LABELS = {
+      symbol: "交易对",
+      strategy_mode: "策略模式",
+      grid_level_mode: "网格模式",
+      min_price: "最低价",
+      max_price: "最高价",
+      n: "网格数",
+      total_quote_budget: "总预算（quote）",
+      sleep_seconds: "循环秒数",
+      grid_band_ratio: "带宽比例",
+      attack_buy_levels: "攻击买格",
+      attack_sell_levels: "攻击卖格",
+      attack_per_order_notional: "攻击单笔金额",
+      attack_sell_loss_tolerance_ratio: "攻击卖损容忍",
+      attack_sell_tight_levels: "攻击贴盘口层数",
+      defense_buy_levels: "防守买格",
+      defense_sell_levels: "防守卖格",
+      defense_per_order_notional: "防守单笔金额",
+      inventory_soft_limit_notional: "库存软上限",
+      inventory_hard_limit_notional: "库存硬上限",
+      center_shift_trigger_ratio: "中心下移触发比例",
+      center_shift_confirm_cycles: "中心下移确认轮次",
+      center_shift_step_ratio: "中心下移步长比例",
+      buy_pause_amp_trigger_ratio: "停买振幅阈值",
+      buy_pause_down_return_trigger_ratio: "停买跌幅阈值",
+      freeze_shift_abs_return_trigger_ratio: "冻结平移绝对涨跌",
+      inventory_recycle_age_minutes: "库存回收年龄",
+      inventory_recycle_loss_tolerance_ratio: "库存回收损耗容忍",
+      inventory_recycle_min_profit_ratio: "库存回收最小收益",
+      max_single_cycle_new_orders: "单轮最大新单",
+      cancel_stale: "撤过期挂单",
+      apply: "真实提交",
+      reset_state: "重置本地状态",
+    };
+    const SPOT_PARAM_ORDER = [
+      "symbol", "strategy_mode", "grid_level_mode", "min_price", "max_price", "n", "total_quote_budget",
+      "sleep_seconds", "grid_band_ratio",
+      "attack_buy_levels", "attack_sell_levels", "attack_per_order_notional",
+      "attack_sell_loss_tolerance_ratio", "attack_sell_tight_levels",
+      "defense_buy_levels", "defense_sell_levels", "defense_per_order_notional",
+      "inventory_soft_limit_notional", "inventory_hard_limit_notional",
+      "center_shift_trigger_ratio", "center_shift_confirm_cycles", "center_shift_step_ratio",
+      "buy_pause_amp_trigger_ratio", "buy_pause_down_return_trigger_ratio", "freeze_shift_abs_return_trigger_ratio",
+      "inventory_recycle_age_minutes", "inventory_recycle_loss_tolerance_ratio", "inventory_recycle_min_profit_ratio",
+      "max_single_cycle_new_orders", "cancel_stale", "apply", "reset_state",
+    ];
 
     function fmtNum(v, digits = 4) {
       if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
@@ -8824,6 +10144,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     function readForm() {
       const strategyMode = String(strategyModeEl.value || "spot_volume_shift_long");
       const [attackBuyLevels, attackSellLevels] = parsePair(attackLevelsEl.value, 14, 22);
+      const [attackSellLossToleranceRatio, attackSellTightLevels] = parsePair(attackSellTightSettingsEl.value, 0, 0);
       const [defenseBuyLevels, defenseSellLevels] = parsePair(defenseLevelsEl.value, 8, 20);
       const [softLimit, hardLimit] = parsePair(inventoryLimitsEl.value, 350, 500);
       const [shiftTrigger, shiftStep] = parsePair(centerShiftRatiosEl.value, 0.012, 0.006);
@@ -8845,6 +10166,8 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         attack_buy_levels: Number(attackBuyLevels || 14),
         attack_sell_levels: Number(attackSellLevels || 22),
         attack_per_order_notional: Number(attackPerOrderNotionalEl.value || 20),
+        attack_sell_loss_tolerance_ratio: Number(attackSellLossToleranceRatio || 0),
+        attack_sell_tight_levels: Number(attackSellTightLevels || 0),
         defense_buy_levels: Number(defenseBuyLevels || 8),
         defense_sell_levels: Number(defenseSellLevels || 20),
         defense_per_order_notional: Number(defensePerOrderNotionalEl.value || 12),
@@ -8866,7 +10189,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     function populateSymbols(symbols, preferred) {
       const prev = symbolEl.value;
       symbolEl.innerHTML = (symbols || []).map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
-      const target = preferred || prev || "SAHARAUSDT";
+      const target = preferred || prev || "NIGHTUSDT";
       if (symbols.includes(target)) {
         symbolEl.value = target;
       } else if (symbols.includes("BTCUSDT")) {
@@ -8885,7 +10208,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         }
         populateSymbols(data.symbols, latestSnapshot && latestSnapshot.symbol);
       } catch (err) {
-        populateSymbols(["SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"], latestSnapshot && latestSnapshot.symbol);
+        populateSymbols(["NIGHTUSDT", "CFGUSDT", "KATUSDT"], latestSnapshot && latestSnapshot.symbol);
         setStatus(`现货交易对加载失败，已使用默认列表：${err}`, true);
       }
     }
@@ -8898,6 +10221,16 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       previewBtn.disabled = !isStatic;
     }
 
+    function syncStrategyModeOptions(snapshot) {
+      const config = ((snapshot || {}).config || {});
+      const runnerCfg = ((((snapshot || {}).runner || {}).config) || {});
+      const shiftLabel = String(config.preset_label || runnerCfg.preset_label || "").trim() || "现货量优先移中心";
+      const shiftOption = strategyModeEl.querySelector('option[value="spot_volume_shift_long"]');
+      const staticOption = strategyModeEl.querySelector('option[value="spot_one_way_long"]');
+      if (shiftOption) shiftOption.textContent = shiftLabel;
+      if (staticOption) staticOption.textContent = "Spot V1 单向做多静态网格";
+    }
+
     function renderSummary(snapshot) {
       const runner = (snapshot && snapshot.runner) || {};
       const config = (snapshot && snapshot.config) || {};
@@ -8907,13 +10240,15 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const trade = (snapshot && snapshot.trade_summary) || {};
       const risk = (snapshot && snapshot.risk_controls) || {};
       const warnings = Array.isArray(snapshot && snapshot.warnings) ? snapshot.warnings : [];
+      const scopeLabel = String(trade.scope_label || "").trim();
+      const scopeSuffix = scopeLabel ? ` · ${scopeLabel}` : "";
       const cards = [
         ["策略状态", runner.is_running ? "运行中" : "未运行", runner.is_running ? "good" : "warn", `PID: ${runner.pid || "--"} · 模式: ${risk.mode || config.strategy_mode || "--"}`],
-        ["累计成交额", fmtNum(trade.gross_notional, 4), "", `买/卖: ${fmtNum(trade.buy_notional, 4)} / ${fmtNum(trade.sell_notional, 4)}`],
-        ["净收益估算", fmtMoney(trade.net_pnl_estimate), statusClass(trade.net_pnl_estimate), `已实现: ${fmtMoney(trade.realized_pnl)} · 浮盈: ${fmtMoney(trade.unrealized_pnl)}`],
+        ["累计成交额", fmtNum(trade.gross_notional, 4), "", `买/卖: ${fmtNum(trade.buy_notional, 4)} / ${fmtNum(trade.sell_notional, 4)}${scopeSuffix}`],
+        ["净收益估算", fmtMoney(trade.net_pnl_estimate), statusClass(trade.net_pnl_estimate), `已实现: ${fmtMoney(trade.realized_pnl)} · 浮盈: ${fmtMoney(trade.unrealized_pnl)}${scopeSuffix}`],
         ["手续费 / 回收损耗", `${fmtMoney(-(trade.commission_quote || 0))} / ${fmtMoney(-(trade.recycle_loss_abs || 0))}`, "bad", `回收已实现: ${fmtMoney(trade.recycle_realized_pnl || 0)}`],
         ["当前库存", `${fmtNum(state.inventory_qty || state.managed_base_qty, 8)} ${escapeHtml(balances.base_asset || "BASE")}`, "", `均价: ${fmtNum(state.inventory_avg_cost, 8)} · 中心: ${fmtNum(risk.center_price, 8)}`],
-        ["账户余额", `${fmtNum(balances.quote_free, 4)} ${escapeHtml(balances.quote_asset || "QUOTE")}`, "", `Base: ${fmtNum(balances.base_free, 8)} ${escapeHtml(balances.base_asset || "BASE")} · 警告: ${warnings.join(" | ") || "无"}`],
+        ["账户余额", `${fmtNum(balances.quote_free, 4)} ${escapeHtml(balances.quote_asset || "QUOTE")}`, "", `Quote 冻结/总额: ${fmtNum(balances.quote_locked, 4)} / ${fmtNum(balances.quote_total, 4)} · Base 可用/冻结/总额: ${fmtNum(balances.base_free, 8)} / ${fmtNum(balances.base_locked, 8)} / ${fmtNum(balances.base_total, 8)} ${escapeHtml(balances.base_asset || "BASE")} · 警告: ${warnings.join(" | ") || "无"}`],
       ];
       summaryEl.innerHTML = cards.map(([label, value, cls, sub]) => `
         <div class="metric">
@@ -8933,6 +10268,75 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       startBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
       stopBtn.disabled = actionPending || !runner.is_running;
       startBtn.disabled = actionPending;
+      applyParamsBtn.disabled = actionPending;
+    }
+
+    function renderSpotRunnerParams(snapshot) {
+      const config = ((snapshot || {}).config) || {};
+      const runner = ((snapshot || {}).runner) || {};
+      const params = extractSpotEditableConfig(config);
+      const rows = SPOT_PARAM_ORDER.filter((key) => params[key] !== undefined);
+      if (!rows.length) {
+        spotRunnerParamsMetaEl.textContent = "当前没有可编辑参数。";
+        spotRunnerParamsBody.innerHTML = '<tr><td colspan="2" class="empty">当前没有参数</td></tr>';
+        return;
+      }
+      spotRunnerParamsMetaEl.textContent = `当前 ${runner.is_running ? "运行中" : "未运行"} · 模式 ${config.strategy_mode || "--"} · 交易对 ${config.symbol || "--"}`;
+      spotRunnerParamsBody.innerHTML = rows.map((key) => {
+        const value = params[key];
+        let rendered = "--";
+        if (typeof value === "boolean") rendered = value ? "true" : "false";
+        else if (typeof value === "number") rendered = String(value);
+        else if (value !== null && value !== undefined) rendered = String(value);
+        return `<tr><td>${escapeHtml(SPOT_PARAM_LABELS[key] || key)}</td><td>${escapeHtml(rendered)}</td></tr>`;
+      }).join("");
+      if (!spotRunnerParamsEditorEl.value.trim()) {
+        spotRunnerParamsEditorEl.value = JSON.stringify(params, null, 2);
+      }
+    }
+
+    function loadSpotRunnerParamsIntoEditor(source) {
+      spotRunnerParamsEditorEl.value = JSON.stringify(extractSpotEditableConfig(source), null, 2);
+    }
+
+    async function applySpotRunnerParams() {
+      if (actionPending) return;
+      let payload;
+      try {
+        payload = JSON.parse(String(spotRunnerParamsEditorEl.value || "{}"));
+      } catch (err) {
+        setStatus(`参数 JSON 解析失败：${err}`, true);
+        return;
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        setStatus("参数必须是 JSON 对象。", true);
+        return;
+      }
+      payload.symbol = String(payload.symbol || symbolEl.value || "").trim().toUpperCase();
+      payload.cancel_stale = true;
+      payload.apply = true;
+      payload.reset_state = true;
+      actionPending = true;
+      startBtn.disabled = true;
+      stopBtn.disabled = true;
+      applyParamsBtn.disabled = true;
+      setStatus(`正在应用 ${payload.symbol || "--"} 现货参数并重启...`);
+      try {
+        const resp = await fetch("/api/spot_runner/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        setStatus(`现货参数已应用${data.restarted ? "（已重启）" : ""}`);
+        spotRunnerParamsEditorEl.value = JSON.stringify(payload, null, 2);
+      } catch (err) {
+        setStatus(`应用参数失败：${err}`, true);
+      } finally {
+        actionPending = false;
+        await loadStatus(true);
+      }
     }
 
     function renderPreview(preview, snapshot) {
@@ -9004,6 +10408,31 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       `).join("");
     }
 
+    function renderHourlyStats(snapshot) {
+      const hourly = ((snapshot || {}).hourly_summary || {});
+      const rows = Array.isArray(hourly.rows) ? hourly.rows : [];
+      const sourceLabel = String(hourly.source_label || "").trim();
+      hourlyMetaEl.textContent = `最近 ${hourly.row_count || 0} / ${hourly.available_hours || 0} 小时${sourceLabel ? ` · ${sourceLabel}` : ""}`;
+      if (!rows.length) {
+        hourlyBody.innerHTML = '<tr><td colspan="10" class="empty">当前没有小时级统计数据</td></tr>';
+        return;
+      }
+      hourlyBody.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${fmtTs(row.hour_start)}</td>
+          <td>${fmtNum(row.gross_notional, 4)}</td>
+          <td>${fmtNum(row.trade_count, 0)}</td>
+          <td class="${statusClass(row.net_after_fees_and_funding)}">${fmtMoney(row.net_after_fees_and_funding)}</td>
+          <td class="${statusClass(row.realized_pnl)}">${fmtMoney(row.realized_pnl)}</td>
+          <td class="bad">${fmtMoney(-Math.abs(Number(row.commission || 0)))}</td>
+          <td>${fmtMoney(row.funding_fee || 0)}</td>
+          <td class="${statusClass(row.return_ratio)}">${fmtPct(row.return_ratio)}</td>
+          <td>${fmtPct(row.amplitude_ratio)}</td>
+          <td>${fmtNum(row.buy_notional, 1)} / ${fmtNum(row.sell_notional, 1)}</td>
+        </tr>
+      `).join("");
+    }
+
     function renderEvents(snapshot) {
       const rows = Array.isArray(snapshot && snapshot.events) ? snapshot.events.slice().reverse() : [];
       if (!rows.length) {
@@ -9027,6 +10456,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
 
     function syncFormFromConfig(snapshot) {
       const config = (snapshot && snapshot.config) || {};
+      syncStrategyModeOptions(snapshot);
       strategyModeEl.value = String(config.strategy_mode || "spot_volume_shift_long");
       if (config.symbol) symbolEl.value = String(config.symbol).toUpperCase();
       if (config.grid_level_mode) gridLevelModeEl.value = String(config.grid_level_mode);
@@ -9041,6 +10471,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       gridBandRatioEl.value = String(config.grid_band_ratio ?? 0.045);
       attackLevelsEl.value = `${config.attack_buy_levels ?? 14},${config.attack_sell_levels ?? 22}`;
       attackPerOrderNotionalEl.value = String(config.attack_per_order_notional ?? 20);
+      attackSellTightSettingsEl.value = `${config.attack_sell_loss_tolerance_ratio ?? 0},${config.attack_sell_tight_levels ?? 0}`;
       defenseLevelsEl.value = `${config.defense_buy_levels ?? 8},${config.defense_sell_levels ?? 20}`;
       defensePerOrderNotionalEl.value = String(config.defense_per_order_notional ?? 12);
       inventoryLimitsEl.value = `${config.inventory_soft_limit_notional ?? 350},${config.inventory_hard_limit_notional ?? 500}`;
@@ -9062,8 +10493,10 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         syncFormFromConfig(latestSnapshot);
         await loadSymbols();
         renderSummary(latestSnapshot);
+        renderSpotRunnerParams(latestSnapshot);
         renderOrders(latestSnapshot);
         renderTrades(latestSnapshot);
+        renderHourlyStats(latestSnapshot);
         renderEvents(latestSnapshot);
         if (latestPreview && String(strategyModeEl.value || "") === "spot_one_way_long") {
           renderPreview(latestPreview, latestSnapshot);
@@ -9159,6 +10592,9 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     });
     startBtn.addEventListener("click", () => controlRunner("start"));
     stopBtn.addEventListener("click", () => controlRunner("stop"));
+    loadRunningParamsBtn.addEventListener("click", () => loadSpotRunnerParamsIntoEditor((latestSnapshot || {}).config || {}));
+    loadFormParamsBtn.addEventListener("click", () => loadSpotRunnerParamsIntoEditor(readForm()));
+    applyParamsBtn.addEventListener("click", applySpotRunnerParams);
     toggleBtn.addEventListener("click", () => {
       paused = !paused;
       toggleBtn.textContent = paused ? "恢复自动刷新" : "暂停自动刷新";
@@ -9395,12 +10831,13 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       <div class="links">
         <a href="/">返回测算页</a>
         <a href="/spot_runner">打开现货执行台</a>
+        <a href="/strategy_backtest">打开回测页</a>
         <a href="/monitor">打开合约实盘监控</a>
         <a href="/strategies">打开合约总览</a>
       </div>
       <div class="toolbar">
         <label>币种列表
-          <input id="symbols_input" type="text" value="SAHARAUSDT,NIGHTUSDT,CFGUSDT" />
+          <input id="symbols_input" type="text" value="NIGHTUSDT,CFGUSDT,KATUSDT" />
         </label>
         <label>自动刷新（秒）
           <input id="refresh_sec" type="number" min="3" step="1" value="8" />
@@ -9548,7 +10985,7 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
             <tbody>
               <tr><th>策略模式</th><td>${escapeHtml(String(config.strategy_mode || "--"))}</td><th>当前中价</th><td>${escapeHtml(fmtNum(market.mid_price || 0, 8))}</td></tr>
               <tr><th>当前盘口</th><td>${escapeHtml(fmtNum(market.bid_price || 0, 8))} / ${escapeHtml(fmtNum(market.ask_price || 0, 8))}</td><th>中心价</th><td>${escapeHtml(fmtNum(risk.center_price || state.center_price || 0, 8))}</td></tr>
-              <tr><th>账户余额</th><td>${escapeHtml(fmtNum(((snapshot.balances || {}).quote_free) || 0, 4))} ${escapeHtml(((snapshot.balances || {}).quote_asset) || "QUOTE")}</td><th>Base 余额</th><td>${escapeHtml(fmtNum(((snapshot.balances || {}).base_free) || 0, 8))} ${escapeHtml(((snapshot.balances || {}).base_asset) || "BASE")}</td></tr>
+              <tr><th>账户余额</th><td>${escapeHtml(fmtNum(((snapshot.balances || {}).quote_free) || 0, 4))} / ${escapeHtml(fmtNum(((snapshot.balances || {}).quote_locked) || 0, 4))} / ${escapeHtml(fmtNum(((snapshot.balances || {}).quote_total) || 0, 4))} ${escapeHtml(((snapshot.balances || {}).quote_asset) || "QUOTE")}</td><th>Base 余额</th><td>${escapeHtml(fmtNum(((snapshot.balances || {}).base_free) || 0, 8))} / ${escapeHtml(fmtNum(((snapshot.balances || {}).base_locked) || 0, 8))} / ${escapeHtml(fmtNum(((snapshot.balances || {}).base_total) || 0, 8))} ${escapeHtml(((snapshot.balances || {}).base_asset) || "BASE")}</td></tr>
               <tr><th>最近成交</th><td>${escapeHtml(latestTrade.side || "--")} ${escapeHtml(fmtNum(latestTrade.notional || 0, 4))}</td><th>成交时间</th><td>${escapeHtml(fmtTs(latestTrade.time))}</td></tr>
               <tr><th>最后刷新</th><td colspan="3">${escapeHtml(fmtTs(new Date().toISOString()))}</td></tr>
             </tbody>
@@ -9611,6 +11048,1111 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
 
     loadSpotStrategies();
     restartTimer();
+  </script>
+</body>
+</html>
+"""
+
+
+STRATEGY_BACKTEST_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>策略回测实验室</title>
+  <style>
+    :root {
+      --bg: #f4efe3;
+      --panel: rgba(255,253,248,0.95);
+      --line: #ddd4c3;
+      --text: #22201a;
+      --muted: #6c685f;
+      --good: #0b6f68;
+      --bad: #b04b37;
+      --accent: #163d36;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: radial-gradient(circle at top, #faf7ee 0%, var(--bg) 55%, #efe6d4 100%);
+      color: var(--text);
+      font-family: "SF Pro SC", "PingFang SC", "Helvetica Neue", sans-serif;
+    }
+    .wrap { max-width: 1440px; margin: 0 auto; padding: 24px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 20px;
+      padding: 20px;
+      box-shadow: 0 10px 30px rgba(48, 37, 17, 0.06);
+    }
+    .header h1 { margin: 0 0 10px; font-size: 32px; }
+    .header p, .meta, .hint { margin: 0; color: var(--muted); line-height: 1.6; }
+    .links, .toolbar, .fields {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      margin-top: 14px;
+      align-items: flex-end;
+    }
+    .fields label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      min-width: 160px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 700;
+    }
+    input, select, textarea {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    input, select { height: 40px; padding: 0 10px; }
+    textarea {
+      width: 100%;
+      min-height: 220px;
+      padding: 12px;
+      font-family: "SFMono-Regular", "JetBrains Mono", monospace;
+      font-size: 12px;
+      line-height: 1.6;
+      resize: vertical;
+    }
+    button, .links a {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 14px;
+      border-radius: 999px;
+      border: 1px solid #bfd4ca;
+      background: #edf6f1;
+      color: var(--accent);
+      text-decoration: none;
+      font-size: 14px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    .grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    .compare-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-top: 16px; }
+    .summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 16px;
+    }
+    .metric {
+      background: linear-gradient(180deg, #fffefc 0%, #faf8f2 100%);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      min-height: 110px;
+    }
+    .metric .label { font-size: 12px; color: var(--muted); margin-bottom: 8px; }
+    .metric .value { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
+    .metric .sub { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+    .good { color: var(--good); }
+    .bad { color: var(--bad); }
+    .table-wrap { overflow: auto; border: 1px solid var(--line); border-radius: 12px; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 720px; }
+    th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { font-size: 12px; color: var(--muted); font-weight: 700; }
+    .empty {
+      padding: 18px;
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      color: var(--muted);
+      font-size: 13px;
+      text-align: center;
+    }
+    .compare-summary {
+      display: grid;
+      gap: 10px;
+      margin-top: 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.7;
+    }
+    .compare-summary .line {
+      padding: 10px 12px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      background: #fff;
+    }
+    @media (max-width: 1100px) {
+      .grid-2, .compare-grid, .summary { grid-template-columns: 1fr; }
+      .fields label { min-width: 100%; }
+    }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="card header">
+      <h1>策略回测实验室</h1>
+      <p>基于当前仓库的静态网格回测引擎，快速调试 long / short / neutral 网格参数。适合做方向、网格数、区间和资金量的参数比较。注意：这里是静态近似回测，不等同于 live runner 的逐笔复原。</p>
+      <div class="links">
+        <a href="/">返回测算页</a>
+        <a href="/monitor">打开合约实盘监控</a>
+        <a href="/spot_runner">打开现货执行台</a>
+      </div>
+      <div class="fields">
+        <label>市场
+          <select id="market_type">
+            <option value="futures">合约</option>
+            <option value="spot">现货</option>
+          </select>
+        </label>
+        <label>合约类型
+          <select id="contract_type">
+            <option value="usdm">USDT 永续</option>
+            <option value="coinm">币本位</option>
+          </select>
+        </label>
+        <label>交易对
+          <input id="symbol" type="text" value="OPNUSDT" />
+        </label>
+        <label>策略方向
+          <select id="strategy_direction">
+            <option value="long">做多</option>
+            <option value="short">做空</option>
+            <option value="neutral">中性</option>
+          </select>
+        </label>
+        <label>网格模式
+          <select id="grid_level_mode">
+            <option value="arithmetic">等差（固定价差）</option>
+            <option value="geometric">等比（固定百分比）</option>
+          </select>
+        </label>
+        <label>回测模式
+          <select id="calc_mode">
+            <option value="fixed">固定参数</option>
+            <option value="optimize">自动优化</option>
+          </select>
+        </label>
+        <label>周期
+          <select id="interval">
+            <option value="1m">1m</option>
+            <option value="5m">5m</option>
+            <option value="15m">15m</option>
+            <option value="1h" selected>1h</option>
+          </select>
+        </label>
+        <label>回看小时
+          <input id="lookback_hours" type="number" min="1" step="1" value="48" />
+        </label>
+        <label>最低价
+          <input id="min_price" type="number" min="0" step="0.0000001" value="0.02" />
+        </label>
+        <label>最高价
+          <input id="max_price" type="number" min="0" step="0.0000001" value="0.03" />
+        </label>
+        <label>固定 N
+          <input id="fixed_n" type="number" min="1" step="1" value="120" />
+        </label>
+        <label>每格名义 / 优化预算
+          <input id="budget_value" type="number" min="0.01" step="0.01" value="70" />
+        </label>
+        <label>优化 N 范围
+          <input id="n_range" type="text" value="20,200" />
+        </label>
+        <label>分配模式
+          <input id="allocation_modes" type="text" value="equal,linear,center_heavy,linear_reverse" />
+        </label>
+        <label>目标函数
+          <select id="objective">
+            <option value="calmar">Calmar</option>
+            <option value="net_profit">净收益</option>
+            <option value="total_return">总收益率</option>
+            <option value="annualized_return">年化收益</option>
+          </select>
+        </label>
+        <label>费率
+          <input id="fee_rate" type="number" min="0" step="0.00001" value="0.0002" />
+        </label>
+        <label>Funding
+          <select id="include_funding">
+            <option value="true">计入</option>
+            <option value="false">不计入</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar">
+        <button id="run_btn" class="primary">运行回测</button>
+        <button id="load_opn_btn">载入 OPN 常用参数</button>
+        <button id="load_night_btn">载入 NIGHT 常用参数</button>
+      </div>
+      <p id="status" class="meta">等待运行回测...</p>
+    </section>
+
+    <section class="grid-2">
+      <section class="card">
+        <h2>读取运行中策略</h2>
+        <p class="hint">按当前市场类型和交易对，直接读取运行中策略的当前生效参数。适合把 live runner 的当前配置快速映射成固定参数回测请求。</p>
+        <div class="toolbar">
+          <button id="load_live_btn">读取当前运行策略</button>
+          <button id="apply_live_btn">一键带入回测</button>
+        </div>
+        <p id="live_status" class="meta">还没有读取运行中策略。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>实盘当前参数</th>
+                <th>值</th>
+              </tr>
+            </thead>
+            <tbody id="live_params_body">
+              <tr><td colspan="2" class="empty">还没有读取运行中策略</td></tr>
+            </tbody>
+          </table>
+        </div>
+        <div class="toolbar">
+          <button id="load_live_config_btn">载入到参数编辑器</button>
+          <button id="save_live_config_btn" class="primary">保存并重启策略</button>
+        </div>
+        <p id="live_config_status" class="meta">这里可以直接修改当前运行中策略的真实参数，保存后会立即重启对应策略。</p>
+        <textarea id="live_config_editor" spellcheck="false"></textarea>
+      </section>
+      <section class="card">
+        <h2>回测当前参数</h2>
+        <p class="hint">这里显示当前表单/JSON 实际要提交给回测引擎的固定参数，便于和实盘当前参数直接对照。</p>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>回测参数</th>
+                <th>值</th>
+              </tr>
+            </thead>
+            <tbody id="backtest_params_body">
+              <tr><td colspan="2" class="empty">当前还没有回测参数</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+
+    <section class="card">
+      <h2>实盘 / 回测对比</h2>
+      <p class="hint">左侧来自运行中的 live runner，右侧来自当前回测请求。回测完成后会把最佳结果摘要并排显示，便于快速判断“当前策略”和“固定参数回测”是否一致。</p>
+      <div id="compare_summary" class="compare-summary">
+        <div class="line">先读取运行中策略，或先运行一次回测。</div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>请求参数 JSON</h2>
+      <p class="hint">点击“运行回测”时会按当前表单生成这份 JSON。你也可以直接编辑它再运行，适合快速调试各种参数。</p>
+      <textarea id="payload_editor" spellcheck="false"></textarea>
+    </section>
+
+    <section class="card">
+      <div id="summary" class="summary"></div>
+    </section>
+
+    <section class="grid-2">
+      <section class="card">
+        <h2>Top 结果</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>N</th>
+                <th>分配</th>
+                <th>方向</th>
+                <th>成交额</th>
+                <th>净收益</th>
+                <th>手续费</th>
+                <th>资金费</th>
+                <th>Calmar</th>
+              </tr>
+            </thead>
+            <tbody id="top_body"></tbody>
+          </table>
+        </div>
+      </section>
+      <section class="card">
+        <h2>最佳方案网格</h2>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr>
+                <th>格子</th>
+                <th>方向</th>
+                <th>买价</th>
+                <th>卖价</th>
+                <th>数量</th>
+                <th>名义</th>
+              </tr>
+            </thead>
+            <tbody id="plan_body"></tbody>
+          </table>
+        </div>
+      </section>
+    </section>
+  </div>
+
+  <script>
+    const marketTypeEl = document.getElementById("market_type");
+    const contractTypeEl = document.getElementById("contract_type");
+    const symbolEl = document.getElementById("symbol");
+    const strategyDirectionEl = document.getElementById("strategy_direction");
+    const gridLevelModeEl = document.getElementById("grid_level_mode");
+    const calcModeEl = document.getElementById("calc_mode");
+    const intervalEl = document.getElementById("interval");
+    const lookbackHoursEl = document.getElementById("lookback_hours");
+    const minPriceEl = document.getElementById("min_price");
+    const maxPriceEl = document.getElementById("max_price");
+    const fixedNEl = document.getElementById("fixed_n");
+    const budgetValueEl = document.getElementById("budget_value");
+    const nRangeEl = document.getElementById("n_range");
+    const allocationModesEl = document.getElementById("allocation_modes");
+    const objectiveEl = document.getElementById("objective");
+    const feeRateEl = document.getElementById("fee_rate");
+    const includeFundingEl = document.getElementById("include_funding");
+    const runBtn = document.getElementById("run_btn");
+    const loadOpnBtn = document.getElementById("load_opn_btn");
+    const loadNightBtn = document.getElementById("load_night_btn");
+    const loadLiveBtn = document.getElementById("load_live_btn");
+    const applyLiveBtn = document.getElementById("apply_live_btn");
+    const loadLiveConfigBtn = document.getElementById("load_live_config_btn");
+    const saveLiveConfigBtn = document.getElementById("save_live_config_btn");
+    const payloadEditorEl = document.getElementById("payload_editor");
+    const statusEl = document.getElementById("status");
+    const liveStatusEl = document.getElementById("live_status");
+    const liveConfigStatusEl = document.getElementById("live_config_status");
+    const liveConfigEditorEl = document.getElementById("live_config_editor");
+    const liveParamsBody = document.getElementById("live_params_body");
+    const backtestParamsBody = document.getElementById("backtest_params_body");
+    const compareSummaryEl = document.getElementById("compare_summary");
+    const summaryEl = document.getElementById("summary");
+    const topBody = document.getElementById("top_body");
+    const planBody = document.getElementById("plan_body");
+
+    let currentJobId = null;
+    let pollTimer = null;
+    let latestLiveStrategy = null;
+    let latestBacktestPayload = null;
+    let latestBacktestResult = null;
+    let liveActionPending = false;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/\\"/g, "&quot;");
+    }
+
+    function fmtNum(v, digits = 4) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      return Number(v).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    }
+
+    function fmtMoney(v) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      const num = Number(v);
+      return `${num > 0 ? "+" : ""}${fmtNum(num, 4)}`;
+    }
+
+    function fmtPct(v) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      const num = Number(v) * 100;
+      return `${num > 0 ? "+" : ""}${num.toFixed(2)}%`;
+    }
+
+    function truthy(value) {
+      if (typeof value === "boolean") return value;
+      return ["1", "true", "yes", "on"].includes(String(value || "").trim().toLowerCase());
+    }
+
+    function directionLabel(value) {
+      const mapping = {
+        long: "做多",
+        short: "做空",
+        neutral: "中性",
+      };
+      return mapping[String(value || "").trim().toLowerCase()] || String(value || "--");
+    }
+
+    function marketLabel(value) {
+      return String(value || "").trim().toLowerCase() === "spot" ? "现货" : "合约";
+    }
+
+    function displayValue(value, digits = 6) {
+      if (value === null || value === undefined || value === "") return "--";
+      if (typeof value === "boolean") return value ? "true" : "false";
+      if (typeof value === "number") return fmtNum(value, digits);
+      return String(value);
+    }
+
+    const LIVE_LABELS = {
+      source_kind: "来源",
+      strategy_profile: "请求预设",
+      effective_strategy: "当前子策略",
+      strategy_mode: "策略模式",
+      symbol: "交易对",
+      grid_level_mode: "网格模式",
+      current_mid: "当前中价",
+      center_price: "中心/参考价",
+      step_price: "步长",
+      buy_levels: "生效买格",
+      sell_levels: "生效卖格",
+      per_order_notional: "生效单笔名义",
+      base_position_notional: "生效底仓目标",
+      current_long_notional: "当前多仓名义",
+      current_short_notional: "当前空仓名义",
+      pause_position_notional: "软停阈值",
+      max_position_notional: "硬上限",
+      open_order_count: "当前挂单数",
+      sleep_seconds: "循环秒数",
+      range_hint: "推导回测区间",
+      fixed_n: "推导固定 N",
+      fixed_per_grid_notional: "推导每格名义",
+    };
+
+    const BACKTEST_LABELS = {
+      market_type: "市场",
+      contract_type: "合约类型",
+      symbol: "交易对",
+      strategy_direction: "策略方向",
+      grid_level_mode: "网格模式",
+      interval: "周期",
+      lookback_hours: "回看小时",
+      min_price: "最低价",
+      max_price: "最高价",
+      fixed_n: "固定 N",
+      fixed_per_grid_notional: "每格名义",
+      fee_rate: "费率",
+      include_funding: "Funding",
+      objective: "目标函数",
+      calc_mode: "回测模式",
+    };
+
+    function parsePair(text, fallbackA, fallbackB) {
+      const raw = String(text || "").replaceAll("，", ",").replaceAll("/", ",");
+      const parts = raw.split(",").map((x) => x.trim()).filter(Boolean);
+      return [Number(parts[0] || fallbackA), Number(parts[1] || fallbackB)];
+    }
+
+    function buildPayloadFromForm() {
+      const marketType = String(marketTypeEl.value || "futures");
+      const calcMode = String(calcModeEl.value || "fixed");
+      const now = new Date();
+      const lookbackHours = Math.max(1, Number(lookbackHoursEl.value || 48));
+      const start = new Date(now.getTime() - lookbackHours * 3600 * 1000);
+      const [nMin, nMax] = parsePair(nRangeEl.value, 20, 200);
+      const payload = {
+        calc_mode: calcMode,
+        market_type: marketType,
+        contract_type: marketType === "futures" ? String(contractTypeEl.value || "usdm") : "",
+        symbol: String(symbolEl.value || "").trim().toUpperCase(),
+        strategy_direction: marketType === "spot" ? "long" : String(strategyDirectionEl.value || "long"),
+        grid_level_mode: String(gridLevelModeEl.value || "arithmetic"),
+        min_price: Number(minPriceEl.value || 0),
+        max_price: Number(maxPriceEl.value || 0),
+        interval: String(intervalEl.value || "1h"),
+        start_time: start.toISOString(),
+        end_time: now.toISOString(),
+        fee_rate: Number(feeRateEl.value || 0.0002),
+        include_funding: marketType === "futures" ? String(includeFundingEl.value || "true") === "true" : false,
+        objective: String(objectiveEl.value || "calmar"),
+      };
+      if (calcMode === "fixed") {
+        payload.fixed_n = Math.max(1, Number(fixedNEl.value || 120));
+        payload.fixed_buy_unit = "notional";
+        payload.fixed_per_grid_notional = Math.max(0.01, Number(budgetValueEl.value || 70));
+      } else {
+        payload.max_buy_notional = Math.max(0.01, Number(budgetValueEl.value || 5000));
+        payload.n_min = Math.max(1, Number(nMin || 20));
+        payload.n_max = Math.max(payload.n_min, Number(nMax || 200));
+        payload.allocation_modes = String(allocationModesEl.value || "equal,linear");
+        payload.top_k = 8;
+      }
+      return payload;
+    }
+
+    function inferRunnerDirection(config) {
+      const cfg = config || {};
+      if (truthy(cfg.custom_grid_enabled)) {
+        const customDirection = String(cfg.custom_grid_direction || "").trim().toLowerCase();
+        if (["long", "short", "neutral"].includes(customDirection)) return customDirection;
+      }
+      const mode = String(cfg.strategy_mode || "").trim().toLowerCase();
+      if (mode === "one_way_short") return "short";
+      if (["inventory_target_neutral", "synthetic_neutral", "hedge_neutral"].includes(mode)) return "neutral";
+      return "long";
+    }
+
+    function deriveLiveRange({ centerPrice, stepPrice, buyLevels, sellLevels, minPrice, maxPrice, fallbackMid }) {
+      let derivedMin = Number(minPrice || 0);
+      let derivedMax = Number(maxPrice || 0);
+      if (!(derivedMin > 0 && derivedMax > derivedMin) && centerPrice > 0 && stepPrice > 0) {
+        derivedMin = Math.max(stepPrice, centerPrice - Math.max(1, buyLevels) * stepPrice);
+        derivedMax = centerPrice + Math.max(1, sellLevels) * stepPrice;
+      }
+      if (!(derivedMin > 0 && derivedMax > derivedMin) && fallbackMid > 0) {
+        derivedMin = fallbackMid * 0.95;
+        derivedMax = fallbackMid * 1.05;
+      }
+      return {
+        minPrice: derivedMin,
+        maxPrice: derivedMax,
+      };
+    }
+
+    function buildFuturesLiveStrategy(snapshot) {
+      const runnerCfg = (((snapshot || {}).runner || {}).config) || {};
+      const risk = (snapshot || {}).risk_controls || {};
+      const market = (snapshot || {}).market || {};
+      const centerSource = risk.center_source || {};
+      const symbol = String((snapshot || {}).symbol || runnerCfg.symbol || symbolEl.value || "").trim().toUpperCase();
+      const direction = inferRunnerDirection(runnerCfg);
+      const gridLevelMode = String(
+        truthy(runnerCfg.custom_grid_enabled)
+          ? (runnerCfg.custom_grid_level_mode || gridLevelModeEl.value || "arithmetic")
+          : (gridLevelModeEl.value || "arithmetic")
+      );
+      const centerPrice = Number(centerSource.center_price || runnerCfg.center_price || market.mid_price || 0);
+      const stepPrice = Number(runnerCfg.step_price || 0);
+      const buyLevels = Number(risk.effective_buy_levels || runnerCfg.buy_levels || 0);
+      const sellLevels = Number(risk.effective_sell_levels || runnerCfg.sell_levels || 0);
+      const perOrder = Number(
+        truthy(runnerCfg.custom_grid_enabled)
+          ? ((Number(runnerCfg.custom_grid_total_notional || 0) / Math.max(Number(runnerCfg.custom_grid_n || 1), 1)) || 0)
+          : (risk.effective_per_order_notional || runnerCfg.per_order_notional || 0)
+      );
+      const basePosition = Number(risk.effective_base_position_notional || runnerCfg.base_position_notional || 0);
+      const range = deriveLiveRange({
+        centerPrice,
+        stepPrice,
+        buyLevels,
+        sellLevels,
+        minPrice: truthy(runnerCfg.custom_grid_enabled) ? runnerCfg.custom_grid_min_price : undefined,
+        maxPrice: truthy(runnerCfg.custom_grid_enabled) ? runnerCfg.custom_grid_max_price : undefined,
+        fallbackMid: Number(market.mid_price || 0),
+      });
+      const fixedN = Math.max(
+        1,
+        Number(
+          truthy(runnerCfg.custom_grid_enabled)
+            ? runnerCfg.custom_grid_n
+            : (buyLevels + sellLevels || runnerCfg.buy_levels || runnerCfg.sell_levels || 120)
+        )
+      );
+      const pauseValue = Number(
+        direction === "short"
+          ? (runnerCfg.pause_short_position_notional || risk.pause_short_position_notional || 0)
+          : (runnerCfg.pause_buy_position_notional || risk.pause_buy_position_notional || 0)
+      );
+      const maxValue = Number(
+        direction === "short"
+          ? (runnerCfg.max_short_position_notional || risk.max_short_position_notional || 0)
+          : (runnerCfg.max_position_notional || risk.max_position_notional || 0)
+      );
+      const currentLong = Number(risk.current_long_notional || 0);
+      const currentShort = Number(risk.current_short_notional || 0);
+      const openOrderCount = Array.isArray(snapshot.open_orders) ? snapshot.open_orders.length : 0;
+      return {
+        sourceKind: "futures",
+        symbol,
+        snapshot,
+        mappedPayload: {
+          calc_mode: "fixed",
+          market_type: "futures",
+          contract_type: String(contractTypeEl.value || "usdm"),
+          symbol,
+          strategy_direction: direction,
+          grid_level_mode: gridLevelMode,
+          min_price: range.minPrice,
+          max_price: range.maxPrice,
+          interval: String(intervalEl.value || "1h"),
+          fee_rate: Number(feeRateEl.value || 0.0002),
+          include_funding: String(includeFundingEl.value || "true") === "true",
+          objective: String(objectiveEl.value || "calmar"),
+          fixed_n: fixedN,
+          fixed_buy_unit: "notional",
+          fixed_per_grid_notional: Math.max(0.01, perOrder || Number(budgetValueEl.value || 70)),
+        },
+        rows: [
+          ["source_kind", marketLabel("futures")],
+          ["strategy_profile", String(runnerCfg.strategy_profile || "--")],
+          ["effective_strategy", String(risk.effective_strategy_label || risk.effective_strategy_profile || runnerCfg.strategy_profile || "--")],
+          ["strategy_mode", String(runnerCfg.strategy_mode || "--")],
+          ["symbol", symbol],
+          ["grid_level_mode", gridLevelMode === "geometric" ? "等比（固定百分比）" : "等差（固定价差）"],
+          ["current_mid", Number(market.mid_price || 0)],
+          ["center_price", centerPrice],
+          ["step_price", stepPrice],
+          ["buy_levels", buyLevels],
+          ["sell_levels", sellLevels],
+          ["per_order_notional", perOrder],
+          ["base_position_notional", basePosition],
+          ["current_long_notional", currentLong],
+          ["current_short_notional", currentShort],
+          ["pause_position_notional", pauseValue],
+          ["max_position_notional", maxValue],
+          ["open_order_count", openOrderCount],
+          ["sleep_seconds", Number(runnerCfg.sleep_seconds || 0)],
+          ["range_hint", `${fmtNum(range.minPrice, 8)} - ${fmtNum(range.maxPrice, 8)}`],
+          ["fixed_n", fixedN],
+          ["fixed_per_grid_notional", Math.max(0.01, perOrder || Number(budgetValueEl.value || 70))],
+        ],
+      };
+    }
+
+    function buildSpotLiveStrategy(wrapper) {
+      const snapshot = (wrapper || {}).snapshot || wrapper || {};
+      const config = snapshot.config || {};
+      const risk = snapshot.risk_controls || {};
+      const state = snapshot.state || {};
+      const market = snapshot.market || {};
+      const symbol = String(snapshot.symbol || config.symbol || symbolEl.value || "").trim().toUpperCase();
+      const minPrice = Number(config.min_price || 0);
+      const maxPrice = Number(config.max_price || 0);
+      const fixedN = Math.max(1, Number(config.n || 120));
+      const perGrid = Number(config.total_quote_budget || 0) > 0
+        ? Number(config.total_quote_budget || 0) / fixedN
+        : 0;
+      return {
+        sourceKind: "spot",
+        symbol,
+        snapshot,
+        mappedPayload: {
+          calc_mode: "fixed",
+          market_type: "spot",
+          contract_type: "",
+          symbol,
+          strategy_direction: "long",
+          grid_level_mode: String(config.grid_level_mode || gridLevelModeEl.value || "arithmetic"),
+          min_price: minPrice,
+          max_price: maxPrice,
+          interval: String(intervalEl.value || "1h"),
+          fee_rate: Number(feeRateEl.value || 0.0002),
+          include_funding: false,
+          objective: String(objectiveEl.value || "calmar"),
+          fixed_n: fixedN,
+          fixed_buy_unit: "notional",
+          fixed_per_grid_notional: Math.max(0.01, perGrid || Number(budgetValueEl.value || 70)),
+        },
+        rows: [
+          ["source_kind", marketLabel("spot")],
+          ["strategy_profile", String(config.strategy_mode || "--")],
+          ["effective_strategy", String(risk.mode || config.strategy_mode || "--")],
+          ["strategy_mode", String(config.strategy_mode || "--")],
+          ["symbol", symbol],
+          ["grid_level_mode", String(config.grid_level_mode || "arithmetic") === "geometric" ? "等比（固定百分比）" : "等差（固定价差）"],
+          ["current_mid", Number(market.mid_price || 0)],
+          ["center_price", Number(risk.center_price || state.center_price || 0)],
+          ["step_price", Number(((maxPrice > minPrice) && fixedN > 0) ? ((maxPrice - minPrice) / fixedN) : 0)],
+          ["buy_levels", Number(risk.effective_buy_levels || 0)],
+          ["sell_levels", Number(risk.effective_sell_levels || 0)],
+          ["per_order_notional", Math.max(0.01, perGrid || Number(budgetValueEl.value || 70))],
+          ["base_position_notional", Number((state.inventory_qty || 0) * (state.inventory_avg_cost || market.mid_price || 0) || 0)],
+          ["current_long_notional", Number((state.inventory_qty || 0) * (market.mid_price || 0) || 0)],
+          ["current_short_notional", 0],
+          ["pause_position_notional", Number(risk.inventory_soft_limit_notional || 0)],
+          ["max_position_notional", Number(risk.inventory_hard_limit_notional || 0)],
+          ["open_order_count", Array.isArray(snapshot.open_orders) ? snapshot.open_orders.length : 0],
+          ["sleep_seconds", Number(config.sleep_seconds || 0)],
+          ["range_hint", `${fmtNum(minPrice, 8)} - ${fmtNum(maxPrice, 8)}`],
+          ["fixed_n", fixedN],
+          ["fixed_per_grid_notional", Math.max(0.01, perGrid || Number(budgetValueEl.value || 70))],
+        ],
+      };
+    }
+
+    function renderKeyValueRows(bodyEl, rows, labelMap, digits = 6) {
+      if (!rows || !rows.length) {
+        bodyEl.innerHTML = '<tr><td colspan="2" class="empty">当前没有可展示的数据</td></tr>';
+        return;
+      }
+      bodyEl.innerHTML = rows.map(([key, value]) => `
+        <tr>
+          <td>${escapeHtml(labelMap[key] || key)}</td>
+          <td>${escapeHtml(displayValue(value, digits))}</td>
+        </tr>
+      `).join("");
+    }
+
+    function renderBacktestParams(payload) {
+      if (!payload || typeof payload !== "object") {
+        renderKeyValueRows(backtestParamsBody, [], BACKTEST_LABELS, 8);
+        return;
+      }
+      const lookbackHours = Math.max(1, Number(lookbackHoursEl.value || 48));
+      const rows = [
+        ["market_type", marketLabel(payload.market_type)],
+        ["contract_type", payload.contract_type || (payload.market_type === "spot" ? "--" : "usdm")],
+        ["symbol", payload.symbol || "--"],
+        ["strategy_direction", directionLabel(payload.strategy_direction)],
+        ["grid_level_mode", String(payload.grid_level_mode || "arithmetic") === "geometric" ? "等比（固定百分比）" : "等差（固定价差）"],
+        ["interval", payload.interval || "--"],
+        ["lookback_hours", lookbackHours],
+        ["min_price", Number(payload.min_price || 0)],
+        ["max_price", Number(payload.max_price || 0)],
+        ["fixed_n", Number(payload.fixed_n || 0)],
+        ["fixed_per_grid_notional", Number(payload.fixed_per_grid_notional || 0)],
+        ["fee_rate", Number(payload.fee_rate || 0)],
+        ["include_funding", payload.market_type === "spot" ? "不适用" : (truthy(payload.include_funding) ? "计入" : "不计入")],
+        ["objective", payload.objective || "--"],
+        ["calc_mode", payload.calc_mode || "--"],
+      ];
+      renderKeyValueRows(backtestParamsBody, rows, BACKTEST_LABELS, 8);
+    }
+
+    function renderCompareSummary() {
+      const lines = [];
+      if (latestLiveStrategy) {
+        const live = latestLiveStrategy;
+        const keyRow = Object.fromEntries(live.rows || []);
+        lines.push(
+          `实盘当前参数：${marketLabel(live.sourceKind)} · ${keyRow.symbol || "--"} · ${keyRow.effective_strategy || keyRow.strategy_profile || "--"} · ${keyRow.strategy_mode || "--"} · 当前中价 ${displayValue(keyRow.current_mid, 8)} · 生效买/卖格 ${displayValue(keyRow.buy_levels, 0)} / ${displayValue(keyRow.sell_levels, 0)} · 单笔名义 ${displayValue(keyRow.per_order_notional, 4)}U`
+        );
+      }
+      if (latestBacktestPayload) {
+        const payload = latestBacktestPayload;
+        lines.push(
+          `当前回测参数：${marketLabel(payload.market_type)} · ${payload.symbol || "--"} · ${directionLabel(payload.strategy_direction)} · ${String(payload.grid_level_mode || "arithmetic") === "geometric" ? "等比（固定百分比）" : "等差（固定价差）"} · 区间 ${displayValue(payload.min_price, 8)} - ${displayValue(payload.max_price, 8)} · N=${displayValue(payload.fixed_n, 0)} · 每格名义 ${displayValue(payload.fixed_per_grid_notional, 4)}U · 周期 ${payload.interval || "--"}`
+        );
+      }
+      if (latestBacktestResult && latestBacktestResult.best) {
+        const best = latestBacktestResult.best || {};
+        lines.push(
+          `回测结果摘要：净收益 ${fmtMoney(best.net_profit || 0)} · 成交额 ${fmtNum(best.entry_notional_sum || 0, 4)} · 交易 ${fmtNum(best.trade_count || 0, 0)} 笔 · 手续费 ${fmtMoney(-(best.total_fees || 0))} · Funding ${fmtMoney(best.funding_pnl || 0)} · 最大回撤 ${fmtPct(best.max_drawdown || 0)}`
+        );
+      }
+      if (!lines.length) {
+        compareSummaryEl.innerHTML = '<div class="line">先读取运行中策略，或先运行一次回测。</div>';
+        return;
+      }
+      compareSummaryEl.innerHTML = lines.map((line) => `<div class="line">${escapeHtml(line)}</div>`).join("");
+    }
+
+    function syncBacktestPayload(payload) {
+      latestBacktestPayload = payload;
+      payloadEditorEl.value = JSON.stringify(payload, null, 2);
+      renderBacktestParams(payload);
+      renderCompareSummary();
+    }
+
+    function syncEditorFromForm() {
+      syncBacktestPayload(buildPayloadFromForm());
+    }
+
+    function setStatus(text, isError = false) {
+      statusEl.textContent = text;
+      statusEl.className = isError ? "meta bad" : "meta";
+    }
+
+    function renderResult(result) {
+      const best = result.best || null;
+      const data = result.data || {};
+      const search = result.search || {};
+      const top = Array.isArray(result.top) ? result.top : [];
+      const plan = Array.isArray(result.plan) ? result.plan : [];
+      latestBacktestResult = result;
+      const cards = best ? [
+        ["最佳净收益", fmtMoney(best.net_profit), Number(best.net_profit || 0) >= 0 ? "good" : "bad", `成交额 ${fmtNum(best.entry_notional_sum || 0, 4)} · 交易 ${fmtNum(best.trade_count || 0, 0)} 笔`],
+        ["Calmar", fmtNum(best.calmar, 4), "", `最大回撤 ${fmtPct(best.max_drawdown || 0)}`],
+        ["手续费 / Funding", `${fmtMoney(-(best.total_fees || 0))} / ${fmtMoney(best.funding_pnl || 0)}`, "", `标的区间 ${fmtNum(best.period_low || 0, 6)} - ${fmtNum(best.period_high || 0, 6)}`],
+        ["搜索规模", fmtNum(search.tested || 0, 0), "", `K线 ${fmtNum(data.candles || 0, 0)} · 覆盖 ${(Number(data.candle_coverage || 0) * 100).toFixed(1)}%`],
+      ] : [];
+      summaryEl.innerHTML = cards.length ? cards.map(([label, value, cls, sub]) => `
+        <div class="metric">
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="value ${cls}">${escapeHtml(value)}</div>
+          <div class="sub">${escapeHtml(sub)}</div>
+        </div>
+      `).join("") : '<div class="empty">当前没有可展示的回测结果</div>';
+      topBody.innerHTML = top.length ? top.map((row) => `
+        <tr>
+          <td>${escapeHtml(fmtNum(row.n, 0))}</td>
+          <td>${escapeHtml(String(row.allocation_mode || "--"))}</td>
+          <td>${escapeHtml(String(row.strategy_direction || "--"))}</td>
+          <td>${escapeHtml(fmtNum(row.entry_notional_sum || row.total_buy_notional || 0, 4))}</td>
+          <td class="${Number(row.net_profit || 0) >= 0 ? "good" : "bad"}">${escapeHtml(fmtMoney(row.net_profit || 0))}</td>
+          <td>${escapeHtml(fmtMoney(-(row.total_fees || 0)))}</td>
+          <td>${escapeHtml(fmtMoney(row.funding_pnl || 0))}</td>
+          <td>${escapeHtml(fmtNum(row.calmar || 0, 4))}</td>
+        </tr>
+      `).join("") : '<tr><td colspan="8" class="empty">当前没有 Top 结果</td></tr>';
+      planBody.innerHTML = plan.length ? plan.map((row) => `
+        <tr>
+          <td>${escapeHtml(fmtNum(row.idx, 0))}</td>
+          <td>${escapeHtml(String(row.grid_side || "--"))}</td>
+          <td>${escapeHtml(fmtNum(row.buy_price || 0, 8))}</td>
+          <td>${escapeHtml(fmtNum(row.sell_price || 0, 8))}</td>
+          <td>${escapeHtml(fmtNum(row.qty || 0, 8))}</td>
+          <td>${escapeHtml(fmtNum(row.buy_notional || 0, 4))}</td>
+        </tr>
+      `).join("") : '<tr><td colspan="6" class="empty">当前没有网格计划</td></tr>';
+      renderCompareSummary();
+    }
+
+    function normalizeLiveConfigForEditor(strategy) {
+      if (!strategy || !strategy.snapshot) return {};
+      if (strategy.sourceKind === "spot") {
+        return JSON.parse(JSON.stringify((strategy.snapshot.config || {})));
+      }
+      return JSON.parse(JSON.stringify((((strategy.snapshot || {}).runner || {}).config) || {}));
+    }
+
+    function loadLiveConfigIntoEditor() {
+      if (!latestLiveStrategy) {
+        liveConfigStatusEl.textContent = "请先读取运行中策略。";
+        return;
+      }
+      const payload = normalizeLiveConfigForEditor(latestLiveStrategy);
+      liveConfigEditorEl.value = JSON.stringify(payload, null, 2);
+      liveConfigStatusEl.textContent = `已载入 ${latestLiveStrategy.symbol} 的当前运行参数，修改后可直接保存并重启。`;
+    }
+
+    async function saveLiveConfig() {
+      if (liveActionPending) return;
+      let payload;
+      try {
+        payload = JSON.parse(String(liveConfigEditorEl.value || "{}"));
+      } catch (err) {
+        liveConfigStatusEl.textContent = `参数 JSON 解析失败：${err}`;
+        return;
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        liveConfigStatusEl.textContent = "参数必须是 JSON 对象。";
+        return;
+      }
+      const marketType = String(marketTypeEl.value || "futures");
+      const symbol = String(payload.symbol || symbolEl.value || "").trim().toUpperCase();
+      if (!symbol) {
+        liveConfigStatusEl.textContent = "缺少 symbol。";
+        return;
+      }
+      payload.symbol = symbol;
+      if (marketType === "spot") {
+        payload.cancel_stale = payload.cancel_stale !== undefined ? payload.cancel_stale : true;
+        payload.apply = payload.apply !== undefined ? payload.apply : true;
+        payload.reset_state = payload.reset_state !== undefined ? payload.reset_state : true;
+      } else if (!payload.strategy_profile && latestLiveStrategy) {
+        payload.strategy_profile = String((((latestLiveStrategy.snapshot || {}).runner || {}).config || {}).strategy_profile || "").trim();
+      }
+      liveActionPending = true;
+      loadLiveBtn.disabled = true;
+      applyLiveBtn.disabled = true;
+      loadLiveConfigBtn.disabled = true;
+      saveLiveConfigBtn.disabled = true;
+      liveConfigStatusEl.textContent = `正在保存 ${symbol} 的策略参数并重启...`;
+      try {
+        const resp = await fetch(marketType === "spot" ? "/api/spot_runner/start" : "/api/runner/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        liveConfigStatusEl.textContent = `${symbol} 参数已保存${data.restarted ? "（已重启）" : ""}。`;
+        await loadLiveStrategy();
+      } catch (err) {
+        liveConfigStatusEl.textContent = `保存失败：${err}`;
+      } finally {
+        liveActionPending = false;
+        loadLiveBtn.disabled = false;
+        applyLiveBtn.disabled = !latestLiveStrategy;
+        loadLiveConfigBtn.disabled = !latestLiveStrategy;
+        saveLiveConfigBtn.disabled = !latestLiveStrategy;
+      }
+    }
+
+    async function loadLiveStrategy() {
+      const symbol = String(symbolEl.value || "").trim().toUpperCase();
+      if (!symbol) {
+        liveStatusEl.textContent = "请先输入交易对。";
+        return;
+      }
+      loadLiveBtn.disabled = true;
+      applyLiveBtn.disabled = true;
+      liveStatusEl.textContent = `正在读取 ${symbol} 的运行中策略...`;
+      try {
+        const marketType = String(marketTypeEl.value || "futures");
+        if (marketType === "spot") {
+          const resp = await fetch(`/api/spot_runner/status?symbol=${encodeURIComponent(symbol)}`);
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+          latestLiveStrategy = buildSpotLiveStrategy(data);
+        } else {
+          const resp = await fetch(`/api/loop_monitor?symbol=${encodeURIComponent(symbol)}`);
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+          latestLiveStrategy = buildFuturesLiveStrategy(data);
+        }
+        renderKeyValueRows(liveParamsBody, latestLiveStrategy.rows, LIVE_LABELS, 8);
+        liveStatusEl.textContent = `已读取 ${latestLiveStrategy.symbol} 的${marketLabel(latestLiveStrategy.sourceKind)}运行中策略。`;
+        applyLiveBtn.disabled = false;
+        loadLiveConfigBtn.disabled = false;
+        saveLiveConfigBtn.disabled = false;
+        if (!String(liveConfigEditorEl.value || "").trim()) {
+          loadLiveConfigIntoEditor();
+        }
+        renderCompareSummary();
+      } catch (err) {
+        latestLiveStrategy = null;
+        renderKeyValueRows(liveParamsBody, [], LIVE_LABELS, 8);
+        liveStatusEl.textContent = `读取失败：${err}`;
+        loadLiveConfigBtn.disabled = true;
+        saveLiveConfigBtn.disabled = true;
+      } finally {
+        loadLiveBtn.disabled = false;
+      }
+    }
+
+    function applyLiveStrategyToBacktest() {
+      if (!latestLiveStrategy || !latestLiveStrategy.mappedPayload) {
+        liveStatusEl.textContent = "请先读取运行中策略。";
+        return;
+      }
+      const mapped = latestLiveStrategy.mappedPayload;
+      marketTypeEl.value = mapped.market_type || "futures";
+      contractTypeEl.value = mapped.contract_type || "usdm";
+      symbolEl.value = mapped.symbol || symbolEl.value;
+      strategyDirectionEl.value = mapped.strategy_direction || strategyDirectionEl.value;
+      gridLevelModeEl.value = mapped.grid_level_mode || gridLevelModeEl.value;
+      calcModeEl.value = "fixed";
+      intervalEl.value = mapped.interval || intervalEl.value;
+      minPriceEl.value = String(mapped.min_price || "");
+      maxPriceEl.value = String(mapped.max_price || "");
+      fixedNEl.value = String(mapped.fixed_n || fixedNEl.value);
+      budgetValueEl.value = String(mapped.fixed_per_grid_notional || budgetValueEl.value);
+      if (mapped.market_type === "spot") {
+        includeFundingEl.value = "false";
+      }
+      syncEditorFromForm();
+      liveStatusEl.textContent = `已将 ${latestLiveStrategy.symbol} 的当前参数带入回测表单。`;
+    }
+
+    function syncBacktestParamsFromEditor() {
+      try {
+        const payload = JSON.parse(String(payloadEditorEl.value || "{}"));
+        latestBacktestPayload = payload;
+        renderBacktestParams(payload);
+      } catch (_err) {
+        backtestParamsBody.innerHTML = '<tr><td colspan="2" class="empty">JSON 暂时不可解析，无法更新回测参数表</td></tr>';
+      }
+      renderCompareSummary();
+    }
+
+    async function pollJob(jobId) {
+      if (pollTimer) clearInterval(pollTimer);
+      const tick = async () => {
+        const resp = await fetch(`/api/job/${encodeURIComponent(jobId)}`);
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const progress = Number(data.progress || 0);
+        const pct = (progress * 100).toFixed(1);
+        setStatus(`${data.message || "回测中"} · ${pct}%`);
+        if (data.status === "done") {
+          if (pollTimer) clearInterval(pollTimer);
+          pollTimer = null;
+          renderResult(data.result || {});
+          setStatus(`回测完成 · ${data.message || ""}`);
+        } else if (data.status === "failed") {
+          if (pollTimer) clearInterval(pollTimer);
+          pollTimer = null;
+          setStatus(`回测失败：${data.error || data.message || "unknown error"}`, true);
+        }
+      };
+      await tick();
+      pollTimer = setInterval(() => tick().catch((err) => {
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = null;
+        setStatus(`轮询失败：${err}`, true);
+      }), 1200);
+    }
+
+    async function runBacktest() {
+      let payload;
+      try {
+        payload = JSON.parse(String(payloadEditorEl.value || "{}"));
+      } catch (err) {
+        setStatus(`JSON 解析失败：${err}`, true);
+        return;
+      }
+      runBtn.disabled = true;
+      latestBacktestPayload = payload;
+      renderBacktestParams(payload);
+      renderCompareSummary();
+      setStatus("正在提交回测任务...");
+      try {
+        const resp = await fetch("/api/optimize", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        currentJobId = String(data.job_id || "");
+        setStatus(`任务已提交，Job ${currentJobId}`);
+        await pollJob(currentJobId);
+      } catch (err) {
+        setStatus(`回测提交失败：${err}`, true);
+      } finally {
+        runBtn.disabled = false;
+      }
+    }
+
+    function loadOpnPreset() {
+      symbolEl.value = "OPNUSDT";
+      strategyDirectionEl.value = "short";
+      minPriceEl.value = "0.02";
+      maxPriceEl.value = "0.03";
+      fixedNEl.value = "120";
+      budgetValueEl.value = "70";
+      intervalEl.value = "1m";
+      lookbackHoursEl.value = "48";
+      calcModeEl.value = "fixed";
+      syncEditorFromForm();
+    }
+
+    function loadNightPreset() {
+      symbolEl.value = "NIGHTUSDT";
+      strategyDirectionEl.value = "long";
+      minPriceEl.value = "0.04";
+      maxPriceEl.value = "0.06";
+      fixedNEl.value = "120";
+      budgetValueEl.value = "70";
+      intervalEl.value = "1m";
+      lookbackHoursEl.value = "48";
+      calcModeEl.value = "fixed";
+      syncEditorFromForm();
+    }
+
+    [
+      marketTypeEl, contractTypeEl, symbolEl, strategyDirectionEl, gridLevelModeEl,
+      calcModeEl, intervalEl, lookbackHoursEl, minPriceEl, maxPriceEl,
+      fixedNEl, budgetValueEl, nRangeEl, allocationModesEl, objectiveEl,
+      feeRateEl, includeFundingEl,
+    ].forEach((el) => el.addEventListener("change", syncEditorFromForm));
+
+    runBtn.addEventListener("click", runBacktest);
+    loadOpnBtn.addEventListener("click", loadOpnPreset);
+    loadNightBtn.addEventListener("click", loadNightPreset);
+    loadLiveBtn.addEventListener("click", loadLiveStrategy);
+    applyLiveBtn.addEventListener("click", applyLiveStrategyToBacktest);
+    loadLiveConfigBtn.addEventListener("click", loadLiveConfigIntoEditor);
+    saveLiveConfigBtn.addEventListener("click", saveLiveConfig);
+    payloadEditorEl.addEventListener("change", syncBacktestParamsFromEditor);
+    payloadEditorEl.addEventListener("blur", syncBacktestParamsFromEditor);
+
+    applyLiveBtn.disabled = true;
+    loadLiveConfigBtn.disabled = true;
+    saveLiveConfigBtn.disabled = true;
+    loadOpnPreset();
   </script>
 </body>
 </html>
@@ -9849,7 +12391,7 @@ STRATEGIES_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
+    const SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT", "BARDUSDT"];
     const cardsEl = document.getElementById("cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");
@@ -13047,6 +15589,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/spot_strategies", "/spot_strategies.html"}:
             self._send_html(SPOT_STRATEGIES_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/strategy_backtest", "/strategy_backtest.html"}:
+            self._send_html(STRATEGY_BACKTEST_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/strategies", "/strategies.html"}:
             self._send_html(STRATEGIES_PAGE, status=HTTPStatus.OK)
             return
@@ -13061,6 +15606,32 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
             self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
+            return
+        if path == "/api/competition_board_history":
+            board_key = str(query.get("board_key", [""])[0]).strip()
+            capture_date = str(query.get("date", [""])[0]).strip() or None
+            try:
+                history = load_competition_board_history(board_key, capture_date=capture_date)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json({"ok": True, "history": history}, status=HTTPStatus.OK)
+            return
+        if path == "/api/competition_board_trend":
+            board_key = str(query.get("board_key", [""])[0]).strip()
+            granularity = str(query.get("granularity", ["daily"])[0]).strip() or "daily"
+            try:
+                trend = load_competition_board_trend(board_key, granularity=granularity)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json({"ok": True, "trend": trend}, status=HTTPStatus.OK)
             return
         if path == "/api/spot_runner/status":
             symbol = str(query.get("symbol", [SPOT_RUNNER_DEFAULT_CONFIG["symbol"]])[0]).upper().strip()
@@ -13277,6 +15848,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/strategy_backtest", "/strategy_backtest.html"}:
+            body = STRATEGY_BACKTEST_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/strategies", "/strategies.html"}:
             body = STRATEGIES_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -13295,6 +15872,8 @@ class _Handler(BaseHTTPRequestHandler):
             or path.startswith("/api/loop_monitor")
             or path == "/api/grid_preview"
             or path == "/api/competition_board"
+            or path == "/api/competition_board_history"
+            or path == "/api/competition_forecast"
             or path == "/api/spot_runner/status"
         ):
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
@@ -13369,7 +15948,11 @@ class _Handler(BaseHTTPRequestHandler):
                     config = _resolve_runner_start_config(payload)
                     result = _start_runner_process(config)
                 else:
-                    result = _stop_runner_process(payload.get("symbol"))
+                    result = _stop_runner_process(
+                        payload.get("symbol"),
+                        cancel_open_orders=_safe_bool(payload.get("cancel_open_orders", False), "cancel_open_orders"),
+                        close_all_positions=_safe_bool(payload.get("close_all_positions", False), "close_all_positions"),
+                    )
                 self._send_json({"ok": True, **result}, status=200)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
@@ -13410,6 +15993,46 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
             self._send_json({"ok": True, **result, "snapshot": snapshot}, status=200)
+            return
+
+        if path == "/api/competition_forecast":
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 1024 * 1024:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            raw = self.rfile.read(content_len)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            if not isinstance(payload, dict):
+                self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
+                return
+            board_key = str(payload.get("board_key", "")).strip()
+            next_day_volume = payload.get("next_day_volume")
+            entry_id = str(payload.get("entry_id", "")).strip() or None
+            name = str(payload.get("name", "")).strip() or None
+            refresh = _safe_bool(payload.get("refresh", False), "refresh")
+            try:
+                forecast = build_competition_board_forecast(
+                    board_key,
+                    next_day_volume=float(next_day_volume),
+                    entry_id=entry_id,
+                    name=name,
+                    refresh=refresh,
+                )
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json({"ok": True, "forecast": forecast}, status=200)
             return
 
         if path not in {
@@ -13625,8 +16248,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
 
+    scheduler_started = start_competition_board_history_scheduler()
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(f"Grid Web UI running at http://{args.host}:{args.port}")
+    if scheduler_started:
+        print(
+            "Competition board history scheduler enabled with 10-minute checks",
+            "(archives by official daily/hourly update slot, Asia/Shanghai)",
+        )
     print("Press Ctrl+C to stop.")
     try:
         server.serve_forever()
