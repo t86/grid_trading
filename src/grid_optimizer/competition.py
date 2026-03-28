@@ -5,6 +5,7 @@ from typing import Any
 
 from .backtest import run_backtest
 from .data import load_or_fetch_candles, load_or_fetch_funding_rates
+from .symbol_lists import get_symbol_list
 from .types import BacktestResult, Candle, FundingRate
 
 COMPETITION_SYMBOLS: tuple[str, ...] = ("ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT")
@@ -34,7 +35,7 @@ COMPETITION_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
 
 
 def competition_symbols() -> list[str]:
-    return list(COMPETITION_SYMBOLS)
+    return get_symbol_list("competition")
 
 
 def competition_profile_keys() -> list[str]:
@@ -108,10 +109,11 @@ def build_competition_symbol_report(
     end_time: datetime | None = None,
 ) -> dict[str, Any]:
     normalized_symbol = str(symbol).upper().strip()
-    if normalized_symbol not in COMPETITION_SYMBOLS:
+    supported_symbols = competition_symbols()
+    if normalized_symbol not in supported_symbols:
         raise ValueError(
             f"Unsupported competition symbol: {symbol}. "
-            f"Supported: {', '.join(COMPETITION_SYMBOLS)}"
+            f"Supported: {', '.join(supported_symbols)}"
         )
     normalized_windows = sorted({int(item) for item in window_days if int(item) > 0}, reverse=True)
     if not normalized_windows:

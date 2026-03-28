@@ -53,6 +53,7 @@ from .semi_auto_plan import (
     build_inventory_target_neutral_plan,
     build_micro_grid_plan,
     build_short_micro_grid_plan,
+    build_best_quote_short_flip_plan,
     diff_open_orders,
     load_or_initialize_state,
     shift_center_price,
@@ -118,6 +119,7 @@ AUTO_REGIME_PROFILE_STEP_HINTS: dict[str, tuple[float, int]] = {
     AUTO_REGIME_STABLE_PROFILE: (0.0004, 2),
     AUTO_REGIME_DEFENSIVE_PROFILE: (0.0008, 4),
 }
+BEST_QUOTE_SHORT_PROFILE = "robo_best_quote_short_v1"
 
 
 def _float(value: float) -> str:
@@ -310,6 +312,10 @@ def _is_custom_grid_mode(args: argparse.Namespace) -> bool:
 
 def _is_one_way_short_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "one_way_short"
+
+
+def _is_best_quote_short_profile(strategy_profile: str) -> bool:
+    return str(strategy_profile).strip() == BEST_QUOTE_SHORT_PROFILE
 
 
 def _convert_plan_orders_to_one_way(plan: dict[str, Any]) -> dict[str, Any]:
@@ -2099,32 +2105,60 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         target_base_qty = 0.0
         bootstrap_qty = 0.0
     elif _is_one_way_short_mode(strategy_mode):
-        inventory_tier = {
-            "enabled": False,
-            "active": False,
-            "ratio": 0.0,
-            "start_notional": None,
-            "end_notional": None,
-            "effective_buy_levels": effective_args.buy_levels,
-            "effective_sell_levels": effective_args.sell_levels,
-            "effective_per_order_notional": effective_args.per_order_notional,
-            "effective_base_position_notional": effective_args.base_position_notional,
-        }
-        plan = build_short_micro_grid_plan(
-            center_price=center_price,
-            step_price=effective_args.step_price,
-            buy_levels=inventory_tier["effective_buy_levels"],
-            sell_levels=inventory_tier["effective_sell_levels"],
-            per_order_notional=inventory_tier["effective_per_order_notional"],
-            base_position_notional=inventory_tier["effective_base_position_notional"],
-            bid_price=bid_price,
-            ask_price=ask_price,
-            tick_size=symbol_info.get("tick_size"),
-            step_size=symbol_info.get("step_size"),
-            min_qty=symbol_info.get("min_qty"),
-            min_notional=symbol_info.get("min_notional"),
-            current_short_qty=current_short_qty,
-        )
+        if _is_best_quote_short_profile(effective_strategy_profile):
+            plan = build_best_quote_short_flip_plan(
+                bid_price=bid_price,
+                ask_price=ask_price,
+                per_order_notional=effective_args.per_order_notional,
+                max_short_position_notional=effective_args.max_short_position_notional,
+                max_entry_orders=effective_args.sell_levels,
+                current_short_qty=current_short_qty,
+                current_short_notional=current_short_notional,
+                tick_size=symbol_info.get("tick_size"),
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+            )
+            inventory_tier = {
+                "enabled": False,
+                "active": False,
+                "ratio": 0.0,
+                "start_notional": None,
+                "end_notional": None,
+                "effective_buy_levels": int(plan.get("active_buy_order_count", len(plan.get("buy_orders", []))) or 0),
+                "effective_sell_levels": int(plan.get("active_sell_order_count", len(plan.get("sell_orders", []))) or 0),
+                "effective_per_order_notional": effective_args.per_order_notional,
+                "effective_base_position_notional": 0.0,
+            }
+        else:
+            inventory_tier = apply_inventory_tiering(
+                current_long_notional=current_short_notional,
+                buy_levels=effective_args.buy_levels,
+                sell_levels=effective_args.sell_levels,
+                per_order_notional=effective_args.per_order_notional,
+                base_position_notional=effective_args.base_position_notional,
+                tier_start_notional=effective_args.inventory_tier_start_notional,
+                tier_end_notional=effective_args.inventory_tier_end_notional,
+                tier_buy_levels=effective_args.inventory_tier_buy_levels,
+                tier_sell_levels=effective_args.inventory_tier_sell_levels,
+                tier_per_order_notional=effective_args.inventory_tier_per_order_notional,
+                tier_base_position_notional=effective_args.inventory_tier_base_position_notional,
+            )
+            plan = build_short_micro_grid_plan(
+                center_price=center_price,
+                step_price=effective_args.step_price,
+                buy_levels=inventory_tier["effective_buy_levels"],
+                sell_levels=inventory_tier["effective_sell_levels"],
+                per_order_notional=inventory_tier["effective_per_order_notional"],
+                base_position_notional=inventory_tier["effective_base_position_notional"],
+                bid_price=bid_price,
+                ask_price=ask_price,
+                tick_size=symbol_info.get("tick_size"),
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+                current_short_qty=current_short_qty,
+            )
         excess_inventory_gate = apply_excess_inventory_reduce_only(
             plan=plan,
             strategy_mode=strategy_mode,

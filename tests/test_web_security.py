@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from grid_optimizer.web import (
     MONITOR_PAGE,
+    STRATEGIES_PAGE,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
     _delete_custom_grid_runner_preset,
@@ -654,10 +655,7 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_monitor_page_uses_symbol_dropdown_for_supported_symbols(self) -> None:
         self.assertIn('<select id="symbol">', MONITOR_PAGE)
-        self.assertIn('value="NIGHTUSDT"', MONITOR_PAGE)
-        self.assertIn('value="OPNUSDT"', MONITOR_PAGE)
-        self.assertIn('value="ROBOUSDT"', MONITOR_PAGE)
-        self.assertIn('value="KATUSDT"', MONITOR_PAGE)
+        self.assertIn("loadMonitorSymbols", MONITOR_PAGE)
         self.assertIn("小时损益拆解", MONITOR_PAGE)
         self.assertIn('id="hourly_body"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_name"', MONITOR_PAGE)
@@ -666,6 +664,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="custom_grid_load_btn"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_update_btn"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_delete_btn"', MONITOR_PAGE)
+
+    def test_strategies_page_contains_manual_symbol_list_controls(self) -> None:
+        self.assertIn('id="monitor_symbol_input"', STRATEGIES_PAGE)
+        self.assertIn('id="competition_symbol_input"', STRATEGIES_PAGE)
+        self.assertIn('id="monitor_symbol_chips"', STRATEGIES_PAGE)
+        self.assertIn('id="competition_symbol_chips"', STRATEGIES_PAGE)
+        self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:

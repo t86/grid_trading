@@ -23,7 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from collections.abc import Callable
 from statistics import mean
-from typing import Any
+from typing import Any, Union
 from urllib.parse import parse_qs, urlparse
 
 from .backtest import (
@@ -90,6 +90,14 @@ from .monitor import (
     runner_pid_path_for_symbol,
 )
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
+from .symbol_lists import (
+    DEFAULT_SYMBOL_LISTS,
+    get_symbol_list,
+    load_symbol_lists,
+    normalize_symbol_list_type,
+    set_symbol_list,
+    update_symbol_list,
+)
 from .types import Candle
 
 JOBS: dict[str, dict[str, Any]] = {}
@@ -111,7 +119,7 @@ GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
 STABLE_SPOT_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD")
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
-MONITOR_SYMBOL_OPTIONS = ("NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT")
+MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
 CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     "volume_long_v4": {
@@ -202,6 +210,120 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "auto_regime_defensive_60m_amplitude_ratio": 0.08,
             "auto_regime_defensive_15m_return_ratio": -0.015,
             "auto_regime_defensive_60m_return_ratio": -0.03,
+        },
+    },
+    "volume_short_v1": {
+        "label": "量优先做空 v1",
+        "description": "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "step_price": 0.00002,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 70.0,
+            "base_position_notional": 420.0,
+            "up_trigger_steps": 3,
+            "down_trigger_steps": 4,
+            "shift_steps": 3,
+            "pause_short_position_notional": 900.0,
+            "max_short_position_notional": 900.0,
+            "inventory_tier_start_notional": 600.0,
+            "inventory_tier_end_notional": 750.0,
+            "inventory_tier_buy_levels": 12,
+            "inventory_tier_sell_levels": 4,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 280.0,
+            "sleep_seconds": 10.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0055,
+            "short_cover_pause_down_return_trigger_ratio": -0.0025,
+        },
+    },
+    "volume_short_v1_aggressive": {
+        "label": "量优先做空 v1（激进）",
+        "description": "激进空头滚动微网格。沿用 OPN 的高量空头参数，适合明显弱势下跌窗口，优先提升成交量。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "step_price": 0.00002,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 70.0,
+            "base_position_notional": 420.0,
+            "up_trigger_steps": 3,
+            "down_trigger_steps": 4,
+            "shift_steps": 3,
+            "pause_short_position_notional": 900.0,
+            "max_short_position_notional": 900.0,
+            "inventory_tier_start_notional": 600.0,
+            "inventory_tier_end_notional": 750.0,
+            "inventory_tier_buy_levels": 12,
+            "inventory_tier_sell_levels": 4,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 280.0,
+            "sleep_seconds": 10.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0055,
+            "short_cover_pause_down_return_trigger_ratio": -0.0025,
+        },
+    },
+    "volume_short_v1_conservative": {
+        "label": "量优先做空 v1（保守）",
+        "description": "保守空头滚动微网格。更轻底仓、更低单笔和更慢追涨开空，适合 NIGHT 这类偏震荡币种试空。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 45.0,
+            "base_position_notional": 180.0,
+            "up_trigger_steps": 5,
+            "down_trigger_steps": 7,
+            "shift_steps": 3,
+            "pause_short_position_notional": 450.0,
+            "max_short_position_notional": 600.0,
+            "inventory_tier_start_notional": 300.0,
+            "inventory_tier_end_notional": 450.0,
+            "inventory_tier_buy_levels": 10,
+            "inventory_tier_sell_levels": 4,
+            "inventory_tier_per_order_notional": 45.0,
+            "inventory_tier_base_position_notional": 90.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0045,
+            "short_cover_pause_down_return_trigger_ratio": -0.002,
+        },
+    },
+    "defensive_quasi_neutral_aggressive_v1": {
+        "label": "准中性降损激进版",
+        "description": "基于 ROBO 最近实盘运行参数固化出的激进准中性版本。仍以做多为主，但提高卖侧卸仓能力、放宽总上限，适合趋势不明时保量控损。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "one_way_long",
+            "step_price": 0.00001,
+            "buy_levels": 8,
+            "sell_levels": 16,
+            "per_order_notional": 180.0,
+            "base_position_notional": 300.0,
+            "up_trigger_steps": 6,
+            "down_trigger_steps": 4,
+            "shift_steps": 4,
+            "pause_buy_position_notional": 1200.0,
+            "max_position_notional": 1500.0,
+            "buy_pause_amp_trigger_ratio": 0.0075,
+            "buy_pause_down_return_trigger_ratio": -0.0035,
+            "freeze_shift_abs_return_trigger_ratio": 0.005,
+            "inventory_tier_start_notional": 800.0,
+            "inventory_tier_end_notional": 1200.0,
+            "inventory_tier_buy_levels": 6,
+            "inventory_tier_sell_levels": 18,
+            "inventory_tier_per_order_notional": 180.0,
+            "inventory_tier_base_position_notional": 180.0,
+            "max_new_orders": 30,
+            "max_total_notional": 5000.0,
+            "sleep_seconds": 5.0,
+            "autotune_symbol_enabled": False,
         },
     },
     "volume_neutral_target_v1": {
@@ -381,7 +503,7 @@ RUNNER_SERVICE_NAME = "grid-loop.service"
 RUNNER_LAUNCH_AGENT_LABEL = "com.tl.grid-optimizer.loop"
 RUNNER_LAUNCH_AGENT_PATH = Path.home() / "Library/LaunchAgents" / f"{RUNNER_LAUNCH_AGENT_LABEL}.plist"
 WEB_AUTH_REALM = "grid-web"
-IPNetwork = ipaddress.IPv4Network | ipaddress.IPv6Network
+IPNetwork = Union[ipaddress.IPv4Network, ipaddress.IPv6Network]
 
 
 def _security_headers() -> dict[str, str]:
@@ -815,6 +937,18 @@ def _load_custom_runner_presets() -> dict[str, dict[str, Any]]:
 def _save_custom_runner_presets(presets: dict[str, dict[str, Any]]) -> None:
     CUSTOM_RUNNER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
     CUSTOM_RUNNER_PRESETS_PATH.write_text(json.dumps(presets, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _current_symbol_lists() -> dict[str, list[str]]:
+    return load_symbol_lists()
+
+
+def _current_monitor_symbols() -> list[str]:
+    return _current_symbol_lists()["monitor"]
+
+
+def _current_competition_symbols() -> list[str]:
+    return _current_symbol_lists()["competition"]
 
 
 def _runner_preset_map(symbol: str | None = None) -> dict[str, dict[str, Any]]:
@@ -7366,12 +7500,7 @@ MONITOR_PAGE = """<!doctype html>
       </div>
       <div class="toolbar">
         <label>交易对
-          <select id="symbol">
-            <option value="NIGHTUSDT">NIGHTUSDT</option>
-            <option value="OPNUSDT">OPNUSDT</option>
-            <option value="ROBOUSDT">ROBOUSDT</option>
-            <option value="KATUSDT">KATUSDT</option>
-          </select>
+          <select id="symbol"></select>
         </label>
         <label>刷新秒数
           <input id="refresh_sec" type="number" min="2" step="1" value="5" />
@@ -7385,6 +7514,7 @@ MONITOR_PAGE = """<!doctype html>
         <button id="stop_strategy_btn">停止策略</button>
       </div>
       <div id="meta" class="meta">等待首轮数据...</div>
+      <div class="meta">监控币种列表可在 <a href="/strategies">策略总览页</a> 手动添加和删除。</div>
       <div id="strategy_action_meta" class="meta"></div>
       <div id="strategy_preset_meta" class="meta"></div>
     </section>
@@ -7618,6 +7748,7 @@ MONITOR_PAGE = """<!doctype html>
     const customGridStatusEl = document.getElementById("custom_grid_status");
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
+    const DEFAULT_MONITOR_SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
     const LOCAL_STRATEGY_PRESETS = [
       {
         key: "volume_long_v4",
@@ -7707,6 +7838,120 @@ MONITOR_PAGE = """<!doctype html>
           auto_regime_defensive_60m_amplitude_ratio: 0.08,
           auto_regime_defensive_15m_return_ratio: -0.015,
           auto_regime_defensive_60m_return_ratio: -0.03,
+        },
+      },
+      {
+        key: "volume_short_v1",
+        label: "量优先做空 v1",
+        description: "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_short",
+          step_price: 0.00002,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 70.0,
+          base_position_notional: 420.0,
+          up_trigger_steps: 3,
+          down_trigger_steps: 4,
+          shift_steps: 3,
+          pause_short_position_notional: 900.0,
+          max_short_position_notional: 900.0,
+          inventory_tier_start_notional: 600.0,
+          inventory_tier_end_notional: 750.0,
+          inventory_tier_buy_levels: 12,
+          inventory_tier_sell_levels: 4,
+          inventory_tier_per_order_notional: 70.0,
+          inventory_tier_base_position_notional: 280.0,
+          sleep_seconds: 10.0,
+        },
+      },
+      {
+        key: "volume_short_v1_aggressive",
+        label: "量优先做空 v1（激进）",
+        description: "激进空头滚动微网格。沿用 OPN 的高量空头参数，适合明显弱势下跌窗口，优先提升成交量。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_short",
+          step_price: 0.00002,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 70.0,
+          base_position_notional: 420.0,
+          up_trigger_steps: 3,
+          down_trigger_steps: 4,
+          shift_steps: 3,
+          pause_short_position_notional: 900.0,
+          max_short_position_notional: 900.0,
+          inventory_tier_start_notional: 600.0,
+          inventory_tier_end_notional: 750.0,
+          inventory_tier_buy_levels: 12,
+          inventory_tier_sell_levels: 4,
+          inventory_tier_per_order_notional: 70.0,
+          inventory_tier_base_position_notional: 280.0,
+          sleep_seconds: 10.0,
+        },
+      },
+      {
+        key: "volume_short_v1_conservative",
+        label: "量优先做空 v1（保守）",
+        description: "保守空头滚动微网格。更轻底仓、更低单笔和更慢追涨开空，适合 NIGHT 这类偏震荡币种试空。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_short",
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 45.0,
+          base_position_notional: 180.0,
+          up_trigger_steps: 5,
+          down_trigger_steps: 7,
+          shift_steps: 3,
+          pause_short_position_notional: 450.0,
+          max_short_position_notional: 600.0,
+          inventory_tier_start_notional: 300.0,
+          inventory_tier_end_notional: 450.0,
+          inventory_tier_buy_levels: 10,
+          inventory_tier_sell_levels: 4,
+          inventory_tier_per_order_notional: 45.0,
+          inventory_tier_base_position_notional: 90.0,
+          short_cover_pause_amp_trigger_ratio: 0.0045,
+          short_cover_pause_down_return_trigger_ratio: -0.002,
+        },
+      },
+      {
+        key: "defensive_quasi_neutral_aggressive_v1",
+        label: "准中性降损激进版",
+        description: "基于 ROBO 最近实盘运行参数固化出的激进准中性版本。仍以做多为主，但提高卖侧卸仓能力、放宽总上限，适合趋势不明时保量控损。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "one_way_long",
+          step_price: 0.00001,
+          buy_levels: 8,
+          sell_levels: 16,
+          per_order_notional: 180.0,
+          base_position_notional: 300.0,
+          up_trigger_steps: 6,
+          down_trigger_steps: 4,
+          shift_steps: 4,
+          pause_buy_position_notional: 1200.0,
+          max_position_notional: 1500.0,
+          buy_pause_amp_trigger_ratio: 0.0075,
+          buy_pause_down_return_trigger_ratio: -0.0035,
+          freeze_shift_abs_return_trigger_ratio: 0.005,
+          inventory_tier_start_notional: 800.0,
+          inventory_tier_end_notional: 1200.0,
+          inventory_tier_buy_levels: 6,
+          inventory_tier_sell_levels: 18,
+          inventory_tier_per_order_notional: 180.0,
+          inventory_tier_base_position_notional: 180.0,
+          max_new_orders: 30,
+          max_total_notional: 5000.0,
+          sleep_seconds: 5.0,
+          autotune_symbol_enabled: false,
         },
       },
       {
@@ -7822,6 +8067,31 @@ MONITOR_PAGE = """<!doctype html>
     let runnerPresets = [];
     let presetsLoaded = false;
     let latestCustomGridPreview = null;
+    let monitorSymbols = [];
+
+    async function loadMonitorSymbols(preferredSymbol = "") {
+      try {
+        const resp = await fetch("/api/symbol_lists?list_type=monitor");
+        const data = await resp.json();
+        if (!resp.ok || !data.ok || !Array.isArray(data.symbols)) {
+          throw new Error(data.error || `HTTP ${resp.status}`);
+        }
+        monitorSymbols = data.symbols.slice();
+      } catch (err) {
+        monitorSymbols = DEFAULT_MONITOR_SYMBOLS.slice();
+      }
+      symbolEl.innerHTML = monitorSymbols
+        .map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)}</option>`)
+        .join("");
+      const normalizedPreferred = String(preferredSymbol || "").trim().toUpperCase();
+      if (normalizedPreferred && monitorSymbols.includes(normalizedPreferred)) {
+        symbolEl.value = normalizedPreferred;
+      } else if (monitorSymbols.length) {
+        symbolEl.value = monitorSymbols[0];
+      } else {
+        symbolEl.value = "";
+      }
+    }
 
     function fmtNum(v, digits = 4) {
       if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
@@ -8245,7 +8515,8 @@ MONITOR_PAGE = """<!doctype html>
     }
 
     function renderPosition(data) {
-      const pos = data.position;
+      const rawPos = data.position;
+      const pos = rawPos || {};
       const risk = data.risk_controls || {};
       const runnerCfg = (data.runner && data.runner.config) || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
@@ -8265,7 +8536,7 @@ MONITOR_PAGE = """<!doctype html>
       const centerSource = risk.center_source || {};
       const isCustomGridCenter = String(centerSource.reason || "").startsWith("custom_grid_");
       const neutralHourly = risk.neutral_hourly_scale || {};
-      if (!pos) {
+      if (!rawPos) {
         positionBox.innerHTML = '<div class="empty">没有可用的账户持仓信息。请确认 Web UI 启动时已加载 Binance API 环境变量。</div>';
         return;
       }
@@ -8459,6 +8730,10 @@ MONITOR_PAGE = """<!doctype html>
 
     async function loadMonitor() {
       const symbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      if (!symbol) {
+        metaEl.textContent = "监控币种列表为空，请先到策略总览页添加币种。";
+        return;
+      }
       metaEl.textContent = `正在刷新 ${symbol} ...`;
       try {
         const resp = await fetch(`/api/loop_monitor?symbol=${encodeURIComponent(symbol)}`);
@@ -8552,9 +8827,14 @@ MONITOR_PAGE = """<!doctype html>
       restartTimer();
     });
 
-    clearCustomGridPreview();
-    loadMonitor();
-    restartTimer();
+    async function initMonitorPage() {
+      await loadMonitorSymbols(symbolEl.value);
+      clearCustomGridPreview();
+      await loadMonitor();
+      restartTimer();
+    }
+
+    initMonitorPage();
   </script>
 </body>
 </html>
@@ -9494,6 +9774,44 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       font-size: 13px;
       line-height: 1.65;
     }
+    .manager-grid {
+      margin-top: 18px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 18px;
+    }
+    .manager-block {
+      display: grid;
+      gap: 12px;
+    }
+    .manager-block h2 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .manager-input {
+      width: min(260px, 100%);
+    }
+    .chip-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 10px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    .chip button {
+      padding: 6px 10px;
+      font-size: 12px;
+      border-radius: 999px;
+    }
     .points {
       display: flex;
       flex-wrap: wrap;
@@ -9536,6 +9854,7 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
     }
     @media (max-width: 1180px) {
       .grid { grid-template-columns: 1fr; }
+      .manager-grid { grid-template-columns: 1fr; }
       .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .sections { grid-template-columns: 1fr; }
     }
@@ -10005,19 +10324,61 @@ STRATEGIES_PAGE = """<!doctype html>
       <div id="meta" class="meta">等待首轮数据...</div>
       <div id="summary"></div>
     </section>
+    <section class="card">
+      <div class="topline">
+        <div class="title">
+          <h2>币种列表管理</h2>
+          <p>监控/总览列表会同时作用于 `/monitor` 和本页。交易赛列表会作用于交易赛相关测算与报表。</p>
+        </div>
+      </div>
+      <div class="manager-grid">
+        <div class="manager-block">
+          <h2>监控/总览币种</h2>
+          <div class="toolbar">
+            <label>新增币种
+              <input id="monitor_symbol_input" class="manager-input" type="text" placeholder="例如 XAUTUSDT" />
+            </label>
+            <button id="monitor_symbol_add_btn" class="primary">添加</button>
+          </div>
+          <div id="monitor_symbol_meta" class="meta">可手动维护 `/monitor` 和 `/strategies` 使用的币种。</div>
+          <div id="monitor_symbol_chips" class="chip-list"></div>
+        </div>
+        <div class="manager-block">
+          <h2>交易赛币种</h2>
+          <div class="toolbar">
+            <label>新增币种
+              <input id="competition_symbol_input" class="manager-input" type="text" placeholder="例如 XAUTUSDT" />
+            </label>
+            <button id="competition_symbol_add_btn" class="primary">添加</button>
+          </div>
+          <div id="competition_symbol_meta" class="meta">可手动维护交易赛回测、报表和相关接口允许的币种。</div>
+          <div id="competition_symbol_chips" class="chip-list"></div>
+        </div>
+      </div>
+    </section>
     <div id="cards" class="grid"></div>
   </div>
 
   <script>
-    const SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
+    const DEFAULT_MONITOR_SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
+    const DEFAULT_COMPETITION_SYMBOLS = ["ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
     const cardsEl = document.getElementById("cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");
     const refreshBtn = document.getElementById("refresh_btn");
     const toggleBtn = document.getElementById("toggle_btn");
     const refreshSecEl = document.getElementById("refresh_sec");
+    const monitorSymbolInputEl = document.getElementById("monitor_symbol_input");
+    const competitionSymbolInputEl = document.getElementById("competition_symbol_input");
+    const monitorSymbolAddBtn = document.getElementById("monitor_symbol_add_btn");
+    const competitionSymbolAddBtn = document.getElementById("competition_symbol_add_btn");
+    const monitorSymbolMetaEl = document.getElementById("monitor_symbol_meta");
+    const competitionSymbolMetaEl = document.getElementById("competition_symbol_meta");
+    const monitorSymbolChipsEl = document.getElementById("monitor_symbol_chips");
+    const competitionSymbolChipsEl = document.getElementById("competition_symbol_chips");
     let timer = null;
     let paused = false;
+    let strategySymbols = [];
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -10055,6 +10416,70 @@ STRATEGIES_PAGE = """<!doctype html>
       if (num > 0) return "good";
       if (num < 0) return "bad";
       return "warn";
+    }
+
+    function normalizeSymbolInput(value) {
+      return String(value || "").trim().toUpperCase();
+    }
+
+    function setListMeta(element, message, isError = false) {
+      element.textContent = message;
+      element.className = isError ? "meta bad" : "meta";
+    }
+
+    function renderSymbolChips(element, listType, symbols) {
+      if (!symbols.length) {
+        element.innerHTML = '<div class="empty">当前列表为空</div>';
+        return;
+      }
+      element.innerHTML = symbols.map((symbol) => `
+        <span class="chip">
+          <span>${escapeHtml(symbol)}</span>
+          <button data-list-type="${escapeHtml(listType)}" data-symbol="${escapeHtml(symbol)}">删除</button>
+        </span>
+      `).join("");
+    }
+
+    async function loadSymbolLists() {
+      const resp = await fetch("/api/symbol_lists");
+      const data = await resp.json();
+      if (!resp.ok || !data.ok || !data.lists) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      const monitorSymbols = Array.isArray(data.lists.monitor)
+        ? data.lists.monitor.slice()
+        : DEFAULT_MONITOR_SYMBOLS.slice();
+      const competitionSymbols = Array.isArray(data.lists.competition)
+        ? data.lists.competition.slice()
+        : DEFAULT_COMPETITION_SYMBOLS.slice();
+      strategySymbols = monitorSymbols;
+      renderSymbolChips(monitorSymbolChipsEl, "monitor", monitorSymbols);
+      renderSymbolChips(competitionSymbolChipsEl, "competition", competitionSymbols);
+      setListMeta(monitorSymbolMetaEl, `当前共 ${monitorSymbols.length} 个监控/总览币种。`);
+      setListMeta(competitionSymbolMetaEl, `当前共 ${competitionSymbols.length} 个交易赛币种。`);
+    }
+
+    async function mutateSymbolList(listType, action, symbol, metaEl) {
+      const normalizedSymbol = normalizeSymbolInput(symbol);
+      if (!normalizedSymbol) {
+        setListMeta(metaEl, "请输入币种，例如 XAUTUSDT。", true);
+        return;
+      }
+      setListMeta(metaEl, `${action === "add" ? "正在添加" : "正在删除"} ${normalizedSymbol} ...`);
+      try {
+        const resp = await fetch("/api/symbol_lists", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ list_type: listType, action, symbol: normalizedSymbol }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        await loadSymbolLists();
+        setListMeta(metaEl, `${normalizedSymbol} 已${action === "add" ? "添加到" : "从"}${listType === "monitor" ? "监控/总览" : "交易赛"}列表。`);
+        await loadStrategies();
+      } catch (err) {
+        setListMeta(metaEl, `${action === "add" ? "添加" : "删除"}失败：${err}`, true);
+      }
     }
 
     function getPreset(snapshot, key) {
@@ -10250,7 +10675,14 @@ STRATEGIES_PAGE = """<!doctype html>
     async function loadStrategies() {
       metaEl.textContent = "正在刷新全部策略...";
       try {
-        const results = await Promise.all(SYMBOLS.map(async (symbol) => {
+        const symbols = strategySymbols.slice();
+        if (!symbols.length) {
+          summaryEl.textContent = "当前监控/总览币种列表为空。";
+          cardsEl.innerHTML = '<div class="empty">请先在上方“币种列表管理”里添加至少一个监控币种。</div>';
+          metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
+          return;
+        }
+        const results = await Promise.all(symbols.map(async (symbol) => {
           const resp = await fetch(`/api/loop_monitor?symbol=${encodeURIComponent(symbol)}`);
           const data = await resp.json();
           if (!resp.ok || !data.ok) throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
@@ -10285,9 +10717,40 @@ STRATEGIES_PAGE = """<!doctype html>
       restartTimer();
     });
     refreshSecEl.addEventListener("change", restartTimer);
+    monitorSymbolAddBtn.addEventListener("click", () => {
+      mutateSymbolList("monitor", "add", monitorSymbolInputEl.value, monitorSymbolMetaEl);
+      monitorSymbolInputEl.value = "";
+    });
+    competitionSymbolAddBtn.addEventListener("click", () => {
+      mutateSymbolList("competition", "add", competitionSymbolInputEl.value, competitionSymbolMetaEl);
+      competitionSymbolInputEl.value = "";
+    });
+    monitorSymbolChipsEl.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLButtonElement)) return;
+      mutateSymbolList("monitor", "remove", target.dataset.symbol || "", monitorSymbolMetaEl);
+    });
+    competitionSymbolChipsEl.addEventListener("click", (event) => {
+      const target = event.target;
+      if (!(target instanceof HTMLButtonElement)) return;
+      mutateSymbolList("competition", "remove", target.dataset.symbol || "", competitionSymbolMetaEl);
+    });
 
-    loadStrategies();
-    restartTimer();
+    async function initStrategiesPage() {
+      try {
+        await loadSymbolLists();
+      } catch (err) {
+        strategySymbols = DEFAULT_MONITOR_SYMBOLS.slice();
+        renderSymbolChips(monitorSymbolChipsEl, "monitor", strategySymbols);
+        renderSymbolChips(competitionSymbolChipsEl, "competition", DEFAULT_COMPETITION_SYMBOLS.slice());
+        setListMeta(monitorSymbolMetaEl, `加载失败，已回退默认监控列表：${err}`, true);
+        setListMeta(competitionSymbolMetaEl, `加载失败，已回退默认交易赛列表：${err}`, true);
+      }
+      await loadStrategies();
+      restartTimer();
+    }
+
+    initStrategiesPage();
   </script>
 </body>
 </html>
@@ -13609,6 +14072,24 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json(payload, status=HTTPStatus.OK)
             return
+        if path == "/api/symbol_lists":
+            list_type_raw = str(query.get("list_type", [""])[0]).strip()
+            try:
+                if list_type_raw:
+                    list_type = normalize_symbol_list_type(list_type_raw)
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "list_type": list_type,
+                            "symbols": get_symbol_list(list_type),
+                        },
+                        status=HTTPStatus.OK,
+                    )
+                else:
+                    self._send_json({"ok": True, "lists": load_symbol_lists()}, status=HTTPStatus.OK)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=400)
+            return
         if path.startswith("/api/symbols"):
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"
             market_type_raw = str(query.get("market_type", ["futures"])[0]).strip()
@@ -13820,7 +14301,8 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if (
-            path.startswith("/api/symbols")
+            path == "/api/symbol_lists"
+            or path.startswith("/api/symbols")
             or path == "/api/price"
             or path.startswith("/api/loop_monitor")
             or path == "/api/grid_preview"
@@ -13908,6 +14390,52 @@ class _Handler(BaseHTTPRequestHandler):
                 else:
                     result = _stop_runner_process(payload.get("symbol"))
                 self._send_json({"ok": True, **result}, status=200)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return
+        if path == "/api/symbol_lists":
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 1024 * 1024:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            raw = self.rfile.read(content_len)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            if not isinstance(payload, dict):
+                self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
+                return
+            try:
+                list_type = normalize_symbol_list_type(payload.get("list_type"))
+                action = str(payload.get("action", "replace")).strip().lower()
+                if action == "replace":
+                    symbols_value = payload.get("symbols")
+                    if not isinstance(symbols_value, list):
+                        raise ValueError("symbols must be list when action=replace")
+                    symbols = set_symbol_list(list_type, symbols_value)
+                else:
+                    symbols = update_symbol_list(
+                        list_type,
+                        action=action,
+                        symbol=payload.get("symbol"),
+                    )
+                self._send_json(
+                    {
+                        "ok": True,
+                        "list_type": list_type,
+                        "symbols": symbols,
+                        "lists": load_symbol_lists(),
+                    },
+                    status=HTTPStatus.OK,
+                )
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return

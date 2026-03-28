@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from grid_optimizer.competition import (
     COMPETITION_SYMBOLS,
@@ -11,11 +12,18 @@ from grid_optimizer.competition import (
 
 
 class CompetitionTests(unittest.TestCase):
-    def test_supported_competition_symbols_include_kat_opn_and_robo(self) -> None:
+    @patch("grid_optimizer.competition.get_symbol_list", return_value=list(COMPETITION_SYMBOLS))
+    def test_supported_competition_symbols_include_kat_opn_and_robo(self, mock_get_symbol_list) -> None:
         self.assertEqual(tuple(competition_symbols()), COMPETITION_SYMBOLS)
         self.assertIn("KATUSDT", COMPETITION_SYMBOLS)
         self.assertIn("OPNUSDT", COMPETITION_SYMBOLS)
         self.assertIn("ROBOUSDT", COMPETITION_SYMBOLS)
+        mock_get_symbol_list.assert_called_once_with("competition")
+
+    @patch("grid_optimizer.competition.get_symbol_list", return_value=["XAUTUSDT", "KATUSDT"])
+    def test_competition_symbols_can_be_overridden_by_saved_list(self, mock_get_symbol_list) -> None:
+        self.assertEqual(competition_symbols(), ["XAUTUSDT", "KATUSDT"])
+        mock_get_symbol_list.assert_called_once_with("competition")
 
     def test_build_competition_strategy_uses_reference_price_band(self) -> None:
         strategy = build_competition_strategy(reference_price=100.0, profile_key="conservative")

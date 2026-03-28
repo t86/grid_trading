@@ -1472,8 +1472,6 @@ def load_or_fetch_candles(
     contract_type: str = "usdm",
     market_type: str = "futures",
     refresh: bool = False,
-    start_time: datetime | None = None,
-    end_time: datetime | None = None,
 ) -> list[Candle]:
     normalized_market_type = normalize_market_type(market_type)
     normalized_contract_type = normalize_contract_type(contract_type) if normalized_market_type == "futures" else "usdm"
