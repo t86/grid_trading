@@ -7915,6 +7915,12 @@ MONITOR_PAGE = """<!doctype html>
       flex-wrap: wrap;
       margin-bottom: 12px;
     }
+    .editor-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
+      gap: 16px;
+      align-items: start;
+    }
     .editor-box {
       width: 100%;
       min-height: 360px;
@@ -7927,6 +7933,41 @@ MONITOR_PAGE = """<!doctype html>
       line-height: 1.55;
       font-family: "SFMono-Regular", "Menlo", "Monaco", "Consolas", monospace;
       resize: vertical;
+    }
+    .param-guide {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fcfbf7;
+      overflow: hidden;
+    }
+    .param-guide .tiny {
+      padding: 12px 14px 0;
+    }
+    .param-guide-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .param-guide-table th,
+    .param-guide-table td {
+      padding: 10px 12px;
+      border-bottom: 1px solid var(--line);
+      vertical-align: top;
+    }
+    .param-guide-table th {
+      background: #f5f1e8;
+      color: var(--muted);
+      position: sticky;
+      top: 0;
+      z-index: 1;
+    }
+    .param-guide-table td code {
+      font-size: 12px;
+      color: #0f423f;
+    }
+    .param-guide-scroll {
+      max-height: 420px;
+      overflow: auto;
     }
     .meta { font-size: 13px; color: var(--muted); }
     .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
@@ -7989,6 +8030,7 @@ MONITOR_PAGE = """<!doctype html>
     @media (max-width: 980px) {
       .status-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .grid-2 { grid-template-columns: 1fr; }
+      .editor-grid { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       .status-row { grid-template-columns: 1fr; }
@@ -8052,7 +8094,28 @@ MONITOR_PAGE = """<!doctype html>
         <button id="apply_params_btn" class="primary">应用参数并启动</button>
       </div>
       <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改 JSON。</div>
-      <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
+      <div class="editor-grid">
+        <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
+        <div class="param-guide">
+          <div class="tiny">右侧会按照当前 JSON 展示参数含义，方便直接对照修改。</div>
+          <div class="param-guide-scroll">
+            <table class="param-guide-table">
+              <thead>
+                <tr>
+                  <th>参数</th>
+                  <th>当前值</th>
+                  <th>说明</th>
+                </tr>
+              </thead>
+              <tbody id="runner_params_guide_body">
+                <tr>
+                  <td colspan="3" class="empty">先载入参数，右侧再显示逐项解释。</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </div>
     </section>
 
     <section class="card">
@@ -8275,6 +8338,7 @@ MONITOR_PAGE = """<!doctype html>
     const applyParamsBtn = document.getElementById("apply_params_btn");
     const runnerParamsMetaEl = document.getElementById("runner_params_meta");
     const runnerParamsEditorEl = document.getElementById("runner_params_editor");
+    const runnerParamsGuideBodyEl = document.getElementById("runner_params_guide_body");
     const customGridNameEl = document.getElementById("custom_grid_name");
     const customGridDirectionEl = document.getElementById("custom_grid_direction");
     const customGridLevelModeEl = document.getElementById("custom_grid_level_mode");
@@ -8612,6 +8676,75 @@ MONITOR_PAGE = """<!doctype html>
     let latestCustomGridPreview = null;
     let monitorSymbols = [];
     let latestRunnerEditorConfig = null;
+    const RUNNER_PARAM_EXPLAIN = {
+      strategy_profile: "策略模板标识。用于区分量优先做空、做多、防守或自定义策略。",
+      strategy_mode: "策略方向/模式。one_way_long 做多，one_way_short 做空，neutral/synthetic 是中性或合成中性。",
+      symbol: "当前交易对。",
+      step_price: "相邻网格之间的固定价差。越小越贴近盘口、成交更密，但更容易因为手续费和反复换手产生磨损。",
+      buy_levels: "买单层数。层数越多，向下承接更深，但资金占用也更高。",
+      sell_levels: "卖单层数。层数越多，向上卸仓或开空覆盖更广。",
+      per_order_notional: "每笔挂单的目标名义金额（U）。直接决定单笔成交额大小。",
+      base_position_notional: "基础持仓目标名义。做多会优先建立底仓，做空则对应基础空仓。",
+      center_price: "固定中心价；为空时由运行时根据中价和偏移逻辑动态计算。",
+      fixed_center_enabled: "是否启用固定中心价。开启后不会按常规触发逻辑自动迁移中心。",
+      fixed_center_roll_enabled: "固定中心启用时，是否允许中心按规则缓慢滚动。",
+      excess_inventory_reduce_only_enabled: "库存超标时只允许减仓，不再继续扩仓。",
+      autotune_symbol_enabled: "是否允许按币种内置调参规则覆盖当前手动参数。你要精确手动调参时通常建议关闭。",
+      up_trigger_steps: "价格向上偏离中心多少格后，触发中心上移。",
+      down_trigger_steps: "价格向下偏离中心多少格后，触发中心下移。",
+      shift_steps: "每次触发后中心移动多少格。越大越跟价，越小越稳。",
+      pause_buy_position_notional: "做多模式下达到该持仓名义后暂停继续买入。",
+      pause_short_position_notional: "做空模式下达到该空仓名义后暂停继续开空。",
+      max_position_notional: "做多模式总持仓上限。",
+      max_short_position_notional: "做空模式总空仓上限。",
+      buy_pause_amp_trigger_ratio: "短时间振幅过大时，暂停做多开仓的阈值。",
+      buy_pause_down_return_trigger_ratio: "短时间跌幅过大时，暂停做多开仓的阈值。",
+      freeze_shift_abs_return_trigger_ratio: "短时波动过大时冻结中心位移，避免不停追价。",
+      short_cover_pause_amp_trigger_ratio: "做空模式下，振幅过大时暂停买回补空。",
+      short_cover_pause_down_return_trigger_ratio: "做空模式下，快速下跌时暂停追着买回补空。",
+      auto_regime_enabled: "是否启用市场状态自动切换。",
+      auto_regime_confirm_cycles: "市场状态切换前需要连续满足条件的轮数。",
+      auto_regime_stable_15m_max_amplitude_ratio: "稳定行情判定的 15 分钟振幅阈值。",
+      auto_regime_stable_60m_max_amplitude_ratio: "稳定行情判定的 60 分钟振幅阈值。",
+      auto_regime_stable_60m_return_floor_ratio: "稳定行情判定的 60 分钟最低涨跌幅阈值。",
+      auto_regime_defensive_15m_amplitude_ratio: "防守行情判定的 15 分钟振幅阈值。",
+      auto_regime_defensive_60m_amplitude_ratio: "防守行情判定的 60 分钟振幅阈值。",
+      auto_regime_defensive_15m_return_ratio: "防守行情判定的 15 分钟涨跌幅阈值。",
+      auto_regime_defensive_60m_return_ratio: "防守行情判定的 60 分钟涨跌幅阈值。",
+      neutral_center_interval_minutes: "中性策略中心重算周期。",
+      neutral_band1_offset_ratio: "中性模式第一层带宽偏移比例。",
+      neutral_band2_offset_ratio: "中性模式第二层带宽偏移比例。",
+      neutral_band3_offset_ratio: "中性模式第三层带宽偏移比例。",
+      neutral_band1_target_ratio: "中性模式第一层目标仓位比例。",
+      neutral_band2_target_ratio: "中性模式第二层目标仓位比例。",
+      neutral_band3_target_ratio: "中性模式第三层目标仓位比例。",
+      neutral_hourly_scale_enabled: "是否按小时级市场状态动态缩放中性仓位。",
+      neutral_hourly_scale_stable: "稳定行情时的中性仓位缩放系数。",
+      neutral_hourly_scale_transition: "过渡行情时的中性仓位缩放系数。",
+      neutral_hourly_scale_defensive: "防守行情时的中性仓位缩放系数。",
+      inventory_tier_start_notional: "持仓达到该名义后开始进入库存分层控制。",
+      inventory_tier_end_notional: "达到该持仓名义后，分层参数完全生效。",
+      inventory_tier_buy_levels: "库存分层生效后的买单层数。",
+      inventory_tier_sell_levels: "库存分层生效后的卖单层数。",
+      inventory_tier_per_order_notional: "库存分层生效后的单笔名义金额。",
+      inventory_tier_base_position_notional: "库存分层生效后的基础底仓/基础空仓名义。",
+      margin_type: "保证金模式。KEEP 表示沿用账户当前保证金设置。",
+      leverage: "杠杆倍数。",
+      max_plan_age_seconds: "计划最大允许年龄，超过就不执行，避免使用过旧计划。",
+      max_mid_drift_steps: "计划生成到下单之间，允许中价漂移的最大格数。",
+      maker_retries: "遇到 post-only 拒单时的重试次数。",
+      max_new_orders: "单轮最多新增多少笔挂单。",
+      max_total_notional: "单轮新增挂单总名义上限。",
+      sleep_seconds: "循环轮询周期。越小越跟价，但撤改单更频繁。",
+      cancel_stale: "是否撤掉与当前目标计划不一致的旧单。",
+      apply: "是否真实下单。关闭时仅做 dry-run。",
+      reset_state: "启动时是否重置本地状态文件。",
+      state_path: "运行状态文件路径。",
+      plan_json: "最近一次计划输出 JSON 路径。",
+      submit_report_json: "最近一次下单提交报告路径。",
+      summary_jsonl: "循环事件日志文件路径。",
+      custom_grid_enabled: "是否启用自定义网格模式。"
+    };
 
     async function loadMonitorSymbols(preferredSymbol = "") {
       try {
@@ -8692,10 +8825,61 @@ MONITOR_PAGE = """<!doctype html>
       return config;
     }
 
+    function formatRunnerGuideValue(value) {
+      if (value === null) return "null";
+      if (value === undefined) return "undefined";
+      if (typeof value === "object") {
+        try {
+          return JSON.stringify(value);
+        } catch (err) {
+          return String(value);
+        }
+      }
+      return String(value);
+    }
+
+    function renderRunnerParamGuide(config) {
+      const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
+      const entries = Object.entries(source);
+      if (!entries.length) {
+        runnerParamsGuideBodyEl.innerHTML = '<tr><td colspan="3" class="empty">先载入参数，右侧再显示逐项解释。</td></tr>';
+        return;
+      }
+      runnerParamsGuideBodyEl.innerHTML = entries
+        .map(([key, value]) => {
+          const explanation = RUNNER_PARAM_EXPLAIN[key] || "当前参数暂无内置说明，可结合策略模式与上下文字段一起判断。";
+          return `
+            <tr>
+              <td><code>${escapeHtml(key)}</code></td>
+              <td><code>${escapeHtml(formatRunnerGuideValue(value))}</code></td>
+              <td>${escapeHtml(explanation)}</td>
+            </tr>
+          `;
+        })
+        .join("");
+    }
+
+    function syncRunnerParamGuideFromEditor() {
+      try {
+        const payload = JSON.parse(runnerParamsEditorEl.value || "{}");
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          throw new Error("参数编辑器内容必须是 JSON 对象");
+        }
+        renderRunnerParamGuide(payload);
+      } catch (err) {
+        runnerParamsGuideBodyEl.innerHTML = `
+          <tr>
+            <td colspan="3" class="empty">JSON 解析失败：${escapeHtml(String(err))}</td>
+          </tr>
+        `;
+      }
+    }
+
     function setRunnerEditorConfig(rawConfig, sourceLabel = "") {
       latestRunnerEditorConfig = normalizeRunnerEditorConfig(rawConfig, rawConfig && rawConfig.strategy_profile ? String(rawConfig.strategy_profile) : "");
       runnerParamsEditorEl.value = JSON.stringify(latestRunnerEditorConfig, null, 2);
       runnerParamsMetaEl.textContent = sourceLabel || "参数已载入，可直接修改 JSON 后应用。";
+      renderRunnerParamGuide(latestRunnerEditorConfig);
     }
 
     function loadRunningConfigToEditor() {
@@ -9487,6 +9671,7 @@ MONITOR_PAGE = """<!doctype html>
     loadRunningParamsBtn.addEventListener("click", loadRunningConfigToEditor);
     loadPresetParamsBtn.addEventListener("click", loadPresetConfigToEditor);
     applyParamsBtn.addEventListener("click", applyRunnerParams);
+    runnerParamsEditorEl.addEventListener("input", syncRunnerParamGuideFromEditor);
     customGridPreviewBtn.addEventListener("click", runCustomGridPreview);
     customGridSaveBtn.addEventListener("click", saveCustomGridStrategy);
     customGridLoadBtn.addEventListener("click", loadCustomGridPresetToForm);
