@@ -21,6 +21,7 @@ from .data import (
 )
 from .dry_run import _round_order_price, _round_order_qty
 from .live_check import extract_symbol_position
+from .semi_auto_plan import diff_open_orders
 
 STOP_REQUESTED = False
 
@@ -236,6 +237,37 @@ def _cancel_our_orders(
     return result
 
 
+def _cancel_orders(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    orders: list[dict[str, Any]],
+    recv_window: int,
+) -> dict[str, Any]:
+    result = {"attempted": len(orders), "canceled": 0, "errors": []}
+    for order in orders:
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
+                orig_client_order_id=str(order.get("clientOrderId", "")).strip() or None,
+                recv_window=recv_window,
+            )
+            result["canceled"] += 1
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    "order_id": order.get("orderId"),
+                    "client_order_id": order.get("clientOrderId"),
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return result
+
+
 def _install_signal_handlers() -> None:
     def _handle_signal(signum: int, _frame: Any) -> None:
         del signum
@@ -281,14 +313,27 @@ def _run(args: argparse.Namespace) -> int:
             return 0
         try:
             snapshot = load_live_flatten_snapshot(args.symbol, api_key, api_secret)
-            cancel_result = _cancel_our_orders(
+            open_orders = fetch_futures_open_orders(args.symbol, api_key, api_secret, recv_window=args.recv_window)
+            our_orders = [order for order in open_orders if isinstance(order, dict) and is_flatten_order(order, prefix)]
+            orders = list(snapshot.get("orders", []))
+            desired_orders = [
+                {
+                    **order,
+                    "side": str(order["side"]),
+                    "price": _safe_float(order["price"]),
+                    "qty": _safe_float(order["quantity"]),
+                    "position_side": order.get("position_side", "BOTH"),
+                }
+                for order in orders
+            ]
+            diff = diff_open_orders(existing_orders=our_orders, desired_orders=desired_orders)
+            cancel_result = _cancel_orders(
                 symbol=args.symbol,
                 api_key=api_key,
                 api_secret=api_secret,
-                prefix=prefix,
+                orders=list(diff.get("stale_orders", [])),
                 recv_window=args.recv_window,
             )
-            orders = list(snapshot.get("orders", []))
             placed_orders: list[dict[str, Any]] = []
             place_errors: list[dict[str, Any]] = []
             if not orders:
@@ -301,10 +346,11 @@ def _run(args: argparse.Namespace) -> int:
                         "symbol": args.symbol,
                         "snapshot": snapshot,
                         "cancel_result": cancel_result,
+                        "kept_order_count": len(diff.get("kept_orders", [])),
                     },
                 )
                 return 0
-            for order in orders:
+            for order in diff.get("missing_orders", []):
                 client_order_id = _build_client_order_id(prefix, str(order.get("tag", "close")), str(order.get("side", "")))
                 try:
                     response = post_futures_order(
@@ -343,6 +389,9 @@ def _run(args: argparse.Namespace) -> int:
                     "event": "cycle",
                     "symbol": args.symbol,
                     "snapshot": snapshot,
+                    "kept_order_count": len(diff.get("kept_orders", [])),
+                    "stale_order_count": len(diff.get("stale_orders", [])),
+                    "missing_order_count": len(diff.get("missing_orders", [])),
                     "cancel_result": cancel_result,
                     "placed_orders": placed_orders,
                     "place_errors": place_errors,

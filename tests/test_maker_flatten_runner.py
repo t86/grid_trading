@@ -3,6 +3,7 @@ from __future__ import annotations
 import unittest
 
 from grid_optimizer.maker_flatten_runner import build_flatten_orders_from_snapshot
+from grid_optimizer.semi_auto_plan import diff_open_orders
 
 
 class MakerFlattenRunnerTests(unittest.TestCase):
@@ -77,6 +78,32 @@ class MakerFlattenRunnerTests(unittest.TestCase):
         self.assertEqual(result["orders"][1]["side"], "BUY")
         self.assertEqual(result["orders"][1]["price"], 1.23)
         self.assertEqual(result["orders"][1]["position_side"], "SHORT")
+
+    def test_matching_flatten_order_is_kept(self) -> None:
+        desired = {
+            "side": "SELL",
+            "price": 1.24,
+            "quantity": 10.0,
+            "qty": 10.0,
+            "position_side": "BOTH",
+            "time_in_force": "GTX",
+        }
+        diff = diff_open_orders(
+            existing_orders=[
+                {
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "price": "1.24",
+                    "origQty": "10",
+                    "positionSide": "BOTH",
+                    "orderId": 1,
+                }
+            ],
+            desired_orders=[desired],
+        )
+        self.assertEqual(len(diff["kept_orders"]), 1)
+        self.assertEqual(len(diff["missing_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 0)
 
 
 if __name__ == "__main__":
