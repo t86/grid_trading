@@ -7909,6 +7909,25 @@ MONITOR_PAGE = """<!doctype html>
       color: var(--text);
       font-size: 14px;
     }
+    .editor-toolbar {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 12px;
+    }
+    .editor-box {
+      width: 100%;
+      min-height: 360px;
+      border-radius: 12px;
+      border: 1px solid var(--line);
+      padding: 12px 14px;
+      background: #fcfbf7;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.55;
+      font-family: "SFMono-Regular", "Menlo", "Monaco", "Consolas", monospace;
+      resize: vertical;
+    }
     .meta { font-size: 13px; color: var(--muted); }
     .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     .metric {
@@ -8020,6 +8039,20 @@ MONITOR_PAGE = """<!doctype html>
       <div class="meta">监控币种列表可在 <a href="/strategies">策略总览页</a> 手动添加和删除。</div>
       <div id="strategy_action_meta" class="meta"></div>
       <div id="strategy_preset_meta" class="meta"></div>
+    </section>
+
+    <section class="card">
+      <div class="panel-title">
+        <h2>策略参数编辑</h2>
+        <div class="tiny">载入当前运行参数或所选预设，直接修改 JSON 后应用到当前交易对</div>
+      </div>
+      <div class="editor-toolbar">
+        <button id="load_running_params_btn">载入运行参数</button>
+        <button id="load_preset_params_btn">载入预设参数</button>
+        <button id="apply_params_btn" class="primary">应用参数并启动</button>
+      </div>
+      <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改 JSON。</div>
+      <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
     </section>
 
     <section class="card">
@@ -8237,6 +8270,11 @@ MONITOR_PAGE = """<!doctype html>
     const stopClosePositionsEl = document.getElementById("stop_close_positions");
     const strategyActionMetaEl = document.getElementById("strategy_action_meta");
     const strategyPresetMetaEl = document.getElementById("strategy_preset_meta");
+    const loadRunningParamsBtn = document.getElementById("load_running_params_btn");
+    const loadPresetParamsBtn = document.getElementById("load_preset_params_btn");
+    const applyParamsBtn = document.getElementById("apply_params_btn");
+    const runnerParamsMetaEl = document.getElementById("runner_params_meta");
+    const runnerParamsEditorEl = document.getElementById("runner_params_editor");
     const customGridNameEl = document.getElementById("custom_grid_name");
     const customGridDirectionEl = document.getElementById("custom_grid_direction");
     const customGridLevelModeEl = document.getElementById("custom_grid_level_mode");
@@ -8573,6 +8611,7 @@ MONITOR_PAGE = """<!doctype html>
     let presetsLoaded = false;
     let latestCustomGridPreview = null;
     let monitorSymbols = [];
+    let latestRunnerEditorConfig = null;
 
     async function loadMonitorSymbols(preferredSymbol = "") {
       try {
@@ -8637,6 +8676,97 @@ MONITOR_PAGE = """<!doctype html>
     function getSelectedCustomPreset() {
       const preset = getPresetByKey(strategyPresetEl.value || "");
       return preset && preset.custom ? preset : null;
+    }
+
+    function normalizeRunnerEditorConfig(rawConfig, strategyProfile = "") {
+      const source = (rawConfig && typeof rawConfig === "object") ? rawConfig : {};
+      const config = {};
+      Object.entries(source).forEach(([key, value]) => {
+        if (value !== undefined) config[key] = value;
+      });
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || String(config.symbol || "NIGHTUSDT").toUpperCase();
+      config.symbol = selectedSymbol;
+      if (strategyProfile && !config.strategy_profile) {
+        config.strategy_profile = strategyProfile;
+      }
+      return config;
+    }
+
+    function setRunnerEditorConfig(rawConfig, sourceLabel = "") {
+      latestRunnerEditorConfig = normalizeRunnerEditorConfig(rawConfig, rawConfig && rawConfig.strategy_profile ? String(rawConfig.strategy_profile) : "");
+      runnerParamsEditorEl.value = JSON.stringify(latestRunnerEditorConfig, null, 2);
+      runnerParamsMetaEl.textContent = sourceLabel || "参数已载入，可直接修改 JSON 后应用。";
+    }
+
+    function loadRunningConfigToEditor() {
+      const runnerConfig = ((((latestMonitorData || {}).runner || {}).config) || {});
+      if (!runnerConfig || !Object.keys(runnerConfig).length) {
+        runnerParamsMetaEl.textContent = "当前没有可载入的运行参数，请先启动一次策略。";
+        return;
+      }
+      const profile = String(runnerConfig.strategy_profile || "");
+      setRunnerEditorConfig(
+        { ...runnerConfig, ...(profile ? { strategy_profile: profile } : {}) },
+        `已载入 ${symbolEl.value || runnerConfig.symbol || "当前交易对"} 的运行参数。`
+      );
+    }
+
+    function loadPresetConfigToEditor() {
+      const preset = getPresetByKey(strategyPresetEl.value || "");
+      if (!preset) {
+        runnerParamsMetaEl.textContent = "请先选择一个策略预设。";
+        return;
+      }
+      setRunnerEditorConfig(
+        { ...((preset && preset.config) || {}), strategy_profile: preset.key },
+        `已载入预设 ${preset.label}，可按当前交易对继续修改。`
+      );
+    }
+
+    async function applyRunnerParams() {
+      const selectedPreset = getPresetByKey(strategyPresetEl.value);
+      const fallbackProfile = selectedPreset
+        ? selectedPreset.key
+        : String((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
+      let payload;
+      try {
+        payload = JSON.parse(runnerParamsEditorEl.value || "{}");
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `JSON 解析失败: ${err}`;
+        return;
+      }
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        runnerParamsMetaEl.textContent = "参数编辑器内容必须是 JSON 对象。";
+        return;
+      }
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      payload.symbol = selectedSymbol;
+      if (!payload.strategy_profile) {
+        payload.strategy_profile = fallbackProfile;
+      }
+      applyParamsBtn.disabled = true;
+      loadRunningParamsBtn.disabled = true;
+      loadPresetParamsBtn.disabled = true;
+      runnerParamsMetaEl.textContent = `正在应用 ${selectedSymbol} 参数并重启策略...`;
+      try {
+        const resp = await fetch("/api/runner/start", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        runnerParamsMetaEl.textContent = `参数已应用到 ${selectedSymbol}${data.restarted ? "，策略已重启" : (data.already_running ? "，策略已在运行" : "，策略已启动")}`;
+        await loadMonitor();
+        const appliedConfig = ((((data || {}).runner || {}).config) || payload);
+        setRunnerEditorConfig(appliedConfig, `已载入 ${selectedSymbol} 当前生效参数。`);
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `应用失败: ${err}`;
+      } finally {
+        applyParamsBtn.disabled = false;
+        loadRunningParamsBtn.disabled = false;
+        loadPresetParamsBtn.disabled = false;
+      }
     }
 
     function syncCustomGridActionButtons() {
@@ -9279,6 +9409,9 @@ MONITOR_PAGE = """<!doctype html>
         renderTrades(data);
         renderEvents(data);
         renderCharts(data);
+        if (!runnerParamsEditorEl.value.trim()) {
+          loadRunningConfigToEditor();
+        }
         const warnings = (data.warnings || []).join(" | ");
         metaEl.textContent = `最后刷新: ${fmtTs(data.ts)}${warnings ? ` · 警告: ${warnings}` : ""}`;
       } catch (err) {
@@ -9351,6 +9484,9 @@ MONITOR_PAGE = """<!doctype html>
     stopStrategyBtn.addEventListener("click", () => controlStrategy("stop"));
     refreshSecEl.addEventListener("change", restartTimer);
     strategyPresetEl.addEventListener("change", () => renderPresetMeta(latestMonitorData));
+    loadRunningParamsBtn.addEventListener("click", loadRunningConfigToEditor);
+    loadPresetParamsBtn.addEventListener("click", loadPresetConfigToEditor);
+    applyParamsBtn.addEventListener("click", applyRunnerParams);
     customGridPreviewBtn.addEventListener("click", runCustomGridPreview);
     customGridSaveBtn.addEventListener("click", saveCustomGridStrategy);
     customGridLoadBtn.addEventListener("click", loadCustomGridPresetToForm);
