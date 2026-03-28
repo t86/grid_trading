@@ -41,7 +41,11 @@ from .competition_board import (
 )
 from .data import (
     cache_file_path,
+    delete_futures_order,
     delete_spot_order,
+    fetch_futures_account_info_v3,
+    fetch_futures_open_orders,
+    fetch_futures_position_mode,
     fetch_spot_account_info,
     fetch_spot_latest_price,
     fetch_spot_open_orders,
@@ -60,6 +64,7 @@ from .data import (
     fetch_futures_latest_price,
     fetch_futures_premium_index,
     fetch_futures_symbol_config,
+    post_futures_order,
     fetch_recent_funding_records,
     fetch_spot_book_tickers,
     fetch_spot_klines,
@@ -78,6 +83,7 @@ from .data import (
     parse_interval_ms,
     read_latest_cached_close,
 )
+from .dry_run import _round_order_price, _round_order_qty
 from .monitor import (
     RUNNER_CONTROL_PATH,
     RUNNER_LOG_PATH,
@@ -1800,7 +1806,13 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.0) -> dict[str, Any]:
+def _stop_runner_process(
+    symbol: str | None = None,
+    timeout_seconds: float = 10.0,
+    *,
+    cancel_open_orders: bool = False,
+    close_all_positions: bool = False,
+) -> dict[str, Any]:
     normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
     runner = _read_runner_process_for_symbol(normalized_symbol)
     pid_path = _runner_pid_path(normalized_symbol)
@@ -1822,6 +1834,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 "runner": _read_runner_process_for_symbol(normalized_symbol),
                 "service": RUNNER_LAUNCH_AGENT_LABEL,
                 "symbol": normalized_symbol,
+                "post_stop_actions": _execute_stop_actions(
+                    symbol=normalized_symbol,
+                    cancel_open_orders=cancel_open_orders,
+                    close_all_positions=close_all_positions,
+                ),
             }
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(RUNNER_LAUNCH_AGENT_PATH)], check=False)
         time.sleep(1.0)
@@ -1830,6 +1847,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 pid_path.unlink()
             except OSError:
                 pass
+        post_stop_actions = _execute_stop_actions(
+            symbol=normalized_symbol,
+            cancel_open_orders=cancel_open_orders,
+            close_all_positions=close_all_positions,
+        )
         return {
             "stopped": True,
             "killed": False,
@@ -1837,6 +1859,7 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
             "service": RUNNER_LAUNCH_AGENT_LABEL,
             "launch_agent": str(RUNNER_LAUNCH_AGENT_PATH),
             "symbol": normalized_symbol,
+            "post_stop_actions": post_stop_actions,
         }
     if service_name and _runner_service_available(normalized_symbol):
         active = _run_systemctl(["is-active", "--quiet", service_name], check=False).returncode == 0
@@ -1852,6 +1875,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 "runner": _read_runner_process_for_symbol(normalized_symbol),
                 "service": service_name,
                 "symbol": normalized_symbol,
+                "post_stop_actions": _execute_stop_actions(
+                    symbol=normalized_symbol,
+                    cancel_open_orders=cancel_open_orders,
+                    close_all_positions=close_all_positions,
+                ),
             }
         _run_systemctl(["stop", service_name], check=True)
         time.sleep(1.0)
@@ -1860,12 +1888,18 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                 pid_path.unlink()
             except OSError:
                 pass
+        post_stop_actions = _execute_stop_actions(
+            symbol=normalized_symbol,
+            cancel_open_orders=cancel_open_orders,
+            close_all_positions=close_all_positions,
+        )
         return {
             "stopped": True,
             "killed": False,
             "runner": _read_runner_process_for_symbol(normalized_symbol),
             "service": service_name,
             "symbol": normalized_symbol,
+            "post_stop_actions": post_stop_actions,
         }
 
     pid = runner.get("pid")
@@ -1880,6 +1914,11 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
             "already_stopped": True,
             "runner": _read_runner_process_for_symbol(normalized_symbol),
             "symbol": normalized_symbol,
+            "post_stop_actions": _execute_stop_actions(
+                symbol=normalized_symbol,
+                cancel_open_orders=cancel_open_orders,
+                close_all_positions=close_all_positions,
+            ),
         }
 
     os.kill(int(pid), signal.SIGTERM)
@@ -1892,7 +1931,17 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
                     pid_path.unlink()
                 except OSError:
                     pass
-            return {"stopped": True, "killed": False, "runner": probe, "symbol": normalized_symbol}
+            return {
+                "stopped": True,
+                "killed": False,
+                "runner": probe,
+                "symbol": normalized_symbol,
+                "post_stop_actions": _execute_stop_actions(
+                    symbol=normalized_symbol,
+                    cancel_open_orders=cancel_open_orders,
+                    close_all_positions=close_all_positions,
+                ),
+            }
         time.sleep(0.25)
 
     os.kill(int(pid), signal.SIGKILL)
@@ -1902,12 +1951,246 @@ def _stop_runner_process(symbol: str | None = None, timeout_seconds: float = 10.
             pid_path.unlink()
         except OSError:
             pass
+    post_stop_actions = _execute_stop_actions(
+        symbol=normalized_symbol,
+        cancel_open_orders=cancel_open_orders,
+        close_all_positions=close_all_positions,
+    )
     return {
         "stopped": True,
         "killed": True,
         "runner": _read_runner_process_for_symbol(normalized_symbol),
         "symbol": normalized_symbol,
+        "post_stop_actions": post_stop_actions,
     }
+
+
+def _safe_numeric(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _extract_futures_position(
+    account_info: dict[str, Any],
+    symbol: str,
+    position_side: str | None = None,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_side = str(position_side or "").upper().strip()
+    positions = account_info.get("positions", [])
+    if not isinstance(positions, list):
+        return {}
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol", "")).upper().strip() != normalized_symbol:
+            continue
+        if normalized_side and str(item.get("positionSide", "")).upper().strip() != normalized_side:
+            continue
+        return item
+    return {}
+
+
+def _build_stop_execution_summary(
+    *,
+    symbol: str,
+    cancel_open_orders: bool,
+    close_all_positions: bool,
+) -> dict[str, Any]:
+    return {
+        "symbol": symbol,
+        "cancel_open_orders_requested": bool(cancel_open_orders),
+        "close_all_positions_requested": bool(close_all_positions),
+        "cancel_open_orders_executed": False,
+        "close_all_positions_executed": False,
+        "cancel_attempted_count": 0,
+        "cancel_success_count": 0,
+        "cancel_errors": [],
+        "close_attempted_count": 0,
+        "close_submitted_count": 0,
+        "close_errors": [],
+        "close_orders": [],
+        "warnings": [],
+    }
+
+
+def _cancel_symbol_open_orders(*, symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+    result = {"attempted": 0, "success": 0, "errors": []}
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
+    result["attempted"] = len(open_orders)
+    for order in open_orders:
+        order_id = order.get("orderId")
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order_id) if order_id is not None else None,
+                orig_client_order_id=str(order.get("clientOrderId", "")).strip() or None,
+            )
+            result["success"] += 1
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    "order_id": order_id,
+                    "client_order_id": order.get("clientOrderId"),
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return result
+
+
+def _build_close_order_request(
+    *,
+    symbol: str,
+    side: str,
+    qty: float,
+    price: float,
+    reduce_only: bool | None,
+    position_side: str | None,
+) -> dict[str, Any]:
+    request: dict[str, Any] = {
+        "symbol": symbol,
+        "side": side,
+        "quantity": qty,
+        "price": price,
+        "time_in_force": "IOC",
+    }
+    if reduce_only is not None:
+        request["reduce_only"] = reduce_only
+    if position_side:
+        request["position_side"] = position_side
+    return request
+
+
+def _close_symbol_positions_at_top_of_book(*, symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+    result = {"attempted": 0, "submitted": 0, "orders": [], "errors": [], "warnings": []}
+    symbol_info = fetch_futures_symbol_config(symbol)
+    book = fetch_futures_book_tickers(symbol=symbol)
+    if not book:
+        raise RuntimeError(f"{symbol} 缺少盘口数据，无法按买一/卖一平仓")
+    bid_price = _safe_numeric(book[0].get("bid_price"))
+    ask_price = _safe_numeric(book[0].get("ask_price"))
+    if bid_price <= 0 or ask_price <= 0:
+        raise RuntimeError(f"{symbol} 盘口价格无效，无法按买一/卖一平仓")
+    account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    dual_side = str(position_mode.get("dualSidePosition", "")).strip().lower() in {"true", "1", "yes"}
+
+    orders_to_submit: list[dict[str, Any]] = []
+    tick_size = symbol_info.get("tick_size")
+    step_size = symbol_info.get("step_size")
+    min_qty = symbol_info.get("min_qty")
+    min_notional = symbol_info.get("min_notional")
+
+    def _append_close_order(raw_qty: float, *, side: str, price: float, reduce_only: bool | None, position_side: str | None) -> None:
+        rounded_price = _round_order_price(price, tick_size, side)
+        rounded_qty = _round_order_qty(abs(raw_qty), step_size)
+        if rounded_qty <= 0:
+            result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓数量向下取整后为 0，已跳过")
+            return
+        if min_qty is not None and rounded_qty < float(min_qty):
+            result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓数量低于最小数量，已跳过")
+            return
+        if min_notional is not None and rounded_qty * rounded_price < float(min_notional):
+            result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓名义低于最小下单额，已跳过")
+            return
+        orders_to_submit.append(
+            _build_close_order_request(
+                symbol=symbol,
+                side=side,
+                qty=rounded_qty,
+                price=rounded_price,
+                reduce_only=reduce_only,
+                position_side=position_side,
+            )
+        )
+
+    if dual_side:
+        long_position = _extract_futures_position(account_info, symbol, "LONG")
+        short_position = _extract_futures_position(account_info, symbol, "SHORT")
+        long_qty = _safe_numeric(long_position.get("positionAmt"))
+        short_qty = abs(_safe_numeric(short_position.get("positionAmt")))
+        if long_qty > 0:
+            _append_close_order(long_qty, side="SELL", price=bid_price, reduce_only=None, position_side="LONG")
+        if short_qty > 0:
+            _append_close_order(short_qty, side="BUY", price=ask_price, reduce_only=None, position_side="SHORT")
+    else:
+        both_position = _extract_futures_position(account_info, symbol)
+        position_amt = _safe_numeric(both_position.get("positionAmt"))
+        if position_amt > 0:
+            _append_close_order(position_amt, side="SELL", price=bid_price, reduce_only=True, position_side=None)
+        elif position_amt < 0:
+            _append_close_order(abs(position_amt), side="BUY", price=ask_price, reduce_only=True, position_side=None)
+
+    result["attempted"] = len(orders_to_submit)
+    for order_request in orders_to_submit:
+        try:
+            response = post_futures_order(
+                symbol=order_request["symbol"],
+                side=order_request["side"],
+                quantity=order_request["quantity"],
+                price=order_request["price"],
+                api_key=api_key,
+                api_secret=api_secret,
+                time_in_force=order_request["time_in_force"],
+                reduce_only=order_request.get("reduce_only"),
+                position_side=order_request.get("position_side"),
+            )
+            result["submitted"] += 1
+            result["orders"].append(
+                {
+                    **order_request,
+                    "order_id": response.get("orderId"),
+                    "client_order_id": response.get("clientOrderId"),
+                }
+            )
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    **order_request,
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return result
+
+
+def _execute_stop_actions(
+    *,
+    symbol: str,
+    cancel_open_orders: bool,
+    close_all_positions: bool,
+) -> dict[str, Any]:
+    summary = _build_stop_execution_summary(
+        symbol=symbol,
+        cancel_open_orders=cancel_open_orders,
+        close_all_positions=close_all_positions,
+    )
+    if not cancel_open_orders and not close_all_positions:
+        return summary
+    if close_all_positions and not cancel_open_orders:
+        summary["warnings"].append("未勾选撤销委托时直接平仓，旧挂单可能继续成交")
+    creds = load_binance_api_credentials()
+    if not creds:
+        raise RuntimeError("未加载 Binance API 凭据，无法执行撤单/平仓")
+    api_key, api_secret = creds
+    if cancel_open_orders:
+        cancel_result = _cancel_symbol_open_orders(symbol=symbol, api_key=api_key, api_secret=api_secret)
+        summary["cancel_open_orders_executed"] = True
+        summary["cancel_attempted_count"] = cancel_result["attempted"]
+        summary["cancel_success_count"] = cancel_result["success"]
+        summary["cancel_errors"] = cancel_result["errors"]
+    if close_all_positions:
+        close_result = _close_symbol_positions_at_top_of_book(symbol=symbol, api_key=api_key, api_secret=api_secret)
+        summary["close_all_positions_executed"] = True
+        summary["close_attempted_count"] = close_result["attempted"]
+        summary["close_submitted_count"] = close_result["submitted"]
+        summary["close_orders"] = close_result["orders"]
+        summary["close_errors"] = close_result["errors"]
+        summary["warnings"].extend(close_result["warnings"])
+    return summary
 
 
 def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -7409,6 +7692,27 @@ MONITOR_PAGE = """<!doctype html>
       color: #fff;
     }
     .toolbar label { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--muted); min-width: 160px; }
+    .toolbar .inline-check {
+      min-width: 220px;
+      padding: 8px 10px;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      justify-content: center;
+    }
+    .toolbar .inline-check .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.4;
+    }
+    .toolbar .inline-check input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+    }
     .toolbar input, .toolbar select {
       height: 38px;
       border-radius: 10px;
@@ -7512,6 +7816,18 @@ MONITOR_PAGE = """<!doctype html>
         <button id="toggle_btn">暂停自动刷新</button>
         <button id="start_strategy_btn" class="primary">启动策略</button>
         <button id="stop_strategy_btn">停止策略</button>
+        <label class="inline-check" title="停止策略后撤销当前交易对全部未成交委托">
+          <span class="check-row">
+            <input id="stop_cancel_orders" type="checkbox" />
+            <span>停止时撤销全部委托</span>
+          </span>
+        </label>
+        <label class="inline-check" title="停止策略后按买一/卖一提交 IOC 平仓单，尽快平掉当前交易对全部仓位">
+          <span class="check-row">
+            <input id="stop_close_positions" type="checkbox" />
+            <span>停止时按买一/卖一平仓</span>
+          </span>
+        </label>
       </div>
       <div id="meta" class="meta">等待首轮数据...</div>
       <div class="meta">监控币种列表可在 <a href="/strategies">策略总览页</a> 手动添加和删除。</div>
@@ -7730,6 +8046,8 @@ MONITOR_PAGE = """<!doctype html>
     const strategyPresetEl = document.getElementById("strategy_preset");
     const startStrategyBtn = document.getElementById("start_strategy_btn");
     const stopStrategyBtn = document.getElementById("stop_strategy_btn");
+    const stopCancelOrdersEl = document.getElementById("stop_cancel_orders");
+    const stopClosePositionsEl = document.getElementById("stop_close_positions");
     const strategyActionMetaEl = document.getElementById("strategy_action_meta");
     const strategyPresetMetaEl = document.getElementById("strategy_preset_meta");
     const customGridNameEl = document.getElementById("custom_grid_name");
@@ -8718,6 +9036,27 @@ MONITOR_PAGE = """<!doctype html>
       `;
     }
 
+    function formatStopActionSummary(summary) {
+      if (!summary) return "";
+      const parts = [];
+      if (summary.cancel_open_orders_requested) {
+        parts.push(`撤单 ${fmtNum(summary.cancel_success_count || 0, 0)} / ${fmtNum(summary.cancel_attempted_count || 0, 0)}`);
+      }
+      if (summary.close_all_positions_requested) {
+        parts.push(`平仓单 ${fmtNum(summary.close_submitted_count || 0, 0)} / ${fmtNum(summary.close_attempted_count || 0, 0)}`);
+      }
+      if (summary.warnings && summary.warnings.length) {
+        parts.push(`提示: ${summary.warnings.join("；")}`);
+      }
+      if (summary.cancel_errors && summary.cancel_errors.length) {
+        parts.push(`撤单错误 ${summary.cancel_errors.length}`);
+      }
+      if (summary.close_errors && summary.close_errors.length) {
+        parts.push(`平仓错误 ${summary.close_errors.length}`);
+      }
+      return parts.join(" · ");
+    }
+
     function renderCharts(data) {
       const tradeSeries = ((data.trade_summary && data.trade_summary.series) || []).map((item) => ({
         notional: Number(item.cumulative_notional || 0),
@@ -8776,7 +9115,11 @@ MONITOR_PAGE = """<!doctype html>
               symbol: selectedSymbol,
               strategy_profile: selectedPreset ? selectedPreset.key : ((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4"),
             }
-          : { symbol: selectedSymbol };
+          : {
+              symbol: selectedSymbol,
+              cancel_open_orders: Boolean(stopCancelOrdersEl && stopCancelOrdersEl.checked),
+              close_all_positions: Boolean(stopClosePositionsEl && stopClosePositionsEl.checked),
+            };
         const resp = await fetch(`/api/runner/${action}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -8786,7 +9129,7 @@ MONITOR_PAGE = """<!doctype html>
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         strategyActionMetaEl.textContent = action === "start"
           ? `策略已启动${data.restarted ? "（已重启应用新配置）" : (data.already_running ? "（已在运行）" : "")}`
-          : `策略已停止${data.already_stopped ? "（原本就未运行）" : ""}`;
+          : `策略已停止${data.already_stopped ? "（原本就未运行）" : ""}${formatStopActionSummary(data.post_stop_actions) ? ` · ${formatStopActionSummary(data.post_stop_actions)}` : ""}`;
       } catch (err) {
         strategyActionMetaEl.textContent = `${action === "start" ? "启动" : "停止"}失败: ${err}`;
       } finally {
@@ -14388,7 +14731,11 @@ class _Handler(BaseHTTPRequestHandler):
                     config = _resolve_runner_start_config(payload)
                     result = _start_runner_process(config)
                 else:
-                    result = _stop_runner_process(payload.get("symbol"))
+                    result = _stop_runner_process(
+                        payload.get("symbol"),
+                        cancel_open_orders=_safe_bool(payload.get("cancel_open_orders", False), "cancel_open_orders"),
+                        close_all_positions=_safe_bool(payload.get("close_all_positions", False), "close_all_positions"),
+                    )
                 self._send_json({"ok": True, **result}, status=200)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
