@@ -95,6 +95,11 @@ from .monitor import (
     runner_log_path_for_symbol,
     runner_pid_path_for_symbol,
 )
+from .maker_flatten_runner import (
+    flatten_client_order_prefix,
+    is_flatten_order,
+    load_live_flatten_snapshot,
+)
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
@@ -648,6 +653,40 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     if runner.get("config"):
         config.update(runner["config"])
     return config
+
+
+def _flatten_pid_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_maker_flatten.pid")
+
+
+def _flatten_control_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_maker_flatten_control.json")
+
+
+def _flatten_log_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_maker_flatten.log")
+
+
+def _flatten_events_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_maker_flatten_events.jsonl")
+
+
+def _read_flatten_process_for_symbol(symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    runner = _read_runner_process(
+        pid_path=_flatten_pid_path(normalized_symbol),
+        control_path=_flatten_control_path(normalized_symbol),
+    )
+    runner["scope"] = "flatten"
+    runner["symbol"] = normalized_symbol
+    return runner
+
+
+def _save_flatten_control_config(config: dict[str, Any], *, symbol: str | None = None) -> None:
+    normalized_symbol = str(symbol or config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
+    control_path = _flatten_control_path(normalized_symbol)
+    control_path.parent.mkdir(parents=True, exist_ok=True)
+    control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = None) -> None:
@@ -1669,6 +1708,7 @@ def _launchctl_loaded(label: str) -> bool:
 
 def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip() or "NIGHTUSDT"
+    _stop_flatten_process(symbol, cancel_orders=True)
     runner = _read_runner_process_for_symbol(symbol)
     restarted = False
     if runner.get("is_running"):
@@ -1804,6 +1844,135 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
         "command": command,
         "symbol": symbol,
     }
+
+
+def _cancel_flatten_orders(*, symbol: str, api_key: str, api_secret: str, prefix: str) -> dict[str, Any]:
+    result = {"attempted": 0, "success": 0, "errors": []}
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
+    ours = [order for order in open_orders if isinstance(order, dict) and is_flatten_order(order, prefix)]
+    result["attempted"] = len(ours)
+    for order in ours:
+        order_id = order.get("orderId")
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order_id) if order_id is not None else None,
+                orig_client_order_id=str(order.get("clientOrderId", "")).strip() or None,
+            )
+            result["success"] += 1
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    "order_id": order_id,
+                    "client_order_id": order.get("clientOrderId"),
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return result
+
+
+def _build_flatten_command(config: dict[str, Any]) -> list[str]:
+    return [
+        sys.executable,
+        "-m",
+        "grid_optimizer.maker_flatten_runner",
+        "--symbol",
+        str(config["symbol"]),
+        "--client-order-prefix",
+        str(config["client_order_prefix"]),
+        "--sleep-seconds",
+        str(config.get("sleep_seconds", 2.0)),
+        "--recv-window",
+        str(config.get("recv_window", 5000)),
+        "--max-consecutive-errors",
+        str(config.get("max_consecutive_errors", 20)),
+        "--events-jsonl",
+        str(config["events_jsonl"]),
+    ]
+
+
+def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
+    flatten = _read_flatten_process_for_symbol(symbol)
+    desired = {
+        "symbol": symbol,
+        "client_order_prefix": str(config.get("client_order_prefix") or flatten_client_order_prefix(symbol)),
+        "sleep_seconds": float(config.get("sleep_seconds", 2.0)),
+        "recv_window": int(config.get("recv_window", 5000)),
+        "max_consecutive_errors": int(config.get("max_consecutive_errors", 20)),
+        "events_jsonl": str(config.get("events_jsonl") or _flatten_events_path(symbol)),
+    }
+    if flatten.get("is_running"):
+        current_config = dict(flatten.get("config") or {})
+        compare_fields = {"symbol", "client_order_prefix", "sleep_seconds", "recv_window", "max_consecutive_errors", "events_jsonl"}
+        if all(current_config.get(field) == desired.get(field) for field in compare_fields):
+            return {"started": False, "already_running": True, "flatten_runner": flatten, "symbol": symbol}
+        _stop_flatten_process(symbol, cancel_orders=True)
+
+    _save_flatten_control_config(desired, symbol=symbol)
+    log_path = _flatten_log_path(symbol)
+    pid_path = _flatten_pid_path(symbol)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    src_path = str((Path.cwd() / "src").resolve())
+    current_pythonpath = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = src_path if not current_pythonpath else f"{src_path}{os.pathsep}{current_pythonpath}"
+    command = _build_flatten_command(desired)
+    with log_path.open("ab") as log_file:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(Path.cwd()),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_path.parent.mkdir(parents=True, exist_ok=True)
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    time.sleep(0.5)
+    return {
+        "started": True,
+        "already_running": False,
+        "flatten_runner": _read_flatten_process_for_symbol(symbol),
+        "command": command,
+        "symbol": symbol,
+    }
+
+
+def _stop_flatten_process(symbol: str | None = None, *, cancel_orders: bool = False, timeout_seconds: float = 5.0) -> dict[str, Any]:
+    normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
+    runner = _read_flatten_process_for_symbol(normalized_symbol)
+    pid_path = _flatten_pid_path(normalized_symbol)
+    control = dict(runner.get("config") or {})
+    prefix = str(control.get("client_order_prefix") or flatten_client_order_prefix(normalized_symbol)).strip()
+
+    if cancel_orders:
+        creds = load_binance_api_credentials()
+        if creds is not None:
+            api_key, api_secret = creds
+            _cancel_flatten_orders(symbol=normalized_symbol, api_key=api_key, api_secret=api_secret, prefix=prefix)
+
+    pid = runner.get("pid")
+    if not pid or not runner.get("is_running"):
+        if pid_path.exists():
+            pid_path.unlink(missing_ok=True)
+        return {"stopped": False, "already_stopped": True, "flatten_runner": _read_flatten_process_for_symbol(normalized_symbol), "symbol": normalized_symbol}
+
+    os.kill(int(pid), signal.SIGTERM)
+    deadline = time.time() + max(timeout_seconds, 0.5)
+    while time.time() < deadline:
+        probe = _read_flatten_process_for_symbol(normalized_symbol)
+        if not probe.get("is_running"):
+            pid_path.unlink(missing_ok=True)
+            return {"stopped": True, "killed": False, "flatten_runner": probe, "symbol": normalized_symbol}
+        time.sleep(0.25)
+
+    os.kill(int(pid), signal.SIGKILL)
+    time.sleep(0.25)
+    pid_path.unlink(missing_ok=True)
+    return {"stopped": True, "killed": True, "flatten_runner": _read_flatten_process_for_symbol(normalized_symbol), "symbol": normalized_symbol}
 
 
 def _stop_runner_process(
@@ -2012,6 +2181,8 @@ def _build_stop_execution_summary(
         "close_submitted_count": 0,
         "close_errors": [],
         "close_orders": [],
+        "flatten_started": False,
+        "flatten_already_running": False,
         "warnings": [],
     }
 
@@ -2183,13 +2354,29 @@ def _execute_stop_actions(
         summary["cancel_success_count"] = cancel_result["success"]
         summary["cancel_errors"] = cancel_result["errors"]
     if close_all_positions:
-        close_result = _close_symbol_positions_at_top_of_book(symbol=symbol, api_key=api_key, api_secret=api_secret)
         summary["close_all_positions_executed"] = True
-        summary["close_attempted_count"] = close_result["attempted"]
-        summary["close_submitted_count"] = close_result["submitted"]
-        summary["close_orders"] = close_result["orders"]
-        summary["close_errors"] = close_result["errors"]
-        summary["warnings"].extend(close_result["warnings"])
+        live_snapshot = load_live_flatten_snapshot(symbol, api_key, api_secret)
+        summary["close_attempted_count"] = len(live_snapshot.get("orders", []))
+        summary["warnings"].extend(live_snapshot.get("warnings", []))
+        if not live_snapshot.get("orders"):
+            summary["warnings"].append("当前无可平持仓，未启动跟价平仓进程")
+        else:
+            flatten_result = _start_flatten_process(
+                {
+                    "symbol": symbol,
+                    "client_order_prefix": flatten_client_order_prefix(symbol),
+                    "sleep_seconds": 2.0,
+                    "recv_window": 5000,
+                    "max_consecutive_errors": 20,
+                    "events_jsonl": str(_flatten_events_path(symbol)),
+                }
+            )
+            summary["flatten_started"] = bool(flatten_result.get("started"))
+            summary["flatten_already_running"] = bool(flatten_result.get("already_running"))
+            if flatten_result.get("started"):
+                summary["warnings"].append("已启动买一/卖一 maker 跟价平仓，直到仓位归零")
+            elif flatten_result.get("already_running"):
+                summary["warnings"].append("买一/卖一 maker 跟价平仓已在运行")
     return summary
 
 
@@ -7822,7 +8009,7 @@ MONITOR_PAGE = """<!doctype html>
             <span>停止时撤销全部委托</span>
           </span>
         </label>
-        <label class="inline-check" title="停止策略后按买一/卖一提交 IOC 平仓单，尽快平掉当前交易对全部仓位">
+        <label class="inline-check" title="停止策略后启动 maker 跟价平仓：多仓挂卖一、空仓挂买一，未成交会撤旧单并重挂，直到仓位归零">
           <span class="check-row">
             <input id="stop_close_positions" type="checkbox" />
             <span>停止时按买一/卖一平仓</span>
@@ -9043,7 +9230,12 @@ MONITOR_PAGE = """<!doctype html>
         parts.push(`撤单 ${fmtNum(summary.cancel_success_count || 0, 0)} / ${fmtNum(summary.cancel_attempted_count || 0, 0)}`);
       }
       if (summary.close_all_positions_requested) {
-        parts.push(`平仓单 ${fmtNum(summary.close_submitted_count || 0, 0)} / ${fmtNum(summary.close_attempted_count || 0, 0)}`);
+        parts.push(`待平仓方向 ${fmtNum(summary.close_attempted_count || 0, 0)}`);
+        if (summary.flatten_started) {
+          parts.push("跟价平仓已启动");
+        } else if (summary.flatten_already_running) {
+          parts.push("跟价平仓已在运行");
+        }
       }
       if (summary.warnings && summary.warnings.length) {
         parts.push(`提示: ${summary.warnings.join("；")}`);
