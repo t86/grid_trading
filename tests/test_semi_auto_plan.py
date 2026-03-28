@@ -147,6 +147,37 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(len(diff["missing_orders"]), 0)
         self.assertEqual(len(diff["stale_orders"]), 0)
 
+    def test_diff_open_orders_keeps_same_price_order_and_adds_delta_when_qty_increases(self) -> None:
+        existing = [
+            {"side": "BUY", "type": "LIMIT", "price": "0.02685", "origQty": "744", "orderId": 1},
+        ]
+        desired = [
+            {"side": "BUY", "price": 0.02685, "qty": 900.0, "notional": 24.165, "level": 1, "role": "entry"},
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 1)
+        self.assertEqual(len(diff["stale_orders"]), 0)
+        self.assertEqual(len(diff["missing_orders"]), 1)
+        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 156.0, places=8)
+        self.assertAlmostEqual(float(diff["missing_orders"][0]["price"]), 0.02685, places=8)
+
+    def test_diff_open_orders_replaces_same_price_order_when_qty_decreases(self) -> None:
+        existing = [
+            {"side": "BUY", "type": "LIMIT", "price": "0.02685", "origQty": "744", "orderId": 1},
+        ]
+        desired = [
+            {"side": "BUY", "price": 0.02685, "qty": 600.0, "notional": 16.11, "level": 1, "role": "entry"},
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 1)
+        self.assertEqual(len(diff["missing_orders"]), 1)
+        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 600.0, places=8)
+
     def test_build_hedge_micro_grid_plan_builds_both_sides(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=0.05057,

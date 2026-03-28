@@ -85,6 +85,29 @@ def _order_key(side: str, price: float, qty: float, position_side: str | None = 
     return f"{side.upper()}:{normalized_position_side}:{price:.10f}:{qty:.10f}"
 
 
+def _order_bucket_key(side: str, price: float, position_side: str | None = None) -> str:
+    normalized_position_side = str(position_side or "BOTH").upper().strip() or "BOTH"
+    return f"{side.upper()}:{normalized_position_side}:{price:.10f}"
+
+
+def _quantity_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def _clone_order_with_qty(order: dict[str, Any], qty: Decimal) -> dict[str, Any]:
+    cloned = dict(order)
+    qty_float = float(qty)
+    cloned["qty"] = qty_float
+    cloned["quantity"] = qty_float
+    price = _safe_float(order.get("price"))
+    if price > 0:
+        cloned["notional"] = price * qty_float
+    return cloned
+
+
 def shift_center_price(
     *,
     center_price: float,
@@ -971,17 +994,19 @@ def diff_open_orders(
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
-    desired_by_key = {
-        _order_key(
+    desired_by_bucket: dict[str, list[dict[str, Any]]] = {}
+    for order in desired_orders:
+        key = _order_bucket_key(
             str(order["side"]),
             float(order["price"]),
-            float(order["qty"]),
             str(order.get("position_side", order.get("positionSide", "BOTH"))),
-        ): order
-        for order in desired_orders
-    }
-    existing_limit_by_key: dict[str, dict[str, Any]] = {}
+        )
+        desired_by_bucket.setdefault(key, []).append(order)
+
+    existing_limit_by_bucket: dict[str, list[dict[str, Any]]] = {}
     stale_orders: list[dict[str, Any]] = []
+    kept_orders: list[dict[str, Any]] = []
+    missing_orders: list[dict[str, Any]] = []
 
     for order in existing_orders:
         side = str(order.get("side", "")).upper()
@@ -992,17 +1017,39 @@ def diff_open_orders(
             continue
         if order_type and order_type not in {"LIMIT", "LIMIT_MAKER"}:
             continue
-        key = _order_key(side, price, qty, str(order.get("positionSide", "BOTH")))
-        existing_limit_by_key[key] = order
-        if key not in desired_by_key:
-            stale_orders.append(order)
+        key = _order_bucket_key(side, price, str(order.get("positionSide", "BOTH")))
+        existing_limit_by_bucket.setdefault(key, []).append(order)
 
-    missing_orders = [
-        order for key, order in desired_by_key.items() if key not in existing_limit_by_key
-    ]
-    kept_orders = [
-        existing_limit_by_key[key] for key in desired_by_key.keys() if key in existing_limit_by_key
-    ]
+    all_keys = set(existing_limit_by_bucket) | set(desired_by_bucket)
+    for key in all_keys:
+        existing_group = existing_limit_by_bucket.get(key, [])
+        desired_group = desired_by_bucket.get(key, [])
+        if not desired_group:
+            stale_orders.extend(existing_group)
+            continue
+        if not existing_group:
+            missing_orders.extend(desired_group)
+            continue
+
+        existing_total = sum(
+            (_quantity_decimal(order.get("origQty", order.get("qty"))) for order in existing_group),
+            Decimal("0"),
+        )
+        desired_total = sum(
+            (_quantity_decimal(order.get("qty", order.get("quantity"))) for order in desired_group),
+            Decimal("0"),
+        )
+
+        if existing_total > desired_total:
+            stale_orders.extend(existing_group)
+            missing_orders.extend(desired_group)
+            continue
+
+        kept_orders.extend(existing_group)
+        delta = desired_total - existing_total
+        if delta > Decimal("0"):
+            missing_orders.append(_clone_order_with_qty(desired_group[0], delta))
+
     return {
         "missing_orders": missing_orders,
         "stale_orders": stale_orders,
