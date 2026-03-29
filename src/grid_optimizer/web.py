@@ -862,13 +862,18 @@ def _read_spot_runner_process_for_symbol(symbol: str) -> dict[str, Any]:
 def _load_spot_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
     normalized_symbol = str(symbol or config.get("symbol", "BTCUSDT")).upper().strip() or "BTCUSDT"
+    config["symbol"] = normalized_symbol
+    runtime_paths = _default_spot_runtime_paths_for_symbol(normalized_symbol)
+    for key, value in runtime_paths.items():
+        config[key] = value
     stored = _read_json_dict(_spot_runner_control_path(normalized_symbol))
     if stored:
         config.update(stored)
     runner = _read_spot_runner_process_for_symbol(normalized_symbol)
     if runner.get("config"):
         config.update(runner["config"])
-    runtime_paths = _default_spot_runtime_paths_for_symbol(str(config.get("symbol", normalized_symbol)))
+    config["symbol"] = str(config.get("symbol", normalized_symbol)).upper().strip() or normalized_symbol
+    runtime_paths = _default_spot_runtime_paths_for_symbol(str(config["symbol"]))
     for key, value in runtime_paths.items():
         config.setdefault(key, value)
     return config
@@ -7998,6 +8003,86 @@ MONITOR_PAGE = """<!doctype html>
       max-height: 420px;
       overflow: auto;
     }
+    .strategy-guide-body {
+      padding: 12px 14px 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .strategy-guide-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: linear-gradient(180deg, #fffefb 0%, #fbf8f2 100%);
+      padding: 14px;
+    }
+    .strategy-guide-card h3 {
+      margin: 0 0 8px;
+      font-size: 16px;
+    }
+    .strategy-guide-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .strategy-guide-pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 9px;
+      border-radius: 999px;
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .strategy-guide-lead {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.6;
+      font-size: 13px;
+    }
+    .strategy-guide-section {
+      border-top: 1px solid var(--line);
+      padding-top: 10px;
+    }
+    .strategy-guide-section:first-of-type {
+      border-top: none;
+      padding-top: 0;
+    }
+    .strategy-guide-section h4 {
+      margin: 0 0 8px;
+      font-size: 13px;
+      color: #0f423f;
+    }
+    .strategy-guide-list {
+      margin: 0;
+      padding-left: 18px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.65;
+    }
+    .strategy-guide-list li + li {
+      margin-top: 6px;
+    }
+    .strategy-guide-note {
+      margin: 0;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .strategy-guide-empty {
+      padding: 16px 4px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .strategy-guide-callout {
+      border: 1px dashed var(--line);
+      border-radius: 10px;
+      background: rgba(255, 255, 255, 0.8);
+      padding: 10px 12px;
+    }
     .meta { font-size: 13px; color: var(--muted); }
     .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     .metric {
@@ -8126,22 +8211,11 @@ MONITOR_PAGE = """<!doctype html>
       <div class="editor-grid">
         <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
         <div class="param-guide">
-          <div class="tiny">右侧会按照当前 JSON 展示参数含义，方便直接对照修改。</div>
+          <div class="tiny">右侧直接解释这份 JSON 会怎样下单、何时移中心、何时暂停或撤单。完整文档在仓库 `docs` 目录下的 `STRATEGY_EXECUTION_GUIDE.md`。</div>
           <div class="param-guide-scroll">
-            <table class="param-guide-table">
-              <thead>
-                <tr>
-                  <th>参数</th>
-                  <th>当前值</th>
-                  <th>说明</th>
-                </tr>
-              </thead>
-              <tbody id="runner_params_guide_body">
-                <tr>
-                  <td colspan="3" class="empty">先载入参数，右侧再显示逐项解释。</td>
-                </tr>
-              </tbody>
-            </table>
+            <div id="runner_params_guide_body" class="strategy-guide-body">
+              <div class="strategy-guide-empty">先载入参数，右侧再显示当前策略的执行说明。</div>
+            </div>
           </div>
         </div>
       </div>
@@ -8884,38 +8958,423 @@ MONITOR_PAGE = """<!doctype html>
       return config;
     }
 
-    function formatRunnerGuideValue(value) {
-      if (value === null) return "null";
-      if (value === undefined) return "undefined";
-      if (typeof value === "object") {
-        try {
-          return JSON.stringify(value);
-        } catch (err) {
-          return String(value);
+    const RUNNER_PROFILE_GUIDE_NOTES = {
+      volume_long_v4: {
+        summary: "偏多滚动微网格，目标是让盘口附近不断有承接买单和减仓卖单，优先把成交密度做高。",
+        focus: [
+          "这不是中性策略，本质上仍然依赖多仓库存来提供上方卖单。",
+          "更适合稳定或偏强市场；遇到持续下跌时，会靠停买和库存分层减轻继续接仓。"
+        ],
+      },
+      volatility_defensive_v1: {
+        summary: "同样是 one_way_long，但把底仓、单笔和停买阈值都压低，优先控制回撤而不是冲量。",
+        focus: [
+          "上方卖单更多、下方买单更少，意味着反弹时更快卸仓，回落时更慢继续接。",
+        ],
+      },
+      adaptive_volatility_v1: {
+        summary: "这不是固定参数集。运行时会先判定市场状态，再在 volume_long_v4 和 volatility_defensive_v1 两套参数之间切换。",
+        focus: [
+          "当 15m/60m 振幅或跌幅触发防守条件时，会连续确认后切换到防守档；稳定后再切回量优先档。",
+        ],
+      },
+      volume_short_v1: {
+        summary: "one_way_short 镜像网格。上方卖单负责开空，下方买单负责回补，适合弱势或冲高回落窗口。",
+        focus: [
+          "买单只用于平已有空仓，不会反手开多。",
+        ],
+      },
+      volume_short_v1_aggressive: {
+        summary: "在 volume_short_v1 的基础上强调换手，接受更高的反复挂单频率来换取更多成交。",
+        focus: [
+          "更适合方向明确的弱势段；横盘里会更容易被手续费磨损。",
+        ],
+      },
+      night_volume_short_v1: {
+        summary: "针对 NIGHTUSDT 的高换手做空版。核心是把第一笔卖空和第一笔买回压得更近，尽快做出往返成交。",
+        focus: [
+          "比通用空头版更快移中心、更快轮询，所以更适合低价、高成交密度的币种。",
+        ],
+      },
+      volume_short_v1_conservative: {
+        summary: "保守型做空网格。底仓和单笔更轻，上移中心更慢，先保证空头库存不要扩太快。",
+        focus: [
+          "适合先试空或高波动震荡段，不适合把量推到极限。",
+        ],
+      },
+      defensive_quasi_neutral_aggressive_v1: {
+        summary: "名字叫准中性，但实现上仍然是 one_way_long。所谓“准中性”是通过少买、多卖、轻底仓来削弱方向偏置。",
+        focus: [
+          "卖侧层数远多于买侧，目的是已有多仓一旦反弹就更快拆掉，同时保留一定成交量。",
+        ],
+      },
+      defensive_quasi_neutral_v1: {
+        summary: "one_way_long 的降损版本。和激进版相比更轻仓、更慢，适合量已经够但想压损耗。",
+        focus: [
+          "同样不是真中性，只是比量优先做多更少接、更多卖。",
+        ],
+      },
+      volume_neutral_target_v1: {
+        summary: "单向账户里的目标净仓中性策略。不是传统一格一格的网格，而是按离中心的偏移带直接指定净仓目标。",
+        focus: [
+          "更像“仓位曲线执行器”：价格偏下就逐步做净多，价格偏上就逐步做净空。",
+        ],
+      },
+      neutral_hedge_v1: {
+        summary: "双向持仓模式下的真中性策略。LONG 和 SHORT 两条腿各自有独立的开仓/止盈网格。",
+        focus: [
+          "这套要求账户本身是 hedge mode，否则提交器会直接拒绝。",
+        ],
+      },
+      synthetic_neutral_v1: {
+        summary: "单向账户里的合成中性。内部维护一套虚拟 long/short 账本，再把双边计划折成单向实际委托。",
+        focus: [
+          "优点是不需要切 hedge mode；代价是实际净仓和虚拟账本需要持续对齐。",
+        ],
+      },
+    };
+    const AUTOTUNE_STEP_HINTS = {
+      volume_long_v4: { stepRatio: 0.0004, minTicks: 2 },
+      volatility_defensive_v1: { stepRatio: 0.0008, minTicks: 4 },
+      volume_neutral_target_v1: { stepRatio: 0.0006, minTicks: 3 },
+      neutral_hedge_v1: { stepRatio: 0.0005, minTicks: 3 },
+      synthetic_neutral_v1: { stepRatio: 0.0005, minTicks: 3 },
+    };
+
+    function asGuideNumber(value) {
+      const num = Number(value);
+      return Number.isFinite(num) ? num : null;
+    }
+
+    function fmtGuideNumber(value, digits = 4) {
+      const num = asGuideNumber(value);
+      if (num === null) return "--";
+      return num.toLocaleString("zh-CN", {
+        minimumFractionDigits: 0,
+        maximumFractionDigits: digits,
+      });
+    }
+
+    function fmtGuidePrice(value) {
+      return fmtGuideNumber(value, 7);
+    }
+
+    function fmtGuideNotional(value) {
+      return `${fmtGuideNumber(value, 4)}U`;
+    }
+
+    function fmtGuidePctFromRatio(value, digits = 2) {
+      const num = asGuideNumber(value);
+      if (num === null) return "--";
+      return `${fmtGuideNumber(num * 100, digits)}%`;
+    }
+
+    function guideStepMoveText(stepPrice, steps, centerPrice = null) {
+      const step = asGuideNumber(stepPrice);
+      const count = Math.max(Number(steps) || 0, 0);
+      if (!(step > 0) || count <= 0) return "未配置";
+      const move = step * count;
+      let text = `${count} 格（${count} × ${fmtGuidePrice(step)} = ${fmtGuidePrice(move)}）`;
+      const center = asGuideNumber(centerPrice);
+      if (center && center > 0) {
+        text += `，约中心价的 ${fmtGuidePctFromRatio(move / center)}`;
+      }
+      return text;
+    }
+
+    function guideHtmlList(items) {
+      const rows = (items || []).filter(Boolean);
+      if (!rows.length) return "";
+      return `
+        <ul class="strategy-guide-list">
+          ${rows.map((item) => `<li>${escapeHtml(String(item))}</li>`).join("")}
+        </ul>
+      `;
+    }
+
+    function guideHtmlSection(title, items) {
+      const rows = (items || []).filter(Boolean);
+      if (!rows.length) return "";
+      return `
+        <section class="strategy-guide-section">
+          <h4>${escapeHtml(title)}</h4>
+          ${guideHtmlList(rows)}
+        </section>
+      `;
+    }
+
+    function getGuidePreset(config) {
+      const profile = String((config || {}).strategy_profile || "").trim();
+      return getPresetByKey(profile) || null;
+    }
+
+    function getGuideMode(config, preset = null) {
+      return String(
+        (config && config.strategy_mode)
+        || (preset && preset.config && preset.config.strategy_mode)
+        || "one_way_long"
+      ).trim() || "one_way_long";
+    }
+
+    function buildModeExecutionLines(config, mode) {
+      const stepPrice = asGuideNumber(config.step_price);
+      const buyLevels = Math.max(Number(config.buy_levels) || 0, 0);
+      const sellLevels = Math.max(Number(config.sell_levels) || 0, 0);
+      const perOrderNotional = asGuideNumber(config.per_order_notional);
+      const basePositionNotional = Math.max(asGuideNumber(config.base_position_notional) || 0, 0);
+      if (mode === "one_way_short") {
+        return [
+          `以上下方运行时中心价为轴，向上每隔 ${fmtGuidePrice(stepPrice)} 挂 ${sellLevels} 层卖单开空，向下每隔 ${fmtGuidePrice(stepPrice)} 挂 ${buyLevels} 层买单回补空仓。`,
+          `单笔目标名义 ${fmtGuideNotional(perOrderNotional)}；如果当前空仓低于基础空仓 ${fmtGuideNotional(basePositionNotional)}，会先在卖一附近挂 bootstrap 卖单补到基础空仓。`,
+          "买单只按现有空仓数量生成，作用是回补，不会因为买单而反手开多。",
+        ];
+      }
+      if (mode === "hedge_neutral") {
+        return [
+          `LONG 腿会在中心下方每隔 ${fmtGuidePrice(stepPrice)} 挂 ${buyLevels} 层买单、中心上方挂 ${sellLevels} 层卖单；SHORT 腿会镜像再做一套。`,
+          `两边都以单笔 ${fmtGuideNotional(perOrderNotional)} 运转；如果 LONG / SHORT 任一边低于基础仓位 ${fmtGuideNotional(basePositionNotional)}，都会各自补 bootstrap 单。`,
+          "这套是双腿独立运行，LONG 的止盈不会替 SHORT 平仓，反之亦然。",
+        ];
+      }
+      if (mode === "synthetic_neutral") {
+        return [
+          `内部先按双向 hedge 网格生成计划：下方买入视为补 LONG、上方卖出视为补 SHORT，再把两边订单折算成单向账户可提交的委托。`,
+          `每边的目标单笔仍是 ${fmtGuideNotional(perOrderNotional)}，基础仓位按 ${fmtGuideNotional(basePositionNotional)} 维护，但仓位判断依赖虚拟 long/short 账本而不是账户原生双向持仓。`,
+          "如果实际净仓和虚拟账本偏离，runner 会先同步账本，再继续按 synthetic 计划下单。",
+        ];
+      }
+      if (mode === "inventory_target_neutral") {
+        return [
+          `这套不是传统 buy_levels / sell_levels 网格，而是每隔 ${Math.max(Number(config.neutral_center_interval_minutes) || 0, 0)} 分钟取最新闭合 K 线收盘价做中心。`,
+          `价格跌到中心下方的 0.5% / 1% / 2% 时，会把目标净多仓逐步拉到最大多仓的 ${fmtGuidePctFromRatio(config.neutral_band1_target_ratio)} / ${fmtGuidePctFromRatio(config.neutral_band2_target_ratio)} / ${fmtGuidePctFromRatio(config.neutral_band3_target_ratio)}；涨到上方时对称转成净空。`,
+          `如果当前净仓和“此刻目标净仓”不一致，会先在买一或卖一附近挂 bootstrap 单把净仓拉向目标，再在三档带宽位置挂后续单。`,
+        ];
+      }
+      return [
+        `以上下方运行时中心价为轴，向下每隔 ${fmtGuidePrice(stepPrice)} 挂 ${buyLevels} 层买单，向上每隔 ${fmtGuidePrice(stepPrice)} 挂 ${sellLevels} 层卖单。`,
+        `单笔目标名义 ${fmtGuideNotional(perOrderNotional)}；如果当前多仓低于基础底仓 ${fmtGuideNotional(basePositionNotional)}，会先在买一附近补 bootstrap 买单。`,
+        "卖单只按现有多仓数量生成，作用是减仓/止盈，不会为了卖出而主动开空。",
+      ];
+    }
+
+    function buildCenterBehaviorLines(config, mode) {
+      const centerPrice = asGuideNumber(config.center_price);
+      const stepPrice = asGuideNumber(config.step_price);
+      if (config.custom_grid_enabled) {
+        return [
+          "当前 JSON 已启用 custom_grid_enabled，中心价来自你定义的固定网格区间中点，不再按普通微网格触发规则移动。",
+        ];
+      }
+      if (config.fixed_center_enabled) {
+        const lines = [
+          centerPrice && centerPrice > 0
+            ? `当前启用了固定中心价，中心直接锁在 ${fmtGuidePrice(centerPrice)}，不会再按 up/down trigger 自动追价。`
+            : "当前启用了固定中心价；如果 JSON 里没显式写 center_price，实际会沿用状态文件中的固定中心。",
+        ];
+        if (config.fixed_center_roll_enabled) {
+          const triggerSteps = asGuideNumber(config.fixed_center_roll_trigger_steps) || 1;
+          const confirmCycles = Math.max(Number(config.fixed_center_roll_confirm_cycles) || 3, 1);
+          const shiftSteps = Math.max(Number(config.fixed_center_roll_shift_steps) || 1, 1);
+          lines.push(
+            `虽然中心固定，但已开启 fixed_center_roll：同方向偏离累计 ${guideStepMoveText(stepPrice, triggerSteps, centerPrice)} 并连续确认 ${confirmCycles} 轮后，中心再滚动 ${guideStepMoveText(stepPrice, shiftSteps, centerPrice)}。`
+          );
+        }
+        return lines;
+      }
+      if (mode === "inventory_target_neutral") {
+        const lines = [
+          `目标仓位中性策略直接使用最近一根闭合 ${Math.max(Number(config.neutral_center_interval_minutes) || 0, 0)} 分钟 K 线收盘价作为新中心，不使用 up/down trigger / shift 迁移规则。`,
+        ];
+        if (asGuideNumber(config.freeze_shift_abs_return_trigger_ratio) > 0) {
+          lines.push(
+            `freeze_shift_abs_return_trigger_ratio=${fmtGuidePctFromRatio(config.freeze_shift_abs_return_trigger_ratio)} 在这个模式里不负责中心迁移，因为中心重算完全走定时 K 线。`
+          );
+        }
+        return lines;
+      }
+      const lines = [
+        `当中价相对中心上涨达到 ${guideStepMoveText(stepPrice, config.up_trigger_steps, centerPrice)} 时，中心会上移 ${guideStepMoveText(stepPrice, config.shift_steps, centerPrice)}；下跌达到 ${guideStepMoveText(stepPrice, config.down_trigger_steps, centerPrice)} 时，中心下移同样的步长。`,
+        "这不是一次只挪一档；同一轮里会持续移动，直到中价重新回到触发带内。",
+      ];
+      if (asGuideNumber(config.freeze_shift_abs_return_trigger_ratio) > 0) {
+        lines.push(
+          `如果最近 1 分钟绝对涨跌达到 ${fmtGuidePctFromRatio(config.freeze_shift_abs_return_trigger_ratio)}，这一轮会冻结中心迁移，避免在急拉急杀里不停追价。`
+        );
+      }
+      return lines;
+    }
+
+    function buildInventoryTierLines(config, mode) {
+      const start = asGuideNumber(config.inventory_tier_start_notional);
+      if (!(start > 0)) {
+        return ["当前未启用库存分层，挂单层数、单笔名义和基础仓位会一直保持这一份 JSON 的主参数。"]; 
+      }
+      const end = Math.max(asGuideNumber(config.inventory_tier_end_notional) || start, start);
+      const currentLabel = mode === "one_way_short" ? "空仓名义" : "持仓名义";
+      return [
+        `当${currentLabel}从 ${fmtGuideNotional(start)} 增加到 ${fmtGuideNotional(end)} 之间时，runner 会线性过渡参数，而不是一步切换。`,
+        `买层 ${Math.max(Number(config.buy_levels) || 0, 0)} -> ${Math.max(Number(config.inventory_tier_buy_levels) || 0, 0)}，卖层 ${Math.max(Number(config.sell_levels) || 0, 0)} -> ${Math.max(Number(config.inventory_tier_sell_levels) || 0, 0)}。`,
+        `单笔名义 ${fmtGuideNotional(config.per_order_notional)} -> ${fmtGuideNotional(config.inventory_tier_per_order_notional)}，基础仓位 ${fmtGuideNotional(config.base_position_notional)} -> ${fmtGuideNotional(config.inventory_tier_base_position_notional)}。`,
+      ];
+    }
+
+    function buildPauseAndCapLines(config, mode) {
+      const lines = [];
+      const buyPause = asGuideNumber(config.pause_buy_position_notional);
+      const shortPause = asGuideNumber(config.pause_short_position_notional);
+      const maxLong = asGuideNumber(config.max_position_notional);
+      const maxShort = asGuideNumber(config.max_short_position_notional);
+      if (mode === "one_way_short") {
+        if (shortPause > 0) {
+          lines.push(`当空仓名义达到 ${fmtGuideNotional(shortPause)} 时，会清掉 bootstrap_short 和新的卖单，只保留买回补空单。`);
+        }
+        if (maxShort > 0) {
+          lines.push(`如果这一轮计划中的新增空仓会把总空仓推过 ${fmtGuideNotional(maxShort)}，多出来的卖单会被裁剪，不会整轮直接放行。`);
+        }
+      } else if (mode === "hedge_neutral" || mode === "synthetic_neutral" || mode === "inventory_target_neutral") {
+        if (buyPause > 0) {
+          lines.push(`LONG 侧名义达到 ${fmtGuideNotional(buyPause)} 时，LONG 开仓买单会被清掉，只保留 LONG 卖出减仓单。`);
+        }
+        if (shortPause > 0) {
+          lines.push(`SHORT 侧名义达到 ${fmtGuideNotional(shortPause)} 时，SHORT 开仓卖单会被清掉，只保留 SHORT 买回减仓单。`);
+        }
+        if (maxLong > 0) {
+          lines.push(`LONG 侧新增计划会被裁剪到总多仓不超过 ${fmtGuideNotional(maxLong)}。`);
+        }
+        if (maxShort > 0) {
+          lines.push(`SHORT 侧新增计划会被裁剪到总空仓不超过 ${fmtGuideNotional(maxShort)}。`);
+        }
+      } else {
+        if (buyPause > 0) {
+          lines.push(`当多仓名义达到 ${fmtGuideNotional(buyPause)} 时，会清掉 bootstrap 和所有买单，只保留上方卖单卸仓。`);
+        }
+        if (maxLong > 0) {
+          lines.push(`如果这一轮计划中的新增买单会把总多仓推过 ${fmtGuideNotional(maxLong)}，买单会按剩余额度裁剪，而不是整轮全部撤掉。`);
         }
       }
-      return String(value);
+      if (asGuideNumber(config.min_mid_price_for_buys) > 0) {
+        lines.push(`当中价跌到 ${fmtGuidePrice(config.min_mid_price_for_buys)} 以下时，LONG 开仓买单会被整体暂停。`);
+      }
+      if (asGuideNumber(config.buy_pause_amp_trigger_ratio) > 0 && asGuideNumber(config.buy_pause_down_return_trigger_ratio) !== null) {
+        lines.push(
+          `最近 1 分钟如果同时满足“振幅 >= ${fmtGuidePctFromRatio(config.buy_pause_amp_trigger_ratio)}”且“收跌 <= ${fmtGuidePctFromRatio(config.buy_pause_down_return_trigger_ratio)}”，LONG 开仓买单会被暂停。`
+        );
+      }
+      if (config.excess_inventory_reduce_only_enabled) {
+        if (mode === "one_way_short") {
+          lines.push("已启用 excess_inventory_reduce_only：如果现有空仓已经高于目标基础空仓，会清掉新的卖单，只允许继续买回减仓。");
+        } else if (mode === "one_way_long") {
+          lines.push("已启用 excess_inventory_reduce_only：如果现有多仓已经高于目标底仓，会清掉新的买单，只允许继续卖出减仓。");
+        }
+      }
+      return lines;
+    }
+
+    function buildExecutionGuardLines(config) {
+      const lines = [
+        `每 ${fmtGuideNumber(config.sleep_seconds, 2)} 秒重算一次目标计划，再和当前挂单做 diff。`,
+      ];
+      if (config.cancel_stale === false) {
+        lines.push("当前 cancel_stale=false：如果新计划和旧挂单不一致，提交器会直接拒绝执行，而不是替你撤单。");
+      } else {
+        lines.push("当前 cancel_stale=true：如果某个价位/方向不再需要，会撤掉旧单；但同价位总量不变时会保留原单。");
+      }
+      lines.push("同价位同方向的单子现在按“价位桶”比较：目标总量增加时只补差额，不会为了补量把原排队单撤掉重挂。");
+      lines.push("只有当同价位目标总量减少，或者这个价位整个被新计划删除时，旧单才会被判成 stale 并撤掉。");
+      if (asGuideNumber(config.max_plan_age_seconds) > 0) {
+        lines.push(`计划生成后超过 ${fmtGuideNumber(config.max_plan_age_seconds, 0)} 秒就不提交，防止旧计划继续下单。`);
+      }
+      if (asGuideNumber(config.max_mid_drift_steps) !== null) {
+        lines.push(`如果实时中价相对计划生成时漂移超过 ${fmtGuideNumber(config.max_mid_drift_steps, 2)} 格，这一轮会拒绝提交，避免计划和盘口偏离太大。`);
+      }
+      if (asGuideNumber(config.maker_retries) !== null) {
+        lines.push(`post-only 被交易所拒单时，最多会按 maker_retries=${fmtGuideNumber(config.maker_retries, 0)} 再尝试调价重提。`);
+      }
+      return lines;
+    }
+
+    function buildAutotuneAndSpecialNotes(config, preset, mode) {
+      const lines = [];
+      const profileKey = String((config || {}).strategy_profile || (preset && preset.key) || "").trim();
+      const autotuneEnabled = Boolean(config.autotune_symbol_enabled);
+      if (autotuneEnabled) {
+        const hint = AUTOTUNE_STEP_HINTS[profileKey] || AUTOTUNE_STEP_HINTS.volume_long_v4;
+        lines.push(
+          `启动前 web 端会按币种自动校准步长：step_price 至少取 max(中价 × ${fmtGuidePctFromRatio(hint.stepRatio, 4)}, 最小 tick × ${hint.minTicks}, 当前点差 × 2)。`
+        );
+        lines.push("如果 per_order_notional 太小，不够满足交易所最小成交额/最小下单量，也会被自动抬高；base_position_notional 至少会被抬到两笔单笔名义。");
+      } else if ("autotune_symbol_enabled" in (config || {})) {
+        lines.push("当前已关闭 autotune_symbol_enabled：启动时不会再按币种自动改步长和单笔名义，当前 JSON 基本会原样执行。");
+      }
+
+      if (Boolean(config.auto_regime_enabled) && mode === "one_way_long") {
+        lines.push(
+          `auto_regime 已开启：15m 振幅 <= ${fmtGuidePctFromRatio(config.auto_regime_stable_15m_max_amplitude_ratio)} 且 60m 振幅 <= ${fmtGuidePctFromRatio(config.auto_regime_stable_60m_max_amplitude_ratio)}、60m 涨跌 >= ${fmtGuidePctFromRatio(config.auto_regime_stable_60m_return_floor_ratio)} 时，视为 stable。`
+        );
+        lines.push(
+          `15m 振幅 >= ${fmtGuidePctFromRatio(config.auto_regime_defensive_15m_amplitude_ratio)}、60m 振幅 >= ${fmtGuidePctFromRatio(config.auto_regime_defensive_60m_amplitude_ratio)}，或 15m / 60m 跌幅分别 <= ${fmtGuidePctFromRatio(config.auto_regime_defensive_15m_return_ratio)} / ${fmtGuidePctFromRatio(config.auto_regime_defensive_60m_return_ratio)} 时，候选切到 defensive。`
+        );
+        lines.push(`候选状态连续满足 ${Math.max(Number(config.auto_regime_confirm_cycles) || 1, 1)} 轮后，才会真正切换到另一套参数，避免来回抖动。`);
+      }
+
+      if (mode === "one_way_short" && (
+        config.short_cover_pause_amp_trigger_ratio !== undefined
+        || config.short_cover_pause_down_return_trigger_ratio !== undefined
+      )) {
+        lines.push("注意：当前 JSON 里的 short_cover_pause_* 字段还没有接入 loop_runner 实际暂停逻辑，现在只会展示，不会真的触发“暂停买回补空”。");
+      }
+
+      if (mode === "inventory_target_neutral") {
+        lines.push("注意：inventory_target_neutral 当前真正生效的是 neutral_center_interval_minutes、三档 band offset / target ratio、max_position_notional / max_short_position_notional 和 neutral_hourly_scale。");
+        lines.push("buy_levels、sell_levels、per_order_notional、base_position_notional、up_trigger_steps、down_trigger_steps、shift_steps 在这个模式里不会决定实际挂单位置。");
+      }
+
+      return lines;
     }
 
     function renderRunnerParamGuide(config) {
       const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
-      const entries = Object.entries(source);
-      if (!entries.length) {
-        runnerParamsGuideBodyEl.innerHTML = '<tr><td colspan="3" class="empty">先载入参数，右侧再显示逐项解释。</td></tr>';
+      if (!Object.keys(source).length) {
+        runnerParamsGuideBodyEl.innerHTML = '<div class="strategy-guide-empty">先载入参数，右侧再显示当前策略的执行说明。</div>';
         return;
       }
-      runnerParamsGuideBodyEl.innerHTML = entries
-        .map(([key, value]) => {
-          const explanation = RUNNER_PARAM_EXPLAIN[key] || "当前参数暂无内置说明，可结合策略模式与上下文字段一起判断。";
-          return `
-            <tr>
-              <td><code>${escapeHtml(key)}</code></td>
-              <td><code>${escapeHtml(formatRunnerGuideValue(value))}</code></td>
-              <td>${escapeHtml(explanation)}</td>
-            </tr>
-          `;
-        })
-        .join("");
+      const preset = getGuidePreset(source);
+      const profileKey = String(source.strategy_profile || (preset && preset.key) || "").trim();
+      const presetNote = RUNNER_PROFILE_GUIDE_NOTES[profileKey] || null;
+      const mode = getGuideMode(source, preset);
+      const title = (preset && preset.label) || profileKey || mode;
+      const lead = (presetNote && presetNote.summary) || (preset && preset.description) || "当前策略没有单独的预设说明，以下内容按真实执行模式和当前 JSON 推导。";
+      const metaPills = [
+        `profile: ${profileKey || "未指定"}`,
+        `mode: ${mode}`,
+        `symbol: ${String(source.symbol || symbolEl.value || "-").toUpperCase()}`,
+        `轮询: ${fmtGuideNumber(source.sleep_seconds, 2)}s`,
+      ];
+      const summarySections = [
+        guideHtmlSection("策略定位", (presetNote && presetNote.focus) || []),
+        guideHtmlSection("这份参数会怎样下单", buildModeExecutionLines(source, mode)),
+        guideHtmlSection("中心价如何移动", buildCenterBehaviorLines(source, mode)),
+        guideHtmlSection("何时暂停、减仓或限额", buildPauseAndCapLines(source, mode)),
+        guideHtmlSection("库存分层如何改网格", buildInventoryTierLines(source, mode)),
+        guideHtmlSection("撤单、补单和执行保护", buildExecutionGuardLines(source)),
+        guideHtmlSection("自动调参 / 特殊注意", buildAutotuneAndSpecialNotes(source, preset, mode)),
+      ].filter(Boolean).join("");
+
+      runnerParamsGuideBodyEl.innerHTML = `
+        <div class="strategy-guide-card">
+          <h3>${escapeHtml(title)}</h3>
+          <div class="strategy-guide-meta">
+            ${metaPills.map((item) => `<span class="strategy-guide-pill">${escapeHtml(item)}</span>`).join("")}
+          </div>
+          <p class="strategy-guide-lead">${escapeHtml(lead)}</p>
+          ${summarySections}
+          <div class="strategy-guide-section">
+            <div class="strategy-guide-callout">
+              <p class="strategy-guide-note">详细版文档已经落到仓库 <code>docs/STRATEGY_EXECUTION_GUIDE.md</code> 文件。右侧说明只解释当前这一份 JSON 真正会怎样运行。</p>
+            </div>
+          </div>
+        </div>
+      `;
     }
 
     function syncRunnerParamGuideFromEditor() {
@@ -8927,9 +9386,7 @@ MONITOR_PAGE = """<!doctype html>
         renderRunnerParamGuide(payload);
       } catch (err) {
         runnerParamsGuideBodyEl.innerHTML = `
-          <tr>
-            <td colspan="3" class="empty">JSON 解析失败：${escapeHtml(String(err))}</td>
-          </tr>
+          <div class="strategy-guide-empty">JSON 解析失败：${escapeHtml(String(err))}</div>
         `;
       }
     }
@@ -9911,6 +10368,9 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         <label>交易对
           <select id="symbol"></select>
         </label>
+        <label>手动筛选 / 直接输入
+          <input id="symbol_search" type="text" placeholder="输入币种，如 BARDUSDT" spellcheck="false" />
+        </label>
         <label>策略模式
           <select id="strategy_mode">
             <option value="spot_volume_shift_long">现货量优先移中心</option>
@@ -10081,6 +10541,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
 
   <script>
     const symbolEl = document.getElementById("symbol");
+    const symbolSearchEl = document.getElementById("symbol_search");
     const strategyModeEl = document.getElementById("strategy_mode");
     const gridLevelModeEl = document.getElementById("grid_level_mode");
     const minPriceEl = document.getElementById("min_price");
@@ -10118,6 +10579,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
 
     let latestSnapshot = null;
     let latestPreview = null;
+    let availableSpotSymbols = [];
     let timer = null;
     let paused = false;
     let actionPending = false;
@@ -10176,6 +10638,20 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       return [Number(parts[0] || fallbackA), Number(parts[1] || fallbackB)];
     }
 
+    function normalizeSymbol(value) {
+      return String(value || "").trim().toUpperCase();
+    }
+
+    function getExactSymbolMatch(value) {
+      const normalized = normalizeSymbol(value);
+      if (!normalized) return "";
+      return availableSpotSymbols.find((symbol) => symbol === normalized) || "";
+    }
+
+    function getSelectedSymbol() {
+      return getExactSymbolMatch(symbolSearchEl.value) || normalizeSymbol(symbolEl.value) || "BARDUSDT";
+    }
+
     function readForm() {
       const strategyMode = String(strategyModeEl.value || "spot_volume_shift_long");
       const [attackBuyLevels, attackSellLevels] = parsePair(attackLevelsEl.value, 14, 22);
@@ -10185,7 +10661,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const [pauseAmp, pauseDown] = parsePair(pauseThresholdsEl.value, 0.045, -0.022);
       const [recycleAge, recycleLoss] = parsePair(recycleSettingsEl.value, 40, 0.006);
       return {
-        symbol: String(symbolEl.value || "").trim().toUpperCase(),
+        symbol: getSelectedSymbol(),
         strategy_mode: strategyMode,
         grid_level_mode: String(gridLevelModeEl.value || "arithmetic"),
         min_price: Number(minPriceEl.value || 0),
@@ -10219,15 +10695,28 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     }
 
     function populateSymbols(symbols, preferred) {
-      const prev = symbolEl.value;
-      symbolEl.innerHTML = (symbols || []).map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
-      const target = preferred || prev || "SAHARAUSDT";
-      if (symbols.includes(target)) {
+      const normalizedSymbols = Array.from(new Set((symbols || []).map((symbol) => normalizeSymbol(symbol)).filter(Boolean)));
+      availableSpotSymbols = normalizedSymbols;
+      const prev = normalizeSymbol(symbolEl.value);
+      const manual = normalizeSymbol(symbolSearchEl.value);
+      const filteredSymbols = manual
+        ? normalizedSymbols.filter((symbol) => symbol.includes(manual))
+        : normalizedSymbols;
+      const target = getExactSymbolMatch(preferred) || getExactSymbolMatch(manual) || prev || "BARDUSDT";
+      if (!filteredSymbols.length) {
+        symbolEl.innerHTML = '<option value="">没有匹配币种</option>';
+        symbolEl.value = "";
+        return;
+      }
+      symbolEl.innerHTML = filteredSymbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
+      if (filteredSymbols.includes(target)) {
         symbolEl.value = target;
-      } else if (symbols.includes("BTCUSDT")) {
+      } else if (filteredSymbols.includes("BARDUSDT")) {
+        symbolEl.value = "BARDUSDT";
+      } else if (filteredSymbols.includes("BTCUSDT")) {
         symbolEl.value = "BTCUSDT";
-      } else if (symbols.length) {
-        symbolEl.value = symbols[0];
+      } else if (filteredSymbols.length) {
+        symbolEl.value = filteredSymbols[0];
       }
     }
 
@@ -10238,9 +10727,9 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         if (!resp.ok || !data.ok || !Array.isArray(data.symbols)) {
           throw new Error(data.error || `HTTP ${resp.status}`);
         }
-        populateSymbols(data.symbols, latestSnapshot && latestSnapshot.symbol);
+        populateSymbols(data.symbols, getSelectedSymbol() || (latestSnapshot && latestSnapshot.symbol) || "BARDUSDT");
       } catch (err) {
-        populateSymbols(["SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"], latestSnapshot && latestSnapshot.symbol);
+        populateSymbols(["BARDUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"], getSelectedSymbol() || (latestSnapshot && latestSnapshot.symbol) || "BARDUSDT");
         setStatus(`现货交易对加载失败，已使用默认列表：${err}`, true);
       }
     }
@@ -10383,7 +10872,6 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     function syncFormFromConfig(snapshot) {
       const config = (snapshot && snapshot.config) || {};
       strategyModeEl.value = String(config.strategy_mode || "spot_volume_shift_long");
-      if (config.symbol) symbolEl.value = String(config.symbol).toUpperCase();
       if (config.grid_level_mode) gridLevelModeEl.value = String(config.grid_level_mode);
       if (config.min_price !== undefined) minPriceEl.value = String(config.min_price);
       if (config.max_price !== undefined) maxPriceEl.value = String(config.max_price);
@@ -10407,7 +10895,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
 
     async function loadStatus(silent = false) {
       try {
-        const selectedSymbol = String(symbolEl.value || "").trim().toUpperCase();
+        const selectedSymbol = getSelectedSymbol();
         const qs = new URLSearchParams();
         if (selectedSymbol) qs.set("symbol", selectedSymbol);
         const resp = await fetch(`/api/spot_runner/status?${qs.toString()}`);
@@ -10480,7 +10968,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         const resp = await fetch(`/api/spot_runner/${action}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(action === "start" ? readForm() : { symbol: String(symbolEl.value || "").trim().toUpperCase() }),
+          body: JSON.stringify(action === "start" ? readForm() : { symbol: getSelectedSymbol() }),
         });
         const data = await resp.json();
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
@@ -10522,6 +11010,29 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     refreshSecondsEl.addEventListener("change", restartTimer);
     strategyModeEl.addEventListener("change", toggleModeFields);
     symbolEl.addEventListener("change", () => loadStatus());
+    symbolSearchEl.addEventListener("input", () => {
+      const cursor = symbolSearchEl.selectionStart;
+      const normalized = normalizeSymbol(symbolSearchEl.value);
+      symbolSearchEl.value = normalized;
+      if (cursor !== null) symbolSearchEl.setSelectionRange(cursor, cursor);
+      populateSymbols(availableSpotSymbols, normalized || symbolEl.value || "BARDUSDT");
+      const exactMatch = getExactSymbolMatch(normalized);
+      if (exactMatch) {
+        symbolEl.value = exactMatch;
+      }
+    });
+    symbolSearchEl.addEventListener("keydown", (event) => {
+      if (event.key === "Enter") {
+        event.preventDefault();
+        const exactMatch = getExactSymbolMatch(symbolSearchEl.value);
+        if (exactMatch) {
+          symbolEl.value = exactMatch;
+          loadStatus();
+        } else {
+          setStatus(`没有找到完全匹配的现货币种：${normalizeSymbol(symbolSearchEl.value)}`, true);
+        }
+      }
+    });
 
     toggleModeFields();
     loadSymbols().then(() => loadStatus());
