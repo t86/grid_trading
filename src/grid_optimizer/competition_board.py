@@ -328,6 +328,7 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
             },
             {
                 "tabLabel": "交易量挑战赛 - 第二阶段",
+                "resourceId": 46948,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "KAT",
@@ -1342,6 +1343,7 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
         reward_unit = str(board.get("reward_unit") or "").strip().upper()
         reward_price = _fetch_symbol_close_price_usdt(reward_unit, now) if reward_unit else None
         reward_rows: list[dict[str, Any]] = []
+        reward_rows_message = ""
         for segment in board.get("segments", []):
             if not isinstance(segment, dict):
                 continue
@@ -1360,6 +1362,13 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
                     "ratio": ratio,
                 }
             )
+        if not reward_rows:
+            if not board.get("segments"):
+                reward_rows_message = "未解析出奖励段，暂时无法计算奖励 / 门槛比值。"
+            elif not board.get("rows"):
+                reward_rows_message = "官方公开榜单暂未返回有效门槛数据，所以奖励 / 门槛比值暂时无法计算。"
+            else:
+                reward_rows_message = "奖励段已识别，但缺少可用门槛值，暂时无法计算奖励 / 门槛比值。"
         ongoing_rows.append(
             {
                 "board_key": board_key,
@@ -1374,6 +1383,7 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
                     for rank in tracked_ranks
                 },
                 "reward_rows": reward_rows,
+                "reward_rows_message": reward_rows_message,
             }
         )
 
@@ -2613,28 +2623,30 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
           </div>
           <div>
             <div class="meta" style="margin-bottom:8px;">奖励 / 最终门槛交易量比值</div>
-            <div class="table-wrap">
-              <table class="analytics-table">
-                <thead>
-                  <tr>
-                    <th>榜段</th>
-                    <th class="num">奖励折 USDT</th>
-                    <th class="num">最终门槛</th>
-                    <th class="num">奖励 / 门槛</th>
-                  </tr>
-                </thead>
-                <tbody class="ongoing-reward-body">
-                  ${item.reward_rows.map((reward) => `
-                    <tr data-forecast-rank="${reward.forecast_rank === null || reward.forecast_rank === undefined ? "" : reward.forecast_rank}">
-                      <td>${escapeHtml(reward.rank_label || "-")}</td>
-                      <td class="num">${reward.reward_value_usdt === null || reward.reward_value_usdt === undefined ? "-" : fmtNum(reward.reward_value_usdt, 2)}</td>
-                      <td class="num">${reward.current_cutoff_value === null || reward.current_cutoff_value === undefined ? "-" : fmtNum(reward.current_cutoff_value, 2)}</td>
-                      <td class="num">${reward.ratio === null || reward.ratio === undefined ? "-" : fmtNum(reward.ratio, 6)}</td>
+            ${item.reward_rows.length ? `
+              <div class="table-wrap">
+                <table class="analytics-table">
+                  <thead>
+                    <tr>
+                      <th>榜段</th>
+                      <th class="num">奖励折 USDT</th>
+                      <th class="num">最终门槛</th>
+                      <th class="num">奖励 / 门槛</th>
                     </tr>
-                  `).join("")}
-                </tbody>
-              </table>
-            </div>
+                  </thead>
+                  <tbody class="ongoing-reward-body">
+                    ${item.reward_rows.map((reward) => `
+                      <tr data-forecast-rank="${reward.forecast_rank === null || reward.forecast_rank === undefined ? "" : reward.forecast_rank}">
+                        <td>${escapeHtml(reward.rank_label || "-")}</td>
+                        <td class="num">${reward.reward_value_usdt === null || reward.reward_value_usdt === undefined ? "-" : fmtNum(reward.reward_value_usdt, 2)}</td>
+                        <td class="num">${reward.current_cutoff_value === null || reward.current_cutoff_value === undefined ? "-" : fmtNum(reward.current_cutoff_value, 2)}</td>
+                        <td class="num">${reward.ratio === null || reward.ratio === undefined ? "-" : fmtNum(reward.ratio, 6)}</td>
+                      </tr>
+                    `).join("")}
+                  </tbody>
+                </table>
+              </div>
+            ` : `<div class="empty">${escapeHtml(item.reward_rows_message || "当前没有可用于计算奖励 / 门槛比值的数据。")}</div>`}
           </div>
         </article>
       `).join("");
@@ -2643,7 +2655,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         const input = card.querySelector(".ongoing-volume-input");
         const body = card.querySelector(".ongoing-threshold-body");
         const rewardBody = card.querySelector(".ongoing-reward-body");
-        if (!input || !body || !rewardBody) return;
+        if (!input || !body) return;
         const boardKey = card.dataset.ongoingBoard || "";
         const board = rows.find((item) => item.board_key === boardKey);
         if (!board) return;
@@ -2677,24 +2689,26 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             if (cells.length < 2) return;
             cells[1].textContent = predicted === null ? "-" : fmtNum(predicted, 0);
           });
-          rewardBody.querySelectorAll("tr").forEach((row) => {
-            const rank = row.dataset.forecastRank || "";
-            const forecastValue = Object.prototype.hasOwnProperty.call(predictedValues, rank)
-              ? predictedValues[rank]
-              : null;
-            const reward = board.reward_rows.find((item) => String(item.forecast_rank ?? "") === rank) || null;
-            if (!reward) return;
-            const finalCutoff = forecastValue !== null && forecastValue !== undefined
-              ? Number(forecastValue)
-              : (reward.current_cutoff_value !== null && reward.current_cutoff_value !== undefined ? Number(reward.current_cutoff_value) : null);
-            const ratio = reward.reward_value_usdt !== null && reward.reward_value_usdt !== undefined && finalCutoff && finalCutoff > 0
-              ? Number(reward.reward_value_usdt) / Number(finalCutoff)
-              : null;
-            const cells = row.querySelectorAll("td");
-            if (cells.length < 4) return;
-            cells[2].textContent = finalCutoff === null ? "-" : fmtNum(finalCutoff, 2);
-            cells[3].textContent = ratio === null ? "-" : fmtNum(ratio, 6);
-          });
+          if (rewardBody) {
+            rewardBody.querySelectorAll("tr").forEach((row) => {
+              const rank = row.dataset.forecastRank || "";
+              const forecastValue = Object.prototype.hasOwnProperty.call(predictedValues, rank)
+                ? predictedValues[rank]
+                : null;
+              const reward = board.reward_rows.find((item) => String(item.forecast_rank ?? "") === rank) || null;
+              if (!reward) return;
+              const finalCutoff = forecastValue !== null && forecastValue !== undefined
+                ? Number(forecastValue)
+                : (reward.current_cutoff_value !== null && reward.current_cutoff_value !== undefined ? Number(reward.current_cutoff_value) : null);
+              const ratio = reward.reward_value_usdt !== null && reward.reward_value_usdt !== undefined && finalCutoff && finalCutoff > 0
+                ? Number(reward.reward_value_usdt) / Number(finalCutoff)
+                : null;
+              const cells = row.querySelectorAll("td");
+              if (cells.length < 4) return;
+              cells[2].textContent = finalCutoff === null ? "-" : fmtNum(finalCutoff, 2);
+              cells[3].textContent = ratio === null ? "-" : fmtNum(ratio, 6);
+            });
+          }
         };
         input.addEventListener("input", updateTable);
         updateTable();
