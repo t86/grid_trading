@@ -9764,6 +9764,7 @@ MONITOR_PAGE = """<!doctype html>
       const latestLoop = loop.latest || {};
       const runner = data.runner || {};
       const runnerCfg = runner.config || {};
+      const competitionWindow = data.competition_window || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const selectedPreset = getPresetByKey(String(strategyPresetEl.value || runnerCfg.strategy_profile || "volume_long_v4"));
       const risk = data.risk_controls || {};
@@ -9824,9 +9825,13 @@ MONITOR_PAGE = """<!doctype html>
         `间隔: ${fmtNum(runnerCfg.sleep_seconds, 0)}s`,
         `杠杆: ${runnerCfg.leverage ? `${runnerCfg.leverage}x` : "--"}`,
       ].join(" · ");
+      const statsWindowLabel = competitionWindow.label
+        ? `${competitionWindow.label} · 起点 ${fmtTs(competitionWindow.stats_start_at || competitionWindow.activity_start_at)}`
+        : `会话起点 ${fmtTs(data.session && data.session.start)}`;
       const cards = [
         ["策略状态", strategyRunning ? "运行中" : "未活跃", strategyRunning ? "good" : "warn", strategyDetail],
         ["执行进程", runnerLabel, runner.is_running ? "good" : "warn", runnerDetail],
+        ["统计区间", statsWindowLabel, "", competitionWindow.activity_end_at ? `结束时间: ${fmtTs(competitionWindow.activity_end_at)}` : "未匹配到交易赛窗口，默认按当前会话统计"],
         ["风控硬限制", riskValue, riskStatusClass, riskDetail],
         ["会话成交笔数", fmtNum(trade.trade_count || 0, 0), "", `Maker: ${fmtNum(trade.maker_count || 0, 0)} · 买/卖: ${fmtNum(trade.buy_count || 0, 0)} / ${fmtNum(trade.sell_count || 0, 0)}`],
         ["累计成交额", fmtNum(trade.gross_notional || 0, 4), "", `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}`],
@@ -9956,7 +9961,11 @@ MONITOR_PAGE = """<!doctype html>
     function renderHourlyStats(data) {
       const hourly = (data.hourly_summary || {});
       const rows = (hourly.rows || []);
-      hourlyMetaEl.textContent = `最近 ${hourly.row_count || 0} / ${hourly.available_hours || 0} 小时`;
+      const competitionWindow = data.competition_window || {};
+      const statsStartText = competitionWindow.stats_start_at
+        ? ` · 统计起点 ${fmtTs(competitionWindow.stats_start_at)}`
+        : "";
+      hourlyMetaEl.textContent = `最近 ${hourly.row_count || 0} / ${hourly.available_hours || 0} 小时${statsStartText}`;
       if (!rows.length) {
         hourlyBody.innerHTML = '<tr><td colspan="10" class="empty">当前没有小时级统计数据</td></tr>';
         return;

@@ -13,9 +13,11 @@ from grid_optimizer.competition_board import (
     _hinted_boards_for_source,
     _load_history_index,
     _normalize_entries,
+    _parse_activity_period_bounds,
     _parse_segments,
     _per_user_reward_from_segment,
     CompetitionSource,
+    resolve_active_competition_board,
     upsert_competition_entry,
     build_competition_board_snapshot,
 )
@@ -165,6 +167,39 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(len(boards), 2)
         self.assertEqual(boards[1].get("resourceId"), 46948)
         self.assertEqual(boards[1]["tabLabel"], "交易量挑战赛 - 第二阶段")
+
+    def test_parse_activity_period_bounds_extracts_start_and_end(self) -> None:
+        start_at, end_at = _parse_activity_period_bounds("2026/03/29 08:00 - 2026/04/08 07:59")
+        self.assertEqual(start_at, "2026-03-29T08:00:00+08:00")
+        self.assertEqual(end_at, "2026-04-08T07:59:00+08:00")
+
+    def test_resolve_active_competition_board_prefers_current_phase(self) -> None:
+        snapshot = {
+            "boards": [
+                {
+                    "symbol": "KAT",
+                    "market": "futures",
+                    "label": "KAT · 交易量挑战赛 - 第一阶段",
+                    "activity_start_at": "2026-03-19T17:00:00+08:00",
+                    "activity_end_at": "2026-03-29T07:59:00+08:00",
+                },
+                {
+                    "symbol": "KAT",
+                    "market": "futures",
+                    "label": "KAT · 交易量挑战赛 - 第二阶段",
+                    "activity_start_at": "2026-03-29T08:00:00+08:00",
+                    "activity_end_at": "2026-04-08T07:59:00+08:00",
+                },
+            ]
+        }
+        board = resolve_active_competition_board(
+            "KATUSDT",
+            "futures",
+            snapshot=snapshot,
+            now=datetime(2026, 3, 29, 0, 30, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["label"], "KAT · 交易量挑战赛 - 第二阶段")
 
     def test_load_history_index_merges_disk_files_with_stale_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

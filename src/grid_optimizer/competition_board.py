@@ -684,6 +684,9 @@ _THRESHOLD_RE = re.compile(
 )
 _CAP_RE = re.compile(r"上限(?:为)?\s*([0-9,]+(?:\.[0-9]+)?)\s*([A-Z]+)")
 _PRIZE_POOL_RE = re.compile(r"(?:瓜分|总奖池|奖池)\s*([0-9,]+(?:\.[0-9]+)?)\s*([A-Z]+)")
+_ACTIVITY_PERIOD_RE = re.compile(
+    r"(?P<start>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})\s*-\s*(?P<end>\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2})"
+)
 
 
 def _now_iso() -> str:
@@ -909,6 +912,21 @@ def _parse_prize_pool(text: str) -> dict[str, Any]:
     }
 
 
+def _parse_activity_period_bounds(text: str) -> tuple[str | None, str | None]:
+    raw = str(text or "").strip()
+    if not raw:
+        return None, None
+    match = _ACTIVITY_PERIOD_RE.search(raw)
+    if not match:
+        return None, None
+    try:
+        start = datetime.strptime(match.group("start"), "%Y/%m/%d %H:%M").replace(tzinfo=UTC_PLUS_8)
+        end = datetime.strptime(match.group("end"), "%Y/%m/%d %H:%M").replace(tzinfo=UTC_PLUS_8)
+    except ValueError:
+        return None, None
+    return start.isoformat(), end.isoformat()
+
+
 def _parse_segments(text: str, total_rows: int) -> list[dict[str, Any]]:
     lines = _normalize_lines(text)
     segments: list[dict[str, Any]] = []
@@ -1056,6 +1074,8 @@ def _compose_board(
         if updated_time_ms > 0
         else None
     )
+    activity_period_text = str(board_meta.get("activityPeriodText", "")).strip()
+    activity_start_at, activity_end_from_period = _parse_activity_period_bounds(activity_period_text)
     lowest_entry = rows[-1]["value"] if rows else None
     rows_truncated = bool(leaderboard_payload.get("rows_truncated"))
 
@@ -1084,8 +1104,9 @@ def _compose_board(
         "task_expired_time": extracted_meta.get("taskExpiredTime"),
         "updated_text": str(board_meta.get("updatedText", "")).strip(),
         "updated_at_utc": updated_at_utc,
-        "activity_period_text": str(board_meta.get("activityPeriodText", "")).strip(),
-        "activity_end_at": str(board_meta.get("activityEndAt", "")).strip(),
+        "activity_period_text": activity_period_text,
+        "activity_start_at": activity_start_at,
+        "activity_end_at": str(board_meta.get("activityEndAt", "")).strip() or activity_end_from_period,
         "threshold_value": threshold["threshold_value"],
         "threshold_unit": threshold["threshold_unit"],
         "cap_value": cap["cap_value"],
@@ -1556,6 +1577,60 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
 
     ongoing_rows.sort(key=lambda item: item["symbol"])
     return {"board_rows": ongoing_rows}
+
+
+def resolve_active_competition_board(
+    symbol: str,
+    market: str,
+    *,
+    snapshot: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_market = str(market or "").strip().lower()
+    if not normalized_symbol or not normalized_market:
+        return None
+    if normalized_symbol.endswith("USDT"):
+        normalized_symbol = normalized_symbol[:-4]
+    current = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    boards = snapshot.get("boards", []) if isinstance(snapshot, dict) else None
+    if not isinstance(boards, list):
+        boards = build_competition_board_snapshot(refresh=False).get("boards", [])
+    candidates: list[dict[str, Any]] = []
+    for board in boards:
+        if not isinstance(board, dict):
+            continue
+        if str(board.get("market", "")).strip().lower() != normalized_market:
+            continue
+        if str(board.get("symbol", "")).upper().strip() != normalized_symbol:
+            continue
+        start_raw = str(board.get("activity_start_at", "")).strip()
+        end_raw = str(board.get("activity_end_at", "")).strip()
+        if not start_raw or not end_raw:
+            parsed_start, parsed_end = _parse_activity_period_bounds(str(board.get("activity_period_text", "")).strip())
+            start_raw = start_raw or str(parsed_start or "")
+            end_raw = end_raw or str(parsed_end or "")
+        start_at = _parse_iso_datetime(start_raw)
+        end_at = _parse_iso_datetime(end_raw)
+        if start_at is None or end_at is None:
+            continue
+        start_utc = start_at.astimezone(timezone.utc)
+        end_utc = end_at.astimezone(timezone.utc)
+        if start_utc <= current <= end_utc:
+            candidates.append(
+                {
+                    **board,
+                    "activity_start_at": start_at.isoformat(),
+                    "activity_end_at": end_at.isoformat(),
+                }
+            )
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: _parse_iso_datetime(item.get("activity_start_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return candidates[0]
 
 
 def _attach_snapshot_analytics(snapshot: dict[str, Any]) -> dict[str, Any]:

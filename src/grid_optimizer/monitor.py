@@ -21,7 +21,6 @@ from .audit import (
     parse_iso_ts as _parse_iso_ts,
     read_json as _read_json,
     read_jsonl as _read_jsonl,
-    scan_iso_bounds,
     trade_row_key,
     trade_row_time_ms,
 )
@@ -38,6 +37,7 @@ from .data import (
     load_binance_api_credentials,
 )
 from .live_check import extract_symbol_position
+from .competition_board import resolve_active_competition_board
 
 
 def _safe_float(value: Any) -> float:
@@ -359,6 +359,31 @@ def _epoch_bounds(rows: list[dict[str, Any]], row_time_ms: Any) -> tuple[datetim
     return first_ts, last_ts
 
 
+def _filter_rows_since(
+    rows: list[dict[str, Any]],
+    *,
+    since: datetime | None,
+    row_time_ms: Any,
+) -> list[dict[str, Any]]:
+    if since is None:
+        return list(rows)
+    floor_ms = int(since.astimezone(timezone.utc).timestamp() * 1000)
+    return [item for item in rows if int(row_time_ms(item) or 0) >= floor_ms]
+
+
+def _filter_events_since(events: list[dict[str, Any]], since: datetime | None) -> list[dict[str, Any]]:
+    if since is None:
+        return list(events)
+    floor = since.astimezone(timezone.utc)
+    filtered: list[dict[str, Any]] = []
+    for item in events:
+        ts = _parse_iso_ts(item.get("ts"))
+        if ts is None or ts < floor:
+            continue
+        filtered.append(item)
+    return filtered
+
+
 def _load_or_fetch_trade_rows(
     *,
     audit_path: Path,
@@ -368,14 +393,16 @@ def _load_or_fetch_trade_rows(
     session_start: datetime | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     audit_rows = _read_jsonl(audit_path, limit=0)
+    effective_start = session_start or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS))
     if audit_rows:
-        return audit_rows, {
+        filtered_rows = _filter_rows_since(audit_rows, since=effective_start, row_time_ms=trade_row_time_ms)
+        return filtered_rows, {
             "source": "audit",
             "path": str(audit_path),
-            "row_count": len(audit_rows),
+            "row_count": len(filtered_rows),
+            "start_time": effective_start.isoformat(),
         }
 
-    effective_start = session_start or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS))
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     rows = fetch_time_paged(
@@ -408,14 +435,16 @@ def _load_or_fetch_income_rows(
     session_start: datetime | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     audit_rows = _read_jsonl(audit_path, limit=0)
+    effective_start = session_start or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS))
     if audit_rows:
-        return audit_rows, {
+        filtered_rows = _filter_rows_since(audit_rows, since=effective_start, row_time_ms=income_row_time_ms)
+        return filtered_rows, {
             "source": "audit",
             "path": str(audit_path),
-            "row_count": len(audit_rows),
+            "row_count": len(filtered_rows),
+            "start_time": effective_start.isoformat(),
         }
 
-    effective_start = session_start or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS))
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     rows = fetch_time_paged(
@@ -739,12 +768,18 @@ def _build_monitor_snapshot_uncached(
     normalized_symbol = str(symbol).upper().strip()
     event_path = Path(events_path)
     audit_paths = build_audit_paths(event_path)
-    events = _read_jsonl(event_path, limit=summary_limit)
+    competition_board = resolve_active_competition_board(normalized_symbol, "futures")
+    competition_start = _parse_iso_ts((competition_board or {}).get("activity_start_at"))
+    competition_end = _parse_iso_ts((competition_board or {}).get("activity_end_at"))
+    all_events = _read_jsonl(event_path, limit=0)
+    filtered_events = _filter_events_since(all_events, competition_start)
+    events = filtered_events[-summary_limit:] if summary_limit > 0 else filtered_events
     plan_report = _read_json(Path(plan_path))
     submit_report = _read_json(Path(submit_report_path))
     session_start, session_last = _build_session_window(events, submit_report)
-    event_start, event_last = scan_iso_bounds(event_path)
+    event_start, event_last = _build_session_window(filtered_events, None)
     session_start = _min_dt(session_start, event_start)
+    stats_start = competition_start or session_start
     session_last = _max_dt(session_last, event_last)
     loop_summary = summarize_loop_events(events)
     runner = runner_process or read_symbol_runner_process(normalized_symbol)
@@ -754,8 +789,14 @@ def _build_monitor_snapshot_uncached(
         "symbol": normalized_symbol,
         "ts": datetime.now(timezone.utc).isoformat(),
         "session": {
-            "start": session_start.isoformat() if session_start else None,
+            "start": stats_start.isoformat() if stats_start else None,
             "last_event": session_last.isoformat() if session_last else None,
+        },
+        "competition_window": {
+            "label": str((competition_board or {}).get("label", "")).strip() or None,
+            "activity_start_at": competition_start.isoformat() if competition_start else None,
+            "activity_end_at": competition_end.isoformat() if competition_end else None,
+            "stats_start_at": stats_start.isoformat() if stats_start else None,
         },
         "local": {
             "loop_summary": loop_summary,
@@ -867,28 +908,30 @@ def _build_monitor_snapshot_uncached(
             symbol=normalized_symbol,
             api_key=api_key,
             api_secret=api_secret,
-            session_start=session_start,
+            session_start=stats_start,
         )
         income_rows, income_meta = _load_or_fetch_income_rows(
             audit_path=audit_paths["income_audit"],
             symbol=normalized_symbol,
             api_key=api_key,
             api_secret=api_secret,
-            session_start=session_start,
+            session_start=stats_start,
         )
         trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
         income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
-        session_start = _min_dt(session_start, trade_start, income_start)
+        session_start = _min_dt(stats_start, trade_start, income_start)
+        stats_start = competition_start or session_start
         session_last = _max_dt(session_last, trade_last, income_last)
-        snapshot["session"]["start"] = session_start.isoformat() if session_start else None
+        snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
         snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
+        snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
         commission_converter = _build_commission_converter(user_trades)
         trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
         income_summary = summarize_income(income_rows)
         hourly_summary = None
         try:
             hourly_window_start = max(
-                session_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
+                stats_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
                 datetime.now(timezone.utc) - timedelta(hours=48),
             )
             hourly_window_start = _floor_hour(hourly_window_start)

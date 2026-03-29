@@ -6,6 +6,8 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 
 from grid_optimizer.monitor import (
+    _filter_events_since,
+    _filter_rows_since,
     _read_runner_process,
     summarize_hourly_metrics,
     summarize_income,
@@ -165,6 +167,26 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(summary["cycle_count"], 2)
         self.assertEqual(summary["error_count"], 0)
         self.assertEqual(summary["success_count"], 2)
+
+    def test_filter_rows_since_discards_older_trade_rows(self) -> None:
+        floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            {"time": int((floor - timedelta(minutes=1)).timestamp() * 1000)},
+            {"time": int((floor + timedelta(minutes=1)).timestamp() * 1000)},
+        ]
+        filtered = _filter_rows_since(rows, since=floor, row_time_ms=lambda item: int(item.get("time", 0)))
+        self.assertEqual(len(filtered), 1)
+        self.assertGreaterEqual(filtered[0]["time"], int(floor.timestamp() * 1000))
+
+    def test_filter_events_since_discards_older_loop_events(self) -> None:
+        floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)
+        rows = [
+            {"ts": (floor - timedelta(seconds=1)).isoformat()},
+            {"ts": (floor + timedelta(seconds=1)).isoformat()},
+        ]
+        filtered = _filter_events_since(rows, floor)
+        self.assertEqual(len(filtered), 1)
+        self.assertEqual(filtered[0]["ts"], (floor + timedelta(seconds=1)).isoformat())
 
     def test_read_runner_process_merges_control_payload_with_parsed_args(self) -> None:
         with TemporaryDirectory() as tmpdir:
