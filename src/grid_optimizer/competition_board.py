@@ -10,7 +10,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -18,11 +18,19 @@ import requests
 
 CACHE_PATH = Path("output/competition_board_cache.json")
 ENTRIES_PATH = Path("output/competition_board_entries.json")
+HISTORY_INDEX_PATH = Path("output/competition_board_history_index.json")
+REWARD_PRICE_CACHE_PATH = Path("output/competition_reward_price_cache.json")
 CACHE_TTL_SECONDS = 1800
 
 _CACHE_LOCK = threading.Lock()
 _REFRESH_LOCK = threading.Lock()
+_PRICE_CACHE_LOCK = threading.Lock()
 _MEMORY_CACHE: dict[str, Any] = {"loaded_at": 0.0, "data": None}
+
+ENDED_LAST_DAY_MARKET_VOLUME: dict[str, float] = {
+    "futures_opn:交易量挑战赛": 176_000_000.0,
+    "futures_robo:交易量挑战赛": 274_000_000.0,
+}
 
 
 @dataclass(frozen=True)
@@ -1033,6 +1041,283 @@ def _write_json_file(path: Path, payload: Any) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
+def _parse_iso_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text or text.lower() == "none":
+      return None
+    try:
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _history_entry_datetime(entry: dict[str, Any]) -> datetime | None:
+    for key in ("updated_at_utc", "captured_at_utc"):
+        parsed = _parse_iso_datetime(entry.get(key))
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def _load_history_index() -> dict[str, list[dict[str, Any]]]:
+    payload = _read_json_file(HISTORY_INDEX_PATH, {})
+    boards = payload.get("boards", {}) if isinstance(payload, dict) else {}
+    if not isinstance(boards, dict):
+        return {}
+    normalized: dict[str, list[dict[str, Any]]] = {}
+    for board_key, items in boards.items():
+        if not isinstance(items, list):
+            continue
+        valid_items = [item for item in items if isinstance(item, dict)]
+        valid_items.sort(
+            key=lambda item: _history_entry_datetime(item) or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
+        normalized[str(board_key)] = valid_items
+    return normalized
+
+
+def _load_history_board(entry: dict[str, Any]) -> dict[str, Any] | None:
+    relative_path = str(entry.get("path", "")).strip()
+    if not relative_path:
+        return None
+    payload = _read_json_file(Path(relative_path), {})
+    if not isinstance(payload, dict):
+        return None
+    board = payload.get("board")
+    return board if isinstance(board, dict) else None
+
+
+def _values_by_rank(board: dict[str, Any]) -> dict[int, float]:
+    out: dict[int, float] = {}
+    for item in board.get("rows", []):
+        if not isinstance(item, dict):
+            continue
+        rank = _safe_int(item.get("rank"))
+        value = _safe_float(item.get("value"))
+        if rank is None or value is None:
+            continue
+        out[int(rank)] = float(value)
+    return out
+
+
+def _select_previous_day_entry(entries: list[dict[str, Any]], final_dt: datetime) -> dict[str, Any] | None:
+    if not entries:
+        return None
+    target = final_dt - timedelta(hours=24)
+    older = [item for item in entries if (_history_entry_datetime(item) or final_dt) <= target]
+    if older:
+        return max(older, key=lambda item: _history_entry_datetime(item) or datetime.min.replace(tzinfo=timezone.utc))
+    candidates = [item for item in entries if (_history_entry_datetime(item) or final_dt) < final_dt]
+    if candidates:
+        return max(candidates, key=lambda item: _history_entry_datetime(item) or datetime.min.replace(tzinfo=timezone.utc))
+    return None
+
+
+def _load_reward_price_cache() -> dict[str, float]:
+    payload = _read_json_file(REWARD_PRICE_CACHE_PATH, {})
+    if not isinstance(payload, dict):
+        return {}
+    out: dict[str, float] = {}
+    for key, value in payload.items():
+        number = _safe_float(value)
+        if number is not None and number > 0:
+            out[str(key)] = float(number)
+    return out
+
+
+def _save_reward_price_cache(cache: dict[str, float]) -> None:
+    _write_json_file(REWARD_PRICE_CACHE_PATH, cache)
+
+
+def _fetch_symbol_close_price_usdt(symbol: str, end_at: datetime) -> float | None:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return None
+    if normalized == "USDT":
+        return 1.0
+    cache_key = f"{normalized}|{end_at.astimezone(timezone.utc).strftime('%Y-%m-%dT%H:%M')}"
+    with _PRICE_CACHE_LOCK:
+        cached = _load_reward_price_cache()
+        if cache_key in cached:
+            return cached[cache_key]
+    params = {
+        "symbol": f"{normalized}USDT",
+        "interval": "1m",
+        "limit": 1,
+        "endTime": int(end_at.astimezone(timezone.utc).timestamp() * 1000),
+    }
+    try:
+        resp = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=10)
+        resp.raise_for_status()
+        payload = resp.json()
+    except Exception:
+        return None
+    if not isinstance(payload, list) or not payload:
+        return None
+    row = payload[-1]
+    if not isinstance(row, list) or len(row) < 5:
+        return None
+    price = _safe_float(row[4])
+    if price is None or price <= 0:
+        return None
+    with _PRICE_CACHE_LOCK:
+        cached = _load_reward_price_cache()
+        cached[cache_key] = float(price)
+        _save_reward_price_cache(cached)
+    return float(price)
+
+
+def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any]:
+    history_index = _load_history_index()
+    now = datetime.now(timezone.utc)
+    delta_rows: list[dict[str, Any]] = []
+    reward_rows: list[dict[str, Any]] = []
+    tracked_ranks = (20, 30, 50, 100, 150, 200)
+
+    ended_boards = [
+        board for board in boards
+        if isinstance(board, dict)
+        and _parse_iso_datetime(board.get("activity_end_at")) is not None
+        and _parse_iso_datetime(board.get("activity_end_at")).astimezone(timezone.utc) <= now
+    ]
+    ended_boards.sort(
+        key=lambda item: _parse_iso_datetime(item.get("activity_end_at")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+
+    for board in ended_boards:
+        board_key = str(board.get("board_key", "")).strip()
+        entries = history_index.get(board_key, [])
+        if len(entries) < 2:
+            continue
+        final_entry = next((item for item in entries if _history_entry_datetime(item) is not None), None)
+        if final_entry is None:
+            continue
+        final_dt = _history_entry_datetime(final_entry)
+        if final_dt is None:
+            continue
+        previous_entry = _select_previous_day_entry(entries, final_dt)
+        if previous_entry is None:
+            continue
+        final_board = _load_history_board(final_entry)
+        previous_board = _load_history_board(previous_entry)
+        if not isinstance(final_board, dict) or not isinstance(previous_board, dict):
+            continue
+        final_values = _values_by_rank(final_board)
+        previous_values = _values_by_rank(previous_board)
+        delta_rows.append(
+            {
+                "board_key": board_key,
+                "label": str(final_board.get("label") or board.get("label") or board_key),
+                "symbol": str(final_board.get("symbol") or board.get("symbol") or ""),
+                "market": str(final_board.get("market") or board.get("market") or ""),
+                "final_capture": str(final_entry.get("capture_label", "")),
+                "previous_capture": str(previous_entry.get("capture_label", "")),
+                "last_day_market_volume": ENDED_LAST_DAY_MARKET_VOLUME.get(board_key),
+                "deltas": {
+                    str(rank): round(max(0.0, final_values.get(rank, 0.0) - previous_values.get(rank, 0.0)), 8)
+                    for rank in tracked_ranks
+                },
+            }
+        )
+
+        end_at = _parse_iso_datetime(final_board.get("activity_end_at") or board.get("activity_end_at"))
+        reward_unit = str(final_board.get("reward_unit") or board.get("reward_unit") or "").strip().upper()
+        reward_price = _fetch_symbol_close_price_usdt(reward_unit, end_at) if end_at is not None and reward_unit else None
+        for segment in final_board.get("segments", []):
+            if not isinstance(segment, dict):
+                continue
+            per_user_reward = _safe_float(segment.get("per_user_reward"))
+            cutoff_value = _safe_float(segment.get("cutoff_value"))
+            if per_user_reward is None or cutoff_value is None or cutoff_value <= 0:
+                continue
+            reward_usdt = float(per_user_reward) * float(reward_price) if reward_price is not None else None
+            ratio = reward_usdt / float(cutoff_value) if reward_usdt is not None and cutoff_value > 0 else None
+            reward_rows.append(
+                {
+                    "board_key": board_key,
+                    "label": str(final_board.get("label") or board.get("label") or board_key),
+                    "symbol": str(final_board.get("symbol") or board.get("symbol") or ""),
+                    "market": str(final_board.get("market") or board.get("market") or ""),
+                    "rank_label": str(segment.get("rank_label", "")).strip() or "-",
+                    "reward_text": str(segment.get("per_user_reward_text") or segment.get("reward_text") or "").strip() or "-",
+                    "reward_unit": reward_unit or str(final_board.get("reward_unit") or "").strip(),
+                    "reward_price_usdt": reward_price,
+                    "reward_value_usdt": reward_usdt,
+                    "cutoff_value": float(cutoff_value),
+                    "cutoff_value_text": f"{float(cutoff_value):,.2f}",
+                    "ratio": ratio,
+                }
+            )
+
+    return {
+        "delta_rows": delta_rows,
+        "reward_rows": reward_rows,
+    }
+
+
+def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any]:
+    now = datetime.now(timezone.utc)
+    tracked_ranks = (20, 30, 50, 100, 150, 200)
+    ongoing_rows: list[dict[str, Any]] = []
+
+    for board in boards:
+        if not isinstance(board, dict):
+            continue
+        end_at = _parse_iso_datetime(board.get("activity_end_at"))
+        if end_at is None or end_at.astimezone(timezone.utc) <= now:
+            continue
+        if str(board.get("market", "")).strip() != "futures":
+            continue
+        values = _values_by_rank(board)
+        reward_unit = str(board.get("reward_unit") or "").strip().upper()
+        reward_price = _fetch_symbol_close_price_usdt(reward_unit, now) if reward_unit else None
+        reward_rows: list[dict[str, Any]] = []
+        for segment in board.get("segments", []):
+            if not isinstance(segment, dict):
+                continue
+            per_user_reward = _safe_float(segment.get("per_user_reward"))
+            cutoff_value = _safe_float(segment.get("cutoff_value"))
+            if per_user_reward is None or cutoff_value is None or cutoff_value <= 0:
+                continue
+            reward_usdt = float(per_user_reward) * float(reward_price) if reward_price is not None else None
+            ratio = reward_usdt / float(cutoff_value) if reward_usdt is not None and cutoff_value > 0 else None
+            reward_rows.append(
+                {
+                    "rank_label": str(segment.get("rank_label", "")).strip() or "-",
+                    "reward_value_usdt": reward_usdt,
+                    "cutoff_value": float(cutoff_value),
+                    "ratio": ratio,
+                }
+            )
+        ongoing_rows.append(
+            {
+                "board_key": str(board.get("board_key", "")).strip(),
+                "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip(),
+                "symbol": str(board.get("symbol", "")).strip(),
+                "updated_at_utc": str(board.get("updated_at_utc", "")).strip(),
+                "current_values": {
+                    str(rank): values.get(rank)
+                    for rank in tracked_ranks
+                },
+                "reward_rows": reward_rows,
+            }
+        )
+
+    ongoing_rows.sort(key=lambda item: item["symbol"])
+    return {"board_rows": ongoing_rows}
+
+
+def _attach_snapshot_analytics(snapshot: dict[str, Any]) -> dict[str, Any]:
+    boards = snapshot.get("boards", []) if isinstance(snapshot, dict) else []
+    if not isinstance(boards, list):
+        boards = []
+    snapshot["ended_analytics"] = _build_ended_boards_analytics(boards)
+    snapshot["ongoing_analytics"] = _build_ongoing_boards_analytics(boards)
+    return snapshot
+
+
 def _load_entries() -> list[dict[str, Any]]:
     payload = _read_json_file(ENTRIES_PATH, [])
     if not isinstance(payload, list):
@@ -1284,11 +1569,13 @@ def _refresh_competition_data() -> dict[str, Any]:
         "entries": _project_entries_for_boards(boards),
         "errors": scrape_errors,
     }
+    payload = _attach_snapshot_analytics(payload)
     _write_json_file(CACHE_PATH, payload)
     return payload
 
 
 def _remember_snapshot(snapshot: dict[str, Any]) -> dict[str, Any]:
+    snapshot = _attach_snapshot_analytics(snapshot)
     with _CACHE_LOCK:
         _MEMORY_CACHE["loaded_at"] = time.time()
         _MEMORY_CACHE["data"] = snapshot
@@ -1616,6 +1903,92 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       align-items: start;
     }
     .two-cols > div { min-width: 0; }
+    .predict-grid {
+      display: grid;
+      grid-template-columns: minmax(280px, 360px) minmax(0, 1fr);
+      gap: 16px;
+      align-items: start;
+    }
+    .predict-panel {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      background: linear-gradient(180deg, #fff 0%, #faf8f2 100%);
+      display: grid;
+      gap: 12px;
+    }
+    .predict-panel h3 {
+      margin: 0;
+      font-size: 16px;
+    }
+    .predict-panel .subtle {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .predict-kpis {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .predict-table { min-width: 760px; table-layout: auto; }
+    .predict-table td:last-child,
+    .predict-table th:last-child {
+      white-space: normal;
+    }
+    .analytics-table {
+      min-width: 0;
+      table-layout: fixed;
+    }
+    .ended-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(560px, 1fr));
+      gap: 16px;
+      align-items: start;
+    }
+    .ended-card {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      background: linear-gradient(180deg, #fff 0%, #faf8f2 100%);
+      display: grid;
+      gap: 12px;
+      min-width: 0;
+      box-shadow: 0 18px 40px rgba(17, 24, 39, 0.06);
+    }
+    .ended-card.ended {
+      background: linear-gradient(180deg, #fffdf9 0%, #faf6ed 100%);
+      border-color: #e2d3b8;
+    }
+    .ended-card.ongoing {
+      background: linear-gradient(180deg, #f7fffb 0%, #eef9f4 100%);
+      border-color: #cfe7d7;
+    }
+    .ended-card h3 {
+      margin: 0;
+      font-size: 18px;
+    }
+    .ended-card .meta-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .ended-card .analytics-table th:first-child,
+    .ended-card .analytics-table td:first-child {
+      width: 26%;
+    }
+    .ended-card .analytics-table th:not(:first-child),
+    .ended-card .analytics-table td:not(:first-child) {
+      width: auto;
+    }
+    .volume-inline {
+      display: grid;
+      grid-template-columns: minmax(180px, 260px) auto;
+      gap: 12px;
+      align-items: end;
+    }
     .empty {
       padding: 18px;
       border: 1px dashed var(--line);
@@ -1624,9 +1997,13 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       font-size: 13px;
       text-align: center;
     }
+    @media (max-width: 1480px) {
+      .ended-grid { grid-template-columns: 1fr; }
+    }
     @media (max-width: 1180px) {
-      .kpi-grid, .board-meta { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .board-grid, .two-cols { grid-template-columns: 1fr; }
+      .kpi-grid, .board-meta, .predict-kpis { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .board-grid, .two-cols, .predict-grid { grid-template-columns: 1fr; }
+      .ended-grid { grid-template-columns: 1fr; }
       .event-strip { grid-template-columns: 1fr; }
     }
     @media (max-width: 680px) {
@@ -1656,6 +2033,18 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
 
     <section class="card">
       <div class="kpi-grid" id="summary"></div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin:0 0 12px;">进行中比赛当前门槛与预测</h2>
+      <p class="meta">仅对合约交易赛展示。输入假定最后一天全市场成交量后，按当前门槛值推算对应预测门槛。</p>
+      <div id="ongoing_cards" class="ended-grid"></div>
+    </section>
+
+    <section class="card">
+      <h2 style="margin:0 0 12px;">已结束比赛最后一天增量对照</h2>
+      <p class="meta">口径：最终榜单快照相对 24 小时前最近一档快照的门槛增量；奖励/门槛比值按比赛结束时奖励币种折算成 USDT 后计算。</p>
+      <div id="ended_cards" class="ended-grid"></div>
     </section>
 
     <section class="card">
@@ -1720,7 +2109,19 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     const entryNoteEl = document.getElementById("entry_note");
     const entrySaveBtn = document.getElementById("entry_save_btn");
     const entriesBody = document.getElementById("entries_body");
+    const ongoingCardsEl = document.getElementById("ongoing_cards");
+    const endedCardsEl = document.getElementById("ended_cards");
     const apiBase = `${window.location.protocol}//${window.location.host}`;
+    const FORECAST_COEFFICIENTS = {
+      20: 0.012575,
+      30: 0.010699,
+      50: 0.009418,
+      100: 0.002558,
+      150: 0.002720,
+      200: 0.002116,
+    };
+    const FORECAST_RANKS = [20, 30, 50, 100, 150, 200];
+    const ONGOING_VOLUME_STORAGE_KEY = "competition_board_ongoing_volume_inputs_v1";
 
     let snapshot = null;
 
@@ -1746,6 +2147,24 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       const d = new Date(value);
       if (Number.isNaN(d.getTime())) return String(value);
       return d.toLocaleString();
+    }
+
+    function loadOngoingVolumeState() {
+      try {
+        const raw = window.localStorage.getItem(ONGOING_VOLUME_STORAGE_KEY);
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        return parsed && typeof parsed === "object" ? parsed : {};
+      } catch (err) {
+        return {};
+      }
+    }
+
+    function saveOngoingVolumeState(state) {
+      try {
+        window.localStorage.setItem(ONGOING_VOLUME_STORAGE_KEY, JSON.stringify(state || {}));
+      } catch (err) {
+      }
     }
 
     function countdownState(value) {
@@ -1960,6 +2379,228 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       `).join("");
     }
 
+    function renderEndedAnalytics() {
+      const analytics = snapshot && snapshot.ended_analytics ? snapshot.ended_analytics : {};
+      const deltaRows = Array.isArray(analytics.delta_rows) ? analytics.delta_rows : [];
+      const rewardRows = Array.isArray(analytics.reward_rows) ? analytics.reward_rows : [];
+      if (!deltaRows.length && !rewardRows.length) {
+        endedCardsEl.innerHTML = `<div class="empty">当前没有可用的已结束比赛历史快照。</div>`;
+        return;
+      }
+      const grouped = new Map();
+      deltaRows.forEach((item) => {
+        const key = item.board_key || item.symbol || item.label;
+        const existing = grouped.get(key) || { delta: null, rewards: [] };
+        existing.delta = item;
+        grouped.set(key, existing);
+      });
+      rewardRows.forEach((item) => {
+        const key = item.board_key || item.symbol || item.label;
+        const existing = grouped.get(key) || { delta: null, rewards: [] };
+        existing.rewards.push(item);
+        grouped.set(key, existing);
+      });
+      endedCardsEl.innerHTML = Array.from(grouped.entries()).map(([_, group]) => {
+        const delta = group.delta;
+        const rewards = Array.isArray(group.rewards) ? group.rewards : [];
+        const label = (delta && delta.label) || (rewards[0] && rewards[0].label) || "-";
+        const symbol = (delta && delta.symbol) || (rewards[0] && rewards[0].symbol) || "-";
+        const metaRow = delta ? `
+          <div class="meta-row">
+            <span>最终快照：${escapeHtml(delta.final_capture || "-")}</span>
+            <span>对比快照：${escapeHtml(delta.previous_capture || "-")}</span>
+            <span>最后一天全市场量：${delta.last_day_market_volume === null || delta.last_day_market_volume === undefined ? "-" : fmtNum(delta.last_day_market_volume, 0)}</span>
+          </div>
+        ` : `<div class="meta-row"><span>未找到对应的历史增量快照。</span></div>`;
+        const deltas = delta && delta.deltas ? delta.deltas : {};
+        const deltaTable = delta ? `
+          <div>
+            <div class="meta" style="margin-bottom:8px;">最后一天门槛增量</div>
+            <div class="table-wrap">
+              <table class="analytics-table">
+                <thead>
+                  <tr>
+                    <th class="num">前20</th>
+                    <th class="num">前30</th>
+                    <th class="num">前50</th>
+                    <th class="num">前100</th>
+                    <th class="num">前150</th>
+                    <th class="num">前200</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr>
+                    <td class="num">${fmtNum(deltas["20"], 0)}</td>
+                    <td class="num">${fmtNum(deltas["30"], 0)}</td>
+                    <td class="num">${fmtNum(deltas["50"], 0)}</td>
+                    <td class="num">${fmtNum(deltas["100"], 0)}</td>
+                    <td class="num">${fmtNum(deltas["150"], 0)}</td>
+                    <td class="num">${fmtNum(deltas["200"], 0)}</td>
+                  </tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ` : `<div class="empty">没有可用的最后一天增量数据。</div>`;
+        const rewardTable = rewards.length ? `
+          <div>
+            <div class="meta" style="margin-bottom:8px;">奖励 / 门槛交易量比值</div>
+            <div class="table-wrap">
+              <table class="analytics-table">
+                <thead>
+                  <tr>
+                    <th>榜段</th>
+                    <th class="num">奖励折 USDT</th>
+                    <th class="num">最终门槛</th>
+                    <th class="num">奖励 / 门槛</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${rewards.map((item) => `
+                    <tr>
+                      <td>${escapeHtml(item.rank_label || "-")}</td>
+                      <td class="num">${item.reward_value_usdt === null || item.reward_value_usdt === undefined ? "-" : fmtNum(item.reward_value_usdt, 2)}</td>
+                      <td class="num">${fmtNum(item.cutoff_value, 2)}</td>
+                      <td class="num">${item.ratio === null || item.ratio === undefined ? "-" : fmtNum(item.ratio, 6)}</td>
+                    </tr>
+                  `).join("")}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        ` : `<div class="empty">没有可用于计算奖励 / 门槛比值的奖励段数据。</div>`;
+        return `
+          <article class="ended-card">
+            <div>
+              <h3>${escapeHtml(symbol)} · ${escapeHtml(label)}</h3>
+              ${metaRow}
+            </div>
+            ${deltaTable}
+            ${rewardTable}
+          </article>
+        `;
+      }).join("");
+    }
+
+    function renderOngoingAnalytics() {
+      const analytics = snapshot && snapshot.ongoing_analytics ? snapshot.ongoing_analytics : {};
+      const rows = Array.isArray(analytics.board_rows) ? analytics.board_rows : [];
+      const savedVolumes = loadOngoingVolumeState();
+      if (!rows.length) {
+        ongoingCardsEl.innerHTML = `<div class="empty">当前没有进行中的合约交易赛可用于预测。</div>`;
+        return;
+      }
+      ongoingCardsEl.innerHTML = rows.map((item) => `
+        <article class="ended-card ongoing" data-ongoing-board="${escapeHtml(item.board_key || "")}">
+          <div>
+            <h3>${escapeHtml(item.symbol || "-")} · ${escapeHtml(item.label || "-")}</h3>
+            <div class="meta-row">
+              <span>当前快照：${escapeHtml(fmtDate(item.updated_at_utc) || "-")}</span>
+              <span>当前 200 名门槛：${item.current_values["200"] === null || item.current_values["200"] === undefined ? "-" : fmtNum(item.current_values["200"], 0)}</span>
+            </div>
+          </div>
+          <div>
+            <div class="meta" style="margin-bottom:8px;">假定最后一天全市场成交量</div>
+            <div class="volume-inline">
+              <label>
+                <input class="ongoing-volume-input" type="number" step="0.01" min="0" placeholder="例如 176000000" />
+              </label>
+              <div class="meta">按当前门槛值直接推算 20 / 30 / 50 / 100 / 150 / 200 名预测值。</div>
+            </div>
+          </div>
+          <div>
+            <div class="meta" style="margin-bottom:8px;">当前门槛与预测门槛</div>
+            <div class="table-wrap">
+              <table class="analytics-table">
+                <thead>
+                  <tr>
+                    <th class="num">排名</th>
+                    <th class="num">当前门槛</th>
+                    <th class="num">预测增量</th>
+                    <th class="num">预测门槛</th>
+                  </tr>
+                </thead>
+                <tbody class="ongoing-threshold-body">
+                  ${FORECAST_RANKS.map((rank) => `
+                    <tr data-rank="${rank}">
+                      <td class="num">${rank}</td>
+                      <td class="num">${item.current_values[String(rank)] === null || item.current_values[String(rank)] === undefined ? "-" : fmtNum(item.current_values[String(rank)], 0)}</td>
+                      <td class="num">-</td>
+                      <td class="num">-</td>
+                    </tr>
+                  `).join("")}
+                </tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <div class="meta" style="margin-bottom:8px;">奖励 / 当前门槛交易量比值</div>
+            <div class="table-wrap">
+              <table class="analytics-table">
+                <thead>
+                  <tr>
+                    <th>榜段</th>
+                    <th class="num">奖励折 USDT</th>
+                    <th class="num">当前门槛</th>
+                    <th class="num">奖励 / 门槛</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${item.reward_rows.map((reward) => `
+                    <tr>
+                      <td>${escapeHtml(reward.rank_label || "-")}</td>
+                      <td class="num">${reward.reward_value_usdt === null || reward.reward_value_usdt === undefined ? "-" : fmtNum(reward.reward_value_usdt, 2)}</td>
+                      <td class="num">${fmtNum(reward.cutoff_value, 2)}</td>
+                      <td class="num">${reward.ratio === null || reward.ratio === undefined ? "-" : fmtNum(reward.ratio, 6)}</td>
+                    </tr>
+                  `).join("")}
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </article>
+      `).join("");
+
+      ongoingCardsEl.querySelectorAll(".ended-card.ongoing").forEach((card) => {
+        const input = card.querySelector(".ongoing-volume-input");
+        const body = card.querySelector(".ongoing-threshold-body");
+        if (!input || !body) return;
+        const boardKey = card.dataset.ongoingBoard || "";
+        const board = rows.find((item) => item.board_key === boardKey);
+        if (!board) return;
+        const currentValues = board.current_values || {};
+        if (savedVolumes && savedVolumes[boardKey] !== undefined && savedVolumes[boardKey] !== null) {
+          input.value = String(savedVolumes[boardKey]);
+        }
+        const updateTable = () => {
+          const assumedVolume = Number(input.value);
+          const safeVolume = Number.isFinite(assumedVolume) && assumedVolume >= 0 ? assumedVolume : 0;
+          const nextState = loadOngoingVolumeState();
+          if (input.value.trim()) {
+            nextState[boardKey] = input.value.trim();
+          } else {
+            delete nextState[boardKey];
+          }
+          saveOngoingVolumeState(nextState);
+          body.querySelectorAll("tr[data-rank]").forEach((row) => {
+            const rank = row.dataset.rank || "";
+            const coefficient = FORECAST_COEFFICIENTS[rank];
+            const currentValue = currentValues[rank];
+            const delta = coefficient ? safeVolume * coefficient : null;
+            const predicted = (currentValue !== null && currentValue !== undefined && delta !== null)
+              ? Number(currentValue) + Number(delta)
+              : null;
+            const cells = row.querySelectorAll("td");
+            if (cells.length < 4) return;
+            cells[2].textContent = delta === null ? "-" : fmtNum(delta, 0);
+            cells[3].textContent = predicted === null ? "-" : fmtNum(predicted, 0);
+          });
+        };
+        input.addEventListener("input", updateTable);
+        updateTable();
+      });
+    }
+
     function renderEntries() {
       const entries = Array.isArray(snapshot && snapshot.entries) ? snapshot.entries : [];
       if (!entries.length) {
@@ -2011,6 +2652,8 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         }
         snapshot = data.snapshot;
         renderSummary(snapshot);
+        renderOngoingAnalytics();
+        renderEndedAnalytics();
         renderBoards();
         renderEntryBoardOptions();
         renderEntries();
@@ -2037,6 +2680,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         if (data.snapshot) {
           snapshot = data.snapshot;
           renderSummary(snapshot);
+          renderEndedAnalytics();
           renderEntries();
           updateSnapshotMeta();
         } else {
