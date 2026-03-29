@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import requests
 
@@ -70,6 +71,13 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         market="spot",
         label="CFG 现货交易竞赛",
         url="https://www.binance.com/zh-CN/activity/trading-competition/spot-altcoin-festival-wave-CFG",
+    ),
+    CompetitionSource(
+        slug="spot_bard",
+        symbol="BARD",
+        market="spot",
+        label="BARD 现货交易竞赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/spot-altcoin-festival-wave-BARD?ref=YEK2JZJT",
     ),
     CompetitionSource(
         slug="futures_opn",
@@ -198,6 +206,49 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分 334,000 CFG
 第 201 - 5000 名
 平分 501,000 CFG
+""",
+            }
+        ]
+    },
+    "spot_bard": {
+        "boards": [
+            {
+                "tabLabel": "默认",
+                "resourceId": 47247,
+                "metricField": "tradingVolume",
+                "metricLabel": "交易量 (USD)",
+                "rewardUnit": "BARD",
+                "leaderboardUnit": "USD",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "SPOT",
+                "activityPeriodText": "2026/03/26 17:00 - 2026/04/16 17:00",
+                "activityEndAt": "2026-04-16T17:00:00+08:00",
+                "maxRows": 5000,
+                "bodyExcerpt": """
+总奖池 3,000,000 BARD
+活动期间，在 BARD/USDT、BARD/USDC 任一符合条件的现货交易对累计交易量至少 500 USD，方可参与排行榜奖励。
+奖励结构
+第1名
+150,000 BARD
+第2名
+120,000 BARD
+第3名
+90,000 BARD
+第4名
+60,000 BARD
+第5名
+30,000 BARD
+第6 - 20名
+平分300,000 BARD奖池
+第21 - 50名
+平分450,000 BARD奖池
+第51 - 200名
+平分450,000 BARD奖池
+第201 - 1,000名
+平分450,000 BARD奖池
+第1001名及之后
+平分900,000 BARD奖池，每位用户的奖励上限为25 BARD
 """,
             }
         ]
@@ -696,10 +747,13 @@ def _run_playwright_extract(url: str) -> dict[str, Any]:
 
 
 def _fetch_leaderboard_rows(resource_id: int, referer: str, *, max_rows: int | None = None) -> dict[str, Any]:
+    referer_text = str(referer or "https://www.binance.com").strip() or "https://www.binance.com"
+    referer_parts = urlsplit(referer_text)
+    origin = f"{referer_parts.scheme}://{referer_parts.netloc}" if referer_parts.scheme and referer_parts.netloc else "https://www.binance.com"
     headers = {
         "Content-Type": "application/json",
-        "Origin": "https://www.binance.com",
-        "Referer": referer,
+        "Origin": origin,
+        "Referer": referer_text,
         "User-Agent": os.environ.get(
             "GRID_COMPETITION_BOARD_UA",
             (
@@ -708,7 +762,7 @@ def _fetch_leaderboard_rows(resource_id: int, referer: str, *, max_rows: int | N
             ),
         ),
     }
-    endpoint = "https://www.binance.com/bapi/growth/v1/friendly/growth-paas/resource/summary/list"
+    endpoint = f"{origin}/bapi/growth/v1/friendly/growth-paas/resource/summary/list"
 
     def _request(page_index: int) -> dict[str, Any]:
         response = requests.post(
