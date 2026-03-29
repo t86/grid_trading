@@ -1989,6 +1989,16 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       gap: 12px;
       align-items: end;
     }
+    .volume-inline input {
+      height: 38px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      padding: 0 10px;
+      background: #fff;
+      color: var(--text);
+      font-size: 14px;
+      width: 100%;
+    }
     .empty {
       padding: 18px;
       border: 1px dashed var(--line);
@@ -2037,7 +2047,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
 
     <section class="card">
       <h2 style="margin:0 0 12px;">进行中比赛当前门槛与预测</h2>
-      <p class="meta">仅对合约交易赛展示。输入假定最后一天全市场成交量后，按当前门槛值推算对应预测门槛。</p>
+      <p class="meta">仅对合约交易赛展示。直接填你假定的“最后一天全市场成交量”，页面就把它当作收官日量来推算最终门槛。</p>
       <div id="ongoing_cards" class="ended-grid"></div>
     </section>
 
@@ -2500,24 +2510,23 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             </div>
           </div>
           <div>
-            <div class="meta" style="margin-bottom:8px;">假定最后一天全市场成交量</div>
+            <div class="meta" style="margin-bottom:8px;">假定收官日全市场成交量</div>
             <div class="volume-inline">
               <label>
-                <input class="ongoing-volume-input" type="number" step="0.01" min="0" placeholder="例如 176000000" />
+                <input class="ongoing-volume-input" type="number" step="0.01" min="0" placeholder="直接填最后一天，例如 176000000" />
               </label>
-              <div class="meta">按当前门槛值直接推算 20 / 30 / 50 / 100 / 150 / 200 名预测值。</div>
+              <div class="meta">这里输入的值会直接当作最后一天全市场成交量，用来推算 20 / 30 / 50 / 100 / 150 / 200 名的最终门槛。</div>
             </div>
           </div>
           <div>
-            <div class="meta" style="margin-bottom:8px;">当前门槛与预测门槛</div>
+            <div class="meta" style="margin-bottom:8px;">当前门槛与预测最终门槛</div>
             <div class="table-wrap">
               <table class="analytics-table">
                 <thead>
                   <tr>
                     <th class="num">排名</th>
                     <th class="num">当前门槛</th>
-                    <th class="num">预测增量</th>
-                    <th class="num">预测门槛</th>
+                    <th class="num">预测最终门槛</th>
                   </tr>
                 </thead>
                 <tbody class="ongoing-threshold-body">
@@ -2525,7 +2534,6 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
                     <tr data-rank="${rank}">
                       <td class="num">${rank}</td>
                       <td class="num">${item.current_values[String(rank)] === null || item.current_values[String(rank)] === undefined ? "-" : fmtNum(item.current_values[String(rank)], 0)}</td>
-                      <td class="num">-</td>
                       <td class="num">-</td>
                     </tr>
                   `).join("")}
@@ -2591,9 +2599,8 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
               ? Number(currentValue) + Number(delta)
               : null;
             const cells = row.querySelectorAll("td");
-            if (cells.length < 4) return;
-            cells[2].textContent = delta === null ? "-" : fmtNum(delta, 0);
-            cells[3].textContent = predicted === null ? "-" : fmtNum(predicted, 0);
+            if (cells.length < 3) return;
+            cells[2].textContent = predicted === null ? "-" : fmtNum(predicted, 0);
           });
         };
         input.addEventListener("input", updateTable);
