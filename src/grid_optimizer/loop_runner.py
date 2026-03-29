@@ -61,8 +61,8 @@ from .semi_auto_plan import (
 from .submit_plan import (
     _build_client_order_id,
     _ignore_noop_error,
-    adjust_post_only_price,
     estimate_mid_drift_steps,
+    prepare_post_only_order_request,
     validate_plan_report,
 )
 from .dry_run import _round_order_qty
@@ -2401,6 +2401,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "executed": False,
         "canceled_orders": [],
         "placed_orders": [],
+        "skipped_orders": [],
         "configuration": {
             "allow_symbol": args.symbol.upper().strip(),
             "strategy_mode": strategy_mode,
@@ -2565,7 +2566,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             )
             report["canceled_orders"].append(cancel_response)
 
-    tick_size = _safe_float((plan_report.get("symbol_info") or {}).get("tick_size"))
+    symbol_info = plan_report.get("symbol_info") or {}
+    tick_size = _safe_float(symbol_info.get("tick_size"))
+    min_qty = symbol_info.get("min_qty")
+    min_notional = symbol_info.get("min_notional")
     for index, order in enumerate(validation["actions"]["place_orders"], start=1):
         role = str(order.get("role", "entry"))
         side = str(order.get("side", "")).upper().strip()
@@ -2574,25 +2578,42 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             reduce_only = None
         else:
             reduce_only = True if (side == "SELL" and role == "take_profit") or (side == "BUY" and role == "take_profit_short") else None
-        desired_price = _safe_float(order.get("price"))
         last_exc: RuntimeError | None = None
         for attempt in range(args.maker_retries + 1):
             current_book = fetch_futures_book_tickers(symbol=symbol)[0]
             current_bid = _safe_float(current_book.get("bid_price"))
             current_ask = _safe_float(current_book.get("ask_price"))
-            submit_price = adjust_post_only_price(
-                desired_price=desired_price,
+            prepared_order, skip_reason = prepare_post_only_order_request(
+                order=order,
                 side=side,
                 live_bid_price=current_bid,
                 live_ask_price=current_ask,
                 tick_size=tick_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
             )
+            if prepared_order is None:
+                report["skipped_orders"].append(
+                    {
+                        "request": {
+                            "role": role,
+                            "side": side,
+                            "position_side": position_side,
+                            "qty": _safe_float(order.get("qty")),
+                            "desired_price": _safe_float(order.get("price")),
+                            "attempt": attempt + 1,
+                        },
+                        "reason": skip_reason or {},
+                    }
+                )
+                last_exc = None
+                break
             try:
                 place_response = post_futures_order(
                     symbol=symbol,
                     side=side,
-                    quantity=_safe_float(order.get("qty")),
-                    price=submit_price,
+                    quantity=_safe_float(prepared_order.get("qty")),
+                    price=_safe_float(prepared_order.get("submitted_price")),
                     api_key=api_key,
                     api_secret=api_secret,
                     recv_window=args.recv_window,
@@ -2607,9 +2628,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "role": role,
                             "side": side,
                             "position_side": position_side,
-                            "qty": _safe_float(order.get("qty")),
-                            "desired_price": desired_price,
-                            "submitted_price": submit_price,
+                            "qty": _safe_float(prepared_order.get("qty")),
+                            "desired_price": _safe_float(prepared_order.get("desired_price")),
+                            "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                            "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
                             "attempt": attempt + 1,
                         },
                         "response": place_response,

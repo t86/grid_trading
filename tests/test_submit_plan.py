@@ -7,6 +7,7 @@ from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     build_execution_actions,
     estimate_mid_drift_steps,
+    prepare_post_only_order_request,
     validate_plan_report,
 )
 
@@ -106,6 +107,22 @@ class SubmitPlanTests(unittest.TestCase):
 
         self.assertAlmostEqual(buy_price, 0.05062, places=8)
         self.assertAlmostEqual(sell_price, 0.05060, places=8)
+
+    def test_prepare_post_only_order_request_skips_order_below_min_notional_after_price_adjustment(self) -> None:
+        prepared, skipped = prepare_post_only_order_request(
+            order={"qty": 9.9, "price": 0.51},
+            side="BUY",
+            live_bid_price=0.49,
+            live_ask_price=0.51,
+            tick_size=0.01,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertIsNone(prepared)
+        self.assertEqual(skipped["reason"], "submitted_notional_below_min_notional")
+        self.assertAlmostEqual(skipped["submitted_price"], 0.50, places=8)
+        self.assertAlmostEqual(skipped["submitted_notional"], 4.95, places=8)
 
 
 if __name__ == "__main__":

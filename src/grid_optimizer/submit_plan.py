@@ -81,6 +81,60 @@ def adjust_post_only_price(
     return max(desired_price, live_ask_price)
 
 
+def prepare_post_only_order_request(
+    *,
+    order: dict[str, Any],
+    side: str,
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    qty = _safe_float(order.get("qty"))
+    desired_price = _safe_float(order.get("price"))
+    submit_price = adjust_post_only_price(
+        desired_price=desired_price,
+        side=side,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=tick_size,
+    )
+    submit_notional = qty * submit_price
+    if qty <= 0:
+        return None, {
+            "reason": "non_positive_qty",
+            "qty": qty,
+            "desired_price": desired_price,
+            "submitted_price": submit_price,
+            "submitted_notional": submit_notional,
+        }
+    if min_qty is not None and qty < min_qty:
+        return None, {
+            "reason": "qty_below_min_qty",
+            "qty": qty,
+            "min_qty": float(min_qty),
+            "desired_price": desired_price,
+            "submitted_price": submit_price,
+            "submitted_notional": submit_notional,
+        }
+    if min_notional is not None and submit_notional < min_notional:
+        return None, {
+            "reason": "submitted_notional_below_min_notional",
+            "qty": qty,
+            "min_notional": float(min_notional),
+            "desired_price": desired_price,
+            "submitted_price": submit_price,
+            "submitted_notional": submit_notional,
+        }
+    return {
+        "qty": qty,
+        "desired_price": desired_price,
+        "submitted_price": submit_price,
+        "submitted_notional": submit_notional,
+    }, None
+
+
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     bootstrap_orders = [
         item for item in plan_report.get("bootstrap_orders", []) if isinstance(item, dict)
@@ -299,6 +353,7 @@ def main() -> None:
         "executed": False,
         "canceled_orders": [],
         "placed_orders": [],
+        "skipped_orders": [],
         "configuration": {
             "allow_symbol": args.allow_symbol.upper().strip(),
             "margin_type": str(args.margin_type).upper().strip(),
@@ -399,29 +454,47 @@ def main() -> None:
                 report["canceled_orders"].append(cancel_response)
 
         tick_size = _safe_float((plan_report.get("symbol_info") or {}).get("tick_size"))
+        min_qty = (plan_report.get("symbol_info") or {}).get("min_qty")
+        min_notional = (plan_report.get("symbol_info") or {}).get("min_notional")
         for index, order in enumerate(validation["actions"]["place_orders"], start=1):
             role = str(order.get("role", "entry"))
             side = str(order.get("side", "")).upper().strip()
             reduce_only = True if side == "SELL" and role == "take_profit" else None
-            desired_price = _safe_float(order.get("price"))
             last_exc: RuntimeError | None = None
             for attempt in range(args.maker_retries + 1):
                 live_book = fetch_futures_book_tickers(symbol=symbol)[0]
                 live_bid = _safe_float(live_book.get("bid_price"))
                 live_ask = _safe_float(live_book.get("ask_price"))
-                submit_price = adjust_post_only_price(
-                    desired_price=desired_price,
+                prepared_order, skip_reason = prepare_post_only_order_request(
+                    order=order,
                     side=side,
                     live_bid_price=live_bid,
                     live_ask_price=live_ask,
                     tick_size=tick_size,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
                 )
+                if prepared_order is None:
+                    report["skipped_orders"].append(
+                        {
+                            "request": {
+                                "role": role,
+                                "side": side,
+                                "qty": _safe_float(order.get("qty")),
+                                "desired_price": _safe_float(order.get("price")),
+                                "attempt": attempt + 1,
+                            },
+                            "reason": skip_reason or {},
+                        }
+                    )
+                    last_exc = None
+                    break
                 try:
                     place_response = post_futures_order(
                         symbol=symbol,
                         side=side,
-                        quantity=_safe_float(order.get("qty")),
-                        price=submit_price,
+                        quantity=_safe_float(prepared_order.get("qty")),
+                        price=_safe_float(prepared_order.get("submitted_price")),
                         api_key=api_key,
                         api_secret=api_secret,
                         recv_window=args.recv_window,
@@ -434,9 +507,10 @@ def main() -> None:
                             "request": {
                                 "role": role,
                                 "side": side,
-                                "qty": _safe_float(order.get("qty")),
-                                "desired_price": desired_price,
-                                "submitted_price": submit_price,
+                                "qty": _safe_float(prepared_order.get("qty")),
+                                "desired_price": _safe_float(prepared_order.get("desired_price")),
+                                "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                                "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
                                 "attempt": attempt + 1,
                             },
                             "response": place_response,
