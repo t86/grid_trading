@@ -91,6 +91,58 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(payload["auto_regime_enabled"])
         self.assertEqual(payload["auto_regime_confirm_cycles"], 2)
 
+    def test_runner_preset_payload_keeps_user_overrides(self) -> None:
+        payload = _runner_preset_payload(
+            "defensive_quasi_neutral_aggressive_v1",
+            {
+                "symbol": "BARDUSDT",
+                "step_price": 0.0001,
+                "buy_levels": 4,
+                "sell_levels": 8,
+                "per_order_notional": 70.0,
+                "base_position_notional": 140.0,
+                "pause_buy_position_notional": 400.0,
+                "max_position_notional": 600.0,
+            },
+        )
+        self.assertEqual(payload["symbol"], "BARDUSDT")
+        self.assertEqual(payload["strategy_profile"], "defensive_quasi_neutral_aggressive_v1")
+        self.assertEqual(payload["step_price"], 0.0001)
+        self.assertEqual(payload["buy_levels"], 4)
+        self.assertEqual(payload["sell_levels"], 8)
+        self.assertEqual(payload["per_order_notional"], 70.0)
+        self.assertEqual(payload["base_position_notional"], 140.0)
+        self.assertEqual(payload["pause_buy_position_notional"], 400.0)
+        self.assertEqual(payload["max_position_notional"], 600.0)
+
+    def test_load_runner_control_config_normalizes_mismatched_runtime_paths(self) -> None:
+        control_path = Path("output/test_katusdt_loop_runner_control.json")
+        control_path.parent.mkdir(parents=True, exist_ok=True)
+        control_path.write_text(
+            json.dumps(
+                {
+                    "symbol": "KATUSDT",
+                    "state_path": "output/nightusdt_loop_state.json",
+                    "plan_json": "output/nightusdt_loop_latest_plan.json",
+                    "submit_report_json": "output/nightusdt_loop_latest_submit.json",
+                    "summary_jsonl": "output/nightusdt_loop_events.jsonl",
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            with patch("grid_optimizer.web._runner_control_path", return_value=control_path), patch(
+                "grid_optimizer.web._read_runner_process_for_symbol",
+                return_value={},
+            ):
+                config = _load_runner_control_config("KATUSDT")
+            self.assertEqual(config["state_path"], "output/katusdt_loop_state.json")
+            self.assertEqual(config["plan_json"], "output/katusdt_loop_latest_plan.json")
+            self.assertEqual(config["submit_report_json"], "output/katusdt_loop_latest_submit.json")
+            self.assertEqual(config["summary_jsonl"], "output/katusdt_loop_events.jsonl")
+        finally:
+            control_path.unlink(missing_ok=True)
+
     def test_symbol_runner_template_disables_legacy_mode(self) -> None:
         with patch.dict("os.environ", {"GRID_RUNNER_SERVICE_TEMPLATE": "grid-loop@{symbol}.service"}):
             self.assertFalse(_uses_legacy_runner("NIGHTUSDT"))

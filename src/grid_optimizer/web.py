@@ -681,6 +681,7 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     runner = _read_runner_process_for_symbol(normalized_symbol)
     if runner.get("config"):
         config.update(runner["config"])
+    config = _normalize_runner_runtime_paths(config, normalized_symbol)
     return config
 
 
@@ -782,6 +783,26 @@ def _default_runtime_paths_for_symbol(symbol: str) -> dict[str, str]:
         "submit_report_json": f"output/{slug}_loop_latest_submit.json",
         "summary_jsonl": f"output/{slug}_loop_events.jsonl",
     }
+
+
+def _normalize_runner_runtime_paths(config: dict[str, Any], symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
+    runtime_paths = _default_runtime_paths_for_symbol(normalized_symbol)
+    normalized = dict(config)
+    for key, expected in runtime_paths.items():
+        raw_value = str(normalized.get(key, "")).strip()
+        if not raw_value:
+            normalized[key] = expected
+            continue
+        path = Path(raw_value)
+        # Only auto-correct default-style output paths that were accidentally copied from another symbol.
+        if path.is_absolute() or path.parts[:1] != ("output",):
+            continue
+        if "_loop_" not in path.name:
+            continue
+        if raw_value != expected:
+            normalized[key] = expected
+    return normalized
 
 
 SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
@@ -1047,27 +1068,10 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
     preset = _runner_preset_map(requested_symbol).get(normalized)
     if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
-    carry_fields = {
-        "symbol",
-        "margin_type",
-        "leverage",
-        "max_plan_age_seconds",
-        "max_mid_drift_steps",
-        "maker_retries",
-        "sleep_seconds",
-        "cancel_stale",
-        "apply",
-        "reset_state",
-        "state_path",
-        "plan_json",
-        "submit_report_json",
-        "summary_jsonl",
-    }
     config = dict(RUNNER_DEFAULT_CONFIG)
-    for key in carry_fields:
-        if key in (base_config or {}):
-            config[key] = (base_config or {})[key]
     config.update(preset.get("config", {}))
+    if base_config:
+        config.update(base_config)
     if preset.get("kind") == "custom_grid":
         preview_params = dict(preset.get("grid_preview_params") or {})
         preview_summary = dict(preset.get("preview_summary") or {})
@@ -1538,6 +1542,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
 
 
 def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_payload = dict(payload)
     config = _normalize_runner_control_payload(payload)
     profile = str(config.get("strategy_profile", RUNNER_DEFAULT_CONFIG["strategy_profile"])).strip() or RUNNER_DEFAULT_CONFIG["strategy_profile"]
     preset = _runner_preset_map(str(config.get("symbol", ""))).get(profile)
@@ -1545,7 +1550,9 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError(f"Unknown strategy_profile: {profile}")
     if not preset.get("startable", True):
         raise ValueError(f"{preset.get('label', profile)} 当前是模板预设，页面已展示参数，但还不能直接启动。")
-    resolved = _runner_preset_payload(profile, config)
+    raw_payload.setdefault("symbol", config.get("symbol"))
+    raw_payload.setdefault("strategy_profile", profile)
+    resolved = _normalize_runner_control_payload(_runner_preset_payload(profile, raw_payload))
     runtime_paths = _default_runtime_paths_for_symbol(str(resolved.get("symbol", "")))
     for key, value in runtime_paths.items():
         if not str(payload.get(key, "")).strip():
