@@ -8,6 +8,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from grid_optimizer.loop_runner import (
+    AUDIT_SYNC_MIN_INTERVAL_SECONDS,
+    _should_sync_account_audit,
     _apply_synthetic_trade_fill,
     apply_excess_inventory_reduce_only,
     apply_hedge_position_controls,
@@ -28,6 +30,25 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_should_sync_account_audit_when_updated_at_missing_or_stale(self) -> None:
+        now = datetime(2026, 3, 29, 12, 0, tzinfo=timezone.utc)
+        self.assertTrue(_should_sync_account_audit({}, now=now))
+        self.assertTrue(
+            _should_sync_account_audit(
+                {"updated_at": (now - timedelta(seconds=AUDIT_SYNC_MIN_INTERVAL_SECONDS + 1)).isoformat()},
+                now=now,
+            )
+        )
+
+    def test_should_not_sync_account_audit_when_recently_updated(self) -> None:
+        now = datetime(2026, 3, 29, 12, 0, tzinfo=timezone.utc)
+        self.assertFalse(
+            _should_sync_account_audit(
+                {"updated_at": (now - timedelta(seconds=AUDIT_SYNC_MIN_INTERVAL_SECONDS - 1)).isoformat()},
+                now=now,
+            )
+        )
+
     def test_build_static_binance_grid_plan_splits_orders_by_current_price(self) -> None:
         bootstrap = build_static_binance_grid_plan(
             strategy_direction="long",

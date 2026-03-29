@@ -69,6 +69,7 @@ from .dry_run import _round_order_qty
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
 AUTO_REGIME_DEFENSIVE_PROFILE = "volatility_defensive_v1"
+AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
         "buy_levels": 8,
@@ -575,6 +576,20 @@ def _load_audit_state(path: Path) -> dict[str, Any]:
     return payload if payload else {}
 
 
+def _should_sync_account_audit(audit_state: dict[str, Any], *, now: datetime) -> bool:
+    updated_at_raw = str((audit_state or {}).get("updated_at") or "").strip()
+    if not updated_at_raw:
+        return True
+    try:
+        updated_at = datetime.fromisoformat(updated_at_raw)
+    except ValueError:
+        return True
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    elapsed = (now.astimezone(timezone.utc) - updated_at.astimezone(timezone.utc)).total_seconds()
+    return elapsed >= AUDIT_SYNC_MIN_INTERVAL_SECONDS
+
+
 def _fetch_trade_rows_since(
     *,
     symbol: str,
@@ -642,6 +657,15 @@ def _sync_account_audit(
     audit_state_path = audit_paths["audit_state"]
     audit_state = _load_audit_state(audit_state_path)
     now = datetime.now(timezone.utc)
+    if not _should_sync_account_audit(audit_state, now=now):
+        return {
+            "trade_appended": 0,
+            "income_appended": 0,
+            "skipped": f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s",
+            "trade_audit_path": str(audit_paths["trade_audit"]),
+            "income_audit_path": str(audit_paths["income_audit"]),
+            "audit_state_path": str(audit_state_path),
+        }
     default_start_time_ms = int((now - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS)).timestamp() * 1000)
     event_start, _ = scan_iso_bounds(summary_path)
     event_start_time_ms = int(event_start.timestamp() * 1000) if event_start else 0
