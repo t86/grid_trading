@@ -8962,7 +8962,56 @@ MONITOR_PAGE = """<!doctype html>
       if (strategyProfile && !config.strategy_profile) {
         config.strategy_profile = strategyProfile;
       }
-      return config;
+      return normalizeRunnerRuntimePaths(config, selectedSymbol);
+    }
+
+    function outputSlugForSymbol(symbol) {
+      return String(symbol || "")
+        .trim()
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "_")
+        .replace(/^_+|_+$/g, "") || "symbol";
+    }
+
+    function defaultRunnerRuntimePathsForSymbol(symbol) {
+      const slug = outputSlugForSymbol(symbol);
+      return {
+        state_path: `output/${slug}_loop_state.json`,
+        plan_json: `output/${slug}_loop_latest_plan.json`,
+        submit_report_json: `output/${slug}_loop_latest_submit.json`,
+        summary_jsonl: `output/${slug}_loop_events.jsonl`,
+      };
+    }
+
+    function normalizeRunnerRuntimePaths(config, symbol) {
+      const normalizedSymbol = String(symbol || (config && config.symbol) || "NIGHTUSDT").trim().toUpperCase() || "NIGHTUSDT";
+      const runtimePaths = defaultRunnerRuntimePathsForSymbol(normalizedSymbol);
+      const normalized = { ...(config || {}), symbol: normalizedSymbol };
+      Object.entries(runtimePaths).forEach(([key, expected]) => {
+        const rawValue = String(normalized[key] || "").trim();
+        if (!rawValue) {
+          normalized[key] = expected;
+          return;
+        }
+        if (!rawValue.startsWith("output/") || !rawValue.includes("_loop_")) {
+          return;
+        }
+        if (rawValue !== expected) {
+          normalized[key] = expected;
+        }
+      });
+      return normalized;
+    }
+
+    async function fetchMonitorSnapshot(symbol, { updateLatest = true } = {}) {
+      const normalizedSymbol = String(symbol || "").trim().toUpperCase() || "NIGHTUSDT";
+      const resp = await fetch(`/api/loop_monitor?symbol=${encodeURIComponent(normalizedSymbol)}`);
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      if (updateLatest) {
+        latestMonitorData = data;
+      }
+      return data;
     }
 
     const RUNNER_PROFILE_GUIDE_NOTES = {
@@ -9405,16 +9454,37 @@ MONITOR_PAGE = """<!doctype html>
       renderRunnerParamGuide(latestRunnerEditorConfig);
     }
 
-    function loadRunningConfigToEditor() {
-      const runnerConfig = ((((latestMonitorData || {}).runner || {}).config) || {});
+    async function loadRunningConfigToEditor(forceRefresh = true) {
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      runnerParamsMetaEl.textContent = `正在载入 ${selectedSymbol} 的运行参数...`;
+      let monitorData = latestMonitorData;
+      if (
+        forceRefresh
+        || !monitorData
+        || String((monitorData || {}).symbol || "").trim().toUpperCase() !== selectedSymbol
+      ) {
+        try {
+          monitorData = await fetchMonitorSnapshot(selectedSymbol);
+          populatePresetOptions(monitorData);
+        } catch (err) {
+          runnerParamsMetaEl.textContent = `载入失败: ${err}`;
+          return;
+        }
+      }
+      const runnerConfig = ((((monitorData || {}).runner || {}).config) || {});
       if (!runnerConfig || !Object.keys(runnerConfig).length) {
         runnerParamsMetaEl.textContent = "当前没有可载入的运行参数，请先启动一次策略。";
         return;
       }
+      const configSymbol = String(runnerConfig.symbol || "").trim().toUpperCase();
+      if (configSymbol && configSymbol !== selectedSymbol) {
+        runnerParamsMetaEl.textContent = `载入失败: 返回了 ${configSymbol} 的配置，当前页面选中的是 ${selectedSymbol}`;
+        return;
+      }
       const profile = String(runnerConfig.strategy_profile || "");
       setRunnerEditorConfig(
-        { ...runnerConfig, ...(profile ? { strategy_profile: profile } : {}) },
-        `已载入 ${symbolEl.value || runnerConfig.symbol || "当前交易对"} 的运行参数。`
+        normalizeRunnerRuntimePaths({ ...runnerConfig, ...(profile ? { strategy_profile: profile } : {}) }, selectedSymbol),
+        `已载入 ${selectedSymbol} 的运行参数。`
       );
     }
 
@@ -10113,10 +10183,7 @@ MONITOR_PAGE = """<!doctype html>
       }
       metaEl.textContent = `正在刷新 ${symbol} ...`;
       try {
-        const resp = await fetch(`/api/loop_monitor?symbol=${encodeURIComponent(symbol)}`);
-        const data = await resp.json();
-        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        latestMonitorData = data;
+        const data = await fetchMonitorSnapshot(symbol);
         populatePresetOptions(data);
         renderCards(data);
         renderPosition(data);
@@ -10126,7 +10193,7 @@ MONITOR_PAGE = """<!doctype html>
         renderEvents(data);
         renderCharts(data);
         if (!runnerParamsEditorEl.value.trim()) {
-          loadRunningConfigToEditor();
+          await loadRunningConfigToEditor(false);
         }
         const warnings = (data.warnings || []).join(" | ");
         metaEl.textContent = `最后刷新: ${fmtTs(data.ts)}${warnings ? ` · 警告: ${warnings}` : ""}`;
@@ -15351,6 +15418,15 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
     symbol = str(query.get("symbol", ["NIGHTUSDT"])[0]).upper().strip() or "NIGHTUSDT"
     summary_limit = _safe_positive_int_query(query.get("summary_limit", ["500"])[0], 500)
     runner = read_symbol_runner_process(symbol)
+    if isinstance(runner, dict):
+        runner = dict(runner)
+        runner_config = runner.get("config", {})
+        if isinstance(runner_config, dict):
+            normalized_runner_config = dict(runner_config)
+            config_symbol = str(normalized_runner_config.get("symbol", "")).upper().strip()
+            if not config_symbol or config_symbol == symbol:
+                normalized_runner_config["symbol"] = symbol
+                runner["config"] = _normalize_runner_runtime_paths(normalized_runner_config, symbol)
     runner_config = runner.get("config", {}) if isinstance(runner, dict) else {}
     if str(runner_config.get("symbol", "")).upper().strip() == symbol:
         default_paths = {

@@ -690,7 +690,38 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(kwargs["events_path"], "output/opnusdt_loop_events.jsonl")
         self.assertEqual(kwargs["plan_path"], "output/opnusdt_loop_latest_plan.json")
         self.assertEqual(kwargs["submit_report_path"], "output/opnusdt_loop_latest_submit.json")
-        self.assertEqual(kwargs["runner_process"], mock_read_runner.return_value)
+        self.assertEqual(kwargs["runner_process"]["config"]["symbol"], "OPNUSDT")
+        self.assertEqual(kwargs["runner_process"]["config"]["summary_jsonl"], "output/opnusdt_loop_events.jsonl")
+        self.assertEqual(kwargs["runner_process"]["config"]["plan_json"], "output/opnusdt_loop_latest_plan.json")
+        self.assertEqual(kwargs["runner_process"]["config"]["submit_report_json"], "output/opnusdt_loop_latest_submit.json")
+
+    @patch("grid_optimizer.web.read_symbol_runner_process")
+    @patch("grid_optimizer.web.build_monitor_snapshot")
+    def test_run_loop_monitor_query_normalizes_runner_runtime_paths(self, mock_snapshot, mock_read_runner) -> None:
+        mock_read_runner.return_value = {
+            "configured": True,
+            "config": {
+                "symbol": "BARDUSDT",
+                "state_path": "output/nightusdt_loop_state.json",
+                "summary_jsonl": "output/nightusdt_loop_events.jsonl",
+                "plan_json": "output/nightusdt_loop_latest_plan.json",
+                "submit_report_json": "output/nightusdt_loop_latest_submit.json",
+            },
+        }
+        mock_snapshot.return_value = {"ok": True}
+
+        _run_loop_monitor_query({"symbol": ["BARDUSDT"]})
+
+        kwargs = mock_snapshot.call_args.kwargs
+        runner_process = kwargs["runner_process"]
+        self.assertEqual(runner_process["config"]["symbol"], "BARDUSDT")
+        self.assertEqual(runner_process["config"]["state_path"], "output/bardusdt_loop_state.json")
+        self.assertEqual(runner_process["config"]["summary_jsonl"], "output/bardusdt_loop_events.jsonl")
+        self.assertEqual(runner_process["config"]["plan_json"], "output/bardusdt_loop_latest_plan.json")
+        self.assertEqual(runner_process["config"]["submit_report_json"], "output/bardusdt_loop_latest_submit.json")
+        self.assertEqual(kwargs["events_path"], "output/bardusdt_loop_events.jsonl")
+        self.assertEqual(kwargs["plan_path"], "output/bardusdt_loop_latest_plan.json")
+        self.assertEqual(kwargs["submit_report_path"], "output/bardusdt_loop_latest_submit.json")
 
     def test_symbol_specific_runner_control_round_trip(self) -> None:
         control_path = Path("output/opnusdt_loop_runner_control.json")
@@ -708,6 +739,8 @@ class WebSecurityTests(unittest.TestCase):
     def test_monitor_page_uses_symbol_dropdown_for_supported_symbols(self) -> None:
         self.assertIn('<select id="symbol">', MONITOR_PAGE)
         self.assertIn("loadMonitorSymbols", MONITOR_PAGE)
+        self.assertIn("fetchMonitorSnapshot", MONITOR_PAGE)
+        self.assertIn("async function loadRunningConfigToEditor", MONITOR_PAGE)
         self.assertIn("小时损益拆解", MONITOR_PAGE)
         self.assertIn('id="hourly_body"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_name"', MONITOR_PAGE)
