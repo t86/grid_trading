@@ -1313,6 +1313,7 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
 
 def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any]:
     now = datetime.now(timezone.utc)
+    history_index = _load_history_index()
     tracked_ranks = (20, 30, 50, 100, 150, 200)
     ongoing_rows: list[dict[str, Any]] = []
 
@@ -1324,7 +1325,20 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
             continue
         if str(board.get("market", "")).strip() != "futures":
             continue
+        board_key = str(board.get("board_key", "")).strip()
         values = _values_by_rank(board)
+        latest_day_volume = None
+        previous_capture = ""
+        current_dt = _parse_iso_datetime(board.get("updated_at_utc")) or now
+        entries = history_index.get(board_key, [])
+        previous_entry = _select_previous_day_entry(entries, current_dt)
+        previous_board = _load_history_board(previous_entry) if previous_entry is not None else None
+        current_total = _safe_float(board.get("eligible_metric_total"))
+        previous_total = _safe_float(previous_board.get("eligible_metric_total")) if isinstance(previous_board, dict) else None
+        if current_total is not None and previous_total is not None:
+            latest_day_volume = max(0.0, float(current_total) - float(previous_total))
+        if previous_entry is not None:
+            previous_capture = str(previous_entry.get("capture_label", "")).strip()
         reward_unit = str(board.get("reward_unit") or "").strip().upper()
         reward_price = _fetch_symbol_close_price_usdt(reward_unit, now) if reward_unit else None
         reward_rows: list[dict[str, Any]] = []
@@ -1341,16 +1355,20 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
                 {
                     "rank_label": str(segment.get("rank_label", "")).strip() or "-",
                     "reward_value_usdt": reward_usdt,
-                    "cutoff_value": float(cutoff_value),
+                    "current_cutoff_value": float(cutoff_value),
+                    "forecast_rank": _safe_int(segment.get("end_rank")),
                     "ratio": ratio,
                 }
             )
         ongoing_rows.append(
             {
-                "board_key": str(board.get("board_key", "")).strip(),
+                "board_key": board_key,
                 "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip(),
                 "symbol": str(board.get("symbol", "")).strip(),
                 "updated_at_utc": str(board.get("updated_at_utc", "")).strip(),
+                "latest_day_volume": latest_day_volume,
+                "latest_day_volume_text": f"{latest_day_volume:,.0f}" if latest_day_volume is not None else "",
+                "previous_capture": previous_capture,
                 "current_values": {
                     str(rank): values.get(rank)
                     for rank in tracked_ranks
@@ -2100,7 +2118,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
-      <h2 style="margin:0 0 12px;">进行中比赛当前门槛与预测</h2>
+      <h2 style="margin:0 0 12px;">进行中比赛最终门槛预测</h2>
       <p class="meta">仅对合约交易赛展示。直接填你假定的“最后一天全市场成交量”，页面就把它当作收官日量来推算最终门槛。</p>
       <div id="ongoing_cards" class="ended-grid"></div>
     </section>
@@ -2560,7 +2578,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             <h3>${escapeHtml(item.symbol || "-")} · ${escapeHtml(item.label || "-")}</h3>
             <div class="meta-row">
               <span>当前快照：${escapeHtml(fmtDate(item.updated_at_utc) || "-")}</span>
-              <span>当前 200 名门槛：${item.current_values["200"] === null || item.current_values["200"] === undefined ? "-" : fmtNum(item.current_values["200"], 0)}</span>
+              <span>最新一天交易量：${item.latest_day_volume === null || item.latest_day_volume === undefined ? "-" : fmtNum(item.latest_day_volume, 0)}</span>
             </div>
           </div>
           <div>
@@ -2569,25 +2587,23 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
               <label>
                 <input class="ongoing-volume-input" type="number" step="0.01" min="0" placeholder="直接填最后一天，例如 176000000" />
               </label>
-              <div class="meta">这里输入的值会直接当作最后一天全市场成交量，用来推算 20 / 30 / 50 / 100 / 150 / 200 名的最终门槛。</div>
+              <div class="meta">这里输入的值会直接当作最后一天全市场成交量；留空时默认使用最近一天交易量${item.previous_capture ? `（对比快照：${escapeHtml(item.previous_capture)}）` : ""}。</div>
             </div>
           </div>
           <div>
-            <div class="meta" style="margin-bottom:8px;">当前门槛与预测最终门槛</div>
+            <div class="meta" style="margin-bottom:8px;">最终门槛</div>
             <div class="table-wrap">
               <table class="analytics-table">
                 <thead>
                   <tr>
                     <th class="num">排名</th>
-                    <th class="num">当前门槛</th>
-                    <th class="num">预测最终门槛</th>
+                    <th class="num">最终门槛</th>
                   </tr>
                 </thead>
                 <tbody class="ongoing-threshold-body">
                   ${FORECAST_RANKS.map((rank) => `
                     <tr data-rank="${rank}">
                       <td class="num">${rank}</td>
-                      <td class="num">${item.current_values[String(rank)] === null || item.current_values[String(rank)] === undefined ? "-" : fmtNum(item.current_values[String(rank)], 0)}</td>
                       <td class="num">-</td>
                     </tr>
                   `).join("")}
@@ -2596,23 +2612,23 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             </div>
           </div>
           <div>
-            <div class="meta" style="margin-bottom:8px;">奖励 / 当前门槛交易量比值</div>
+            <div class="meta" style="margin-bottom:8px;">奖励 / 最终门槛交易量比值</div>
             <div class="table-wrap">
               <table class="analytics-table">
                 <thead>
                   <tr>
                     <th>榜段</th>
                     <th class="num">奖励折 USDT</th>
-                    <th class="num">当前门槛</th>
+                    <th class="num">最终门槛</th>
                     <th class="num">奖励 / 门槛</th>
                   </tr>
                 </thead>
-                <tbody>
+                <tbody class="ongoing-reward-body">
                   ${item.reward_rows.map((reward) => `
-                    <tr>
+                    <tr data-forecast-rank="${reward.forecast_rank === null || reward.forecast_rank === undefined ? "" : reward.forecast_rank}">
                       <td>${escapeHtml(reward.rank_label || "-")}</td>
                       <td class="num">${reward.reward_value_usdt === null || reward.reward_value_usdt === undefined ? "-" : fmtNum(reward.reward_value_usdt, 2)}</td>
-                      <td class="num">${fmtNum(reward.cutoff_value, 2)}</td>
+                      <td class="num">${reward.current_cutoff_value === null || reward.current_cutoff_value === undefined ? "-" : fmtNum(reward.current_cutoff_value, 2)}</td>
                       <td class="num">${reward.ratio === null || reward.ratio === undefined ? "-" : fmtNum(reward.ratio, 6)}</td>
                     </tr>
                   `).join("")}
@@ -2626,24 +2642,28 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       ongoingCardsEl.querySelectorAll(".ended-card.ongoing").forEach((card) => {
         const input = card.querySelector(".ongoing-volume-input");
         const body = card.querySelector(".ongoing-threshold-body");
-        if (!input || !body) return;
+        const rewardBody = card.querySelector(".ongoing-reward-body");
+        if (!input || !body || !rewardBody) return;
         const boardKey = card.dataset.ongoingBoard || "";
         const board = rows.find((item) => item.board_key === boardKey);
         if (!board) return;
         const currentValues = board.current_values || {};
+        const defaultVolume = Number(board.latest_day_volume);
         if (savedVolumes && savedVolumes[boardKey] !== undefined && savedVolumes[boardKey] !== null) {
           input.value = String(savedVolumes[boardKey]);
         }
         const updateTable = () => {
-          const assumedVolume = Number(input.value);
+          const hasManualValue = input.value.trim() !== "";
+          const assumedVolume = Number(hasManualValue ? input.value : defaultVolume);
           const safeVolume = Number.isFinite(assumedVolume) && assumedVolume >= 0 ? assumedVolume : 0;
           const nextState = loadOngoingVolumeState();
-          if (input.value.trim()) {
+          if (hasManualValue) {
             nextState[boardKey] = input.value.trim();
           } else {
             delete nextState[boardKey];
           }
           saveOngoingVolumeState(nextState);
+          const predictedValues = {};
           body.querySelectorAll("tr[data-rank]").forEach((row) => {
             const rank = row.dataset.rank || "";
             const coefficient = FORECAST_COEFFICIENTS[rank];
@@ -2651,10 +2671,29 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             const delta = coefficient ? safeVolume * coefficient : null;
             const predicted = (currentValue !== null && currentValue !== undefined && delta !== null)
               ? Number(currentValue) + Number(delta)
+              : (currentValue !== null && currentValue !== undefined ? Number(currentValue) : null);
+            predictedValues[rank] = predicted;
+            const cells = row.querySelectorAll("td");
+            if (cells.length < 2) return;
+            cells[1].textContent = predicted === null ? "-" : fmtNum(predicted, 0);
+          });
+          rewardBody.querySelectorAll("tr").forEach((row) => {
+            const rank = row.dataset.forecastRank || "";
+            const forecastValue = Object.prototype.hasOwnProperty.call(predictedValues, rank)
+              ? predictedValues[rank]
+              : null;
+            const reward = board.reward_rows.find((item) => String(item.forecast_rank ?? "") === rank) || null;
+            if (!reward) return;
+            const finalCutoff = forecastValue !== null && forecastValue !== undefined
+              ? Number(forecastValue)
+              : (reward.current_cutoff_value !== null && reward.current_cutoff_value !== undefined ? Number(reward.current_cutoff_value) : null);
+            const ratio = reward.reward_value_usdt !== null && reward.reward_value_usdt !== undefined && finalCutoff && finalCutoff > 0
+              ? Number(reward.reward_value_usdt) / Number(finalCutoff)
               : null;
             const cells = row.querySelectorAll("td");
-            if (cells.length < 3) return;
-            cells[2].textContent = predicted === null ? "-" : fmtNum(predicted, 0);
+            if (cells.length < 4) return;
+            cells[2].textContent = finalCutoff === null ? "-" : fmtNum(finalCutoff, 2);
+            cells[3].textContent = ratio === null ? "-" : fmtNum(ratio, 6);
           });
         };
         input.addEventListener("input", updateTable);
