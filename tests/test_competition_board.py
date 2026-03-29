@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -10,6 +11,7 @@ from grid_optimizer import competition_board
 from grid_optimizer.competition_board import (
     _entry_projection,
     _hinted_boards_for_source,
+    _load_history_index,
     _normalize_entries,
     _parse_segments,
     _per_user_reward_from_segment,
@@ -161,8 +163,126 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertIsNotNone(hinted)
         _, boards = hinted or ({}, [])
         self.assertEqual(len(boards), 2)
-        self.assertIsNone(boards[1].get("resourceId"))
+        self.assertEqual(boards[1].get("resourceId"), 46948)
         self.assertEqual(boards[1]["tabLabel"], "交易量挑战赛 - 第二阶段")
+
+    def test_load_history_index_merges_disk_files_with_stale_index(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            history_dir = base / "competition_board_history"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            history_index_path = base / "competition_board_history_index.json"
+            history_index_path.write_text(
+                """
+{
+  "updated_at_utc": "2026-03-28T00:00:00+00:00",
+  "boards": {
+    "futures_kat:交易量挑战赛_-_第一阶段": [
+      {
+        "capture_key": "2026-03-25 07:00",
+        "capture_label": "2026-03-25 07:00",
+        "capture_date": "2026-03-25",
+        "capture_granularity": "hourly",
+        "captured_at_utc": "2026-03-25T00:00:00+00:00",
+        "path": "output/competition_board_history/2026-03-25_0700__futures_kat旧.json",
+        "label": "KAT · 交易量挑战赛 - 第一阶段",
+        "updated_at_utc": "2026-03-24T23:59:59+00:00"
+      }
+    ]
+  }
+}
+""",
+                encoding="utf-8",
+            )
+            (history_dir / "2026-03-28_0700__futures_kat新.json").write_text(
+                """
+{
+  "board_key": "futures_kat:交易量挑战赛_-_第一阶段",
+  "capture_key": "2026-03-28 07:00",
+  "capture_label": "2026-03-28 07:00",
+  "capture_date": "2026-03-28",
+  "capture_granularity": "hourly",
+  "captured_at_utc": "2026-03-28T05:25:15.510863+00:00",
+  "board": {
+    "board_key": "futures_kat:交易量挑战赛_-_第一阶段",
+    "label": "KAT · 交易量挑战赛 - 第一阶段",
+    "updated_at_utc": "2026-03-27T23:59:59+00:00"
+  }
+}
+""",
+                encoding="utf-8",
+            )
+            with patch.object(competition_board, "HISTORY_INDEX_PATH", history_index_path), patch.object(
+                competition_board, "HISTORY_DIR_PATH", history_dir
+            ):
+                index = _load_history_index()
+            entries = index["futures_kat:交易量挑战赛_-_第一阶段"]
+            self.assertEqual(entries[0]["capture_label"], "2026-03-28 07:00")
+            self.assertEqual(len(entries), 2)
+
+    def test_refresh_persists_boards_to_history_for_ended_analytics(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            cache_path = base / "competition_board_cache.json"
+            entries_path = base / "competition_board_entries.json"
+            history_dir = base / "competition_board_history"
+            history_index_path = base / "competition_board_history_index.json"
+            entries_path.write_text("[]", encoding="utf-8")
+            stale_board = {
+                "board_key": "futures_kat:交易量挑战赛_-_第一阶段",
+                "label": "KAT · 交易量挑战赛 - 第一阶段",
+                "symbol": "KAT",
+                "market": "futures",
+                "updated_at_utc": "2026-03-27T23:59:59+00:00",
+                "activity_end_at": "2026-03-29T07:59:00+08:00",
+                "rows": [{"rank": 200, "value": 37994.9}],
+                "segments": [],
+            }
+            previous_payload = {
+                "board_key": stale_board["board_key"],
+                "capture_key": "2026-03-28 07:00",
+                "capture_label": "2026-03-28 07:00",
+                "capture_date": "2026-03-28",
+                "capture_granularity": "hourly",
+                "captured_at_utc": "2026-03-28T05:25:15.510863+00:00",
+                "board": stale_board,
+            }
+            history_dir.mkdir(parents=True, exist_ok=True)
+            (history_dir / "2026-03-28_0700__futures_kat交易量挑战赛_-_第一阶段.json").write_text(
+                json.dumps(previous_payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            fresh_board = dict(stale_board)
+            fresh_board["updated_at_utc"] = "2026-03-28T23:59:59+00:00"
+            fresh_board["rows"] = [{"rank": 200, "value": 208428.74}]
+            fresh_board["eligible_user_count"] = 40000
+            fresh_board["current_floor_value_text"] = "208,428.74"
+
+            def fake_refresh() -> dict[str, object]:
+                payload = {
+                    "generated_at_utc": "2026-03-29T00:10:00+00:00",
+                    "boards": [fresh_board],
+                    "markets": {"futures": [fresh_board], "spot": []},
+                    "entries": [],
+                    "errors": [],
+                }
+                competition_board._persist_boards_to_history([fresh_board], snapshot_generated_at_utc=payload["generated_at_utc"])
+                return competition_board._attach_snapshot_analytics(payload)
+
+            with patch.object(competition_board, "CACHE_PATH", cache_path), patch.object(
+                competition_board, "ENTRIES_PATH", entries_path
+            ), patch.object(competition_board, "HISTORY_INDEX_PATH", history_index_path), patch.object(
+                competition_board, "HISTORY_DIR_PATH", history_dir
+            ), patch.object(competition_board, "_refresh_competition_data", side_effect=fake_refresh), patch.object(
+                competition_board, "COMPETITION_SOURCES", ()
+            ):
+                competition_board._MEMORY_CACHE["loaded_at"] = 0.0
+                competition_board._MEMORY_CACHE["data"] = None
+                snapshot = build_competition_board_snapshot(refresh=True)
+            ended = snapshot["ended_analytics"]["delta_rows"]
+            self.assertEqual(len(ended), 1)
+            self.assertEqual(ended[0]["final_capture"], "2026-03-29 07:00")
+            self.assertAlmostEqual(float(ended[0]["deltas"]["200"]), 170433.84, places=2)
 
     def test_build_snapshot_reprojects_entries_from_cached_boards(self) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()

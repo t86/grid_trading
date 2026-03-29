@@ -20,8 +20,10 @@ import requests
 CACHE_PATH = Path("output/competition_board_cache.json")
 ENTRIES_PATH = Path("output/competition_board_entries.json")
 HISTORY_INDEX_PATH = Path("output/competition_board_history_index.json")
+HISTORY_DIR_PATH = Path("output/competition_board_history")
 REWARD_PRICE_CACHE_PATH = Path("output/competition_reward_price_cache.json")
 CACHE_TTL_SECONDS = 1800
+UTC_PLUS_8 = timezone(timedelta(hours=8))
 
 _CACHE_LOCK = threading.Lock()
 _REFRESH_LOCK = threading.Lock()
@@ -1159,22 +1161,142 @@ def _history_entry_datetime(entry: dict[str, Any]) -> datetime | None:
     return None
 
 
-def _load_history_index() -> dict[str, list[dict[str, Any]]]:
-    payload = _read_json_file(HISTORY_INDEX_PATH, {})
-    boards = payload.get("boards", {}) if isinstance(payload, dict) else {}
+def _normalize_history_index_payload(boards: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     if not isinstance(boards, dict):
         return {}
     normalized: dict[str, list[dict[str, Any]]] = {}
     for board_key, items in boards.items():
         if not isinstance(items, list):
             continue
-        valid_items = [item for item in items if isinstance(item, dict)]
+        deduped: dict[str, dict[str, Any]] = {}
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            dedupe_key = str(item.get("path") or item.get("capture_key") or item.get("updated_at_utc") or uuid.uuid4().hex)
+            deduped[dedupe_key] = item
+        valid_items = list(deduped.values())
         valid_items.sort(
             key=lambda item: _history_entry_datetime(item) or datetime.min.replace(tzinfo=timezone.utc),
             reverse=True,
         )
         normalized[str(board_key)] = valid_items
     return normalized
+
+
+def _history_storage_name(board: dict[str, Any]) -> str:
+    symbol = re.sub(r"[^0-9A-Za-z._-]+", "", str(board.get("symbol", "")).strip().lower()) or "board"
+    tab_label = str(board.get("tab_label") or board.get("label") or "default").strip()
+    normalized_tab = re.sub(r"\s+", "", tab_label)
+    normalized_tab = re.sub(r"[/:]+", "_", normalized_tab)
+    normalized_tab = normalized_tab.replace("·", "_")
+    normalized_tab = normalized_tab or "default"
+    return f"{str(board.get('market', '')).strip().lower()}_{symbol}{normalized_tab}"
+
+
+def _capture_info_for_board(board: dict[str, Any], *, captured_at_utc: str | None = None) -> dict[str, Any]:
+    updated_dt = _parse_iso_datetime(board.get("updated_at_utc"))
+    captured_dt = _parse_iso_datetime(captured_at_utc) if captured_at_utc else None
+    anchor_dt = updated_dt or captured_dt or datetime.now(timezone.utc)
+    capture_dt = anchor_dt.astimezone(UTC_PLUS_8).replace(minute=0, second=0, microsecond=0)
+    return {
+        "capture_key": capture_dt.strftime("%Y-%m-%d %H:00"),
+        "capture_label": capture_dt.strftime("%Y-%m-%d %H:00"),
+        "capture_date": capture_dt.strftime("%Y-%m-%d"),
+        "capture_granularity": "hourly",
+    }
+
+
+def _history_entry_from_payload(payload: dict[str, Any], path: Path) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    board = payload.get("board")
+    if not isinstance(board, dict):
+        return None
+    board_key = str(payload.get("board_key") or board.get("board_key") or "").strip()
+    if not board_key:
+        return None
+    capture_info = _capture_info_for_board(board, captured_at_utc=str(payload.get("captured_at_utc", "")).strip() or None)
+    return {
+        "capture_key": str(payload.get("capture_key") or capture_info["capture_key"]).strip(),
+        "capture_label": str(payload.get("capture_label") or capture_info["capture_label"]).strip(),
+        "capture_date": str(payload.get("capture_date") or capture_info["capture_date"]).strip(),
+        "capture_granularity": str(payload.get("capture_granularity") or capture_info["capture_granularity"]).strip(),
+        "captured_at_utc": str(payload.get("captured_at_utc", "")).strip(),
+        "path": str(path),
+        "label": str(payload.get("label") or board.get("label") or board_key).strip(),
+        "updated_text": str(payload.get("updated_text") or board.get("updated_text") or "").strip(),
+        "updated_at_utc": str(payload.get("updated_at_utc") or board.get("updated_at_utc") or "").strip(),
+        "eligible_user_count": _safe_int(payload.get("eligible_user_count") or board.get("eligible_user_count")),
+        "current_floor_value_text": str(payload.get("current_floor_value_text") or board.get("current_floor_value_text") or "").strip(),
+    }
+
+
+def _scan_history_index_from_disk() -> dict[str, list[dict[str, Any]]]:
+    boards: dict[str, list[dict[str, Any]]] = {}
+    if not HISTORY_DIR_PATH.exists():
+        return boards
+    for path in sorted(HISTORY_DIR_PATH.glob("*.json")):
+        payload = _read_json_file(path, {})
+        entry = _history_entry_from_payload(payload, path)
+        if entry is None:
+            continue
+        board = payload.get("board") if isinstance(payload, dict) else None
+        board_key = str(payload.get("board_key") or (board or {}).get("board_key") or "").strip()
+        if not board_key:
+            continue
+        boards.setdefault(board_key, []).append(entry)
+    return _normalize_history_index_payload(boards)
+
+
+def _save_history_index(boards: dict[str, list[dict[str, Any]]]) -> None:
+    payload = {
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "boards": _normalize_history_index_payload(boards),
+    }
+    _write_json_file(HISTORY_INDEX_PATH, payload)
+
+
+def _load_history_index() -> dict[str, list[dict[str, Any]]]:
+    payload = _read_json_file(HISTORY_INDEX_PATH, {})
+    indexed = _normalize_history_index_payload(payload.get("boards", {}) if isinstance(payload, dict) else {})
+    scanned = _scan_history_index_from_disk()
+    merged: dict[str, list[dict[str, Any]]] = {}
+    for board_key in set(indexed) | set(scanned):
+        merged[board_key] = list(indexed.get(board_key, [])) + list(scanned.get(board_key, []))
+    normalized = _normalize_history_index_payload(merged)
+    if normalized != indexed:
+        _save_history_index(normalized)
+    return normalized
+
+
+def _persist_boards_to_history(boards: list[dict[str, Any]], *, snapshot_generated_at_utc: str) -> None:
+    if not isinstance(boards, list):
+        return
+    history_index = _load_history_index()
+    for board in boards:
+        if not isinstance(board, dict):
+            continue
+        board_key = str(board.get("board_key", "")).strip()
+        if not board_key:
+            continue
+        capture_info = _capture_info_for_board(board)
+        file_name = f"{capture_info['capture_date']}_{capture_info['capture_label'][-5:].replace(':', '')}__{_history_storage_name(board)}.json"
+        path = HISTORY_DIR_PATH / file_name
+        payload = {
+            "board_key": board_key,
+            **capture_info,
+            "captured_at_utc": datetime.now(timezone.utc).isoformat(),
+            "snapshot_generated_at_utc": snapshot_generated_at_utc,
+            "board": board,
+        }
+        _write_json_file(path, payload)
+        entry = _history_entry_from_payload(payload, path)
+        if entry is None:
+            continue
+        history_index.setdefault(board_key, [])
+        history_index[board_key] = [item for item in history_index[board_key] if str(item.get("path")) != str(path)]
+        history_index[board_key].append(entry)
+    _save_history_index(history_index)
 
 
 def _load_history_board(entry: dict[str, Any]) -> dict[str, Any] | None:
@@ -1696,6 +1818,7 @@ def _refresh_competition_data() -> dict[str, Any]:
         "entries": _project_entries_for_boards(boards),
         "errors": scrape_errors,
     }
+    _persist_boards_to_history(boards, snapshot_generated_at_utc=generated_at)
     payload = _attach_snapshot_analytics(payload)
     _write_json_file(CACHE_PATH, payload)
     return payload
