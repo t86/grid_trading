@@ -119,6 +119,7 @@ You can input parameters in browser and run optimization directly.
 
 Competition guide:
 - [TRADE_COMPETITION_GUIDE.md](TRADE_COMPETITION_GUIDE.md): Chinese guide for competition-oriented settings, smart range suggestions, and result interpretation.
+- [docs/ENDED_FUTURES_COMPETITION_SUMMARY.md](docs/ENDED_FUTURES_COMPETITION_SUMMARY.md): Fixed summary of ended futures competitions, including reward-in-USDT, final cutoffs, and reward-to-cutoff ratios.
 
 ## Dry Run Executor
 
