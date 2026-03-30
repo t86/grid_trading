@@ -116,6 +116,76 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         label="BARD 合约交易挑战赛",
         url="https://www.bmwweb.solutions/zh-CN/activity/trading-competition/futures-bard-challenge2?ref=YEK2JZJT",
     ),
+    CompetitionSource(
+        slug="futures_enso",
+        symbol="ENSO",
+        market="futures",
+        label="ENSO 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-enso-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_zama",
+        symbol="ZAMA",
+        market="futures",
+        label="ZAMA 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-zama-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_birb",
+        symbol="BIRB",
+        market="futures",
+        label="BIRB 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-birb-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_elsa",
+        symbol="ELSA",
+        market="futures",
+        label="ELSA 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-elsa-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_sent",
+        symbol="SENT",
+        market="futures",
+        label="SENT 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-sent-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_fogo",
+        symbol="FOGO",
+        market="futures",
+        label="FOGO 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-fogo-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_zkp",
+        symbol="ZKP",
+        market="futures",
+        label="ZKP 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-zkp-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_magma",
+        symbol="MAGMA",
+        market="futures",
+        label="MAGMA 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-magma-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_collect",
+        symbol="COLLECT",
+        market="futures",
+        label="COLLECT 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-collect-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_brev",
+        symbol="BREV",
+        market="futures",
+        label="BREV 合约交易挑战赛",
+        url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/futures-brev-challenge?ref=YEK2JZJT",
+    ),
 )
 
 STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
@@ -481,6 +551,376 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分 75,000 BARD
 第 51 - 200 名
 平分 150,000 BARD
+""",
+            }
+        ]
+    },
+    "futures_enso": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 43343,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BNB",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-03-18T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 ENSO U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 300 BNB
+第 1 名
+30 BNB
+第 2 名
+24 BNB
+第 3 名
+18 BNB
+第 4 名
+12 BNB
+第 5 名
+6 BNB
+第 6 - 20 名
+平分 45 BNB
+第 21 - 50 名
+平分 60 BNB
+第 51 - 200 名
+平分 105 BNB
+""",
+            }
+        ]
+    },
+    "futures_zama": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 41118,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "ZAMA",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-02-13T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 ZAMA U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 8,000,000 ZAMA
+第 1 名
+800,000 ZAMA
+第 2 名
+640,000 ZAMA
+第 3 名
+480,000 ZAMA
+第 4 名
+320,000 ZAMA
+第 5 名
+160,000 ZAMA
+第 6 - 20 名
+平分 1,200,000 ZAMA
+第 21 - 50 名
+平分 1,600,000 ZAMA
+第 51 - 200 名
+平分 2,800,000 ZAMA
+""",
+            }
+        ]
+    },
+    "futures_birb": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 40507,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BIRB",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-02-08T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 BIRB U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 1,200,000 BIRB
+第 1 名
+120,000 BIRB
+第 2 名
+96,000 BIRB
+第 3 名
+72,000 BIRB
+第 4 名
+48,000 BIRB
+第 5 名
+24,000 BIRB
+第 6 - 20 名
+平分 180,000 BIRB
+第 21 - 50 名
+平分 240,000 BIRB
+第 51 - 200 名
+平分 420,000 BIRB
+""",
+            }
+        ]
+    },
+    "futures_elsa": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 39559,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "ELSA",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-02-02T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 ELSA U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 400,000 ELSA
+第 1 名
+40,000 ELSA
+第 2 名
+32,000 ELSA
+第 3 名
+24,000 ELSA
+第 4 名
+16,000 ELSA
+第 5 名
+8,000 ELSA
+第 6 - 20 名
+平分 60,000 ELSA
+第 21 - 50 名
+平分 80,000 ELSA
+第 51 - 200 名
+平分 140,000 ELSA
+""",
+            }
+        ]
+    },
+    "futures_sent": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 39509,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "SENT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-02-02T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 SENT U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 7,000,000 SENT
+第 1 名
+700,000 SENT
+第 2 名
+560,000 SENT
+第 3 名
+420,000 SENT
+第 4 名
+280,000 SENT
+第 5 名
+140,000 SENT
+第 6 - 20 名
+平分 1,050,000 SENT
+第 21 - 50 名
+平分 1,400,000 SENT
+第 51 - 200 名
+平分 2,450,000 SENT
+""",
+            }
+        ]
+    },
+    "futures_fogo": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 38183,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "FOGO",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-01-25T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 FOGO U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 3,500,000 FOGO
+第 1 名
+350,000 FOGO
+第 2 名
+280,000 FOGO
+第 3 名
+210,000 FOGO
+第 4 名
+140,000 FOGO
+第 5 名
+70,000 FOGO
+第 6 - 20 名
+平分 525,000 FOGO
+第 21 - 50 名
+平分 700,000 FOGO
+第 51 - 200 名
+平分 1,225,000 FOGO
+""",
+            }
+        ]
+    },
+    "futures_zkp": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 38070,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "ZKP",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-01-24T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 ZKP U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 1,000,000 ZKP
+第 1 名
+100,000 ZKP
+第 2 名
+80,000 ZKP
+第 3 名
+60,000 ZKP
+第 4 名
+40,000 ZKP
+第 5 名
+20,000 ZKP
+第 6 - 20 名
+平分 150,000 ZKP
+第 21 - 50 名
+平分 200,000 ZKP
+第 51 - 200 名
+平分 350,000 ZKP
+""",
+            }
+        ]
+    },
+    "futures_magma": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 37323,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "MAGMA",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-01-17T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 MAGMA U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 500,000 MAGMA
+第 1 名
+50,000 MAGMA
+第 2 名
+40,000 MAGMA
+第 3 名
+30,000 MAGMA
+第 4 名
+20,000 MAGMA
+第 5 名
+10,000 MAGMA
+第 6 - 20 名
+平分 75,000 MAGMA
+第 21 - 50 名
+平分 100,000 MAGMA
+第 51 - 200 名
+平分 175,000 MAGMA
+""",
+            }
+        ]
+    },
+    "futures_collect": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 37348,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "COLLECT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-01-17T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 COLLECT U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 1,200,000 COLLECT
+第 1 名
+120,000 COLLECT
+第 2 名
+96,000 COLLECT
+第 3 名
+72,000 COLLECT
+第 4 名
+48,000 COLLECT
+第 5 名
+24,000 COLLECT
+第 6 - 20 名
+平分 180,000 COLLECT
+第 21 - 50 名
+平分 240,000 COLLECT
+第 51 - 200 名
+平分 420,000 COLLECT
+""",
+            }
+        ]
+    },
+    "futures_brev": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 37158,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BREV",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityEndAt": "2026-01-16T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+累计 BREV U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 500,000 BREV
+第 1 名
+50,000 BREV
+第 2 名
+40,000 BREV
+第 3 名
+30,000 BREV
+第 4 名
+20,000 BREV
+第 5 名
+10,000 BREV
+第 6 - 20 名
+平分 75,000 BREV
+第 21 - 50 名
+平分 100,000 BREV
+第 51 - 200 名
+平分 175,000 BREV
 """,
             }
         ]
