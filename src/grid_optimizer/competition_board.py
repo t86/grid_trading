@@ -35,6 +35,149 @@ ENDED_LAST_DAY_MARKET_VOLUME: dict[str, float] = {
     "futures_robo:交易量挑战赛": 274_000_000.0,
 }
 
+STATIC_ENDED_REWARD_SUMMARIES: dict[str, dict[str, Any]] = {
+    "futures_enso:交易量挑战赛": {
+        "symbol": "ENSO",
+        "label": "ENSO 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": 20058.30, "cutoff_value": 86691314.25, "ratio": 0.000231},
+            {"rank_label": "第 2 名", "reward_value_usdt": 16046.64, "cutoff_value": 55725507.86, "ratio": 0.000288},
+            {"rank_label": "第 3 名", "reward_value_usdt": 12034.98, "cutoff_value": 55261143.23, "ratio": 0.000218},
+            {"rank_label": "第 4 名", "reward_value_usdt": 8023.32, "cutoff_value": 46482395.32, "ratio": 0.000173},
+            {"rank_label": "第 5 名", "reward_value_usdt": 4011.66, "cutoff_value": 43734447.96, "ratio": 0.000092},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": 2005.83, "cutoff_value": 6351679.10, "ratio": 0.000316},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": 1337.22, "cutoff_value": 4370469.55, "ratio": 0.000306},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": 468.03, "cutoff_value": 1205606.16, "ratio": 0.000388},
+        ],
+    },
+    "futures_zama:交易量挑战赛": {
+        "symbol": "ZAMA",
+        "label": "ZAMA 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": 14512.00, "cutoff_value": 44205967.06, "ratio": 0.000328},
+            {"rank_label": "第 2 名", "reward_value_usdt": 11609.60, "cutoff_value": 35675435.18, "ratio": 0.000325},
+            {"rank_label": "第 3 名", "reward_value_usdt": 8707.20, "cutoff_value": 20625290.73, "ratio": 0.000422},
+            {"rank_label": "第 4 名", "reward_value_usdt": 5804.80, "cutoff_value": 14375690.16, "ratio": 0.000404},
+            {"rank_label": "第 5 名", "reward_value_usdt": 2902.40, "cutoff_value": 5158472.41, "ratio": 0.000563},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": 1451.20, "cutoff_value": 2735692.31, "ratio": 0.000530},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": 967.47, "cutoff_value": 1902993.71, "ratio": 0.000508},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": 338.61, "cutoff_value": 389458.32, "ratio": 0.000869},
+        ],
+    },
+    "futures_birb:交易量挑战赛": {
+        "symbol": "BIRB",
+        "label": "BIRB 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": None, "cutoff_value": 87361530.24, "ratio": None},
+            {"rank_label": "第 2 名", "reward_value_usdt": None, "cutoff_value": 63132367.43, "ratio": None},
+            {"rank_label": "第 3 名", "reward_value_usdt": None, "cutoff_value": 60967628.55, "ratio": None},
+            {"rank_label": "第 4 名", "reward_value_usdt": None, "cutoff_value": 39749252.10, "ratio": None},
+            {"rank_label": "第 5 名", "reward_value_usdt": None, "cutoff_value": 27215865.19, "ratio": None},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": None, "cutoff_value": 6126050.03, "ratio": None},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": None, "cutoff_value": 3267159.91, "ratio": None},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": None, "cutoff_value": 1125142.20, "ratio": None},
+        ],
+    },
+    "futures_elsa:交易量挑战赛": {
+        "symbol": "ELSA",
+        "label": "ELSA 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": None, "cutoff_value": 16985052.80, "ratio": None},
+            {"rank_label": "第 2 名", "reward_value_usdt": None, "cutoff_value": 8497432.23, "ratio": None},
+            {"rank_label": "第 3 名", "reward_value_usdt": None, "cutoff_value": 8000133.96, "ratio": None},
+            {"rank_label": "第 4 名", "reward_value_usdt": None, "cutoff_value": 6915946.94, "ratio": None},
+            {"rank_label": "第 5 名", "reward_value_usdt": None, "cutoff_value": 3087567.46, "ratio": None},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": None, "cutoff_value": 1114832.19, "ratio": None},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": None, "cutoff_value": 591614.56, "ratio": None},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": None, "cutoff_value": 151414.31, "ratio": None},
+        ],
+    },
+    "futures_sent:交易量挑战赛": {
+        "symbol": "SENT",
+        "label": "SENT 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": 27748.00, "cutoff_value": 72338496.81, "ratio": 0.000384},
+            {"rank_label": "第 2 名", "reward_value_usdt": 22198.40, "cutoff_value": 58723131.40, "ratio": 0.000378},
+            {"rank_label": "第 3 名", "reward_value_usdt": 16648.80, "cutoff_value": 48870930.84, "ratio": 0.000341},
+            {"rank_label": "第 4 名", "reward_value_usdt": 11099.20, "cutoff_value": 48522939.04, "ratio": 0.000229},
+            {"rank_label": "第 5 名", "reward_value_usdt": 5549.60, "cutoff_value": 39331514.09, "ratio": 0.000141},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": 2774.80, "cutoff_value": 4962123.23, "ratio": 0.000559},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": 1849.87, "cutoff_value": 3006484.49, "ratio": 0.000615},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": 647.45, "cutoff_value": 973170.35, "ratio": 0.000665},
+        ],
+    },
+    "futures_fogo:交易量挑战赛": {
+        "symbol": "FOGO",
+        "label": "FOGO 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": 13468.00, "cutoff_value": 60941911.92, "ratio": 0.000221},
+            {"rank_label": "第 2 名", "reward_value_usdt": 10774.40, "cutoff_value": 59100487.35, "ratio": 0.000182},
+            {"rank_label": "第 3 名", "reward_value_usdt": 8080.80, "cutoff_value": 17544927.15, "ratio": 0.000461},
+            {"rank_label": "第 4 名", "reward_value_usdt": 5387.20, "cutoff_value": 12379863.94, "ratio": 0.000435},
+            {"rank_label": "第 5 名", "reward_value_usdt": 2693.60, "cutoff_value": 8775521.29, "ratio": 0.000307},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": 1346.80, "cutoff_value": 3361731.01, "ratio": 0.000401},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": 897.87, "cutoff_value": 1467693.55, "ratio": 0.000612},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": 314.25, "cutoff_value": 560508.17, "ratio": 0.000561},
+        ],
+    },
+    "futures_zkp:交易量挑战赛": {
+        "symbol": "ZKP",
+        "label": "ZKP 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": 11850.00, "cutoff_value": 41095197.63, "ratio": 0.000288},
+            {"rank_label": "第 2 名", "reward_value_usdt": 9480.00, "cutoff_value": 39149212.48, "ratio": 0.000242},
+            {"rank_label": "第 3 名", "reward_value_usdt": 7110.00, "cutoff_value": 21332413.59, "ratio": 0.000333},
+            {"rank_label": "第 4 名", "reward_value_usdt": 4740.00, "cutoff_value": 20779558.24, "ratio": 0.000228},
+            {"rank_label": "第 5 名", "reward_value_usdt": 2370.00, "cutoff_value": 17755937.84, "ratio": 0.000133},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": 1185.00, "cutoff_value": 2724287.59, "ratio": 0.000435},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": 790.00, "cutoff_value": 1813332.41, "ratio": 0.000436},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": 276.50, "cutoff_value": 421419.02, "ratio": 0.000656},
+        ],
+    },
+    "futures_magma:交易量挑战赛": {
+        "symbol": "MAGMA",
+        "label": "MAGMA 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": None, "cutoff_value": 21832348.11, "ratio": None},
+            {"rank_label": "第 2 名", "reward_value_usdt": None, "cutoff_value": 15274016.29, "ratio": None},
+            {"rank_label": "第 3 名", "reward_value_usdt": None, "cutoff_value": 14569706.52, "ratio": None},
+            {"rank_label": "第 4 名", "reward_value_usdt": None, "cutoff_value": 12910864.67, "ratio": None},
+            {"rank_label": "第 5 名", "reward_value_usdt": None, "cutoff_value": 11223176.48, "ratio": None},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": None, "cutoff_value": 1814327.81, "ratio": None},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": None, "cutoff_value": 678787.74, "ratio": None},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": None, "cutoff_value": 157063.05, "ratio": None},
+        ],
+    },
+    "futures_collect:交易量挑战赛": {
+        "symbol": "COLLECT",
+        "label": "COLLECT 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": None, "cutoff_value": 32315389.24, "ratio": None},
+            {"rank_label": "第 2 名", "reward_value_usdt": None, "cutoff_value": 29088269.90, "ratio": None},
+            {"rank_label": "第 3 名", "reward_value_usdt": None, "cutoff_value": 24826234.93, "ratio": None},
+            {"rank_label": "第 4 名", "reward_value_usdt": None, "cutoff_value": 15329938.67, "ratio": None},
+            {"rank_label": "第 5 名", "reward_value_usdt": None, "cutoff_value": 9365065.51, "ratio": None},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": None, "cutoff_value": 2515592.70, "ratio": None},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": None, "cutoff_value": 1582278.87, "ratio": None},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": None, "cutoff_value": 413872.59, "ratio": None},
+        ],
+    },
+    "futures_brev:交易量挑战赛": {
+        "symbol": "BREV",
+        "label": "BREV 合约交易挑战赛",
+        "rows": [
+            {"rank_label": "第 1 名", "reward_value_usdt": 15570.00, "cutoff_value": 153588397.60, "ratio": 0.000101},
+            {"rank_label": "第 2 名", "reward_value_usdt": 12456.00, "cutoff_value": 102192670.35, "ratio": 0.000122},
+            {"rank_label": "第 3 名", "reward_value_usdt": 9342.00, "cutoff_value": 85586624.48, "ratio": 0.000109},
+            {"rank_label": "第 4 名", "reward_value_usdt": 6228.00, "cutoff_value": 61430452.38, "ratio": 0.000101},
+            {"rank_label": "第 5 名", "reward_value_usdt": 3114.00, "cutoff_value": 31753045.35, "ratio": 0.000098},
+            {"rank_label": "第 6 - 20 名", "reward_value_usdt": 1557.00, "cutoff_value": 8274285.33, "ratio": 0.000188},
+            {"rank_label": "第 21 - 50 名", "reward_value_usdt": 1038.00, "cutoff_value": 6032188.17, "ratio": 0.000172},
+            {"rank_label": "第 51 - 200 名", "reward_value_usdt": 363.30, "cutoff_value": 1239024.78, "ratio": 0.000293},
+        ],
+    },
+}
+
 
 @dataclass(frozen=True)
 class CompetitionSource:
@@ -1857,6 +2000,7 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
     delta_rows: list[dict[str, Any]] = []
     reward_rows: list[dict[str, Any]] = []
     tracked_ranks = (20, 30, 50, 100, 150, 200)
+    known_reward_keys: set[str] = set()
 
     ended_boards = [
         board for board in boards
@@ -1931,6 +2075,33 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
                     "cutoff_value": float(cutoff_value),
                     "cutoff_value_text": f"{float(cutoff_value):,.2f}",
                     "ratio": ratio,
+                }
+            )
+            known_reward_keys.add(board_key)
+
+    for board_key, summary in STATIC_ENDED_REWARD_SUMMARIES.items():
+        if board_key in known_reward_keys:
+            continue
+        for row in summary.get("rows", []):
+            if not isinstance(row, dict):
+                continue
+            cutoff_value = _safe_float(row.get("cutoff_value"))
+            if cutoff_value is None or cutoff_value <= 0:
+                continue
+            reward_rows.append(
+                {
+                    "board_key": board_key,
+                    "label": str(summary.get("label") or board_key),
+                    "symbol": str(summary.get("symbol") or ""),
+                    "market": "futures",
+                    "rank_label": str(row.get("rank_label") or "-"),
+                    "reward_text": "-",
+                    "reward_unit": "",
+                    "reward_price_usdt": None,
+                    "reward_value_usdt": _safe_float(row.get("reward_value_usdt")),
+                    "cutoff_value": float(cutoff_value),
+                    "cutoff_value_text": f"{float(cutoff_value):,.2f}",
+                    "ratio": _safe_float(row.get("ratio")),
                 }
             )
 
