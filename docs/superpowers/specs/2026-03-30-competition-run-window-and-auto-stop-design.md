@@ -1,227 +1,227 @@
-# Competition Runner Window And Auto-Stop Design
+# 交易赛 Runner 运行时间窗与自动停止设计
 
-**Date:** 2026-03-30
+**日期：** 2026-03-30
 
-## Summary
+## 概述
 
-Add shared runtime controls for both futures and spot competition runners so they can:
+为合约和现货两套交易赛 runner 增加统一的运行时控制能力，使它们可以：
 
-- wait until a configured start time before placing strategy orders
-- stop at a configured end time
-- stop automatically when rolling 60-minute loss reaches a threshold
-- stop automatically when cumulative traded notional reaches a threshold
+- 在配置的开始时间之前等待，不下策略单
+- 在配置的结束时间到达后自动停止
+- 在最近 60 分钟滚动亏损达到阈值后自动停止
+- 在累计成交额达到阈值后自动停止
 
-When any stop condition is hit, the system must stop the main strategy, cancel strategy-owned open orders, and reuse the existing top-of-book maker flatten flow so it keeps chasing the best bid/ask until the position is fully closed.
+当任一停止条件命中时，系统必须停止主策略、撤掉策略自身挂单，并复用现有的买一卖一顶档 `maker` 平仓追单机制，使其持续跟随盘口直到仓位完全归零。
 
-This change applies to:
+本次变更适用于：
 
-- futures runner started from `/api/runner/start`
-- spot runner started from `/api/spot_runner/start`
-- the corresponding runner status pages and snapshots
+- 从 `/api/runner/start` 启动的合约 runner
+- 从 `/api/spot_runner/start` 启动的现货 runner
+- 对应的 runner 状态页和 snapshot 数据
 
-Deployment scope for this work is the existing repository plus post-merge update on `43.155.136.111`.
+本次工作的部署范围为当前仓库代码，以及合并后更新到 `43.155.136.111`。
 
-## Goals
+## 目标
 
-- Support explicit runner start and end timestamps for futures and spot competition strategies.
-- Support rolling 60-minute loss based auto-stop for futures and spot.
-- Support cumulative traded notional based auto-stop for futures and spot.
-- Reuse existing stop execution behavior instead of creating a second liquidation path.
-- Make stop state visible in web snapshots and pages.
+- 为合约和现货交易赛策略支持显式的开始时间和结束时间。
+- 为合约和现货支持基于最近 60 分钟滚动亏损的自动停机。
+- 为合约和现货支持基于累计成交额的自动停机。
+- 复用现有停止执行路径，而不是再造一套新的清仓逻辑。
+- 在 web snapshot 和页面上展示停止状态与停止原因。
 
-## Non-Goals
+## 非目标
 
-- No new competition board ranking model changes.
-- No new deployment target beyond the requested update to `43.155.136.111`.
-- No attempt to auto-restart a runner after an end condition has triggered.
-- No change to how the existing flatten runner places maker chase orders beyond wiring it into the new auto-stop path.
+- 不修改交易赛榜单本身的数据模型。
+- 不扩展到 `43.155.136.111` 之外的部署目标。
+- 不在触发结束条件后自动重启 runner。
+- 不改变现有 flatten runner 的 `maker` 追单机制本身，只负责将它接入新的自动停止流程。
 
-## Current Context
+## 当前上下文
 
-The repository already has two independent live strategy loops:
+仓库里已经有两套独立的实时策略循环：
 
-- futures: [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py)
-- spot: [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py)
+- 合约：[`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py)
+- 现货：[`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py)
 
-Runtime configuration and the web UI are assembled in [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py).
+运行时配置和 web UI 组装位于 [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py)。
 
-The codebase already supports futures-side manual stop behavior that can:
+当前代码库在合约侧已经支持手动停止流程，可以：
 
-- stop the main runner
-- cancel strategy orders
-- start a maker flatten process that keeps working the top of book until positions are closed
+- 停止主 runner
+- 撤掉策略挂单
+- 启动一个 maker flatten 进程，在盘口顶档持续工作直到仓位归零
 
-For spot, the codebase currently supports stopping the runner and canceling strategy orders, but it does not yet have an equivalent continuously chasing maker flatten loop. This feature must add that missing spot-side close path so spot and futures match the requested behavior.
+对于现货，当前代码只支持停止 runner 和撤掉策略挂单，还没有与合约等价的持续 `maker` 平仓追单循环。本次功能需要补齐这条现货侧关闭路径，使现货和合约都能满足你要求的行为。
 
-## User-Facing Behavior
+## 用户可见行为
 
-### Start Window
+### 开始时间窗
 
-- If `run_start_time` is unset, the runner may trade immediately.
-- If `run_start_time` is set and current time is earlier than it, the runner process may remain alive but must not place new strategy orders.
-- During the pre-start period, the UI should clearly show that the runner is waiting for the configured start time.
+- 如果未设置 `run_start_time`，runner 可以立即交易。
+- 如果设置了 `run_start_time`，且当前时间早于该时间，runner 进程可以保持存活，但不得下新的策略单。
+- 在开始时间到来之前，UI 需要明确显示 runner 正在等待开始时间。
 
-### Active Window
+### 运行时间窗内
 
-- If current time is within the configured run window, the runner behaves normally.
-- Each loop cycle evaluates the configured auto-stop thresholds before placing new orders.
+- 如果当前时间位于配置的运行窗口内，runner 正常运行。
+- 每一轮循环在下新单之前，都要检查自动停止阈值。
 
-### End Conditions
+### 结束条件
 
-The following conditions stop the strategy:
+以下条件任一满足时，策略停止：
 
-- current time is at or after `run_end_time`
-- rolling 60-minute loss is greater than or equal to `rolling_hourly_loss_limit`
-- cumulative traded notional is greater than or equal to `max_cumulative_notional`
+- 当前时间大于等于 `run_end_time`
+- 最近 60 分钟滚动亏损大于等于 `rolling_hourly_loss_limit`
+- 累计成交额大于等于 `max_cumulative_notional`
 
-If multiple conditions are true in the same cycle, the stop metadata should record all matched reasons and a primary reason for display.
+如果同一轮内同时命中多个条件，停止元数据需要同时记录全部命中原因，并给出一个主原因用于页面展示。
 
-### Stop Action
+### 停止动作
 
-Once an end condition is hit:
+一旦命中结束条件：
 
-1. stop the main strategy loop from placing further orders
-2. cancel strategy-owned open orders
-3. start or continue the existing maker flatten process
-4. keep chasing top-of-book maker close orders until position size reaches zero
+1. 主策略循环停止继续下单
+2. 撤掉策略自身挂单
+3. 启动或继续已有的顶档 `maker` 平仓流程
+4. 持续按盘口顶档追单，直到仓位数量归零
 
-This behavior must be identical for futures and spot from the operator point of view, even though the futures implementation can reuse an existing flatten runner and spot needs a new equivalent close loop.
+从操作者视角看，现货和合约的行为必须一致。实现上，合约可以复用现有 flatten runner，现货则需要新增一条等价的平仓追单流程。
 
-## Configuration Additions
+## 配置项新增
 
-Add the following fields to both futures and spot runner configs:
+为合约和现货 runner 都新增以下字段：
 
-- `run_start_time`: optional ISO 8601 datetime
-- `run_end_time`: optional ISO 8601 datetime
-- `rolling_hourly_loss_limit`: optional positive float
-- `max_cumulative_notional`: optional positive float
+- `run_start_time`：可选，ISO 8601 时间
+- `run_end_time`：可选，ISO 8601 时间
+- `rolling_hourly_loss_limit`：可选，正数浮点值
+- `max_cumulative_notional`：可选，正数浮点值
 
-Validation rules:
+校验规则：
 
-- if both start and end are set, `run_start_time` must be earlier than `run_end_time`
-- loss limit must be strictly positive when set
-- cumulative notional limit must be strictly positive when set
-- all timestamps are stored and compared in timezone-aware UTC form
+- 如果同时设置了开始和结束时间，则 `run_start_time` 必须早于 `run_end_time`
+- 亏损阈值一旦设置，必须严格大于 0
+- 累计成交额阈值一旦设置，必须严格大于 0
+- 所有时间统一存储为带时区的 UTC 时间并以 UTC 比较
 
-## Data Semantics
+## 数据语义
 
-### Time
+### 时间
 
-- The web layer accepts datetime input and normalizes it to timezone-aware UTC strings.
-- The runners compare against current UTC time.
-- Snapshots return normalized ISO 8601 timestamps.
+- web 层接收时间输入后，统一归一化为带时区的 UTC 字符串
+- runner 内部统一按当前 UTC 时间比较
+- snapshot 返回归一化后的 ISO 8601 时间字符串
 
-### Rolling 60-Minute Loss
+### 最近 60 分钟滚动亏损
 
-This uses a rolling window, not a natural clock hour.
+这里使用滚动窗口，而不是自然小时。
 
-Window definition:
+窗口定义：
 
-- include runner trade and income effects whose timestamps fall within `now - 60 minutes` through `now`
+- 纳入 `now - 60 分钟` 到 `now` 之间的交易与收益事件
 
-Futures loss basis:
+合约侧亏损口径：
 
-- use realized PnL and income/audit data already available to the futures runner monitor path
-- the value used for stop comparison is `max(0, -window_net_pnl)`
+- 使用 futures runner 现有监控路径里可获得的已实现收益和 income/audit 数据
+- 用于比较阈值的值为 `max(0, -window_net_pnl)`
 
-Spot loss basis:
+现货侧亏损口径：
 
-- use spot realized PnL for the last 60 minutes
-- subtract fees and recycle loss already tracked in state/summary
-- the value used for stop comparison is `max(0, -window_net_pnl)`
+- 使用最近 60 分钟现货已实现收益
+- 再扣除 state/summary 中已经维护的手续费和 `recycle_loss_abs`
+- 用于比较阈值的值为 `max(0, -window_net_pnl)`
 
-If the rolling loss limit is unset, the condition is disabled.
+如果没有设置滚动亏损阈值，则该条件关闭。
 
-### Cumulative Traded Notional
+### 累计成交额
 
-- use the runner's cumulative `gross_notional`
-- compare against `max_cumulative_notional`
-- if the threshold is unset, the condition is disabled
+- 直接使用 runner 已维护的累计 `gross_notional`
+- 与 `max_cumulative_notional` 比较
+- 如果没有设置该阈值，则该条件关闭
 
-## Architecture
+## 架构设计
 
-### Shared Runtime Guard Helper
+### 共享运行时守卫 Helper
 
-Add a small shared helper module for runtime gate evaluation. The helper should:
+新增一个很薄的共享 helper 模块，专门负责运行时 gate 判断。这个 helper 需要：
 
-- normalize optional runtime guard config
-- determine whether the runner is before start, active, or after end
-- compute rolling 60-minute loss from the available event/state inputs
-- evaluate cumulative notional threshold
-- return a normalized guard result with:
+- 归一化可选的运行时守卫配置
+- 判断 runner 当前处于开始前、运行中还是结束后
+- 计算最近 60 分钟滚动亏损
+- 判断累计成交额阈值
+- 返回统一的 guard 结果，至少包括：
   - `tradable`
   - `stop_triggered`
   - `primary_reason`
   - `matched_reasons`
   - `triggered_at`
-  - computed metrics for display
+  - 用于展示的计算结果
 
-This keeps futures and spot on the same decision model while still allowing each runner to provide its own metric inputs.
+这样 futures 和 spot 可以共用一套决策模型，同时各自仍能提供自身的指标输入。
 
-### Futures Runner Integration
+### 合约 Runner 接入
 
-In [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py):
+在 [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/loop_runner.py) 中：
 
-- parse new CLI arguments
-- evaluate runtime guards near the start of each cycle, before plan execution places or refreshes orders
-- if before start, skip plan submission and write a waiting summary
-- if a stop condition is hit, write stop metadata to summary/state, invoke the existing futures stop execution path with cancel + flatten behavior, and exit the main loop cleanly
+- 解析新的 CLI 参数
+- 在每轮循环开始处尽早执行运行时守卫判断，且早于计划执行和下单逻辑
+- 如果还没到开始时间，则跳过计划提交，只写一条等待状态 summary
+- 如果命中停止条件，则把停止元数据写入 summary/state，调用现有的合约停止路径执行撤单 + flatten，然后让主循环干净退出
 
-### Spot Runner Integration
+### 现货 Runner 接入
 
-In [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py):
+在 [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/spot_loop_runner.py) 中：
 
-- parse new CLI arguments
-- evaluate runtime guards before building or submitting desired orders
-- if before start, skip order placement and write a waiting summary
-- if a stop condition is hit, write stop metadata to summary/state, invoke a new spot close path that cancels strategy orders and starts a top-of-book maker chase until spot inventory is flat, and exit the main loop cleanly
+- 解析新的 CLI 参数
+- 在构建或提交目标订单之前执行运行时守卫判断
+- 如果还没到开始时间，则跳过下单，只写一条等待状态 summary
+- 如果命中停止条件，则把停止元数据写入 summary/state，调用新的现货关闭路径：先撤单，再启动顶档 `maker` 平仓追单，最后让主循环干净退出
 
-### Flattening Integration
+### Flatten 接入
 
-The close path must be market-specific behind a consistent stop contract:
+关闭路径需要按市场类型分别落地，但对外保持一致的停止契约：
 
-- futures reuses the existing maker flatten runner
-- spot adds a new maker-style flatten loop or equivalent module with the same operational semantics:
-  - place maker close orders at top of book
-  - cancel/replace as the quote moves
-  - continue until managed inventory reaches zero
-  - avoid duplicate flatten processes for the same symbol
+- 合约：复用现有 maker flatten runner
+- 现货：新增一个具有相同操作语义的 maker 平仓循环或等价模块，要求：
+  - 在盘口顶档挂 maker 平仓单
+  - 盘口变动时撤单重挂
+  - 持续运行直到受管库存归零
+  - 同一 symbol 避免重复启动多个 flatten 进程
 
-### Web Layer Integration
+### Web 层接入
 
-In [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py):
+在 [`/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py`](/Volumes/WORK/binance/grid_trading/src/grid_optimizer/web.py) 中：
 
-- add the four new config fields to futures runner payload normalization
-- add the four new config fields to spot runner payload normalization
-- include the new fields in command construction for both runners
-- add snapshot fields so the UI can show:
-  - configured run window
-  - runtime status (`waiting`, `running`, `stopped`)
-  - rolling 60-minute loss
-  - cumulative traded notional
-  - whether auto-stop fired
-  - stop reason and stop timestamp
+- 为合约 runner 的 payload 归一化增加这 4 个新字段
+- 为现货 runner 的 payload 归一化增加这 4 个新字段
+- 在两套 runner 的启动命令组装中加入新的 CLI 参数
+- 在 snapshot 中增加以下展示字段，使页面可以看到：
+  - 配置的运行时间窗
+  - 当前运行状态（`waiting`、`running`、`stopped`）
+  - 最近 60 分钟滚动亏损
+  - 累计成交额
+  - 是否已经触发自动停止
+  - 停止原因和停止时间
 
-## Stop Reason Model
+## 停止原因模型
 
-Use stable reason codes:
+使用稳定的 reason code：
 
 - `before_start_window`
 - `after_end_window`
 - `rolling_hourly_loss_limit_hit`
 - `max_cumulative_notional_hit`
 
-Behavior:
+行为定义：
 
-- `before_start_window` is a waiting state, not a terminal stop
-- the other three are terminal stop conditions
-- snapshots should expose both machine-readable reason codes and short human-readable text
+- `before_start_window` 是等待状态，不是终态停止
+- 另外三个都是终态停止条件
+- snapshot 既要暴露机器可读的 reason code，也要暴露简短的人类可读文案
 
-## State And Summary Changes
+## State 与 Summary 变更
 
-Both runners should emit enough data for troubleshooting and UI display.
+合约和现货两边都需要输出足够的运行信息，方便排障和页面展示。
 
-Add or persist fields such as:
+建议新增或持久化以下字段：
 
 - `run_start_time`
 - `run_end_time`
@@ -235,66 +235,66 @@ Add or persist fields such as:
 - `stop_reasons`
 - `stop_triggered_at`
 
-For waiting cycles before start, summaries should still append a lightweight status event so operators can confirm the runner is alive and intentionally idle.
+在开始时间之前的等待周期里，也应该持续追加轻量状态事件，方便操作者确认 runner 还活着，而且是有意空转等待。
 
-## Error Handling
+## 错误处理
 
-- Invalid config should fail at web payload normalization or CLI parsing, not mid-cycle.
-- If stop actions partially fail, summaries must still record the failure details and preserve the primary stop reason.
-- If flattening is already running when an auto-stop fires, the system should reuse that state instead of launching duplicate flatten processes.
-- If no position exists at stop time, the process still cancels strategy orders and exits cleanly.
+- 非法配置应在 web payload 归一化或 CLI 参数解析阶段失败，而不是运行中途才报错。
+- 如果停止动作部分失败，summary 仍然必须记录失败细节，并保留主停止原因。
+- 如果 flatten 进程在自动停止触发前已经运行，则应直接复用，而不是重复启动。
+- 如果停止时本身已经没有仓位，流程仍然需要完成撤单并干净退出。
 
-## Testing Strategy
+## 测试策略
 
-### Web Tests
+### Web 测试
 
-Extend web tests to verify:
+扩展 web 侧测试，验证：
 
-- new futures fields normalize correctly
-- new spot fields normalize correctly
-- command builders include the new CLI flags
-- snapshot payloads expose runtime window and stop metadata
+- 合约新增字段可以正确归一化
+- 现货新增字段可以正确归一化
+- 命令构造中包含新的 CLI 参数
+- snapshot 能暴露运行时间窗和停止元数据
 
-### Futures Runner Tests
+### 合约 Runner 测试
 
-Add tests for:
+新增测试覆盖：
 
-- waiting before `run_start_time`
-- stopping at `run_end_time`
-- stopping when rolling loss exceeds threshold
-- stopping when cumulative gross notional exceeds threshold
-- routing through existing cancel + flatten stop behavior
+- `run_start_time` 之前处于等待状态
+- 到达 `run_end_time` 时自动停止
+- 最近 60 分钟滚动亏损超过阈值时自动停止
+- 累计 `gross_notional` 超过阈值时自动停止
+- 能正确走现有的撤单 + flatten 停止路径
 
-### Spot Runner Tests
+### 现货 Runner 测试
 
-Add tests for:
+新增测试覆盖：
 
-- waiting before `run_start_time`
-- stopping at `run_end_time`
-- stopping when rolling loss exceeds threshold
-- stopping when cumulative gross notional exceeds threshold
-- routing through spot stop execution and the new maker flatten behavior
+- `run_start_time` 之前处于等待状态
+- 到达 `run_end_time` 时自动停止
+- 最近 60 分钟滚动亏损超过阈值时自动停止
+- 累计 `gross_notional` 超过阈值时自动停止
+- 能正确走现货的停止执行路径以及新的 maker flatten 行为
 
-### Verification
+### 验证
 
-Before deployment:
+部署前需要：
 
-- run targeted unit tests for web, futures runner, and spot runner
-- run at least one focused command-level verification for each runner path to ensure the new flags parse correctly
+- 跑 web、futures runner、spot runner 的目标单测
+- 至少对两套 runner 各做一次命令级验证，确认新参数可正确解析
 
-## Deployment Plan
+## 部署计划
 
-After implementation and local verification:
+在实现完成并完成本地验证后：
 
-1. merge the change into `main`
-2. deploy using the existing Oracle deployment flow in [`/Volumes/WORK/binance/grid_trading/deploy/oracle/install_or_update.sh`](/Volumes/WORK/binance/grid_trading/deploy/oracle/install_or_update.sh)
-3. update the requested host `43.155.136.111`
-4. confirm the relevant service status and that the new runtime fields are visible in the web UI or snapshot response
+1. 将变更合并到 `main`
+2. 使用现有 Oracle 部署流程 [`/Volumes/WORK/binance/grid_trading/deploy/oracle/install_or_update.sh`](/Volumes/WORK/binance/grid_trading/deploy/oracle/install_or_update.sh) 更新服务
+3. 更新指定主机 `43.155.136.111`
+4. 核对相关服务状态，并确认新的运行时字段已在 web UI 或 snapshot 中生效
 
-Only the requested `43.155.136.111` host is in scope for this deployment step.
+本次部署步骤只覆盖你指定的 `43.155.136.111`。
 
-## Implementation Notes
+## 实现备注
 
-- Prefer a shared helper for guard evaluation over duplicating logic in both runners.
-- Reuse existing stop and flatten orchestration rather than inventing a second exit path.
-- Keep the UI additions explicit and operationally oriented: operators should immediately see whether a runner is waiting, actively trading, or auto-stopped and why.
+- 运行时守卫判断优先抽成共享 helper，不要在两套 runner 里复制逻辑。
+- 停止和 flatten 编排优先复用现有机制，不要再造第二套退出路径。
+- UI 新增项应偏运维视角，确保操作者能一眼看出当前是等待中、运行中还是已自动停止，以及具体原因。
