@@ -1108,11 +1108,28 @@ def apply_hedge_position_controls(
     }
 
 
+def apply_short_cover_pause(
+    *,
+    plan: dict[str, Any],
+    active: bool,
+    pause_reasons: list[str] | None = None,
+) -> dict[str, Any]:
+    reasons = list(pause_reasons or [])
+    if active:
+        plan["buy_orders"] = []
+    return {
+        "short_cover_paused": bool(active),
+        "short_cover_pause_reasons": reasons,
+    }
+
+
 def assess_market_guard(
     *,
     symbol: str,
     buy_pause_amp_trigger_ratio: float | None,
     buy_pause_down_return_trigger_ratio: float | None,
+    short_cover_pause_amp_trigger_ratio: float | None,
+    short_cover_pause_down_return_trigger_ratio: float | None,
     freeze_shift_abs_return_trigger_ratio: float | None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
@@ -1122,14 +1139,18 @@ def assess_market_guard(
             for threshold in (
                 buy_pause_amp_trigger_ratio,
                 buy_pause_down_return_trigger_ratio,
+                short_cover_pause_amp_trigger_ratio,
+                short_cover_pause_down_return_trigger_ratio,
                 freeze_shift_abs_return_trigger_ratio,
             )
         ),
         "available": False,
         "warning": None,
         "buy_pause_active": False,
+        "short_cover_pause_active": False,
         "shift_frozen": False,
         "buy_pause_reasons": [],
+        "short_cover_pause_reasons": [],
         "shift_freeze_reasons": [],
         "candle": None,
         "return_ratio": 0.0,
@@ -1167,16 +1188,27 @@ def assess_market_guard(
     amplitude_ratio = ((high_price / low_price) - 1.0) if low_price > 0 else 0.0
 
     buy_pause_reasons: list[str] = []
+    short_cover_pause_reasons: list[str] = []
     shift_freeze_reasons: list[str] = []
-    if (
-        buy_pause_amp_trigger_ratio is not None
-        and buy_pause_amp_trigger_ratio > 0
-        and buy_pause_down_return_trigger_ratio is not None
-        and amplitude_ratio >= buy_pause_amp_trigger_ratio
-        and return_ratio <= buy_pause_down_return_trigger_ratio
-    ):
+
+    def _matches_extreme_down(amp_trigger: float | None, down_trigger: float | None) -> bool:
+        return (
+            amp_trigger is not None
+            and amp_trigger > 0
+            and down_trigger is not None
+            and amplitude_ratio >= amp_trigger
+            and return_ratio <= down_trigger
+        )
+
+    if _matches_extreme_down(buy_pause_amp_trigger_ratio, buy_pause_down_return_trigger_ratio):
         buy_pause_reasons.append(
             "1m_extreme_down_candle "
+            f"amp={amplitude_ratio * 100:.2f}% "
+            f"ret={return_ratio * 100:.2f}%"
+        )
+    if _matches_extreme_down(short_cover_pause_amp_trigger_ratio, short_cover_pause_down_return_trigger_ratio):
+        short_cover_pause_reasons.append(
+            "1m_short_cover_pause "
             f"amp={amplitude_ratio * 100:.2f}% "
             f"ret={return_ratio * 100:.2f}%"
         )
@@ -1194,8 +1226,10 @@ def assess_market_guard(
         {
             "available": True,
             "buy_pause_active": bool(buy_pause_reasons),
+            "short_cover_pause_active": bool(short_cover_pause_reasons),
             "shift_frozen": bool(shift_freeze_reasons),
             "buy_pause_reasons": buy_pause_reasons,
+            "short_cover_pause_reasons": short_cover_pause_reasons,
             "shift_freeze_reasons": shift_freeze_reasons,
             "candle": {
                 "open_time": candle.open_time.isoformat(),
@@ -1888,6 +1922,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         symbol=symbol,
         buy_pause_amp_trigger_ratio=effective_args.buy_pause_amp_trigger_ratio,
         buy_pause_down_return_trigger_ratio=effective_args.buy_pause_down_return_trigger_ratio,
+        short_cover_pause_amp_trigger_ratio=getattr(effective_args, "short_cover_pause_amp_trigger_ratio", None),
+        short_cover_pause_down_return_trigger_ratio=getattr(effective_args, "short_cover_pause_down_return_trigger_ratio", None),
         freeze_shift_abs_return_trigger_ratio=effective_args.freeze_shift_abs_return_trigger_ratio,
     )
     center_price = float(state["center_price"])
@@ -2031,6 +2067,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "excess_qty": 0.0,
         "reason": None,
     }
+    short_cover_controls = {
+        "short_cover_paused": False,
+        "short_cover_pause_reasons": [],
+    }
 
     if _is_custom_grid_mode(args):
         excess_inventory_gate["enabled"] = False
@@ -2140,6 +2180,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
             )
+            short_cover_controls = apply_short_cover_pause(
+                plan=plan,
+                active=bool(market_guard.get("short_cover_pause_active")),
+                pause_reasons=list(market_guard.get("short_cover_pause_reasons", [])),
+            )
+            if short_cover_controls["short_cover_paused"]:
+                controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+                for reason in short_cover_controls["short_cover_pause_reasons"]:
+                    controls["pause_reasons"].append(f"short_cover_pause: {reason}")
             target_base_qty = 0.0
             bootstrap_qty = 0.0
         else:
@@ -2426,6 +2475,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
         )
+        short_cover_controls = apply_short_cover_pause(
+            plan=plan,
+            active=bool(market_guard.get("short_cover_pause_active")),
+            pause_reasons=list(market_guard.get("short_cover_pause_reasons", [])),
+        )
+        if short_cover_controls["short_cover_paused"]:
+            controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+            for reason in short_cover_controls["short_cover_pause_reasons"]:
+                controls["pause_reasons"].append(f"short_cover_pause: {reason}")
         target_base_qty = 0.0
         bootstrap_qty = 0.0
     else:
@@ -2585,6 +2643,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "pause_reasons": controls["pause_reasons"],
         "short_paused": bool(controls.get("short_paused")),
         "short_pause_reasons": list(controls.get("short_pause_reasons", [])),
+        "short_cover_paused": bool(short_cover_controls.get("short_cover_paused")),
+        "short_cover_pause_reasons": list(short_cover_controls.get("short_cover_pause_reasons", [])),
         "buy_cap_applied": cap_controls["cap_applied"],
         "buy_budget_notional": cap_controls["buy_budget_notional"],
         "planned_buy_notional": cap_controls["planned_buy_notional"],
@@ -2941,6 +3001,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--min-mid-price-for-buys", type=float, default=None)
     parser.add_argument("--buy-pause-amp-trigger-ratio", type=float, default=None)
     parser.add_argument("--buy-pause-down-return-trigger-ratio", type=float, default=None)
+    parser.add_argument("--short-cover-pause-amp-trigger-ratio", type=float, default=None)
+    parser.add_argument("--short-cover-pause-down-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--freeze-shift-abs-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
@@ -3006,10 +3068,11 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         print(f"  error: {summary['error_message']}")
     if summary.get("pause_reasons"):
         print(f"  pause: {'; '.join(summary['pause_reasons'])}")
-    if summary.get("volatility_buy_pause") or summary.get("shift_frozen"):
+    if summary.get("volatility_buy_pause") or summary.get("short_cover_paused") or summary.get("shift_frozen"):
         print(
             "  market_guard: "
             f"buy_pause={'yes' if summary.get('volatility_buy_pause') else 'no'} "
+            f"short_cover_pause={'yes' if summary.get('short_cover_paused') else 'no'} "
             f"shift_frozen={'yes' if summary.get('shift_frozen') else 'no'} "
             f"ret={summary.get('market_guard_return_ratio', 0.0) * 100:.2f}% "
             f"amp={summary.get('market_guard_amplitude_ratio', 0.0) * 100:.2f}%"
@@ -3114,6 +3177,10 @@ def main() -> None:
         raise SystemExit("--buy-pause-amp-trigger-ratio must be > 0")
     if args.buy_pause_down_return_trigger_ratio is not None and args.buy_pause_down_return_trigger_ratio >= 0:
         raise SystemExit("--buy-pause-down-return-trigger-ratio must be < 0")
+    if args.short_cover_pause_amp_trigger_ratio is not None and args.short_cover_pause_amp_trigger_ratio <= 0:
+        raise SystemExit("--short-cover-pause-amp-trigger-ratio must be > 0")
+    if args.short_cover_pause_down_return_trigger_ratio is not None and args.short_cover_pause_down_return_trigger_ratio >= 0:
+        raise SystemExit("--short-cover-pause-down-return-trigger-ratio must be < 0")
     if args.freeze_shift_abs_return_trigger_ratio is not None and args.freeze_shift_abs_return_trigger_ratio <= 0:
         raise SystemExit("--freeze-shift-abs-return-trigger-ratio must be > 0")
     if args.auto_regime_confirm_cycles <= 0:
@@ -3344,6 +3411,7 @@ def main() -> None:
                 "planned_buy_notional": _safe_float(plan_report.get("planned_buy_notional")),
                 "max_position_notional": _safe_float(plan_report.get("max_position_notional")),
                 "short_cap_applied": bool(plan_report.get("short_cap_applied")),
+                "short_cover_paused": bool(plan_report.get("short_cover_paused")),
                 "short_budget_notional": _safe_float(plan_report.get("short_budget_notional")),
                 "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
                 "max_short_position_notional": _safe_float(plan_report.get("max_short_position_notional")),

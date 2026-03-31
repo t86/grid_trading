@@ -23,6 +23,7 @@ from grid_optimizer.loop_runner import (
     apply_inventory_tiering,
     apply_max_position_notional_cap,
     apply_position_controls,
+    apply_short_cover_pause,
     assess_auto_regime,
     assess_market_guard,
     build_effective_runner_args,
@@ -619,6 +620,24 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 1)
         self.assertEqual(result["pause_reasons"], ["1m_extreme_down_candle amp=0.80% ret=-0.40%"])
 
+    def test_apply_short_cover_pause_clears_buy_orders_when_active(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "SELL", "price": 0.051, "qty": 100, "role": "bootstrap_short"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 100, "role": "take_profit_short"}],
+            "sell_orders": [{"side": "SELL", "price": 0.052, "qty": 100, "role": "entry_short"}],
+        }
+
+        result = apply_short_cover_pause(
+            plan=plan,
+            active=True,
+            pause_reasons=["1m_short_cover_pause amp=0.80% ret=-0.40%"],
+        )
+
+        self.assertTrue(result["short_cover_paused"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(result["short_cover_pause_reasons"], ["1m_short_cover_pause amp=0.80% ret=-0.40%"])
+
     @patch("grid_optimizer.loop_runner.assess_auto_regime")
     def test_resolve_neutral_hourly_scale_caches_per_hour_bucket(self, mock_assess_auto_regime) -> None:
         now = datetime(2026, 3, 19, 10, 25, tzinfo=timezone.utc)
@@ -951,6 +970,8 @@ class LoopRunnerTests(unittest.TestCase):
             symbol="NIGHTUSDT",
             buy_pause_amp_trigger_ratio=0.0075,
             buy_pause_down_return_trigger_ratio=-0.0035,
+            short_cover_pause_amp_trigger_ratio=None,
+            short_cover_pause_down_return_trigger_ratio=None,
             freeze_shift_abs_return_trigger_ratio=0.0035,
             now=now,
         )
@@ -980,12 +1001,45 @@ class LoopRunnerTests(unittest.TestCase):
             symbol="NIGHTUSDT",
             buy_pause_amp_trigger_ratio=0.0075,
             buy_pause_down_return_trigger_ratio=-0.0035,
+            short_cover_pause_amp_trigger_ratio=None,
+            short_cover_pause_down_return_trigger_ratio=None,
             freeze_shift_abs_return_trigger_ratio=0.005,
             now=now,
         )
 
         self.assertTrue(result["available"])
         self.assertFalse(result["buy_pause_active"])
+        self.assertFalse(result["short_cover_pause_active"])
+        self.assertFalse(result["shift_frozen"])
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_market_guard_flags_short_cover_pause(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.return_value = [
+            Candle(
+                open_time=now - timedelta(minutes=1),
+                close_time=now - timedelta(seconds=1),
+                open=0.0500,
+                high=0.05025,
+                low=0.04970,
+                close=0.04980,
+            ),
+        ]
+
+        result = assess_market_guard(
+            symbol="NIGHTUSDT",
+            buy_pause_amp_trigger_ratio=None,
+            buy_pause_down_return_trigger_ratio=None,
+            short_cover_pause_amp_trigger_ratio=0.004,
+            short_cover_pause_down_return_trigger_ratio=-0.0018,
+            freeze_shift_abs_return_trigger_ratio=None,
+            now=now,
+        )
+
+        self.assertTrue(result["enabled"])
+        self.assertTrue(result["available"])
+        self.assertFalse(result["buy_pause_active"])
+        self.assertTrue(result["short_cover_pause_active"])
         self.assertFalse(result["shift_frozen"])
 
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")

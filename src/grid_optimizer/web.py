@@ -281,7 +281,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     },
     "night_volume_short_v1": {
         "label": "NIGHT 专用做空高换手",
-        "description": "针对 NIGHTUSDT 的低价高换手做空预设。收紧中心迁移触发与轮询周期，让第一笔卖空和第一笔买回更靠近，优先提升来回成交密度。",
+        "description": "针对 NIGHTUSDT 的低价高换手做空预设。仍然保留更快轮询和更近的首笔往返，但降低单笔、底仓和总空仓上限，并在急跌放量时暂停追着买回。",
         "startable": True,
         "kind": "one_way",
         "config": {
@@ -289,23 +289,24 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "step_price": 0.00002,
             "buy_levels": 8,
             "sell_levels": 8,
-            "per_order_notional": 70.0,
-            "base_position_notional": 420.0,
-            "up_trigger_steps": 2,
-            "down_trigger_steps": 2,
+            "per_order_notional": 45.0,
+            "base_position_notional": 180.0,
+            "up_trigger_steps": 4,
+            "down_trigger_steps": 4,
             "shift_steps": 2,
-            "pause_short_position_notional": 900.0,
-            "max_short_position_notional": 900.0,
-            "inventory_tier_start_notional": 600.0,
-            "inventory_tier_end_notional": 750.0,
-            "inventory_tier_buy_levels": 12,
+            "pause_short_position_notional": 450.0,
+            "max_short_position_notional": 600.0,
+            "inventory_tier_start_notional": 300.0,
+            "inventory_tier_end_notional": 450.0,
+            "inventory_tier_buy_levels": 10,
             "inventory_tier_sell_levels": 4,
-            "inventory_tier_per_order_notional": 70.0,
-            "inventory_tier_base_position_notional": 280.0,
-            "sleep_seconds": 5.0,
+            "inventory_tier_per_order_notional": 45.0,
+            "inventory_tier_base_position_notional": 90.0,
+            "sleep_seconds": 10.0,
             "autotune_symbol_enabled": False,
-            "short_cover_pause_amp_trigger_ratio": 0.0055,
-            "short_cover_pause_down_return_trigger_ratio": -0.0025,
+            "short_cover_pause_amp_trigger_ratio": 0.004,
+            "short_cover_pause_down_return_trigger_ratio": -0.0018,
+            "freeze_shift_abs_return_trigger_ratio": 0.0045,
         },
     },
     "volume_short_v1_conservative": {
@@ -1225,6 +1226,8 @@ def _normalize_custom_grid_runtime_config(config: dict[str, Any]) -> dict[str, A
     for field in {
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
@@ -1507,6 +1510,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "min_mid_price_for_buys",
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
@@ -1577,6 +1582,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "min_mid_price_for_buys",
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
@@ -1740,6 +1747,10 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--buy-pause-amp-trigger-ratio", str(config["buy_pause_amp_trigger_ratio"])])
     if config.get("buy_pause_down_return_trigger_ratio") is not None:
         command.extend(["--buy-pause-down-return-trigger-ratio", str(config["buy_pause_down_return_trigger_ratio"])])
+    if config.get("short_cover_pause_amp_trigger_ratio") is not None:
+        command.extend(["--short-cover-pause-amp-trigger-ratio", str(config["short_cover_pause_amp_trigger_ratio"])])
+    if config.get("short_cover_pause_down_return_trigger_ratio") is not None:
+        command.extend(["--short-cover-pause-down-return-trigger-ratio", str(config["short_cover_pause_down_return_trigger_ratio"])])
     if config.get("freeze_shift_abs_return_trigger_ratio") is not None:
         command.extend(["--freeze-shift-abs-return-trigger-ratio", str(config["freeze_shift_abs_return_trigger_ratio"])])
     command.append("--auto-regime-enabled" if config.get("auto_regime_enabled", False) else "--no-auto-regime-enabled")
@@ -1865,6 +1876,8 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "min_mid_price_for_buys",
             "buy_pause_amp_trigger_ratio",
             "buy_pause_down_return_trigger_ratio",
+            "short_cover_pause_amp_trigger_ratio",
+            "short_cover_pause_down_return_trigger_ratio",
             "freeze_shift_abs_return_trigger_ratio",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
@@ -8860,7 +8873,7 @@ MONITOR_PAGE = """<!doctype html>
       {
         key: "night_volume_short_v1",
         label: "NIGHT 专用做空高换手",
-        description: "针对 NIGHTUSDT 的低价高换手做空预设。收紧中心迁移触发与轮询周期，让第一笔卖空和第一笔买回更靠近，优先提升来回成交密度。",
+        description: "针对 NIGHTUSDT 的低价高换手做空预设。仍保留更快轮询和更近的首笔往返，但降低单笔、底仓和总空仓上限，并在急跌放量时暂停追着买回。",
         startable: true,
         kind: "one_way",
         config: {
@@ -8868,23 +8881,24 @@ MONITOR_PAGE = """<!doctype html>
           step_price: 0.00002,
           buy_levels: 8,
           sell_levels: 8,
-          per_order_notional: 70.0,
-          base_position_notional: 420.0,
-          up_trigger_steps: 2,
-          down_trigger_steps: 2,
+          per_order_notional: 45.0,
+          base_position_notional: 180.0,
+          up_trigger_steps: 4,
+          down_trigger_steps: 4,
           shift_steps: 2,
-          pause_short_position_notional: 900.0,
-          max_short_position_notional: 900.0,
-          inventory_tier_start_notional: 600.0,
-          inventory_tier_end_notional: 750.0,
-          inventory_tier_buy_levels: 12,
+          pause_short_position_notional: 450.0,
+          max_short_position_notional: 600.0,
+          inventory_tier_start_notional: 300.0,
+          inventory_tier_end_notional: 450.0,
+          inventory_tier_buy_levels: 10,
           inventory_tier_sell_levels: 4,
-          inventory_tier_per_order_notional: 70.0,
-          inventory_tier_base_position_notional: 280.0,
-          sleep_seconds: 5.0,
+          inventory_tier_per_order_notional: 45.0,
+          inventory_tier_base_position_notional: 90.0,
+          sleep_seconds: 10.0,
           autotune_symbol_enabled: false,
-          short_cover_pause_amp_trigger_ratio: 0.0055,
-          short_cover_pause_down_return_trigger_ratio: -0.0025,
+          short_cover_pause_amp_trigger_ratio: 0.004,
+          short_cover_pause_down_return_trigger_ratio: -0.0018,
+          freeze_shift_abs_return_trigger_ratio: 0.0045,
         },
       },
       {
@@ -9551,9 +9565,9 @@ MONITOR_PAGE = """<!doctype html>
         ],
       },
       night_volume_short_v1: {
-        summary: "针对 NIGHTUSDT 的高换手做空版。核心是把第一笔卖空和第一笔买回压得更近，尽快做出往返成交。",
+        summary: "针对 NIGHTUSDT 的高换手做空版。仍然偏快，但比原先明显收了单笔、底仓和总空仓，并加入急跌停回补保护。",
         focus: [
-          "比通用空头版更快移中心、更快轮询，所以更适合低价、高成交密度的币种。",
+          "比通用空头版仍然更快移中心、更快轮询，但不会像之前那样一边放大仓位一边追着回补。",
         ],
       },
       volume_short_v1_conservative: {
@@ -9791,6 +9805,11 @@ MONITOR_PAGE = """<!doctype html>
         if (maxShort > 0) {
           lines.push(`如果这一轮计划中的新增空仓会把总空仓推过 ${fmtGuideNotional(maxShort)}，多出来的卖单会被裁剪，不会整轮直接放行。`);
         }
+        if (asGuideNumber(config.short_cover_pause_amp_trigger_ratio) > 0 && asGuideNumber(config.short_cover_pause_down_return_trigger_ratio) !== null) {
+          lines.push(
+            `最近 1 分钟如果同时满足“振幅 >= ${fmtGuidePctFromRatio(config.short_cover_pause_amp_trigger_ratio)}”且“收跌 <= ${fmtGuidePctFromRatio(config.short_cover_pause_down_return_trigger_ratio)}”，BUY 回补单会被暂停，避免在急跌里过早回补。`
+          );
+        }
       } else if (mode === "hedge_neutral" || mode === "synthetic_neutral" || mode === "inventory_target_neutral") {
         if (buyPause > 0) {
           lines.push(`LONG 侧名义达到 ${fmtGuideNotional(buyPause)} 时，LONG 开仓买单会被清掉，只保留 LONG 卖出减仓单。`);
@@ -9875,13 +9894,6 @@ MONITOR_PAGE = """<!doctype html>
           `15m 振幅 >= ${fmtGuidePctFromRatio(config.auto_regime_defensive_15m_amplitude_ratio)}、60m 振幅 >= ${fmtGuidePctFromRatio(config.auto_regime_defensive_60m_amplitude_ratio)}，或 15m / 60m 跌幅分别 <= ${fmtGuidePctFromRatio(config.auto_regime_defensive_15m_return_ratio)} / ${fmtGuidePctFromRatio(config.auto_regime_defensive_60m_return_ratio)} 时，候选切到 defensive。`
         );
         lines.push(`候选状态连续满足 ${Math.max(Number(config.auto_regime_confirm_cycles) || 1, 1)} 轮后，才会真正切换到另一套参数，避免来回抖动。`);
-      }
-
-      if (mode === "one_way_short" && (
-        config.short_cover_pause_amp_trigger_ratio !== undefined
-        || config.short_cover_pause_down_return_trigger_ratio !== undefined
-      )) {
-        lines.push("注意：当前 JSON 里的 short_cover_pause_* 字段还没有接入 loop_runner 实际暂停逻辑，现在只会展示，不会真的触发“暂停买回补空”。");
       }
 
       if (mode === "inventory_target_neutral") {

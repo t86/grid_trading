@@ -116,7 +116,7 @@
 - `short_cover_pause_amp_trigger_ratio`
 - `short_cover_pause_down_return_trigger_ratio`
 
-这两个字段目前还没有接入 `loop_runner` 的实际暂停逻辑，现阶段只是保存在配置里，不会真的触发“暂停买回补空”。
+最近 1 分钟如果同时满足“振幅 >= short_cover_pause_amp_trigger_ratio”且“收跌 <= short_cover_pause_down_return_trigger_ratio”，`loop_runner` 会暂停本轮买回补空单，避免在急跌扩振里过早回补。
 
 ### 3. `hedge_neutral`
 

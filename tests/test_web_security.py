@@ -493,6 +493,8 @@ class WebSecurityTests(unittest.TestCase):
                 "shift_steps": 2,
                 "pause_short_position_notional": 260.0,
                 "max_short_position_notional": 300.0,
+                "short_cover_pause_amp_trigger_ratio": 0.004,
+                "short_cover_pause_down_return_trigger_ratio": -0.0018,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -513,6 +515,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("one_way_short", command)
         self.assertIn("--pause-short-position-notional", command)
         self.assertIn("--max-short-position-notional", command)
+        self.assertIn("--short-cover-pause-amp-trigger-ratio", command)
+        self.assertIn("--short-cover-pause-down-return-trigger-ratio", command)
 
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:
