@@ -232,12 +232,17 @@ class WebSecurityTests(unittest.TestCase):
             self.assertEqual(payload["custom_grid_direction"], "long")
             self.assertEqual(payload["custom_grid_n"], 120)
             self.assertAlmostEqual(payload["custom_grid_total_notional"], 1000.0)
-            self.assertTrue(payload["excess_inventory_reduce_only_enabled"])
+            self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
             self.assertFalse(payload["auto_regime_enabled"])
             self.assertFalse(payload["neutral_hourly_scale_enabled"])
             self.assertIsNone(payload["inventory_tier_start_notional"])
             self.assertIsNone(payload["inventory_tier_buy_levels"])
             self.assertIsNone(payload["buy_pause_amp_trigger_ratio"])
+            self.assertFalse(payload["custom_grid_roll_enabled"])
+            self.assertEqual(payload["custom_grid_roll_interval_minutes"], 5)
+            self.assertEqual(payload["custom_grid_roll_trade_threshold"], 100)
+            self.assertAlmostEqual(payload["custom_grid_roll_upper_distance_ratio"], 0.30)
+            self.assertEqual(payload["custom_grid_roll_shift_levels"], 1)
         finally:
             custom_path.unlink(missing_ok=True)
 
@@ -420,6 +425,48 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--custom-grid-min-price", command)
         self.assertIn("--custom-grid-total-notional", command)
 
+    def test_build_runner_command_includes_custom_grid_roll_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "KATUSDT",
+                "strategy_profile": "custom_grid_katusdt_demo",
+                "strategy_mode": "one_way_long",
+                "step_price": 0.00001,
+                "buy_levels": 10,
+                "sell_levels": 10,
+                "per_order_notional": 10.0,
+                "base_position_notional": 100.0,
+                "custom_grid_enabled": True,
+                "custom_grid_direction": "long",
+                "custom_grid_level_mode": "arithmetic",
+                "custom_grid_min_price": 0.00995,
+                "custom_grid_max_price": 0.01115,
+                "custom_grid_n": 120,
+                "custom_grid_total_notional": 1000.0,
+                "custom_grid_roll_enabled": True,
+                "custom_grid_roll_interval_minutes": 5,
+                "custom_grid_roll_trade_threshold": 100,
+                "custom_grid_roll_upper_distance_ratio": 0.30,
+                "custom_grid_roll_shift_levels": 1,
+                "margin_type": "KEEP",
+                "leverage": 10,
+                "max_new_orders": 200,
+                "max_total_notional": 1200.0,
+                "state_path": "output/katusdt_loop_state.json",
+                "plan_json": "output/katusdt_loop_plan.json",
+                "submit_report_json": "output/katusdt_loop_submit.json",
+                "summary_jsonl": "output/katusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+        self.assertIn("--custom-grid-roll-enabled", command)
+        self.assertIn("--custom-grid-roll-interval-minutes", command)
+        self.assertIn("--custom-grid-roll-trade-threshold", command)
+        self.assertIn("--custom-grid-roll-upper-distance-ratio", command)
+        self.assertIn("--custom-grid-roll-shift-levels", command)
+
     def test_build_runner_command_supports_one_way_short(self) -> None:
         command = _build_runner_command(
             {
@@ -507,7 +554,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(built["preset"]["config"]["custom_grid_enabled"])
         self.assertFalse(built["preset"]["config"]["fixed_center_enabled"])
         self.assertFalse(built["preset"]["config"]["fixed_center_roll_enabled"])
-        self.assertTrue(built["preset"]["config"]["excess_inventory_reduce_only_enabled"])
+        self.assertFalse(built["preset"]["config"]["excess_inventory_reduce_only_enabled"])
         self.assertFalse(built["preset"]["config"]["autotune_symbol_enabled"])
         self.assertEqual(built["preset"]["config"]["max_total_notional"], 1000.0)
         self.assertAlmostEqual(built["preset"]["config"]["per_order_notional"], 11.25)
@@ -758,6 +805,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="custom_grid_load_btn"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_update_btn"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_delete_btn"', MONITOR_PAGE)
+        self.assertIn('id="custom_grid_roll_enabled"', MONITOR_PAGE)
+        self.assertIn('id="custom_grid_roll_interval_minutes"', MONITOR_PAGE)
+        self.assertIn('id="custom_grid_roll_trade_threshold"', MONITOR_PAGE)
+        self.assertIn('id="custom_grid_roll_upper_distance_ratio"', MONITOR_PAGE)
+        self.assertIn('id="custom_grid_roll_shift_levels"', MONITOR_PAGE)
 
     def test_strategies_page_contains_manual_symbol_list_controls(self) -> None:
         self.assertIn('id="monitor_symbol_input"', STRATEGIES_PAGE)
