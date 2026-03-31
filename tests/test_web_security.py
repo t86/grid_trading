@@ -50,6 +50,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("现价启动底仓", MONITOR_PAGE)
         self.assertIn("合约 USDT", MONITOR_PAGE)
         self.assertIn("合约 BNB", MONITOR_PAGE)
+        self.assertIn("定位参数", MONITOR_PAGE)
+        self.assertIn("生成建议参数", MONITOR_PAGE)
+        self.assertIn("data-alert-action", MONITOR_PAGE)
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")

@@ -8163,6 +8163,33 @@ MONITOR_PAGE = """<!doctype html>
       margin-top: 6px;
       color: var(--text);
     }
+    .alert-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .alert-action-btn {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: #0f423f;
+      font-size: 12px;
+      font-weight: 700;
+      height: 32px;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    .alert-action-btn.primary {
+      background: var(--brand-soft);
+      border-color: rgba(15, 118, 110, 0.24);
+      color: var(--brand);
+    }
+    .alert-action-btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
     .alert-empty {
       border: 1px dashed var(--line);
       border-radius: 12px;
@@ -8970,6 +8997,86 @@ MONITOR_PAGE = """<!doctype html>
       summary_jsonl: "循环事件日志文件路径。",
       custom_grid_enabled: "是否启用自定义网格模式。"
     };
+    const ALERT_PARAM_KEYS = {
+      margin_insufficient: [
+        "base_position_notional",
+        "per_order_notional",
+        "buy_levels",
+        "sell_levels",
+        "pause_buy_position_notional",
+        "pause_short_position_notional",
+        "max_position_notional",
+        "max_short_position_notional",
+        "max_new_orders",
+      ],
+      rate_limited: [
+        "sleep_seconds",
+        "max_new_orders",
+        "maker_retries",
+      ],
+      post_only_rejected: [
+        "step_price",
+        "maker_retries",
+        "sleep_seconds",
+      ],
+      validation_failed: [
+        "strategy_mode",
+        "margin_type",
+        "leverage",
+      ],
+      buy_paused: [
+        "buy_levels",
+        "per_order_notional",
+        "base_position_notional",
+        "pause_buy_position_notional",
+        "inventory_tier_buy_levels",
+        "inventory_tier_per_order_notional",
+        "excess_inventory_reduce_only_enabled",
+      ],
+      short_paused: [
+        "sell_levels",
+        "per_order_notional",
+        "base_position_notional",
+        "pause_short_position_notional",
+        "inventory_tier_sell_levels",
+        "inventory_tier_per_order_notional",
+        "excess_inventory_reduce_only_enabled",
+      ],
+      buy_cap_applied: [
+        "buy_levels",
+        "per_order_notional",
+        "max_position_notional",
+        "max_new_orders",
+      ],
+      short_cap_applied: [
+        "sell_levels",
+        "per_order_notional",
+        "max_short_position_notional",
+        "max_new_orders",
+      ],
+      volatility_buy_pause: [
+        "buy_pause_amp_trigger_ratio",
+        "buy_pause_down_return_trigger_ratio",
+        "sleep_seconds",
+      ],
+      shift_frozen: [
+        "freeze_shift_abs_return_trigger_ratio",
+        "up_trigger_steps",
+        "down_trigger_steps",
+        "shift_steps",
+      ],
+    };
+    const ALERT_SUGGESTION_LABELS = {
+      margin_insufficient: "保证金不足",
+      rate_limited: "频率超限",
+      post_only_rejected: "Post only 拒单",
+      buy_paused: "停买",
+      short_paused: "停空",
+      buy_cap_applied: "多仓硬上限裁剪",
+      short_cap_applied: "空仓硬上限裁剪",
+      volatility_buy_pause: "分钟级停买",
+      shift_frozen: "冻结中心迁移",
+    };
 
     async function loadMonitorSymbols(preferredSymbol = "") {
       try {
@@ -9097,6 +9204,170 @@ MONITOR_PAGE = """<!doctype html>
         latestMonitorData = data;
       }
       return data;
+    }
+
+    function alertParamKeys(code) {
+      const normalizedCode = String(code || "").trim();
+      return (ALERT_PARAM_KEYS[normalizedCode] || []).slice();
+    }
+
+    function alertSupportsSuggestion(code) {
+      return Boolean(ALERT_SUGGESTION_LABELS[String(code || "").trim()]);
+    }
+
+    function formatAlertCodeLabel(code) {
+      return ALERT_SUGGESTION_LABELS[String(code || "").trim()] || String(code || "当前告警");
+    }
+
+    function scaleNumber(value, ratio, digits = 4, minValue = null) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return value;
+      const scaled = num * ratio;
+      const clamped = minValue === null ? scaled : Math.max(minValue, scaled);
+      return Number(clamped.toFixed(digits));
+    }
+
+    function reduceInteger(value, delta, minValue = 1) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return value;
+      return Math.max(minValue, Math.round(num - delta));
+    }
+
+    function readRunnerEditorConfigFromTextarea() {
+      const payload = JSON.parse(runnerParamsEditorEl.value || "{}");
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("参数编辑器内容必须是 JSON 对象。");
+      }
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      return normalizeRunnerRuntimePaths(payload, selectedSymbol);
+    }
+
+    async function ensureEditorConfigForAlert() {
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      try {
+        const payload = readRunnerEditorConfigFromTextarea();
+        const configSymbol = String(payload.symbol || "").trim().toUpperCase();
+        if (!configSymbol || configSymbol === selectedSymbol) {
+          latestRunnerEditorConfig = payload;
+          return payload;
+        }
+      } catch (_err) {
+      }
+      await loadRunningConfigToEditor(true);
+      return readRunnerEditorConfigFromTextarea();
+    }
+
+    function focusRunnerEditorOnKey(key) {
+      if (!key) return false;
+      const marker = `"${String(key)}"`;
+      const text = runnerParamsEditorEl.value || "";
+      const idx = text.indexOf(marker);
+      runnerParamsEditorEl.focus();
+      if (idx < 0) return false;
+      runnerParamsEditorEl.setSelectionRange(idx, idx + marker.length);
+      const linesBefore = text.slice(0, idx).split("\n").length - 1;
+      runnerParamsEditorEl.scrollTop = Math.max(0, (linesBefore - 2) * 24);
+      return true;
+    }
+
+    async function locateAlertParams(code) {
+      const keys = alertParamKeys(code);
+      if (!keys.length) {
+        runnerParamsMetaEl.textContent = `告警“${formatAlertCodeLabel(code)}”更偏运行环境或账户状态，没有直接对应的参数可定位。`;
+        return;
+      }
+      const config = await ensureEditorConfigForAlert();
+      const primaryKey = keys.find((key) => Object.prototype.hasOwnProperty.call(config, key)) || keys[0];
+      const located = focusRunnerEditorOnKey(primaryKey);
+      runnerParamsMetaEl.textContent = `已定位“${formatAlertCodeLabel(code)}”相关参数：${keys.join("、")}${located ? "" : "（当前 JSON 里未显式写出首个参数，但建议优先检查它）"}。`;
+      renderRunnerParamGuide(config);
+    }
+
+    function buildAlertSuggestion(code, currentConfig) {
+      const normalizedCode = String(code || "").trim();
+      const nextConfig = JSON.parse(JSON.stringify(currentConfig || {}));
+      const changedKeys = [];
+      const applyChange = (key, value) => {
+        if (value === undefined) return;
+        if (nextConfig[key] === value) return;
+        nextConfig[key] = value;
+        changedKeys.push(key);
+      };
+      if (normalizedCode === "margin_insufficient") {
+        applyChange("autotune_symbol_enabled", false);
+        applyChange("base_position_notional", scaleNumber(nextConfig.base_position_notional, 0.75, 4, 20));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.8, 4, 5));
+        applyChange("buy_levels", reduceInteger(nextConfig.buy_levels, 2, 2));
+        applyChange("sell_levels", reduceInteger(nextConfig.sell_levels, 1, 2));
+        applyChange("pause_buy_position_notional", scaleNumber(nextConfig.pause_buy_position_notional, 0.82, 4, 50));
+        applyChange("pause_short_position_notional", scaleNumber(nextConfig.pause_short_position_notional, 0.82, 4, 50));
+        applyChange("max_position_notional", scaleNumber(nextConfig.max_position_notional, 0.82, 4, 80));
+        applyChange("max_short_position_notional", scaleNumber(nextConfig.max_short_position_notional, 0.82, 4, 80));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 4, 4));
+      } else if (normalizedCode === "rate_limited") {
+        applyChange("sleep_seconds", Math.max(10, Math.round(Number(nextConfig.sleep_seconds || 5) + 3)));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 4, 4));
+        applyChange("maker_retries", reduceInteger(nextConfig.maker_retries, 1, 1));
+      } else if (normalizedCode === "post_only_rejected") {
+        applyChange("step_price", scaleNumber(nextConfig.step_price, 1.5, 7, 0.0000001));
+        applyChange("maker_retries", reduceInteger(nextConfig.maker_retries, 1, 1));
+        applyChange("sleep_seconds", Math.max(6, Math.round(Number(nextConfig.sleep_seconds || 5))));
+      } else if (normalizedCode === "buy_paused") {
+        applyChange("autotune_symbol_enabled", false);
+        applyChange("buy_levels", reduceInteger(nextConfig.buy_levels, 2, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.88, 4, 5));
+        applyChange("base_position_notional", scaleNumber(nextConfig.base_position_notional, 0.9, 4, 20));
+        applyChange("inventory_tier_buy_levels", reduceInteger(nextConfig.inventory_tier_buy_levels, 1, 1));
+        applyChange("inventory_tier_per_order_notional", scaleNumber(nextConfig.inventory_tier_per_order_notional, 0.88, 4, 5));
+        applyChange("excess_inventory_reduce_only_enabled", true);
+      } else if (normalizedCode === "short_paused") {
+        applyChange("autotune_symbol_enabled", false);
+        applyChange("sell_levels", reduceInteger(nextConfig.sell_levels, 2, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.88, 4, 5));
+        applyChange("base_position_notional", scaleNumber(nextConfig.base_position_notional, 0.9, 4, 20));
+        applyChange("inventory_tier_sell_levels", reduceInteger(nextConfig.inventory_tier_sell_levels, 2, 2));
+        applyChange("inventory_tier_per_order_notional", scaleNumber(nextConfig.inventory_tier_per_order_notional, 0.88, 4, 5));
+        applyChange("excess_inventory_reduce_only_enabled", true);
+      } else if (normalizedCode === "buy_cap_applied") {
+        applyChange("buy_levels", reduceInteger(nextConfig.buy_levels, 1, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.92, 4, 5));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 2, 4));
+      } else if (normalizedCode === "short_cap_applied") {
+        applyChange("sell_levels", reduceInteger(nextConfig.sell_levels, 1, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.92, 4, 5));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 2, 4));
+      } else if (normalizedCode === "volatility_buy_pause") {
+        applyChange("buy_pause_amp_trigger_ratio", scaleNumber(nextConfig.buy_pause_amp_trigger_ratio, 1.15, 6, 0.0001));
+        const downReturn = Number(nextConfig.buy_pause_down_return_trigger_ratio);
+        if (Number.isFinite(downReturn) && downReturn < 0) {
+          applyChange("buy_pause_down_return_trigger_ratio", Number((downReturn * 1.15).toFixed(6)));
+        }
+        applyChange("sleep_seconds", Math.max(6, Math.round(Number(nextConfig.sleep_seconds || 5) + 1)));
+      } else if (normalizedCode === "shift_frozen") {
+        applyChange("freeze_shift_abs_return_trigger_ratio", scaleNumber(nextConfig.freeze_shift_abs_return_trigger_ratio, 1.15, 6, 0.0001));
+        applyChange("shift_steps", Math.max(1, Math.round(Number(nextConfig.shift_steps || 1))));
+      } else {
+        return null;
+      }
+      return { config: normalizeRunnerRuntimePaths(nextConfig, nextConfig.symbol || symbolEl.value), changedKeys };
+    }
+
+    async function applyAlertSuggestion(code) {
+      if (!alertSupportsSuggestion(code)) {
+        runnerParamsMetaEl.textContent = `告警“${formatAlertCodeLabel(code)}”暂时没有安全的通用建议参数，请先手动检查当前配置。`;
+        return;
+      }
+      const config = await ensureEditorConfigForAlert();
+      const suggestion = buildAlertSuggestion(code, config);
+      if (!suggestion || !suggestion.changedKeys.length) {
+        runnerParamsMetaEl.textContent = `告警“${formatAlertCodeLabel(code)}”当前没有可自动生成的建议参数。`;
+        return;
+      }
+      setRunnerEditorConfig(
+        suggestion.config,
+        `已按“${formatAlertCodeLabel(code)}”生成建议参数：${suggestion.changedKeys.join("、")}。请检查后再点“应用参数并启动”。`
+      );
+      focusRunnerEditorOnKey(suggestion.changedKeys[0]);
     }
 
     const RUNNER_PROFILE_GUIDE_NOTES = {
@@ -10037,7 +10308,19 @@ MONITOR_PAGE = """<!doctype html>
         const severity = ["critical", "warning", "info"].includes(item.severity) ? item.severity : "info";
         const detail = String(item.detail || "").trim();
         const action = String(item.action || "").trim();
+        const code = String(item.code || "").trim();
         const ts = item.ts ? fmtTs(item.ts) : "";
+        const actionButtons = [];
+        if (code && alertParamKeys(code).length) {
+          actionButtons.push(
+            `<button type="button" class="alert-action-btn" data-alert-action="locate" data-alert-code="${escapeHtml(code)}">定位参数</button>`
+          );
+        }
+        if (code && alertSupportsSuggestion(code)) {
+          actionButtons.push(
+            `<button type="button" class="alert-action-btn primary" data-alert-action="suggest" data-alert-code="${escapeHtml(code)}">生成建议参数</button>`
+          );
+        }
         return `
           <div class="alert-item ${severity}">
             <div class="alert-head">
@@ -10046,6 +10329,7 @@ MONITOR_PAGE = """<!doctype html>
             </div>
             ${detail ? `<div class="alert-detail">${escapeHtml(detail)}</div>` : ""}
             ${action ? `<div class="alert-action">建议：${escapeHtml(action)}</div>` : ""}
+            ${actionButtons.length ? `<div class="alert-actions">${actionButtons.join("")}</div>` : ""}
             ${ts ? `<div class="alert-ts">时间：${escapeHtml(ts)}</div>` : ""}
           </div>
         `;
@@ -10403,6 +10687,25 @@ MONITOR_PAGE = """<!doctype html>
     loadPresetParamsBtn.addEventListener("click", loadPresetConfigToEditor);
     applyParamsBtn.addEventListener("click", applyRunnerParams);
     runnerParamsEditorEl.addEventListener("input", syncRunnerParamGuideFromEditor);
+    alertBoxEl.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-alert-action]");
+      if (!button) return;
+      const action = String(button.getAttribute("data-alert-action") || "").trim();
+      const code = String(button.getAttribute("data-alert-code") || "").trim();
+      if (!action || !code) return;
+      button.disabled = true;
+      try {
+        if (action === "locate") {
+          await locateAlertParams(code);
+        } else if (action === "suggest") {
+          await applyAlertSuggestion(code);
+        }
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `告警动作失败: ${err}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
     customGridPreviewBtn.addEventListener("click", runCustomGridPreview);
     customGridSaveBtn.addEventListener("click", saveCustomGridStrategy);
     customGridLoadBtn.addEventListener("click", loadCustomGridPresetToForm);
