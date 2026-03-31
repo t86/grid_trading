@@ -17,6 +17,7 @@ venv/
 # Project outputs and local cache
 data/
 output/
+.worktrees/
 
 # Temp files
 *.log
