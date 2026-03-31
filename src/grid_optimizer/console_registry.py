@@ -25,7 +25,7 @@ def load_console_registry(path: Path | str | None = None) -> dict[str, Any]:
         raise ValueError("Duplicate account id in console registry")
 
     competition_source = _normalize_competition_source(raw.get("competition_source"), servers_by_id)
-    default_account = _select_default_account(accounts)
+    default_account = _select_default_account(accounts, servers_by_id)
 
     return {
         "servers": servers,
@@ -73,6 +73,13 @@ def _require_int(item: dict[str, Any], key: str, context: str) -> int:
     return value
 
 
+def _require_bool(item: dict[str, Any], key: str, context: str) -> bool:
+    value = item.get(key)
+    if not isinstance(value, bool):
+        raise ValueError(f"{context} must include a boolean {key}")
+    return value
+
+
 def _require_str_list(item: dict[str, Any], key: str, context: str) -> list[str]:
     value = item.get(key, [])
     if not isinstance(value, list) or any(not isinstance(entry, str) for entry in value):
@@ -87,7 +94,7 @@ def _normalize_server(item: Any) -> dict[str, Any]:
     normalized["id"] = server_id
     normalized["label"] = _require_str(server, "label", f"server {server_id}")
     normalized["base_url"] = _require_str(server, "base_url", f"server {server_id}")
-    normalized["enabled"] = bool(server.get("enabled", True))
+    normalized["enabled"] = _require_bool(server, "enabled", f"server {server_id}")
     normalized["capabilities"] = _require_str_list(server, "capabilities", f"server {server_id}")
     return normalized
 
@@ -107,7 +114,7 @@ def _normalize_account(item: Any, servers_by_id: dict[str, dict[str, Any]]) -> d
     normalized["label"] = _require_str(account, "label", f"account {account_id}")
     normalized["kind"] = kind
     normalized["priority"] = _require_int(account, "priority", f"account {account_id}")
-    normalized["enabled"] = bool(account.get("enabled", True))
+    normalized["enabled"] = _require_bool(account, "enabled", f"account {account_id}")
     normalized["default_symbols"] = _require_str_list(account, "default_symbols", f"account {account_id}")
     normalized["competition_symbols"] = _require_str_list(account, "competition_symbols", f"account {account_id}")
     normalized["pages"] = _require_str_list(account, "pages", f"account {account_id}")
@@ -129,11 +136,17 @@ def _normalize_competition_source(
     return normalized
 
 
-def _select_default_account(accounts: list[dict[str, Any]]) -> dict[str, Any]:
+def _select_default_account(
+    accounts: list[dict[str, Any]],
+    servers_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
     best_account: dict[str, Any] | None = None
     best_priority: int | None = None
     for account in accounts:
         if not account["enabled"]:
+            continue
+        server = servers_by_id[account["server_id"]]
+        if not server["enabled"]:
             continue
         priority = account["priority"]
         if best_account is None or priority > best_priority:
