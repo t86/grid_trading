@@ -4,8 +4,10 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from grid_optimizer.console_registry import load_console_registry
+from grid_optimizer.console_overview import build_console_overview
 
 
 class ConsoleRegistryTests(unittest.TestCase):
@@ -87,6 +89,73 @@ class ConsoleRegistryTests(unittest.TestCase):
 
             with self.assertRaisesRegex(ValueError, "Unknown server_id"):
                 load_console_registry(registry_path)
+
+
+class ConsoleOverviewTests(unittest.TestCase):
+    def _registry(self) -> dict[str, object]:
+        account = {
+            "id": "acct_main_a",
+            "label": "Main",
+            "server_id": "srv_150",
+            "kind": "futures",
+            "priority": 100,
+            "enabled": True,
+            "default_symbols": ["BARDUSDT"],
+            "competition_symbols": ["KAT", "BARD"],
+            "pages": ["/monitor", "/strategies", "/competition_board", "/spot_runner", "/spot_strategies", "/basis"],
+        }
+        server = {
+            "id": "srv_150",
+            "label": "A",
+            "base_url": "http://node-a:8788",
+            "enabled": True,
+            "capabilities": ["futures_monitor", "competition_board", "strategies", "spot_runner", "spot_strategies", "basis"],
+        }
+        return {
+            "servers": [server],
+            "servers_by_id": {"srv_150": server},
+            "accounts": [account],
+            "accounts_by_id": {"acct_main_a": account},
+            "default_account": account,
+            "competition_source": {"server_id": "srv_150", "path": "/api/competition_board"},
+        }
+
+    @patch("grid_optimizer.console_overview._fetch_remote_json")
+    def test_build_console_overview_returns_links_and_competitions(self, mock_fetch_remote_json) -> None:
+        mock_fetch_remote_json.side_effect = [
+            {"ok": True},
+            {"ok": True, "symbol": "BARDUSDT", "snapshot": {"runner_status": "running", "open_orders": [1, 2]}},
+            {
+                "ok": True,
+                "snapshot": {
+                    "boards": [
+                        {"symbol": "KAT", "market": "spot", "label": "KAT activity"},
+                        {"symbol": "ENSO", "market": "futures", "label": "ENSO activity"},
+                    ]
+                },
+            },
+        ]
+
+        overview = build_console_overview(self._registry(), "acct_main_a")
+
+        self.assertTrue(overview["ok"])
+        self.assertEqual(overview["account"]["id"], "acct_main_a")
+        self.assertEqual(overview["links"]["monitor"], "http://node-a:8788/monitor")
+        self.assertEqual(overview["links"]["competition_board"], "http://node-a:8788/competition_board")
+        self.assertEqual(len(overview["competitions"]), 1)
+        self.assertEqual(overview["competitions"][0]["symbol"], "KAT")
+
+    @patch("grid_optimizer.console_overview._fetch_remote_json")
+    def test_build_console_overview_degrades_when_health_fails(self, mock_fetch_remote_json) -> None:
+        mock_fetch_remote_json.side_effect = RuntimeError("health timeout")
+
+        overview = build_console_overview(self._registry(), "acct_main_a")
+
+        self.assertTrue(overview["ok"])
+        self.assertEqual(overview["health"]["status"], "offline")
+        self.assertEqual(overview["links"]["competition_board"], "http://node-a:8788/competition_board")
+        self.assertGreaterEqual(len(overview["warnings"]), 1)
+        self.assertIn("health timeout", overview["warnings"][0])
 
 
 if __name__ == "__main__":
