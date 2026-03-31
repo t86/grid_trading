@@ -9,6 +9,7 @@ from grid_optimizer.monitor import (
     _filter_events_since,
     _filter_rows_since,
     _read_runner_process,
+    build_monitor_alerts,
     summarize_hourly_metrics,
     summarize_income,
     summarize_loop_events,
@@ -167,6 +168,70 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(summary["cycle_count"], 2)
         self.assertEqual(summary["error_count"], 0)
         self.assertEqual(summary["success_count"], 2)
+
+    def test_build_monitor_alerts_maps_margin_error_and_pause_reason(self) -> None:
+        loop_summary = {
+            "recent": [
+                {
+                    "ts": "2026-03-30T15:00:00+00:00",
+                    "cycle": 12,
+                    "error_message": "RuntimeError: Binance API error -2019: Margin is insufficient.",
+                }
+            ]
+        }
+        risk_controls = {
+            "buy_paused": True,
+            "pause_reasons": ["current_long_notional=820.0000 >= pause_buy_position_notional=750.0000"],
+            "short_paused": False,
+            "short_pause_reasons": [],
+            "buy_cap_applied": False,
+            "short_cap_applied": False,
+            "volatility_buy_pause": False,
+            "shift_frozen": False,
+        }
+
+        alerts = build_monitor_alerts(
+            loop_summary=loop_summary,
+            warnings=[],
+            risk_controls=risk_controls,
+            runner={"configured": True, "is_running": True},
+        )
+
+        self.assertEqual(alerts[0]["code"], "margin_insufficient")
+        self.assertEqual(alerts[0]["severity"], "critical")
+        self.assertEqual(alerts[1]["code"], "buy_paused")
+
+    def test_build_monitor_alerts_maps_rate_limit_and_dead_runner(self) -> None:
+        loop_summary = {
+            "recent": [
+                {
+                    "ts": "2026-03-30T15:00:00+00:00",
+                    "cycle": 22,
+                    "error_message": "RuntimeError: Binance API error -1003: Too many requests;",
+                }
+            ]
+        }
+        risk_controls = {
+            "buy_paused": False,
+            "pause_reasons": [],
+            "short_paused": False,
+            "short_pause_reasons": [],
+            "buy_cap_applied": False,
+            "short_cap_applied": False,
+            "volatility_buy_pause": False,
+            "shift_frozen": False,
+        }
+
+        alerts = build_monitor_alerts(
+            loop_summary=loop_summary,
+            warnings=["runner_pid_present_but_process_not_running"],
+            risk_controls=risk_controls,
+            runner={"configured": True, "is_running": False},
+        )
+
+        codes = [item["code"] for item in alerts]
+        self.assertIn("runner_not_running", codes)
+        self.assertIn("rate_limited", codes)
 
     def test_filter_rows_since_discards_older_trade_rows(self) -> None:
         floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)

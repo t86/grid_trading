@@ -720,6 +720,224 @@ def summarize_loop_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _latest_recent_error(loop_summary: dict[str, Any]) -> dict[str, Any] | None:
+    rows = loop_summary.get("recent") or []
+    for item in reversed(rows):
+        if str(item.get("error_message", "")).strip():
+            return item
+    return None
+
+
+def _push_alert(
+    alerts: list[dict[str, Any]],
+    seen_codes: set[str],
+    *,
+    code: str,
+    severity: str,
+    title: str,
+    detail: str,
+    action: str | None = None,
+    ts: str | None = None,
+) -> None:
+    if code in seen_codes:
+        return
+    seen_codes.add(code)
+    alerts.append(
+        {
+            "code": code,
+            "severity": severity,
+            "title": title,
+            "detail": detail,
+            "action": action,
+            "ts": ts,
+        }
+    )
+
+
+def build_monitor_alerts(
+    *,
+    loop_summary: dict[str, Any],
+    warnings: list[str],
+    risk_controls: dict[str, Any],
+    runner: dict[str, Any],
+) -> list[dict[str, Any]]:
+    alerts: list[dict[str, Any]] = []
+    seen_codes: set[str] = set()
+
+    latest_error = _latest_recent_error(loop_summary)
+    latest_error_message = str((latest_error or {}).get("error_message", "")).strip()
+    latest_error_ts = str((latest_error or {}).get("ts", "")).strip() or None
+
+    if runner.get("configured") and not runner.get("is_running"):
+        _push_alert(
+            alerts,
+            seen_codes,
+            code="runner_not_running",
+            severity="critical",
+            title="策略进程已退出",
+            detail="监控检测到本地控制文件存在，但 loop_runner 进程当前不在运行。",
+            action="先看最近循环日志和错误事件，再决定是否直接重启策略。",
+        )
+
+    if latest_error_message:
+        if "-2019" in latest_error_message or "Margin is insufficient" in latest_error_message:
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="margin_insufficient",
+                severity="critical",
+                title="保证金不足，交易所已拒单",
+                detail=latest_error_message,
+                action="降低 base_position_notional、per_order_notional、挂单层数和仓位上限，或释放其他币种占用的保证金。",
+                ts=latest_error_ts,
+            )
+        elif "-1003" in latest_error_message or "Too many requests" in latest_error_message:
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="rate_limited",
+                severity="critical",
+                title="Binance API 频率超限",
+                detail=latest_error_message,
+                action="降低监控页自动刷新频率，减少同时运行币种，或继续压低 runner 的 REST 轮询频率。",
+                ts=latest_error_ts,
+            )
+        elif "-5022" in latest_error_message or "post only rejected" in latest_error_message.lower():
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="post_only_rejected",
+                severity="warning",
+                title="Post only 挂单被拒",
+                detail=latest_error_message,
+                action="说明挂单价格过于贴近会立即成交。应适当放大 step_price，或降低 maker_retries，避免反复无效重挂。",
+                ts=latest_error_ts,
+            )
+        elif "validation failed" in latest_error_message.lower():
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="validation_failed",
+                severity="critical",
+                title="下单前校验失败",
+                detail=latest_error_message,
+                action="优先检查账户持仓模式、策略模式和提交参数是否匹配，再决定是否重启。",
+                ts=latest_error_ts,
+            )
+
+    for warning in warnings:
+        if warning == "runner_pid_present_but_process_not_running":
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="stale_runner_pid",
+                severity="warning",
+                title="状态文件里有旧 PID",
+                detail="监控发现控制文件记录了 runner PID，但对应进程已经不存在。",
+                action="这通常说明策略异常退出过；先看最近一轮错误，再决定是否清理状态并重启。",
+            )
+        elif warning.startswith("account_read_failed:"):
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="account_read_failed",
+                severity="warning",
+                title="账户读取失败",
+                detail=warning.removeprefix("account_read_failed:").strip(),
+                action="账户读不到时，页面里的持仓、挂单和损益会不完整，应先恢复 API 可用性。",
+            )
+        elif warning.startswith("market_read_failed:"):
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="market_read_failed",
+                severity="warning",
+                title="行情读取失败",
+                detail=warning.removeprefix("market_read_failed:").strip(),
+                action="行情读不到时，中心价和挂单判断都会失真。先确认网络和 Binance 行情接口可用。",
+            )
+        elif warning == "missing_binance_api_credentials":
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="missing_credentials",
+                severity="critical",
+                title="缺少 Binance API 凭证",
+                detail="当前 Web 进程没有读到 BINANCE_API_KEY / BINANCE_API_SECRET。",
+                action="先补齐环境变量，否则页面只能看到本地文件，不能拿到账户真实状态。",
+            )
+
+    pause_reasons = [str(item).strip() for item in (risk_controls.get("pause_reasons") or []) if str(item).strip()]
+    if risk_controls.get("buy_paused") and pause_reasons:
+        _push_alert(
+            alerts,
+            seen_codes,
+            code="buy_paused",
+            severity="warning",
+            title="当前已暂停继续买入",
+            detail="；".join(pause_reasons[:2]),
+            action="这通常表示多仓已经偏重，或触发了价格/振幅保护。若想恢复成交密度，需要先降低库存或上调阈值。",
+        )
+
+    short_pause_reasons = [str(item).strip() for item in (risk_controls.get("short_pause_reasons") or []) if str(item).strip()]
+    if risk_controls.get("short_paused") and short_pause_reasons:
+        _push_alert(
+            alerts,
+            seen_codes,
+            code="short_paused",
+            severity="warning",
+            title="当前已暂停继续开空",
+            detail="；".join(short_pause_reasons[:2]),
+            action="这通常表示空仓已经偏重。若想继续放量，需要先回补一部分空仓或上调空仓阈值。",
+        )
+
+    if risk_controls.get("buy_cap_applied"):
+        _push_alert(
+            alerts,
+            seen_codes,
+            code="buy_cap_applied",
+            severity="info",
+            title="买单已触发硬上限裁剪",
+            detail="本轮计划中的买单总量超过了 max_position_notional，系统已经自动裁掉超出的部分。",
+            action="如果成交量不够，应该先确认保证金充足，再考虑适度提高 max_position_notional。",
+        )
+
+    if risk_controls.get("short_cap_applied"):
+        _push_alert(
+            alerts,
+            seen_codes,
+            code="short_cap_applied",
+            severity="info",
+            title="卖空单已触发硬上限裁剪",
+            detail="本轮计划中的卖空总量超过了 max_short_position_notional，系统已经自动裁掉超出的部分。",
+            action="如果想继续提升做空成交量，需要先确认保证金余量，再考虑提高空仓上限。",
+        )
+
+    if risk_controls.get("volatility_buy_pause"):
+        _push_alert(
+            alerts,
+            seen_codes,
+            code="volatility_buy_pause",
+            severity="info",
+            title="分钟级风控已暂停做多开仓",
+            detail="最近 1 分钟的振幅和跌幅触发了 buy_pause_amp_trigger_ratio / buy_pause_down_return_trigger_ratio。",
+            action="这是策略自带的短时熔断，不是异常。恢复后会自动重新挂单。",
+        )
+
+    if risk_controls.get("shift_frozen"):
+        _push_alert(
+            alerts,
+            seen_codes,
+            code="shift_frozen",
+            severity="info",
+            title="中心迁移已临时冻结",
+            detail="最近 1 分钟波动超过 freeze_shift_abs_return_trigger_ratio，本轮不会继续追价移动中心。",
+            action="这是为了防止急拉急杀里频繁追价，不代表策略停止运行。",
+        )
+
+    return alerts
+
+
 def build_monitor_snapshot(
     *,
     symbol: str,
@@ -823,6 +1041,7 @@ def _build_monitor_snapshot_uncached(
         "hourly_summary": None,
         "risk_controls": None,
         "warnings": [],
+        "alerts": [],
     }
     if runner["configured"] and not runner["is_running"]:
         snapshot["warnings"].append("runner_pid_present_but_process_not_running")
@@ -847,6 +1066,12 @@ def _build_monitor_snapshot_uncached(
     credentials = load_binance_api_credentials()
     if credentials is None:
         snapshot["warnings"].append("missing_binance_api_credentials")
+        snapshot["alerts"] = build_monitor_alerts(
+            loop_summary=loop_summary,
+            warnings=snapshot["warnings"],
+            risk_controls={},
+            runner=runner,
+        )
         return snapshot
 
     api_key, api_secret = credentials
@@ -1217,5 +1442,11 @@ def _build_monitor_snapshot_uncached(
         "effective_per_order_notional": _safe_float((plan_report or {}).get("effective_per_order_notional")),
         "effective_base_position_notional": _safe_float((plan_report or {}).get("effective_base_position_notional")),
     }
+    snapshot["alerts"] = build_monitor_alerts(
+        loop_summary=loop_summary,
+        warnings=snapshot["warnings"],
+        risk_controls=snapshot["risk_controls"],
+        runner=runner,
+    )
 
     return snapshot

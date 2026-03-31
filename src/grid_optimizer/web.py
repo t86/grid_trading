@@ -8091,6 +8091,87 @@ MONITOR_PAGE = """<!doctype html>
       padding: 10px 12px;
     }
     .meta { font-size: 13px; color: var(--muted); }
+    .alert-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .alert-item {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      background: #fcfbf7;
+    }
+    .alert-item.critical {
+      border-color: rgba(180, 35, 24, 0.28);
+      background: #fff4f2;
+    }
+    .alert-item.warning {
+      border-color: rgba(183, 110, 0, 0.28);
+      background: #fff9ef;
+    }
+    .alert-item.info {
+      border-color: rgba(15, 118, 110, 0.22);
+      background: #f2fbfa;
+    }
+    .alert-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    .alert-title {
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .alert-severity {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      border: 1px solid transparent;
+    }
+    .alert-item.critical .alert-severity {
+      color: var(--bad);
+      background: rgba(180, 35, 24, 0.08);
+      border-color: rgba(180, 35, 24, 0.12);
+    }
+    .alert-item.warning .alert-severity {
+      color: var(--warn);
+      background: rgba(183, 110, 0, 0.08);
+      border-color: rgba(183, 110, 0, 0.12);
+    }
+    .alert-item.info .alert-severity {
+      color: var(--brand);
+      background: rgba(15, 118, 110, 0.08);
+      border-color: rgba(15, 118, 110, 0.12);
+    }
+    .alert-detail,
+    .alert-action,
+    .alert-ts {
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--muted);
+    }
+    .alert-action {
+      margin-top: 6px;
+      color: var(--text);
+    }
+    .alert-empty {
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      background: #fcfbf7;
+    }
     .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     .metric {
       background: linear-gradient(180deg, #fffefc 0%, #faf8f2 100%);
@@ -8202,6 +8283,9 @@ MONITOR_PAGE = """<!doctype html>
       <div class="meta">监控币种列表可在 <a href="/strategies">策略总览页</a> 手动添加和删除。</div>
       <div id="strategy_action_meta" class="meta"></div>
       <div id="strategy_preset_meta" class="meta"></div>
+      <div id="alert_box" class="alert-stack">
+        <div class="alert-empty">等待首轮数据，拿到 runner 状态后会在这里直接提示“保证金不足 / 频率超限 / 停买停空 / 进程退出”等关键问题。</div>
+      </div>
     </section>
 
     <section class="card">
@@ -8431,6 +8515,7 @@ MONITOR_PAGE = """<!doctype html>
     const hourlyBody = document.getElementById("hourly_body");
     const hourlyMetaEl = document.getElementById("hourly_meta");
     const metaEl = document.getElementById("meta");
+    const alertBoxEl = document.getElementById("alert_box");
     const openOrderMetaEl = document.getElementById("open_order_meta");
     const symbolEl = document.getElementById("symbol");
     const refreshSecEl = document.getElementById("refresh_sec");
@@ -9931,6 +10016,37 @@ MONITOR_PAGE = """<!doctype html>
       stopStrategyBtn.disabled = strategyActionPending || !Boolean(runner.is_running);
     }
 
+    function formatAlertSeverity(severity) {
+      if (severity === "critical") return "严重";
+      if (severity === "warning") return "警告";
+      return "提示";
+    }
+
+    function renderAlerts(data) {
+      const alerts = Array.isArray(data.alerts) ? data.alerts : [];
+      if (!alerts.length) {
+        alertBoxEl.innerHTML = '<div class="alert-empty">当前没有明确的运行告警。这里会直接提示保证金不足、频率超限、停买/停空、进程退出等关键问题。</div>';
+        return;
+      }
+      alertBoxEl.innerHTML = alerts.map((item) => {
+        const severity = ["critical", "warning", "info"].includes(item.severity) ? item.severity : "info";
+        const detail = String(item.detail || "").trim();
+        const action = String(item.action || "").trim();
+        const ts = item.ts ? fmtTs(item.ts) : "";
+        return `
+          <div class="alert-item ${severity}">
+            <div class="alert-head">
+              <div class="alert-title">${escapeHtml(String(item.title || "运行提示"))}</div>
+              <span class="alert-severity">${escapeHtml(formatAlertSeverity(severity))}</span>
+            </div>
+            ${detail ? `<div class="alert-detail">${escapeHtml(detail)}</div>` : ""}
+            ${action ? `<div class="alert-action">建议：${escapeHtml(action)}</div>` : ""}
+            ${ts ? `<div class="alert-ts">时间：${escapeHtml(ts)}</div>` : ""}
+          </div>
+        `;
+      }).join("");
+    }
+
     function renderPosition(data) {
       const rawPos = data.position;
       const pos = rawPos || {};
@@ -10186,6 +10302,7 @@ MONITOR_PAGE = """<!doctype html>
         const data = await fetchMonitorSnapshot(symbol);
         populatePresetOptions(data);
         renderCards(data);
+        renderAlerts(data);
         renderPosition(data);
         renderOpenOrders(data);
         renderHourlyStats(data);
@@ -10198,6 +10315,7 @@ MONITOR_PAGE = """<!doctype html>
         const warnings = (data.warnings || []).join(" | ");
         metaEl.textContent = `最后刷新: ${fmtTs(data.ts)}${warnings ? ` · 警告: ${warnings}` : ""}`;
       } catch (err) {
+        alertBoxEl.innerHTML = '<div class="alert-empty">当前没拿到监控快照，所以还无法判断是参数问题、账户问题还是 Binance 接口异常。</div>';
         metaEl.textContent = `刷新失败: ${err}`;
       }
     }
