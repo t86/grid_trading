@@ -31,6 +31,9 @@ ssh srv-43-155-136-111 '/usr/local/bin/grid-web-update'
 ssh srv-43-155-163-114 '/usr/local/bin/grid-web-update'
 ```
 
+The server-local `/usr/local/bin/grid-web-update` should match the tracked script at
+`deploy/oracle/grid-web-update.sh`.
+
 `grid-web-update` is responsible for:
 
 - pulling the latest `main`
