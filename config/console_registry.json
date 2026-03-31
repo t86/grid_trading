@@ -1,0 +1,47 @@
+{
+  "servers": [
+    {
+      "id": "srv_150",
+      "label": "Main Entry A",
+      "base_url": "http://43.131.232.150:8788",
+      "location": "Singapore",
+      "enabled": true,
+      "capabilities": ["futures_monitor", "competition_board", "strategies"],
+      "notes": "Primary console node"
+    },
+    {
+      "id": "srv_114",
+      "label": "Main Entry B",
+      "base_url": "http://43.155.163.114:8788",
+      "location": "Singapore",
+      "enabled": true,
+      "capabilities": ["futures_monitor", "spot_runner", "spot_strategies", "strategies"]
+    },
+    {
+      "id": "srv_111",
+      "label": "Online Entry",
+      "base_url": "http://43.155.136.111:8787",
+      "location": "Oracle",
+      "enabled": true,
+      "capabilities": ["futures_monitor", "competition_board", "strategies"]
+    }
+  ],
+  "accounts": [
+    {
+      "id": "acct_main_a",
+      "label": "Main Account A",
+      "server_id": "srv_150",
+      "kind": "futures",
+      "priority": 100,
+      "enabled": true,
+      "default_symbols": ["BARDUSDT", "XAUTUSDT"],
+      "competition_symbols": ["KAT", "NIGHT", "BARD", "XAUT"],
+      "pages": ["/monitor", "/strategies", "/competition_board"],
+      "notes": "Default console account"
+    }
+  ],
+  "competition_source": {
+    "server_id": "srv_150",
+    "path": "/api/competition_board"
+  }
+}
