@@ -39,6 +39,9 @@ from .competition_board import (
     delete_competition_entry,
     upsert_competition_entry,
 )
+from .console_overview import build_console_overview
+from .console_page import build_console_page
+from .console_registry import load_console_registry, serialize_console_registry
 from .data import (
     cache_file_path,
     delete_futures_order,
@@ -15601,6 +15604,29 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
     return snapshot
 
 
+def _console_redirect_target(path: str) -> str | None:
+    if path in {"/", "/index.html", "/hub", "/hub.html", "/portal", "/portal.html"}:
+        return "/console"
+    return None
+
+
+def _console_registry_payload() -> dict[str, Any]:
+    registry = load_console_registry()
+    payload = serialize_console_registry(registry)
+    return {"ok": True, **payload}
+
+
+def _console_overview_payload(query: dict[str, list[str]]) -> tuple[dict[str, Any], int]:
+    account_id = str(query.get("account_id", [""])[0]).strip()
+    if not account_id:
+        return {"ok": False, "error": "account_id is required"}, HTTPStatus.BAD_REQUEST
+    registry = load_console_registry()
+    try:
+        return build_console_overview(registry, account_id), HTTPStatus.OK
+    except ValueError as exc:
+        return {"ok": False, "error": str(exc)}, HTTPStatus.NOT_FOUND
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "grid-web/0.1"
 
@@ -15670,17 +15696,25 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _send_redirect(self, location: str, status: int = HTTPStatus.FOUND) -> None:
+        self.send_response(status)
+        self.send_header("Location", location)
+        for key, value in _security_headers().items():
+            self.send_header(key, value)
+        self.end_headers()
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
+        redirect_target = _console_redirect_target(path)
+        if redirect_target is not None:
+            self._send_redirect(redirect_target)
+            return
         if not self._authorize_request():
             return
-        if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
-            self._send_html(SERVER_HUB_PAGE, status=HTTPStatus.OK)
-            return
-        if path in {"/", "/index.html"}:
-            self._send_html(HTML_PAGE, status=HTTPStatus.OK)
+        if path in {"/console", "/console.html"}:
+            self._send_html(build_console_page(), status=HTTPStatus.OK)
             return
         if path in {"/rankings", "/rankings.html"}:
             self._send_html(RANKING_PAGE, status=HTTPStatus.OK)
@@ -15705,6 +15739,13 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
+            return
+        if path == "/api/console/registry":
+            self._send_json(_console_registry_payload(), status=HTTPStatus.OK)
+            return
+        if path == "/api/console/overview":
+            payload, status = _console_overview_payload(query)
+            self._send_json(payload, status=status)
             return
         if path == "/api/competition_board":
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"
@@ -15898,16 +15939,14 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        redirect_target = _console_redirect_target(path)
+        if redirect_target is not None:
+            self._send_redirect(redirect_target)
+            return
         if not self._authorize_request():
             return
-        if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
-            body = SERVER_HUB_PAGE.encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self._send_common_headers("text/html; charset=utf-8", len(body))
-            self.end_headers()
-            return
-        if path in {"/", "/index.html"}:
-            body = HTML_PAGE.encode("utf-8")
+        if path in {"/console", "/console.html"}:
+            body = build_console_page().encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
@@ -15955,6 +15994,18 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/api/health":
+            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("application/json; charset=utf-8", len(body))
+            self.end_headers()
+            return
+        if path == "/api/console/registry":
+            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("application/json; charset=utf-8", len(body))
+            self.end_headers()
+            return
+        if path == "/api/console/overview":
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("application/json; charset=utf-8", len(body))

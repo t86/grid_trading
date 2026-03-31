@@ -9,6 +9,11 @@ from unittest.mock import patch
 from grid_optimizer.console_registry import load_console_registry
 from grid_optimizer.console_overview import build_console_overview
 from grid_optimizer.console_page import build_console_page
+from grid_optimizer.web import (
+    _console_overview_payload,
+    _console_redirect_target,
+    _console_registry_payload,
+)
 
 
 class ConsoleRegistryTests(unittest.TestCase):
@@ -498,6 +503,39 @@ class ConsolePageTests(unittest.TestCase):
         self.assertIn("Runtime", html)
         self.assertIn("Legacy Entries", html)
         self.assertIn("Server", html)
+
+
+class ConsoleRouteGlueTests(unittest.TestCase):
+    def test_console_redirect_target_handles_root_and_hub(self) -> None:
+        self.assertEqual(_console_redirect_target("/"), "/console")
+        self.assertEqual(_console_redirect_target("/index.html"), "/console")
+        self.assertEqual(_console_redirect_target("/hub"), "/console")
+        self.assertEqual(_console_redirect_target("/portal"), "/console")
+        self.assertIsNone(_console_redirect_target("/monitor"))
+
+    @patch("grid_optimizer.web.load_console_registry")
+    def test_console_registry_payload_serializes_registry(self, mock_load_console_registry) -> None:
+        mock_load_console_registry.return_value = {
+            "servers": [],
+            "accounts": [],
+            "default_account": {"id": "acct_main_a"},
+            "competition_source": {"server_id": "srv_150", "path": "/api/competition_board"},
+        }
+
+        payload = _console_registry_payload()
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["default_account_id"], "acct_main_a")
+
+    @patch("grid_optimizer.web.build_console_overview")
+    @patch("grid_optimizer.web.load_console_registry")
+    def test_console_overview_payload_requires_account_id(self, mock_load_console_registry, mock_build_console_overview) -> None:
+        payload, status = _console_overview_payload({})
+
+        self.assertFalse(payload["ok"])
+        self.assertEqual(status, 400)
+        mock_load_console_registry.assert_not_called()
+        mock_build_console_overview.assert_not_called()
 
 
 if __name__ == "__main__":
