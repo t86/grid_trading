@@ -17,6 +17,7 @@ from grid_optimizer.competition_board import (
     _parse_segments,
     _per_user_reward_from_segment,
     CompetitionSource,
+    build_reward_volume_targets,
     resolve_active_competition_board,
     upsert_competition_entry,
     build_competition_board_snapshot,
@@ -24,6 +25,27 @@ from grid_optimizer.competition_board import (
 
 
 class CompetitionBoardTests(unittest.TestCase):
+    def test_build_reward_volume_targets_maps_20_50_200_loss_targets(self) -> None:
+        board = {
+            "label": "KAT 合约交易挑战赛",
+            "symbol": "KAT",
+            "reward_unit": "KAT",
+            "segments": [
+                {"start_rank": 6, "end_rank": 20, "rank_label": "第 6 - 20 名", "per_user_reward": 1000.0, "cutoff_value": 200000.0},
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名", "per_user_reward": 600.0, "cutoff_value": 150000.0},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名", "per_user_reward": 240.0, "cutoff_value": 80000.0},
+            ],
+        }
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.2):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 3, 31, tzinfo=timezone.utc))
+        self.assertIsNotNone(targets)
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        rank_200 = targets["tiers"][0]
+        self.assertAlmostEqual(rank_200["reward_value_usdt"], 48.0, places=8)
+        self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["3"], 160000.0, places=8)
+        self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["4"], 120000.0, places=8)
+        self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["5"], 96000.0, places=8)
+
     def test_parse_segments_extracts_fixed_reward_brackets(self) -> None:
         text = """
         奖池结构

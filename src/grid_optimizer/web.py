@@ -8210,6 +8210,34 @@ MONITOR_PAGE = """<!doctype html>
     .metric .label { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
     .metric .value { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
     .metric .sub { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+    .metric-lines {
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .metric-line {
+      font-size: 12px;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+    .metric-line strong {
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .metric-line .inline-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 42px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.08);
+      color: var(--brand);
+      font-weight: 700;
+      margin-right: 6px;
+    }
     .good { color: var(--good); }
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
@@ -9115,6 +9143,15 @@ MONITOR_PAGE = """<!doctype html>
       const num = Number(v);
       const sign = num > 0 ? "+" : "";
       return sign + fmtNum(num, 4);
+    }
+
+    function fmtWanVolume(v) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      const num = Number(v);
+      const wan = num / 10000;
+      if (Math.abs(wan) >= 100) return `${wan.toFixed(0)}万`;
+      if (Math.abs(wan) >= 10) return `${wan.toFixed(1)}万`;
+      return `${wan.toFixed(2)}万`;
     }
 
     function formatStartupInventory(summary, quantityDigits = 4, notionalDigits = 4) {
@@ -10187,6 +10224,37 @@ MONITOR_PAGE = """<!doctype html>
       return "";
     }
 
+    function buildCompetitionRewardTargetCard(targets) {
+      const payload = (targets && typeof targets === "object") ? targets : {};
+      const tiers = Array.isArray(payload.tiers) ? payload.tiers : [];
+      const message = String(payload.message || "").trim();
+      if (!tiers.length && !message) {
+        return null;
+      }
+      const rows = tiers.map((item) => {
+        const volumes = (item && item.volumes_by_loss_rate) || {};
+        const rewardText = item.reward_value_usdt === null || item.reward_value_usdt === undefined
+          ? "--"
+          : fmtNum(item.reward_value_usdt, 2);
+        return `
+          <div class="metric-line">
+            <strong><span class="inline-badge">${escapeHtml(item.rank_label || "--")}</span>${escapeHtml(item.segment_label || "")}</strong><br />
+            奖励 ${rewardText}U · 万3 ${fmtWanVolume(volumes["3"])} · 万4 ${fmtWanVolume(volumes["4"])} · 万5 ${fmtWanVolume(volumes["5"])}
+          </div>
+        `;
+      }).join("");
+      const rewardPriceText = payload.reward_price_usdt === null || payload.reward_price_usdt === undefined
+        ? "--"
+        : fmtNum(payload.reward_price_usdt, 4);
+      return {
+        label: "奖励回本量",
+        value: "20 / 50 / 200",
+        cls: "",
+        sub: `按当前奖励折 USDT 估算 · 奖励币种 ${String(payload.reward_unit || "--").toUpperCase()} · 现价 ${rewardPriceText}`,
+        bodyHtml: `<div class="metric-lines">${rows || `<div class="metric-line">${escapeHtml(message || "当前没有可用的奖励换手量目标。")}</div>`}</div>`,
+      };
+    }
+
     function renderCards(data) {
       const trade = data.trade_summary || {};
       const income = data.income_summary || {};
@@ -10201,6 +10269,7 @@ MONITOR_PAGE = """<!doctype html>
       const runner = data.runner || {};
       const runnerCfg = runner.config || {};
       const competitionWindow = data.competition_window || {};
+      const competitionRewardTargets = data.competition_reward_targets || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const selectedPreset = getPresetByKey(String(strategyPresetEl.value || runnerCfg.strategy_profile || "volume_long_v4"));
       const risk = data.risk_controls || {};
@@ -10265,28 +10334,40 @@ MONITOR_PAGE = """<!doctype html>
         ? `${competitionWindow.label} · 起点 ${fmtTs(competitionWindow.stats_start_at || competitionWindow.activity_start_at)}`
         : `会话起点 ${fmtTs(data.session && data.session.start)}`;
       const cards = [
-        ["策略状态", strategyRunning ? "运行中" : "未活跃", strategyRunning ? "good" : "warn", strategyDetail],
-        ["执行进程", runnerLabel, runner.is_running ? "good" : "warn", runnerDetail],
-        ["统计区间", statsWindowLabel, "", competitionWindow.activity_end_at ? `结束时间: ${fmtTs(competitionWindow.activity_end_at)}` : "未匹配到交易赛窗口，默认按当前会话统计"],
-        ["风控硬限制", riskValue, riskStatusClass, riskDetail],
-        ["会话成交笔数", fmtNum(trade.trade_count || 0, 0), "", `Maker: ${fmtNum(trade.maker_count || 0, 0)} · 买/卖: ${fmtNum(trade.buy_count || 0, 0)} / ${fmtNum(trade.sell_count || 0, 0)}`],
-        ["累计成交额", fmtNum(trade.gross_notional || 0, 4), "", `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}`],
-        ["净收益估算", fmtMoney(trade.net_pnl_estimate || 0), statusClass(trade.net_pnl_estimate || 0), `已实现: ${fmtMoney(trade.realized_pnl || 0)} · 浮盈: ${fmtMoney(pos.unrealized_pnl || 0)}`],
-        ["手续费 / 资金费", `${fmtMoney(-(trade.commission || 0))} / ${fmtMoney(income.funding_fee || 0)}`, "", `左侧为折算 USDT 后的累计手续费 · 原始资产: ${escapeHtml(JSON.stringify(trade.commission_raw_by_asset || {}))}`],
-        ["审计日志", `成交 ${fmtNum(audit.trade_row_count || 0, 0)} / 资金费 ${fmtNum(audit.income_row_count || 0, 0)}`, "", `委托事件: ${fmtNum(audit.order_event_count || 0, 0)} · 提交轮次: ${fmtNum(audit.submit_event_count || 0, 0)} · 计划轮次: ${fmtNum(audit.plan_event_count || 0, 0)}`],
-        ["当前仓位", isNeutralMode ? `净 ${fmtNum(netQty, 0)}` : fmtNum(pos.position_amt || 0, 0), "", isNeutralMode ? `Long/Short: ${fmtNum(longQty, 0)} / ${fmtNum(shortQty, 0)} · ${centerLabelText} · 中价名义: ${fmtNum((longQty + shortQty) * (market.mid_price || 0), 4)}` : `开仓均价: ${fmtNum(pos.entry_price || 0, 7)} · ${centerLabelText} · 持仓名义: ${fmtNum(Math.abs(pos.position_amt || 0) * (market.mid_price || 0), 4)}`],
-        ["当前挂单数", fmtNum((data.open_orders || []).length, 0), "", `买/卖: ${fmtNum((data.open_orders || []).filter(x => x.side === "BUY").length, 0)} / ${fmtNum((data.open_orders || []).filter(x => x.side === "SELL").length, 0)}`],
-        ["合约 USDT", usdtAsset ? fmtNum(usdtAsset.wallet_balance || 0, 4) : "--", "", usdtAsset ? `可用: ${fmtNum(usdtAsset.available_balance || 0, 4)} · 可提: ${fmtNum(usdtAsset.max_withdraw_amount || 0, 4)}` : "未读到 USDT 资产"],
-        ["合约 BNB", bnbAsset ? fmtNum(bnbAsset.wallet_balance || 0, 6) : "--", "", bnbAsset ? `可用: ${fmtNum(bnbAsset.available_balance || 0, 6)} · 可提: ${fmtNum(bnbAsset.max_withdraw_amount || 0, 6)}` : "未读到 BNB 资产"],
-        ["市场", `${fmtNum(market.bid_price || 0, 7)} / ${fmtNum(market.ask_price || 0, 7)}`, "", `中价: ${fmtNum(market.mid_price || 0, 7)} · Funding: ${fmtPct(market.funding_rate || 0)}`],
+        { label: "策略状态", value: strategyRunning ? "运行中" : "未活跃", cls: strategyRunning ? "good" : "warn", sub: strategyDetail },
+        { label: "执行进程", value: runnerLabel, cls: runner.is_running ? "good" : "warn", sub: runnerDetail },
+        { label: "统计区间", value: statsWindowLabel, cls: "", sub: competitionWindow.activity_end_at ? `结束时间: ${fmtTs(competitionWindow.activity_end_at)}` : "未匹配到交易赛窗口，默认按当前会话统计" },
+        { label: "风控硬限制", value: riskValue, cls: riskStatusClass, sub: riskDetail },
+        { label: "会话成交笔数", value: fmtNum(trade.trade_count || 0, 0), cls: "", sub: `Maker: ${fmtNum(trade.maker_count || 0, 0)} · 买/卖: ${fmtNum(trade.buy_count || 0, 0)} / ${fmtNum(trade.sell_count || 0, 0)}` },
+        { label: "累计成交额", value: fmtNum(trade.gross_notional || 0, 4), cls: "", sub: `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}` },
+        { label: "净收益估算", value: fmtMoney(trade.net_pnl_estimate || 0), cls: statusClass(trade.net_pnl_estimate || 0), sub: `已实现: ${fmtMoney(trade.realized_pnl || 0)} · 浮盈: ${fmtMoney(pos.unrealized_pnl || 0)}` },
+        { label: "手续费 / 资金费", value: `${fmtMoney(-(trade.commission || 0))} / ${fmtMoney(income.funding_fee || 0)}`, cls: "", sub: `左侧为折算 USDT 后的累计手续费 · 原始资产: ${escapeHtml(JSON.stringify(trade.commission_raw_by_asset || {}))}` },
+        { label: "审计日志", value: `成交 ${fmtNum(audit.trade_row_count || 0, 0)} / 资金费 ${fmtNum(audit.income_row_count || 0, 0)}`, cls: "", sub: `委托事件: ${fmtNum(audit.order_event_count || 0, 0)} · 提交轮次: ${fmtNum(audit.submit_event_count || 0, 0)} · 计划轮次: ${fmtNum(audit.plan_event_count || 0, 0)}` },
+        { label: "当前仓位", value: isNeutralMode ? `净 ${fmtNum(netQty, 0)}` : fmtNum(pos.position_amt || 0, 0), cls: "", sub: isNeutralMode ? `Long/Short: ${fmtNum(longQty, 0)} / ${fmtNum(shortQty, 0)} · ${centerLabelText} · 中价名义: ${fmtNum((longQty + shortQty) * (market.mid_price || 0), 4)}` : `开仓均价: ${fmtNum(pos.entry_price || 0, 7)} · ${centerLabelText} · 持仓名义: ${fmtNum(Math.abs(pos.position_amt || 0) * (market.mid_price || 0), 4)}` },
+        { label: "当前挂单数", value: fmtNum((data.open_orders || []).length, 0), cls: "", sub: `买/卖: ${fmtNum((data.open_orders || []).filter(x => x.side === "BUY").length, 0)} / ${fmtNum((data.open_orders || []).filter(x => x.side === "SELL").length, 0)}` },
+        { label: "合约 USDT", value: usdtAsset ? fmtNum(usdtAsset.wallet_balance || 0, 4) : "--", cls: "", sub: usdtAsset ? `可用: ${fmtNum(usdtAsset.available_balance || 0, 4)} · 可提: ${fmtNum(usdtAsset.max_withdraw_amount || 0, 4)}` : "未读到 USDT 资产" },
+        { label: "合约 BNB", value: bnbAsset ? fmtNum(bnbAsset.wallet_balance || 0, 6) : "--", cls: "", sub: bnbAsset ? `可用: ${fmtNum(bnbAsset.available_balance || 0, 6)} · 可提: ${fmtNum(bnbAsset.max_withdraw_amount || 0, 6)}` : "未读到 BNB 资产" },
+        { label: "市场", value: `${fmtNum(market.bid_price || 0, 7)} / ${fmtNum(market.ask_price || 0, 7)}`, cls: "", sub: `中价: ${fmtNum(market.mid_price || 0, 7)} · Funding: ${fmtPct(market.funding_rate || 0)}` },
       ];
-      summaryEl.innerHTML = cards.map(([label, value, cls, sub]) => `
-        <div class="metric">
-          <div class="label">${escapeHtml(label)}</div>
-          <div class="value ${cls}">${escapeHtml(value)}</div>
-          <div class="sub">${escapeHtml(sub)}</div>
-        </div>
-      `).join("");
+      const rewardTargetCard = buildCompetitionRewardTargetCard(competitionRewardTargets);
+      if (rewardTargetCard) {
+        cards.splice(6, 0, rewardTargetCard);
+      }
+      summaryEl.innerHTML = cards.map((item) => {
+        const label = String(item.label || "");
+        const value = String(item.value || "--");
+        const cls = String(item.cls || "");
+        const sub = String(item.sub || "");
+        const bodyHtml = String(item.bodyHtml || "");
+        return `
+          <div class="metric">
+            <div class="label">${escapeHtml(label)}</div>
+            <div class="value ${cls}">${escapeHtml(value)}</div>
+            <div class="sub">${escapeHtml(sub)}</div>
+            ${bodyHtml}
+          </div>
+        `;
+      }).join("");
       startStrategyBtn.disabled = strategyActionPending || Boolean(selectedPreset && !selectedPreset.startable);
       startStrategyBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
       stopStrategyBtn.disabled = strategyActionPending || !Boolean(runner.is_running);

@@ -1994,6 +1994,85 @@ def _fetch_symbol_close_price_usdt(symbol: str, end_at: datetime) -> float | Non
     return float(price)
 
 
+def build_reward_volume_targets(
+    board: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+    tracked_ranks: tuple[int, ...] = (200, 50, 20),
+    loss_per_10k_options: tuple[int, ...] = (3, 4, 5),
+) -> dict[str, Any] | None:
+    if not isinstance(board, dict):
+        return None
+    segments = board.get("segments", [])
+    if not isinstance(segments, list) or not segments:
+        return {
+            "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip() or "-",
+            "symbol": str(board.get("symbol", "")).strip(),
+            "reward_unit": str(board.get("reward_unit", "")).strip().upper(),
+            "reward_price_usdt": None,
+            "tiers": [],
+            "message": "当前比赛没有可用奖励段，暂时无法估算奖励回本量。",
+        }
+    ref_time = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    reward_unit = str(board.get("reward_unit", "")).strip().upper()
+    reward_price = _fetch_symbol_close_price_usdt(reward_unit, ref_time) if reward_unit else None
+    if reward_price is None:
+        return {
+            "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip() or "-",
+            "symbol": str(board.get("symbol", "")).strip(),
+            "reward_unit": reward_unit,
+            "reward_price_usdt": None,
+            "tiers": [],
+            "message": "当前拿不到奖励币种对 USDT 的价格，暂时无法估算奖励回本量。",
+        }
+
+    by_end_rank: dict[int, dict[str, Any]] = {}
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        end_rank = _safe_int(segment.get("end_rank"))
+        if end_rank is None:
+            continue
+        by_end_rank[end_rank] = segment
+
+    tiers: list[dict[str, Any]] = []
+    for rank in tracked_ranks:
+        segment = by_end_rank.get(int(rank))
+        if not isinstance(segment, dict):
+            continue
+        per_user_reward = _safe_float(segment.get("per_user_reward"))
+        cutoff_value = _safe_float(segment.get("cutoff_value"))
+        if per_user_reward is None or per_user_reward <= 0:
+            continue
+        reward_value_usdt = float(per_user_reward) * float(reward_price)
+        volumes_by_loss_rate: dict[str, float] = {}
+        for loss_per_10k in loss_per_10k_options:
+            loss_value = _safe_float(loss_per_10k)
+            if loss_value is None or loss_value <= 0:
+                continue
+            volumes_by_loss_rate[str(int(loss_value))] = reward_value_usdt / float(loss_value) * 10_000.0
+        tiers.append(
+            {
+                "rank": int(rank),
+                "rank_label": f"{int(rank)}名",
+                "segment_label": str(segment.get("rank_label", "")).strip() or f"{int(rank)}名",
+                "reward_value_usdt": reward_value_usdt,
+                "cutoff_value": float(cutoff_value) if cutoff_value is not None and cutoff_value > 0 else None,
+                "volumes_by_loss_rate": volumes_by_loss_rate,
+            }
+        )
+
+    return {
+        "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip() or "-",
+        "symbol": str(board.get("symbol", "")).strip(),
+        "reward_unit": reward_unit,
+        "reward_price_usdt": float(reward_price),
+        "loss_per_10k_options": [int(item) for item in loss_per_10k_options],
+        "tiers": tiers,
+        "message": "" if tiers else "奖励段已识别，但没有拿到 20 / 50 / 200 名对应的有效奖励数据。",
+    }
+
+
 def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any]:
     history_index = _load_history_index()
     now = datetime.now(timezone.utc)

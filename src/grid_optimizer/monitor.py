@@ -37,7 +37,7 @@ from .data import (
     load_binance_api_credentials,
 )
 from .live_check import extract_symbol_position
-from .competition_board import resolve_active_competition_board
+from .competition_board import build_reward_volume_targets, resolve_active_competition_board
 
 
 def _safe_float(value: Any) -> float:
@@ -1057,6 +1057,7 @@ def _build_monitor_snapshot_uncached(
             "plan_report": plan_report,
             "submit_report": submit_report,
         },
+        "competition_reward_targets": build_reward_volume_targets(competition_board),
         "runner": runner,
         "audit": {
             "paths": {key: str(path) for key, path in audit_paths.items()},
