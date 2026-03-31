@@ -56,3 +56,27 @@ sudo journalctl -u grid-web -n 100 --no-pager
 - Health check: `http://<ORACLE_HOST>:8787/api/health`
 
 For production/public internet, place Nginx/Caddy in front with TLS and basic auth.
+
+## 5) Existing Server Checks
+
+Before updating an existing server, verify the live systemd unit instead of assuming the
+default app directory from this README:
+
+```bash
+sudo systemctl cat grid-web.service
+```
+
+Confirm at least:
+
+- `WorkingDirectory`
+- `ExecStart`
+- `EnvironmentFile`
+
+Some hosts may still serve from a legacy directory such as `/home/ubuntu/wangge` rather than
+`/home/<user>/grid_trading`. If you sync code to the wrong directory, deployment can appear to
+succeed while the service continues running old code from the real working directory.
+
+Also note that preserving `output/` keeps runner state and control JSON files. That is usually
+required, but it also means a code deployment does not automatically refresh saved runtime
+configuration. When debugging "server still uses old config" issues, inspect the persisted files
+under `output/` in addition to the code version.
