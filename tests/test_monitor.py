@@ -9,6 +9,7 @@ from grid_optimizer.monitor import (
     _filter_events_since,
     _filter_rows_since,
     _read_runner_process,
+    _extract_futures_asset_snapshot,
     build_monitor_alerts,
     summarize_hourly_metrics,
     summarize_income,
@@ -232,6 +233,40 @@ class MonitorTests(unittest.TestCase):
         codes = [item["code"] for item in alerts]
         self.assertIn("runner_not_running", codes)
         self.assertIn("rate_limited", codes)
+
+    def test_extract_futures_asset_snapshot_reads_asset_rows_with_usdt_fallback(self) -> None:
+        account_info = {
+            "availableBalance": "123.45",
+            "totalWalletBalance": "156.78",
+            "totalMarginBalance": "160.00",
+            "maxWithdrawAmount": "120.00",
+            "assets": [
+                {
+                    "asset": "BNB",
+                    "walletBalance": "0.52",
+                    "availableBalance": "0.31",
+                    "marginBalance": "0.54",
+                    "crossUnPnl": "0.01",
+                    "maxWithdrawAmount": "0.30",
+                }
+            ],
+        }
+
+        usdt = _extract_futures_asset_snapshot(account_info, "USDT")
+        bnb = _extract_futures_asset_snapshot(account_info, "BNB")
+
+        self.assertIsNotNone(usdt)
+        self.assertEqual(usdt["asset"], "USDT")
+        self.assertAlmostEqual(usdt["wallet_balance"], 156.78, places=8)
+        self.assertAlmostEqual(usdt["available_balance"], 123.45, places=8)
+        self.assertAlmostEqual(usdt["max_withdraw_amount"], 120.0, places=8)
+
+        self.assertIsNotNone(bnb)
+        self.assertEqual(bnb["asset"], "BNB")
+        self.assertAlmostEqual(bnb["wallet_balance"], 0.52, places=8)
+        self.assertAlmostEqual(bnb["available_balance"], 0.31, places=8)
+
+        self.assertIsNone(_extract_futures_asset_snapshot(account_info, "ETH"))
 
     def test_filter_rows_since_discards_older_trade_rows(self) -> None:
         floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)

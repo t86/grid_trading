@@ -754,6 +754,42 @@ def _push_alert(
     )
 
 
+def _extract_futures_asset_snapshot(account_info: dict[str, Any], asset: str) -> dict[str, Any] | None:
+    normalized_asset = str(asset or "").upper().strip()
+    if not normalized_asset:
+        return None
+    assets = account_info.get("assets")
+    asset_row: dict[str, Any] | None = None
+    if isinstance(assets, list):
+        for item in assets:
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("asset", "")).upper().strip() == normalized_asset:
+                asset_row = item
+                break
+    if asset_row is None and normalized_asset != "USDT":
+        return None
+
+    wallet_balance = _safe_float((asset_row or {}).get("walletBalance"))
+    available_balance = _safe_float((asset_row or {}).get("availableBalance"))
+    cross_un_pnl = _safe_float((asset_row or {}).get("crossUnPnl"))
+    max_withdraw_amount = _safe_float((asset_row or {}).get("maxWithdrawAmount"))
+    margin_balance = _safe_float((asset_row or {}).get("marginBalance"))
+    if normalized_asset == "USDT":
+        wallet_balance = wallet_balance or _safe_float(account_info.get("totalWalletBalance"))
+        available_balance = available_balance or _safe_float(account_info.get("availableBalance"))
+        margin_balance = margin_balance or _safe_float(account_info.get("totalMarginBalance"))
+        max_withdraw_amount = max_withdraw_amount or _safe_float(account_info.get("maxWithdrawAmount"))
+    return {
+        "asset": normalized_asset,
+        "wallet_balance": wallet_balance,
+        "available_balance": available_balance,
+        "margin_balance": margin_balance,
+        "unrealized_pnl": cross_un_pnl,
+        "max_withdraw_amount": max_withdraw_amount,
+    }
+
+
 def build_monitor_alerts(
     *,
     loop_summary: dict[str, Any],
@@ -1035,6 +1071,7 @@ def _build_monitor_snapshot_uncached(
         "account_connected": False,
         "market": None,
         "position": None,
+        "account_assets": {},
         "open_orders": [],
         "trade_summary": None,
         "income_summary": None,
@@ -1112,6 +1149,10 @@ def _build_monitor_snapshot_uncached(
             "available_balance": _safe_float(account_info.get("availableBalance")),
             "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
             "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
+        }
+        snapshot["account_assets"] = {
+            "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
+            "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
         }
         snapshot["open_orders"] = [
             {

@@ -48,6 +48,8 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_monitor_page_contains_custom_grid_startup_inventory_text(self) -> None:
         self.assertIn("现价启动底仓", MONITOR_PAGE)
+        self.assertIn("合约 USDT", MONITOR_PAGE)
+        self.assertIn("合约 BNB", MONITOR_PAGE)
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")

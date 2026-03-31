@@ -9921,6 +9921,9 @@ MONITOR_PAGE = """<!doctype html>
       const income = data.income_summary || {};
       const audit = data.audit || {};
       const pos = data.position || {};
+      const accountAssets = data.account_assets || {};
+      const usdtAsset = accountAssets.USDT || null;
+      const bnbAsset = accountAssets.BNB || null;
       const market = data.market || {};
       const loop = (data.local && data.local.loop_summary) || {};
       const latestLoop = loop.latest || {};
@@ -10002,6 +10005,8 @@ MONITOR_PAGE = """<!doctype html>
         ["审计日志", `成交 ${fmtNum(audit.trade_row_count || 0, 0)} / 资金费 ${fmtNum(audit.income_row_count || 0, 0)}`, "", `委托事件: ${fmtNum(audit.order_event_count || 0, 0)} · 提交轮次: ${fmtNum(audit.submit_event_count || 0, 0)} · 计划轮次: ${fmtNum(audit.plan_event_count || 0, 0)}`],
         ["当前仓位", isNeutralMode ? `净 ${fmtNum(netQty, 0)}` : fmtNum(pos.position_amt || 0, 0), "", isNeutralMode ? `Long/Short: ${fmtNum(longQty, 0)} / ${fmtNum(shortQty, 0)} · ${centerLabelText} · 中价名义: ${fmtNum((longQty + shortQty) * (market.mid_price || 0), 4)}` : `开仓均价: ${fmtNum(pos.entry_price || 0, 7)} · ${centerLabelText} · 持仓名义: ${fmtNum(Math.abs(pos.position_amt || 0) * (market.mid_price || 0), 4)}`],
         ["当前挂单数", fmtNum((data.open_orders || []).length, 0), "", `买/卖: ${fmtNum((data.open_orders || []).filter(x => x.side === "BUY").length, 0)} / ${fmtNum((data.open_orders || []).filter(x => x.side === "SELL").length, 0)}`],
+        ["合约 USDT", usdtAsset ? fmtNum(usdtAsset.wallet_balance || 0, 4) : "--", "", usdtAsset ? `可用: ${fmtNum(usdtAsset.available_balance || 0, 4)} · 可提: ${fmtNum(usdtAsset.max_withdraw_amount || 0, 4)}` : "未读到 USDT 资产"],
+        ["合约 BNB", bnbAsset ? fmtNum(bnbAsset.wallet_balance || 0, 6) : "--", "", bnbAsset ? `可用: ${fmtNum(bnbAsset.available_balance || 0, 6)} · 可提: ${fmtNum(bnbAsset.max_withdraw_amount || 0, 6)}` : "未读到 BNB 资产"],
         ["市场", `${fmtNum(market.bid_price || 0, 7)} / ${fmtNum(market.ask_price || 0, 7)}`, "", `中价: ${fmtNum(market.mid_price || 0, 7)} · Funding: ${fmtPct(market.funding_rate || 0)}`],
       ];
       summaryEl.innerHTML = cards.map(([label, value, cls, sub]) => `
@@ -10051,6 +10056,9 @@ MONITOR_PAGE = """<!doctype html>
       const rawPos = data.position;
       const pos = rawPos || {};
       const risk = data.risk_controls || {};
+      const accountAssets = data.account_assets || {};
+      const usdtAsset = accountAssets.USDT || null;
+      const bnbAsset = accountAssets.BNB || null;
       const runnerCfg = (data.runner && data.runner.config) || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const strategyMode = String(risk.strategy_mode || runnerCfg.strategy_mode || "one_way_long");
@@ -10090,6 +10098,12 @@ MONITOR_PAGE = """<!doctype html>
         ["Multi-Assets", pos.multi_assets_margin ? "是" : "否"],
         ["可用余额", fmtNum(pos.available_balance || 0, 4)],
         ["钱包余额", fmtNum(pos.wallet_balance || 0, 4)],
+        ["合约 USDT 余额", usdtAsset ? fmtNum(usdtAsset.wallet_balance || 0, 4) : "--"],
+        ["合约 USDT 可用", usdtAsset ? fmtNum(usdtAsset.available_balance || 0, 4) : "--"],
+        ["合约 USDT 可提", usdtAsset ? fmtNum(usdtAsset.max_withdraw_amount || 0, 4) : "--"],
+        ["合约 BNB 余额", bnbAsset ? fmtNum(bnbAsset.wallet_balance || 0, 6) : "--"],
+        ["合约 BNB 可用", bnbAsset ? fmtNum(bnbAsset.available_balance || 0, 6) : "--"],
+        ["合约 BNB 可提", bnbAsset ? fmtNum(bnbAsset.max_withdraw_amount || 0, 6) : "--"],
         ["每笔名义", fmtNum(runnerCfg.per_order_notional, 4)],
         ["底仓目标名义", fmtNum(runnerCfg.base_position_notional, 4)],
         ["软停买阈值", fmtNum(risk.pause_buy_position_notional, 4)],
