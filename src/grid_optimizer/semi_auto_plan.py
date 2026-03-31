@@ -175,6 +175,7 @@ def build_static_binance_grid_plan(
     min_notional: float | None,
     current_long_qty: float,
     current_short_qty: float,
+    bootstrap_positions: bool = True,
 ) -> dict[str, Any]:
     if min_price <= 0 or max_price <= 0 or min_price >= max_price:
         raise ValueError("invalid grid bounds")
@@ -206,7 +207,7 @@ def build_static_binance_grid_plan(
         slippage=0.0,
         funding_rates=[],
         neutral_anchor_price=neutral_anchor_price,
-        bootstrap_positions=True,
+        bootstrap_positions=bootstrap_positions,
         capture_funding_events=False,
         capture_trades=False,
         capture_curves=False,
@@ -321,7 +322,7 @@ def build_static_binance_grid_plan(
                 break
 
     bootstrap_long_qty = _round_order_qty(max(startup_long_qty - current_long_qty, 0.0), step_size)
-    if bootstrap_long_qty > 0:
+    if bootstrap_positions and bootstrap_long_qty > 0:
         bootstrap_price = _round_order_price(bid_price, tick_size, "BUY")
         bootstrap_notional = bootstrap_price * bootstrap_long_qty
         if (min_qty is None or bootstrap_long_qty >= min_qty) and (
@@ -338,7 +339,7 @@ def build_static_binance_grid_plan(
             )
 
     bootstrap_short_qty = _round_order_qty(max(startup_short_qty - current_short_qty, 0.0), step_size)
-    if bootstrap_short_qty > 0:
+    if bootstrap_positions and bootstrap_short_qty > 0:
         bootstrap_price = _round_order_price(ask_price, tick_size, "SELL")
         bootstrap_notional = bootstrap_price * bootstrap_short_qty
         if (min_qty is None or bootstrap_short_qty >= min_qty) and (
@@ -354,14 +355,26 @@ def build_static_binance_grid_plan(
                 )
             )
 
+    target_base_qty = startup_long_qty if strategy_direction == "long" else startup_short_qty if strategy_direction == "short" else 0.0
+    bootstrap_qty = bootstrap_long_qty if strategy_direction == "long" else bootstrap_short_qty if strategy_direction == "short" else 0.0
+    target_long_base_qty = startup_long_qty
+    target_short_base_qty = startup_short_qty
+    if not bootstrap_positions:
+        bootstrap_long_qty = 0.0
+        bootstrap_short_qty = 0.0
+        target_base_qty = 0.0
+        bootstrap_qty = 0.0
+        target_long_base_qty = 0.0
+        target_short_base_qty = 0.0
+
     return {
         "buy_orders": [order.__dict__ for order in buy_orders],
         "sell_orders": [order.__dict__ for order in sell_orders],
         "bootstrap_orders": [order.__dict__ for order in bootstrap_orders],
-        "target_base_qty": startup_long_qty if strategy_direction == "long" else startup_short_qty if strategy_direction == "short" else 0.0,
-        "bootstrap_qty": bootstrap_long_qty if strategy_direction == "long" else bootstrap_short_qty if strategy_direction == "short" else 0.0,
-        "target_long_base_qty": startup_long_qty,
-        "target_short_base_qty": startup_short_qty,
+        "target_base_qty": target_base_qty,
+        "bootstrap_qty": bootstrap_qty,
+        "target_long_base_qty": target_long_base_qty,
+        "target_short_base_qty": target_short_base_qty,
         "bootstrap_long_qty": bootstrap_long_qty,
         "bootstrap_short_qty": bootstrap_short_qty,
         "active_buy_order_count": len(buy_orders),
@@ -1085,6 +1098,11 @@ def _config_payload(args: argparse.Namespace, symbol_info: dict[str, Any]) -> di
         "custom_grid_n",
         "custom_grid_total_notional",
         "custom_grid_neutral_anchor_price",
+        "custom_grid_roll_enabled",
+        "custom_grid_roll_interval_minutes",
+        "custom_grid_roll_trade_threshold",
+        "custom_grid_roll_upper_distance_ratio",
+        "custom_grid_roll_shift_levels",
         "neutral_center_interval_minutes",
         "neutral_band1_offset_ratio",
         "neutral_band2_offset_ratio",
@@ -1126,7 +1144,7 @@ def load_or_initialize_state(
 
     center_price = args.center_price if args.center_price is not None else mid_price
     center_price = _round_to_nearest_step(center_price, symbol_info.get("tick_size"))
-    return {
+    state = {
         "version": STATE_VERSION,
         "created_at": _isoformat(_utc_now()),
         "updated_at": _isoformat(_utc_now()),
@@ -1135,6 +1153,23 @@ def load_or_initialize_state(
         "center_price": center_price,
         "last_mid_price": mid_price,
     }
+    if getattr(args, "custom_grid_enabled", False):
+        state.update(
+            {
+                "custom_grid_runtime_min_price": getattr(args, "custom_grid_min_price", None),
+                "custom_grid_runtime_max_price": getattr(args, "custom_grid_max_price", None),
+                "custom_grid_roll_last_check_bucket": None,
+                "custom_grid_roll_trade_baseline": 0,
+                "custom_grid_roll_trades_since_last_roll": 0,
+                "custom_grid_roll_last_applied_at": None,
+                "custom_grid_roll_last_applied_price": None,
+                "custom_grid_roll_last_old_min_price": None,
+                "custom_grid_roll_last_old_max_price": None,
+                "custom_grid_roll_last_new_min_price": None,
+                "custom_grid_roll_last_new_max_price": None,
+            }
+        )
+    return state
 
 
 def _build_parser() -> argparse.ArgumentParser:

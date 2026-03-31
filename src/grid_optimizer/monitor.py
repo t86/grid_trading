@@ -1156,6 +1156,119 @@ def _build_monitor_snapshot_uncached(
     if not effective_strategy_label:
         effective_strategy_label = effective_strategy_profile
 
+    custom_grid_roll = (plan_report or {}).get("custom_grid_roll")
+    if not isinstance(custom_grid_roll, dict) or not custom_grid_roll:
+        custom_grid_roll = {}
+    custom_grid_runtime_min_price = _safe_float(custom_grid_roll.get("current_min_price"))
+    if custom_grid_runtime_min_price <= 0:
+        custom_grid_runtime_min_price = _safe_float((plan_report or {}).get("custom_grid_runtime_min_price"))
+    if custom_grid_runtime_min_price <= 0:
+        custom_grid_runtime_min_price = _safe_float(latest_loop.get("custom_grid_runtime_min_price"))
+    if custom_grid_runtime_min_price <= 0:
+        custom_grid_runtime_min_price = _safe_float(runner_config.get("custom_grid_min_price"))
+    custom_grid_runtime_max_price = _safe_float(custom_grid_roll.get("current_max_price"))
+    if custom_grid_runtime_max_price <= 0:
+        custom_grid_runtime_max_price = _safe_float((plan_report or {}).get("custom_grid_runtime_max_price"))
+    if custom_grid_runtime_max_price <= 0:
+        custom_grid_runtime_max_price = _safe_float(latest_loop.get("custom_grid_runtime_max_price"))
+    if custom_grid_runtime_max_price <= 0:
+        custom_grid_runtime_max_price = _safe_float(runner_config.get("custom_grid_max_price"))
+    custom_grid_roll_enabled = bool(custom_grid_roll.get("enabled"))
+    if not custom_grid_roll_enabled:
+        custom_grid_roll_enabled = bool(runner_config.get("custom_grid_roll_enabled"))
+    custom_grid_roll_checked = bool(custom_grid_roll.get("checked"))
+    if not custom_grid_roll_checked:
+        custom_grid_roll_checked = bool(latest_loop.get("custom_grid_roll_checked"))
+    custom_grid_roll_triggered = bool(custom_grid_roll.get("triggered"))
+    if not custom_grid_roll_triggered:
+        custom_grid_roll_triggered = bool(latest_loop.get("custom_grid_roll_triggered"))
+    custom_grid_roll_reason = str(custom_grid_roll.get("reason", "") or latest_loop.get("custom_grid_roll_reason", "") or "")
+    custom_grid_roll_interval_minutes = int(
+        custom_grid_roll.get("interval_minutes", 0)
+        or latest_loop.get("custom_grid_roll_interval_minutes", 0)
+        or runner_config.get("custom_grid_roll_interval_minutes", 0)
+        or 0
+    )
+    custom_grid_roll_trade_threshold = int(
+        custom_grid_roll.get("trade_threshold", 0)
+        or latest_loop.get("custom_grid_roll_trade_threshold", 0)
+        or runner_config.get("custom_grid_roll_trade_threshold", 0)
+        or 0
+    )
+    custom_grid_roll_upper_distance_ratio = _safe_float(
+        custom_grid_roll.get("upper_distance_ratio")
+        if custom_grid_roll.get("upper_distance_ratio") is not None
+        else latest_loop.get("custom_grid_roll_upper_distance_ratio")
+        if latest_loop.get("custom_grid_roll_upper_distance_ratio") is not None
+        else runner_config.get("custom_grid_roll_upper_distance_ratio")
+    )
+    custom_grid_roll_shift_levels = int(
+        custom_grid_roll.get("shift_levels", 0)
+        or latest_loop.get("custom_grid_roll_shift_levels", 0)
+        or runner_config.get("custom_grid_roll_shift_levels", 0)
+        or 0
+    )
+    custom_grid_roll_current_trade_count = int(
+        custom_grid_roll.get("current_trade_count", 0)
+        or latest_loop.get("custom_grid_roll_current_trade_count", 0)
+        or 0
+    )
+    custom_grid_roll_trade_baseline = int(
+        custom_grid_roll.get("trade_baseline", 0)
+        or latest_loop.get("custom_grid_roll_trade_baseline", 0)
+        or 0
+    )
+    custom_grid_roll_trades_since_last_roll = int(
+        custom_grid_roll.get("trades_since_last_roll", 0)
+        or latest_loop.get("custom_grid_roll_trades_since_last_roll", 0)
+        or 0
+    )
+    custom_grid_roll_levels_above_current = int(
+        custom_grid_roll.get("levels_above_current", 0)
+        or latest_loop.get("custom_grid_roll_levels_above_current", 0)
+        or 0
+    )
+    custom_grid_roll_required_levels_above = int(
+        custom_grid_roll.get("required_levels_above", 0)
+        or latest_loop.get("custom_grid_roll_required_levels_above", 0)
+        or 0
+    )
+    custom_grid_roll_last_check_bucket = (
+        custom_grid_roll.get("last_check_bucket")
+        or latest_loop.get("custom_grid_roll_last_check_bucket")
+        or None
+    )
+    custom_grid_roll_last_applied_at = (
+        custom_grid_roll.get("last_applied_at")
+        or latest_loop.get("custom_grid_roll_last_applied_at")
+        or None
+    )
+    custom_grid_roll_last_applied_price = _safe_float(
+        custom_grid_roll.get("last_applied_price")
+        if custom_grid_roll.get("last_applied_price") is not None
+        else latest_loop.get("custom_grid_roll_last_applied_price")
+    )
+    custom_grid_roll_last_old_min_price = _safe_float(
+        custom_grid_roll.get("last_old_min_price")
+        if custom_grid_roll.get("last_old_min_price") is not None
+        else latest_loop.get("custom_grid_roll_last_old_min_price")
+    )
+    custom_grid_roll_last_old_max_price = _safe_float(
+        custom_grid_roll.get("last_old_max_price")
+        if custom_grid_roll.get("last_old_max_price") is not None
+        else latest_loop.get("custom_grid_roll_last_old_max_price")
+    )
+    custom_grid_roll_last_new_min_price = _safe_float(
+        custom_grid_roll.get("last_new_min_price")
+        if custom_grid_roll.get("last_new_min_price") is not None
+        else latest_loop.get("custom_grid_roll_last_new_min_price")
+    )
+    custom_grid_roll_last_new_max_price = _safe_float(
+        custom_grid_roll.get("last_new_max_price")
+        if custom_grid_roll.get("last_new_max_price") is not None
+        else latest_loop.get("custom_grid_roll_last_new_max_price")
+    )
+
     if synthetic_mode:
         snapshot["position"]["virtual_long_qty"] = synthetic_long_qty
         snapshot["position"]["virtual_short_qty"] = synthetic_short_qty
@@ -1216,6 +1329,28 @@ def _build_monitor_snapshot_uncached(
         "effective_sell_levels": int((plan_report or {}).get("effective_sell_levels", 0) or 0),
         "effective_per_order_notional": _safe_float((plan_report or {}).get("effective_per_order_notional")),
         "effective_base_position_notional": _safe_float((plan_report or {}).get("effective_base_position_notional")),
+        "custom_grid_runtime_min_price": custom_grid_runtime_min_price,
+        "custom_grid_runtime_max_price": custom_grid_runtime_max_price,
+        "custom_grid_roll_enabled": custom_grid_roll_enabled,
+        "custom_grid_roll_checked": custom_grid_roll_checked,
+        "custom_grid_roll_triggered": custom_grid_roll_triggered,
+        "custom_grid_roll_reason": custom_grid_roll_reason or None,
+        "custom_grid_roll_interval_minutes": custom_grid_roll_interval_minutes,
+        "custom_grid_roll_trade_threshold": custom_grid_roll_trade_threshold,
+        "custom_grid_roll_upper_distance_ratio": custom_grid_roll_upper_distance_ratio,
+        "custom_grid_roll_shift_levels": custom_grid_roll_shift_levels,
+        "custom_grid_roll_current_trade_count": custom_grid_roll_current_trade_count,
+        "custom_grid_roll_trade_baseline": custom_grid_roll_trade_baseline,
+        "custom_grid_roll_trades_since_last_roll": custom_grid_roll_trades_since_last_roll,
+        "custom_grid_roll_levels_above_current": custom_grid_roll_levels_above_current,
+        "custom_grid_roll_required_levels_above": custom_grid_roll_required_levels_above,
+        "custom_grid_roll_last_check_bucket": custom_grid_roll_last_check_bucket,
+        "custom_grid_roll_last_applied_at": custom_grid_roll_last_applied_at,
+        "custom_grid_roll_last_applied_price": custom_grid_roll_last_applied_price if custom_grid_roll_last_applied_price > 0 else None,
+        "custom_grid_roll_last_old_min_price": custom_grid_roll_last_old_min_price if custom_grid_roll_last_old_min_price > 0 else None,
+        "custom_grid_roll_last_old_max_price": custom_grid_roll_last_old_max_price if custom_grid_roll_last_old_max_price > 0 else None,
+        "custom_grid_roll_last_new_min_price": custom_grid_roll_last_new_min_price if custom_grid_roll_last_new_min_price > 0 else None,
+        "custom_grid_roll_last_new_max_price": custom_grid_roll_last_new_max_price if custom_grid_roll_last_new_max_price > 0 else None,
     }
 
     return snapshot

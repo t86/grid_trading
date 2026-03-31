@@ -488,6 +488,11 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "fixed_center_enabled": False,
     "fixed_center_roll_enabled": False,
     "excess_inventory_reduce_only_enabled": False,
+    "custom_grid_roll_enabled": False,
+    "custom_grid_roll_interval_minutes": 5,
+    "custom_grid_roll_trade_threshold": 100,
+    "custom_grid_roll_upper_distance_ratio": 0.30,
+    "custom_grid_roll_shift_levels": 1,
     "autotune_symbol_enabled": True,
     "up_trigger_steps": 6,
     "down_trigger_steps": 4,
@@ -1148,8 +1153,31 @@ def _normalize_grid_strategy_create_payload(payload: dict[str, Any]) -> dict[str
     name = str(payload.get("name", "")).strip()
     if not name:
         raise ValueError("strategy name is required")
-    if params["grid_level_mode"] != "arithmetic":
-        raise ValueError("当前只支持将 arithmetic 网格保存为可执行策略")
+    params["custom_grid_roll_enabled"] = _safe_bool(payload.get("custom_grid_roll_enabled", False), "custom_grid_roll_enabled")
+    params["custom_grid_roll_interval_minutes"] = _safe_int(
+        payload.get("custom_grid_roll_interval_minutes", 5),
+        "custom_grid_roll_interval_minutes",
+    )
+    params["custom_grid_roll_trade_threshold"] = _safe_int(
+        payload.get("custom_grid_roll_trade_threshold", 100),
+        "custom_grid_roll_trade_threshold",
+    )
+    params["custom_grid_roll_upper_distance_ratio"] = _safe_float(
+        payload.get("custom_grid_roll_upper_distance_ratio", 0.30),
+        "custom_grid_roll_upper_distance_ratio",
+    )
+    params["custom_grid_roll_shift_levels"] = _safe_int(
+        payload.get("custom_grid_roll_shift_levels", 1),
+        "custom_grid_roll_shift_levels",
+    )
+    if params["custom_grid_roll_interval_minutes"] <= 0:
+        raise ValueError("custom_grid_roll_interval_minutes must be > 0")
+    if params["custom_grid_roll_trade_threshold"] < 0:
+        raise ValueError("custom_grid_roll_trade_threshold must be >= 0")
+    if not 0 <= params["custom_grid_roll_upper_distance_ratio"] <= 1:
+        raise ValueError("custom_grid_roll_upper_distance_ratio must be between 0 and 1")
+    if params["custom_grid_roll_shift_levels"] <= 0:
+        raise ValueError("custom_grid_roll_shift_levels must be > 0")
     params["name"] = name
     return params
 
@@ -1170,7 +1198,27 @@ def _normalize_custom_grid_runtime_config(config: dict[str, Any]) -> dict[str, A
     normalized["custom_grid_enabled"] = True
     normalized["fixed_center_enabled"] = False
     normalized["fixed_center_roll_enabled"] = False
-    normalized["excess_inventory_reduce_only_enabled"] = True
+    normalized["excess_inventory_reduce_only_enabled"] = False
+    normalized["custom_grid_roll_enabled"] = _safe_bool(
+        normalized.get("custom_grid_roll_enabled", False),
+        "custom_grid_roll_enabled",
+    )
+    normalized["custom_grid_roll_interval_minutes"] = _safe_int(
+        normalized.get("custom_grid_roll_interval_minutes", 5),
+        "custom_grid_roll_interval_minutes",
+    )
+    normalized["custom_grid_roll_trade_threshold"] = _safe_int(
+        normalized.get("custom_grid_roll_trade_threshold", 100),
+        "custom_grid_roll_trade_threshold",
+    )
+    normalized["custom_grid_roll_upper_distance_ratio"] = _safe_float(
+        normalized.get("custom_grid_roll_upper_distance_ratio", 0.30),
+        "custom_grid_roll_upper_distance_ratio",
+    )
+    normalized["custom_grid_roll_shift_levels"] = _safe_int(
+        normalized.get("custom_grid_roll_shift_levels", 1),
+        "custom_grid_roll_shift_levels",
+    )
     normalized["autotune_symbol_enabled"] = False
     normalized["auto_regime_enabled"] = False
     normalized["neutral_hourly_scale_enabled"] = False
@@ -1213,9 +1261,15 @@ def _build_custom_grid_runner_preset(params: dict[str, Any]) -> dict[str, Any]:
     symbol = str(summary.get("symbol") or params["symbol"]).upper().strip()
     current_price = _safe_float(summary.get("current_price"), "current_price")
     grid_count = max(_safe_int(summary.get("grid_count", params["n"]), "grid_count"), 1)
-    step_price = (float(params["max_price"]) - float(params["min_price"])) / float(grid_count)
+    levels = build_grid_levels(
+        min_price=float(params["min_price"]),
+        max_price=float(params["max_price"]),
+        n=grid_count,
+        grid_level_mode=str(params["grid_level_mode"]),
+    )
+    step_price = float(levels[1] - levels[0]) if len(levels) >= 2 else 0.0
     if step_price <= 0:
-        raise ValueError("invalid arithmetic step_price")
+        raise ValueError("invalid custom grid step_price")
     symbol_info = dict(summary.get("symbol_info") or {})
     position_budget_notional = _safe_float(summary.get("position_budget_notional"), "position_budget_notional")
     preview_entry_notionals = [
@@ -1247,6 +1301,23 @@ def _build_custom_grid_runner_preset(params: dict[str, Any]) -> dict[str, Any]:
         "custom_grid_neutral_anchor_price": _safe_float(summary.get("neutral_anchor_price"), "neutral_anchor_price")
         if direction == "neutral"
         else None,
+        "custom_grid_roll_enabled": bool(params.get("custom_grid_roll_enabled", False)),
+        "custom_grid_roll_interval_minutes": _safe_int(
+            params.get("custom_grid_roll_interval_minutes", 5),
+            "custom_grid_roll_interval_minutes",
+        ),
+        "custom_grid_roll_trade_threshold": _safe_int(
+            params.get("custom_grid_roll_trade_threshold", 100),
+            "custom_grid_roll_trade_threshold",
+        ),
+        "custom_grid_roll_upper_distance_ratio": _safe_float(
+            params.get("custom_grid_roll_upper_distance_ratio", 0.30),
+            "custom_grid_roll_upper_distance_ratio",
+        ),
+        "custom_grid_roll_shift_levels": _safe_int(
+            params.get("custom_grid_roll_shift_levels", 1),
+            "custom_grid_roll_shift_levels",
+        ),
         "step_price": step_price,
         "per_order_notional": per_order_notional,
         "margin_type": "KEEP",
@@ -1634,6 +1705,19 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--custom-grid-total-notional", str(config["custom_grid_total_notional"])])
     if config.get("custom_grid_neutral_anchor_price") is not None:
         command.extend(["--custom-grid-neutral-anchor-price", str(config["custom_grid_neutral_anchor_price"])])
+    command.append(
+        "--custom-grid-roll-enabled"
+        if config.get("custom_grid_roll_enabled", False)
+        else "--no-custom-grid-roll-enabled"
+    )
+    if config.get("custom_grid_roll_interval_minutes") is not None:
+        command.extend(["--custom-grid-roll-interval-minutes", str(config["custom_grid_roll_interval_minutes"])])
+    if config.get("custom_grid_roll_trade_threshold") is not None:
+        command.extend(["--custom-grid-roll-trade-threshold", str(config["custom_grid_roll_trade_threshold"])])
+    if config.get("custom_grid_roll_upper_distance_ratio") is not None:
+        command.extend(["--custom-grid-roll-upper-distance-ratio", str(config["custom_grid_roll_upper_distance_ratio"])])
+    if config.get("custom_grid_roll_shift_levels") is not None:
+        command.extend(["--custom-grid-roll-shift-levels", str(config["custom_grid_roll_shift_levels"])])
     command.extend([
         "--down-trigger-steps",
         str(config.get("down_trigger_steps", 4)),
@@ -1773,6 +1857,11 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "pause_short_position_notional",
             "max_position_notional",
             "max_short_position_notional",
+            "custom_grid_roll_enabled",
+            "custom_grid_roll_interval_minutes",
+            "custom_grid_roll_trade_threshold",
+            "custom_grid_roll_upper_distance_ratio",
+            "custom_grid_roll_shift_levels",
             "min_mid_price_for_buys",
             "buy_pause_amp_trigger_ratio",
             "buy_pause_down_return_trigger_ratio",
@@ -8265,13 +8354,28 @@ MONITOR_PAGE = """<!doctype html>
         <label>杠杆
           <input id="custom_grid_leverage" type="number" min="1" step="0.1" value="2" />
         </label>
+        <label>条件下移
+          <input id="custom_grid_roll_enabled" type="checkbox" />
+        </label>
+        <label>检查周期（分钟）
+          <input id="custom_grid_roll_interval_minutes" type="number" min="1" step="1" value="5" />
+        </label>
+        <label>成交阈值（笔）
+          <input id="custom_grid_roll_trade_threshold" type="number" min="0" step="1" value="100" />
+        </label>
+        <label>距上沿比例阈值
+          <input id="custom_grid_roll_upper_distance_ratio" type="number" min="0" max="1" step="0.01" value="0.30" />
+        </label>
+        <label>每次下移层数
+          <input id="custom_grid_roll_shift_levels" type="number" min="1" step="1" value="1" />
+        </label>
         <button id="custom_grid_preview_btn" class="primary">预览网格</button>
         <button id="custom_grid_save_btn">保存为策略</button>
         <button id="custom_grid_load_btn">载入已选策略</button>
         <button id="custom_grid_update_btn">更新已选策略</button>
         <button id="custom_grid_delete_btn" class="danger">删除已选策略</button>
       </div>
-      <div id="custom_grid_status" class="meta">按当前选中的交易对生成预览。保存后会出现在上方“策略预设”下拉里。已保存的自定义策略支持载入、编辑和删除。</div>
+      <div id="custom_grid_status" class="meta">按当前选中的交易对生成预览。保存后会出现在上方“策略预设”下拉里。已保存的自定义策略支持载入、编辑和删除。条件下移目前只对做多静态网格生效。</div>
       <div class="meta">网格模式说明：等差表示相邻网格的价格差固定，适合你已经明确绝对价差区间；等比表示相邻网格的百分比间距固定，价格越高格距越大，更适合跨度较大的区间。无论哪种模式，预览和保存后的策略都按每格固定名义金额分配，不按固定币数分配。</div>
       <div id="custom_grid_summary" class="meta"></div>
       <div class="table-wrap">
@@ -8457,6 +8561,11 @@ MONITOR_PAGE = """<!doctype html>
     const customGridMaxPriceEl = document.getElementById("custom_grid_max_price");
     const customGridMarginAmountEl = document.getElementById("custom_grid_margin_amount");
     const customGridLeverageEl = document.getElementById("custom_grid_leverage");
+    const customGridRollEnabledEl = document.getElementById("custom_grid_roll_enabled");
+    const customGridRollIntervalEl = document.getElementById("custom_grid_roll_interval_minutes");
+    const customGridRollTradeThresholdEl = document.getElementById("custom_grid_roll_trade_threshold");
+    const customGridRollUpperDistanceRatioEl = document.getElementById("custom_grid_roll_upper_distance_ratio");
+    const customGridRollShiftLevelsEl = document.getElementById("custom_grid_roll_shift_levels");
     const customGridPreviewBtn = document.getElementById("custom_grid_preview_btn");
     const customGridSaveBtn = document.getElementById("custom_grid_save_btn");
     const customGridLoadBtn = document.getElementById("custom_grid_load_btn");
@@ -8883,7 +8992,12 @@ MONITOR_PAGE = """<!doctype html>
       plan_json: "最近一次计划输出 JSON 路径。",
       submit_report_json: "最近一次下单提交报告路径。",
       summary_jsonl: "循环事件日志文件路径。",
-      custom_grid_enabled: "是否启用自定义网格模式。"
+      custom_grid_enabled: "是否启用自定义网格模式。",
+      custom_grid_roll_enabled: "仅做多静态网格有效。开启后会按时间桶检查成交是否足够活跃、价格是否已明显远离上沿，满足后把整个区间下移。",
+      custom_grid_roll_interval_minutes: "条件下移的检查周期。每个时间桶最多检查一次。",
+      custom_grid_roll_trade_threshold: "自上次成功下移后，至少累计多少笔成交才允许再次触发。",
+      custom_grid_roll_upper_distance_ratio: "当前价格距上沿还剩多少比例的梯子层数时，才允许触发下移。",
+      custom_grid_roll_shift_levels: "每次触发时整个静态梯子向下移动多少层。"
     };
 
     async function loadMonitorSymbols(preferredSymbol = "") {
@@ -9605,6 +9719,7 @@ MONITOR_PAGE = """<!doctype html>
         return;
       }
       const params = preset.grid_preview_params || {};
+      const config = preset.config || {};
       customGridNameEl.value = String(preset.label || "");
       customGridDirectionEl.value = String(params.strategy_direction || "neutral");
       customGridLevelModeEl.value = String(params.grid_level_mode || "arithmetic");
@@ -9613,6 +9728,11 @@ MONITOR_PAGE = """<!doctype html>
       customGridMaxPriceEl.value = String(params.max_price ?? "");
       customGridMarginAmountEl.value = String(params.margin_amount ?? "");
       customGridLeverageEl.value = String(params.leverage ?? 2);
+      customGridRollEnabledEl.checked = Boolean(config.custom_grid_roll_enabled);
+      customGridRollIntervalEl.value = String(config.custom_grid_roll_interval_minutes ?? 5);
+      customGridRollTradeThresholdEl.value = String(config.custom_grid_roll_trade_threshold ?? 100);
+      customGridRollUpperDistanceRatioEl.value = String(config.custom_grid_roll_upper_distance_ratio ?? 0.30);
+      customGridRollShiftLevelsEl.value = String(config.custom_grid_roll_shift_levels ?? 1);
       latestCustomGridPreview = null;
       customGridSummaryEl.textContent = "";
       customGridPreviewBody.innerHTML = '<tr><td colspan="9" class="empty">已载入已选自定义策略。点击“预览网格”可查看当前盘面下的最新委托明细。</td></tr>';
@@ -9631,6 +9751,11 @@ MONITOR_PAGE = """<!doctype html>
         max_price: Number(customGridMaxPriceEl.value || 0),
         margin_amount: Number(customGridMarginAmountEl.value || 0),
         leverage: Number(customGridLeverageEl.value || 0),
+        custom_grid_roll_enabled: Boolean(customGridRollEnabledEl.checked),
+        custom_grid_roll_interval_minutes: Number(customGridRollIntervalEl.value || 5),
+        custom_grid_roll_trade_threshold: Number(customGridRollTradeThresholdEl.value || 100),
+        custom_grid_roll_upper_distance_ratio: Number(customGridRollUpperDistanceRatioEl.value || 0.30),
+        custom_grid_roll_shift_levels: Number(customGridRollShiftLevelsEl.value || 1),
       };
     }
 
@@ -12017,7 +12142,9 @@ STRATEGIES_PAGE = """<!doctype html>
       const basePosition = Number(risk.effective_base_position_notional || runnerCfg.base_position_notional || 0);
       if (runnerCfg.custom_grid_enabled) {
         const direction = String(runnerCfg.custom_grid_direction || "long");
-        const rangeText = `${fmtNum(runnerCfg.custom_grid_min_price, 7)} - ${fmtNum(runnerCfg.custom_grid_max_price, 7)}，${fmtNum(runnerCfg.custom_grid_n, 0)} 格`;
+        const liveMinPrice = Number(risk.custom_grid_runtime_min_price || runnerCfg.custom_grid_min_price || 0);
+        const liveMaxPrice = Number(risk.custom_grid_runtime_max_price || runnerCfg.custom_grid_max_price || 0);
+        const rangeText = `${fmtNum(liveMinPrice, 7)} - ${fmtNum(liveMaxPrice, 7)}，${fmtNum(runnerCfg.custom_grid_n, 0)} 格`;
         if (direction === "neutral") {
           return {
             description,
@@ -12071,6 +12198,7 @@ STRATEGIES_PAGE = """<!doctype html>
     }
 
     function currentBehavior(snapshot) {
+      const runnerCfg = ((snapshot.runner || {}).config || {});
       const risk = snapshot.risk_controls || {};
       const parts = [];
       if (risk.auto_regime_enabled) {
@@ -12090,6 +12218,20 @@ STRATEGIES_PAGE = """<!doctype html>
       }
       if (risk.shift_frozen) {
         parts.push("分钟级大波动冻结了中心/重心平移");
+      }
+      if (runnerCfg.custom_grid_enabled) {
+        if (risk.custom_grid_roll_enabled) {
+          parts.push(
+            `条件下移已开启：每 ${fmtNum(risk.custom_grid_roll_interval_minutes || 0, 0)} 分钟检查，成交 ${fmtNum(risk.custom_grid_roll_trades_since_last_roll || 0, 0)} / ${fmtNum(risk.custom_grid_roll_trade_threshold || 0, 0)}，距上沿 ${fmtNum(risk.custom_grid_roll_levels_above_current || 0, 0)} / ${fmtNum(risk.custom_grid_roll_required_levels_above || 0, 0)} 层`
+          );
+          if (risk.custom_grid_roll_last_applied_at) {
+            parts.push(
+              `最近一次下移 ${fmtTs(risk.custom_grid_roll_last_applied_at)}：${fmtNum(risk.custom_grid_roll_last_old_min_price, 7)} - ${fmtNum(risk.custom_grid_roll_last_old_max_price, 7)} -> ${fmtNum(risk.custom_grid_roll_last_new_min_price, 7)} - ${fmtNum(risk.custom_grid_roll_last_new_max_price, 7)}`
+            );
+          }
+        } else if (String(runnerCfg.custom_grid_direction || "long") === "long") {
+          parts.push("条件下移未开启");
+        }
       }
       return parts.length ? parts.join("。") : "当前没有额外风控接管，按预设规则正常运行。";
     }

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import time
@@ -13,6 +14,7 @@ from .audit import (
     DEFAULT_AUDIT_LOOKBACK_DAYS,
     append_jsonl as _append_jsonl,
     build_audit_paths,
+    count_jsonl_lines,
     collect_new_rows,
     epoch_ms,
     fetch_time_paged,
@@ -24,6 +26,7 @@ from .audit import (
     trade_row_time_ms,
     write_json as _write_json,
 )
+from .backtest import build_grid_levels
 from .data import (
     delete_futures_order,
     fetch_futures_account_info_v3,
@@ -214,6 +217,211 @@ def _resolve_fixed_center_roll(
         "pending_count": pending_count,
         "shifted": shifted,
     }
+
+
+def _current_check_bucket(now: datetime, interval_minutes: int) -> str:
+    safe_interval = max(int(interval_minutes), 1)
+    utc_now = now.astimezone(timezone.utc)
+    bucket_minute = (utc_now.minute // safe_interval) * safe_interval
+    bucket = utc_now.replace(minute=bucket_minute, second=0, microsecond=0)
+    return bucket.strftime("%Y-%m-%dT%H:%MZ")
+
+
+def _custom_grid_levels_above_current(levels: list[float], current_price: float) -> int:
+    if len(levels) < 2:
+        return 0
+    insertion = bisect.bisect_left(levels, float(current_price))
+    return max((len(levels) - 1) - insertion, 0)
+
+
+def _shift_custom_grid_bounds(
+    *,
+    min_price: float,
+    max_price: float,
+    n: int,
+    grid_level_mode: str,
+    shift_levels: int,
+) -> dict[str, float]:
+    safe_n = max(int(n), 1)
+    safe_shift_levels = max(int(shift_levels), 1)
+    if min_price <= 0 or max_price <= 0 or max_price <= min_price:
+        raise ValueError("invalid custom grid bounds")
+    mode = str(grid_level_mode or "arithmetic").strip().lower() or "arithmetic"
+    if mode == "arithmetic":
+        step_price = (float(max_price) - float(min_price)) / float(safe_n)
+        if step_price <= 0:
+            raise ValueError("invalid arithmetic custom grid step")
+        delta = step_price * safe_shift_levels
+        return {
+            "min_price": float(min_price) - delta,
+            "max_price": float(max_price) - delta,
+        }
+
+    ratio = (float(max_price) / float(min_price)) ** (1.0 / float(safe_n))
+    if ratio <= 1.0:
+        raise ValueError("invalid geometric custom grid ratio")
+    divisor = ratio**safe_shift_levels
+    return {
+        "min_price": float(min_price) / divisor,
+        "max_price": float(max_price) / divisor,
+    }
+
+
+def _read_custom_grid_trade_count(summary_path: str | Path) -> int:
+    trade_audit_path = build_audit_paths(summary_path)["trade_audit"]
+    return count_jsonl_lines(trade_audit_path)
+
+
+def _resolve_custom_grid_roll(
+    *,
+    state: dict[str, Any],
+    summary_path: str | Path,
+    now: datetime,
+    current_price: float,
+    min_price: float,
+    max_price: float,
+    n: int,
+    grid_level_mode: str,
+    direction: str,
+    enabled: bool,
+    interval_minutes: int,
+    trade_threshold: int,
+    upper_distance_ratio: float,
+    shift_levels: int,
+) -> tuple[float, float, dict[str, Any]]:
+    safe_direction = str(direction or "").strip().lower()
+    safe_enabled = bool(enabled)
+    safe_interval_minutes = max(int(interval_minutes), 1)
+    safe_trade_threshold = max(int(trade_threshold), 0)
+    safe_upper_distance_ratio = max(min(float(upper_distance_ratio), 1.0), 0.0)
+    safe_shift_levels = max(int(shift_levels), 1)
+    safe_n = max(int(n), 1)
+    current_min_price = float(min_price)
+    current_max_price = float(max_price)
+    current_trade_count = _read_custom_grid_trade_count(summary_path)
+    trade_baseline = max(int(state.get("custom_grid_roll_trade_baseline", 0) or 0), 0)
+    if current_trade_count < trade_baseline:
+        trade_baseline = current_trade_count
+    trades_since_last_roll = max(current_trade_count - trade_baseline, 0)
+    current_bucket = _current_check_bucket(now, safe_interval_minutes)
+    last_check_bucket = str(state.get("custom_grid_roll_last_check_bucket", "") or "")
+    levels = build_grid_levels(
+        min_price=current_min_price,
+        max_price=current_max_price,
+        n=safe_n,
+        grid_level_mode=grid_level_mode,
+    )
+    levels_above_current = _custom_grid_levels_above_current(levels, current_price)
+    required_levels_above = min(max(int(math.ceil(float(safe_n) * safe_upper_distance_ratio)), 0), safe_n)
+    last_applied_at = state.get("custom_grid_roll_last_applied_at")
+    last_applied_price = _safe_float(state.get("custom_grid_roll_last_applied_price"))
+    old_min_price = current_min_price
+    old_max_price = current_max_price
+    new_min_price = current_min_price
+    new_max_price = current_max_price
+
+    state["custom_grid_runtime_min_price"] = current_min_price
+    state["custom_grid_runtime_max_price"] = current_max_price
+    state["custom_grid_roll_trade_baseline"] = trade_baseline
+    state["custom_grid_roll_trades_since_last_roll"] = trades_since_last_roll
+
+    result = {
+        "enabled": safe_enabled,
+        "direction": safe_direction,
+        "checked": False,
+        "triggered": False,
+        "reason": "disabled" if not safe_enabled else "direction_not_long" if safe_direction != "long" else "pending_check",
+        "interval_minutes": safe_interval_minutes,
+        "trade_threshold": safe_trade_threshold,
+        "upper_distance_ratio": safe_upper_distance_ratio,
+        "shift_levels": safe_shift_levels,
+        "current_trade_count": current_trade_count,
+        "trade_baseline": trade_baseline,
+        "trades_since_last_roll": trades_since_last_roll,
+        "levels_above_current": levels_above_current,
+        "required_levels_above": required_levels_above,
+        "current_price": float(current_price),
+        "current_bucket": current_bucket,
+        "last_check_bucket": last_check_bucket or None,
+        "current_min_price": current_min_price,
+        "current_max_price": current_max_price,
+        "old_min_price": old_min_price,
+        "old_max_price": old_max_price,
+        "new_min_price": new_min_price,
+        "new_max_price": new_max_price,
+        "last_applied_at": last_applied_at,
+        "last_applied_price": last_applied_price if last_applied_price > 0 else None,
+        "last_old_min_price": _safe_float(state.get("custom_grid_roll_last_old_min_price")),
+        "last_old_max_price": _safe_float(state.get("custom_grid_roll_last_old_max_price")),
+        "last_new_min_price": _safe_float(state.get("custom_grid_roll_last_new_min_price")),
+        "last_new_max_price": _safe_float(state.get("custom_grid_roll_last_new_max_price")),
+    }
+
+    if not safe_enabled or safe_direction != "long":
+        return current_min_price, current_max_price, result
+
+    if last_check_bucket == current_bucket:
+        result["reason"] = "already_checked_bucket"
+        return current_min_price, current_max_price, result
+
+    result["checked"] = True
+    state["custom_grid_roll_last_check_bucket"] = current_bucket
+    result["last_check_bucket"] = current_bucket
+
+    if float(current_price) > current_max_price:
+        result["reason"] = "price_above_upper"
+        return current_min_price, current_max_price, result
+    if trades_since_last_roll < safe_trade_threshold:
+        result["reason"] = "trade_threshold_not_met"
+        return current_min_price, current_max_price, result
+    if levels_above_current < required_levels_above:
+        result["reason"] = "upper_distance_not_met"
+        return current_min_price, current_max_price, result
+
+    shifted = _shift_custom_grid_bounds(
+        min_price=current_min_price,
+        max_price=current_max_price,
+        n=safe_n,
+        grid_level_mode=grid_level_mode,
+        shift_levels=safe_shift_levels,
+    )
+    new_min_price = float(shifted["min_price"])
+    new_max_price = float(shifted["max_price"])
+    if new_min_price <= 0 or new_max_price <= new_min_price:
+        result["reason"] = "shift_would_cross_zero"
+        return current_min_price, current_max_price, result
+
+    applied_at = now.astimezone(timezone.utc).isoformat()
+    state["custom_grid_runtime_min_price"] = new_min_price
+    state["custom_grid_runtime_max_price"] = new_max_price
+    state["custom_grid_roll_trade_baseline"] = current_trade_count
+    state["custom_grid_roll_trades_since_last_roll"] = 0
+    state["custom_grid_roll_last_applied_at"] = applied_at
+    state["custom_grid_roll_last_applied_price"] = float(current_price)
+    state["custom_grid_roll_last_old_min_price"] = current_min_price
+    state["custom_grid_roll_last_old_max_price"] = current_max_price
+    state["custom_grid_roll_last_new_min_price"] = new_min_price
+    state["custom_grid_roll_last_new_max_price"] = new_max_price
+
+    result.update(
+        {
+            "triggered": True,
+            "reason": "triggered",
+            "trade_baseline": current_trade_count,
+            "trades_since_last_roll": 0,
+            "current_min_price": new_min_price,
+            "current_max_price": new_max_price,
+            "new_min_price": new_min_price,
+            "new_max_price": new_max_price,
+            "last_applied_at": applied_at,
+            "last_applied_price": float(current_price),
+            "last_old_min_price": current_min_price,
+            "last_old_max_price": current_max_price,
+            "last_new_min_price": new_min_price,
+            "last_new_max_price": new_max_price,
+        }
+    )
+    return new_min_price, new_max_price, result
 
 
 def _run_periodic_reconcile(
@@ -552,6 +760,11 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         custom_grid_n=getattr(args, "custom_grid_n", None),
         custom_grid_total_notional=getattr(args, "custom_grid_total_notional", None),
         custom_grid_neutral_anchor_price=getattr(args, "custom_grid_neutral_anchor_price", None),
+        custom_grid_roll_enabled=getattr(args, "custom_grid_roll_enabled", False),
+        custom_grid_roll_interval_minutes=getattr(args, "custom_grid_roll_interval_minutes", 5),
+        custom_grid_roll_trade_threshold=getattr(args, "custom_grid_roll_trade_threshold", 100),
+        custom_grid_roll_upper_distance_ratio=getattr(args, "custom_grid_roll_upper_distance_ratio", 0.30),
+        custom_grid_roll_shift_levels=getattr(args, "custom_grid_roll_shift_levels", 1),
         down_trigger_steps=args.down_trigger_steps,
         up_trigger_steps=args.up_trigger_steps,
         shift_steps=args.shift_steps,
@@ -1617,6 +1830,7 @@ def apply_hedge_position_notional_caps(
 def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     symbol = args.symbol.upper().strip()
     strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    summary_path = Path(args.summary_jsonl)
     if strategy_mode not in {"one_way_long", "one_way_short", "hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
         raise RuntimeError(f"Unsupported strategy_mode: {strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
@@ -1681,11 +1895,32 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     center_source: dict[str, Any] | None = None
     neutral_hourly_scale: dict[str, Any] | None = None
     fixed_center_roll: dict[str, Any] | None = None
+    custom_grid_roll: dict[str, Any] | None = None
     fixed_center_enabled = bool(getattr(args, "fixed_center_enabled", False))
     if _is_custom_grid_mode(args):
-        custom_min_price = _safe_float(getattr(args, "custom_grid_min_price", None))
-        custom_max_price = _safe_float(getattr(args, "custom_grid_max_price", None))
+        custom_min_price = _safe_float(
+            state.get("custom_grid_runtime_min_price", getattr(args, "custom_grid_min_price", None))
+        )
+        custom_max_price = _safe_float(
+            state.get("custom_grid_runtime_max_price", getattr(args, "custom_grid_max_price", None))
+        )
         custom_direction = str(getattr(args, "custom_grid_direction", strategy_mode) or strategy_mode).strip().lower()
+        custom_min_price, custom_max_price, custom_grid_roll = _resolve_custom_grid_roll(
+            state=state,
+            summary_path=summary_path,
+            now=_utc_now(),
+            current_price=mid_price,
+            min_price=custom_min_price,
+            max_price=custom_max_price,
+            n=max(int(getattr(args, "custom_grid_n", 0) or 0), 1),
+            grid_level_mode=str(getattr(args, "custom_grid_level_mode", "arithmetic") or "arithmetic"),
+            direction=custom_direction,
+            enabled=bool(getattr(args, "custom_grid_roll_enabled", False)),
+            interval_minutes=int(getattr(args, "custom_grid_roll_interval_minutes", 5)),
+            trade_threshold=int(getattr(args, "custom_grid_roll_trade_threshold", 100)),
+            upper_distance_ratio=float(getattr(args, "custom_grid_roll_upper_distance_ratio", 0.30)),
+            shift_levels=int(getattr(args, "custom_grid_roll_shift_levels", 1)),
+        )
         center_price = (custom_min_price + custom_max_price) / 2.0 if custom_min_price > 0 and custom_max_price > custom_min_price else center_price
         center_source = {
             "available": True,
@@ -1798,6 +2033,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     if _is_custom_grid_mode(args):
+        excess_inventory_gate["enabled"] = False
         custom_direction = str(getattr(args, "custom_grid_direction", strategy_mode) or strategy_mode).strip().lower()
         if custom_direction not in {"long", "short", "neutral"}:
             raise RuntimeError(f"Unsupported custom_grid_direction: {custom_direction}")
@@ -1837,8 +2073,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         plan = build_static_binance_grid_plan(
             strategy_direction=custom_direction,
             grid_level_mode=str(getattr(args, "custom_grid_level_mode", "arithmetic") or "arithmetic"),
-            min_price=_safe_float(getattr(args, "custom_grid_min_price", None)),
-            max_price=_safe_float(getattr(args, "custom_grid_max_price", None)),
+            min_price=custom_min_price,
+            max_price=custom_max_price,
             n=max(int(getattr(args, "custom_grid_n", 0) or 0), 1),
             total_grid_notional=_safe_float(getattr(args, "custom_grid_total_notional", None)),
             neutral_anchor_price=(
@@ -1854,6 +2090,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
+            bootstrap_positions=False,
         )
         inventory_tier["effective_buy_levels"] = int(plan.get("active_buy_order_count", len(plan.get("buy_orders", []))) or 0)
         inventory_tier["effective_sell_levels"] = int(plan.get("active_sell_order_count", len(plan.get("sell_orders", []))) or 0)
@@ -1882,14 +2119,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             target_base_qty = 0.0
             bootstrap_qty = 0.0
         elif custom_direction == "short":
-            excess_inventory_gate = apply_excess_inventory_reduce_only(
-                plan=plan,
-                strategy_mode="one_way_short",
-                current_long_qty=0.0,
-                current_short_qty=current_short_qty,
-                target_base_qty=plan["target_base_qty"],
-                enabled=bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
-            )
             controls = apply_hedge_position_controls(
                 plan=plan,
                 current_long_qty=0.0,
@@ -1911,17 +2140,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
             )
-            target_base_qty = plan["target_base_qty"]
-            bootstrap_qty = plan["bootstrap_qty"]
+            target_base_qty = 0.0
+            bootstrap_qty = 0.0
         else:
-            excess_inventory_gate = apply_excess_inventory_reduce_only(
-                plan=plan,
-                strategy_mode="one_way_long",
-                current_long_qty=current_long_qty,
-                current_short_qty=0.0,
-                target_base_qty=plan["target_base_qty"],
-                enabled=bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
-            )
             controls = apply_position_controls(
                 plan=plan,
                 current_long_qty=current_long_qty,
@@ -1931,13 +2152,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 external_buy_pause=bool(market_guard["buy_pause_active"]),
                 external_pause_reasons=list(market_guard["buy_pause_reasons"]),
             )
-            if excess_inventory_gate["active"]:
-                controls["buy_paused"] = True
-                controls["pause_reasons"] = list(controls.get("pause_reasons", []))
-                if excess_inventory_gate["reason"]:
-                    controls["pause_reasons"].append(
-                        f"excess_inventory_reduce_only: {excess_inventory_gate['reason']}"
-                    )
             cap_controls = apply_max_position_notional_cap(
                 plan=plan,
                 current_long_notional=controls["current_long_notional"],
@@ -1946,8 +2160,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
             )
-            target_base_qty = plan["target_base_qty"]
-            bootstrap_qty = plan["bootstrap_qty"]
+            target_base_qty = 0.0
+            bootstrap_qty = 0.0
     elif strategy_mode == "hedge_neutral":
         inventory_tier = {
             "enabled": False,
@@ -2304,6 +2518,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "center_price": center_price,
         "step_price": effective_args.step_price,
         "center_source": center_source,
+        "custom_grid_roll": custom_grid_roll,
+        "custom_grid_runtime_min_price": custom_min_price if _is_custom_grid_mode(args) else None,
+        "custom_grid_runtime_max_price": custom_max_price if _is_custom_grid_mode(args) else None,
         "fixed_center_roll": fixed_center_roll,
         "excess_inventory_gate": excess_inventory_gate,
         "neutral_hourly_scale": neutral_hourly_scale,
@@ -2706,6 +2923,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--custom-grid-n", type=int, default=None)
     parser.add_argument("--custom-grid-total-notional", type=float, default=None)
     parser.add_argument("--custom-grid-neutral-anchor-price", type=float, default=None)
+    parser.add_argument("--custom-grid-roll-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--custom-grid-roll-interval-minutes", type=int, default=5)
+    parser.add_argument("--custom-grid-roll-trade-threshold", type=int, default=100)
+    parser.add_argument("--custom-grid-roll-upper-distance-ratio", type=float, default=0.30)
+    parser.add_argument("--custom-grid-roll-shift-levels", type=int, default=1)
     parser.add_argument("--fixed-center-roll-trigger-steps", type=float, default=1.0)
     parser.add_argument("--fixed-center-roll-confirm-cycles", type=int, default=3)
     parser.add_argument("--fixed-center-roll-shift-steps", type=int, default=1)
@@ -2981,6 +3203,14 @@ def main() -> None:
             raise SystemExit("--custom-grid-n must be > 0 when --custom-grid-enabled")
         if args.custom_grid_total_notional is None or args.custom_grid_total_notional <= 0:
             raise SystemExit("--custom-grid-total-notional must be > 0 when --custom-grid-enabled")
+    if args.custom_grid_roll_interval_minutes <= 0:
+        raise SystemExit("--custom-grid-roll-interval-minutes must be > 0")
+    if args.custom_grid_roll_trade_threshold < 0:
+        raise SystemExit("--custom-grid-roll-trade-threshold must be >= 0")
+    if args.custom_grid_roll_upper_distance_ratio < 0 or args.custom_grid_roll_upper_distance_ratio > 1:
+        raise SystemExit("--custom-grid-roll-upper-distance-ratio must be between 0 and 1")
+    if args.custom_grid_roll_shift_levels <= 0:
+        raise SystemExit("--custom-grid-roll-shift-levels must be > 0")
 
     plan_path = Path(args.plan_json)
     submit_report_path = Path(args.submit_report_json)
@@ -3138,6 +3368,32 @@ def main() -> None:
                 "effective_sell_levels": int(plan_report.get("effective_sell_levels", 0) or 0),
                 "effective_per_order_notional": _safe_float(plan_report.get("effective_per_order_notional")),
                 "effective_base_position_notional": _safe_float(plan_report.get("effective_base_position_notional")),
+                "custom_grid_runtime_min_price": _safe_float(plan_report.get("custom_grid_runtime_min_price")),
+                "custom_grid_runtime_max_price": _safe_float(plan_report.get("custom_grid_runtime_max_price")),
+                "custom_grid_roll_enabled": bool(((plan_report.get("custom_grid_roll") or {}).get("enabled"))),
+                "custom_grid_roll_checked": bool(((plan_report.get("custom_grid_roll") or {}).get("checked"))),
+                "custom_grid_roll_triggered": bool(((plan_report.get("custom_grid_roll") or {}).get("triggered"))),
+                "custom_grid_roll_reason": (plan_report.get("custom_grid_roll") or {}).get("reason"),
+                "custom_grid_roll_interval_minutes": int(((plan_report.get("custom_grid_roll") or {}).get("interval_minutes", 0) or 0)),
+                "custom_grid_roll_trade_threshold": int(((plan_report.get("custom_grid_roll") or {}).get("trade_threshold", 0) or 0)),
+                "custom_grid_roll_upper_distance_ratio": _safe_float((plan_report.get("custom_grid_roll") or {}).get("upper_distance_ratio")),
+                "custom_grid_roll_shift_levels": int(((plan_report.get("custom_grid_roll") or {}).get("shift_levels", 0) or 0)),
+                "custom_grid_roll_current_trade_count": int(((plan_report.get("custom_grid_roll") or {}).get("current_trade_count", 0) or 0)),
+                "custom_grid_roll_trade_baseline": int(((plan_report.get("custom_grid_roll") or {}).get("trade_baseline", 0) or 0)),
+                "custom_grid_roll_trades_since_last_roll": int(((plan_report.get("custom_grid_roll") or {}).get("trades_since_last_roll", 0) or 0)),
+                "custom_grid_roll_levels_above_current": int(((plan_report.get("custom_grid_roll") or {}).get("levels_above_current", 0) or 0)),
+                "custom_grid_roll_required_levels_above": int(((plan_report.get("custom_grid_roll") or {}).get("required_levels_above", 0) or 0)),
+                "custom_grid_roll_last_check_bucket": (plan_report.get("custom_grid_roll") or {}).get("last_check_bucket"),
+                "custom_grid_roll_last_applied_at": (plan_report.get("custom_grid_roll") or {}).get("last_applied_at"),
+                "custom_grid_roll_last_applied_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_applied_price")),
+                "custom_grid_roll_old_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("old_min_price")),
+                "custom_grid_roll_old_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("old_max_price")),
+                "custom_grid_roll_new_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("new_min_price")),
+                "custom_grid_roll_new_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("new_max_price")),
+                "custom_grid_roll_last_old_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_old_min_price")),
+                "custom_grid_roll_last_old_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_old_max_price")),
+                "custom_grid_roll_last_new_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_new_min_price")),
+                "custom_grid_roll_last_new_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_new_max_price")),
                 "fixed_center_roll": dict(plan_report.get("fixed_center_roll") or {}),
                 "shift_moves": list(plan_report.get("shift_moves", [])),
                 "reconcile": reconcile_snapshot,

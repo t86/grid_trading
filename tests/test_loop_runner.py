@@ -7,10 +7,16 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from grid_optimizer.audit import build_audit_paths
 from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _should_sync_account_audit,
     _apply_synthetic_trade_fill,
+    _current_check_bucket,
+    _custom_grid_levels_above_current,
+    _read_custom_grid_trade_count,
+    _resolve_custom_grid_roll,
+    _shift_custom_grid_bounds,
     apply_excess_inventory_reduce_only,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
@@ -20,6 +26,7 @@ from grid_optimizer.loop_runner import (
     assess_auto_regime,
     assess_market_guard,
     build_effective_runner_args,
+    generate_plan_report,
     execute_plan_report,
     resolve_neutral_hourly_scale,
     resolve_auto_regime_profile,
@@ -30,6 +37,126 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_current_check_bucket_rounds_down_to_interval(self) -> None:
+        bucket = _current_check_bucket(
+            datetime(2026, 3, 31, 14, 27, 12, tzinfo=timezone.utc),
+            interval_minutes=5,
+        )
+        self.assertEqual(bucket, "2026-03-31T14:25Z")
+
+    def test_custom_grid_levels_above_current_counts_remaining_complete_ladders(self) -> None:
+        levels = [10.0, 11.0, 12.0, 13.0, 14.0]
+        self.assertEqual(_custom_grid_levels_above_current(levels, 12.0), 2)
+        self.assertEqual(_custom_grid_levels_above_current(levels, 11.99), 2)
+        self.assertEqual(_custom_grid_levels_above_current(levels, 9.5), 4)
+        self.assertEqual(_custom_grid_levels_above_current(levels, 14.5), 0)
+
+    def test_shift_custom_grid_bounds_supports_arithmetic_and_geometric(self) -> None:
+        arithmetic = _shift_custom_grid_bounds(
+            min_price=10.0,
+            max_price=14.0,
+            n=4,
+            grid_level_mode="arithmetic",
+            shift_levels=1,
+        )
+        self.assertAlmostEqual(arithmetic["min_price"], 9.0, places=8)
+        self.assertAlmostEqual(arithmetic["max_price"], 13.0, places=8)
+
+        geometric = _shift_custom_grid_bounds(
+            min_price=10.0,
+            max_price=160.0,
+            n=4,
+            grid_level_mode="geometric",
+            shift_levels=1,
+        )
+        self.assertAlmostEqual(geometric["min_price"], 5.0, places=8)
+        self.assertAlmostEqual(geometric["max_price"], 80.0, places=8)
+
+    def test_read_custom_grid_trade_count_uses_trade_audit_path(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "opnusdt_loop_events.jsonl"
+            trade_path = build_audit_paths(summary_path)["trade_audit"]
+            trade_path.write_text('{"id":1}\n{"id":2}\n{"id":3}\n', encoding="utf-8")
+
+            self.assertEqual(_read_custom_grid_trade_count(summary_path), 3)
+
+    def test_resolve_custom_grid_roll_triggers_and_resets_trade_baseline(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "opnusdt_loop_events.jsonl"
+            trade_path = build_audit_paths(summary_path)["trade_audit"]
+            trade_path.write_text('{"id":1}\n{"id":2}\n{"id":3}\n', encoding="utf-8")
+            state: dict[str, object] = {}
+
+            new_min, new_max, roll = _resolve_custom_grid_roll(
+                state=state,
+                summary_path=summary_path,
+                now=datetime(2026, 3, 31, 14, 27, 12, tzinfo=timezone.utc),
+                current_price=12.0,
+                min_price=10.0,
+                max_price=14.0,
+                n=4,
+                grid_level_mode="arithmetic",
+                direction="long",
+                enabled=True,
+                interval_minutes=5,
+                trade_threshold=3,
+                upper_distance_ratio=0.50,
+                shift_levels=1,
+            )
+
+            self.assertAlmostEqual(new_min, 9.0, places=8)
+            self.assertAlmostEqual(new_max, 13.0, places=8)
+            self.assertTrue(roll["checked"])
+            self.assertTrue(roll["triggered"])
+            self.assertEqual(roll["reason"], "triggered")
+            self.assertEqual(roll["levels_above_current"], 2)
+            self.assertEqual(roll["required_levels_above"], 2)
+            self.assertEqual(roll["current_trade_count"], 3)
+            self.assertEqual(roll["trades_since_last_roll"], 0)
+            self.assertEqual(state["custom_grid_roll_last_check_bucket"], "2026-03-31T14:25Z")
+            self.assertEqual(state["custom_grid_roll_trade_baseline"], 3)
+            self.assertEqual(state["custom_grid_roll_trades_since_last_roll"], 0)
+            self.assertAlmostEqual(state["custom_grid_runtime_min_price"], 9.0, places=8)
+            self.assertAlmostEqual(state["custom_grid_runtime_max_price"], 13.0, places=8)
+            self.assertEqual(state["custom_grid_roll_last_applied_at"], "2026-03-31T14:27:12+00:00")
+            self.assertAlmostEqual(float(state["custom_grid_roll_last_applied_price"]), 12.0, places=8)
+
+    def test_resolve_custom_grid_roll_skips_when_bucket_already_checked(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            summary_path = Path(tmpdir) / "opnusdt_loop_events.jsonl"
+            trade_path = build_audit_paths(summary_path)["trade_audit"]
+            trade_path.write_text('{"id":1}\n{"id":2}\n{"id":3}\n{"id":4}\n', encoding="utf-8")
+            state: dict[str, object] = {
+                "custom_grid_roll_last_check_bucket": "2026-03-31T14:25Z",
+                "custom_grid_roll_trade_baseline": 1,
+            }
+
+            new_min, new_max, roll = _resolve_custom_grid_roll(
+                state=state,
+                summary_path=summary_path,
+                now=datetime(2026, 3, 31, 14, 29, 0, tzinfo=timezone.utc),
+                current_price=12.0,
+                min_price=10.0,
+                max_price=14.0,
+                n=4,
+                grid_level_mode="arithmetic",
+                direction="long",
+                enabled=True,
+                interval_minutes=5,
+                trade_threshold=3,
+                upper_distance_ratio=0.50,
+                shift_levels=1,
+            )
+
+            self.assertAlmostEqual(new_min, 10.0, places=8)
+            self.assertAlmostEqual(new_max, 14.0, places=8)
+            self.assertFalse(roll["checked"])
+            self.assertFalse(roll["triggered"])
+            self.assertEqual(roll["reason"], "already_checked_bucket")
+            self.assertEqual(roll["trades_since_last_roll"], 3)
+            self.assertEqual(state["custom_grid_roll_last_check_bucket"], "2026-03-31T14:25Z")
+            self.assertEqual(state["custom_grid_roll_trades_since_last_roll"], 3)
+
     def test_should_sync_account_audit_when_updated_at_missing_or_stale(self) -> None:
         now = datetime(2026, 3, 29, 12, 0, tzinfo=timezone.utc)
         self.assertTrue(_should_sync_account_audit({}, now=now))
@@ -92,6 +219,158 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertGreater(len(live["sell_orders"]), 0)
         nearest_sell = min(item["price"] for item in live["sell_orders"])
         self.assertAlmostEqual(nearest_sell, 13.0, places=8)
+
+    def test_build_static_binance_grid_plan_can_disable_base_bootstrap(self) -> None:
+        plan = build_static_binance_grid_plan(
+            strategy_direction="long",
+            grid_level_mode="arithmetic",
+            min_price=10.0,
+            max_price=14.0,
+            n=4,
+            total_grid_notional=400.0,
+            neutral_anchor_price=None,
+            bid_price=11.99,
+            ask_price=12.01,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+            bootstrap_positions=False,
+        )
+
+        self.assertGreater(len(plan["buy_orders"]), 0)
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["target_base_qty"], 0.0)
+        self.assertEqual(plan["bootstrap_qty"], 0.0)
+        self.assertEqual(plan["target_long_base_qty"], 0.0)
+        self.assertEqual(plan["bootstrap_long_qty"], 0.0)
+
+    @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_custom_grid_long_ignores_base_inventory_gate(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_resolve_custom_grid_roll,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.1,
+            "min_qty": 0.1,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "11.99", "ask_price": "12.01"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "KATUSDT", "positionAmt": "60", "entryPrice": "11.50"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        mock_resolve_custom_grid_roll.return_value = (
+            10.0,
+            14.0,
+            {"enabled": False, "checked": False, "triggered": False, "reason": "disabled"},
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                symbol="KATUSDT",
+                strategy_mode="one_way_long",
+                strategy_profile="custom_grid_katusdt_kat",
+                step_price=0.01,
+                buy_levels=95,
+                sell_levels=5,
+                per_order_notional=10.0,
+                base_position_notional=30.0,
+                center_price=12.0,
+                fixed_center_enabled=False,
+                fixed_center_roll_enabled=False,
+                fixed_center_roll_trigger_steps=1.0,
+                fixed_center_roll_confirm_cycles=3,
+                fixed_center_roll_shift_steps=1,
+                custom_grid_enabled=True,
+                custom_grid_direction="long",
+                custom_grid_level_mode="arithmetic",
+                custom_grid_min_price=10.0,
+                custom_grid_max_price=14.0,
+                custom_grid_n=4,
+                custom_grid_total_notional=400.0,
+                custom_grid_neutral_anchor_price=None,
+                custom_grid_roll_enabled=False,
+                custom_grid_roll_interval_minutes=5,
+                custom_grid_roll_trade_threshold=100,
+                custom_grid_roll_upper_distance_ratio=0.30,
+                custom_grid_roll_shift_levels=1,
+                down_trigger_steps=1,
+                up_trigger_steps=1,
+                shift_steps=1,
+                neutral_center_interval_minutes=3,
+                neutral_band1_offset_ratio=0.005,
+                neutral_band2_offset_ratio=0.01,
+                neutral_band3_offset_ratio=0.02,
+                neutral_band1_target_ratio=0.20,
+                neutral_band2_target_ratio=0.50,
+                neutral_band3_target_ratio=1.00,
+                neutral_hourly_scale_enabled=False,
+                neutral_hourly_scale_stable=1.0,
+                neutral_hourly_scale_transition=0.85,
+                neutral_hourly_scale_defensive=0.65,
+                max_position_notional=2000.0,
+                max_short_position_notional=None,
+                pause_buy_position_notional=None,
+                pause_short_position_notional=None,
+                min_mid_price_for_buys=None,
+                excess_inventory_reduce_only_enabled=True,
+                auto_regime_enabled=False,
+                auto_regime_confirm_cycles=2,
+                auto_regime_stable_15m_max_amplitude_ratio=0.02,
+                auto_regime_stable_60m_max_amplitude_ratio=0.05,
+                auto_regime_stable_60m_return_floor_ratio=-0.01,
+                auto_regime_defensive_15m_amplitude_ratio=0.035,
+                auto_regime_defensive_60m_amplitude_ratio=0.08,
+                auto_regime_defensive_15m_return_ratio=-0.015,
+                auto_regime_defensive_60m_return_ratio=-0.03,
+                buy_pause_amp_trigger_ratio=None,
+                buy_pause_down_return_trigger_ratio=None,
+                freeze_shift_abs_return_trigger_ratio=None,
+                recv_window=5000,
+                reset_state=True,
+                state_path=str(Path(tmpdir) / "katusdt_state.json"),
+                summary_jsonl=str(Path(tmpdir) / "katusdt_events.jsonl"),
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertFalse(report["buy_paused"])
+        self.assertFalse(report["excess_inventory_gate"]["active"])
+        self.assertEqual(report["target_base_qty"], 0.0)
+        self.assertEqual(report["bootstrap_qty"], 0.0)
+        self.assertEqual(report["bootstrap_orders"], [])
+        self.assertGreater(len(report["buy_orders"]), 0)
 
     def test_apply_synthetic_trade_fill_tracks_virtual_long_and_short_books(self) -> None:
         ledger = {
