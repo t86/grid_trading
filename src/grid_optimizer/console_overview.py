@@ -197,10 +197,11 @@ def _board_symbol(board: dict[str, Any]) -> str:
 
 def _account_implies_market(account: dict[str, Any], market: str) -> bool:
     kind = str(account.get("kind", "")).strip().lower()
+    pages = {str(path).strip() for path in (account.get("pages") or []) if isinstance(path, str)}
     if market == "futures":
-        return kind in {"futures", "mixed"}
+        return kind in {"futures", "mixed"} and bool(pages & {"/monitor", "/strategies"})
     if market == "spot":
-        return kind in {"spot", "mixed"}
+        return kind in {"spot", "mixed"} and bool(pages & {"/spot_runner", "/spot_strategies"})
     return False
 
 

@@ -406,6 +406,25 @@ class ConsoleOverviewTests(unittest.TestCase):
         self.assertGreaterEqual(len(overview["warnings"]), 1)
         self.assertIn("health timeout", overview["warnings"][0])
 
+    @patch("grid_optimizer.console_overview._fetch_remote_json")
+    def test_build_console_overview_skips_market_fetches_when_pages_do_not_imply_them(self, mock_fetch_remote_json) -> None:
+        account = dict(self._registry()["accounts_by_id"]["acct_main_a"])
+        account["pages"] = ["/competition_board"]
+        registry = self._registry()
+        registry["accounts"] = [account]
+        registry["accounts_by_id"] = {"acct_main_a": account}
+        registry["default_account"] = account
+        mock_fetch_remote_json.side_effect = [
+            {"ok": True},
+            {"ok": True, "snapshot": {"boards": []}},
+        ]
+
+        overview = build_console_overview(registry, "acct_main_a")
+
+        self.assertEqual(overview["futures"], [])
+        self.assertEqual(overview["spot"], [])
+        self.assertEqual(mock_fetch_remote_json.call_count, 2)
+
 
 if __name__ == "__main__":
     unittest.main()
