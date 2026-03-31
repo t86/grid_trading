@@ -130,7 +130,7 @@ def _fetch_market_overview(
             payload = _fetch_remote_json(server, path, params={"symbol": symbol})
         except Exception as exc:
             warnings.append(f"{market} unavailable for {symbol}: {exc}")
-            return []
+            continue
         overview.append(_normalize_market_snapshot(symbol, payload))
     return overview
 
@@ -140,6 +140,14 @@ def _fetch_competitions(
     account: dict[str, Any],
     warnings: list[str],
 ) -> list[dict[str, Any]]:
+    wanted = {
+        str(symbol).strip().upper()
+        for symbol in (account.get("competition_symbols") or [])
+        if isinstance(symbol, str) and symbol.strip()
+    }
+    if not wanted:
+        return []
+
     competition_source = registry.get("competition_source") or {}
     servers_by_id = registry.get("servers_by_id") or {}
     source_server = servers_by_id.get(competition_source.get("server_id"))
@@ -160,14 +168,6 @@ def _fetch_competitions(
             boards = candidate
     elif isinstance(payload, list):
         boards = payload
-
-    wanted = {
-        str(symbol).strip().upper()
-        for symbol in (account.get("competition_symbols") or [])
-        if isinstance(symbol, str) and symbol.strip()
-    }
-    if not wanted:
-        return []
 
     competitions: list[dict[str, Any]] = []
     for board in boards:

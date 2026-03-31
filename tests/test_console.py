@@ -425,6 +425,44 @@ class ConsoleOverviewTests(unittest.TestCase):
         self.assertEqual(overview["spot"], [])
         self.assertEqual(mock_fetch_remote_json.call_count, 2)
 
+    @patch("grid_optimizer.console_overview._fetch_remote_json")
+    def test_build_console_overview_keeps_successful_market_snapshots_after_later_failure(self, mock_fetch_remote_json) -> None:
+        account = dict(self._registry()["accounts_by_id"]["acct_main_a"])
+        account["default_symbols"] = ["BARDUSDT", "XAUTUSDT"]
+        account["competition_symbols"] = []
+        registry = self._registry()
+        registry["accounts"] = [account]
+        registry["accounts_by_id"] = {"acct_main_a": account}
+        registry["default_account"] = account
+        mock_fetch_remote_json.side_effect = [
+            {"ok": True},
+            {"ok": True, "snapshot": {"runner_status": "running", "open_orders": [1]}},
+            RuntimeError("second symbol failed"),
+        ]
+
+        overview = build_console_overview(registry, "acct_main_a")
+
+        self.assertEqual([item["symbol"] for item in overview["futures"]], ["BARDUSDT"])
+        self.assertGreaterEqual(len(overview["warnings"]), 1)
+        self.assertIn("second symbol failed", overview["warnings"][0])
+
+    @patch("grid_optimizer.console_overview._fetch_remote_json")
+    def test_build_console_overview_skips_competitions_fetch_when_symbols_empty(self, mock_fetch_remote_json) -> None:
+        account = dict(self._registry()["accounts_by_id"]["acct_main_a"])
+        account["pages"] = ["/competition_board"]
+        account["competition_symbols"] = []
+        registry = self._registry()
+        registry["accounts"] = [account]
+        registry["accounts_by_id"] = {"acct_main_a": account}
+        registry["default_account"] = account
+        mock_fetch_remote_json.side_effect = [{"ok": True}]
+
+        overview = build_console_overview(registry, "acct_main_a")
+
+        self.assertEqual(overview["competitions"], [])
+        self.assertEqual(overview["warnings"], [])
+        self.assertEqual(mock_fetch_remote_json.call_count, 1)
+
 
 if __name__ == "__main__":
     unittest.main()
