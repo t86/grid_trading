@@ -32,7 +32,8 @@ Required:
 
 Optional:
 - `ORACLE_PORT`: ssh port (default `22`)
-- `ORACLE_APP_DIR`: deploy directory (default `/home/<ORACLE_USER>/grid_trading`)
+- `ORACLE_APP_DIR`: deploy directory override. If omitted, the workflow first reuses the current
+  `grid-web.service` `WorkingDirectory` on the server and only falls back to `/home/<ORACLE_USER>/grid_trading`
 - `GRID_WEB_PORT`: web port (default `8787`)
 - `SERVICE_NAME`: systemd service name (default `grid-web`)
 
