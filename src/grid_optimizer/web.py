@@ -12508,7 +12508,7 @@ STRATEGIES_PAGE = """<!doctype html>
 
   <script>
     const DEFAULT_MONITOR_SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
-    const DEFAULT_COMPETITION_SYMBOLS = ["ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
+    const DEFAULT_COMPETITION_SYMBOLS = ["ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT", "BASEDUSDT"];
     const cardsEl = document.getElementById("cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");

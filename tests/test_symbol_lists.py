@@ -24,6 +24,7 @@ class SymbolListsTests(unittest.TestCase):
 
     def test_load_symbol_lists_defaults_when_file_missing(self) -> None:
         self.assertEqual(load_symbol_lists(self.path), DEFAULT_SYMBOL_LISTS)
+        self.assertIn("BASEDUSDT", DEFAULT_SYMBOL_LISTS["competition"])
 
     def test_set_symbol_list_normalizes_and_deduplicates(self) -> None:
         symbols = set_symbol_list("monitor", [" nightusdt ", "xautusdt", "NIGHTUSDT"], self.path)

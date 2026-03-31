@@ -8,7 +8,7 @@ from .data import load_or_fetch_candles, load_or_fetch_funding_rates
 from .symbol_lists import get_symbol_list
 from .types import BacktestResult, Candle, FundingRate
 
-COMPETITION_SYMBOLS: tuple[str, ...] = ("ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT")
+COMPETITION_SYMBOLS: tuple[str, ...] = ("ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT", "BASEDUSDT")
 
 COMPETITION_PROFILE_PRESETS: dict[str, dict[str, Any]] = {
     "conservative": {
