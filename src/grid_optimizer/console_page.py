@@ -98,20 +98,26 @@ def build_console_page() -> str:
       text-decoration: none;
     }
     .stack { display: grid; gap: 10px; }
+    .account-sheet-shell {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 30;
+      display: flex;
+      justify-content: center;
+      pointer-events: none;
+      padding: 0 12px 12px;
+    }
     .account-sheet {
-      margin-top: 18px;
+      width: min(720px, 100%);
       padding: 16px;
       border-radius: 22px 22px 0 0;
       background: #fff;
       border: 1px solid var(--border);
       box-shadow: 0 -12px 36px rgba(77, 50, 28, 0.12);
+      pointer-events: auto;
     }
-    .account-sheet summary {
-      list-style: none;
-      cursor: pointer;
-      font-weight: 700;
-    }
-    .account-sheet summary::-webkit-details-marker { display: none; }
     @media (min-width: 700px) {
       .metric-grid,
       .link-grid { grid-template-columns: repeat(4, minmax(0, 1fr)); }
@@ -124,7 +130,7 @@ def build_console_page() -> str:
     <span id="console-status">Booting</span>
   </header>
   <main>
-    <section class="card hero-summary" aria-labelledby="hero-summary-title">
+    <section class="card hero-summary" id="hero-summary" aria-labelledby="hero-summary-title">
       <h1 class="section-title" id="hero-summary-title">Hero Summary</h1>
       <div class="metric-grid">
         <div class="metric"><small>Account</small><strong id="hero-account">Loading</strong></div>
@@ -134,7 +140,7 @@ def build_console_page() -> str:
       </div>
     </section>
 
-    <section class="card" aria-labelledby="competition-title">
+    <section class="card" id="competition" aria-labelledby="competition-title">
       <h2 class="section-title" id="competition-title">Competition</h2>
       <div class="link-grid" id="competition-links">
         <a href="/competition_board">Competition board</a>
@@ -142,31 +148,32 @@ def build_console_page() -> str:
       </div>
     </section>
 
-    <section class="card" aria-labelledby="runtime-title">
+    <section class="card" id="runtime" aria-labelledby="runtime-title">
       <h2 class="section-title" id="runtime-title">Runtime</h2>
       <div class="stack" id="runtime-panel">
         <div class="ghost-note">Runtime checks and latest state appear here.</div>
       </div>
     </section>
 
-    <section class="card" aria-labelledby="legacy-entries-title">
+    <section class="card" id="legacy-entries" aria-labelledby="legacy-entries-title">
       <h2 class="section-title" id="legacy-entries-title">Legacy Entries</h2>
       <div class="stack" id="legacy-entries-panel">
         <div class="ghost-note">Historical entries remain available for review.</div>
       </div>
     </section>
 
-    <section class="card" aria-labelledby="server-title">
+    <section class="card" id="server" aria-labelledby="server-title">
       <h2 class="section-title" id="server-title">Server</h2>
       <div class="stack" id="server-panel">
         <div class="ghost-note">Server status and links will be hydrated here.</div>
       </div>
     </section>
 
-    <details class="account-sheet" id="account-sheet">
-      <summary>Account picker</summary>
-      <div class="ghost-note">Bottom sheet for account selection.</div>
-    </details>
+    <div class="account-sheet-shell" id="account-sheet-shell" data-sheet="account-picker">
+      <div class="account-sheet" id="account-sheet" role="dialog" aria-modal="false" aria-label="Account picker">
+        <div class="ghost-note">Bottom sheet for account selection.</div>
+      </div>
+    </div>
   </main>
   <script>
     async function fetchJson(url) {
@@ -194,9 +201,13 @@ def build_console_page() -> str:
       const statusEl = document.getElementById("console-status");
       try {
         statusEl.textContent = "Loading registry";
-        await fetchJson("/api/console/registry");
+        const registry = await fetchJson("/api/console/registry");
+        const accountId = registry.default_account_id || (registry.default_account && registry.default_account.id) || "";
+        const overviewUrl = accountId
+          ? "/api/console/overview?account_id=" + encodeURIComponent(accountId)
+          : "/api/console/overview";
         statusEl.textContent = "Loading overview";
-        const overview = await fetchJson("/api/console/overview");
+        const overview = await fetchJson(overviewUrl);
         updateHero(overview);
         statusEl.textContent = "Ready";
       } catch (error) {

@@ -466,16 +466,32 @@ class ConsoleOverviewTests(unittest.TestCase):
 
 
 class ConsolePageTests(unittest.TestCase):
-    def test_build_console_page_contains_bootstrap_endpoints_and_account_sheet(self) -> None:
+    def test_build_console_page_wires_registry_default_account_into_overview_request(self) -> None:
         html = build_console_page()
 
         self.assertIn("/api/console/registry", html)
-        self.assertIn("/api/console/overview", html)
-        self.assertIn("account-sheet", html)
+        self.assertIn("default_account_id", html)
+        self.assertIn("registry.default_account.id", html)
+        self.assertIn('/api/console/overview?account_id=', html)
 
-    def test_build_console_page_contains_mobile_sections(self) -> None:
+    def test_build_console_page_exposes_fixed_bottom_sheet_account_shell(self) -> None:
         html = build_console_page()
 
+        self.assertIn('class="account-sheet-shell"', html)
+        self.assertIn('id="account-sheet-shell"', html)
+        self.assertIn("position: fixed", html)
+        self.assertIn('id="account-sheet"', html)
+        self.assertIn('role="dialog"', html)
+        self.assertIn('aria-label="Account picker"', html)
+
+    def test_build_console_page_contains_required_section_anchors(self) -> None:
+        html = build_console_page()
+
+        self.assertIn('id="hero-summary"', html)
+        self.assertIn('id="competition"', html)
+        self.assertIn('id="runtime"', html)
+        self.assertIn('id="legacy-entries"', html)
+        self.assertIn('id="server"', html)
         self.assertIn("Hero Summary", html)
         self.assertIn("Competition", html)
         self.assertIn("Runtime", html)
