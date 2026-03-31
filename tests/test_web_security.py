@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from grid_optimizer.web import (
     MONITOR_PAGE,
+    HTML_PAGE,
     STRATEGIES_PAGE,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
@@ -57,6 +58,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("定位参数", MONITOR_PAGE)
         self.assertIn("生成建议参数", MONITOR_PAGE)
         self.assertIn("data-alert-action", MONITOR_PAGE)
+
+    def test_main_page_does_not_duplicate_symbol_element_declaration(self) -> None:
+        needle = 'const symbolEl = document.getElementById("symbol");'
+        self.assertEqual(HTML_PAGE.count(needle), 1)
+
+    def test_monitor_page_keeps_newline_escape_in_editor_locator(self) -> None:
+        self.assertIn('split("\\n").length - 1', MONITOR_PAGE)
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")

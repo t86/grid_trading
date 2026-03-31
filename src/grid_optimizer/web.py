@@ -4226,15 +4226,12 @@ HTML_PAGE = """<!doctype html>
     const layerTargetStepFields = Array.from(document.querySelectorAll(".layer-target-step-field"));
     const calcModeEl = document.getElementById("calc_mode");
     const marketTypeEl = document.getElementById("market_type");
-    const symbolEl = document.getElementById("symbol");
     const fixedBuyUnitEl = document.getElementById("fixed_buy_unit");
     const fixedBuyValueLabelEl = document.getElementById("fixed_buy_value_label");
     const fixedBuyValueEl = document.getElementById("fixed_buy_value");
     const strategyDirectionEl = document.getElementById("strategy_direction");
     const gridLevelModeEl = document.getElementById("grid_level_mode");
     const includeFundingEl = document.getElementById("include_funding");
-    const startTimeEl = document.getElementById("start_time");
-    const endTimeEl = document.getElementById("end_time");
     const intervalEl = document.getElementById("interval");
     const progressBoxEl = document.getElementById("progress_box");
     const progressFillEl = document.getElementById("progress_fill");
@@ -9416,7 +9413,7 @@ MONITOR_PAGE = """<!doctype html>
       runnerParamsEditorEl.focus();
       if (idx < 0) return false;
       runnerParamsEditorEl.setSelectionRange(idx, idx + marker.length);
-      const linesBefore = text.slice(0, idx).split("\n").length - 1;
+      const linesBefore = text.slice(0, idx).split("\\n").length - 1;
       runnerParamsEditorEl.scrollTop = Math.max(0, (linesBefore - 2) * 24);
       return true;
     }
