@@ -249,6 +249,94 @@ class ConsoleRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "No enabled accounts available"):
                 load_console_registry(registry_path)
 
+    def test_load_console_registry_rejects_duplicate_server_or_account_ids(self) -> None:
+        cases = [
+            (
+                "server",
+                {
+                    "servers": [
+                        {
+                            "id": "srv_150",
+                            "label": "A",
+                            "base_url": "http://127.0.0.1:8788",
+                            "enabled": True,
+                            "capabilities": ["futures_monitor"],
+                        },
+                        {
+                            "id": "srv_150",
+                            "label": "B",
+                            "base_url": "http://127.0.0.1:8789",
+                            "enabled": True,
+                            "capabilities": ["futures_monitor"],
+                        },
+                    ],
+                    "accounts": [
+                        {
+                            "id": "acct_main",
+                            "label": "Main",
+                            "server_id": "srv_150",
+                            "kind": "futures",
+                            "priority": 1,
+                            "enabled": True,
+                            "default_symbols": ["BARDUSDT"],
+                            "competition_symbols": ["BARD"],
+                            "pages": ["/monitor"],
+                        }
+                    ],
+                    "competition_source": {"server_id": "srv_150", "path": "/api/competition_board"},
+                },
+                "Duplicate server_id",
+            ),
+            (
+                "account",
+                {
+                    "servers": [
+                        {
+                            "id": "srv_150",
+                            "label": "A",
+                            "base_url": "http://127.0.0.1:8788",
+                            "enabled": True,
+                            "capabilities": ["futures_monitor"],
+                        }
+                    ],
+                    "accounts": [
+                        {
+                            "id": "acct_main",
+                            "label": "Main A",
+                            "server_id": "srv_150",
+                            "kind": "futures",
+                            "priority": 1,
+                            "enabled": True,
+                            "default_symbols": ["BARDUSDT"],
+                            "competition_symbols": ["BARD"],
+                            "pages": ["/monitor"],
+                        },
+                        {
+                            "id": "acct_main",
+                            "label": "Main B",
+                            "server_id": "srv_150",
+                            "kind": "futures",
+                            "priority": 2,
+                            "enabled": True,
+                            "default_symbols": ["XAUTUSDT"],
+                            "competition_symbols": ["XAUT"],
+                            "pages": ["/monitor"],
+                        },
+                    ],
+                    "competition_source": {"server_id": "srv_150", "path": "/api/competition_board"},
+                },
+                "Duplicate account id",
+            ),
+        ]
+
+        for field_name, payload, message in cases:
+            with self.subTest(field_name=field_name), tempfile.TemporaryDirectory() as temp_dir:
+                registry_path = Path(temp_dir) / "console_registry.json"
+                registry_path.write_text(json.dumps(payload), encoding="utf-8")
+
+                with self.assertRaisesRegex(ValueError, message):
+                    load_console_registry(registry_path)
+
 
 if __name__ == "__main__":
     unittest.main()
