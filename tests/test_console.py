@@ -480,6 +480,7 @@ class ConsolePageTests(unittest.TestCase):
         self.assertIn('class="account-sheet-shell"', html)
         self.assertIn('id="account-sheet-shell"', html)
         self.assertIn("position: fixed", html)
+        self.assertIn("padding: 76px 16px 176px", html)
         self.assertIn('id="account-sheet"', html)
         self.assertIn('role="dialog"', html)
         self.assertIn('aria-label="Account picker"', html)

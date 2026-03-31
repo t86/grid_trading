@@ -35,7 +35,7 @@ def build_console_page() -> str:
     main {
       max-width: 720px;
       margin: 0 auto;
-      padding: 76px 16px 24px;
+      padding: 76px 16px 176px;
     }
     .sticky-context-bar {
       position: sticky;
