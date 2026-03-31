@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from grid_optimizer.console_registry import load_console_registry
 from grid_optimizer.console_overview import build_console_overview
+from grid_optimizer.console_page import build_console_page
 
 
 class ConsoleRegistryTests(unittest.TestCase):
@@ -462,6 +463,24 @@ class ConsoleOverviewTests(unittest.TestCase):
         self.assertEqual(overview["competitions"], [])
         self.assertEqual(overview["warnings"], [])
         self.assertEqual(mock_fetch_remote_json.call_count, 1)
+
+
+class ConsolePageTests(unittest.TestCase):
+    def test_build_console_page_contains_bootstrap_endpoints_and_account_sheet(self) -> None:
+        html = build_console_page()
+
+        self.assertIn("/api/console/registry", html)
+        self.assertIn("/api/console/overview", html)
+        self.assertIn("account-sheet", html)
+
+    def test_build_console_page_contains_mobile_sections(self) -> None:
+        html = build_console_page()
+
+        self.assertIn("Hero Summary", html)
+        self.assertIn("Competition", html)
+        self.assertIn("Runtime", html)
+        self.assertIn("Legacy Entries", html)
+        self.assertIn("Server", html)
 
 
 if __name__ == "__main__":
