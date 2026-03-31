@@ -471,6 +471,16 @@ class ConsoleOverviewTests(unittest.TestCase):
 
 
 class ConsolePageTests(unittest.TestCase):
+    def test_build_console_page_contains_interaction_shell_controls(self) -> None:
+        html = build_console_page()
+
+        self.assertIn('id="open-account-sheet"', html)
+        self.assertIn('id="refresh-console"', html)
+        self.assertIn('id="account-sheet-backdrop"', html)
+        self.assertIn('id="account-list"', html)
+        self.assertIn('id="legacy-links"', html)
+        self.assertIn('id="competition-panel"', html)
+
     def test_build_console_page_wires_registry_default_account_into_overview_request(self) -> None:
         html = build_console_page()
 
@@ -503,6 +513,17 @@ class ConsolePageTests(unittest.TestCase):
         self.assertIn("Runtime", html)
         self.assertIn("Legacy Entries", html)
         self.assertIn("Server", html)
+
+    def test_build_console_page_contains_account_switching_and_render_helpers(self) -> None:
+        html = build_console_page()
+
+        self.assertIn("function openAccountSheet()", html)
+        self.assertIn("function closeAccountSheet()", html)
+        self.assertIn("function renderAccountList(", html)
+        self.assertIn("function renderOverview(", html)
+        self.assertIn("async function loadOverview(accountId)", html)
+        self.assertIn('"/api/console/overview?account_id=" + encodeURIComponent(accountId)', html)
+        self.assertIn('document.getElementById("refresh-console")', html)
 
 
 class ConsoleRouteGlueTests(unittest.TestCase):
