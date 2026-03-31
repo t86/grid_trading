@@ -18,6 +18,7 @@ venv/
 data/
 output/
 .worktrees/
+.superpowers/
 
 # Temp files
 *.log
