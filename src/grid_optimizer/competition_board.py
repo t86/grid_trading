@@ -260,6 +260,13 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.bmwweb.solutions/zh-CN/activity/trading-competition/futures-bard-challenge2?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="futures_based",
+        symbol="BASED",
+        market="futures",
+        label="BASED 合约交易挑战赛",
+        url="https://www.bmwweb.cloud/zh-CN/activity/trading-competition/futures-based-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
         slug="futures_enso",
         symbol="ENSO",
         market="futures",
@@ -696,6 +703,78 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分 150,000 BARD
 """,
             }
+        ]
+    },
+    "futures_based": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛 - 第一阶段",
+                "resourceId": 0,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BASED",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/03/31 18:00 - 2026/04/10 07:59",
+                "activityEndAt": "2026-04-10T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/03/31 18:00 - 2026/04/10 07:59
+累计 BASED U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+187,500 BASED
+第 2 名
+150,000 BASED
+第 3 名
+87,500 BASED
+第 4 名
+50,000 BASED
+第 5 名
+25,000 BASED
+第 6 - 20 名
+平分 187,500 BASED
+第 21 - 50 名
+平分 187,500 BASED
+第 51 - 200 名
+平分 375,000 BASED
+""",
+            },
+            {
+                "tabLabel": "交易量挑战赛 - 第二阶段",
+                "resourceId": 0,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BASED",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/10 08:00 - 2026/04/20 07:59",
+                "activityEndAt": "2026-04-20T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/10 08:00 - 2026/04/20 07:59
+累计 BASED U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+187,500 BASED
+第 2 名
+150,000 BASED
+第 3 名
+87,500 BASED
+第 4 名
+50,000 BASED
+第 5 名
+25,000 BASED
+第 6 - 20 名
+平分 187,500 BASED
+第 21 - 50 名
+平分 187,500 BASED
+第 51 - 200 名
+平分 375,000 BASED
+""",
+            },
         ]
     },
     "futures_enso": {
