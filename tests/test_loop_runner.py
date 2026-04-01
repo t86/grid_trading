@@ -1320,6 +1320,47 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(effective.max_position_notional, 260.0)
         self.assertEqual(effective.step_price, 12.0)
 
+    def test_build_xaut_adaptive_runner_args_applies_short_normal_profile(self) -> None:
+        args = Namespace(
+            strategy_profile="xaut_short_adaptive_v1",
+            strategy_mode="one_way_short",
+            symbol="XAUTUSDT",
+            step_price=7.5,
+            buy_levels=10,
+            sell_levels=6,
+            per_order_notional=80.0,
+            base_position_notional=320.0,
+            up_trigger_steps=4,
+            down_trigger_steps=5,
+            shift_steps=3,
+            pause_short_position_notional=520.0,
+            max_short_position_notional=680.0,
+            inventory_tier_start_notional=420.0,
+            inventory_tier_end_notional=520.0,
+            inventory_tier_buy_levels=12,
+            inventory_tier_sell_levels=3,
+            inventory_tier_per_order_notional=70.0,
+            inventory_tier_base_position_notional=160.0,
+            short_cover_pause_amp_trigger_ratio=0.0060,
+            short_cover_pause_down_return_trigger_ratio=-0.0045,
+        )
+
+        effective = build_xaut_adaptive_runner_args(
+            args=args,
+            active_state="normal",
+        )
+
+        self.assertEqual(effective.step_price, 8.5)
+        self.assertEqual(effective.base_position_notional, 280.0)
+        self.assertEqual(effective.pause_short_position_notional, 480.0)
+        self.assertEqual(effective.max_short_position_notional, 620.0)
+        self.assertEqual(effective.inventory_tier_start_notional, 360.0)
+        self.assertEqual(effective.inventory_tier_end_notional, 450.0)
+        self.assertEqual(effective.inventory_tier_buy_levels, 14)
+        self.assertEqual(effective.inventory_tier_sell_levels, 2)
+        self.assertEqual(effective.inventory_tier_per_order_notional, 65.0)
+        self.assertEqual(effective.inventory_tier_base_position_notional, 120.0)
+
 
 if __name__ == "__main__":
     unittest.main()
