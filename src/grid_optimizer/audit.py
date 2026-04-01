@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 DEFAULT_AUDIT_LOOKBACK_DAYS = 7
 _JSONL_LINE_COUNT_CACHE: dict[str, tuple[int, int, int]] = {}
@@ -45,10 +46,9 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def read_jsonl(path: Path, limit: int = 500) -> list[dict[str, Any]]:
+def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
     if not path.exists():
-        return []
-    rows: list[dict[str, Any]] = []
+        return
     try:
         with path.open("r", encoding="utf-8") as f:
             for raw in f:
@@ -60,12 +60,32 @@ def read_jsonl(path: Path, limit: int = 500) -> list[dict[str, Any]]:
                 except json.JSONDecodeError:
                     continue
                 if isinstance(item, dict):
-                    rows.append(item)
+                    yield item
     except OSError:
-        return []
+        return
+
+
+def read_jsonl(path: Path, limit: int = 500) -> list[dict[str, Any]]:
     if limit > 0:
-        return rows[-limit:]
-    return rows
+        rows: deque[dict[str, Any]] = deque(maxlen=limit)
+        for item in iter_jsonl(path):
+            rows.append(item)
+        return list(rows)
+    return list(iter_jsonl(path))
+
+
+def read_jsonl_filtered(
+    path: Path,
+    *,
+    limit: int = 500,
+    predicate: Callable[[dict[str, Any]], bool] | None = None,
+) -> list[dict[str, Any]]:
+    rows: deque[dict[str, Any]] = deque(maxlen=limit if limit > 0 else None)
+    for item in iter_jsonl(path):
+        if predicate is not None and not predicate(item):
+            continue
+        rows.append(item)
+    return list(rows)
 
 
 def count_jsonl_lines(path: Path) -> int:
@@ -119,7 +139,7 @@ def scan_iso_bounds(path: Path, field: str = "ts") -> tuple[datetime | None, dat
 
     first_ts: datetime | None = None
     last_ts: datetime | None = None
-    for item in read_jsonl(path, limit=0):
+    for item in iter_jsonl(path):
         ts = parse_iso_ts(item.get(field))
         if ts is None:
             continue

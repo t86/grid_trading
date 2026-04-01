@@ -1,18 +1,25 @@
 from __future__ import annotations
 
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 from unittest.mock import patch
 
 from grid_optimizer.monitor import (
+    _MONITOR_CACHE,
+    _MONITOR_CACHE_LOCK,
+    _MONITOR_INFLIGHT,
     _filter_events_since,
     _filter_rows_since,
-    _read_runner_process,
     _extract_futures_asset_snapshot,
-    build_monitor_snapshot,
+    _read_event_window,
+    _read_runner_process,
     build_monitor_alerts,
+    build_monitor_snapshot,
     summarize_hourly_metrics,
     summarize_income,
     summarize_loop_events,
@@ -22,6 +29,11 @@ from grid_optimizer.types import Candle
 
 
 class MonitorTests(unittest.TestCase):
+    def setUp(self) -> None:
+        with _MONITOR_CACHE_LOCK:
+            _MONITOR_CACHE.clear()
+            _MONITOR_INFLIGHT.clear()
+
     def test_summarize_user_trades_accumulates_counts_volume_and_pnl(self) -> None:
         trades = [
             {
@@ -375,6 +387,55 @@ class MonitorTests(unittest.TestCase):
 
             self.assertEqual(result["config"]["strategy_profile"], "volume_long_v4")
             self.assertEqual(result["config"]["symbol"], "NIGHTUSDT")
+
+    def test_read_event_window_keeps_recent_rows_and_bounds(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "events.jsonl"
+            base = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+            path.write_text(
+                "\n".join(
+                    [
+                        f'{{"ts": "{(base + timedelta(minutes=idx)).isoformat()}", "cycle": {idx}}}'
+                        for idx in range(5)
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rows, first_ts, last_ts = _read_event_window(
+                path,
+                since=base + timedelta(minutes=1),
+                limit=2,
+            )
+
+        self.assertEqual([row["cycle"] for row in rows], [3, 4])
+        self.assertEqual(first_ts, base + timedelta(minutes=1))
+        self.assertEqual(last_ts, base + timedelta(minutes=4))
+
+    def test_build_monitor_snapshot_deduplicates_inflight_requests(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+        call_count = 0
+
+        def fake_build(**kwargs: object) -> dict[str, object]:
+            nonlocal call_count
+            call_count += 1
+            started.set()
+            release.wait(timeout=2)
+            return {"ok": True, "symbol": kwargs["symbol"], "ts": "2026-04-02T00:00:00+00:00"}
+
+        with mock.patch("grid_optimizer.monitor._build_monitor_snapshot_uncached", side_effect=fake_build):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                future1 = pool.submit(build_monitor_snapshot, symbol="NIGHTUSDT")
+                self.assertTrue(started.wait(timeout=2))
+                future2 = pool.submit(build_monitor_snapshot, symbol="NIGHTUSDT")
+                release.set()
+                result1 = future1.result(timeout=2)
+                result2 = future2.result(timeout=2)
+
+        self.assertEqual(call_count, 1)
+        self.assertEqual(result1, result2)
 
 
 if __name__ == "__main__":

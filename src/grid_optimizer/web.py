@@ -9538,6 +9538,7 @@ MONITOR_PAGE = """<!doctype html>
     let timer = null;
     let paused = false;
     let latestMonitorData = null;
+    let monitorLoadPromise = null;
     let strategyActionPending = false;
     let runnerPresets = [];
     let presetsLoaded = false;
@@ -11307,31 +11308,41 @@ MONITOR_PAGE = """<!doctype html>
     }
 
     async function loadMonitor() {
-      const symbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
-      if (!symbol) {
-        metaEl.textContent = "监控币种列表为空，请先到策略总览页添加币种。";
-        return;
+      if (monitorLoadPromise) {
+        return monitorLoadPromise;
       }
-      metaEl.textContent = `正在刷新 ${symbol} ...`;
-      try {
-        const data = await fetchMonitorSnapshot(symbol);
-        populatePresetOptions(data);
-        renderCards(data);
-        renderAlerts(data);
-        renderPosition(data);
-        renderOpenOrders(data);
-        renderHourlyStats(data);
-        renderTrades(data);
-        renderEvents(data);
-        renderCharts(data);
-        if (!runnerParamsEditorEl.value.trim()) {
-          await loadRunningConfigToEditor(false);
+      monitorLoadPromise = (async () => {
+        const symbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+        if (!symbol) {
+          metaEl.textContent = "监控币种列表为空，请先到策略总览页添加币种。";
+          return;
         }
-        const warnings = (data.warnings || []).join(" | ");
-        metaEl.textContent = `最后刷新: ${fmtTs(data.ts)}${warnings ? ` · 警告: ${warnings}` : ""}`;
-      } catch (err) {
-        alertBoxEl.innerHTML = '<div class="alert-empty">当前没拿到监控快照，所以还无法判断是参数问题、账户问题还是 Binance 接口异常。</div>';
-        metaEl.textContent = `刷新失败: ${err}`;
+        metaEl.textContent = `正在刷新 ${symbol} ...`;
+        try {
+          const data = await fetchMonitorSnapshot(symbol);
+          populatePresetOptions(data);
+          renderCards(data);
+          renderAlerts(data);
+          renderPosition(data);
+          renderOpenOrders(data);
+          renderHourlyStats(data);
+          renderTrades(data);
+          renderEvents(data);
+          renderCharts(data);
+          if (!runnerParamsEditorEl.value.trim()) {
+            await loadRunningConfigToEditor(false);
+          }
+          const warnings = (data.warnings || []).join(" | ");
+          metaEl.textContent = `最后刷新: ${fmtTs(data.ts)}${warnings ? ` · 警告: ${warnings}` : ""}`;
+        } catch (err) {
+          alertBoxEl.innerHTML = '<div class="alert-empty">当前没拿到监控快照，所以还无法判断是参数问题、账户问题还是 Binance 接口异常。</div>';
+          metaEl.textContent = `刷新失败: ${err}`;
+        }
+      })();
+      try {
+        await monitorLoadPromise;
+      } finally {
+        monitorLoadPromise = null;
       }
     }
 
@@ -13040,6 +13051,7 @@ STRATEGIES_PAGE = """<!doctype html>
     let timer = null;
     let paused = false;
     let strategySymbols = [];
+    let strategiesLoadPromise = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -13357,30 +13369,61 @@ STRATEGIES_PAGE = """<!doctype html>
       `;
     }
 
-    async function loadStrategies() {
-      metaEl.textContent = "正在刷新全部策略...";
-      try {
-        const symbols = strategySymbols.slice();
-        if (!symbols.length) {
-          summaryEl.textContent = "当前监控/总览币种列表为空。";
-          cardsEl.innerHTML = '<div class="empty">请先在上方“币种列表管理”里添加至少一个监控币种。</div>';
-          metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
-          return;
-        }
-        const results = await Promise.all(symbols.map(async (symbol) => {
+    async function fetchStrategySnapshots(symbols, concurrency = 2) {
+      const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
+      const results = new Array(symbols.length);
+      let nextIndex = 0;
+
+      async function worker() {
+        while (true) {
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+          if (currentIndex >= symbols.length) {
+            return;
+          }
+          const symbol = symbols[currentIndex];
           const resp = await fetch(`/api/loop_monitor?symbol=${encodeURIComponent(symbol)}`);
           const data = await resp.json();
-          if (!resp.ok || !data.ok) throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
-          return data;
-        }));
-        const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
-        const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
-        summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
-        cardsEl.innerHTML = results.map(renderCard).join("");
-        metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
-      } catch (err) {
-        cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
-        metaEl.textContent = `刷新失败：${err}`;
+          if (!resp.ok || !data.ok) {
+            throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
+          }
+          results[currentIndex] = data;
+        }
+      }
+
+      await Promise.all(Array.from({ length: Math.min(normalizedConcurrency, symbols.length) }, () => worker()));
+      return results;
+    }
+
+    async function loadStrategies() {
+      if (strategiesLoadPromise) {
+        return strategiesLoadPromise;
+      }
+      strategiesLoadPromise = (async () => {
+        metaEl.textContent = "正在刷新全部策略...";
+        try {
+          const symbols = strategySymbols.slice();
+          if (!symbols.length) {
+            summaryEl.textContent = "当前监控/总览币种列表为空。";
+            cardsEl.innerHTML = '<div class="empty">请先在上方“币种列表管理”里添加至少一个监控币种。</div>';
+            metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
+            return;
+          }
+          const results = await fetchStrategySnapshots(symbols, 2);
+          const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
+          const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
+          summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
+          cardsEl.innerHTML = results.map(renderCard).join("");
+          metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
+        } catch (err) {
+          cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
+          metaEl.textContent = `刷新失败：${err}`;
+        }
+      })();
+      try {
+        await strategiesLoadPromise;
+      } finally {
+        strategiesLoadPromise = null;
       }
     }
 
@@ -16712,7 +16755,7 @@ def _safe_positive_int_query(value: Any, default: int) -> int:
 
 def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
     symbol = str(query.get("symbol", ["NIGHTUSDT"])[0]).upper().strip() or "NIGHTUSDT"
-    summary_limit = _safe_positive_int_query(query.get("summary_limit", ["500"])[0], 500)
+    summary_limit = min(_safe_positive_int_query(query.get("summary_limit", ["500"])[0], 500), 2000)
     runner = read_symbol_runner_process(symbol)
     if isinstance(runner, dict):
         runner = dict(runner)

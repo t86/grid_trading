@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import threading
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -18,9 +19,10 @@ from .audit import (
     fetch_time_paged,
     income_row_key,
     income_row_time_ms,
+    iter_jsonl,
     parse_iso_ts as _parse_iso_ts,
     read_json as _read_json,
-    read_jsonl as _read_jsonl,
+    read_jsonl_filtered,
     trade_row_key,
     trade_row_time_ms,
 )
@@ -60,6 +62,14 @@ STABLE_QUOTE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 MONITOR_CACHE_TTL_SECONDS = 2.0
 _MONITOR_CACHE_LOCK = threading.Lock()
 _MONITOR_CACHE: dict[tuple[str, str, str, str, int], tuple[float, dict[str, Any]]] = {}
+_MONITOR_INFLIGHT: dict[tuple[str, str, str, str, int], "_InflightMonitorSnapshot"] = {}
+
+
+class _InflightMonitorSnapshot:
+    def __init__(self) -> None:
+        self.event = threading.Event()
+        self.snapshot: dict[str, Any] | None = None
+        self.error: Exception | None = None
 
 
 def _read_json_dict(path: Path) -> dict[str, Any] | None:
@@ -384,6 +394,29 @@ def _filter_events_since(events: list[dict[str, Any]], since: datetime | None) -
     return filtered
 
 
+def _read_event_window(
+    path: Path,
+    *,
+    since: datetime | None,
+    limit: int,
+) -> tuple[list[dict[str, Any]], datetime | None, datetime | None]:
+    floor = since.astimezone(timezone.utc) if since is not None else None
+    rows: deque[dict[str, Any]] = deque(maxlen=limit if limit > 0 else None)
+    first_ts: datetime | None = None
+    last_ts: datetime | None = None
+    for item in iter_jsonl(path):
+        ts = _parse_iso_ts(item.get("ts"))
+        if ts is None:
+            continue
+        if floor is not None and ts < floor:
+            continue
+        if first_ts is None:
+            first_ts = ts
+        last_ts = ts
+        rows.append(item)
+    return list(rows), first_ts, last_ts
+
+
 def _load_or_fetch_trade_rows(
     *,
     audit_path: Path,
@@ -392,14 +425,18 @@ def _load_or_fetch_trade_rows(
     api_secret: str,
     session_start: datetime | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    audit_rows = _read_jsonl(audit_path, limit=0)
     effective_start = session_start or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS))
+    floor_ms = int(effective_start.timestamp() * 1000)
+    audit_rows = read_jsonl_filtered(
+        audit_path,
+        limit=0,
+        predicate=lambda item: int(trade_row_time_ms(item) or 0) >= floor_ms,
+    )
     if audit_rows:
-        filtered_rows = _filter_rows_since(audit_rows, since=effective_start, row_time_ms=trade_row_time_ms)
-        return filtered_rows, {
+        return audit_rows, {
             "source": "audit",
             "path": str(audit_path),
-            "row_count": len(filtered_rows),
+            "row_count": len(audit_rows),
             "start_time": effective_start.isoformat(),
         }
 
@@ -434,14 +471,18 @@ def _load_or_fetch_income_rows(
     api_secret: str,
     session_start: datetime | None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    audit_rows = _read_jsonl(audit_path, limit=0)
     effective_start = session_start or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS))
+    floor_ms = int(effective_start.timestamp() * 1000)
+    audit_rows = read_jsonl_filtered(
+        audit_path,
+        limit=0,
+        predicate=lambda item: int(income_row_time_ms(item) or 0) >= floor_ms,
+    )
     if audit_rows:
-        filtered_rows = _filter_rows_since(audit_rows, since=effective_start, row_time_ms=income_row_time_ms)
-        return filtered_rows, {
+        return audit_rows, {
             "source": "audit",
             "path": str(audit_path),
-            "row_count": len(filtered_rows),
+            "row_count": len(audit_rows),
             "start_time": effective_start.isoformat(),
         }
 
@@ -996,17 +1037,43 @@ def build_monitor_snapshot(
         cached = _MONITOR_CACHE.get(cache_key)
         if cached is not None and (now - cached[0]) <= MONITOR_CACHE_TTL_SECONDS:
             return cached[1]
+        inflight = _MONITOR_INFLIGHT.get(cache_key)
+        if inflight is None:
+            inflight = _InflightMonitorSnapshot()
+            _MONITOR_INFLIGHT[cache_key] = inflight
+            owner = True
+        else:
+            owner = False
 
-    snapshot = _build_monitor_snapshot_uncached(
-        symbol=normalized_symbol,
-        events_path=events_path,
-        plan_path=plan_path,
-        submit_report_path=submit_report_path,
-        summary_limit=summary_limit,
-        runner_process=runner_process,
-    )
+    if not owner:
+        inflight.event.wait()
+        if inflight.snapshot is not None:
+            return inflight.snapshot
+        if inflight.error is not None:
+            raise RuntimeError("monitor snapshot build failed") from inflight.error
+        raise RuntimeError("monitor snapshot build failed without result")
+
+    try:
+        snapshot = _build_monitor_snapshot_uncached(
+            symbol=normalized_symbol,
+            events_path=events_path,
+            plan_path=plan_path,
+            submit_report_path=submit_report_path,
+            summary_limit=summary_limit,
+            runner_process=runner_process,
+        )
+    except Exception as exc:
+        with _MONITOR_CACHE_LOCK:
+            inflight.error = exc
+            _MONITOR_INFLIGHT.pop(cache_key, None)
+        inflight.event.set()
+        raise
+
     with _MONITOR_CACHE_LOCK:
         _MONITOR_CACHE[cache_key] = (time.time(), snapshot)
+        inflight.snapshot = snapshot
+        _MONITOR_INFLIGHT.pop(cache_key, None)
+    inflight.event.set()
     return snapshot
 
 
@@ -1025,13 +1092,14 @@ def _build_monitor_snapshot_uncached(
     competition_board = resolve_active_competition_board(normalized_symbol, "futures")
     competition_start = _parse_iso_ts((competition_board or {}).get("activity_start_at"))
     competition_end = _parse_iso_ts((competition_board or {}).get("activity_end_at"))
-    all_events = _read_jsonl(event_path, limit=0)
-    filtered_events = _filter_events_since(all_events, competition_start)
-    events = filtered_events[-summary_limit:] if summary_limit > 0 else filtered_events
+    events, event_start, event_last = _read_event_window(
+        event_path,
+        since=competition_start,
+        limit=summary_limit,
+    )
     plan_report = _read_json(Path(plan_path))
     submit_report = _read_json(Path(submit_report_path))
     session_start, session_last = _build_session_window(events, submit_report)
-    event_start, event_last = _build_session_window(filtered_events, None)
     session_start = _min_dt(session_start, event_start)
     stats_start = competition_start or session_start
     session_last = _max_dt(session_last, event_last)

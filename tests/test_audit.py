@@ -2,8 +2,20 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from grid_optimizer.audit import build_audit_paths, collect_new_rows, income_row_key, income_row_time_ms, trade_row_key, trade_row_time_ms
+from grid_optimizer.audit import (
+    build_audit_paths,
+    collect_new_rows,
+    income_row_key,
+    income_row_time_ms,
+    parse_iso_ts,
+    read_jsonl,
+    read_jsonl_filtered,
+    scan_iso_bounds,
+    trade_row_key,
+    trade_row_time_ms,
+)
 
 
 class AuditTests(unittest.TestCase):
@@ -54,6 +66,64 @@ class AuditTests(unittest.TestCase):
         self.assertEqual([int(item["tranId"]) for item in fresh_rows], [11, 12])
         self.assertEqual(last_time_ms, 3000)
         self.assertEqual(last_keys, [income_row_key(rows[2])])
+
+    def test_read_jsonl_keeps_only_tail_when_limit_is_set(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        '{"idx": 1}',
+                        '{"idx": 2}',
+                        '{"idx": 3}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rows = read_jsonl(path, limit=2)
+
+        self.assertEqual([row["idx"] for row in rows], [2, 3])
+
+    def test_read_jsonl_filtered_applies_predicate(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        '{"time": 1000, "id": 1}',
+                        '{"time": 2000, "id": 2}',
+                        '{"time": 3000, "id": 3}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rows = read_jsonl_filtered(path, limit=0, predicate=lambda item: int(item["time"]) >= 2000)
+
+        self.assertEqual([row["id"] for row in rows], [2, 3])
+
+    def test_scan_iso_bounds_streams_file(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "rows.jsonl"
+            path.write_text(
+                "\n".join(
+                    [
+                        '{"ts": "2026-04-01T00:00:00+00:00"}',
+                        '{"ts": "2026-04-01T01:00:00+00:00"}',
+                        '{"ts": "2026-04-01T02:00:00+00:00"}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            first_ts, last_ts = scan_iso_bounds(path)
+
+        self.assertEqual(first_ts, parse_iso_ts("2026-04-01T00:00:00+00:00"))
+        self.assertEqual(last_ts, parse_iso_ts("2026-04-01T02:00:00+00:00"))
 
 
 if __name__ == "__main__":
