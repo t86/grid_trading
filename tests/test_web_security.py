@@ -63,6 +63,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("XAUT 三态状态", MONITOR_PAGE)
         self.assertIn("XAUT 三态原因", MONITOR_PAGE)
 
+    def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
+        if "getSelectedSymbol(" in MONITOR_PAGE:
+            self.assertIn("function getSelectedSymbol()", MONITOR_PAGE)
+
     def test_main_page_does_not_duplicate_symbol_element_declaration(self) -> None:
         needle = 'const symbolEl = document.getElementById("symbol");'
         self.assertEqual(HTML_PAGE.count(needle), 1)

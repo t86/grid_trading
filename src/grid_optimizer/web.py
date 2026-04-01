@@ -10558,7 +10558,7 @@ MONITOR_PAGE = """<!doctype html>
     }
 
     function populatePresetOptions(data) {
-      const selectedSymbol = String(getSelectedSymbol() || "").trim().toUpperCase();
+      const selectedSymbol = String(symbolEl.value || "").trim().toUpperCase();
       const presets = (((data && data.runner_presets) && data.runner_presets.length)
         ? data.runner_presets
         : LOCAL_STRATEGY_PRESETS).filter((item) => {
