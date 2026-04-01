@@ -2394,6 +2394,49 @@ def resolve_active_competition_board(
                 }
             )
     if not candidates:
+        for source in COMPETITION_SOURCES:
+            if str(source.market).strip().lower() != normalized_market:
+                continue
+            if str(source.symbol).upper().strip() != normalized_symbol:
+                continue
+            hinted = _hinted_boards_for_source(source)
+            if hinted is None:
+                continue
+            meta, board_metas = hinted
+            for board_meta in board_metas:
+                if not isinstance(board_meta, dict):
+                    continue
+                start_raw = str(board_meta.get("activityStartAt", "")).strip()
+                end_raw = str(board_meta.get("activityEndAt", "")).strip()
+                if not start_raw or not end_raw:
+                    parsed_start, parsed_end = _parse_activity_period_bounds(str(board_meta.get("activityPeriodText", "")).strip())
+                    start_raw = start_raw or str(parsed_start or "")
+                    end_raw = end_raw or str(parsed_end or "")
+                start_at = _parse_iso_datetime(start_raw)
+                end_at = _parse_iso_datetime(end_raw)
+                if start_at is None or end_at is None:
+                    continue
+                start_utc = start_at.astimezone(timezone.utc)
+                end_utc = end_at.astimezone(timezone.utc)
+                if not (start_utc <= current <= end_utc):
+                    continue
+                board = _compose_board(
+                    source,
+                    board_meta,
+                    {
+                        "resource_id": _safe_int(board_meta.get("resourceId")) or 0,
+                        "eligible_user_count": 0,
+                        "eligible_metric_total": 0.0,
+                        "updated_time_ms": 0,
+                        "rows_truncated": False,
+                        "last_rank_fetched": 0,
+                        "rows": [],
+                    },
+                    meta if isinstance(meta, dict) else {},
+                )
+                board["activity_start_at"] = start_at.isoformat()
+                board["activity_end_at"] = end_at.isoformat()
+                return board
         return None
     candidates.sort(
         key=lambda item: _parse_iso_datetime(item.get("activity_start_at")) or datetime.min.replace(tzinfo=timezone.utc),

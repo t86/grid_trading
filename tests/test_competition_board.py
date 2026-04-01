@@ -223,6 +223,35 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertIsNotNone(board)
         self.assertEqual(board["label"], "KAT · 交易量挑战赛 - 第二阶段")
 
+    def test_resolve_active_competition_board_falls_back_to_hinted_bard_board_when_snapshot_missing(self) -> None:
+        board = resolve_active_competition_board(
+            "BARDUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "BARD")
+        self.assertEqual(board["market"], "futures")
+        self.assertIn("第一阶段", board["label"])
+        self.assertEqual(len(board.get("segments", [])), 8)
+
+    def test_build_reward_volume_targets_works_for_hinted_bard_board_without_rows(self) -> None:
+        board = resolve_active_competition_board(
+            "BARDUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.12):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc))
+        self.assertIsNotNone(targets)
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        rank_200 = targets["tiers"][0]
+        self.assertAlmostEqual(rank_200["reward_value_usdt"], 120.0, places=8)
+        self.assertIsNone(rank_200["cutoff_value"])
+
     def test_load_history_index_merges_disk_files_with_stale_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
