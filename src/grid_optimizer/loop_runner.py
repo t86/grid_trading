@@ -224,7 +224,7 @@ XAUT_ADAPTIVE_STATE_CONFIGS: dict[str, dict[str, dict[str, Any]]] = {
             "up_trigger_steps": 4,
             "down_trigger_steps": 5,
             "shift_steps": 3,
-            "pause_short_position_notional": 480.0,
+            "pause_short_position_notional": 560.0,
             "max_short_position_notional": 620.0,
             "inventory_tier_start_notional": 360.0,
             "inventory_tier_end_notional": 450.0,

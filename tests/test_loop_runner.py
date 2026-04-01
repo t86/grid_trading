@@ -1352,7 +1352,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(effective.step_price, 8.5)
         self.assertEqual(effective.base_position_notional, 280.0)
-        self.assertEqual(effective.pause_short_position_notional, 480.0)
+        self.assertEqual(effective.pause_short_position_notional, 560.0)
         self.assertEqual(effective.max_short_position_notional, 620.0)
         self.assertEqual(effective.inventory_tier_start_notional, 360.0)
         self.assertEqual(effective.inventory_tier_end_notional, 450.0)

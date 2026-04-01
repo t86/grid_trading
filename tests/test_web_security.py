@@ -132,7 +132,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["autotune_symbol_enabled"])
         self.assertEqual(payload["step_price"], 8.5)
         self.assertEqual(payload["base_position_notional"], 280.0)
-        self.assertEqual(payload["pause_short_position_notional"], 480.0)
+        self.assertEqual(payload["pause_short_position_notional"], 560.0)
         self.assertEqual(payload["max_short_position_notional"], 620.0)
         self.assertEqual(payload["inventory_tier_start_notional"], 360.0)
         self.assertEqual(payload["inventory_tier_end_notional"], 450.0)
