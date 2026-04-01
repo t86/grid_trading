@@ -1224,6 +1224,62 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(result["available"])
         self.assertEqual(result["candidate_state"], "reduce_only")
 
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines", autospec=True)
+    def test_assess_xaut_adaptive_regime_fetches_recent_klines_with_time_bounds(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.side_effect = [
+            [
+                Candle(
+                    open_time=now - timedelta(minutes=15),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=100.5,
+                    low=99.8,
+                    close=100.1,
+                )
+            ],
+            [
+                Candle(
+                    open_time=now - timedelta(hours=1),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=100.6,
+                    low=99.7,
+                    close=100.2,
+                )
+            ],
+        ]
+
+        result = assess_xaut_adaptive_regime(
+            symbol="XAUTUSDT",
+            strategy_mode="one_way_short",
+            now=now,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertIsNone(result["warning"])
+        self.assertEqual(len(mock_fetch_futures_klines.call_args_list), 2)
+
+        first_call = mock_fetch_futures_klines.call_args_list[0].kwargs
+        self.assertEqual(first_call["symbol"], "XAUTUSDT")
+        self.assertEqual(first_call["interval"], "15m")
+        self.assertEqual(first_call["limit"], 8)
+        self.assertEqual(first_call["end_ms"], int(now.timestamp() * 1000))
+        self.assertEqual(
+            first_call["start_ms"],
+            int((now - timedelta(minutes=15 * 8)).timestamp() * 1000),
+        )
+
+        second_call = mock_fetch_futures_klines.call_args_list[1].kwargs
+        self.assertEqual(second_call["symbol"], "XAUTUSDT")
+        self.assertEqual(second_call["interval"], "1h")
+        self.assertEqual(second_call["limit"], 8)
+        self.assertEqual(second_call["end_ms"], int(now.timestamp() * 1000))
+        self.assertEqual(
+            second_call["start_ms"],
+            int((now - timedelta(hours=8)).timestamp() * 1000),
+        )
+
     def test_resolve_xaut_adaptive_state_enters_reduce_only_immediately_from_normal(self) -> None:
         state: dict[str, object] = {}
 

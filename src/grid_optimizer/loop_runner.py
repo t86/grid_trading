@@ -1474,10 +1474,25 @@ def assess_xaut_adaptive_regime(
         "metrics": {},
     }
     current_time = now or datetime.now(timezone.utc)
+    end_ms = int(current_time.timestamp() * 1000)
+    start_15m_ms = int((current_time - timedelta(minutes=15 * 8)).timestamp() * 1000)
+    start_60m_ms = int((current_time - timedelta(hours=8)).timestamp() * 1000)
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
     try:
-        candles_15m = fetch_futures_klines(symbol=symbol, interval="15m", limit=8)
-        candles_60m = fetch_futures_klines(symbol=symbol, interval="1h", limit=8)
+        candles_15m = fetch_futures_klines(
+            symbol=symbol,
+            interval="15m",
+            start_ms=start_15m_ms,
+            end_ms=end_ms,
+            limit=8,
+        )
+        candles_60m = fetch_futures_klines(
+            symbol=symbol,
+            interval="1h",
+            start_ms=start_60m_ms,
+            end_ms=end_ms,
+            limit=8,
+        )
     except Exception as exc:
         report["warning"] = f"{exc.__class__.__name__}: {exc}"
         return report
