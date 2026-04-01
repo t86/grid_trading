@@ -1417,6 +1417,46 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(effective.inventory_tier_per_order_notional, 65.0)
         self.assertEqual(effective.inventory_tier_base_position_notional, 120.0)
 
+    def test_build_xaut_adaptive_runner_args_applies_short_defensive_profile_with_small_entry_budget(self) -> None:
+        args = Namespace(
+            strategy_profile="xaut_short_adaptive_v1",
+            strategy_mode="one_way_short",
+            symbol="XAUTUSDT",
+            step_price=8.5,
+            buy_levels=10,
+            sell_levels=6,
+            per_order_notional=80.0,
+            base_position_notional=280.0,
+            up_trigger_steps=4,
+            down_trigger_steps=5,
+            shift_steps=3,
+            pause_short_position_notional=560.0,
+            max_short_position_notional=620.0,
+            inventory_tier_start_notional=360.0,
+            inventory_tier_end_notional=450.0,
+            inventory_tier_buy_levels=14,
+            inventory_tier_sell_levels=2,
+            inventory_tier_per_order_notional=65.0,
+            inventory_tier_base_position_notional=120.0,
+            short_cover_pause_amp_trigger_ratio=0.0060,
+            short_cover_pause_down_return_trigger_ratio=-0.0045,
+        )
+
+        effective = build_xaut_adaptive_runner_args(
+            args=args,
+            active_state="defensive",
+        )
+
+        self.assertEqual(effective.step_price, 12.0)
+        self.assertEqual(effective.buy_levels, 14)
+        self.assertEqual(effective.sell_levels, 2)
+        self.assertEqual(effective.pause_short_position_notional, 580.0)
+        self.assertEqual(effective.max_short_position_notional, 620.0)
+        self.assertEqual(effective.inventory_tier_buy_levels, 16)
+        self.assertEqual(effective.inventory_tier_sell_levels, 1)
+        self.assertEqual(effective.inventory_tier_per_order_notional, 40.0)
+        self.assertEqual(effective.inventory_tier_base_position_notional, 60.0)
+
 
 if __name__ == "__main__":
     unittest.main()
