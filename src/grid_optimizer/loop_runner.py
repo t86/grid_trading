@@ -72,6 +72,15 @@ from .dry_run import _round_order_qty
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
 AUTO_REGIME_DEFENSIVE_PROFILE = "volatility_defensive_v1"
+XAUT_LONG_ADAPTIVE_PROFILE = "xaut_long_adaptive_v1"
+XAUT_SHORT_ADAPTIVE_PROFILE = "xaut_short_adaptive_v1"
+XAUT_ADAPTIVE_PROFILES = {
+    XAUT_LONG_ADAPTIVE_PROFILE: "one_way_long",
+    XAUT_SHORT_ADAPTIVE_PROFILE: "one_way_short",
+}
+XAUT_ADAPTIVE_STATE_NORMAL = "normal"
+XAUT_ADAPTIVE_STATE_DEFENSIVE = "defensive"
+XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
@@ -118,12 +127,162 @@ AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
 AUTO_REGIME_PROFILE_LABELS = {
     AUTO_REGIME_STABLE_PROFILE: "量优先做多 v4",
     AUTO_REGIME_DEFENSIVE_PROFILE: "高波动防守 v1",
+    XAUT_LONG_ADAPTIVE_PROFILE: "XAUT 自适应做多 v1",
+    XAUT_SHORT_ADAPTIVE_PROFILE: "XAUT 自适应做空 v1",
 }
 AUTO_REGIME_PROFILE_STEP_HINTS: dict[str, tuple[float, int]] = {
     AUTO_REGIME_STABLE_PROFILE: (0.0004, 2),
     AUTO_REGIME_DEFENSIVE_PROFILE: (0.0008, 4),
 }
 BEST_QUOTE_SHORT_PROFILE = "robo_best_quote_short_v1"
+XAUT_ADAPTIVE_TRANSITION_CONFIRMATIONS = {
+    (XAUT_ADAPTIVE_STATE_NORMAL, XAUT_ADAPTIVE_STATE_DEFENSIVE): 2,
+    (XAUT_ADAPTIVE_STATE_DEFENSIVE, XAUT_ADAPTIVE_STATE_NORMAL): 2,
+    (XAUT_ADAPTIVE_STATE_DEFENSIVE, XAUT_ADAPTIVE_STATE_REDUCE_ONLY): 1,
+    (XAUT_ADAPTIVE_STATE_REDUCE_ONLY, XAUT_ADAPTIVE_STATE_DEFENSIVE): 2,
+    (XAUT_ADAPTIVE_STATE_NORMAL, XAUT_ADAPTIVE_STATE_REDUCE_ONLY): 1,
+}
+XAUT_ADAPTIVE_STATE_CONFIGS: dict[str, dict[str, dict[str, Any]]] = {
+    "one_way_long": {
+        XAUT_ADAPTIVE_STATE_NORMAL: {
+            "step_price": 7.5,
+            "buy_levels": 6,
+            "sell_levels": 10,
+            "per_order_notional": 80.0,
+            "base_position_notional": 320.0,
+            "up_trigger_steps": 5,
+            "down_trigger_steps": 4,
+            "shift_steps": 3,
+            "pause_buy_position_notional": 520.0,
+            "max_position_notional": 680.0,
+            "buy_pause_amp_trigger_ratio": 0.0060,
+            "buy_pause_down_return_trigger_ratio": -0.0045,
+            "freeze_shift_abs_return_trigger_ratio": 0.0048,
+            "inventory_tier_start_notional": 420.0,
+            "inventory_tier_end_notional": 520.0,
+            "inventory_tier_buy_levels": 3,
+            "inventory_tier_sell_levels": 12,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 160.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+        XAUT_ADAPTIVE_STATE_DEFENSIVE: {
+            "step_price": 12.0,
+            "buy_levels": 2,
+            "sell_levels": 14,
+            "per_order_notional": 45.0,
+            "base_position_notional": 100.0,
+            "up_trigger_steps": 4,
+            "down_trigger_steps": 6,
+            "shift_steps": 2,
+            "pause_buy_position_notional": 180.0,
+            "max_position_notional": 260.0,
+            "buy_pause_amp_trigger_ratio": 0.0045,
+            "buy_pause_down_return_trigger_ratio": -0.0035,
+            "freeze_shift_abs_return_trigger_ratio": 0.0040,
+            "inventory_tier_start_notional": 140.0,
+            "inventory_tier_end_notional": 180.0,
+            "inventory_tier_buy_levels": 1,
+            "inventory_tier_sell_levels": 16,
+            "inventory_tier_per_order_notional": 40.0,
+            "inventory_tier_base_position_notional": 60.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+        XAUT_ADAPTIVE_STATE_REDUCE_ONLY: {
+            "step_price": 12.0,
+            "buy_levels": 2,
+            "sell_levels": 14,
+            "per_order_notional": 45.0,
+            "base_position_notional": 100.0,
+            "up_trigger_steps": 4,
+            "down_trigger_steps": 6,
+            "shift_steps": 2,
+            "pause_buy_position_notional": 180.0,
+            "max_position_notional": 260.0,
+            "buy_pause_amp_trigger_ratio": 0.0045,
+            "buy_pause_down_return_trigger_ratio": -0.0035,
+            "freeze_shift_abs_return_trigger_ratio": 0.0040,
+            "inventory_tier_start_notional": 140.0,
+            "inventory_tier_end_notional": 180.0,
+            "inventory_tier_buy_levels": 1,
+            "inventory_tier_sell_levels": 16,
+            "inventory_tier_per_order_notional": 40.0,
+            "inventory_tier_base_position_notional": 60.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": True,
+        },
+    },
+    "one_way_short": {
+        XAUT_ADAPTIVE_STATE_NORMAL: {
+            "step_price": 7.5,
+            "buy_levels": 10,
+            "sell_levels": 6,
+            "per_order_notional": 80.0,
+            "base_position_notional": 320.0,
+            "up_trigger_steps": 4,
+            "down_trigger_steps": 5,
+            "shift_steps": 3,
+            "pause_short_position_notional": 520.0,
+            "max_short_position_notional": 680.0,
+            "inventory_tier_start_notional": 420.0,
+            "inventory_tier_end_notional": 520.0,
+            "inventory_tier_buy_levels": 12,
+            "inventory_tier_sell_levels": 3,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 160.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0060,
+            "short_cover_pause_down_return_trigger_ratio": -0.0045,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+        XAUT_ADAPTIVE_STATE_DEFENSIVE: {
+            "step_price": 12.0,
+            "buy_levels": 14,
+            "sell_levels": 2,
+            "per_order_notional": 45.0,
+            "base_position_notional": 100.0,
+            "up_trigger_steps": 6,
+            "down_trigger_steps": 4,
+            "shift_steps": 2,
+            "pause_short_position_notional": 180.0,
+            "max_short_position_notional": 260.0,
+            "inventory_tier_start_notional": 140.0,
+            "inventory_tier_end_notional": 180.0,
+            "inventory_tier_buy_levels": 16,
+            "inventory_tier_sell_levels": 1,
+            "inventory_tier_per_order_notional": 40.0,
+            "inventory_tier_base_position_notional": 60.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0045,
+            "short_cover_pause_down_return_trigger_ratio": -0.0035,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+        XAUT_ADAPTIVE_STATE_REDUCE_ONLY: {
+            "step_price": 12.0,
+            "buy_levels": 14,
+            "sell_levels": 2,
+            "per_order_notional": 45.0,
+            "base_position_notional": 100.0,
+            "up_trigger_steps": 6,
+            "down_trigger_steps": 4,
+            "shift_steps": 2,
+            "pause_short_position_notional": 180.0,
+            "max_short_position_notional": 260.0,
+            "inventory_tier_start_notional": 140.0,
+            "inventory_tier_end_notional": 180.0,
+            "inventory_tier_buy_levels": 16,
+            "inventory_tier_sell_levels": 1,
+            "inventory_tier_per_order_notional": 40.0,
+            "inventory_tier_base_position_notional": 60.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0045,
+            "short_cover_pause_down_return_trigger_ratio": -0.0035,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": True,
+        },
+    },
+}
 
 
 def _float(value: float) -> str:
@@ -132,6 +291,14 @@ def _float(value: float) -> str:
 
 def _price(value: float) -> str:
     return f"{value:.7f}"
+
+
+def is_xaut_adaptive_profile(profile: str) -> bool:
+    return str(profile).strip() in XAUT_ADAPTIVE_PROFILES
+
+
+def _xaut_transition_confirm_cycles(active_state: str, candidate_state: str) -> int:
+    return max(int(XAUT_ADAPTIVE_TRANSITION_CONFIRMATIONS.get((str(active_state), str(candidate_state)), 1) or 1), 1)
 
 
 def _round_up_to_step(value: float, step: float | None) -> float:
@@ -1268,6 +1435,194 @@ def _aggregate_recent_window(candles: list[Any], *, count: int) -> dict[str, Any
     }
 
 
+def _latest_closed_window(candles: list[Any], *, now: datetime | None = None) -> dict[str, Any] | None:
+    current_time = now or datetime.now(timezone.utc)
+    closed = [item for item in candles if item.close_time <= current_time]
+    if not closed:
+        return None
+    candle = closed[-1]
+    open_price = max(float(candle.open), 0.0)
+    high_price = max(float(candle.high), 0.0)
+    low_price = max(float(candle.low), 0.0)
+    close_price = max(float(candle.close), 0.0)
+    amplitude_ratio = ((high_price / low_price) - 1.0) if low_price > 0 else 0.0
+    return_ratio = ((close_price / open_price) - 1.0) if open_price > 0 else 0.0
+    return {
+        "open_time": candle.open_time.isoformat(),
+        "close_time": candle.close_time.isoformat(),
+        "open": open_price,
+        "high": high_price,
+        "low": low_price,
+        "close": close_price,
+        "amplitude_ratio": amplitude_ratio,
+        "return_ratio": return_ratio,
+    }
+
+
+def assess_xaut_adaptive_regime(
+    *,
+    symbol: str,
+    strategy_mode: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    report = {
+        "enabled": True,
+        "available": False,
+        "warning": None,
+        "candidate_state": XAUT_ADAPTIVE_STATE_DEFENSIVE,
+        "reason": None,
+        "metrics": {},
+    }
+    current_time = now or datetime.now(timezone.utc)
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    try:
+        candles_15m = fetch_futures_klines(symbol=symbol, interval="15m", limit=8)
+        candles_60m = fetch_futures_klines(symbol=symbol, interval="1h", limit=8)
+    except Exception as exc:
+        report["warning"] = f"{exc.__class__.__name__}: {exc}"
+        return report
+
+    window_15m = _latest_closed_window(candles_15m, now=current_time)
+    window_60m = _latest_closed_window(candles_60m, now=current_time)
+    if window_15m is None or window_60m is None:
+        report["warning"] = "insufficient_closed_candles"
+        return report
+
+    report["available"] = True
+    report["metrics"] = {
+        "window_15m": window_15m,
+        "window_60m": window_60m,
+    }
+
+    amp_15m = float(window_15m["amplitude_ratio"])
+    amp_60m = float(window_60m["amplitude_ratio"])
+    ret_15m = float(window_15m["return_ratio"])
+    ret_60m = float(window_60m["return_ratio"])
+
+    if normalized_mode == "one_way_short":
+        reduce_only = (
+            amp_15m >= 0.009
+            or amp_60m >= 0.016
+            or ret_15m >= 0.007
+            or ret_60m >= 0.012
+        )
+        defensive = (
+            amp_15m >= 0.006
+            or amp_60m >= 0.012
+            or ret_15m >= 0.004
+            or ret_60m >= 0.008
+        )
+        normal = amp_15m <= 0.0035 and amp_60m <= 0.0075 and ret_60m <= 0.003
+    else:
+        reduce_only = (
+            amp_15m >= 0.009
+            or amp_60m >= 0.016
+            or ret_15m <= -0.007
+            or ret_60m <= -0.012
+        )
+        defensive = (
+            amp_15m >= 0.006
+            or amp_60m >= 0.012
+            or ret_15m <= -0.004
+            or ret_60m <= -0.008
+        )
+        normal = amp_15m <= 0.0035 and amp_60m <= 0.0075 and ret_60m >= -0.003
+
+    if reduce_only:
+        candidate_state = XAUT_ADAPTIVE_STATE_REDUCE_ONLY
+    elif defensive or not normal:
+        candidate_state = XAUT_ADAPTIVE_STATE_DEFENSIVE
+    else:
+        candidate_state = XAUT_ADAPTIVE_STATE_NORMAL
+
+    report["candidate_state"] = candidate_state
+    report["reason"] = (
+        f"15m amp={amp_15m * 100:.2f}% ret={ret_15m * 100:.2f}% · "
+        f"60m amp={amp_60m * 100:.2f}% ret={ret_60m * 100:.2f}%"
+    )
+    return report
+
+
+def resolve_xaut_adaptive_state(
+    *,
+    state: dict[str, Any],
+    regime_report: dict[str, Any],
+    strategy_mode: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = now or datetime.now(timezone.utc)
+    adaptive_state = dict(state.get("xaut_adaptive_state") or {})
+    active_state = str(adaptive_state.get("active_state") or XAUT_ADAPTIVE_STATE_NORMAL).strip() or XAUT_ADAPTIVE_STATE_NORMAL
+    pending_state = str(adaptive_state.get("pending_state") or "").strip() or None
+    pending_count = int(adaptive_state.get("pending_count") or 0)
+    candidate_state = str(regime_report.get("candidate_state") or active_state).strip() or active_state
+    warning = regime_report.get("warning")
+    switched = False
+    report_available = bool(regime_report.get("available", "candidate_state" in regime_report))
+
+    if not report_available:
+        candidate_state = active_state
+        pending_state = None
+        pending_count = 0
+    elif active_state == XAUT_ADAPTIVE_STATE_REDUCE_ONLY and candidate_state == XAUT_ADAPTIVE_STATE_NORMAL:
+        candidate_state = XAUT_ADAPTIVE_STATE_DEFENSIVE
+
+    if candidate_state != active_state:
+        if pending_state == candidate_state:
+            pending_count += 1
+        else:
+            pending_state = candidate_state
+            pending_count = 1
+        if pending_count >= _xaut_transition_confirm_cycles(active_state, candidate_state):
+            active_state = candidate_state
+            pending_state = None
+            pending_count = 0
+            switched = True
+    else:
+        pending_state = None
+        pending_count = 0
+
+    adaptive_state.update(
+        {
+            "enabled": True,
+            "direction": "short" if str(strategy_mode).strip() == "one_way_short" else "long",
+            "active_state": active_state,
+            "candidate_state": candidate_state,
+            "pending_state": pending_state,
+            "pending_count": pending_count,
+            "reason": regime_report.get("reason"),
+            "metrics": dict(regime_report.get("metrics") or {}),
+            "warning": warning,
+            "switched": switched,
+            "updated_at": current_time.isoformat(),
+        }
+    )
+    state["xaut_adaptive_state"] = adaptive_state
+    return adaptive_state
+
+
+def build_xaut_adaptive_runner_args(
+    *,
+    args: argparse.Namespace,
+    active_state: str,
+) -> argparse.Namespace:
+    effective = argparse.Namespace(**vars(args))
+    strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    overrides = dict(XAUT_ADAPTIVE_STATE_CONFIGS.get(strategy_mode, {}).get(str(active_state), {}))
+    for key, value in overrides.items():
+        setattr(effective, key, value)
+    return effective
+
+
+def apply_xaut_reduce_only_pruning(*, plan: dict[str, Any], strategy_mode: str) -> None:
+    mode = str(strategy_mode).strip()
+    plan["bootstrap_orders"] = []
+    if mode == "one_way_short":
+        plan["sell_orders"] = []
+    else:
+        plan["buy_orders"] = []
+
+
 def assess_auto_regime(
     *,
     symbol: str,
@@ -1891,9 +2246,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         reset_state=args.reset_state,
     )
     auto_regime: dict[str, Any] | None = None
+    xaut_adaptive: dict[str, Any] | None = None
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
-    if getattr(args, "auto_regime_enabled", False) and strategy_mode == "one_way_long":
+    if is_xaut_adaptive_profile(requested_strategy_profile):
+        if symbol != "XAUTUSDT":
+            raise RuntimeError("XAUT adaptive profiles require symbol=XAUTUSDT")
+        expected_mode = XAUT_ADAPTIVE_PROFILES.get(requested_strategy_profile)
+        if expected_mode and strategy_mode != expected_mode:
+            raise RuntimeError(f"{requested_strategy_profile} requires strategy_mode={expected_mode}")
+        regime_report = assess_xaut_adaptive_regime(
+            symbol=symbol,
+            strategy_mode=strategy_mode,
+        )
+        xaut_adaptive = resolve_xaut_adaptive_state(
+            state=state,
+            regime_report=regime_report,
+            strategy_mode=strategy_mode,
+        )
+        effective_args = build_xaut_adaptive_runner_args(
+            args=args,
+            active_state=str(xaut_adaptive.get("active_state") or XAUT_ADAPTIVE_STATE_NORMAL),
+        )
+    elif getattr(args, "auto_regime_enabled", False) and strategy_mode == "one_way_long":
         regime_report = assess_auto_regime(
             symbol=symbol,
             stable_15m_max_amplitude_ratio=args.auto_regime_stable_15m_max_amplitude_ratio,
@@ -2067,6 +2442,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "excess_qty": 0.0,
         "reason": None,
     }
+    xaut_reduce_only_active = bool((xaut_adaptive or {}).get("active_state") == XAUT_ADAPTIVE_STATE_REDUCE_ONLY)
     short_cover_controls = {
         "short_cover_paused": False,
         "short_cover_pause_reasons": [],
@@ -2452,8 +2828,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_qty=0.0,
             current_short_qty=current_short_qty,
             target_base_qty=plan["target_base_qty"],
-            enabled=bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
+            enabled=bool(getattr(effective_args, "excess_inventory_reduce_only_enabled", False)),
         )
+        if xaut_reduce_only_active:
+            apply_xaut_reduce_only_pruning(plan=plan, strategy_mode=strategy_mode)
         controls = apply_hedge_position_controls(
             plan=plan,
             current_long_qty=0.0,
@@ -2521,8 +2899,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_qty=current_long_qty,
             current_short_qty=0.0,
             target_base_qty=plan["target_base_qty"],
-            enabled=bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
+            enabled=bool(getattr(effective_args, "excess_inventory_reduce_only_enabled", False)),
         )
+        if xaut_reduce_only_active:
+            apply_xaut_reduce_only_pruning(plan=plan, strategy_mode=strategy_mode)
         controls = apply_position_controls(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -2585,6 +2965,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "auto_regime": auto_regime,
+        "xaut_adaptive": xaut_adaptive,
         "current_long_qty": current_long_qty,
         "current_long_notional": controls["current_long_notional"],
         "current_short_qty": current_short_qty,
@@ -3131,6 +3512,15 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         )
         if summary.get("auto_regime_reason"):
             print(f"  auto_reason: {summary['auto_regime_reason']}")
+    if summary.get("xaut_adaptive_enabled"):
+        print(
+            "  xaut_adaptive: "
+            f"{summary.get('xaut_adaptive_state', '--')} "
+            f"(candidate={summary.get('xaut_adaptive_candidate_state', '--')} "
+            f"pending={int(summary.get('xaut_adaptive_pending_count', 0) or 0)})"
+        )
+        if summary.get("xaut_adaptive_reason"):
+            print(f"  xaut_reason: {summary['xaut_adaptive_reason']}")
     if summary.get("neutral_hourly_scale_enabled"):
         print(
             "  neutral_hourly: "
@@ -3384,6 +3774,7 @@ def main() -> None:
                 "effective_strategy_profile": str(
                     plan_report.get("effective_strategy_profile") or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
                 ),
+                "effective_strategy_label": str(plan_report.get("effective_strategy_label") or ""),
                 "strategy_mode": str(getattr(args, "strategy_mode", "one_way_long")),
                 "mid_price": _safe_float(plan_report.get("mid_price")),
                 "center_price": _safe_float(plan_report.get("center_price")),
@@ -3427,6 +3818,11 @@ def main() -> None:
                 "auto_regime_pending_count": int(((plan_report.get("auto_regime") or {}).get("pending_count", 0) or 0)),
                 "auto_regime_confirm_cycles": int(((plan_report.get("auto_regime") or {}).get("confirm_cycles", 0) or 0)),
                 "auto_regime_switched": bool((plan_report.get("auto_regime") or {}).get("switched")),
+                "xaut_adaptive_enabled": bool(plan_report.get("xaut_adaptive")),
+                "xaut_adaptive_state": str(((plan_report.get("xaut_adaptive") or {}).get("active_state", "") or "")),
+                "xaut_adaptive_candidate_state": str(((plan_report.get("xaut_adaptive") or {}).get("candidate_state", "") or "")),
+                "xaut_adaptive_pending_count": int(((plan_report.get("xaut_adaptive") or {}).get("pending_count", 0) or 0)),
+                "xaut_adaptive_reason": (plan_report.get("xaut_adaptive") or {}).get("reason"),
                 "neutral_hourly_scale_enabled": bool(((plan_report.get("neutral_hourly_scale") or {}).get("enabled"))),
                 "neutral_hourly_scale_ratio": _safe_float((plan_report.get("neutral_hourly_scale") or {}).get("scale")),
                 "neutral_hourly_regime": str(((plan_report.get("neutral_hourly_scale") or {}).get("regime", "") or "")),

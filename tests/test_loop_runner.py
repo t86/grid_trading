@@ -24,13 +24,17 @@ from grid_optimizer.loop_runner import (
     apply_max_position_notional_cap,
     apply_position_controls,
     apply_short_cover_pause,
+    apply_xaut_reduce_only_pruning,
     assess_auto_regime,
     assess_market_guard,
+    assess_xaut_adaptive_regime,
     build_effective_runner_args,
+    build_xaut_adaptive_runner_args,
     generate_plan_report,
     execute_plan_report,
     resolve_neutral_hourly_scale,
     resolve_auto_regime_profile,
+    resolve_xaut_adaptive_state,
     update_synthetic_order_refs,
 )
 from grid_optimizer.semi_auto_plan import build_static_binance_grid_plan
@@ -1149,6 +1153,172 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(effective.sell_levels, 12)
         self.assertEqual(effective.max_position_notional, 420.0)
         self.assertGreaterEqual(effective.step_price, 0.0004)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_xaut_adaptive_regime_prefers_reduce_only_for_long_extreme_drop(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.side_effect = [
+            [
+                Candle(
+                    open_time=now - timedelta(minutes=15),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=100.2,
+                    low=99.1,
+                    close=99.2,
+                )
+            ],
+            [
+                Candle(
+                    open_time=now - timedelta(hours=1),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=100.4,
+                    low=98.4,
+                    close=98.7,
+                )
+            ],
+        ]
+
+        result = assess_xaut_adaptive_regime(
+            symbol="XAUTUSDT",
+            strategy_mode="one_way_long",
+            now=now,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["candidate_state"], "reduce_only")
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_xaut_adaptive_regime_prefers_reduce_only_for_short_extreme_rally(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.side_effect = [
+            [
+                Candle(
+                    open_time=now - timedelta(minutes=15),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=101.0,
+                    low=99.8,
+                    close=100.8,
+                )
+            ],
+            [
+                Candle(
+                    open_time=now - timedelta(hours=1),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=101.7,
+                    low=99.9,
+                    close=101.3,
+                )
+            ],
+        ]
+
+        result = assess_xaut_adaptive_regime(
+            symbol="XAUTUSDT",
+            strategy_mode="one_way_short",
+            now=now,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["candidate_state"], "reduce_only")
+
+    def test_resolve_xaut_adaptive_state_enters_reduce_only_immediately_from_normal(self) -> None:
+        state: dict[str, object] = {}
+
+        resolved = resolve_xaut_adaptive_state(
+            state=state,
+            regime_report={"candidate_state": "reduce_only", "reason": "extreme"},
+            strategy_mode="one_way_long",
+            now=datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(resolved["active_state"], "reduce_only")
+        self.assertTrue(resolved["switched"])
+
+    def test_resolve_xaut_adaptive_state_requires_reduce_only_to_pass_through_defensive(self) -> None:
+        state: dict[str, object] = {
+            "xaut_adaptive_state": {
+                "active_state": "reduce_only",
+                "pending_state": None,
+                "pending_count": 0,
+            }
+        }
+
+        resolved = resolve_xaut_adaptive_state(
+            state=state,
+            regime_report={"candidate_state": "normal", "reason": "stable"},
+            strategy_mode="one_way_long",
+            now=datetime(2026, 4, 1, 0, 5, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(resolved["active_state"], "reduce_only")
+        self.assertEqual(resolved["candidate_state"], "defensive")
+        self.assertEqual(resolved["pending_state"], "defensive")
+        self.assertEqual(resolved["pending_count"], 1)
+
+    def test_apply_xaut_reduce_only_pruning_drops_long_opening_orders(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "role": "take_profit"}],
+        }
+
+        apply_xaut_reduce_only_pruning(plan=plan, strategy_mode="one_way_long")
+
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_apply_xaut_reduce_only_pruning_drops_short_opening_orders(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "SELL", "role": "bootstrap_short"}],
+            "buy_orders": [{"side": "BUY", "role": "take_profit_short"}],
+            "sell_orders": [{"side": "SELL", "role": "entry_short"}],
+        }
+
+        apply_xaut_reduce_only_pruning(plan=plan, strategy_mode="one_way_short")
+
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+
+    def test_build_xaut_adaptive_runner_args_applies_defensive_profile(self) -> None:
+        args = Namespace(
+            strategy_profile="xaut_long_adaptive_v1",
+            strategy_mode="one_way_long",
+            symbol="XAUTUSDT",
+            step_price=7.5,
+            buy_levels=6,
+            sell_levels=10,
+            per_order_notional=80.0,
+            base_position_notional=320.0,
+            up_trigger_steps=5,
+            down_trigger_steps=4,
+            shift_steps=3,
+            pause_buy_position_notional=520.0,
+            max_position_notional=680.0,
+            buy_pause_amp_trigger_ratio=0.0060,
+            buy_pause_down_return_trigger_ratio=-0.0045,
+            freeze_shift_abs_return_trigger_ratio=0.0048,
+            inventory_tier_start_notional=420.0,
+            inventory_tier_end_notional=520.0,
+            inventory_tier_buy_levels=3,
+            inventory_tier_sell_levels=12,
+            inventory_tier_per_order_notional=70.0,
+            inventory_tier_base_position_notional=160.0,
+        )
+
+        effective = build_xaut_adaptive_runner_args(
+            args=args,
+            active_state="defensive",
+        )
+
+        self.assertEqual(effective.buy_levels, 2)
+        self.assertEqual(effective.sell_levels, 14)
+        self.assertEqual(effective.max_position_notional, 260.0)
+        self.assertEqual(effective.step_price, 12.0)
 
 
 if __name__ == "__main__":

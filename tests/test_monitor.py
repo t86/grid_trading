@@ -4,12 +4,14 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from grid_optimizer.monitor import (
     _filter_events_since,
     _filter_rows_since,
     _read_runner_process,
     _extract_futures_asset_snapshot,
+    build_monitor_snapshot,
     build_monitor_alerts,
     summarize_hourly_metrics,
     summarize_income,
@@ -267,6 +269,79 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(bnb["available_balance"], 0.31, places=8)
 
         self.assertIsNone(_extract_futures_asset_snapshot(account_info, "ETH"))
+
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [
+                {
+                    "symbol": "XAUTUSDT",
+                    "positionAmt": "0",
+                    "entryPrice": "0",
+                    "breakEvenPrice": "0",
+                    "unRealizedProfit": "0",
+                    "isolated": False,
+                    "leverage": "2",
+                }
+            ],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0.0001", "mark_price": "4558.7"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "4558.6", "ask_price": "4558.8"}])
+    def test_build_monitor_snapshot_exposes_xaut_adaptive_state(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "xaut_events.jsonl"
+            plan_path = root / "xaut_plan.json"
+            submit_path = root / "xaut_submit.json"
+            events_path.write_text("", encoding="utf-8")
+            plan_path.write_text(
+                '{"strategy_mode":"one_way_long","effective_strategy_profile":"xaut_long_adaptive_v1","effective_strategy_label":"XAUT 自适应做多 v1","xaut_adaptive":{"enabled":true,"active_state":"reduce_only","candidate_state":"reduce_only","pending_count":0,"reason":"15m amp=1.00% ret=-0.80%"}}',
+                encoding="utf-8",
+            )
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="XAUTUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": True,
+                    "config": {
+                        "symbol": "XAUTUSDT",
+                        "strategy_profile": "xaut_long_adaptive_v1",
+                        "strategy_mode": "one_way_long",
+                    },
+                },
+            )
+
+        risk = snapshot["risk_controls"]
+        self.assertTrue(risk["xaut_adaptive_enabled"])
+        self.assertEqual(risk["xaut_adaptive_state"], "reduce_only")
+        self.assertEqual(risk["xaut_adaptive_candidate_state"], "reduce_only")
+        self.assertEqual(risk["xaut_adaptive_reason"], "15m amp=1.00% ret=-0.80%")
 
     def test_filter_rows_since_discards_older_trade_rows(self) -> None:
         floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)

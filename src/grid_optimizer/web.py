@@ -224,6 +224,69 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "auto_regime_defensive_60m_return_ratio": -0.03,
         },
     },
+    "xaut_long_adaptive_v1": {
+        "label": "XAUT 自适应做多 v1",
+        "description": "仅用于 XAUTUSDT 的三态自适应做多。平稳时刷量，扩振时转防守，极端波动时立即撤买单并只保留卖单减仓。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "one_way_long",
+            "step_price": 7.5,
+            "buy_levels": 6,
+            "sell_levels": 10,
+            "per_order_notional": 80.0,
+            "base_position_notional": 320.0,
+            "up_trigger_steps": 5,
+            "down_trigger_steps": 4,
+            "shift_steps": 3,
+            "pause_buy_position_notional": 520.0,
+            "max_position_notional": 680.0,
+            "buy_pause_amp_trigger_ratio": 0.0060,
+            "buy_pause_down_return_trigger_ratio": -0.0045,
+            "freeze_shift_abs_return_trigger_ratio": 0.0048,
+            "inventory_tier_start_notional": 420.0,
+            "inventory_tier_end_notional": 520.0,
+            "inventory_tier_buy_levels": 3,
+            "inventory_tier_sell_levels": 12,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 160.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+    },
+    "xaut_short_adaptive_v1": {
+        "label": "XAUT 自适应做空 v1",
+        "description": "仅用于 XAUTUSDT 的三态自适应做空。平稳时刷量，扩振时转防守，极端波动时立即撤卖单并只保留买单回补减仓。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "one_way_short",
+            "step_price": 7.5,
+            "buy_levels": 10,
+            "sell_levels": 6,
+            "per_order_notional": 80.0,
+            "base_position_notional": 320.0,
+            "up_trigger_steps": 4,
+            "down_trigger_steps": 5,
+            "shift_steps": 3,
+            "pause_short_position_notional": 520.0,
+            "max_short_position_notional": 680.0,
+            "inventory_tier_start_notional": 420.0,
+            "inventory_tier_end_notional": 520.0,
+            "inventory_tier_buy_levels": 12,
+            "inventory_tier_sell_levels": 3,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 160.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0060,
+            "short_cover_pause_down_return_trigger_ratio": -0.0045,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+    },
     "volume_short_v1": {
         "label": "量优先做空 v1",
         "description": "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
@@ -1110,11 +1173,17 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
     requested_symbol = str((base_config or {}).get("symbol", "")).upper().strip()
     preset = _runner_preset_map(requested_symbol).get(normalized)
     if preset is None:
+        preset = _runner_preset_map().get(normalized)
+    if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
+    preset_symbol = str(preset.get("symbol", "")).upper().strip()
     config = dict(RUNNER_DEFAULT_CONFIG)
     config.update(preset.get("config", {}))
     if base_config:
         config.update(base_config)
+    resolved_symbol = str(config.get("symbol", "")).upper().strip()
+    if preset_symbol and resolved_symbol and resolved_symbol != preset_symbol:
+        raise ValueError(f"{preset.get('label', normalized)} requires symbol={preset_symbol}")
     if preset.get("kind") == "custom_grid":
         preview_params = dict(preset.get("grid_preview_params") or {})
         preview_summary = dict(preset.get("preview_summary") or {})
@@ -1662,9 +1731,15 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
     profile = str(config.get("strategy_profile", RUNNER_DEFAULT_CONFIG["strategy_profile"])).strip() or RUNNER_DEFAULT_CONFIG["strategy_profile"]
     preset = _runner_preset_map(str(config.get("symbol", ""))).get(profile)
     if preset is None:
+        preset = _runner_preset_map().get(profile)
+    if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
     if not preset.get("startable", True):
         raise ValueError(f"{preset.get('label', profile)} 当前是模板预设，页面已展示参数，但还不能直接启动。")
+    preset_symbol = str(preset.get("symbol", "")).upper().strip()
+    resolved_symbol = str(config.get("symbol", "")).upper().strip()
+    if preset_symbol and resolved_symbol and resolved_symbol != preset_symbol:
+        raise ValueError(f"{preset.get('label', profile)} requires symbol={preset_symbol}")
     raw_payload.setdefault("symbol", config.get("symbol"))
     raw_payload.setdefault("strategy_profile", profile)
     resolved = _normalize_runner_control_payload(_runner_preset_payload(profile, raw_payload))
@@ -9116,6 +9191,71 @@ MONITOR_PAGE = """<!doctype html>
         },
       },
       {
+        key: "xaut_long_adaptive_v1",
+        label: "XAUT 自适应做多 v1",
+        description: "仅用于 XAUTUSDT 的三态自适应做多。平稳时刷量，扩振时转防守，极端波动时立即撤买单并只保留卖单减仓。",
+        startable: true,
+        kind: "one_way",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "one_way_long",
+          step_price: 7.5,
+          buy_levels: 6,
+          sell_levels: 10,
+          per_order_notional: 80.0,
+          base_position_notional: 320.0,
+          up_trigger_steps: 5,
+          down_trigger_steps: 4,
+          shift_steps: 3,
+          pause_buy_position_notional: 520.0,
+          max_position_notional: 680.0,
+          buy_pause_amp_trigger_ratio: 0.0060,
+          buy_pause_down_return_trigger_ratio: -0.0045,
+          freeze_shift_abs_return_trigger_ratio: 0.0048,
+          inventory_tier_start_notional: 420.0,
+          inventory_tier_end_notional: 520.0,
+          inventory_tier_buy_levels: 3,
+          inventory_tier_sell_levels: 12,
+          inventory_tier_per_order_notional: 70.0,
+          inventory_tier_base_position_notional: 160.0,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+        },
+      },
+      {
+        key: "xaut_short_adaptive_v1",
+        label: "XAUT 自适应做空 v1",
+        description: "仅用于 XAUTUSDT 的三态自适应做空。平稳时刷量，扩振时转防守，极端波动时立即撤卖单并只保留买单回补减仓。",
+        startable: true,
+        kind: "one_way",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "one_way_short",
+          step_price: 7.5,
+          buy_levels: 10,
+          sell_levels: 6,
+          per_order_notional: 80.0,
+          base_position_notional: 320.0,
+          up_trigger_steps: 4,
+          down_trigger_steps: 5,
+          shift_steps: 3,
+          pause_short_position_notional: 520.0,
+          max_short_position_notional: 680.0,
+          inventory_tier_start_notional: 420.0,
+          inventory_tier_end_notional: 520.0,
+          inventory_tier_buy_levels: 12,
+          inventory_tier_sell_levels: 3,
+          inventory_tier_per_order_notional: 70.0,
+          inventory_tier_base_position_notional: 160.0,
+          short_cover_pause_amp_trigger_ratio: 0.0060,
+          short_cover_pause_down_return_trigger_ratio: -0.0045,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+        },
+      },
+      {
         key: "volume_short_v1",
         label: "量优先做空 v1",
         description: "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
@@ -9878,6 +10018,18 @@ MONITOR_PAGE = """<!doctype html>
         summary: "这不是固定参数集。运行时会先判定市场状态，再在 volume_long_v4 和 volatility_defensive_v1 两套参数之间切换。",
         focus: [
           "当 15m/60m 振幅或跌幅触发防守条件时，会连续确认后切换到防守档；稳定后再切回量优先档。",
+        ],
+      },
+      xaut_long_adaptive_v1: {
+        summary: "XAUT 专用三态做多。除了 normal / defensive 外，还会在极端下跌或扩振时进入 reduce_only，立即撤买单，只保留卖单减仓。",
+        focus: [
+          "这套只允许在 XAUTUSDT 上使用，目的是把高波动时的继续接仓速度压到最低。",
+        ],
+      },
+      xaut_short_adaptive_v1: {
+        summary: "XAUT 专用三态做空。极端上冲或扩振时进入 reduce_only，立即撤卖单，只保留买单回补减空仓。",
+        focus: [
+          "结构上镜像 xaut_long_adaptive_v1，但风险触发方向反过来。",
         ],
       },
       volume_short_v1: {
@@ -10752,6 +10904,10 @@ MONITOR_PAGE = """<!doctype html>
       const autoRegimeEnabled = Boolean(risk.auto_regime_enabled);
       const autoRegimeRegime = String(risk.auto_regime_regime || "--");
       const autoRegimePending = `${fmtNum(risk.auto_regime_pending_count || 0, 0)} / ${fmtNum(risk.auto_regime_confirm_cycles || 0, 0)}`;
+      const xautAdaptiveEnabled = Boolean(risk.xaut_adaptive_enabled);
+      const xautAdaptiveState = String(risk.xaut_adaptive_state || "--");
+      const xautAdaptiveCandidateState = String(risk.xaut_adaptive_candidate_state || "--");
+      const xautAdaptivePending = fmtNum(risk.xaut_adaptive_pending_count || 0, 0);
       const neutralHourlyEnabled = Boolean(risk.neutral_hourly_scale_enabled);
       const neutralHourlyRegime = String(risk.neutral_hourly_regime || "--");
       const neutralHourlyScale = fmtNum(risk.neutral_hourly_scale_ratio || 0, 2);
@@ -10791,6 +10947,7 @@ MONITOR_PAGE = """<!doctype html>
         isNeutralMode ? `计划多/空: ${fmtNum(risk.planned_buy_notional, 4)} / ${fmtNum(risk.planned_short_notional, 4)}` : (isOneWayShort ? `计划卖空: ${fmtNum(risk.planned_short_notional, 4)}` : `计划买单: ${fmtNum(risk.planned_buy_notional, 4)}`),
         isNeutralMode ? `多/空预算: ${fmtNum(risk.buy_budget_notional, 4)} / ${fmtNum(risk.short_budget_notional, 4)}` : (isOneWayShort ? `卖空预算: ${fmtNum(risk.short_budget_notional, 4)}` : `买单预算: ${fmtNum(risk.buy_budget_notional, 4)}`),
         `自适应状态: ${autoRegimeEnabled ? `${autoRegimeRegime} (${autoRegimePending})` : "关闭"}`,
+        `XAUT 三态: ${xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"}`,
         `中性小时缩放: ${neutralHourlyEnabled ? `${neutralHourlyRegime} x${neutralHourlyScale}` : "关闭"}`,
         `分层: ${risk.inventory_tier_active ? `${Math.round((risk.inventory_tier_ratio || 0) * 100)}%` : "未激活"}`,
         `分钟停买: ${risk.volatility_buy_pause ? "是" : "否"}`,
@@ -10902,6 +11059,10 @@ MONITOR_PAGE = """<!doctype html>
       const strategyMode = String(risk.strategy_mode || runnerCfg.strategy_mode || "one_way_long");
       const effectiveProfile = String(risk.effective_strategy_profile || runnerCfg.strategy_profile || "volume_long_v4");
       const effectiveProfileLabel = String(risk.effective_strategy_label || effectiveProfile || "--");
+      const xautAdaptiveEnabled = Boolean(risk.xaut_adaptive_enabled);
+      const xautAdaptiveState = String(risk.xaut_adaptive_state || "--");
+      const xautAdaptiveCandidateState = String(risk.xaut_adaptive_candidate_state || "--");
+      const xautAdaptivePending = fmtNum(risk.xaut_adaptive_pending_count || 0, 0);
       const isOneWayShort = strategyMode === "one_way_short";
       const isHedge = strategyMode === "hedge_neutral";
       const isSyntheticNeutral = strategyMode === "synthetic_neutral";
@@ -10968,6 +11129,8 @@ MONITOR_PAGE = """<!doctype html>
         ["最新1m振幅", fmtPct(risk.market_guard_amplitude_ratio || 0)],
         ["自适应状态", risk.auto_regime_enabled ? `${risk.auto_regime_regime || "--"} (${fmtNum(risk.auto_regime_pending_count || 0, 0)} / ${fmtNum(risk.auto_regime_confirm_cycles || 0, 0)})` : "关闭"],
         ["自适应原因", risk.auto_regime_reason || "--"],
+        ["XAUT 三态状态", xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"],
+        ["XAUT 三态原因", risk.xaut_adaptive_reason || "--"],
         ["中性目标带", (targetBands.offsets && targetBands.target_ratios) ? `${targetBands.offsets.map((v, i) => `${(Number(v) * 100).toFixed(1)}%:${Math.round(Number((targetBands.target_ratios || [])[i] || 0) * 100)}%`).join(' / ')}` : "--"],
         ["中性基础目标带", (targetBands.offsets && targetBands.base_target_ratios) ? `${targetBands.offsets.map((v, i) => `${(Number(v) * 100).toFixed(1)}%:${Math.round(Number((targetBands.base_target_ratios || [])[i] || 0) * 100)}%`).join(' / ')}` : "--"],
         ["当前目标净仓", fmtNum(targetBands.current_target_notional, 4)],
@@ -13064,7 +13227,14 @@ STRATEGIES_PAGE = """<!doctype html>
     function currentBehavior(snapshot) {
       const runnerCfg = ((snapshot.runner || {}).config || {});
       const risk = snapshot.risk_controls || {};
+      const strategyMode = String(risk.strategy_mode || runnerCfg.strategy_mode || "one_way_long");
       const parts = [];
+      if (risk.xaut_adaptive_enabled) {
+        parts.push(`XAUT 三态：${risk.xaut_adaptive_state || "--"}，候选 ${risk.xaut_adaptive_candidate_state || "--"}，原因 ${risk.xaut_adaptive_reason || "--"}`);
+        if (String(risk.xaut_adaptive_state || "") === "reduce_only") {
+          parts.push(strategyMode === "one_way_short" ? "已撤掉卖单，只保留买单回补减空仓。" : "已撤掉买单，只保留卖单减仓。");
+        }
+      }
       if (risk.auto_regime_enabled) {
         parts.push(`自适应状态：${risk.auto_regime_regime || "--"}，当前子策略 ${risk.effective_strategy_label || risk.effective_strategy_profile || "--"}`);
       }

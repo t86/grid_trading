@@ -59,6 +59,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("生成建议参数", MONITOR_PAGE)
         self.assertIn("data-alert-action", MONITOR_PAGE)
 
+    def test_monitor_page_contains_xaut_adaptive_status_text(self) -> None:
+        self.assertIn("XAUT 三态状态", MONITOR_PAGE)
+        self.assertIn("XAUT 三态原因", MONITOR_PAGE)
+
     def test_main_page_does_not_duplicate_symbol_element_declaration(self) -> None:
         needle = 'const symbolEl = document.getElementById("symbol");'
         self.assertEqual(HTML_PAGE.count(needle), 1)
@@ -107,6 +111,26 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["strategy_profile"], "adaptive_volatility_v1")
         self.assertTrue(payload["auto_regime_enabled"])
         self.assertEqual(payload["auto_regime_confirm_cycles"], 2)
+
+    def test_runner_preset_payload_applies_xaut_long_adaptive_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_long_adaptive_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_long_adaptive_v1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertEqual(payload["step_price"], 7.5)
+
+    def test_runner_preset_payload_applies_xaut_short_adaptive_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_short_adaptive_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_short_adaptive_v1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "one_way_short")
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertEqual(payload["step_price"], 7.5)
+
+    def test_runner_preset_payload_rejects_xaut_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _runner_preset_payload("xaut_long_adaptive_v1", {"symbol": "BTCUSDT"})
 
     def test_runner_preset_payload_keeps_user_overrides(self) -> None:
         payload = _runner_preset_payload(
@@ -313,6 +337,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["strategy_profile"], "adaptive_volatility_v1")
         self.assertTrue(config["auto_regime_enabled"])
         self.assertEqual(config["state_path"], "output/opnusdt_loop_state.json")
+
+    def test_resolve_runner_start_config_rejects_xaut_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_long_adaptive_v1"})
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")

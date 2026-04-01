@@ -1422,6 +1422,21 @@ def _build_monitor_snapshot_uncached(
     effective_strategy_label = str((plan_report or {}).get("effective_strategy_label") or "").strip()
     if not effective_strategy_label:
         effective_strategy_label = effective_strategy_profile
+    xaut_adaptive = (plan_report or {}).get("xaut_adaptive")
+    if not isinstance(xaut_adaptive, dict) or not xaut_adaptive:
+        xaut_adaptive = {}
+    xaut_adaptive_enabled = bool(xaut_adaptive) or bool(latest_loop.get("xaut_adaptive_enabled"))
+    xaut_adaptive_state = str(xaut_adaptive.get("active_state", "")).strip() or str(latest_loop.get("xaut_adaptive_state", "")).strip()
+    xaut_adaptive_candidate_state = (
+        str(xaut_adaptive.get("candidate_state", "")).strip()
+        or str(latest_loop.get("xaut_adaptive_candidate_state", "")).strip()
+    )
+    xaut_adaptive_pending_count = int(
+        xaut_adaptive.get("pending_count", 0)
+        or latest_loop.get("xaut_adaptive_pending_count", 0)
+        or 0
+    )
+    xaut_adaptive_reason = xaut_adaptive.get("reason") or latest_loop.get("xaut_adaptive_reason")
 
     custom_grid_roll = (plan_report or {}).get("custom_grid_roll")
     if not isinstance(custom_grid_roll, dict) or not custom_grid_roll:
@@ -1585,6 +1600,11 @@ def _build_monitor_snapshot_uncached(
         "auto_regime_confirm_cycles": auto_regime_confirm_cycles,
         "effective_strategy_profile": effective_strategy_profile,
         "effective_strategy_label": effective_strategy_label,
+        "xaut_adaptive_enabled": xaut_adaptive_enabled,
+        "xaut_adaptive_state": xaut_adaptive_state,
+        "xaut_adaptive_candidate_state": xaut_adaptive_candidate_state,
+        "xaut_adaptive_pending_count": xaut_adaptive_pending_count,
+        "xaut_adaptive_reason": xaut_adaptive_reason,
         "inventory_target_bands": (plan_report or {}).get("inventory_target_bands"),
         "neutral_hourly_scale": (plan_report or {}).get("neutral_hourly_scale"),
         "neutral_hourly_scale_enabled": bool(((plan_report or {}).get("neutral_hourly_scale") or {}).get("enabled")),
