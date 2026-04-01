@@ -101,6 +101,7 @@ from .maker_flatten_runner import (
     load_live_flatten_snapshot,
 )
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
+from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
     get_symbol_list,
@@ -333,6 +334,34 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "inventory_tier_base_position_notional": 90.0,
             "short_cover_pause_amp_trigger_ratio": 0.0045,
             "short_cover_pause_down_return_trigger_ratio": -0.002,
+        },
+    },
+    "xaut_volume_short_v1": {
+        "label": "XAUT 专用做空高换手",
+        "description": "面向 XAUTUSDT 的高换手空头预设。维持 1000 USDT 空仓上限，收紧动态步长到现价约 0.017%，优先把小时成交额顶到 1 万附近。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "step_price": 0.00002,
+            "buy_levels": 10,
+            "sell_levels": 10,
+            "per_order_notional": 100.0,
+            "base_position_notional": 240.0,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 3,
+            "shift_steps": 2,
+            "pause_short_position_notional": 850.0,
+            "max_short_position_notional": 1000.0,
+            "inventory_tier_start_notional": 650.0,
+            "inventory_tier_end_notional": 850.0,
+            "inventory_tier_buy_levels": 14,
+            "inventory_tier_sell_levels": 6,
+            "inventory_tier_per_order_notional": 100.0,
+            "inventory_tier_base_position_notional": 150.0,
+            "sleep_seconds": 5.0,
+            "autotune_symbol_enabled": True,
         },
     },
     "defensive_quasi_neutral_aggressive_v1": {
@@ -990,6 +1019,9 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
     if profile == "volatility_defensive_v1":
         step_ratio = 0.0008
         min_ticks = 4
+    elif profile == "xaut_volume_short_v1":
+        step_ratio = 0.00017
+        min_ticks = 2
     elif profile == "volume_neutral_target_v1":
         step_ratio = 0.0006
         min_ticks = 3
@@ -1058,8 +1090,13 @@ def _current_competition_symbols() -> list[str]:
 
 
 def _runner_preset_map(symbol: str | None = None) -> dict[str, dict[str, Any]]:
-    merged = dict(RUNNER_STRATEGY_PRESETS)
     requested_symbol = str(symbol or "").upper().strip()
+    merged: dict[str, dict[str, Any]] = {}
+    for key, item in RUNNER_STRATEGY_PRESETS.items():
+        preset_symbol = str(item.get("symbol", "")).upper().strip()
+        if requested_symbol and preset_symbol and preset_symbol != requested_symbol:
+            continue
+        merged[key] = item
     for key, item in _load_custom_runner_presets().items():
         preset_symbol = str(item.get("symbol", "")).upper().strip()
         if requested_symbol and preset_symbol and preset_symbol != requested_symbol:
@@ -3814,6 +3851,7 @@ HTML_PAGE = """<!doctype html>
         <div class="actions">
           <button id="run_btn" type="submit">开始测算</button>
           <button id="suggest_btn" type="button" class="optimize-only">智能建议 min/max</button>
+          <button id="short_candidate_btn" type="button" class="market-futures-only">空头刷量候选</button>
           <button id="csv_btn" type="button" disabled>下载当前买入计划 CSV</button>
           <span id="status" class="msg">等待输入参数。</span>
         </div>
@@ -4005,6 +4043,36 @@ HTML_PAGE = """<!doctype html>
       </div>
     </section>
 
+    <section class="card market-futures-only">
+      <h3>空头刷量候选</h3>
+      <p class="hint">基于当前交易对、时间窗、预算、手续费和资金费设定，自动生成 3 个纯空候选。点击“应用”会把候选参数回填到上方主表单，你可以继续修改后再点“开始测算”。</p>
+      <div id="short_candidate_summary" class="summary"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>候选</th>
+              <th>说明</th>
+              <th>区间</th>
+              <th>N / 模式</th>
+              <th>成交额倍数</th>
+              <th>净收益</th>
+              <th>收益率</th>
+              <th>最大回撤</th>
+              <th>成交数</th>
+              <th>资金费</th>
+              <th>手续费</th>
+              <th>平均占用</th>
+              <th>推荐目标</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="short_candidate_tbody"></tbody>
+        </table>
+      </div>
+      <p id="short_candidate_status" class="hint">等待生成。</p>
+    </section>
+
     <section class="card">
       <h3>当前方案（可在Top候选点击切换）</h3>
       <div id="summary" class="summary"></div>
@@ -4184,8 +4252,12 @@ HTML_PAGE = """<!doctype html>
     const statusEl = document.getElementById("status");
     const runBtn = document.getElementById("run_btn");
     const suggestBtn = document.getElementById("suggest_btn");
+    const shortCandidateBtn = document.getElementById("short_candidate_btn");
     const csvBtn = document.getElementById("csv_btn");
     const suggestStatusEl = document.getElementById("suggest_status");
+    const shortCandidateStatusEl = document.getElementById("short_candidate_status");
+    const shortCandidateSummaryEl = document.getElementById("short_candidate_summary");
+    const shortCandidateBody = document.getElementById("short_candidate_tbody");
     const rankRunBtn = document.getElementById("rank_run_btn");
     const rankAutoBtn = document.getElementById("rank_auto_btn");
     const rankStatusEl = document.getElementById("rank_status");
@@ -4258,6 +4330,8 @@ HTML_PAGE = """<!doctype html>
     let latestPlanRows = [];
     let latestTopCandidates = [];
     let latestRangeSuggestions = [];
+    let latestShortCandidates = [];
+    let latestShortCandidateContext = null;
     let latestCandleCount = 0;
     let latestExpectedCandleCount = 0;
     let latestCandleCoverage = null;
@@ -4268,7 +4342,9 @@ HTML_PAGE = """<!doctype html>
     let latestComparison = null;
     let latestFundingRows = [];
     let selectedTopIndex = 0;
+    let selectedShortCandidateIndex = -1;
     let currentPollToken = 0;
+    let currentShortCandidatePollToken = 0;
     let rankAutoTimer = null;
     let lastFuturesContractType = "usdm";
     let lastFuturesStrategyDirection = "long";
@@ -4305,6 +4381,15 @@ HTML_PAGE = """<!doctype html>
     function fmtNum(v, digits = 4) {
       if (v === null || v === undefined || Number.isNaN(v)) return "-";
       return Number(v).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     function fmtPct(v) {
@@ -4500,6 +4585,11 @@ HTML_PAGE = """<!doctype html>
       suggestStatusEl.className = isError ? "msg error" : "msg";
     }
 
+    function setShortCandidateStatus(text, isError = false) {
+      shortCandidateStatusEl.textContent = text;
+      shortCandidateStatusEl.className = isError ? "hint msg error" : "hint";
+    }
+
     function setLayerStatus(text, isError = false) {
       layerStatusEl.textContent = text;
       layerStatusEl.className = isError ? "msg error" : "msg";
@@ -4529,6 +4619,22 @@ HTML_PAGE = """<!doctype html>
       previewSummaryEl.innerHTML = "";
       previewBody.innerHTML = "";
       setPreviewStatus(message, false);
+    }
+
+    function clearShortCandidates(message = "等待生成。") {
+      latestShortCandidates = [];
+      latestShortCandidateContext = null;
+      selectedShortCandidateIndex = -1;
+      shortCandidateSummaryEl.innerHTML = "";
+      shortCandidateBody.innerHTML = "";
+      setShortCandidateStatus(message, false);
+    }
+
+    function setAllocationModeSelection(modes) {
+      const normalized = new Set((Array.isArray(modes) ? modes : []).map((item) => String(item || "").trim().toLowerCase()));
+      for (const checkbox of document.querySelectorAll('input[name="allocation_mode"]')) {
+        checkbox.checked = normalized.has(String(checkbox.value || "").trim().toLowerCase());
+      }
     }
 
     function capSecondIntervalRange(startInput, endInput, intervalValue) {
@@ -5673,6 +5779,96 @@ HTML_PAGE = """<!doctype html>
       `).join("");
     }
 
+    function renderShortCandidateSummary(report) {
+      const context = (report && report.context) || {};
+      const snapshot = (report && report.current_funding_snapshot) || null;
+      const items = [
+        ["窗口涨跌", fmtPct(context.window_return)],
+        ["当前 funding", snapshot ? fmtPct(snapshot.funding_rate) : "-"],
+        ["最近 funding 累计", fmtPct(context.funding_sum)],
+        ["参考收盘价", fmtNum(context.reference_price)],
+        ["区间低/高", `${fmtNum(context.window_low)} / ${fmtNum(context.window_high)}`],
+        ["预算", fmtMoney(context.budget, context.reference_price)],
+        ["K线数", context.candle_count ?? "-"],
+        ["资金费", context.include_funding ? "计入" : "忽略"],
+      ];
+      shortCandidateSummaryEl.innerHTML = items.map(([k, v]) => (
+        `<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`
+      )).join("");
+    }
+
+    function renderShortCandidates(rows, activeIndex = selectedShortCandidateIndex) {
+      latestShortCandidates = Array.isArray(rows) ? rows : [];
+      if (!latestShortCandidates.length) {
+        shortCandidateBody.innerHTML = '<tr><td colspan="14">当前没有可用候选，请调整时间窗、预算或手续费后重试。</td></tr>';
+        return;
+      }
+      shortCandidateBody.innerHTML = latestShortCandidates.map((item, idx) => {
+        const params = item.params || {};
+        const metrics = item.metrics || {};
+        const isActive = idx === activeIndex;
+        return `
+          <tr class="candidate-row ${isActive ? "active" : ""}">
+            <td>${escapeHtml(item.title || item.label || `候选${idx + 1}`)}</td>
+            <td>${escapeHtml(item.description || "-")}</td>
+            <td>
+              <div>${fmtNum(params.min_price)} - ${fmtNum(params.max_price)}</div>
+              <div class="value-sub">${fmtNum(params.min_offset_pct, 2)}% / +${fmtNum(params.max_offset_pct, 2)}%</div>
+            </td>
+            <td>${params.n || "-"} / ${escapeHtml(`${params.grid_level_mode || "-"} / ${params.allocation_mode || "-"}`)}</td>
+            <td>${fmtNum(metrics.turnover_multiple, 2)}x</td>
+            <td>${fmtMoney(metrics.net_profit, params.max_price)}</td>
+            <td>${fmtPct(metrics.total_return)}</td>
+            <td>${fmtPct(metrics.max_drawdown)}</td>
+            <td>${metrics.trade_count ?? "-"}</td>
+            <td>${fmtMoney(metrics.funding_pnl, params.max_price)}</td>
+            <td>${fmtMoney(metrics.total_fees, params.max_price)}</td>
+            <td>${fmtPct(metrics.avg_capital_usage)}</td>
+            <td>${escapeHtml(item.recommended_objective || "-")}</td>
+            <td><button type="button" data-short-candidate-idx="${idx}">应用</button></td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function applyShortCandidate(index) {
+      if (index < 0 || index >= latestShortCandidates.length) return;
+      const candidate = latestShortCandidates[index];
+      const patch = candidate.form_patch || {};
+      const data = (latestShortCandidateContext && latestShortCandidateContext.data) || {};
+      if (marketTypeEl.value !== "futures") {
+        marketTypeEl.value = "futures";
+        applyMarketTypeUI();
+      }
+      if (data.contract_type && contractTypeEl.value !== data.contract_type) {
+        contractTypeEl.value = data.contract_type;
+      }
+      if (data.symbol && symbolEl.querySelector(`option[value="${data.symbol}"]`)) {
+        symbolEl.value = data.symbol;
+      }
+      calcModeEl.value = String(patch.calc_mode || "optimize");
+      applyCalcModeUI();
+      strategyDirectionEl.value = String(patch.strategy_direction || "short");
+      gridLevelModeEl.value = String(patch.grid_level_mode || "arithmetic");
+      document.getElementById("min_price").value = String(Number(patch.min_price || 0));
+      document.getElementById("max_price").value = String(Number(patch.max_price || 0));
+      document.getElementById("n_min").value = String(Number(patch.n_min || 0));
+      document.getElementById("n_max").value = String(Number(patch.n_max || 0));
+      document.getElementById("objective").value = String(patch.objective || "competition_volume");
+      if (Number.isFinite(Number(data.total_buy_notional)) && Number(data.total_buy_notional) > 0) {
+        document.getElementById("total_buy_notional").value = String(Number(data.total_buy_notional));
+      }
+      if (includeFundingEl && data.include_funding !== undefined) {
+        includeFundingEl.value = data.include_funding ? "1" : "0";
+      }
+      setAllocationModeSelection(patch.allocation_modes || []);
+      selectedShortCandidateIndex = index;
+      renderShortCandidates(latestShortCandidates, selectedShortCandidateIndex);
+      setStatus(
+        `已应用空头候选：${candidate.title || candidate.label}。现在可以直接点“开始测算”，也可以先微调区间、N、分配模式后再回测。`
+      );
+    }
+
     function renderPlanOverview(selected, rows) {
       const planRows = Array.isArray(rows) ? rows : [];
       const totalQty = planRows.reduce((acc, row) => acc + Number(row.qty || 0), 0);
@@ -6106,11 +6302,26 @@ HTML_PAGE = """<!doctype html>
     calcModeEl.addEventListener("change", applyCalcModeUI);
     fixedBuyUnitEl.addEventListener("change", applyFixedBuyUnitUI);
     intervalEl.addEventListener("change", () => applyMainSecondIntervalLimit(true));
+    intervalEl.addEventListener("change", () => clearShortCandidates("参数已变更，请重新生成空头候选。"));
     startTimeEl.addEventListener("change", () => applyMainSecondIntervalLimit(true));
+    startTimeEl.addEventListener("change", () => clearShortCandidates("参数已变更，请重新生成空头候选。"));
     endTimeEl.addEventListener("change", () => applyMainSecondIntervalLimit(true));
+    endTimeEl.addEventListener("change", () => clearShortCandidates("参数已变更，请重新生成空头候选。"));
     rankIntervalEl.addEventListener("change", () => applyRankSecondIntervalLimit(true));
     rankStartTimeEl.addEventListener("change", () => applyRankSecondIntervalLimit(true));
     rankEndTimeEl.addEventListener("change", () => applyRankSecondIntervalLimit(true));
+    document.getElementById("total_buy_notional").addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
+    document.getElementById("fee_rate").addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
+    document.getElementById("slippage").addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
+    includeFundingEl.addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
     marketTypeEl.addEventListener("change", () => {
       stopRankAutoRefresh();
       applyMarketTypeUI();
@@ -6124,6 +6335,7 @@ HTML_PAGE = """<!doctype html>
       latestResultContractType = latestResultMarketType === "futures" ? String(contractTypeEl.value || "usdm") : "";
       latestResultSymbol = String(symbolEl.value || "").toUpperCase();
       selectedTopIndex = 0;
+      clearShortCandidates(getSelectedMarketType() === "spot" ? "现货模式不支持空头刷量候选。" : "等待生成。");
       latestCandleCount = 0;
       latestExpectedCandleCount = 0;
       latestCandleCoverage = null;
@@ -6137,10 +6349,12 @@ HTML_PAGE = """<!doctype html>
     });
     contractTypeEl.addEventListener("change", () => {
       clearGridPreview("交易对已切换，请重新生成当前网格预览。");
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
       loadSymbols(true);
     });
     symbolEl.addEventListener("change", () => {
       clearGridPreview("交易对已切换，请重新生成当前网格预览。");
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
     });
     previewBtn.addEventListener("click", runGridPreview);
     rankRunBtn.addEventListener("click", () => runMarketRanking(false));
@@ -6160,6 +6374,7 @@ HTML_PAGE = """<!doctype html>
     applyRankSecondIntervalLimit(false);
     loadSymbols();
     renderRangeSuggestions([]);
+    clearShortCandidates(getSelectedMarketType() === "spot" ? "现货模式不支持空头刷量候选。" : "等待生成。");
     clearFunding(getSelectedMarketType() === "spot" ? "现货模式无资金费。" : "等待测算结果。");
     clearGridPreview();
 
@@ -6229,15 +6444,90 @@ HTML_PAGE = """<!doctype html>
       });
     }
 
-    async function pollJob(jobId, token) {
-      while (token === currentPollToken) {
+    if (shortCandidateBtn) {
+      shortCandidateBody.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-short-candidate-idx]");
+        if (!btn) return;
+        const idx = Number(btn.dataset.shortCandidateIdx);
+        if (Number.isNaN(idx)) return;
+        applyShortCandidate(idx);
+      });
+
+      shortCandidateBtn.addEventListener("click", async () => {
+        const payload = readForm();
+        if (payload.market_type !== "futures") {
+          setShortCandidateStatus("空头刷量候选仅支持合约。", true);
+          return;
+        }
+        const rangeErr = validateSecondIntervalRange(
+          payload.start_time,
+          payload.end_time,
+          payload.interval,
+          "空头候选"
+        );
+        if (rangeErr) {
+          setShortCandidateStatus(rangeErr, true);
+          return;
+        }
+        currentShortCandidatePollToken += 1;
+        const token = currentShortCandidatePollToken;
+        shortCandidateBtn.disabled = true;
+        setShortCandidateStatus("正在提交空头候选任务...");
+        try {
+          const submitResp = await fetch("/api/short_volume_candidates", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const submitData = await submitResp.json();
+          if (!submitResp.ok || !submitData.ok) {
+            throw new Error(submitData.error || `请求失败(${submitResp.status})`);
+          }
+          setShortCandidateStatus(`任务已启动：${submitData.job_id.slice(0, 8)}...`);
+          const data = await pollBackgroundJob(
+            submitData.job_id,
+            token,
+            () => token === currentShortCandidatePollToken,
+            (job) => {
+              const pct = Math.max(0, Math.min(100, Number(job.progress || 0) * 100));
+              setShortCandidateStatus(`${job.message || "正在生成候选..."} · ${pct.toFixed(1)}%`);
+            }
+          );
+          latestShortCandidateContext = data;
+          selectedShortCandidateIndex = -1;
+          renderShortCandidateSummary(data);
+          renderShortCandidates(Array.isArray(data.candidates) ? data.candidates : [], selectedShortCandidateIndex);
+          const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+          if (!candidates.length) {
+            setShortCandidateStatus("未生成可用候选，请放宽时间窗或预算后重试。", true);
+            return;
+          }
+          const cacheLabel = data.data && data.data.cache_file ? ` 缓存：${data.data.cache_file}` : "";
+          const fundingLabel = data.current_funding_snapshot
+            ? ` 当前 funding=${fmtPct(data.current_funding_snapshot.funding_rate)}`
+            : "";
+          setShortCandidateStatus(`已生成 ${candidates.length} 个空头候选。点击“应用”即可回填主表单。${fundingLabel}${cacheLabel}`);
+        } catch (err) {
+          clearShortCandidates("等待生成。");
+          setShortCandidateStatus(`空头候选失败：${err.message}`, true);
+        } finally {
+          if (token === currentShortCandidatePollToken) {
+            shortCandidateBtn.disabled = false;
+          }
+        }
+      });
+    }
+
+    async function pollBackgroundJob(jobId, token, isStillCurrent, onProgress) {
+      while (isStillCurrent()) {
         const resp = await fetch(`/api/job/${jobId}`);
         const data = await resp.json();
         if (!resp.ok || !data.ok) {
           throw new Error(data.error || `任务查询失败(${resp.status})`);
         }
-
-        setProgress(data.progress, data.eta_seconds, data.message || "");
+        if (typeof onProgress === "function") {
+          onProgress(data);
+        }
 
         if (data.status === "done") {
           return data.result;
@@ -6248,6 +6538,15 @@ HTML_PAGE = """<!doctype html>
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
       throw new Error("任务已被新的测算请求替换");
+    }
+
+    async function pollJob(jobId, token) {
+      return pollBackgroundJob(
+        jobId,
+        token,
+        () => token === currentPollToken,
+        (data) => setProgress(data.progress, data.eta_seconds, data.message || "")
+      );
     }
 
     form.addEventListener("submit", async (e) => {
@@ -8929,6 +9228,35 @@ MONITOR_PAGE = """<!doctype html>
         },
       },
       {
+        key: "xaut_volume_short_v1",
+        label: "XAUT 专用做空高换手",
+        description: "面向 XAUTUSDT 的高换手空头预设。维持 1000 USDT 空仓上限，收紧动态步长到现价约 0.017%，优先把小时成交额顶到 1 万附近。",
+        startable: true,
+        kind: "one_way",
+        symbol: "XAUTUSDT",
+        config: {
+          strategy_mode: "one_way_short",
+          step_price: 0.00002,
+          buy_levels: 10,
+          sell_levels: 10,
+          per_order_notional: 100.0,
+          base_position_notional: 240.0,
+          up_trigger_steps: 2,
+          down_trigger_steps: 3,
+          shift_steps: 2,
+          pause_short_position_notional: 850.0,
+          max_short_position_notional: 1000.0,
+          inventory_tier_start_notional: 650.0,
+          inventory_tier_end_notional: 850.0,
+          inventory_tier_buy_levels: 14,
+          inventory_tier_sell_levels: 6,
+          inventory_tier_per_order_notional: 100.0,
+          inventory_tier_base_position_notional: 150.0,
+          sleep_seconds: 5.0,
+          autotune_symbol_enabled: true,
+        },
+      },
+      {
         key: "defensive_quasi_neutral_aggressive_v1",
         label: "准中性降损激进版",
         description: "基于 ROBO 最近实盘运行参数固化出的激进准中性版本。仍以做多为主，但提高卖侧卸仓能力、放宽总上限，适合趋势不明时保量控损。",
@@ -9576,6 +9904,12 @@ MONITOR_PAGE = """<!doctype html>
           "适合先试空或高波动震荡段，不适合把量推到极限。",
         ],
       },
+      xaut_volume_short_v1: {
+        summary: "XAUTUSDT 的专用空头高换手方案。仍然是 one_way_short，但把空仓上限钉在 1000 USDT，并把自动步长压到更紧的 0.017%。",
+        focus: [
+          "目标是把小时成交额拉到 1 万附近，所以更依赖 XAUT 自身短周期波动；如果行情突然变钝，量会明显回落。",
+        ],
+      },
       defensive_quasi_neutral_aggressive_v1: {
         summary: "名字叫准中性，但实现上仍然是 one_way_long。所谓“准中性”是通过少买、多卖、轻底仓来削弱方向偏置。",
         focus: [
@@ -9610,6 +9944,7 @@ MONITOR_PAGE = """<!doctype html>
     const AUTOTUNE_STEP_HINTS = {
       volume_long_v4: { stepRatio: 0.0004, minTicks: 2 },
       volatility_defensive_v1: { stepRatio: 0.0008, minTicks: 4 },
+      xaut_volume_short_v1: { stepRatio: 0.00017, minTicks: 2 },
       volume_neutral_target_v1: { stepRatio: 0.0006, minTicks: 3 },
       neutral_hedge_v1: { stepRatio: 0.0005, minTicks: 3 },
       synthetic_neutral_v1: { stepRatio: 0.0005, minTicks: 3 },
@@ -10071,9 +10406,13 @@ MONITOR_PAGE = """<!doctype html>
     }
 
     function populatePresetOptions(data) {
-      const presets = ((data && data.runner_presets) && data.runner_presets.length)
+      const selectedSymbol = String(getSelectedSymbol() || "").trim().toUpperCase();
+      const presets = (((data && data.runner_presets) && data.runner_presets.length)
         ? data.runner_presets
-        : LOCAL_STRATEGY_PRESETS;
+        : LOCAL_STRATEGY_PRESETS).filter((item) => {
+          const presetSymbol = String((item && item.symbol) || "").trim().toUpperCase();
+          return !selectedSymbol || !presetSymbol || presetSymbol === selectedSymbol;
+        });
       runnerPresets = presets;
       const currentProfile = String((((data || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
       const existingValue = strategyPresetEl.value || currentProfile;
@@ -15267,7 +15606,7 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _create_job(params: dict[str, Any]) -> str:
+def _create_job(params: dict[str, Any], job_kind: str = "optimize") -> str:
     job_id = uuid.uuid4().hex
     now = time.time()
     with JOBS_LOCK:
@@ -15282,6 +15621,7 @@ def _create_job(params: dict[str, Any]) -> str:
 
         JOBS[job_id] = {
             "job_id": job_id,
+            "job_kind": job_kind,
             "status": "queued",
             "created_at": now,
             "updated_at": now,
@@ -15494,6 +15834,101 @@ def _normalize_suggest_payload(payload: dict[str, Any]) -> dict[str, Any]:
     params["allocation_modes"] = _ordered_suggestion_modes(params["allocation_modes"])
     params["top_k"] = min(10, max(1, params["top_k"]))
     return params
+
+
+def _normalize_short_volume_candidates_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    market_type = normalize_market_type(payload.get("market_type", "futures"))
+    if market_type != "futures":
+        raise ValueError("short_volume_candidates only supports futures")
+    contract_type = normalize_contract_type(payload.get("contract_type", "usdm"))
+    symbol = str(payload.get("symbol", "BTCUSDT")).upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    start_time = _safe_datetime(payload.get("start_time"), "start_time")
+    end_time = _safe_datetime(payload.get("end_time"), "end_time")
+    interval = str(payload.get("interval", "1m")).strip()
+    total_buy_notional = _safe_float(
+        payload.get("total_buy_notional", payload.get("max_buy_notional", 0)),
+        "total_buy_notional",
+    )
+    include_funding = _safe_bool(payload.get("include_funding", True), "include_funding")
+    fee_rate = _safe_float(payload.get("fee_rate", 0.0002), "fee_rate")
+    slippage = _safe_float(payload.get("slippage", 0.0), "slippage")
+    refresh = bool(payload.get("refresh", False))
+
+    if start_time >= end_time:
+        raise ValueError("start_time must be earlier than end_time")
+    _enforce_seconds_interval_limit(start_time, end_time, interval)
+    if total_buy_notional <= 0:
+        raise ValueError("total_buy_notional must be > 0")
+    if fee_rate < 0 or slippage < 0:
+        raise ValueError("fee_rate/slippage must be >= 0")
+    _validate_market_symbol(symbol=symbol, market_type=market_type, contract_type=contract_type)
+
+    return {
+        "market_type": market_type,
+        "contract_type": contract_type,
+        "symbol": symbol,
+        "start_time": start_time,
+        "end_time": end_time,
+        "interval": interval,
+        "total_buy_notional": total_buy_notional,
+        "include_funding": include_funding,
+        "fee_rate": fee_rate,
+        "slippage": slippage,
+        "refresh": refresh,
+    }
+
+
+def _run_short_volume_candidates(
+    params: dict[str, Any],
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    cache_path = str(
+        cache_file_path(
+            params["symbol"],
+            params["interval"],
+            cache_dir="data",
+            contract_type=params["contract_type"],
+            market_type=params["market_type"],
+        )
+    )
+    funding_cache_path = str(
+        funding_cache_file_path(
+            params["symbol"],
+            cache_dir="data",
+            contract_type=params["contract_type"],
+            market_type=params["market_type"],
+        )
+    )
+    report = build_short_volume_candidate_report(
+        symbol=params["symbol"],
+        start_time=params["start_time"],
+        end_time=params["end_time"],
+        interval=params["interval"],
+        total_buy_notional=params["total_buy_notional"],
+        contract_type=params["contract_type"],
+        cache_dir="data",
+        include_funding=params["include_funding"],
+        fee_rate=params["fee_rate"],
+        slippage=params["slippage"],
+        refresh=params["refresh"],
+        progress_callback=progress_callback,
+    )
+    report["ok"] = True
+    report["data"] = {
+        "market_type": params["market_type"],
+        "contract_type": params["contract_type"],
+        "symbol": params["symbol"],
+        "interval": params["interval"],
+        "start_time": params["start_time"].isoformat(),
+        "end_time": params["end_time"].isoformat(),
+        "total_buy_notional": params["total_buy_notional"],
+        "include_funding": params["include_funding"],
+        "cache_file": cache_path,
+        "funding_cache_file": funding_cache_path if params["include_funding"] else None,
+    }
+    return report
 
 
 def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
@@ -16005,6 +16440,7 @@ def _run_job_worker(job_id: str) -> None:
     if not snapshot:
         return
     params = snapshot["params"]
+    job_kind = str(snapshot.get("job_kind", "optimize")).strip().lower()
     start_ts = time.time()
     backtest_start_ts = start_ts
 
@@ -16029,12 +16465,22 @@ def _run_job_worker(job_id: str) -> None:
             eta_seconds = int(elapsed * (1.0 - ratio) / ratio)
 
         progress_value = 0.15 + 0.8 * ratio
-        message = f"回测中 {processed}/{total}"
-        if n is not None:
-            message += f" (N={n}"
-            if mode:
-                message += f", mode={mode}"
-            message += ")"
+        message = str(event.get("message", "")).strip()
+        if not message:
+            if job_kind == "short_volume_candidates":
+                message = f"生成候选中 {processed}/{total}"
+                if n is not None:
+                    message += f" (N={n}"
+                    if mode:
+                        message += f", mode={mode}"
+                    message += ")"
+            else:
+                message = f"回测中 {processed}/{total}"
+                if n is not None:
+                    message += f" (N={n}"
+                    if mode:
+                        message += f", mode={mode}"
+                    message += ")"
 
         _update_job(
             job_id,
@@ -16047,18 +16493,31 @@ def _run_job_worker(job_id: str) -> None:
         )
 
     try:
-        load_message = "加载K线和资金费率数据..." if params.get("include_funding") else "加载K线数据..."
+        if job_kind == "short_volume_candidates":
+            load_message = "加载K线并生成空头刷量候选..."
+        else:
+            load_message = "加载K线和资金费率数据..." if params.get("include_funding") else "加载K线数据..."
         _update_job(job_id, status="running", progress=0.05, message=load_message)
-        result = _run_optimizer(params, progress_callback=_progress)
+        if job_kind == "short_volume_candidates":
+            result = _run_short_volume_candidates(params, progress_callback=_progress)
+        else:
+            result = _run_optimizer(params, progress_callback=_progress)
+        search_info = result.get("search", {})
+        processed = int(search_info.get("tested", 0) or 0)
+        total = int(search_info.get("total", processed) or processed)
         total_elapsed = int(time.time() - start_ts)
         _update_job(
             job_id,
             status="done",
             progress=1.0,
-            processed=result.get("search", {}).get("tested", 0),
-            total=result.get("search", {}).get("tested", 0),
+            processed=processed,
+            total=total,
             eta_seconds=0,
-            message=f"测算完成，用时 {total_elapsed}s",
+            message=(
+                f"候选生成完成，用时 {total_elapsed}s"
+                if job_kind == "short_volume_candidates"
+                else f"测算完成，用时 {total_elapsed}s"
+            ),
             result=result,
             error=None,
         )
@@ -16668,6 +17127,7 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path not in {
             "/api/optimize",
+            "/api/short_volume_candidates",
             "/api/grid_preview",
             "/api/runner/presets/create_grid",
             "/api/runner/presets/update_grid",
@@ -16707,7 +17167,19 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
-            job_id = _create_job(params)
+            job_id = _create_job(params, job_kind="optimize")
+            worker = threading.Thread(target=_run_job_worker, args=(job_id,), daemon=True)
+            worker.start()
+            self._send_json({"ok": True, "job_id": job_id}, status=202)
+            return
+
+        if path == "/api/short_volume_candidates":
+            try:
+                params = _normalize_short_volume_candidates_payload(payload)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            job_id = _create_job(params, job_kind="short_volume_candidates")
             worker = threading.Thread(target=_run_job_worker, args=(job_id,), daemon=True)
             worker.start()
             self._send_json({"ok": True, "job_id": job_id}, status=202)

@@ -180,6 +180,22 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["neutral_band2_target_ratio"], 0.50)
         self.assertAlmostEqual(payload["neutral_band3_target_ratio"], 1.00)
 
+    def test_runner_preset_payload_applies_xaut_short_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_volume_short_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_volume_short_v1")
+        self.assertEqual(payload["strategy_mode"], "one_way_short")
+        self.assertEqual(payload["buy_levels"], 10)
+        self.assertEqual(payload["sell_levels"], 10)
+        self.assertEqual(payload["per_order_notional"], 100.0)
+        self.assertEqual(payload["base_position_notional"], 240.0)
+        self.assertEqual(payload["pause_short_position_notional"], 850.0)
+        self.assertEqual(payload["max_short_position_notional"], 1000.0)
+        self.assertTrue(payload["autotune_symbol_enabled"])
+
+    def test_runner_preset_payload_rejects_xaut_short_profile_for_other_symbol(self) -> None:
+        with self.assertRaises(ValueError):
+            _runner_preset_payload("xaut_volume_short_v1", {"symbol": "OPNUSDT"})
+
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
         custom_path = Path("output/test_custom_runner_presets.json")
@@ -313,6 +329,23 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["max_short_position_notional"], 900.0)
         self.assertEqual(config["max_total_notional"], 1800.0)
         self.assertTrue(config["neutral_hourly_scale_enabled"])
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_xaut_profile_with_tight_step(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "4669.00", "ask_price": "4669.02"}]
+        config = _resolve_runner_start_config({"symbol": "XAUTUSDT", "strategy_profile": "xaut_volume_short_v1"})
+        self.assertEqual(config["strategy_profile"], "xaut_volume_short_v1")
+        self.assertEqual(config["strategy_mode"], "one_way_short")
+        self.assertEqual(config["state_path"], "output/xautusdt_loop_state.json")
+        self.assertAlmostEqual(config["step_price"], 0.80)
+        self.assertEqual(config["max_short_position_notional"], 1000.0)
 
     def test_default_runtime_paths_are_symbol_specific(self) -> None:
         paths = _default_runtime_paths_for_symbol("ENSOUSDT")
@@ -592,6 +625,12 @@ class WebSecurityTests(unittest.TestCase):
             self.assertIn("custom_grid_opn", opn_keys)
         finally:
             custom_path.unlink(missing_ok=True)
+
+    def test_runner_preset_summaries_filter_builtin_symbol_bound_presets(self) -> None:
+        xaut_keys = {item["key"] for item in _runner_preset_summaries("XAUTUSDT")}
+        opn_keys = {item["key"] for item in _runner_preset_summaries("OPNUSDT")}
+        self.assertIn("xaut_volume_short_v1", xaut_keys)
+        self.assertNotIn("xaut_volume_short_v1", opn_keys)
 
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_summaries_include_custom_grid_edit_metadata(self) -> None:
