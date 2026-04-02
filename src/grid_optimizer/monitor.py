@@ -250,6 +250,8 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--inventory-tier-per-order-notional",
             "--inventory-tier-base-position-notional",
             "--max-total-notional",
+            "--rolling-hourly-loss-limit",
+            "--max-cumulative-notional",
             "--max-mid-drift-steps",
             "--sleep-seconds",
         }:
@@ -273,7 +275,17 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
                 pass
             i += 2
             continue
-        if token in {"--symbol", "--strategy-mode", "--margin-type", "--state-path", "--plan-json", "--submit-report-json", "--summary-jsonl"}:
+        if token in {
+            "--symbol",
+            "--strategy-mode",
+            "--margin-type",
+            "--state-path",
+            "--plan-json",
+            "--submit-report-json",
+            "--summary-jsonl",
+            "--run-start-time",
+            "--run-end-time",
+        }:
             config[key] = next_token
             i += 2
             continue
@@ -1684,6 +1696,17 @@ def _build_monitor_snapshot_uncached(
         "effective_sell_levels": int((plan_report or {}).get("effective_sell_levels", 0) or 0),
         "effective_per_order_notional": _safe_float((plan_report or {}).get("effective_per_order_notional")),
         "effective_base_position_notional": _safe_float((plan_report or {}).get("effective_base_position_notional")),
+        "runtime_status": str(latest_loop.get("runtime_status", "") or "running"),
+        "stop_triggered": bool(latest_loop.get("stop_triggered")),
+        "stop_reason": latest_loop.get("stop_reason"),
+        "stop_reasons": list(latest_loop.get("stop_reasons") or []),
+        "stop_triggered_at": latest_loop.get("stop_triggered_at"),
+        "run_start_time": runner_config.get("run_start_time"),
+        "run_end_time": runner_config.get("run_end_time"),
+        "rolling_hourly_loss": _safe_float(latest_loop.get("rolling_hourly_loss")),
+        "rolling_hourly_loss_limit": _safe_float(runner_config.get("rolling_hourly_loss_limit")),
+        "cumulative_gross_notional": _safe_float(latest_loop.get("cumulative_gross_notional")),
+        "max_cumulative_notional": _safe_float(runner_config.get("max_cumulative_notional")),
         "custom_grid_runtime_min_price": custom_grid_runtime_min_price,
         "custom_grid_runtime_max_price": custom_grid_runtime_max_price,
         "custom_grid_roll_enabled": custom_grid_roll_enabled,

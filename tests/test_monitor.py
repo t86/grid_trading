@@ -286,6 +286,7 @@ class MonitorTests(unittest.TestCase):
     @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))
     @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
     @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
     @patch(
         "grid_optimizer.monitor.fetch_futures_account_info_v3",
         return_value={
@@ -316,6 +317,7 @@ class MonitorTests(unittest.TestCase):
         _mock_credentials,
         _mock_klines,
         _mock_account,
+        _mock_competition,
         _mock_position_mode,
         _mock_open_orders,
         _mock_trade_rows,

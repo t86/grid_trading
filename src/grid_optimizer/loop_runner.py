@@ -4,6 +4,9 @@ import argparse
 import bisect
 import json
 import math
+import os
+import subprocess
+import sys
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -21,6 +24,7 @@ from .audit import (
     income_row_key,
     income_row_time_ms,
     read_json,
+    read_jsonl,
     scan_iso_bounds,
     trade_row_key,
     trade_row_time_ms,
@@ -44,6 +48,12 @@ from .data import (
     post_futures_order,
 )
 from .live_check import extract_symbol_position
+from .maker_flatten_runner import (
+    flatten_client_order_prefix,
+    is_flatten_order,
+    load_live_flatten_snapshot,
+)
+from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config
 from .semi_auto_plan import (
     STATE_VERSION,
     _isoformat,
@@ -1129,6 +1139,318 @@ def _sync_account_audit(
         "income_audit_path": str(audit_paths["income_audit"]),
         "audit_state_path": str(audit_state_path),
     }
+
+
+def _strategy_client_order_prefix(symbol: str) -> str:
+    return f"gx-{symbol.lower().replace('usdt', 'u')}-"
+
+
+def _flatten_pid_path(symbol: str) -> Path:
+    slug = "".join(ch if ch.isalnum() else "_" for ch in str(symbol or "").strip().lower()).strip("_") or "symbol"
+    return Path(f"output/{slug}_maker_flatten.pid")
+
+
+def _flatten_log_path(symbol: str) -> Path:
+    slug = "".join(ch if ch.isalnum() else "_" for ch in str(symbol or "").strip().lower()).strip("_") or "symbol"
+    return Path(f"output/{slug}_maker_flatten.log")
+
+
+def _flatten_events_path(symbol: str) -> Path:
+    slug = "".join(ch if ch.isalnum() else "_" for ch in str(symbol or "").strip().lower()).strip("_") or "symbol"
+    return Path(f"output/{slug}_maker_flatten_events.jsonl")
+
+
+def _pid_is_running(pid_path: Path) -> bool:
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid_path.unlink(missing_ok=True)
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        pid_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _start_futures_flatten_process(symbol: str) -> dict[str, Any]:
+    pid_path = _flatten_pid_path(symbol)
+    if _pid_is_running(pid_path):
+        return {"started": False, "already_running": True}
+    log_path = _flatten_log_path(symbol)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    src_path = str((Path.cwd() / "src").resolve())
+    current_pythonpath = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = src_path if not current_pythonpath else f"{src_path}{os.pathsep}{current_pythonpath}"
+    command = [
+        sys.executable,
+        "-m",
+        "grid_optimizer.maker_flatten_runner",
+        "--symbol",
+        str(symbol),
+        "--client-order-prefix",
+        flatten_client_order_prefix(symbol),
+        "--sleep-seconds",
+        "2.0",
+        "--recv-window",
+        "5000",
+        "--max-consecutive-errors",
+        "20",
+        "--events-jsonl",
+        str(_flatten_events_path(symbol)),
+    ]
+    with log_path.open("ab") as log_file:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(Path.cwd()),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    return {"started": True, "already_running": False, "pid": proc.pid}
+
+
+def _load_futures_runtime_guard_inputs(summary_path: Path) -> tuple[float, list[dict[str, Any]]]:
+    audit_paths = build_audit_paths(summary_path)
+    trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
+    income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
+    cumulative_gross_notional = 0.0
+    pnl_events: list[dict[str, Any]] = []
+    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    for row in trade_rows:
+        price = _safe_float(row.get("price"))
+        qty = abs(_safe_float(row.get("qty")))
+        cumulative_gross_notional += price * qty
+        trade_time_ms = trade_row_time_ms(row)
+        if trade_time_ms <= 0:
+            continue
+        realized_pnl = _safe_float(row.get("realizedPnl"))
+        commission = _safe_float(row.get("commission"))
+        commission_asset = str(row.get("commissionAsset", "")).upper().strip()
+        net_pnl = realized_pnl - (commission if commission_asset in stable_assets else 0.0)
+        pnl_events.append(
+            {
+                "ts": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "net_pnl": net_pnl,
+            }
+        )
+    for row in income_rows:
+        income_time_ms = income_row_time_ms(row)
+        if income_time_ms <= 0:
+            continue
+        pnl_events.append(
+            {
+                "ts": datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "net_pnl": _safe_float(row.get("income")),
+            }
+        )
+    return cumulative_gross_notional, pnl_events
+
+
+def _cancel_futures_strategy_orders(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+) -> int:
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    flatten_prefix = flatten_client_order_prefix(symbol)
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
+    count = 0
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        client_order_id = str(order.get("clientOrderId", "") or "")
+        if not client_order_id.startswith(strategy_prefix) or is_flatten_order(order, flatten_prefix):
+            continue
+        delete_futures_order(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
+            orig_client_order_id=client_order_id or None,
+            recv_window=recv_window,
+        )
+        count += 1
+    return count
+
+
+def _maybe_handle_runtime_guard(
+    *,
+    args: argparse.Namespace,
+    cycle: int,
+    cycle_started_at: datetime,
+    summary_path: Path,
+) -> dict[str, Any] | None:
+    runtime_guard_config = normalize_runtime_guard_config(vars(args))
+    if not any(
+        (
+            runtime_guard_config.run_start_time,
+            runtime_guard_config.run_end_time,
+            runtime_guard_config.rolling_hourly_loss_limit,
+            runtime_guard_config.max_cumulative_notional,
+        )
+    ):
+        return None
+    cumulative_gross_notional, pnl_events = _load_futures_runtime_guard_inputs(summary_path)
+    runtime_guard_result = evaluate_runtime_guards(
+        config=runtime_guard_config,
+        now=cycle_started_at,
+        cumulative_gross_notional=cumulative_gross_notional,
+        pnl_events=pnl_events,
+    )
+    if runtime_guard_result.tradable:
+        return None
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
+    api_key, api_secret = credentials
+    canceled_count = _cancel_futures_strategy_orders(
+        symbol=args.symbol.upper().strip(),
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+    )
+    flatten_result = {"started": False, "already_running": False}
+    flatten_snapshot = load_live_flatten_snapshot(args.symbol.upper().strip(), api_key, api_secret)
+    if list(flatten_snapshot.get("orders", [])):
+        flatten_result = _start_futures_flatten_process(args.symbol.upper().strip())
+    summary = {
+        "ts": cycle_started_at.isoformat(),
+        "cycle": cycle,
+        "symbol": args.symbol.upper().strip(),
+        "strategy_profile": str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)),
+        "effective_strategy_profile": str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)),
+        "strategy_mode": str(getattr(args, "strategy_mode", "one_way_long")),
+        "mid_price": _safe_float(flatten_snapshot.get("bid_price"))
+        and (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
+        or 0.0,
+        "center_price": 0.0,
+        "current_long_qty": _safe_float(flatten_snapshot.get("long_qty")),
+        "current_long_notional": _safe_float(flatten_snapshot.get("long_qty"))
+        * (
+            (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
+            if (_safe_float(flatten_snapshot.get("bid_price")) > 0 and _safe_float(flatten_snapshot.get("ask_price")) > 0)
+            else 0.0
+        ),
+        "current_short_qty": _safe_float(flatten_snapshot.get("short_qty")),
+        "current_short_notional": _safe_float(flatten_snapshot.get("short_qty"))
+        * (
+            (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
+            if (_safe_float(flatten_snapshot.get("bid_price")) > 0 and _safe_float(flatten_snapshot.get("ask_price")) > 0)
+            else 0.0
+        ),
+        "actual_net_qty": _safe_float(flatten_snapshot.get("net_qty")),
+        "actual_net_notional": _safe_float(flatten_snapshot.get("net_qty"))
+        * (
+            (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
+            if (_safe_float(flatten_snapshot.get("bid_price")) > 0 and _safe_float(flatten_snapshot.get("ask_price")) > 0)
+            else 0.0
+        ),
+        "synthetic_net_qty": 0.0,
+        "synthetic_drift_qty": 0.0,
+        "synthetic_unmatched_trade_count": 0,
+        "open_order_count": 0,
+        "kept_order_count": 0,
+        "missing_order_count": 0,
+        "stale_order_count": 0,
+        "placed_count": 0,
+        "canceled_count": canceled_count,
+        "buy_paused": False,
+        "pause_reasons": [],
+        "buy_cap_applied": False,
+        "buy_budget_notional": 0.0,
+        "planned_buy_notional": 0.0,
+        "max_position_notional": 0.0,
+        "short_cap_applied": False,
+        "short_budget_notional": 0.0,
+        "planned_short_notional": 0.0,
+        "max_short_position_notional": 0.0,
+        "inventory_tier_active": False,
+        "inventory_tier_ratio": 0.0,
+        "volatility_buy_pause": False,
+        "shift_frozen": False,
+        "market_guard_return_ratio": 0.0,
+        "market_guard_amplitude_ratio": 0.0,
+        "auto_regime_enabled": bool(getattr(args, "auto_regime_enabled", False)),
+        "auto_regime_regime": "",
+        "auto_regime_reason": None,
+        "auto_regime_pending_count": 0,
+        "auto_regime_confirm_cycles": 0,
+        "auto_regime_switched": False,
+        "neutral_hourly_scale_enabled": False,
+        "neutral_hourly_scale_ratio": 0.0,
+        "neutral_hourly_regime": "",
+        "neutral_hourly_reason": None,
+        "neutral_hourly_bucket": None,
+        "effective_buy_levels": 0,
+        "effective_sell_levels": 0,
+        "effective_per_order_notional": 0.0,
+        "effective_base_position_notional": 0.0,
+        "custom_grid_runtime_min_price": 0.0,
+        "custom_grid_runtime_max_price": 0.0,
+        "custom_grid_roll_enabled": False,
+        "custom_grid_roll_checked": False,
+        "custom_grid_roll_triggered": False,
+        "custom_grid_roll_reason": None,
+        "custom_grid_roll_interval_minutes": 0,
+        "custom_grid_roll_trade_threshold": 0,
+        "custom_grid_roll_upper_distance_ratio": 0.0,
+        "custom_grid_roll_shift_levels": 0,
+        "custom_grid_roll_current_trade_count": 0,
+        "custom_grid_roll_trade_baseline": 0,
+        "custom_grid_roll_trades_since_last_roll": 0,
+        "custom_grid_roll_levels_above_current": 0,
+        "custom_grid_roll_required_levels_above": 0,
+        "custom_grid_roll_last_check_bucket": None,
+        "custom_grid_roll_last_applied_at": None,
+        "custom_grid_roll_last_applied_price": 0.0,
+        "custom_grid_roll_old_min_price": 0.0,
+        "custom_grid_roll_old_max_price": 0.0,
+        "custom_grid_roll_new_min_price": 0.0,
+        "custom_grid_roll_new_max_price": 0.0,
+        "custom_grid_roll_last_old_min_price": 0.0,
+        "custom_grid_roll_last_old_max_price": 0.0,
+        "custom_grid_roll_last_new_min_price": 0.0,
+        "custom_grid_roll_last_new_max_price": 0.0,
+        "fixed_center_roll": {},
+        "shift_moves": [],
+        "reconcile": {},
+        "reconcile_checked": False,
+        "reconcile_ok": None,
+        "reconcile_message": None,
+        "reconcile_interval_cycles": 0,
+        "reconcile_expected_open_order_count": 0,
+        "reconcile_actual_open_order_count": 0,
+        "reconcile_expected_actual_net_qty": 0.0,
+        "reconcile_actual_actual_net_qty": 0.0,
+        "executed": False,
+        "trade_audit_appended": 0,
+        "income_audit_appended": 0,
+        "audit_error": None,
+        "error_message": None,
+        "runtime_status": runtime_guard_result.runtime_status,
+        "stop_triggered": runtime_guard_result.stop_triggered,
+        "stop_reason": runtime_guard_result.primary_reason,
+        "stop_reasons": runtime_guard_result.matched_reasons,
+        "stop_triggered_at": runtime_guard_result.triggered_at,
+        "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
+        "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
+        "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+        "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+        "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
+        "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+        "flatten_started": bool(flatten_result.get("started")),
+        "flatten_already_running": bool(flatten_result.get("already_running")),
+    }
+    return summary
 
 
 def apply_position_controls(
@@ -3444,6 +3766,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--plan-json", type=str, default="output/night_loop_latest_plan.json")
     parser.add_argument("--submit-report-json", type=str, default="output/night_loop_latest_submit.json")
     parser.add_argument("--summary-jsonl", type=str, default="output/night_loop_events.jsonl")
+    parser.add_argument("--run-start-time", type=str, default=None)
+    parser.add_argument("--run-end-time", type=str, default=None)
+    parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
+    parser.add_argument("--max-cumulative-notional", type=float, default=None)
     parser.add_argument("--reset-state", action="store_true")
     return parser
 
@@ -3464,6 +3790,15 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         print(f"  error: {summary['error_message']}")
     if summary.get("pause_reasons"):
         print(f"  pause: {'; '.join(summary['pause_reasons'])}")
+    if summary.get("runtime_status") and summary.get("runtime_status") != "running":
+        print(
+            "  runtime_guard: "
+            f"status={summary.get('runtime_status')} "
+            f"rolling_loss={_float(summary.get('rolling_hourly_loss', 0.0))} "
+            f"gross={_float(summary.get('cumulative_gross_notional', 0.0))}"
+        )
+    if summary.get("stop_reason"):
+        print(f"  stop_reason: {summary['stop_reason']}")
     if summary.get("volatility_buy_pause") or summary.get("short_cover_paused") or summary.get("shift_frozen"):
         print(
             "  market_guard: "
@@ -3683,6 +4018,7 @@ def main() -> None:
         raise SystemExit("--custom-grid-roll-upper-distance-ratio must be between 0 and 1")
     if args.custom_grid_roll_shift_levels <= 0:
         raise SystemExit("--custom-grid-roll-shift-levels must be > 0")
+    normalize_runtime_guard_config(vars(args))
 
     plan_path = Path(args.plan_json)
     submit_report_path = Path(args.submit_report_json)
@@ -3695,6 +4031,24 @@ def main() -> None:
         cycle += 1
         cycle_started_at = datetime.now(timezone.utc)
         try:
+            runtime_guard_summary = _maybe_handle_runtime_guard(
+                args=args,
+                cycle=cycle,
+                cycle_started_at=cycle_started_at,
+                summary_path=summary_path,
+            )
+            if runtime_guard_summary is not None:
+                _append_jsonl(summary_path, runtime_guard_summary)
+                _print_cycle_summary(runtime_guard_summary)
+                consecutive_errors = 0
+                if runtime_guard_summary.get("stop_triggered"):
+                    break
+                if args.reset_state:
+                    args.reset_state = False
+                if args.iterations and cycle >= args.iterations:
+                    break
+                time.sleep(args.sleep_seconds)
+                continue
             plan_report = generate_plan_report(args)
             _write_json(plan_path, plan_report)
             _append_jsonl(
@@ -3780,6 +4134,14 @@ def main() -> None:
                 )
             state["last_reconcile"] = reconcile_snapshot
             _write_json(state_path, state)
+            runtime_guard_config = normalize_runtime_guard_config(vars(args))
+            runtime_cumulative_gross_notional, runtime_pnl_events = _load_futures_runtime_guard_inputs(summary_path)
+            runtime_guard_result = evaluate_runtime_guards(
+                config=runtime_guard_config,
+                now=cycle_started_at,
+                cumulative_gross_notional=runtime_cumulative_gross_notional,
+                pnl_events=runtime_pnl_events,
+            )
 
             summary = {
                 "ts": cycle_started_at.isoformat(),
@@ -3889,6 +4251,17 @@ def main() -> None:
                 "income_audit_appended": int(audit_sync.get("income_appended", 0) or 0),
                 "audit_error": audit_sync.get("error"),
                 "error_message": None,
+                "runtime_status": runtime_guard_result.runtime_status,
+                "stop_triggered": runtime_guard_result.stop_triggered,
+                "stop_reason": runtime_guard_result.primary_reason,
+                "stop_reasons": runtime_guard_result.matched_reasons,
+                "stop_triggered_at": runtime_guard_result.triggered_at,
+                "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
+                "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
+                "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+                "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
+                "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
             }
             _append_jsonl(summary_path, summary)
             _print_cycle_summary(summary)

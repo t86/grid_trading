@@ -592,6 +592,64 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--short-cover-pause-amp-trigger-ratio", command)
         self.assertIn("--short-cover-pause-down-return-trigger-ratio", command)
 
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config(
+            {
+                "symbol": "ENSOUSDT",
+                "strategy_profile": "defensive_quasi_neutral_v1",
+                "run_start_time": "2026-03-31T01:00:00+00:00",
+                "run_end_time": "2026-03-31T03:00:00+00:00",
+                "rolling_hourly_loss_limit": 150.0,
+                "max_cumulative_notional": 100000.0,
+            }
+        )
+        self.assertEqual(config["run_start_time"], "2026-03-31T01:00:00+00:00")
+        self.assertEqual(config["run_end_time"], "2026-03-31T03:00:00+00:00")
+        self.assertEqual(config["rolling_hourly_loss_limit"], 150.0)
+        self.assertEqual(config["max_cumulative_notional"], 100000.0)
+
+    def test_build_runner_command_includes_runtime_guard_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "ENSOUSDT",
+                "strategy_profile": "defensive_quasi_neutral_v1",
+                "strategy_mode": "one_way_long",
+                "step_price": 0.0001,
+                "buy_levels": 4,
+                "sell_levels": 8,
+                "per_order_notional": 50.0,
+                "base_position_notional": 100.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 20,
+                "max_total_notional": 500.0,
+                "sleep_seconds": 15,
+                "state_path": "output/ensousdt_loop_state.json",
+                "plan_json": "output/ensousdt_loop_latest_plan.json",
+                "submit_report_json": "output/ensousdt_loop_latest_submit.json",
+                "summary_jsonl": "output/ensousdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+                "run_start_time": "2026-03-31T01:00:00+00:00",
+                "run_end_time": "2026-03-31T03:00:00+00:00",
+                "rolling_hourly_loss_limit": 150.0,
+                "max_cumulative_notional": 100000.0,
+            }
+        )
+        self.assertIn("--run-start-time", command)
+        self.assertIn("2026-03-31T01:00:00+00:00", command)
+        self.assertIn("--run-end-time", command)
+        self.assertIn("--rolling-hourly-loss-limit", command)
+        self.assertIn("--max-cumulative-notional", command)
+
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:
         mock_preview.return_value = {

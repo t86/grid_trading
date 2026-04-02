@@ -101,6 +101,7 @@ from .maker_flatten_runner import (
     load_live_flatten_snapshot,
 )
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
+from .runtime_guards import normalize_runtime_guard_payload
 from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
@@ -628,6 +629,10 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "maker_retries": 2,
     "max_new_orders": 20,
     "max_total_notional": 1000.0,
+    "run_start_time": None,
+    "run_end_time": None,
+    "rolling_hourly_loss_limit": None,
+    "max_cumulative_notional": None,
     "sleep_seconds": 15.0,
     "cancel_stale": True,
     "apply": True,
@@ -938,6 +943,10 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "inventory_recycle_loss_tolerance_ratio": 0.006,
     "inventory_recycle_min_profit_ratio": 0.001,
     "max_single_cycle_new_orders": 8,
+    "run_start_time": None,
+    "run_end_time": None,
+    "rolling_hourly_loss_limit": None,
+    "max_cumulative_notional": None,
 }
 
 
@@ -1642,6 +1651,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_plan_age_seconds",
         "max_mid_drift_steps",
         "max_total_notional",
+        "rolling_hourly_loss_limit",
+        "max_cumulative_notional",
         "sleep_seconds",
     }
     int_fields = {
@@ -1678,6 +1689,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "plan_json",
         "submit_report_json",
         "summary_jsonl",
+        "run_start_time",
+        "run_end_time",
     }
     noneable_fields = {
         "center_price",
@@ -1697,6 +1710,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "inventory_tier_base_position_notional",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
+        "rolling_hourly_loss_limit",
+        "max_cumulative_notional",
+        "run_start_time",
+        "run_end_time",
     }
 
     for key, value in payload.items():
@@ -1722,6 +1739,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     config["symbol"] = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"
     config["margin_type"] = str(config.get("margin_type", "KEEP")).upper().strip() or "KEEP"
+    config.update(normalize_runtime_guard_payload(config))
     return config
 
 
@@ -1865,6 +1883,14 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--short-cover-pause-down-return-trigger-ratio", str(config["short_cover_pause_down_return_trigger_ratio"])])
     if config.get("freeze_shift_abs_return_trigger_ratio") is not None:
         command.extend(["--freeze-shift-abs-return-trigger-ratio", str(config["freeze_shift_abs_return_trigger_ratio"])])
+    if config.get("run_start_time") is not None:
+        command.extend(["--run-start-time", str(config["run_start_time"])])
+    if config.get("run_end_time") is not None:
+        command.extend(["--run-end-time", str(config["run_end_time"])])
+    if config.get("rolling_hourly_loss_limit") is not None:
+        command.extend(["--rolling-hourly-loss-limit", str(config["rolling_hourly_loss_limit"])])
+    if config.get("max_cumulative_notional") is not None:
+        command.extend(["--max-cumulative-notional", str(config["max_cumulative_notional"])])
     command.append("--auto-regime-enabled" if config.get("auto_regime_enabled", False) else "--no-auto-regime-enabled")
     if config.get("auto_regime_confirm_cycles") is not None:
         command.extend(["--auto-regime-confirm-cycles", str(config["auto_regime_confirm_cycles"])])
@@ -2024,6 +2050,10 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "maker_retries",
             "max_new_orders",
             "max_total_notional",
+            "run_start_time",
+            "run_end_time",
+            "rolling_hourly_loss_limit",
+            "max_cumulative_notional",
             "sleep_seconds",
             "cancel_stale",
             "apply",
@@ -2723,6 +2753,7 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("max_single_cycle_new_orders", SPOT_RUNNER_DEFAULT_CONFIG["max_single_cycle_new_orders"]),
         "max_single_cycle_new_orders",
     )
+    runtime_guard_config = normalize_runtime_guard_payload(payload)
 
     if grid_level_mode not in set(supported_grid_level_modes()):
         raise ValueError(
@@ -2790,6 +2821,10 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_loss_tolerance_ratio": inventory_recycle_loss_tolerance_ratio,
             "inventory_recycle_min_profit_ratio": inventory_recycle_min_profit_ratio,
             "max_single_cycle_new_orders": max_single_cycle_new_orders,
+            "run_start_time": runtime_guard_config["run_start_time"],
+            "run_end_time": runtime_guard_config["run_end_time"],
+            "rolling_hourly_loss_limit": runtime_guard_config["rolling_hourly_loss_limit"],
+            "max_cumulative_notional": runtime_guard_config["max_cumulative_notional"],
         }
     )
     config.update(_default_spot_runtime_paths_for_symbol(symbol))
@@ -2844,6 +2879,10 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--inventory-recycle-loss-tolerance-ratio", config.get("inventory_recycle_loss_tolerance_ratio")),
         ("--inventory-recycle-min-profit-ratio", config.get("inventory_recycle_min_profit_ratio")),
         ("--max-single-cycle-new-orders", config.get("max_single_cycle_new_orders")),
+        ("--run-start-time", config.get("run_start_time")),
+        ("--run-end-time", config.get("run_end_time")),
+        ("--rolling-hourly-loss-limit", config.get("rolling_hourly_loss_limit")),
+        ("--max-cumulative-notional", config.get("max_cumulative_notional")),
     ]
     for flag, value in extra_args:
         if value is not None:
@@ -2922,6 +2961,10 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_loss_tolerance_ratio",
             "inventory_recycle_min_profit_ratio",
             "max_single_cycle_new_orders",
+            "run_start_time",
+            "run_end_time",
+            "rolling_hourly_loss_limit",
+            "max_cumulative_notional",
         }
         config_changed = any(current_config.get(field) != config.get(field) for field in compare_fields)
         if not config_changed:
@@ -3127,6 +3170,17 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
             "center_price": _float_or_default(state.get("center_price"), "center_price"),
             "center_shift_count": _int_or_default(state.get("center_shift_count"), "center_shift_count"),
             "mode": str(state.get("last_mode", "") or latest_event.get("mode", "") if isinstance(latest_event, dict) else ""),
+            "runtime_status": str(latest_event.get("runtime_status", "") or "running") if isinstance(latest_event, dict) else "running",
+            "stop_triggered": bool(latest_event.get("stop_triggered")) if isinstance(latest_event, dict) else False,
+            "stop_reason": latest_event.get("stop_reason") if isinstance(latest_event, dict) else None,
+            "stop_reasons": list(latest_event.get("stop_reasons") or []) if isinstance(latest_event, dict) else [],
+            "stop_triggered_at": latest_event.get("stop_triggered_at") if isinstance(latest_event, dict) else None,
+            "run_start_time": config.get("run_start_time"),
+            "run_end_time": config.get("run_end_time"),
+            "rolling_hourly_loss_limit": _float_or_default(config.get("rolling_hourly_loss_limit"), "rolling_hourly_loss_limit"),
+            "max_cumulative_notional": _float_or_default(config.get("max_cumulative_notional"), "max_cumulative_notional"),
+            "rolling_hourly_loss": _float_or_default(latest_event.get("rolling_hourly_loss"), "rolling_hourly_loss") if isinstance(latest_event, dict) else 0.0,
+            "cumulative_gross_notional": _float_or_default(latest_event.get("cumulative_gross_notional"), "cumulative_gross_notional") if isinstance(latest_event, dict) else 0.0,
             "buy_paused": bool(latest_event.get("buy_paused")) if isinstance(latest_event, dict) else False,
             "pause_reasons": list(latest_event.get("pause_reasons") or []) if isinstance(latest_event, dict) else [],
             "inventory_soft_limit_notional": _float_or_default(config.get("inventory_soft_limit_notional"), "inventory_soft_limit_notional"),
@@ -10942,11 +10996,15 @@ MONITOR_PAGE = """<!doctype html>
         : (isOneWayShort
             ? `软停空 ${fmtNum(risk.pause_short_position_notional, 4)} / 硬上限 ${fmtNum(risk.max_short_position_notional, 4)}`
             : `软停买 ${fmtNum(risk.pause_buy_position_notional, 4)} / 硬上限 ${fmtNum(risk.max_position_notional, 4)}`);
-      const riskDetail = [
+        const riskDetail = [
         isNeutralMode ? `当前多/空: ${fmtNum(risk.current_long_notional, 4)} / ${fmtNum(risk.current_short_notional, 4)}` : (isOneWayShort ? `当前空仓: ${fmtNum(risk.current_short_notional, 4)}` : `当前净仓: ${fmtNum(risk.current_long_notional, 4)}`),
         isNeutralMode ? `多/空剩余空间: ${fmtNum(risk.remaining_headroom, 4)} / ${fmtNum(risk.remaining_short_headroom, 4)}` : (isOneWayShort ? `剩余空间: ${fmtNum(risk.remaining_short_headroom, 4)}` : `剩余空间: ${fmtNum(risk.remaining_headroom, 4)}`),
         isNeutralMode ? `计划多/空: ${fmtNum(risk.planned_buy_notional, 4)} / ${fmtNum(risk.planned_short_notional, 4)}` : (isOneWayShort ? `计划卖空: ${fmtNum(risk.planned_short_notional, 4)}` : `计划买单: ${fmtNum(risk.planned_buy_notional, 4)}`),
         isNeutralMode ? `多/空预算: ${fmtNum(risk.buy_budget_notional, 4)} / ${fmtNum(risk.short_budget_notional, 4)}` : (isOneWayShort ? `卖空预算: ${fmtNum(risk.short_budget_notional, 4)}` : `买单预算: ${fmtNum(risk.buy_budget_notional, 4)}`),
+        `运行状态: ${risk.runtime_status || "--"}`,
+        `滚动亏损: ${fmtNum(risk.rolling_hourly_loss || 0, 4)} / ${fmtNum(risk.rolling_hourly_loss_limit || 0, 4)}`,
+        `累计成交额: ${fmtNum(risk.cumulative_gross_notional || 0, 4)} / ${fmtNum(risk.max_cumulative_notional || 0, 4)}`,
+        `停止原因: ${risk.stop_reason || "--"}`,
         `自适应状态: ${autoRegimeEnabled ? `${autoRegimeRegime} (${autoRegimePending})` : "关闭"}`,
         `XAUT 三态: ${xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"}`,
         `中性小时缩放: ${neutralHourlyEnabled ? `${neutralHourlyRegime} x${neutralHourlyScale}` : "关闭"}`,
@@ -11114,6 +11172,14 @@ MONITOR_PAGE = """<!doctype html>
         ["当前空仓名义", fmtNum(risk.current_short_notional, 4)],
         ["剩余上限空间", fmtNum(risk.remaining_headroom, 4)],
         ["空仓剩余空间", fmtNum(risk.remaining_short_headroom, 4)],
+        ["运行状态", risk.runtime_status || "--"],
+        ["起始时间", risk.run_start_time ? fmtTs(risk.run_start_time) : "--"],
+        ["结束时间", risk.run_end_time ? fmtTs(risk.run_end_time) : "--"],
+        ["滚动亏损", fmtNum(risk.rolling_hourly_loss, 4)],
+        ["滚动亏损阈值", fmtNum(risk.rolling_hourly_loss_limit, 4)],
+        ["累计成交额", fmtNum(risk.cumulative_gross_notional, 4)],
+        ["累计成交额阈值", fmtNum(risk.max_cumulative_notional, 4)],
+        ["停止原因", risk.stop_reason || "--"],
         ["本轮买单预算", fmtNum(risk.buy_budget_notional, 4)],
         ["本轮卖空预算", fmtNum(risk.short_budget_notional, 4)],
         ["本轮计划买单", fmtNum(risk.planned_buy_notional, 4)],
@@ -11687,6 +11753,20 @@ SPOT_RUNNER_PAGE = """<!doctype html>
           <input id="recycle_settings" type="text" />
         </label>
       </div>
+      <div class="fields" id="runtime_guard_fields">
+        <label>起始时间
+          <input id="run_start_time" type="datetime-local" />
+        </label>
+        <label>结束时间
+          <input id="run_end_time" type="datetime-local" />
+        </label>
+        <label>滚动 60 分钟亏损阈值
+          <input id="rolling_hourly_loss_limit" type="number" min="0" step="0.01" />
+        </label>
+        <label>累计成交额阈值
+          <input id="max_cumulative_notional" type="number" min="0" step="0.01" />
+        </label>
+      </div>
       <div class="actions">
         <span id="status" class="meta">等待状态加载...</span>
       </div>
@@ -11804,6 +11884,10 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const centerShiftRatiosEl = document.getElementById("center_shift_ratios");
     const pauseThresholdsEl = document.getElementById("pause_thresholds");
     const recycleSettingsEl = document.getElementById("recycle_settings");
+    const runStartTimeEl = document.getElementById("run_start_time");
+    const runEndTimeEl = document.getElementById("run_end_time");
+    const rollingHourlyLossLimitEl = document.getElementById("rolling_hourly_loss_limit");
+    const maxCumulativeNotionalEl = document.getElementById("max_cumulative_notional");
     const sleepSecondsEl = document.getElementById("sleep_seconds");
     const refreshSecondsEl = document.getElementById("refresh_seconds");
     const staticFieldsEl = document.getElementById("static_fields");
@@ -11855,6 +11939,22 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const dt = new Date(v);
       if (Number.isNaN(dt.getTime())) return String(v);
       return dt.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function toLocalInputValue(value) {
+      if (!value) return "";
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) return "";
+      const pad = (num) => String(num).padStart(2, "0");
+      return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    }
+
+    function fromLocalInputValue(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return null;
+      const dt = new Date(raw);
+      if (Number.isNaN(dt.getTime())) return null;
+      return dt.toISOString();
     }
 
     function escapeHtml(s) {
@@ -11937,6 +12037,10 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         inventory_recycle_loss_tolerance_ratio: Number(recycleLoss || 0.006),
         inventory_recycle_min_profit_ratio: 0.001,
         max_single_cycle_new_orders: 8,
+        run_start_time: fromLocalInputValue(runStartTimeEl.value),
+        run_end_time: fromLocalInputValue(runEndTimeEl.value),
+        rolling_hourly_loss_limit: rollingHourlyLossLimitEl.value ? Number(rollingHourlyLossLimitEl.value) : null,
+        max_cumulative_notional: maxCumulativeNotionalEl.value ? Number(maxCumulativeNotionalEl.value) : null,
       };
     }
 
@@ -12015,9 +12119,13 @@ SPOT_RUNNER_PAGE = """<!doctype html>
 
       const riskPills = [
         ["风控模式", risk.mode || "--"],
+        ["运行状态", risk.runtime_status || "--"],
         ["停买", risk.buy_paused ? "是" : "否"],
         ["软/硬库存上限", `${fmtNum(risk.inventory_soft_limit_notional, 2)} / ${fmtNum(risk.inventory_hard_limit_notional, 2)}`],
         ["1m 涨跌 / 振幅", `${fmtPct(risk.market_guard_return_ratio)} / ${fmtPct(risk.market_guard_amplitude_ratio)}`],
+        ["滚动亏损 / 阈值", `${fmtMoney(-(risk.rolling_hourly_loss || 0))} / ${fmtNum(risk.rolling_hourly_loss_limit, 2)}`],
+        ["累计成交额 / 阈值", `${fmtNum(risk.cumulative_gross_notional, 2)} / ${fmtNum(risk.max_cumulative_notional, 2)}`],
+        ["停止原因", risk.stop_reason || "--"],
       ];
       riskSummaryEl.innerHTML = riskPills.map(([k, v]) => `<div class="pill"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`).join("");
       startBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
@@ -12136,6 +12244,10 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       centerShiftRatiosEl.value = `${config.center_shift_trigger_ratio ?? 0.012},${config.center_shift_step_ratio ?? 0.006}`;
       pauseThresholdsEl.value = `${config.buy_pause_amp_trigger_ratio ?? 0.045},${config.buy_pause_down_return_trigger_ratio ?? -0.022}`;
       recycleSettingsEl.value = `${config.inventory_recycle_age_minutes ?? 40},${config.inventory_recycle_loss_tolerance_ratio ?? 0.006}`;
+      runStartTimeEl.value = toLocalInputValue(config.run_start_time);
+      runEndTimeEl.value = toLocalInputValue(config.run_end_time);
+      rollingHourlyLossLimitEl.value = config.rolling_hourly_loss_limit ?? "";
+      maxCumulativeNotionalEl.value = config.max_cumulative_notional ?? "";
       toggleModeFields();
     }
 

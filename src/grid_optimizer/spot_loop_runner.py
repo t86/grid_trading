@@ -3,6 +3,9 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
+import subprocess
+import sys
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
@@ -23,7 +26,9 @@ from .data import (
     post_spot_order,
 )
 from .dry_run import _round_order_price, _round_order_qty
+from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config
 from .semi_auto_plan import diff_open_orders
+from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
 
 STATE_VERSION = 2
 EPSILON = 1e-12
@@ -342,7 +347,105 @@ def _append_recent_trade(metrics: dict[str, Any], payload: dict[str, Any]) -> No
     if not isinstance(rows, list):
         rows = []
     rows.append(payload)
-    metrics["recent_trades"] = rows[-100:]
+    metrics["recent_trades"] = rows[-2000:]
+
+
+def _symbol_output_slug(symbol: str) -> str:
+    normalized = "".join(ch if ch.isalnum() else "_" for ch in str(symbol or "").strip().lower()).strip("_")
+    return normalized or "symbol"
+
+
+def _spot_flatten_pid_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_spot_flatten.pid")
+
+
+def _spot_flatten_log_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_spot_flatten.log")
+
+
+def _spot_flatten_events_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_spot_flatten_events.jsonl")
+
+
+def _pid_is_running(pid_path: Path) -> bool:
+    if not pid_path.exists():
+        return False
+    try:
+        pid = int(pid_path.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        pid_path.unlink(missing_ok=True)
+        return False
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        pid_path.unlink(missing_ok=True)
+        return False
+    return True
+
+
+def _start_spot_flatten_process(symbol: str) -> dict[str, Any]:
+    pid_path = _spot_flatten_pid_path(symbol)
+    if _pid_is_running(pid_path):
+        return {"started": False, "already_running": True}
+    log_path = _spot_flatten_log_path(symbol)
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    env = os.environ.copy()
+    src_path = str((Path.cwd() / "src").resolve())
+    current_pythonpath = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = src_path if not current_pythonpath else f"{src_path}{os.pathsep}{current_pythonpath}"
+    command = [
+        sys.executable,
+        "-m",
+        "grid_optimizer.spot_flatten_runner",
+        "--symbol",
+        str(symbol),
+        "--client-order-prefix",
+        spot_flatten_client_order_prefix(symbol),
+        "--sleep-seconds",
+        "2.0",
+        "--recv-window",
+        "5000",
+        "--max-consecutive-errors",
+        "20",
+        "--events-jsonl",
+        str(_spot_flatten_events_path(symbol)),
+    ]
+    with log_path.open("ab") as log_file:
+        proc = subprocess.Popen(
+            command,
+            cwd=str(Path.cwd()),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    pid_path.write_text(str(proc.pid), encoding="utf-8")
+    return {"started": True, "already_running": False, "pid": proc.pid}
+
+
+def _runtime_guard_events_from_metrics(metrics: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = metrics.get("recent_trades")
+    if not isinstance(rows, list):
+        return []
+    events: list[dict[str, Any]] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        trade_time_ms = _safe_int(row.get("time"))
+        if trade_time_ms <= 0:
+            continue
+        commission_quote = _safe_float(row.get("commission_quote"))
+        realized_pnl = _safe_float(row.get("realized_pnl"))
+        recycle_loss_abs = abs(realized_pnl) if "recycle" in str(row.get("role", "")).lower() and realized_pnl < 0 else 0.0
+        events.append(
+            {
+                "ts": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "realized_pnl": realized_pnl,
+                "commission_quote": commission_quote,
+                "recycle_loss_abs": recycle_loss_abs,
+            }
+        )
+    return events
 
 
 def _record_trade_metrics(
@@ -1028,6 +1131,97 @@ def _cancel_orders(
     return count
 
 
+def _build_runtime_guard_summary(
+    *,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    metrics: dict[str, Any],
+    symbol: str,
+    strategy_mode: str,
+    base_asset: str,
+    quote_asset: str,
+    bid_price: float,
+    ask_price: float,
+    mid_price: float,
+    quote_free: float,
+    base_free: float,
+    runtime_guard_result: Any,
+    runtime_guard_config: Any,
+    canceled_count: int,
+    flatten_result: dict[str, Any],
+) -> dict[str, Any]:
+    inventory_qty = _sum_inventory_qty(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
+    inventory_cost_quote = _sum_inventory_cost(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
+    inventory_avg_cost = (inventory_cost_quote / inventory_qty) if inventory_qty > EPSILON else 0.0
+    unrealized_pnl = (mid_price - inventory_avg_cost) * inventory_qty if inventory_qty > EPSILON else 0.0
+    return {
+        "ts": _utc_now().isoformat(),
+        "cycle": int(state.get("cycle", 0) or 0),
+        "symbol": symbol,
+        "strategy_mode": strategy_mode,
+        "mid_price": mid_price,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "grid_count": 0,
+        "active_buy_orders": 0,
+        "active_sell_orders": 0,
+        "managed_base_qty": inventory_qty,
+        "quote_free": quote_free,
+        "base_free": base_free,
+        "quote_asset": quote_asset,
+        "base_asset": base_asset,
+        "applied_trades": 0,
+        "placed_count": 0,
+        "canceled_count": canceled_count,
+        "open_strategy_orders": 0,
+        "placement_errors": [],
+        "gross_notional": _safe_float(metrics.get("gross_notional")),
+        "buy_notional": _safe_float(metrics.get("buy_notional")),
+        "sell_notional": _safe_float(metrics.get("sell_notional")),
+        "commission_quote": _safe_float(metrics.get("commission_quote")),
+        "realized_pnl": _safe_float(metrics.get("realized_pnl")),
+        "recycle_realized_pnl": _safe_float(metrics.get("recycle_realized_pnl")),
+        "recycle_loss_abs": _safe_float(metrics.get("recycle_loss_abs")),
+        "unrealized_pnl": unrealized_pnl,
+        "net_pnl_estimate": _safe_float(metrics.get("realized_pnl")) + unrealized_pnl,
+        "trade_count": _safe_int(metrics.get("trade_count")),
+        "maker_count": _safe_int(metrics.get("maker_count")),
+        "buy_count": _safe_int(metrics.get("buy_count")),
+        "sell_count": _safe_int(metrics.get("sell_count")),
+        "inventory_qty": inventory_qty,
+        "inventory_notional": inventory_qty * mid_price,
+        "inventory_avg_cost": inventory_avg_cost,
+        "oldest_inventory_age_minutes": _oldest_inventory_age_minutes(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else []),
+        "mode": "runtime_guard",
+        "buy_paused": False,
+        "pause_reasons": [],
+        "shift_frozen": False,
+        "center_price": _safe_float(state.get("center_price")),
+        "center_shift_count": _safe_int(state.get("center_shift_count")),
+        "market_guard_return_ratio": 0.0,
+        "market_guard_amplitude_ratio": 0.0,
+        "inventory_soft_limit_notional": _safe_float(getattr(args, "inventory_soft_limit_notional", 0.0)),
+        "inventory_hard_limit_notional": _safe_float(getattr(args, "inventory_hard_limit_notional", 0.0)),
+        "effective_buy_levels": 0,
+        "effective_sell_levels": 0,
+        "effective_per_order_notional": 0.0,
+        "shift_moves": [],
+        "runtime_status": runtime_guard_result.runtime_status,
+        "stop_triggered": runtime_guard_result.stop_triggered,
+        "stop_reason": runtime_guard_result.primary_reason,
+        "stop_reasons": runtime_guard_result.matched_reasons,
+        "stop_triggered_at": runtime_guard_result.triggered_at,
+        "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
+        "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
+        "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+        "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+        "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
+        "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+        "flatten_started": bool(flatten_result.get("started")),
+        "flatten_already_running": bool(flatten_result.get("already_running")),
+    }
+
+
 def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: str, api_secret: str) -> dict[str, Any]:
     symbol = str(args.symbol).upper().strip()
     strategy_mode = str(args.strategy_mode or "spot_one_way_long").strip()
@@ -1116,6 +1310,49 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     account_info = fetch_spot_account_info(api_key, api_secret)
     open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
     strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+    metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else _new_metrics()
+    runtime_guard_config = normalize_runtime_guard_config(vars(args))
+    runtime_guard_result = evaluate_runtime_guards(
+        config=runtime_guard_config,
+        now=_utc_now(),
+        cumulative_gross_notional=_safe_float(metrics.get("gross_notional")),
+        pnl_events=_runtime_guard_events_from_metrics(metrics),
+    )
+    if not runtime_guard_result.tradable:
+        canceled_count = 0
+        if strategy_open_orders:
+            canceled_count = _cancel_orders(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                orders=strategy_open_orders,
+            )
+        flatten_result = {"started": False, "already_running": False}
+        flatten_snapshot = load_live_spot_flatten_snapshot(symbol, api_key, api_secret)
+        if list(flatten_snapshot.get("orders", [])):
+            flatten_result = _start_spot_flatten_process(symbol)
+        quote_free, base_free = _available_new_funds(account_info, base_asset, quote_asset)
+        summary = _build_runtime_guard_summary(
+            args=args,
+            state=state,
+            metrics=metrics,
+            symbol=symbol,
+            strategy_mode=strategy_mode,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            mid_price=mid_price,
+            quote_free=quote_free,
+            base_free=base_free,
+            runtime_guard_result=runtime_guard_result,
+            runtime_guard_config=runtime_guard_config,
+            canceled_count=canceled_count,
+            flatten_result=flatten_result,
+        )
+        _save_state(state_path, state)
+        _append_jsonl(Path(args.summary_jsonl), summary)
+        return summary
 
     if strategy_mode == "spot_one_way_long":
         desired_orders = _build_static_desired_orders(
@@ -1201,7 +1438,6 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         except Exception as exc:  # pragma: no cover - network/runtime specific
             placement_errors.append(f"{side} {price:.8f} x {qty:.8f}: {type(exc).__name__}: {exc}")
 
-    metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else _new_metrics()
     inventory_qty = _sum_inventory_qty(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
     inventory_cost_quote = _sum_inventory_cost(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
     inventory_avg_cost = (inventory_cost_quote / inventory_qty) if inventory_qty > EPSILON else 0.0
@@ -1265,6 +1501,17 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "effective_sell_levels": _safe_int(controls.get("effective_sell_levels")),
         "effective_per_order_notional": _safe_float(controls.get("effective_per_order_notional")),
         "shift_moves": controls.get("shift_moves", []),
+        "runtime_status": runtime_guard_result.runtime_status,
+        "stop_triggered": runtime_guard_result.stop_triggered,
+        "stop_reason": runtime_guard_result.primary_reason,
+        "stop_reasons": runtime_guard_result.matched_reasons,
+        "stop_triggered_at": runtime_guard_result.triggered_at,
+        "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
+        "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
+        "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+        "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+        "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
+        "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
     }
     _save_state(state_path, state)
     _append_jsonl(Path(args.summary_jsonl), summary)
@@ -1329,8 +1576,13 @@ def main() -> None:
     parser.add_argument("--inventory-recycle-loss-tolerance-ratio", type=float, default=0.006)
     parser.add_argument("--inventory-recycle-min-profit-ratio", type=float, default=0.001)
     parser.add_argument("--max-single-cycle-new-orders", type=int, default=8)
+    parser.add_argument("--run-start-time", type=str, default=None)
+    parser.add_argument("--run-end-time", type=str, default=None)
+    parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
+    parser.add_argument("--max-cumulative-notional", type=float, default=None)
 
     args = parser.parse_args()
+    normalize_runtime_guard_config(vars(args))
 
     while True:
         cycle_started_at = _utc_now()
@@ -1344,8 +1596,11 @@ def main() -> None:
                 f"volume={summary.get('gross_notional', 0.0):.4f} "
                 f"inventory={summary.get('inventory_qty', summary.get('managed_base_qty', 0.0)):.8f} "
                 f"placed={summary.get('placed_count')} "
-                f"canceled={summary.get('canceled_count')}"
+                f"canceled={summary.get('canceled_count')} "
+                f"runtime={summary.get('runtime_status', 'running')}"
             )
+            if summary.get("stop_reason"):
+                print(f"  stop_reason: {summary['stop_reason']}")
         except KeyboardInterrupt:
             raise
         except Exception as exc:  # pragma: no cover - runtime specific

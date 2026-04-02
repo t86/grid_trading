@@ -58,6 +58,10 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("summary_jsonl", payload)
         self.assertIn("client_order_prefix", payload)
         self.assertEqual(payload["grid_band_ratio"], 0.045)
+        self.assertIsNone(payload["run_start_time"])
+        self.assertIsNone(payload["run_end_time"])
+        self.assertIsNone(payload["rolling_hourly_loss_limit"])
+        self.assertIsNone(payload["max_cumulative_notional"])
 
     def test_build_spot_runner_command_uses_spot_loop_runner(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
@@ -82,6 +86,26 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--apply", command)
         self.assertIn("--cancel-stale", command)
 
+    def test_build_spot_runner_command_includes_runtime_guard_arguments(self) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "BTCUSDT",
+                "run_start_time": "2026-03-31T01:00:00+00:00",
+                "run_end_time": "2026-03-31T03:00:00+00:00",
+                "rolling_hourly_loss_limit": 250.0,
+                "max_cumulative_notional": 100000.0,
+            }
+        )
+
+        command = _build_spot_runner_command(config)
+
+        self.assertIn("--run-start-time", command)
+        self.assertIn("2026-03-31T01:00:00+00:00", command)
+        self.assertIn("--run-end-time", command)
+        self.assertIn("--rolling-hourly-loss-limit", command)
+        self.assertIn("--max-cumulative-notional", command)
+
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")
     @patch("grid_optimizer.web.load_binance_api_credentials")
@@ -103,7 +127,6 @@ class SpotRunnerTests(unittest.TestCase):
         mock_fetch_account,
         mock_fetch_open_orders,
     ) -> None:
-        mock_load_config.return_value = dict(SPOT_RUNNER_DEFAULT_CONFIG)
         mock_read_runner.return_value = {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}}
         mock_read_json.return_value = {
             "cycle": 2,
@@ -127,7 +150,27 @@ class SpotRunnerTests(unittest.TestCase):
             "last_mode": "attack",
             "center_shift_count": 2,
         }
-        mock_tail_jsonl.return_value = [{"mid_price": 68000.5, "mode": "attack"}]
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "run_start_time": "2026-03-31T01:00:00+00:00",
+                "run_end_time": "2026-03-31T03:00:00+00:00",
+                "rolling_hourly_loss_limit": 150.0,
+                "max_cumulative_notional": 100000.0,
+            }
+        )
+        mock_load_config.return_value = config
+        mock_tail_jsonl.return_value = [
+            {
+                "mid_price": 68000.5,
+                "mode": "attack",
+                "runtime_status": "stopped",
+                "stop_triggered": True,
+                "stop_reason": "max_cumulative_notional_hit",
+                "rolling_hourly_loss": 123.4,
+                "cumulative_gross_notional": 99999.0,
+            }
+        ]
         mock_symbol_config.return_value = {
             "base_asset": "BTC",
             "quote_asset": "USDT",
@@ -158,6 +201,11 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot["trade_summary"]["recycle_loss_abs"], 1.25)
         self.assertEqual(snapshot["state"]["inventory_qty"], 0.5)
         self.assertEqual(snapshot["risk_controls"]["center_shift_count"], 2)
+        self.assertEqual(snapshot["risk_controls"]["runtime_status"], "stopped")
+        self.assertTrue(snapshot["risk_controls"]["stop_triggered"])
+        self.assertEqual(snapshot["risk_controls"]["stop_reason"], "max_cumulative_notional_hit")
+        self.assertAlmostEqual(snapshot["risk_controls"]["rolling_hourly_loss"], 123.4)
+        self.assertEqual(snapshot["risk_controls"]["run_start_time"], "2026-03-31T01:00:00+00:00")
 
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")
