@@ -579,6 +579,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "per_order_notional": 70.0,
     "base_position_notional": 420.0,
     "center_price": None,
+    "flat_start_enabled": True,
+    "warm_start_enabled": True,
     "fixed_center_enabled": False,
     "fixed_center_roll_enabled": False,
     "excess_inventory_reduce_only_enabled": False,
@@ -1673,6 +1675,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "cancel_stale",
         "apply",
         "reset_state",
+        "flat_start_enabled",
+        "warm_start_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
@@ -1816,6 +1820,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
     ]
     if config.get("center_price") is not None:
         command.extend(["--center-price", str(config["center_price"])])
+    command.append("--flat-start-enabled" if config.get("flat_start_enabled", True) else "--no-flat-start-enabled")
+    command.append("--warm-start-enabled" if config.get("warm_start_enabled", True) else "--no-warm-start-enabled")
     command.append("--fixed-center-enabled" if config.get("fixed_center_enabled", False) else "--no-fixed-center-enabled")
     command.append("--fixed-center-roll-enabled" if config.get("fixed_center_roll_enabled", False) else "--no-fixed-center-roll-enabled")
     command.append(
@@ -1992,6 +1998,8 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "strategy_mode",
             "symbol",
             "center_price",
+            "flat_start_enabled",
+            "warm_start_enabled",
             "fixed_center_enabled",
             "autotune_symbol_enabled",
             "step_price",

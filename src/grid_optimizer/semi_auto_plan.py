@@ -1089,6 +1089,8 @@ def _config_payload(args: argparse.Namespace, symbol_info: dict[str, Any]) -> di
         "min_notional": symbol_info.get("min_notional"),
     }
     optional_fields = (
+        "flat_start_enabled",
+        "warm_start_enabled",
         "fixed_center_enabled",
         "custom_grid_enabled",
         "custom_grid_direction",
@@ -1148,6 +1150,8 @@ def load_or_initialize_state(
         "version": STATE_VERSION,
         "created_at": _isoformat(_utc_now()),
         "updated_at": _isoformat(_utc_now()),
+        "startup_pending": True,
+        "startup_completed_at": None,
         "config": config,
         "config_signature": _config_signature(config),
         "center_price": center_price,

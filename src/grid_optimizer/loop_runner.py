@@ -152,6 +152,12 @@ XAUT_ADAPTIVE_TRANSITION_CONFIRMATIONS = {
     (XAUT_ADAPTIVE_STATE_REDUCE_ONLY, XAUT_ADAPTIVE_STATE_DEFENSIVE): 2,
     (XAUT_ADAPTIVE_STATE_NORMAL, XAUT_ADAPTIVE_STATE_REDUCE_ONLY): 1,
 }
+
+
+class StartupProtectionError(RuntimeError):
+    """Raised when startup preconditions fail and the runner should stop."""
+
+
 XAUT_ADAPTIVE_STATE_CONFIGS: dict[str, dict[str, dict[str, Any]]] = {
     "one_way_long": {
         XAUT_ADAPTIVE_STATE_NORMAL: {
@@ -704,6 +710,139 @@ def _is_best_quote_short_profile(strategy_profile: str) -> bool:
     return str(strategy_profile).strip() == BEST_QUOTE_SHORT_PROFILE
 
 
+def _startup_pending(state: dict[str, Any]) -> bool:
+    return _truthy((state or {}).get("startup_pending"))
+
+
+def assess_flat_start_guard(
+    *,
+    strategy_mode: str,
+    actual_net_qty: float,
+    open_orders: list[dict[str, Any]],
+    enabled: bool,
+) -> dict[str, Any]:
+    mode = str(strategy_mode or "").strip()
+    open_order_count = len([item for item in open_orders if isinstance(item, dict)])
+    result = {
+        "enabled": bool(enabled),
+        "blocked": False,
+        "mode": mode,
+        "open_order_count": open_order_count,
+        "reverse_qty": 0.0,
+        "reason": None,
+    }
+    if not enabled or mode not in {"one_way_long", "one_way_short"}:
+        return result
+
+    tolerance = 1e-9
+    safe_actual_net_qty = float(actual_net_qty)
+    if mode == "one_way_long" and safe_actual_net_qty < -tolerance:
+        result.update(
+            {
+                "blocked": True,
+                "reverse_qty": abs(safe_actual_net_qty),
+                "reason": (
+                    "flat-start 已拦截启动：one_way_long 启动前必须先清空反向空仓，"
+                    f"当前 actual_net_qty={safe_actual_net_qty:.8f}"
+                ),
+            }
+        )
+        return result
+    if mode == "one_way_short" and safe_actual_net_qty > tolerance:
+        result.update(
+            {
+                "blocked": True,
+                "reverse_qty": abs(safe_actual_net_qty),
+                "reason": (
+                    "flat-start 已拦截启动：one_way_short 启动前必须先清空反向多仓，"
+                    f"当前 actual_net_qty={safe_actual_net_qty:.8f}"
+                ),
+            }
+        )
+        return result
+    if open_order_count > 0:
+        result.update(
+            {
+                "blocked": True,
+                "reason": (
+                    "flat-start 已拦截启动：启动前必须先撤掉遗留挂单，"
+                    f"当前 open_order_count={open_order_count}"
+                ),
+            }
+        )
+    return result
+
+
+def apply_warm_start_bootstrap_guard(
+    *,
+    plan: dict[str, Any],
+    strategy_mode: str,
+    current_long_qty: float,
+    current_short_qty: float,
+    startup_pending: bool,
+    enabled: bool,
+) -> dict[str, Any]:
+    result = {
+        "enabled": bool(enabled),
+        "active": False,
+        "direction": None,
+        "existing_qty": 0.0,
+        "suppressed_bootstrap_qty": 0.0,
+        "suppressed_bootstrap_notional": 0.0,
+        "reason": None,
+    }
+    if not enabled or not startup_pending:
+        return result
+
+    tolerance = 1e-9
+    mode = str(strategy_mode or "").strip()
+    if mode == "one_way_long" and float(current_long_qty) > tolerance:
+        suppressed_orders = [item for item in plan.get("bootstrap_orders", []) if _is_long_entry_order(item)]
+        suppressed_qty = sum(_safe_float(item.get("qty")) for item in suppressed_orders)
+        suppressed_notional = sum(_safe_float(item.get("notional")) for item in suppressed_orders)
+        if suppressed_qty > tolerance or suppressed_notional > tolerance:
+            plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
+            plan["bootstrap_qty"] = 0.0
+            if "bootstrap_long_qty" in plan:
+                plan["bootstrap_long_qty"] = 0.0
+            result.update(
+                {
+                    "active": True,
+                    "direction": "long",
+                    "existing_qty": float(current_long_qty),
+                    "suppressed_bootstrap_qty": suppressed_qty,
+                    "suppressed_bootstrap_notional": suppressed_notional,
+                    "reason": (
+                        f"warm-start: startup inventory current_long_qty={float(current_long_qty):.8f} > 0, "
+                        "bootstrap suppressed"
+                    ),
+                }
+            )
+    elif mode == "one_way_short" and float(current_short_qty) > tolerance:
+        suppressed_orders = [item for item in plan.get("bootstrap_orders", []) if _is_short_entry_order(item)]
+        suppressed_qty = sum(_safe_float(item.get("qty")) for item in suppressed_orders)
+        suppressed_notional = sum(_safe_float(item.get("notional")) for item in suppressed_orders)
+        if suppressed_qty > tolerance or suppressed_notional > tolerance:
+            plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
+            plan["bootstrap_qty"] = 0.0
+            if "bootstrap_short_qty" in plan:
+                plan["bootstrap_short_qty"] = 0.0
+            result.update(
+                {
+                    "active": True,
+                    "direction": "short",
+                    "existing_qty": float(current_short_qty),
+                    "suppressed_bootstrap_qty": suppressed_qty,
+                    "suppressed_bootstrap_notional": suppressed_notional,
+                    "reason": (
+                        f"warm-start: startup inventory current_short_qty={float(current_short_qty):.8f} > 0, "
+                        "bootstrap suppressed"
+                    ),
+                }
+            )
+    return result
+
+
 def _convert_plan_orders_to_one_way(plan: dict[str, Any]) -> dict[str, Any]:
     converted = dict(plan)
     for key in ("bootstrap_orders", "buy_orders", "sell_orders"):
@@ -922,6 +1061,8 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         symbol=args.symbol,
         strategy_mode=args.strategy_mode,
+        flat_start_enabled=getattr(args, "flat_start_enabled", True),
+        warm_start_enabled=getattr(args, "warm_start_enabled", True),
         step_price=args.step_price,
         buy_levels=args.buy_levels,
         sell_levels=args.sell_levels,
@@ -2582,6 +2723,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         mid_price=mid_price,
         reset_state=args.reset_state,
     )
+    startup_pending = _startup_pending(state)
     auto_regime: dict[str, Any] | None = None
     xaut_adaptive: dict[str, Any] | None = None
     effective_args = args
@@ -2784,6 +2926,33 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "short_cover_paused": False,
         "short_cover_pause_reasons": [],
     }
+    flat_start_guard = {
+        "enabled": bool(getattr(args, "flat_start_enabled", True)),
+        "blocked": False,
+        "mode": strategy_mode,
+        "open_order_count": 0,
+        "reverse_qty": 0.0,
+        "reason": None,
+    }
+    warm_start = {
+        "enabled": bool(getattr(args, "warm_start_enabled", True)),
+        "active": False,
+        "direction": None,
+        "existing_qty": 0.0,
+        "suppressed_bootstrap_qty": 0.0,
+        "suppressed_bootstrap_notional": 0.0,
+        "reason": None,
+    }
+
+    if startup_pending and not _is_custom_grid_mode(args) and strategy_mode in {"one_way_long", "one_way_short"}:
+        flat_start_guard = assess_flat_start_guard(
+            strategy_mode=strategy_mode,
+            actual_net_qty=actual_net_qty,
+            open_orders=open_orders,
+            enabled=bool(getattr(args, "flat_start_enabled", True)),
+        )
+        if flat_start_guard["blocked"]:
+            raise StartupProtectionError(str(flat_start_guard["reason"]))
 
     if _is_custom_grid_mode(args):
         excess_inventory_gate["enabled"] = False
@@ -3266,15 +3435,31 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
+
+    if startup_pending and not _is_custom_grid_mode(args) and strategy_mode in {"one_way_long", "one_way_short"}:
+        warm_start = apply_warm_start_bootstrap_guard(
+            plan=plan,
+            strategy_mode=strategy_mode,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            startup_pending=startup_pending,
+            enabled=bool(getattr(args, "warm_start_enabled", True)),
+        )
+        bootstrap_qty = _safe_float(plan.get("bootstrap_qty", bootstrap_qty))
+
     desired_orders = [
         *plan["buy_orders"],
         *plan["sell_orders"],
     ]
     diff = diff_open_orders(existing_orders=open_orders, desired_orders=desired_orders)
 
+    state_now = _isoformat(_utc_now())
+    if startup_pending:
+        state["startup_pending"] = False
+        state["startup_completed_at"] = state_now
     state["center_price"] = center_price
     state["last_mid_price"] = mid_price
-    state["updated_at"] = _isoformat(_utc_now())
+    state["updated_at"] = state_now
     state["version"] = STATE_VERSION
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3297,6 +3482,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "custom_grid_runtime_min_price": custom_min_price if _is_custom_grid_mode(args) else None,
         "custom_grid_runtime_max_price": custom_max_price if _is_custom_grid_mode(args) else None,
         "fixed_center_roll": fixed_center_roll,
+        "startup_pending": startup_pending,
+        "flat_start_guard": flat_start_guard,
+        "warm_start": warm_start,
         "excess_inventory_gate": excess_inventory_gate,
         "neutral_hourly_scale": neutral_hourly_scale,
         "shift_moves": shift_moves,
@@ -3690,6 +3878,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-order-notional", type=float, default=12.6)
     parser.add_argument("--base-position-notional", type=float, default=75.6)
     parser.add_argument("--center-price", type=float, default=None)
+    parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--warm-start-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--fixed-center-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--fixed-center-roll-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--excess-inventory-reduce-only-enabled", action=argparse.BooleanOptionalAction, default=False)
@@ -4269,6 +4459,19 @@ def main() -> None:
         except KeyboardInterrupt:
             raise
         except Exception as exc:
+            if isinstance(exc, StartupProtectionError):
+                error_report = {
+                    "ts": cycle_started_at.isoformat(),
+                    "cycle": cycle,
+                    "symbol": args.symbol.upper().strip(),
+                    "error_type": exc.__class__.__name__,
+                    "error_message": str(exc),
+                    "traceback": traceback.format_exc(),
+                    "consecutive_errors": consecutive_errors,
+                }
+                _append_jsonl(summary_path, error_report)
+                print(f"[{cycle}] error: {exc}")
+                raise SystemExit(str(exc)) from exc
             consecutive_errors += 1
             error_report = {
                 "ts": cycle_started_at.isoformat(),

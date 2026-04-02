@@ -414,6 +414,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["strategy_profile"], "defensive_quasi_neutral_v1")
         self.assertEqual(config["state_path"], "output/ensousdt_loop_state.json")
         self.assertEqual(config["summary_jsonl"], "output/ensousdt_loop_events.jsonl")
+        self.assertTrue(config["flat_start_enabled"])
+        self.assertTrue(config["warm_start_enabled"])
 
     def test_build_runner_command_resets_state_on_start(self) -> None:
         command = _build_runner_command(
@@ -429,6 +431,8 @@ class WebSecurityTests(unittest.TestCase):
                 "down_trigger_steps": 4,
                 "up_trigger_steps": 6,
                 "shift_steps": 4,
+                "flat_start_enabled": True,
+                "warm_start_enabled": False,
                 "auto_regime_enabled": True,
                 "auto_regime_confirm_cycles": 2,
                 "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -474,6 +478,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--neutral-center-interval-minutes", command)
         self.assertIn("--neutral-hourly-scale-enabled", command)
         self.assertIn("--center-price", command)
+        self.assertIn("--flat-start-enabled", command)
+        self.assertIn("--no-warm-start-enabled", command)
         self.assertIn("--fixed-center-enabled", command)
         self.assertIn("--reset-state", command)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from argparse import Namespace
+import json
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -17,6 +18,7 @@ from grid_optimizer.loop_runner import (
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _shift_custom_grid_bounds,
+    StartupProtectionError,
     apply_excess_inventory_reduce_only,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
@@ -24,6 +26,8 @@ from grid_optimizer.loop_runner import (
     apply_max_position_notional_cap,
     apply_position_controls,
     apply_short_cover_pause,
+    apply_warm_start_bootstrap_guard,
+    assess_flat_start_guard,
     apply_xaut_reduce_only_pruning,
     assess_auto_regime,
     assess_market_guard,
@@ -252,6 +256,85 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["target_long_base_qty"], 0.0)
         self.assertEqual(plan["bootstrap_long_qty"], 0.0)
 
+    def _base_one_way_long_args(self, tmpdir: str, **overrides: object) -> Namespace:
+        payload: dict[str, object] = {
+            "symbol": "BARDUSDT",
+            "strategy_mode": "one_way_long",
+            "strategy_profile": "bard_volume_long_v2",
+            "step_price": 0.0002,
+            "buy_levels": 5,
+            "sell_levels": 11,
+            "per_order_notional": 40.0,
+            "base_position_notional": 120.0,
+            "center_price": None,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "fixed_center_enabled": False,
+            "fixed_center_roll_enabled": False,
+            "fixed_center_roll_trigger_steps": 1.0,
+            "fixed_center_roll_confirm_cycles": 3,
+            "fixed_center_roll_shift_steps": 1,
+            "custom_grid_enabled": False,
+            "custom_grid_direction": None,
+            "custom_grid_level_mode": "arithmetic",
+            "custom_grid_min_price": None,
+            "custom_grid_max_price": None,
+            "custom_grid_n": None,
+            "custom_grid_total_notional": None,
+            "custom_grid_neutral_anchor_price": None,
+            "custom_grid_roll_enabled": False,
+            "custom_grid_roll_interval_minutes": 5,
+            "custom_grid_roll_trade_threshold": 100,
+            "custom_grid_roll_upper_distance_ratio": 0.30,
+            "custom_grid_roll_shift_levels": 1,
+            "down_trigger_steps": 2,
+            "up_trigger_steps": 2,
+            "shift_steps": 2,
+            "neutral_center_interval_minutes": 3,
+            "neutral_band1_offset_ratio": 0.005,
+            "neutral_band2_offset_ratio": 0.01,
+            "neutral_band3_offset_ratio": 0.02,
+            "neutral_band1_target_ratio": 0.20,
+            "neutral_band2_target_ratio": 0.50,
+            "neutral_band3_target_ratio": 1.00,
+            "neutral_hourly_scale_enabled": False,
+            "neutral_hourly_scale_stable": 1.0,
+            "neutral_hourly_scale_transition": 0.85,
+            "neutral_hourly_scale_defensive": 0.65,
+            "max_position_notional": 560.0,
+            "max_short_position_notional": None,
+            "pause_buy_position_notional": 420.0,
+            "pause_short_position_notional": None,
+            "min_mid_price_for_buys": None,
+            "excess_inventory_reduce_only_enabled": True,
+            "auto_regime_enabled": False,
+            "auto_regime_confirm_cycles": 2,
+            "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
+            "auto_regime_stable_60m_max_amplitude_ratio": 0.05,
+            "auto_regime_stable_60m_return_floor_ratio": -0.01,
+            "auto_regime_defensive_15m_amplitude_ratio": 0.035,
+            "auto_regime_defensive_60m_amplitude_ratio": 0.08,
+            "auto_regime_defensive_15m_return_ratio": -0.015,
+            "auto_regime_defensive_60m_return_ratio": -0.03,
+            "buy_pause_amp_trigger_ratio": 0.0048,
+            "buy_pause_down_return_trigger_ratio": -0.002,
+            "short_cover_pause_amp_trigger_ratio": None,
+            "short_cover_pause_down_return_trigger_ratio": None,
+            "freeze_shift_abs_return_trigger_ratio": 0.004,
+            "inventory_tier_start_notional": 260.0,
+            "inventory_tier_end_notional": 380.0,
+            "inventory_tier_buy_levels": 2,
+            "inventory_tier_sell_levels": 14,
+            "inventory_tier_per_order_notional": 35.0,
+            "inventory_tier_base_position_notional": 80.0,
+            "recv_window": 5000,
+            "reset_state": True,
+            "state_path": str(Path(tmpdir) / "bardusdt_state.json"),
+            "summary_jsonl": str(Path(tmpdir) / "bardusdt_events.jsonl"),
+        }
+        payload.update(overrides)
+        return Namespace(**payload)
+
     @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -376,6 +459,108 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["bootstrap_qty"], 0.0)
         self.assertEqual(report["bootstrap_orders"], [])
         self.assertGreater(len(report["buy_orders"]), 0)
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_blocks_flat_start_when_open_orders_exist(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.3120", "ask_price": "0.3122"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "BARDUSDT", "positionAmt": "0", "entryPrice": "0"},
+            ],
+        }
+        mock_open_orders.return_value = [{"orderId": 12345}]
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(tmpdir)
+            with self.assertRaises(StartupProtectionError):
+                generate_plan_report(args)
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_warm_starts_existing_long_without_bootstrap(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.3120", "ask_price": "0.3122"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "BARDUSDT", "positionAmt": "300", "entryPrice": "0.3000"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(tmpdir)
+            report = generate_plan_report(args)
+            state = json.loads(Path(args.state_path).read_text(encoding="utf-8"))
+
+        self.assertTrue(report["startup_pending"])
+        self.assertTrue(report["warm_start"]["active"])
+        self.assertEqual(report["bootstrap_orders"], [])
+        self.assertEqual(report["bootstrap_qty"], 0.0)
+        self.assertGreater(report["target_base_qty"], report["current_long_qty"])
+        self.assertFalse(state["startup_pending"])
+        self.assertIsNotNone(state["startup_completed_at"])
 
     def test_apply_synthetic_trade_fill_tracks_virtual_long_and_short_books(self) -> None:
         ledger = {
@@ -600,6 +785,55 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["bootstrap_orders"], [])
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_assess_flat_start_guard_blocks_reverse_short_for_long_startup(self) -> None:
+        result = assess_flat_start_guard(
+            strategy_mode="one_way_long",
+            actual_net_qty=-1573.0,
+            open_orders=[],
+            enabled=True,
+        )
+
+        self.assertTrue(result["blocked"])
+        self.assertIn("清空反向空仓", str(result["reason"]))
+        self.assertAlmostEqual(result["reverse_qty"], 1573.0)
+
+    def test_assess_flat_start_guard_blocks_lingering_open_orders(self) -> None:
+        result = assess_flat_start_guard(
+            strategy_mode="one_way_short",
+            actual_net_qty=0.0,
+            open_orders=[{"orderId": 1}, {"orderId": 2}],
+            enabled=True,
+        )
+
+        self.assertTrue(result["blocked"])
+        self.assertIn("撤掉遗留挂单", str(result["reason"]))
+        self.assertEqual(result["open_order_count"], 2)
+
+    def test_apply_warm_start_bootstrap_guard_clears_long_bootstrap_when_inventory_exists(self) -> None:
+        plan = {
+            "bootstrap_qty": 180.0,
+            "bootstrap_long_qty": 180.0,
+            "bootstrap_orders": [{"side": "BUY", "price": 0.05, "qty": 3600, "notional": 180.0, "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "price": 0.049, "qty": 1000, "notional": 49.0, "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "price": 0.051, "qty": 1000, "notional": 51.0, "role": "take_profit"}],
+        }
+
+        result = apply_warm_start_bootstrap_guard(
+            plan=plan,
+            strategy_mode="one_way_long",
+            current_long_qty=300.0,
+            current_short_qty=0.0,
+            startup_pending=True,
+            enabled=True,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["direction"], "long")
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["bootstrap_qty"], 0.0)
+        self.assertEqual(plan["bootstrap_long_qty"], 0.0)
+        self.assertEqual(len(plan["buy_orders"]), 1)
 
     def test_apply_position_controls_respects_external_market_guard_pause(self) -> None:
         plan = {
