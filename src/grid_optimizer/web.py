@@ -8483,6 +8483,13 @@ MONITOR_PAGE = """<!doctype html>
       flex-wrap: wrap;
       margin-bottom: 12px;
     }
+    .runtime-guard-toolbar {
+      margin-top: 0;
+      margin-bottom: 8px;
+    }
+    .runtime-guard-toolbar label {
+      min-width: 220px;
+    }
     .editor-grid {
       display: grid;
       grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
@@ -8880,6 +8887,21 @@ MONITOR_PAGE = """<!doctype html>
         <button id="load_preset_params_btn">载入预设参数</button>
         <button id="apply_params_btn" class="primary">应用参数并启动</button>
       </div>
+      <div class="toolbar runtime-guard-toolbar">
+        <label>起始交易时间
+          <input id="monitor_run_start_time" type="datetime-local" />
+        </label>
+        <label>结束交易时间
+          <input id="monitor_run_end_time" type="datetime-local" />
+        </label>
+        <label>滚动 60 分钟亏损阈值
+          <input id="monitor_rolling_hourly_loss_limit" type="number" min="0" step="0.01" />
+        </label>
+        <label>累计成交额阈值
+          <input id="monitor_max_cumulative_notional" type="number" min="0" step="0.01" />
+        </label>
+      </div>
+      <div class="tiny">这四项会和下方 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
       <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改 JSON。</div>
       <div class="editor-grid">
         <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
@@ -9131,6 +9153,10 @@ MONITOR_PAGE = """<!doctype html>
     const runnerParamsMetaEl = document.getElementById("runner_params_meta");
     const runnerParamsEditorEl = document.getElementById("runner_params_editor");
     const runnerParamsGuideBodyEl = document.getElementById("runner_params_guide_body");
+    const monitorRunStartTimeEl = document.getElementById("monitor_run_start_time");
+    const monitorRunEndTimeEl = document.getElementById("monitor_run_end_time");
+    const monitorRollingHourlyLossLimitEl = document.getElementById("monitor_rolling_hourly_loss_limit");
+    const monitorMaxCumulativeNotionalEl = document.getElementById("monitor_max_cumulative_notional");
     const customGridNameEl = document.getElementById("custom_grid_name");
     const customGridDirectionEl = document.getElementById("custom_grid_direction");
     const customGridLevelModeEl = document.getElementById("custom_grid_level_mode");
@@ -9659,6 +9685,10 @@ MONITOR_PAGE = """<!doctype html>
       max_new_orders: "单轮最多新增多少笔挂单。",
       max_total_notional: "单轮新增挂单总名义上限。",
       sleep_seconds: "循环轮询周期。越小越跟价，但撤改单更频繁。",
+      run_start_time: "允许开始交易的时间。未到时间前会停止交易、撤策略单并进入清仓逻辑。",
+      run_end_time: "允许结束交易的时间。超过时间后会停止交易、撤策略单并进入清仓逻辑。",
+      rolling_hourly_loss_limit: "最近 60 分钟滚动亏损阈值。达到后会自动停机、撤单并清仓。",
+      max_cumulative_notional: "累计成交额阈值。达到后会自动停机、撤单并清仓。",
       cancel_stale: "是否撤掉与当前目标计划不一致的旧单。",
       apply: "是否真实下单。关闭时仅做 dry-run。",
       reset_state: "启动时是否重置本地状态文件。",
@@ -9925,6 +9955,47 @@ MONITOR_PAGE = """<!doctype html>
       }
       const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
       return normalizeRunnerRuntimePaths(payload, selectedSymbol);
+    }
+
+    function readRuntimeGuardConfigFromInputs() {
+      return {
+        run_start_time: fromLocalInputValue(monitorRunStartTimeEl.value),
+        run_end_time: fromLocalInputValue(monitorRunEndTimeEl.value),
+        rolling_hourly_loss_limit: monitorRollingHourlyLossLimitEl.value ? Number(monitorRollingHourlyLossLimitEl.value) : null,
+        max_cumulative_notional: monitorMaxCumulativeNotionalEl.value ? Number(monitorMaxCumulativeNotionalEl.value) : null,
+      };
+    }
+
+    function syncRuntimeGuardInputsFromConfig(config) {
+      const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
+      monitorRunStartTimeEl.value = toLocalInputValue(source.run_start_time);
+      monitorRunEndTimeEl.value = toLocalInputValue(source.run_end_time);
+      monitorRollingHourlyLossLimitEl.value = source.rolling_hourly_loss_limit ?? "";
+      monitorMaxCumulativeNotionalEl.value = source.max_cumulative_notional ?? "";
+    }
+
+    function mergeRuntimeGuardConfig(payload) {
+      const source = (payload && typeof payload === "object" && !Array.isArray(payload)) ? payload : {};
+      return {
+        ...source,
+        ...readRuntimeGuardConfigFromInputs(),
+      };
+    }
+
+    function syncRuntimeGuardInputsToEditor() {
+      let payload = latestRunnerEditorConfig ? { ...latestRunnerEditorConfig } : {};
+      try {
+        payload = readRunnerEditorConfigFromTextarea();
+      } catch (_err) {
+      }
+      const nextConfig = normalizeRunnerRuntimePaths(
+        mergeRuntimeGuardConfig(payload),
+        symbolEl.value.trim().toUpperCase() || "NIGHTUSDT"
+      );
+      latestRunnerEditorConfig = nextConfig;
+      runnerParamsEditorEl.value = JSON.stringify(nextConfig, null, 2);
+      renderRunnerParamGuide(nextConfig);
+      runnerParamsMetaEl.textContent = "运行保护参数已同步到 JSON，可继续修改后应用。";
     }
 
     async function ensureEditorConfigForAlert() {
@@ -10395,6 +10466,18 @@ MONITOR_PAGE = """<!doctype html>
       const lines = [
         `每 ${fmtGuideNumber(config.sleep_seconds, 2)} 秒重算一次目标计划，再和当前挂单做 diff。`,
       ];
+      if (config.run_start_time) {
+        lines.push(`run_start_time=${fmtTs(config.run_start_time)} 之前不会继续交易；如果当前已有仓位或挂单，会先撤策略单并转入清仓。`);
+      }
+      if (config.run_end_time) {
+        lines.push(`run_end_time=${fmtTs(config.run_end_time)} 之后会自动停止交易、撤策略单并转入清仓。`);
+      }
+      if (asGuideNumber(config.rolling_hourly_loss_limit) > 0) {
+        lines.push(`最近 60 分钟滚动亏损达到 ${fmtGuideNotional(config.rolling_hourly_loss_limit)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (asGuideNumber(config.max_cumulative_notional) > 0) {
+        lines.push(`累计成交额达到 ${fmtGuideNotional(config.max_cumulative_notional)} 时，会直接停机并执行撤单清仓。`);
+      }
       if (config.cancel_stale === false) {
         lines.push("当前 cancel_stale=false：如果新计划和旧挂单不一致，提交器会直接拒绝执行，而不是替你撤单。");
       } else {
@@ -10497,7 +10580,9 @@ MONITOR_PAGE = """<!doctype html>
         if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
           throw new Error("参数编辑器内容必须是 JSON 对象");
         }
-        renderRunnerParamGuide(payload);
+        latestRunnerEditorConfig = normalizeRunnerRuntimePaths(payload, symbolEl.value.trim().toUpperCase() || "NIGHTUSDT");
+        syncRuntimeGuardInputsFromConfig(latestRunnerEditorConfig);
+        renderRunnerParamGuide(latestRunnerEditorConfig);
       } catch (err) {
         runnerParamsGuideBodyEl.innerHTML = `
           <div class="strategy-guide-empty">JSON 解析失败：${escapeHtml(String(err))}</div>
@@ -10508,6 +10593,7 @@ MONITOR_PAGE = """<!doctype html>
     function setRunnerEditorConfig(rawConfig, sourceLabel = "") {
       latestRunnerEditorConfig = normalizeRunnerEditorConfig(rawConfig, rawConfig && rawConfig.strategy_profile ? String(rawConfig.strategy_profile) : "");
       runnerParamsEditorEl.value = JSON.stringify(latestRunnerEditorConfig, null, 2);
+      syncRuntimeGuardInputsFromConfig(latestRunnerEditorConfig);
       runnerParamsMetaEl.textContent = sourceLabel || "参数已载入，可直接修改 JSON 后应用。";
       renderRunnerParamGuide(latestRunnerEditorConfig);
     }
@@ -10565,16 +10651,13 @@ MONITOR_PAGE = """<!doctype html>
         : String((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
       let payload;
       try {
-        payload = JSON.parse(runnerParamsEditorEl.value || "{}");
+        payload = readRunnerEditorConfigFromTextarea();
       } catch (err) {
         runnerParamsMetaEl.textContent = `JSON 解析失败: ${err}`;
         return;
       }
-      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        runnerParamsMetaEl.textContent = "参数编辑器内容必须是 JSON 对象。";
-        return;
-      }
       const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      payload = mergeRuntimeGuardConfig(payload);
       payload.symbol = selectedSymbol;
       if (!payload.strategy_profile) {
         payload.strategy_profile = fallbackProfile;
@@ -10887,6 +10970,22 @@ MONITOR_PAGE = """<!doctype html>
       const dt = new Date(v);
       if (Number.isNaN(dt.getTime())) return String(v);
       return dt.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function toLocalInputValue(value) {
+      if (!value) return "";
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) return "";
+      const pad = (num) => String(num).padStart(2, "0");
+      return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    }
+
+    function fromLocalInputValue(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return null;
+      const dt = new Date(raw);
+      if (Number.isNaN(dt.getTime())) return null;
+      return dt.toISOString();
     }
 
     function escapeHtml(s) {
@@ -11481,6 +11580,8 @@ MONITOR_PAGE = """<!doctype html>
     loadPresetParamsBtn.addEventListener("click", loadPresetConfigToEditor);
     applyParamsBtn.addEventListener("click", applyRunnerParams);
     runnerParamsEditorEl.addEventListener("input", syncRunnerParamGuideFromEditor);
+    [monitorRunStartTimeEl, monitorRunEndTimeEl, monitorRollingHourlyLossLimitEl, monitorMaxCumulativeNotionalEl]
+      .forEach((el) => el.addEventListener("change", syncRuntimeGuardInputsToEditor));
     alertBoxEl.addEventListener("click", async (event) => {
       const button = event.target.closest("[data-alert-action]");
       if (!button) return;

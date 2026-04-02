@@ -63,6 +63,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("XAUT 三态状态", MONITOR_PAGE)
         self.assertIn("XAUT 三态原因", MONITOR_PAGE)
 
+    def test_monitor_page_includes_runtime_guard_inputs(self) -> None:
+        self.assertIn('id="monitor_run_start_time"', MONITOR_PAGE)
+        self.assertIn('id="monitor_run_end_time"', MONITOR_PAGE)
+        self.assertIn('id="monitor_rolling_hourly_loss_limit"', MONITOR_PAGE)
+        self.assertIn('id="monitor_max_cumulative_notional"', MONITOR_PAGE)
+
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
         if "getSelectedSymbol(" in MONITOR_PAGE:
             self.assertIn("function getSelectedSymbol()", MONITOR_PAGE)
