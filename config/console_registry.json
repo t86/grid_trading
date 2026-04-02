@@ -28,16 +28,38 @@
   ],
   "accounts": [
     {
-      "id": "acct_main_a",
-      "label": "Main Account A",
-      "server_id": "srv_150",
-      "kind": "futures",
+      "id": "tl",
+      "label": "tl",
+      "server_id": "srv_111",
+      "kind": "mixed",
       "priority": 100,
       "enabled": true,
-      "default_symbols": ["BARDUSDT", "XAUTUSDT"],
-      "competition_symbols": ["KAT", "NIGHT", "BARD", "XAUT"],
+      "default_symbols": ["NIGHTUSDT"],
+      "competition_symbols": ["KAT", "NIGHT", "BARD", "XAUT", "BASED"],
       "pages": ["/monitor", "/strategies", "/competition_board"],
       "notes": "Default console account"
+    },
+    {
+      "id": "estar",
+      "label": "estar",
+      "server_id": "srv_111",
+      "kind": "mixed",
+      "priority": 90,
+      "enabled": true,
+      "default_symbols": ["NIGHTUSDT"],
+      "competition_symbols": ["KAT", "NIGHT", "BARD", "XAUT", "BASED"],
+      "pages": ["/monitor", "/strategies", "/competition_board"]
+    },
+    {
+      "id": "lb",
+      "label": "lb",
+      "server_id": "srv_111",
+      "kind": "mixed",
+      "priority": 80,
+      "enabled": true,
+      "default_symbols": ["NIGHTUSDT"],
+      "competition_symbols": ["KAT", "NIGHT", "BARD", "XAUT", "BASED"],
+      "pages": ["/monitor", "/strategies", "/competition_board"]
     }
   ],
   "competition_source": {
