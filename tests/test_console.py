@@ -6,8 +6,10 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import requests
+
 from grid_optimizer.console_registry import load_console_registry
-from grid_optimizer.console_overview import build_console_overview
+from grid_optimizer.console_overview import _fetch_remote_json, build_console_overview
 from grid_optimizer.console_page import build_console_page
 from grid_optimizer.web import (
     _console_overview_payload,
@@ -384,7 +386,15 @@ class ConsoleOverviewTests(unittest.TestCase):
                 "ok": True,
                 "snapshot": {
                     "boards": [
-                        {"symbol": "KAT", "market": "spot", "label": "KAT activity"},
+                        {
+                            "symbol": "KAT",
+                            "market": "spot",
+                            "label": "KAT activity",
+                            "url": "https://example.test/kat",
+                            "activity_end_at": "2026-04-02T09:00:00+08:00",
+                            "current_floor_value_text": "1044.96",
+                            "top_rows": [1, 2, 3],
+                        },
                         {"symbol": "ENSO", "market": "futures", "label": "ENSO activity"},
                     ]
                 },
@@ -399,6 +409,9 @@ class ConsoleOverviewTests(unittest.TestCase):
         self.assertEqual(overview["links"]["competition_board"], "http://node-a:8788/competition_board")
         self.assertEqual(len(overview["competitions"]), 1)
         self.assertEqual(overview["competitions"][0]["symbol"], "KAT")
+        self.assertEqual(overview["competitions"][0]["url"], "https://example.test/kat")
+        self.assertEqual(overview["competitions"][0]["current_floor"], "1044.96")
+        self.assertNotIn("board", overview["competitions"][0])
 
     @patch("grid_optimizer.console_overview._fetch_remote_json")
     def test_build_console_overview_degrades_when_health_fails(self, mock_fetch_remote_json) -> None:
@@ -468,6 +481,37 @@ class ConsoleOverviewTests(unittest.TestCase):
         self.assertEqual(overview["competitions"], [])
         self.assertEqual(overview["warnings"], [])
         self.assertEqual(mock_fetch_remote_json.call_count, 1)
+
+
+class ConsoleRemoteFetchTests(unittest.TestCase):
+    @patch.dict(
+        "os.environ",
+        {
+            "GRID_NODE_SRV_150_USERNAME": "grid",
+            "GRID_NODE_SRV_150_PASSWORD": "secret",
+        },
+        clear=False,
+    )
+    @patch("grid_optimizer.console_overview.requests.get")
+    def test_fetch_remote_json_retries_single_read_timeout(self, mock_get) -> None:
+        response = unittest.mock.Mock()
+        response.json.return_value = {"ok": True}
+        response.raise_for_status.return_value = None
+        mock_get.side_effect = [
+            requests.ReadTimeout("first timeout"),
+            response,
+        ]
+
+        payload = _fetch_remote_json(
+            {
+                "id": "srv_150",
+                "base_url": "http://node-a:8788",
+            },
+            "/api/health",
+        )
+
+        self.assertEqual(payload, {"ok": True})
+        self.assertEqual(mock_get.call_count, 2)
 
 
 class ConsolePageTests(unittest.TestCase):

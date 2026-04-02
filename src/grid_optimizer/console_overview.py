@@ -16,6 +16,8 @@ _KNOWN_LINK_PATHS = {
     "/competition_board": "competition_board",
     "/basis": "basis",
 }
+_REMOTE_TIMEOUT_SECONDS = 4
+_READ_TIMEOUT_RETRIES = 1
 
 
 def build_console_overview(registry: dict[str, Any], account_id: str) -> dict[str, Any]:
@@ -79,17 +81,27 @@ def _fetch_remote_json(
     token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
     base_url = str(server.get("base_url", "")).strip().rstrip("/")
     url = f"{base_url}{path}"
-    response = requests.get(
-        url,
-        headers={"Authorization": f"Basic {token}", "Accept": "application/json"},
-        params=params or None,
-        timeout=4,
-    )
-    response.raise_for_status()
-    payload = response.json()
-    if not isinstance(payload, dict):
-        raise RuntimeError(f"Unexpected JSON payload from {url}")
-    return payload
+    last_error: Exception | None = None
+    for attempt in range(_READ_TIMEOUT_RETRIES + 1):
+        try:
+            response = requests.get(
+                url,
+                headers={"Authorization": f"Basic {token}", "Accept": "application/json"},
+                params=params or None,
+                timeout=_REMOTE_TIMEOUT_SECONDS,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise RuntimeError(f"Unexpected JSON payload from {url}")
+            return payload
+        except requests.ReadTimeout as exc:
+            last_error = exc
+            if attempt >= _READ_TIMEOUT_RETRIES:
+                raise
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError(f"Unreachable remote fetch state for {url}")
 
 
 def _fetch_health(server: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
@@ -181,7 +193,9 @@ def _fetch_competitions(
                 "symbol": symbol,
                 "market": board.get("market"),
                 "label": board.get("label") or board.get("tabLabel") or symbol,
-                "board": board,
+                "url": board.get("url"),
+                "activity_end_at": board.get("activity_end_at"),
+                "current_floor": board.get("current_floor_value_text") or board.get("current_floor_value"),
             }
         )
     return competitions
