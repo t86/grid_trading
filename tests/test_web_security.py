@@ -122,6 +122,23 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(payload["auto_regime_enabled"])
         self.assertEqual(payload["auto_regime_confirm_cycles"], 2)
 
+    def test_runner_preset_payload_applies_bard_volume_long_v2_profile(self) -> None:
+        payload = _runner_preset_payload("bard_volume_long_v2", {"symbol": "BARDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "bard_volume_long_v2")
+        self.assertEqual(payload["symbol"], "BARDUSDT")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertTrue(payload["flat_start_enabled"])
+        self.assertTrue(payload["warm_start_enabled"])
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertTrue(payload["excess_inventory_reduce_only_enabled"])
+        self.assertEqual(payload["buy_levels"], 5)
+        self.assertEqual(payload["sell_levels"], 11)
+        self.assertEqual(payload["base_position_notional"], 120.0)
+
+    def test_runner_preset_payload_rejects_bard_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BARDUSDT"):
+            _runner_preset_payload("bard_volume_long_v2", {"symbol": "NIGHTUSDT"})
+
     def test_runner_preset_payload_applies_xaut_long_adaptive_profile(self) -> None:
         payload = _runner_preset_payload("xaut_long_adaptive_v1", {"symbol": "XAUTUSDT"})
         self.assertEqual(payload["strategy_profile"], "xaut_long_adaptive_v1")
