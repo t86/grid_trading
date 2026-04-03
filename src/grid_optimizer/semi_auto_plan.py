@@ -80,6 +80,29 @@ def _round_to_nearest_step(value: float, step: float | None) -> float:
     return float(units * step_dec)
 
 
+def _shift_center_by_minimum_increment(
+    *,
+    center_price: float,
+    shift_size: float,
+    tick_size: float | None,
+    direction: str,
+) -> float:
+    delta = abs(float(shift_size))
+    if direction == "down":
+        candidate = _round_to_nearest_step(center_price - delta, tick_size)
+        if abs(candidate - center_price) <= 1e-12 and tick_size is not None and tick_size > 0:
+            candidate = _round_to_nearest_step(center_price - float(tick_size), tick_size)
+    elif direction == "up":
+        candidate = _round_to_nearest_step(center_price + delta, tick_size)
+        if abs(candidate - center_price) <= 1e-12 and tick_size is not None and tick_size > 0:
+            candidate = _round_to_nearest_step(center_price + float(tick_size), tick_size)
+    else:
+        raise ValueError(f"Unsupported direction: {direction}")
+    if abs(candidate - center_price) <= 1e-12:
+        raise ValueError("effective center shift is zero after tick rounding")
+    return candidate
+
+
 def _order_key(side: str, price: float, qty: float, position_side: str | None = None) -> str:
     normalized_position_side = str(position_side or "BOTH").upper().strip() or "BOTH"
     return f"{side.upper()}:{normalized_position_side}:{price:.10f}:{qty:.10f}"
@@ -129,12 +152,24 @@ def shift_center_price(
     up_trigger = step_price * up_trigger_steps
     shift_size = step_price * shift_steps
 
-    while mid_price <= center - down_trigger:
-        center = _round_to_nearest_step(center - shift_size, tick_size)
-        moves.append({"direction": "down", "new_center_price": center})
-    while mid_price >= center + up_trigger:
-        center = _round_to_nearest_step(center + shift_size, tick_size)
-        moves.append({"direction": "up", "new_center_price": center})
+    if mid_price <= center - down_trigger:
+        while mid_price <= center - down_trigger:
+            center = _shift_center_by_minimum_increment(
+                center_price=center,
+                shift_size=shift_size,
+                tick_size=tick_size,
+                direction="down",
+            )
+            moves.append({"direction": "down", "new_center_price": center})
+    elif mid_price >= center + up_trigger:
+        while mid_price >= center + up_trigger:
+            center = _shift_center_by_minimum_increment(
+                center_price=center,
+                shift_size=shift_size,
+                tick_size=tick_size,
+                direction="up",
+            )
+            moves.append({"direction": "up", "new_center_price": center})
     return center, moves
 
 
