@@ -1,7 +1,12 @@
 from __future__ import annotations
 
 import base64
+import copy
+import json
 import os
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import Any
 
@@ -18,6 +23,9 @@ _KNOWN_LINK_PATHS = {
 }
 _REMOTE_TIMEOUT_SECONDS = 4
 _READ_TIMEOUT_RETRIES = 1
+_OVERVIEW_CACHE_TTL_SECONDS = 10
+_OVERVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_OVERVIEW_CACHE_LOCK = threading.Lock()
 
 
 def build_console_overview(registry: dict[str, Any], account_id: str) -> dict[str, Any]:
@@ -34,14 +42,30 @@ def build_console_overview(registry: dict[str, Any], account_id: str) -> dict[st
     if server is None:
         raise ValueError(f"Unknown server_id for account {account_id}: {account.get('server_id')}")
 
+    cache_key = _overview_cache_key(registry, account, server)
+    cached = _get_cached_console_overview(cache_key)
+    if cached is not None:
+        return cached
+
     warnings: list[str] = []
-    health = _fetch_health(server, warnings)
-    futures = _fetch_market_overview(server, account, warnings, market="futures")
-    spot = _fetch_market_overview(server, account, warnings, market="spot")
-    competitions = _fetch_competitions(registry, account, warnings)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_health = executor.submit(_run_overview_section, _fetch_health, server)
+        future_futures = executor.submit(_run_overview_section, _fetch_market_overview, server, account, market="futures")
+        future_spot = executor.submit(_run_overview_section, _fetch_market_overview, server, account, market="spot")
+        future_competitions = executor.submit(_run_overview_section, _fetch_competitions, registry, account)
+
+        health, health_warnings = future_health.result()
+        futures, futures_warnings = future_futures.result()
+        spot, spot_warnings = future_spot.result()
+        competitions, competitions_warnings = future_competitions.result()
+
+    warnings.extend(health_warnings)
+    warnings.extend(futures_warnings)
+    warnings.extend(spot_warnings)
+    warnings.extend(competitions_warnings)
     links = build_console_links(server, account)
 
-    return {
+    overview = {
         "ok": True,
         "account": account,
         "server": server,
@@ -54,6 +78,8 @@ def build_console_overview(registry: dict[str, Any], account_id: str) -> dict[st
         "warnings": warnings,
         "fetched_at": datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
     }
+    _set_cached_console_overview(cache_key, overview)
+    return copy.deepcopy(overview)
 
 
 def build_console_links(server: dict[str, Any], account: dict[str, Any]) -> dict[str, str]:
@@ -102,6 +128,12 @@ def _fetch_remote_json(
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"Unreachable remote fetch state for {url}")
+
+
+def _run_overview_section(func: Any, *args: Any, **kwargs: Any) -> tuple[Any, list[str]]:
+    section_warnings: list[str] = []
+    result = func(*args, section_warnings, **kwargs)
+    return result, section_warnings
 
 
 def _fetch_health(server: dict[str, Any], warnings: list[str]) -> dict[str, Any]:
@@ -249,3 +281,53 @@ def _build_summary(
         "warning_count": len(warnings),
         "primary_status": "degraded" if warnings else "healthy",
     }
+
+
+def _overview_cache_key(
+    registry: dict[str, Any],
+    account: dict[str, Any],
+    server: dict[str, Any],
+) -> str:
+    competition_source = registry.get("competition_source") or {}
+    key_payload = {
+        "account": {
+            "id": account.get("id"),
+            "server_id": account.get("server_id"),
+            "kind": account.get("kind"),
+            "default_symbols": account.get("default_symbols") or [],
+            "competition_symbols": account.get("competition_symbols") or [],
+            "pages": account.get("pages") or [],
+        },
+        "server": {
+            "id": server.get("id"),
+            "base_url": server.get("base_url"),
+        },
+        "competition_source": {
+            "server_id": competition_source.get("server_id"),
+            "path": competition_source.get("path"),
+        },
+    }
+    return json.dumps(key_payload, sort_keys=True, ensure_ascii=False)
+
+
+def _get_cached_console_overview(cache_key: str) -> dict[str, Any] | None:
+    now = time.monotonic()
+    with _OVERVIEW_CACHE_LOCK:
+        cached = _OVERVIEW_CACHE.get(cache_key)
+        if cached is None:
+            return None
+        cached_at, payload = cached
+        if now - cached_at > _OVERVIEW_CACHE_TTL_SECONDS:
+            _OVERVIEW_CACHE.pop(cache_key, None)
+            return None
+        return copy.deepcopy(payload)
+
+
+def _set_cached_console_overview(cache_key: str, overview: dict[str, Any]) -> None:
+    with _OVERVIEW_CACHE_LOCK:
+        _OVERVIEW_CACHE[cache_key] = (time.monotonic(), copy.deepcopy(overview))
+
+
+def _clear_console_overview_cache() -> None:
+    with _OVERVIEW_CACHE_LOCK:
+        _OVERVIEW_CACHE.clear()

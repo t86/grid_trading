@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import multiprocessing as mp
 import unittest
 
 from grid_optimizer.semi_auto_plan import (
@@ -11,7 +12,31 @@ from grid_optimizer.semi_auto_plan import (
 )
 
 
+def _shift_center_price_in_subprocess(queue: mp.Queue, kwargs: dict) -> None:
+    try:
+        queue.put(("ok", shift_center_price(**kwargs)))
+    except Exception as exc:  # pragma: no cover - surfaced to parent assertion
+        queue.put(("error", repr(exc)))
+
+
 class SemiAutoPlanTests(unittest.TestCase):
+    def _run_shift_center_price(self, **kwargs):
+        ctx = mp.get_context("spawn")
+        queue = ctx.Queue()
+        proc = ctx.Process(target=_shift_center_price_in_subprocess, args=(queue, kwargs))
+        proc.start()
+        proc.join(timeout=1.0)
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=1.0)
+            self.fail("shift_center_price did not terminate")
+        if queue.empty():
+            self.fail("shift_center_price produced no result")
+        status, payload = queue.get_nowait()
+        if status != "ok":
+            self.fail(payload)
+        return payload
+
     def test_shift_center_price_moves_down_and_up_in_steps(self) -> None:
         new_center, moves = shift_center_price(
             center_price=0.05050,
@@ -39,6 +64,36 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertAlmostEqual(new_center, 0.05048, places=8)
         self.assertEqual(len(moves), 1)
+        self.assertEqual(moves[0]["direction"], "up")
+
+    def test_shift_center_price_terminates_when_tick_size_exceeds_shift_size_down(self) -> None:
+        new_center, moves = self._run_shift_center_price(
+            center_price=0.0101,
+            mid_price=0.01004,
+            step_price=0.00002,
+            tick_size=0.0001,
+            down_trigger_steps=2,
+            up_trigger_steps=2,
+            shift_steps=2,
+        )
+
+        self.assertAlmostEqual(new_center, 0.0100, places=8)
+        self.assertGreaterEqual(len(moves), 1)
+        self.assertEqual(moves[0]["direction"], "down")
+
+    def test_shift_center_price_terminates_when_tick_size_exceeds_shift_size_up(self) -> None:
+        new_center, moves = self._run_shift_center_price(
+            center_price=0.0100,
+            mid_price=0.01006,
+            step_price=0.00002,
+            tick_size=0.0001,
+            down_trigger_steps=2,
+            up_trigger_steps=2,
+            shift_steps=2,
+        )
+
+        self.assertAlmostEqual(new_center, 0.0101, places=8)
+        self.assertGreaterEqual(len(moves), 1)
         self.assertEqual(moves[0]["direction"], "up")
 
     def test_build_micro_grid_plan_uses_inventory_for_sell_orders_and_bootstrap(self) -> None:

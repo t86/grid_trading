@@ -24,6 +24,25 @@ from grid_optimizer.data import (
 
 
 class DataFetchTests(unittest.TestCase):
+    class _FakeResponse:
+        def __init__(self, payload: bytes, *, headers: dict[str, str] | None = None) -> None:
+            self._payload = payload
+            self._offset = 0
+            self.headers = headers or {}
+
+        def __enter__(self) -> "DataFetchTests._FakeResponse":
+            return self
+
+        def __exit__(self, exc_type, exc, tb) -> None:
+            return None
+
+        def read(self, size: int = -1) -> bytes:
+            if size is None or size < 0:
+                size = len(self._payload) - self._offset
+            chunk = self._payload[self._offset : self._offset + size]
+            self._offset += len(chunk)
+            return chunk
+
     def test_prefer_ipv4_nested_context_is_reentrant_and_restores_socket(self) -> None:
         original = socket.getaddrinfo
 
@@ -55,6 +74,48 @@ class DataFetchTests(unittest.TestCase):
             _http_request_json("https://fapi.binance.com/fapi/v1/marginType", {}, method="POST")
 
         self.assertIn("No need to change margin type", str(ctx.exception))
+
+    @patch("grid_optimizer.data.MAX_HTTP_RESPONSE_BYTES", 64, create=True)
+    @patch("grid_optimizer.data.urlopen")
+    def test_http_request_json_rejects_large_content_length(self, mock_urlopen) -> None:
+        payload = b'{"data":"' + (b"x" * 100) + b'"}'
+        mock_urlopen.return_value = self._FakeResponse(
+            payload,
+            headers={"Content-Length": str(len(payload))},
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _http_request_json("https://example.com/huge", {})
+
+        self.assertIn("too large", str(ctx.exception).lower())
+
+    @patch("grid_optimizer.data.MAX_HTTP_RESPONSE_BYTES", 64, create=True)
+    @patch("grid_optimizer.data.urlopen")
+    def test_http_request_json_rejects_large_chunked_body(self, mock_urlopen) -> None:
+        payload = b'{"data":"' + (b"y" * 100) + b'"}'
+        mock_urlopen.return_value = self._FakeResponse(payload)
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _http_request_json("https://example.com/chunked", {})
+
+        self.assertIn("too large", str(ctx.exception).lower())
+
+    @patch("grid_optimizer.data.MAX_HTTP_RESPONSE_BYTES", 64, create=True)
+    @patch("grid_optimizer.data.urlopen")
+    def test_http_request_json_rejects_large_http_error_body(self, mock_urlopen) -> None:
+        payload = b'{"code":-1000,"msg":"' + (b"z" * 100) + b'"}'
+        mock_urlopen.side_effect = HTTPError(
+            url="https://example.com/huge-error",
+            code=502,
+            msg="Bad Gateway",
+            hdrs={"Content-Length": str(len(payload))},
+            fp=BytesIO(payload),
+        )
+
+        with self.assertRaises(RuntimeError) as ctx:
+            _http_request_json("https://example.com/huge-error", {})
+
+        self.assertIn("too large", str(ctx.exception).lower())
 
     def test_second_level_interval_range_limit(self) -> None:
         start = datetime(2025, 1, 1, tzinfo=timezone.utc)

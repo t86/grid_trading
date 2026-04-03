@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -9,7 +10,11 @@ from unittest.mock import patch
 import requests
 
 from grid_optimizer.console_registry import load_console_registry
-from grid_optimizer.console_overview import _fetch_remote_json, build_console_overview
+from grid_optimizer.console_overview import (
+    _clear_console_overview_cache,
+    _fetch_remote_json,
+    build_console_overview,
+)
 from grid_optimizer.console_page import build_console_page
 from grid_optimizer.web import (
     _console_overview_payload,
@@ -349,6 +354,9 @@ class ConsoleRegistryTests(unittest.TestCase):
 
 
 class ConsoleOverviewTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _clear_console_overview_cache()
+
     def _registry(self) -> dict[str, object]:
         account = {
             "id": "acct_main_a",
@@ -482,8 +490,71 @@ class ConsoleOverviewTests(unittest.TestCase):
         self.assertEqual(overview["warnings"], [])
         self.assertEqual(mock_fetch_remote_json.call_count, 1)
 
+    @patch("grid_optimizer.console_overview._fetch_competitions")
+    @patch("grid_optimizer.console_overview._fetch_market_overview")
+    @patch("grid_optimizer.console_overview._fetch_health")
+    def test_build_console_overview_fetches_sections_concurrently(
+        self,
+        mock_fetch_health,
+        mock_fetch_market_overview,
+        mock_fetch_competitions,
+    ) -> None:
+        def slow_health(server, warnings):
+            time.sleep(0.2)
+            return {"ok": True, "status": "online", "error": None}
+
+        def slow_market(server, account, warnings, *, market):
+            time.sleep(0.2)
+            return [{"symbol": f"{market}-item", "ok": True, "status": "online", "snapshot": {}}]
+
+        def slow_competitions(registry, account, warnings):
+            time.sleep(0.2)
+            return [{"symbol": "KAT", "market": "spot", "label": "KAT activity"}]
+
+        mock_fetch_health.side_effect = slow_health
+        mock_fetch_market_overview.side_effect = slow_market
+        mock_fetch_competitions.side_effect = slow_competitions
+
+        started = time.perf_counter()
+        overview = build_console_overview(self._registry(), "acct_main_a")
+        elapsed = time.perf_counter() - started
+
+        self.assertTrue(overview["ok"])
+        self.assertLess(elapsed, 0.45)
+
+    @patch("grid_optimizer.console_overview._fetch_competitions")
+    @patch("grid_optimizer.console_overview._fetch_market_overview")
+    @patch("grid_optimizer.console_overview._fetch_health")
+    def test_build_console_overview_uses_short_ttl_cache(
+        self,
+        mock_fetch_health,
+        mock_fetch_market_overview,
+        mock_fetch_competitions,
+    ) -> None:
+        mock_fetch_health.return_value = {"ok": True, "status": "online", "error": None}
+        mock_fetch_market_overview.side_effect = [
+            [{"symbol": "BARDUSDT", "ok": True, "status": "running", "snapshot": {}}],
+            [],
+        ]
+        mock_fetch_competitions.return_value = [{"symbol": "KAT", "market": "spot", "label": "KAT activity"}]
+
+        with patch("grid_optimizer.console_overview.time.monotonic", side_effect=[100.0, 100.1, 100.5]):
+            first = build_console_overview(self._registry(), "acct_main_a")
+            second = build_console_overview(self._registry(), "acct_main_a")
+
+        self.assertTrue(first["ok"])
+        self.assertTrue(second["ok"])
+        self.assertEqual(mock_fetch_health.call_count, 1)
+        self.assertEqual(mock_fetch_market_overview.call_count, 2)
+        self.assertEqual(mock_fetch_competitions.call_count, 1)
+        self.assertEqual(first["summary"], second["summary"])
+        self.assertEqual(first["competitions"], second["competitions"])
+
 
 class ConsoleRemoteFetchTests(unittest.TestCase):
+    def setUp(self) -> None:
+        _clear_console_overview_cache()
+
     @patch.dict(
         "os.environ",
         {
