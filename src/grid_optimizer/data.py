@@ -63,6 +63,8 @@ _CONTRACT_TYPE_ALIASES = {
     "delivery": "coinm",
 }
 DEFAULT_TIMEOUT_SECONDS = 30
+MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
+HTTP_READ_CHUNK_BYTES = 64 * 1024
 SYMBOL_CACHE_TTL_SECONDS = 6 * 3600
 COINM_MAX_KLINE_WINDOW_MS = 200 * 24 * 60 * 60 * 1000
 FUNDING_DEFAULT_STEP_MS = 8 * 60 * 60 * 1000
@@ -151,6 +153,49 @@ def _market_api_urls(contract_type: str | None) -> dict[str, str]:
     return _COINM_URLS
 
 
+def _response_header_value(response: Any, name: str) -> str | None:
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    if hasattr(headers, "get"):
+        value = headers.get(name)
+    elif isinstance(headers, dict):
+        value = headers.get(name)
+    else:
+        value = None
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _read_http_response_bytes(response: Any, *, url: str) -> bytes:
+    content_length = _response_header_value(response, "Content-Length")
+    if content_length is not None:
+        try:
+            expected_size = int(content_length)
+        except ValueError:
+            expected_size = None
+        if expected_size is not None and expected_size > MAX_HTTP_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"HTTP response from {url} is too large: "
+                f"{expected_size} bytes exceeds {MAX_HTTP_RESPONSE_BYTES}"
+            )
+
+    payload = bytearray()
+    while True:
+        chunk = response.read(HTTP_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        if len(payload) + len(chunk) > MAX_HTTP_RESPONSE_BYTES:
+            raise RuntimeError(
+                f"HTTP response from {url} is too large: "
+                f"exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+            )
+        payload.extend(chunk)
+    return bytes(payload)
+
+
 def _http_request_json(
     url: str,
     params: dict[str, str | int],
@@ -173,9 +218,9 @@ def _http_request_json(
     try:
         with _prefer_ipv4():
             with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-                payload = response.read().decode("utf-8")
+                payload = _read_http_response_bytes(response, url=full_url).decode("utf-8")
     except HTTPError as exc:
-        payload = exc.read().decode("utf-8", errors="replace")
+        payload = _read_http_response_bytes(exc, url=full_url).decode("utf-8", errors="replace")
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:

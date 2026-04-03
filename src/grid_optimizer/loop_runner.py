@@ -4233,13 +4233,13 @@ def main() -> None:
                 consecutive_errors = 0
                 if runtime_guard_summary.get("stop_triggered"):
                     break
-                if args.reset_state:
-                    args.reset_state = False
                 if args.iterations and cycle >= args.iterations:
                     break
                 time.sleep(args.sleep_seconds)
                 continue
             plan_report = generate_plan_report(args)
+            if args.reset_state:
+                args.reset_state = False
             _write_json(plan_path, plan_report)
             _append_jsonl(
                 audit_paths["plan_audit"],
@@ -4489,8 +4489,6 @@ def main() -> None:
                     f"Stopped after {consecutive_errors} consecutive errors. Inspect {summary_path} and {submit_report_path}."
                 ) from exc
 
-        if args.reset_state:
-            args.reset_state = False
         if args.iterations and cycle >= args.iterations:
             break
         time.sleep(args.sleep_seconds)
