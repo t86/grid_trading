@@ -2,7 +2,7 @@
   "servers": [
     {
       "id": "srv_150",
-      "label": "Main Entry A",
+      "label": "主入口 A",
       "base_url": "http://43.131.232.150:8788",
       "location": "Singapore",
       "enabled": true,
@@ -11,7 +11,7 @@
     },
     {
       "id": "srv_114",
-      "label": "Main Entry B",
+      "label": "主入口 B",
       "base_url": "http://43.155.163.114:8788",
       "location": "Singapore",
       "enabled": true,
@@ -19,7 +19,7 @@
     },
     {
       "id": "srv_111",
-      "label": "Online Entry",
+      "label": "在线入口",
       "base_url": "http://43.155.136.111:8787",
       "location": "Oracle",
       "enabled": true,

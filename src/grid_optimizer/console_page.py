@@ -5,11 +5,11 @@ __all__ = ["build_console_page"]
 
 def build_console_page() -> str:
     return """<!doctype html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Grid Console</title>
+  <title>统一控制台</title>
   <style>
     :root {
       color-scheme: light;
@@ -427,21 +427,21 @@ def build_console_page() -> str:
   <header class="terminal-bar">
     <div class="terminal-meta">
       <div class="terminal-title-row">
-        <strong class="terminal-title" id="current-account-label">Console</strong>
-        <span class="status-chip is-degraded" id="health-chip">Booting</span>
+        <strong class="terminal-title" id="current-account-label">控制台</strong>
+        <span class="status-chip is-degraded" id="health-chip">启动中</span>
       </div>
-      <div class="terminal-subtitle" id="console-subtitle">Waiting for account context</div>
+      <div class="terminal-subtitle" id="console-subtitle">等待账号上下文</div>
     </div>
     <div class="terminal-actions">
-      <button id="open-account-sheet" type="button">Accounts</button>
-      <button class="primary-action" id="refresh-console" type="button">Refresh</button>
+      <button id="open-account-sheet" type="button">账号</button>
+      <button class="primary-action" id="refresh-console" type="button">刷新</button>
     </div>
   </header>
   <main>
     <section class="card terminal-overview" id="overview" aria-labelledby="overview-title">
       <div class="section-head">
-        <h1 class="section-title" id="overview-title">Overview</h1>
-        <span class="section-caption" id="overview-caption">Terminal state</span>
+        <h1 class="section-title" id="overview-title">总览</h1>
+        <span class="section-caption" id="overview-caption">首页概览</span>
       </div>
       <div class="overview-grid" id="overview-panel"></div>
       <div class="overview-meta" id="overview-meta"></div>
@@ -449,8 +449,8 @@ def build_console_page() -> str:
 
     <section class="card" id="runtime" aria-labelledby="runtime-title">
       <div class="section-head">
-        <h2 class="section-title" id="runtime-title">Runtime</h2>
-        <span class="section-caption">Primary symbols first</span>
+        <h2 class="section-title" id="runtime-title">运行态</h2>
+        <span class="section-caption">默认标的优先</span>
       </div>
       <div class="runtime-shell" id="runtime-shell">
         <div class="runtime-primary" id="runtime-primary"></div>
@@ -460,16 +460,16 @@ def build_console_page() -> str:
 
     <section class="card" id="competition" aria-labelledby="competition-title">
       <div class="section-head">
-        <h2 class="section-title" id="competition-title">Competition</h2>
-        <span class="section-caption">Tracked opportunities</span>
+        <h2 class="section-title" id="competition-title">比赛</h2>
+        <span class="section-caption">当前关注</span>
       </div>
       <div class="competition-list" id="competition-panel"></div>
     </section>
 
     <section class="card" id="quick-actions" aria-labelledby="quick-actions-title">
       <div class="section-head">
-        <h2 class="section-title" id="quick-actions-title">Quick Actions</h2>
-        <span class="section-caption">Deep links and server context</span>
+        <h2 class="section-title" id="quick-actions-title">快捷入口</h2>
+        <span class="section-caption">深链与节点信息</span>
       </div>
       <div class="quick-actions-grid" id="quick-actions-panel"></div>
       <div class="quick-actions-footer" id="server-meta"></div>
@@ -478,8 +478,8 @@ def build_console_page() -> str:
     <div class="account-sheet-backdrop" id="account-sheet-backdrop" data-open="false"></div>
     <div class="account-sheet-shell" id="account-sheet-shell" data-sheet="account-picker" data-open="false">
       <div class="account-sheet" id="account-sheet" role="dialog" aria-modal="false" aria-label="Account picker">
-        <h2 class="account-sheet-title">Choose account</h2>
-        <div class="ghost-note">Tap an account slot to reload the console.</div>
+        <h2 class="account-sheet-title">切换账号</h2>
+        <div class="ghost-note">点击账号卡片切换当前控制台。</div>
         <div class="account-list" id="account-list"></div>
       </div>
     </div>
@@ -489,6 +489,39 @@ def build_console_page() -> str:
     let currentAccountId = "";
     let currentOverview = null;
     let competitionExpanded = false;
+
+    const STATUS_LABELS = {
+      healthy: "健康",
+      online: "在线",
+      ready: "就绪",
+      running: "运行中",
+      degraded: "降级",
+      offline: "离线",
+      failed: "失败",
+      error: "异常",
+      unknown: "未知",
+      booting: "启动中"
+    };
+
+    const KIND_LABELS = {
+      futures: "合约",
+      spot: "现货",
+      mixed: "混合"
+    };
+
+    const MARKET_LABELS = {
+      futures: "合约",
+      spot: "现货"
+    };
+
+    const CAPABILITY_LABELS = {
+      futures_monitor: "合约监控",
+      competition_board: "比赛榜单",
+      strategies: "策略页",
+      spot_runner: "现货执行",
+      spot_strategies: "现货策略",
+      basis: "基差页"
+    };
 
     async function fetchJson(url) {
       const response = await fetch(url, { headers: { Accept: "application/json" } });
@@ -516,6 +549,31 @@ def build_console_page() -> str:
         return "offline";
       }
       return "degraded";
+    }
+
+    function localizeStatus(value) {
+      const normalized = normalizeStatus(value);
+      return STATUS_LABELS[normalized] || STATUS_LABELS.unknown;
+    }
+
+    function localizeKind(value) {
+      const normalized = String(value || "").trim().toLowerCase();
+      return KIND_LABELS[normalized] || "未知";
+    }
+
+    function localizeMarket(value) {
+      const normalized = String(value || "").trim().toLowerCase();
+      return MARKET_LABELS[normalized] || "未知";
+    }
+
+    function localizeCapabilities(values) {
+      const entries = Array.isArray(values) ? values : [];
+      if (!entries.length) {
+        return "--";
+      }
+      return entries.map(function (item) {
+        return CAPABILITY_LABELS[item] || item;
+      }).join("、");
     }
 
     function statusChipHtml(label, status) {
@@ -556,12 +614,12 @@ def build_console_page() -> str:
 
     function titleFromLinkKey(key) {
       const mapping = {
-        monitor: "Monitor",
-        strategies: "Strategies",
-        competition_board: "Competition",
-        spot_runner: "Spot Runner",
-        spot_strategies: "Spot Strategies",
-        basis: "Basis",
+        monitor: "监控页",
+        strategies: "策略页",
+        competition_board: "比赛榜单",
+        spot_runner: "现货执行台",
+        spot_strategies: "现货策略页",
+        basis: "基差页",
       };
       return mapping[key] || key.replace(/_/g, " ");
     }
@@ -573,15 +631,15 @@ def build_console_page() -> str:
       const currentAccountLabelEl = document.getElementById("current-account-label");
       const subtitleEl = document.getElementById("console-subtitle");
       const chipEl = document.getElementById("health-chip");
-      currentAccountLabelEl.textContent = account.label || account.id || "Console";
+      currentAccountLabelEl.textContent = account.label || account.id || "控制台";
       subtitleEl.textContent =
-        (server.label || server.id || "Unknown server") +
+        (server.label || server.id || "未知服务器") +
         " · " +
-        (account.kind || "unknown") +
+        localizeKind(account.kind) +
         " · " +
         String((overview && overview.fetched_at) || "--");
       chipEl.className = "status-chip is-" + normalizeStatus(summary.primary_status || overview && overview.health && overview.health.status);
-      chipEl.textContent = summary.primary_status || (overview && overview.health && overview.health.status) || "unknown";
+      chipEl.textContent = localizeStatus(summary.primary_status || overview && overview.health && overview.health.status);
     }
 
     function renderOverviewPanel(overview) {
@@ -593,10 +651,10 @@ def build_console_page() -> str:
       const warnings = overview && overview.warnings ? overview.warnings : [];
 
       panel.innerHTML = [
-        { label: "Status", value: summary.primary_status || "unknown" },
-        { label: "Warnings", value: String(summary.warning_count || 0) },
-        { label: "Runtime", value: formatDateTime(overview && overview.fetched_at) },
-        { label: "Competitions", value: String(summary.competition_count || 0) },
+        { label: "状态", value: localizeStatus(summary.primary_status || "unknown") },
+        { label: "告警", value: String(summary.warning_count || 0) },
+        { label: "更新时间", value: formatDateTime(overview && overview.fetched_at) },
+        { label: "比赛数量", value: String(summary.competition_count || 0) },
       ].map(function (item) {
         return (
           '<div class="overview-tile">' +
@@ -607,10 +665,10 @@ def build_console_page() -> str:
       }).join("");
 
       meta.innerHTML =
-        '<div class="meta-line"><span>Account</span><strong>' + escapeHtml(account.label || account.id || "--") + "</strong></div>" +
-        '<div class="meta-line"><span>Server</span><strong>' + escapeHtml(server.label || server.id || "--") + "</strong></div>" +
-        '<div class="meta-line"><span>Health</span><strong>' + escapeHtml(summary.health_status || overview && overview.health && overview.health.status || "--") + "</strong></div>" +
-        '<div class="meta-line"><span>Latest warning</span><strong>' + escapeHtml(warnings[0] || "none") + "</strong></div>";
+        '<div class="meta-line"><span>账号</span><strong>' + escapeHtml(account.label || account.id || "--") + "</strong></div>" +
+        '<div class="meta-line"><span>服务器</span><strong>' + escapeHtml(server.label || server.id || "--") + "</strong></div>" +
+        '<div class="meta-line"><span>健康状态</span><strong>' + escapeHtml(localizeStatus(summary.health_status || overview && overview.health && overview.health.status || "--")) + "</strong></div>" +
+        '<div class="meta-line"><span>最新告警</span><strong>' + escapeHtml(warnings.length ? ("共 " + warnings.length + " 条告警") : "无") + "</strong></div>";
     }
 
     function renderRuntimeDesk(overview) {
@@ -621,7 +679,7 @@ def build_console_page() -> str:
         .concat(overview && overview.spot ? overview.spot : []);
 
       if (!runtimeItems.length) {
-        primary.innerHTML = '<div class="ghost-note">No runtime summaries available for this account.</div>';
+        primary.innerHTML = '<div class="ghost-note">当前账号暂无运行态摘要。</div>';
         panel.innerHTML = "";
         return;
       }
@@ -633,18 +691,18 @@ def build_console_page() -> str:
 
       primary.innerHTML =
         '<div class="runtime-primary-top">' +
-        '<div><strong>' + escapeHtml(mainItem.symbol || "Unknown") + '</strong><div class="ghost-note">Primary tracked symbol</div></div>' +
-        '<span class="runtime-badge">' + escapeHtml(mainItem.status || "unknown") + "</span>" +
+        '<div><strong>' + escapeHtml(mainItem.symbol || "未知标的") + '</strong><div class="ghost-note">当前主标的</div></div>' +
+        '<span class="runtime-badge">' + escapeHtml(localizeStatus(mainItem.status || "unknown")) + "</span>" +
         "</div>" +
         '<div class="runtime-stats">' +
-        '<div class="runtime-stat"><small>Open orders</small><strong>' + escapeHtml(String(((mainSnapshot.open_orders || []).length || 0))) + "</strong></div>" +
-        '<div class="runtime-stat"><small>Warnings</small><strong>' + escapeHtml(String(warningCount)) + "</strong></div>" +
-        '<div class="runtime-stat"><small>Runner</small><strong>' + escapeHtml(mainSnapshot.runner_status || mainItem.status || "--") + "</strong></div>" +
-        '<div class="runtime-stat"><small>Mode</small><strong>' + escapeHtml(mainSnapshot.strategy_mode || mainSnapshot.status || "--") + "</strong></div>" +
+        '<div class="runtime-stat"><small>挂单数</small><strong>' + escapeHtml(String(((mainSnapshot.open_orders || []).length || 0))) + "</strong></div>" +
+        '<div class="runtime-stat"><small>告警数</small><strong>' + escapeHtml(String(warningCount)) + "</strong></div>" +
+        '<div class="runtime-stat"><small>执行状态</small><strong>' + escapeHtml(localizeStatus(mainSnapshot.runner_status || mainItem.status || "--")) + "</strong></div>" +
+        '<div class="runtime-stat"><small>模式</small><strong>' + escapeHtml(mainSnapshot.strategy_mode || mainSnapshot.status || "--") + "</strong></div>" +
         "</div>";
 
       if (!extraItems.length) {
-        panel.innerHTML = '<div class="ghost-note">No secondary runtime items.</div>';
+        panel.innerHTML = '<div class="ghost-note">暂无其他运行项。</div>';
         return;
       }
 
@@ -654,8 +712,8 @@ def build_console_page() -> str:
           '<div class="runtime-card">' +
           '<strong>' + escapeHtml(item.symbol || "--") + '</strong>' +
           '<div class="terminal-item-grid">' +
-          '<div class="terminal-item-note">Status: ' + escapeHtml(item.status || "unknown") + "</div>" +
-          '<div class="terminal-item-note">Open orders: ' + escapeHtml(String(((snapshot.open_orders || []).length || 0))) + "</div>" +
+          '<div class="terminal-item-note">状态：' + escapeHtml(localizeStatus(item.status || "unknown")) + "</div>" +
+          '<div class="terminal-item-note">挂单数：' + escapeHtml(String(((snapshot.open_orders || []).length || 0))) + "</div>" +
           "</div>" +
           "</div>"
         );
@@ -666,7 +724,7 @@ def build_console_page() -> str:
       const panel = document.getElementById("competition-panel");
       const competitions = overview && overview.competitions ? overview.competitions : [];
       if (!competitions.length) {
-        panel.innerHTML = '<div class="ghost-note">No active competition items for this account.</div>';
+        panel.innerHTML = '<div class="ghost-note">当前账号暂无比赛条目。</div>';
         return;
       }
 
@@ -676,10 +734,10 @@ def build_console_page() -> str:
           '<div class="competition-card">' +
           '<strong>' + escapeHtml(item.label || item.symbol) + '</strong>' +
           '<div class="terminal-item-grid">' +
-          '<div class="terminal-item-note">Symbol: ' + escapeHtml(item.symbol || "--") + "</div>" +
-          '<div class="terminal-item-note">Market: ' + escapeHtml(item.market || "--") + "</div>" +
-          '<div class="terminal-item-note">Floor: ' + escapeHtml(item.current_floor || "--") + "</div>" +
-          '<div class="terminal-item-note">Ends: ' + escapeHtml(formatDateTime(item.activity_end_at)) + "</div>" +
+          '<div class="terminal-item-note">标的：' + escapeHtml(item.symbol || "--") + "</div>" +
+          '<div class="terminal-item-note">市场：' + escapeHtml(localizeMarket(item.market || "--")) + "</div>" +
+          '<div class="terminal-item-note">门槛：' + escapeHtml(item.current_floor || "--") + "</div>" +
+          '<div class="terminal-item-note">截止：' + escapeHtml(formatDateTime(item.activity_end_at)) + "</div>" +
           "</div>" +
           "</div>"
         );
@@ -688,7 +746,7 @@ def build_console_page() -> str:
       if (competitions.length > 4) {
         panel.innerHTML +=
           '<button class="toggle-button" id="competition-toggle" type="button">' +
-          escapeHtml(competitionExpanded ? "Show less" : "Show more") +
+          escapeHtml(competitionExpanded ? "收起" : "展开更多") +
           "</button>";
         document.getElementById("competition-toggle").addEventListener("click", function () {
           competitionExpanded = !competitionExpanded;
@@ -706,7 +764,7 @@ def build_console_page() -> str:
       const health = overview && overview.health ? overview.health : {};
 
       if (!entries.length) {
-        panel.innerHTML = '<div class="ghost-note">No quick actions configured for this account.</div>';
+        panel.innerHTML = '<div class="ghost-note">当前账号未配置快捷入口。</div>';
       } else {
         panel.innerHTML = entries.map(function (entry) {
           const key = entry[0];
@@ -714,17 +772,17 @@ def build_console_page() -> str:
           return (
             '<a class="quick-action" href="' + escapeHtml(href) + '" target="_blank" rel="noopener noreferrer">' +
             '<strong>' + escapeHtml(titleFromLinkKey(key)) + '</strong>' +
-            '<small>' + escapeHtml("Open " + titleFromLinkKey(key).toLowerCase()) + '</small>' +
+            '<small>' + escapeHtml("打开" + titleFromLinkKey(key)) + '</small>' +
             "</a>"
           );
         }).join("");
       }
 
       serverMeta.innerHTML =
-        '<div class="meta-line"><span>Server</span><strong>' + escapeHtml(server.label || server.id || "--") + "</strong></div>" +
-        '<div class="meta-line"><span>Status</span><strong>' + escapeHtml(health.status || "--") + "</strong></div>" +
-        '<div class="meta-line"><span>Base URL</span><strong>' + escapeHtml(server.base_url || "--") + "</strong></div>" +
-        '<div class="meta-line"><span>Capabilities</span><strong>' + escapeHtml((server.capabilities || []).join(", ") || "--") + "</strong></div>";
+        '<div class="meta-line"><span>服务器</span><strong>' + escapeHtml(server.label || server.id || "--") + "</strong></div>" +
+        '<div class="meta-line"><span>状态</span><strong>' + escapeHtml(localizeStatus(health.status || "--")) + "</strong></div>" +
+        '<div class="meta-line"><span>节点地址</span><strong>' + escapeHtml(server.base_url || "--") + "</strong></div>" +
+        '<div class="meta-line"><span>功能</span><strong>' + escapeHtml(localizeCapabilities(server.capabilities || [])) + "</strong></div>";
     }
 
     function renderAccountList(registry, activeAccountId) {
@@ -735,8 +793,8 @@ def build_console_page() -> str:
         return (
           '<button class="account-option' + activeClass + '" type="button" data-account-id="' + escapeHtml(account.id) + '">' +
           '<strong>' + escapeHtml(account.label || account.id) + '</strong>' +
-          '<div class="account-option-note">Server: ' + escapeHtml(account.server_id || "--") + "</div>" +
-          '<div class="account-option-note">Kind: ' + escapeHtml(account.kind || "--") + "</div>" +
+          '<div class="account-option-note">服务器：' + escapeHtml(account.server_id || "--") + "</div>" +
+          '<div class="account-option-note">类型：' + escapeHtml(localizeKind(account.kind || "--")) + "</div>" +
           "</button>"
         );
       }).join("");
@@ -762,11 +820,11 @@ def build_console_page() -> str:
     function renderConsoleFailure(error) {
       currentOverview = null;
       document.getElementById("health-chip").className = "status-chip is-offline";
-      document.getElementById("health-chip").textContent = "Offline";
-      document.getElementById("console-subtitle").textContent = error.message || "Overview unavailable";
-      document.getElementById("overview-panel").innerHTML = '<div class="ghost-note">Overview unavailable.</div>';
+      document.getElementById("health-chip").textContent = "离线";
+      document.getElementById("console-subtitle").textContent = "概览加载失败，请稍后重试";
+      document.getElementById("overview-panel").innerHTML = '<div class="ghost-note">概览暂不可用。</div>';
       document.getElementById("overview-meta").innerHTML = "";
-      document.getElementById("runtime-primary").innerHTML = '<div class="ghost-note">Overview unavailable.</div>';
+      document.getElementById("runtime-primary").innerHTML = '<div class="ghost-note">概览暂不可用。</div>';
       document.getElementById("runtime-panel").innerHTML = "";
       document.getElementById("competition-panel").innerHTML = "";
       document.getElementById("quick-actions-panel").innerHTML = "";
@@ -776,17 +834,17 @@ def build_console_page() -> str:
     async function loadOverview(accountId) {
       const statusEl = document.getElementById("console-subtitle");
       try {
-        statusEl.textContent = "Refreshing…";
+        statusEl.textContent = "刷新中…";
         currentAccountId = accountId || currentAccountId;
         competitionExpanded = false;
         const overview = await fetchJson("/api/console/overview?account_id=" + encodeURIComponent(accountId));
         renderOverview(overview);
         renderAccountList(currentRegistry, currentAccountId);
         statusEl.textContent =
-          (overview.server && (overview.server.label || overview.server.id) || "Unknown server") +
+          (overview.server && (overview.server.label || overview.server.id) || "未知服务器") +
           " · " +
-          (overview.account && overview.account.kind || "unknown") +
-          " · Ready";
+          localizeKind(overview.account && overview.account.kind || "unknown") +
+          " · 已就绪";
       } catch (error) {
         renderConsoleFailure(error);
       }
@@ -795,7 +853,7 @@ def build_console_page() -> str:
     async function bootstrapConsole() {
       const statusEl = document.getElementById("console-subtitle");
       try {
-        statusEl.textContent = "Loading registry";
+        statusEl.textContent = "加载账号注册表";
         const registry = await fetchJson("/api/console/registry");
         currentRegistry = registry;
         currentAccountId =
