@@ -593,8 +593,10 @@ class ConsolePageTests(unittest.TestCase):
         self.assertIn('id="refresh-console"', html)
         self.assertIn('id="account-sheet-backdrop"', html)
         self.assertIn('id="account-list"', html)
-        self.assertIn('id="legacy-links"', html)
+        self.assertIn('id="quick-actions-panel"', html)
         self.assertIn('id="competition-panel"', html)
+        self.assertIn('id="runtime-panel"', html)
+        self.assertIn('id="overview-panel"', html)
 
     def test_build_console_page_wires_registry_default_account_into_overview_request(self) -> None:
         html = build_console_page()
@@ -610,7 +612,7 @@ class ConsolePageTests(unittest.TestCase):
         self.assertIn('class="account-sheet-shell"', html)
         self.assertIn('id="account-sheet-shell"', html)
         self.assertIn("position: fixed", html)
-        self.assertIn("padding: 76px 16px 176px", html)
+        self.assertIn("padding: 88px 16px 160px", html)
         self.assertIn('id="account-sheet"', html)
         self.assertIn('role="dialog"', html)
         self.assertIn('aria-label="Account picker"', html)
@@ -618,16 +620,15 @@ class ConsolePageTests(unittest.TestCase):
     def test_build_console_page_contains_required_section_anchors(self) -> None:
         html = build_console_page()
 
-        self.assertIn('id="hero-summary"', html)
+        self.assertIn('id="overview"', html)
         self.assertIn('id="competition"', html)
         self.assertIn('id="runtime"', html)
-        self.assertIn('id="legacy-entries"', html)
-        self.assertIn('id="server"', html)
-        self.assertIn("Hero Summary", html)
+        self.assertIn('id="quick-actions"', html)
+        self.assertIn('id="runtime-shell"', html)
+        self.assertIn("Overview", html)
         self.assertIn("Competition", html)
         self.assertIn("Runtime", html)
-        self.assertIn("Legacy Entries", html)
-        self.assertIn("Server", html)
+        self.assertIn("Quick Actions", html)
 
     def test_build_console_page_contains_account_switching_and_render_helpers(self) -> None:
         html = build_console_page()
@@ -635,8 +636,15 @@ class ConsolePageTests(unittest.TestCase):
         self.assertIn("function openAccountSheet()", html)
         self.assertIn("function closeAccountSheet()", html)
         self.assertIn("function renderAccountList(", html)
+        self.assertIn("function renderOverviewPanel(", html)
+        self.assertIn("function renderRuntimeDesk(", html)
+        self.assertIn("function renderQuickActions(", html)
         self.assertIn("function renderOverview(", html)
         self.assertIn("async function loadOverview(accountId)", html)
+        self.assertIn("Refreshing…", html)
+        self.assertIn("Show more", html)
+        self.assertIn("current_floor", html)
+        self.assertIn("activity_end_at", html)
         self.assertIn('"/api/console/overview?account_id=" + encodeURIComponent(accountId)', html)
         self.assertIn('document.getElementById("refresh-console")', html)
 
