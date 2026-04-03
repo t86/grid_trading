@@ -1640,16 +1640,17 @@ class LoopRunnerTests(unittest.TestCase):
             active_state="normal",
         )
 
-        self.assertEqual(effective.step_price, 7.6)
-        self.assertEqual(effective.base_position_notional, 260.0)
-        self.assertEqual(effective.pause_short_position_notional, 600.0)
-        self.assertEqual(effective.max_short_position_notional, 660.0)
-        self.assertEqual(effective.inventory_tier_start_notional, 360.0)
-        self.assertEqual(effective.inventory_tier_end_notional, 500.0)
+        self.assertEqual(effective.step_price, 7.4)
+        self.assertEqual(effective.per_order_notional, 60.0)
+        self.assertEqual(effective.base_position_notional, 220.0)
+        self.assertEqual(effective.pause_short_position_notional, 620.0)
+        self.assertEqual(effective.max_short_position_notional, 720.0)
+        self.assertEqual(effective.inventory_tier_start_notional, 320.0)
+        self.assertEqual(effective.inventory_tier_end_notional, 520.0)
         self.assertEqual(effective.inventory_tier_buy_levels, 14)
-        self.assertEqual(effective.inventory_tier_sell_levels, 2)
-        self.assertEqual(effective.inventory_tier_per_order_notional, 65.0)
-        self.assertEqual(effective.inventory_tier_base_position_notional, 120.0)
+        self.assertEqual(effective.inventory_tier_sell_levels, 3)
+        self.assertEqual(effective.inventory_tier_per_order_notional, 45.0)
+        self.assertEqual(effective.inventory_tier_base_position_notional, 100.0)
 
     def test_build_xaut_adaptive_runner_args_applies_short_defensive_profile_with_small_entry_budget(self) -> None:
         args = Namespace(
@@ -1681,18 +1682,19 @@ class LoopRunnerTests(unittest.TestCase):
             active_state="defensive",
         )
 
-        self.assertEqual(effective.step_price, 11.0)
+        self.assertEqual(effective.step_price, 10.5)
         self.assertEqual(effective.buy_levels, 14)
         self.assertEqual(effective.sell_levels, 2)
-        self.assertEqual(effective.base_position_notional, 90.0)
-        self.assertEqual(effective.pause_short_position_notional, 600.0)
-        self.assertEqual(effective.max_short_position_notional, 660.0)
+        self.assertEqual(effective.per_order_notional, 35.0)
+        self.assertEqual(effective.base_position_notional, 70.0)
+        self.assertEqual(effective.pause_short_position_notional, 620.0)
+        self.assertEqual(effective.max_short_position_notional, 720.0)
         self.assertEqual(effective.inventory_tier_start_notional, 180.0)
-        self.assertEqual(effective.inventory_tier_end_notional, 260.0)
+        self.assertEqual(effective.inventory_tier_end_notional, 300.0)
         self.assertEqual(effective.inventory_tier_buy_levels, 16)
-        self.assertEqual(effective.inventory_tier_sell_levels, 1)
-        self.assertEqual(effective.inventory_tier_per_order_notional, 40.0)
-        self.assertEqual(effective.inventory_tier_base_position_notional, 60.0)
+        self.assertEqual(effective.inventory_tier_sell_levels, 2)
+        self.assertEqual(effective.inventory_tier_per_order_notional, 30.0)
+        self.assertEqual(effective.inventory_tier_base_position_notional, 50.0)
 
 
 if __name__ == "__main__":
