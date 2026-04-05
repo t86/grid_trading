@@ -1144,6 +1144,7 @@ class WebSecurityTests(unittest.TestCase):
         payload = _runner_preset_payload("based_volume_long_trigger_v1", {"symbol": "BASEDUSDT"})
         self.assertEqual(payload["symbol"], "BASEDUSDT")
         self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertEqual(payload["runtime_guard_stats_start_time"], "2026-03-31T18:00:00+08:00")
         self.assertTrue(payload["volume_trigger_enabled"])
         self.assertEqual(payload["volume_trigger_window"], "15m")
         self.assertEqual(payload["volume_trigger_start_threshold"], 260000.0)
@@ -1162,6 +1163,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["base_position_notional"], 0.0)
         self.assertFalse(payload["autotune_symbol_enabled"])
         self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
+        self.assertEqual(payload["runtime_guard_stats_start_time"], "2026-03-31T18:00:00+08:00")
         self.assertIsNone(payload["rolling_hourly_loss_limit"])
 
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))

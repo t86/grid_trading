@@ -71,6 +71,7 @@
   "summary_jsonl": "output/basedusdt_loop_events.jsonl",
   "run_start_time": null,
   "run_end_time": null,
+  "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
   "rolling_hourly_loss_limit": 4.0,
   "max_cumulative_notional": null,
   "pause_short_position_notional": null,

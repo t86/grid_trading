@@ -24,6 +24,7 @@
   "freeze_shift_abs_return_trigger_ratio": 0.006,
   "autotune_symbol_enabled": false,
   "excess_inventory_reduce_only_enabled": false,
+  "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
   "rolling_hourly_loss_limit": null,
   "sleep_seconds": 3.0,
   "cancel_stale": true,
