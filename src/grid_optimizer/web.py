@@ -26,6 +26,7 @@ from statistics import mean
 from typing import Any, Union
 from urllib.parse import parse_qs, urlparse
 
+from .audit import build_audit_paths, income_row_time_ms, read_jsonl, trade_row_time_ms
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -102,7 +103,11 @@ from .maker_flatten_runner import (
     load_live_flatten_snapshot,
 )
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
-from .runtime_guards import normalize_runtime_guard_payload
+from .runtime_guards import (
+    evaluate_runtime_guards,
+    normalize_runtime_guard_config,
+    normalize_runtime_guard_payload,
+)
 from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
@@ -118,6 +123,8 @@ JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 RANKING_CACHE: dict[str, dict[str, Any]] = {}
 RANKING_CACHE_LOCK = threading.Lock()
+COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS = 600.0
+COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS = 60.0
 BASIS_CACHE: dict[str, dict[str, Any]] = {}
 BASIS_CACHE_LOCK = threading.Lock()
 DETAIL_CACHE: dict[str, dict[str, Any]] = {}
@@ -963,6 +970,26 @@ def _security_headers() -> dict[str, str]:
     }
 
 
+def _competition_board_auto_refresh_enabled() -> bool:
+    raw = os.environ.get("GRID_COMPETITION_BOARD_AUTO_REFRESH", "").strip().lower()
+    if not raw:
+        return True
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _competition_board_auto_refresh_interval_seconds() -> float:
+    raw = os.environ.get("GRID_COMPETITION_BOARD_REFRESH_SECONDS", "").strip()
+    if not raw:
+        return COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS
+    if value <= 0:
+        return COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS
+    return max(COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS, value)
+
+
 def _load_web_auth_credentials() -> tuple[str, str] | None:
     username = os.environ.get("GRID_WEB_USERNAME", "").strip()
     password = os.environ.get("GRID_WEB_PASSWORD", "")
@@ -1330,6 +1357,32 @@ def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
                     },
                 )
         stop_event.wait(VOLUME_TRIGGER_POLL_SECONDS)
+
+
+def _run_competition_board_auto_refresh_loop(stop_event: threading.Event, interval_seconds: float) -> None:
+    interval = max(COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS, float(interval_seconds))
+    next_run = time.monotonic()
+    while not stop_event.is_set():
+        now = time.monotonic()
+        if now < next_run:
+            stop_event.wait(next_run - now)
+            continue
+        started = time.monotonic()
+        try:
+            snapshot = build_competition_board_snapshot(refresh=True)
+            duration = time.monotonic() - started
+            boards = len(snapshot.get("boards", [])) if isinstance(snapshot, dict) else 0
+            errors = snapshot.get("errors", []) if isinstance(snapshot, dict) else []
+            error_count = len(errors) if isinstance(errors, list) else 0
+            generated_at = snapshot.get("generated_at_utc", "") if isinstance(snapshot, dict) else ""
+            print(
+                f"[competition-board] auto refresh ok duration={duration:.1f}s "
+                f"boards={boards} errors={error_count} generated_at={generated_at}"
+            )
+        except Exception as exc:  # pragma: no cover
+            duration = time.monotonic() - started
+            print(f"[competition-board] auto refresh failed after {duration:.1f}s: {type(exc).__name__}: {exc}")
+        next_run = time.monotonic() + interval
 
 
 def _symbol_output_slug(symbol: str) -> str:
@@ -2286,6 +2339,121 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
     return _autotune_runner_symbol_config(resolved)
 
 
+def _runtime_guard_input_summary(summary_path: Path) -> tuple[float, list[dict[str, Any]]]:
+    audit_paths = build_audit_paths(summary_path)
+    trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
+    income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
+
+    cumulative_gross_notional = 0.0
+    pnl_events: list[dict[str, Any]] = []
+    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for row in trade_rows:
+        price = _as_float(row.get("price"))
+        qty = abs(_as_float(row.get("qty")))
+        cumulative_gross_notional += price * qty
+        trade_time_ms = trade_row_time_ms(row)
+        if trade_time_ms <= 0:
+            continue
+        realized_pnl = _as_float(row.get("realizedPnl"))
+        commission = _as_float(row.get("commission"))
+        commission_asset = str(row.get("commissionAsset", "")).upper().strip()
+        net_pnl = realized_pnl - (commission if commission_asset in stable_assets else 0.0)
+        pnl_events.append(
+            {
+                "ts": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "net_pnl": net_pnl,
+            }
+        )
+
+    for row in income_rows:
+        income_time_ms = income_row_time_ms(row)
+        if income_time_ms <= 0:
+            continue
+        pnl_events.append(
+            {
+                "ts": datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "net_pnl": _as_float(row.get("income")),
+            }
+        )
+
+    return cumulative_gross_notional, pnl_events
+
+
+def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
+    runtime_guard_config = normalize_runtime_guard_config(config)
+    if not any(
+        (
+            runtime_guard_config.run_start_time,
+            runtime_guard_config.run_end_time,
+            runtime_guard_config.rolling_hourly_loss_limit,
+            runtime_guard_config.max_cumulative_notional,
+            runtime_guard_config.max_actual_net_notional,
+            runtime_guard_config.max_synthetic_drift_notional,
+        )
+    ):
+        return
+
+    summary_text = str(config.get("summary_jsonl", "")).strip()
+    if not summary_text:
+        return
+
+    summary_path = Path(summary_text)
+    cumulative_gross_notional, pnl_events = _runtime_guard_input_summary(summary_path)
+    runtime_guard_result = evaluate_runtime_guards(
+        config=runtime_guard_config,
+        now=datetime.now(timezone.utc),
+        cumulative_gross_notional=cumulative_gross_notional,
+        pnl_events=pnl_events,
+    )
+    if runtime_guard_result.runtime_status == "waiting" or runtime_guard_result.tradable:
+        return
+
+    audit_paths = build_audit_paths(summary_path)
+    reasons = set(runtime_guard_result.matched_reasons)
+    detail_lines: list[str] = []
+    if "after_end_window" in reasons and runtime_guard_config.run_end_time is not None:
+        detail_lines.append(f"当前时间已超过 run_end_time={runtime_guard_config.run_end_time.isoformat()}")
+    if "rolling_hourly_loss_limit_hit" in reasons and runtime_guard_config.rolling_hourly_loss_limit is not None:
+        detail_lines.append(
+            "最近 60 分钟滚动亏损 "
+            f"{runtime_guard_result.rolling_hourly_loss:.4f} >= 阈值 {runtime_guard_config.rolling_hourly_loss_limit:.4f}"
+        )
+    if "max_cumulative_notional_hit" in reasons and runtime_guard_config.max_cumulative_notional is not None:
+        detail_lines.append(
+            "累计成交额 "
+            f"{runtime_guard_result.cumulative_gross_notional:.4f} >= 阈值 {runtime_guard_config.max_cumulative_notional:.4f}"
+        )
+    if "max_actual_net_notional_hit" in reasons and runtime_guard_config.max_actual_net_notional is not None:
+        detail_lines.append(
+            "实际净敞口 "
+            f"{runtime_guard_result.actual_net_notional_abs:.4f} >= 阈值 {runtime_guard_config.max_actual_net_notional:.4f}"
+        )
+    if (
+        "max_synthetic_drift_notional_hit" in reasons
+        and runtime_guard_config.max_synthetic_drift_notional is not None
+    ):
+        detail_lines.append(
+            "synthetic 漂移 "
+            f"{runtime_guard_result.synthetic_drift_notional:.4f} >= 阈值 {runtime_guard_config.max_synthetic_drift_notional:.4f}"
+        )
+    if not detail_lines:
+        detail_lines.append(f"stop_reason={runtime_guard_result.primary_reason}")
+
+    raise ValueError(
+        "启动前风控预检已拦截："
+        + "；".join(detail_lines)
+        + "。注意：reset_state 只重置本地状态，不会清空 runtime guard 审计计数。"
+        + f"如需重新启动，请调高阈值，或清理 {audit_paths['trade_audit']} / {audit_paths['income_audit']} 后再启动。"
+    )
+
+
 def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
     config = _resolve_runner_start_config(payload)
     symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
@@ -2556,6 +2724,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip() or "NIGHTUSDT"
     _stop_flatten_process(symbol, cancel_orders=True)
     runner = _read_runner_process_for_symbol(symbol)
+    _preflight_runner_runtime_guards(config)
     restarted = False
     if runner.get("is_running"):
         current_config = dict(runner.get("config") or {})
@@ -18886,6 +19055,20 @@ def main() -> None:
         name="runner-volume-trigger",
     )
     volume_trigger_thread.start()
+    competition_refresh_stop_event = threading.Event()
+    if _competition_board_auto_refresh_enabled():
+        refresh_interval = _competition_board_auto_refresh_interval_seconds()
+        competition_refresh_thread = threading.Thread(
+            target=_run_competition_board_auto_refresh_loop,
+            args=(competition_refresh_stop_event, refresh_interval),
+            daemon=True,
+            name="competition-board-refresh",
+        )
+        competition_refresh_thread.start()
+        print(
+            "[competition-board] auto refresh every "
+            f"{refresh_interval / 60:.0f}m ({refresh_interval:.0f}s)"
+        )
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(f"Grid Web UI running at http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop.")
@@ -18895,6 +19078,7 @@ def main() -> None:
         pass
     finally:
         volume_trigger_stop_event.set()
+        competition_refresh_stop_event.set()
         server.server_close()
 
 

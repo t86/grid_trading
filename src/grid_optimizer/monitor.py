@@ -132,6 +132,10 @@ def _read_runner_process(
         raw_pid = pid_path.read_text(encoding="utf-8").strip()
         pid = int(raw_pid)
     except (OSError, ValueError):
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return runner
 
     runner["configured"] = True
@@ -148,10 +152,18 @@ def _read_runner_process(
 
     line = proc.stdout.strip().splitlines()
     if proc.returncode != 0 or not line:
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return runner
 
     parts = line[-1].strip().split(None, 2)
     if len(parts) < 3:
+        try:
+            pid_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return runner
 
     _, elapsed, args_text = parts

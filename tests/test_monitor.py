@@ -390,6 +390,19 @@ class MonitorTests(unittest.TestCase):
             self.assertEqual(result["config"]["strategy_profile"], "volume_long_v4")
             self.assertEqual(result["config"]["symbol"], "NIGHTUSDT")
 
+    def test_read_runner_process_removes_stale_pid_file_when_process_missing(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            pid_path = root / "runner.pid"
+            control_path = root / "runner.json"
+            pid_path.write_text("999999", encoding="utf-8")
+            control_path.write_text('{"strategy_profile":"volume_long_v4","symbol":"NIGHTUSDT"}', encoding="utf-8")
+
+            result = _read_runner_process(pid_path=pid_path, control_path=control_path)
+
+            self.assertFalse(result["is_running"])
+            self.assertFalse(pid_path.exists())
+
     def test_read_event_window_keeps_recent_rows_and_bounds(self) -> None:
         with TemporaryDirectory() as tmpdir:
             path = Path(tmpdir) / "events.jsonl"

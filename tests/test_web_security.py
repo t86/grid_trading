@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import json
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from grid_optimizer.web import (
@@ -23,6 +25,7 @@ from grid_optimizer.web import (
     _resolve_runner_volume_trigger_action,
     _resolve_runner_start_config,
     _run_loop_monitor_query,
+    _runtime_guard_input_summary,
     _runner_service_name_for_symbol,
     _runner_preset_payload,
     _runner_preset_summaries,
@@ -834,6 +837,85 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["run_end_time"], "2026-03-31T03:00:00+00:00")
         self.assertEqual(config["rolling_hourly_loss_limit"], 150.0)
         self.assertEqual(config["max_cumulative_notional"], 100000.0)
+
+    def test_runtime_guard_input_summary_reads_trade_and_income_audits(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "bardusdt_loop_events.jsonl"
+            (root / "bardusdt_loop_trade_audit.jsonl").write_text(
+                json.dumps(
+                    {
+                        "price": "2.5",
+                        "qty": "10",
+                        "time": int(datetime(2026, 4, 5, 0, 0, tzinfo=timezone.utc).timestamp() * 1000),
+                        "realizedPnl": "1.2",
+                        "commission": "0.2",
+                        "commissionAsset": "USDT",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "bardusdt_loop_income_audit.jsonl").write_text(
+                json.dumps(
+                    {
+                        "time": int(datetime(2026, 4, 5, 0, 5, tzinfo=timezone.utc).timestamp() * 1000),
+                        "income": "0.8",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            events_path.write_text("", encoding="utf-8")
+
+            gross, pnl_events = _runtime_guard_input_summary(events_path)
+
+            self.assertAlmostEqual(gross, 25.0, places=8)
+            self.assertEqual(len(pnl_events), 2)
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_start_runner_process_blocks_when_cumulative_notional_already_hit(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "bardusdt_loop_events.jsonl"
+            (root / "bardusdt_loop_trade_audit.jsonl").write_text(
+                json.dumps(
+                    {
+                        "price": "10",
+                        "qty": "20",
+                        "time": int(datetime(2026, 4, 5, 0, 0, tzinfo=timezone.utc).timestamp() * 1000),
+                        "realizedPnl": "0",
+                        "commission": "0",
+                        "commissionAsset": "USDT",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "bardusdt_loop_income_audit.jsonl").write_text("", encoding="utf-8")
+            events_path.write_text("", encoding="utf-8")
+            mock_symbol_config.return_value = self._mock_symbol_config()
+            mock_book_tickers.return_value = self._mock_book()
+
+            config = _resolve_runner_start_config(
+                {
+                    "strategy_profile": "bard_12h_push_neutral_v2",
+                    "symbol": "BARDUSDT",
+                    "summary_jsonl": str(events_path),
+                    "max_cumulative_notional": 150.0,
+                }
+            )
+
+            with self.assertRaisesRegex(ValueError, "启动前风控预检已拦截"):
+                _start_runner_process(config)
 
     def test_build_runner_command_includes_runtime_guard_arguments(self) -> None:
         command = _build_runner_command(
