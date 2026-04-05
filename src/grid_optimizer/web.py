@@ -2657,7 +2657,13 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     config["symbol"] = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"
     config["margin_type"] = str(config.get("margin_type", "KEEP")).upper().strip() or "KEEP"
-    config.update(normalize_runtime_guard_payload(config))
+    config.update(
+        normalize_runtime_guard_payload(
+            config,
+            symbol=str(config.get("symbol", "")),
+            market="futures",
+        )
+    )
     return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 
 
@@ -3856,7 +3862,11 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("max_single_cycle_new_orders", SPOT_RUNNER_DEFAULT_CONFIG["max_single_cycle_new_orders"]),
         "max_single_cycle_new_orders",
     )
-    runtime_guard_config = normalize_runtime_guard_payload(payload)
+    runtime_guard_config = normalize_runtime_guard_payload(
+        payload,
+        symbol=str(payload.get("symbol", "")),
+        market="spot",
+    )
 
     if grid_level_mode not in set(supported_grid_level_modes()):
         raise ValueError(
@@ -12339,6 +12349,13 @@ MONITOR_PAGE = """<!doctype html>
         : String((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
     }
 
+    function buildRunnerStartPayload(selectedSymbol, selectedPreset = null) {
+      return {
+        symbol: selectedSymbol,
+        strategy_profile: runnerFallbackProfile(selectedPreset),
+      };
+    }
+
     function buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset = null) {
       let payload = readRunnerEditorConfigFromTextarea();
       const payloadSymbol = String(payload.symbol || "").trim().toUpperCase();
@@ -13187,12 +13204,7 @@ MONITOR_PAGE = """<!doctype html>
       const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
       let startPayload = null;
       if (action === "start") {
-        try {
-          startPayload = buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset);
-        } catch (err) {
-          strategyActionMetaEl.textContent = `启动失败: ${err}`;
-          return;
-        }
+        startPayload = buildRunnerStartPayload(selectedSymbol, selectedPreset);
         const effectivePreset = getPresetByKey(String(startPayload.strategy_profile || ""));
         if (effectivePreset && !effectivePreset.startable) {
           strategyActionMetaEl.textContent = `${effectivePreset.label} 当前是模板预设，页面已展示参数，但还不能直接启动。`;
@@ -13200,7 +13212,7 @@ MONITOR_PAGE = """<!doctype html>
         }
       }
       strategyActionPending = true;
-      strategyActionMetaEl.textContent = action === "start" ? "正在按当前编辑器参数启动策略..." : "正在停止策略...";
+      strategyActionMetaEl.textContent = action === "start" ? "正在按当前选中预设启动策略..." : "正在停止策略...";
       startStrategyBtn.disabled = true;
       stopStrategyBtn.disabled = true;
       try {

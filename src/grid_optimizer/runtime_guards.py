@@ -76,22 +76,25 @@ def resolve_runtime_guard_stats_start_time(
         explicit_start = _parse_datetime(runtime_guard_stats_start_time, "runtime_guard_stats_start_time")
     except ValueError:
         explicit_start = None
-    if explicit_start is not None:
-        return explicit_start
     normalized_symbol = str(symbol or "").upper().strip()
     normalized_market = str(market or "").strip().lower()
     if not normalized_symbol or not normalized_market:
-        return None
+        return explicit_start
     try:
         board = resolve_active_competition_board(normalized_symbol, normalized_market, now=now)
     except Exception:
-        return None
+        return explicit_start
     if not isinstance(board, dict):
-        return None
+        return explicit_start
     try:
-        return _parse_datetime(board.get("activity_start_at"), "activity_start_at")
+        board_start = _parse_datetime(board.get("activity_start_at"), "activity_start_at")
     except ValueError:
-        return None
+        return explicit_start
+    if explicit_start is None:
+        return board_start
+    if board_start is None:
+        return explicit_start
+    return max(explicit_start, board_start)
 
 
 def summarize_futures_runtime_guard_inputs(
@@ -191,8 +194,21 @@ def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
     return config
 
 
-def normalize_runtime_guard_payload(raw: dict[str, Any]) -> dict[str, Any]:
+def normalize_runtime_guard_payload(
+    raw: dict[str, Any],
+    *,
+    symbol: str | None = None,
+    market: str = "futures",
+    now: datetime | None = None,
+) -> dict[str, Any]:
     config = normalize_runtime_guard_config(raw)
+    normalized_symbol = str(symbol or raw.get("symbol") or "").upper().strip() or None
+    resolved_stats_start_time = resolve_runtime_guard_stats_start_time(
+        runtime_guard_stats_start_time=config.runtime_guard_stats_start_time,
+        symbol=normalized_symbol,
+        market=market,
+        now=now,
+    )
     return {
         "run_start_time": config.run_start_time.isoformat() if config.run_start_time else None,
         "run_end_time": config.run_end_time.isoformat() if config.run_end_time else None,
@@ -200,9 +216,7 @@ def normalize_runtime_guard_payload(raw: dict[str, Any]) -> dict[str, Any]:
         "max_cumulative_notional": config.max_cumulative_notional,
         "max_actual_net_notional": config.max_actual_net_notional,
         "max_synthetic_drift_notional": config.max_synthetic_drift_notional,
-        "runtime_guard_stats_start_time": (
-            config.runtime_guard_stats_start_time.isoformat() if config.runtime_guard_stats_start_time else None
-        ),
+        "runtime_guard_stats_start_time": resolved_stats_start_time.isoformat() if resolved_stats_start_time else None,
     }
 
 

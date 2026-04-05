@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest.mock import patch
 
 from grid_optimizer.runtime_guards import (
     RuntimeGuardConfig,
     evaluate_runtime_guards,
     normalize_runtime_guard_config,
+    normalize_runtime_guard_payload,
+    resolve_runtime_guard_stats_start_time,
 )
 
 
@@ -41,6 +44,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_end_time=None,
             rolling_hourly_loss_limit=None,
             max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
         )
         result = evaluate_runtime_guards(
             config=cfg,
@@ -60,6 +65,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_end_time=datetime(2026, 3, 30, 9, 30, tzinfo=timezone.utc),
             rolling_hourly_loss_limit=None,
             max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
         )
         result = evaluate_runtime_guards(
             config=cfg,
@@ -78,6 +85,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_end_time=None,
             rolling_hourly_loss_limit=50.0,
             max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
         )
         result = evaluate_runtime_guards(
             config=cfg,
@@ -99,6 +108,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_end_time=None,
             rolling_hourly_loss_limit=None,
             max_cumulative_notional=1000.0,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
         )
         result = evaluate_runtime_guards(
             config=cfg,
@@ -116,6 +127,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_end_time=datetime(2026, 3, 30, 9, 30, tzinfo=timezone.utc),
             rolling_hourly_loss_limit=50.0,
             max_cumulative_notional=1000.0,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
         )
         result = evaluate_runtime_guards(
             config=cfg,
@@ -135,6 +148,57 @@ class RuntimeGuardsTests(unittest.TestCase):
             ],
         )
         self.assertEqual(result.primary_reason, "after_end_window")
+
+    @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
+    def test_resolve_runtime_guard_stats_start_time_clamps_stale_explicit_start_to_active_phase(self, mock_board) -> None:
+        mock_board.return_value = {
+            "activity_start_at": "2026-04-05T08:00:00+08:00",
+            "activity_end_at": "2026-04-15T07:59:00+08:00",
+        }
+
+        resolved = resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time="2026-03-26T18:00:00+08:00",
+            symbol="BARDUSDT",
+            market="futures",
+            now=datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(resolved, datetime(2026, 4, 5, 0, 0, tzinfo=timezone.utc))
+
+    @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
+    def test_resolve_runtime_guard_stats_start_time_keeps_later_manual_start(self, mock_board) -> None:
+        mock_board.return_value = {
+            "activity_start_at": "2026-04-05T08:00:00+08:00",
+            "activity_end_at": "2026-04-15T07:59:00+08:00",
+        }
+
+        resolved = resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time="2026-04-06T09:30:00+08:00",
+            symbol="BARDUSDT",
+            market="futures",
+            now=datetime(2026, 4, 6, 2, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(resolved, datetime(2026, 4, 6, 1, 30, tzinfo=timezone.utc))
+
+    @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
+    def test_normalize_runtime_guard_payload_uses_active_competition_phase_start(self, mock_board) -> None:
+        mock_board.return_value = {
+            "activity_start_at": "2026-04-05T08:00:00+08:00",
+            "activity_end_at": "2026-04-15T07:59:00+08:00",
+        }
+
+        payload = normalize_runtime_guard_payload(
+            {
+                "symbol": "BARDUSDT",
+                "runtime_guard_stats_start_time": "2026-03-26T18:00:00+08:00",
+            },
+            symbol="BARDUSDT",
+            market="futures",
+            now=datetime(2026, 4, 5, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(payload["runtime_guard_stats_start_time"], "2026-04-05T00:00:00+00:00")
 
 
 if __name__ == "__main__":
