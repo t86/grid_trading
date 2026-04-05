@@ -71,6 +71,7 @@ class WebSecurityTests(unittest.TestCase):
     def test_monitor_page_includes_runtime_guard_inputs(self) -> None:
         self.assertIn('id="monitor_run_start_time"', MONITOR_PAGE)
         self.assertIn('id="monitor_run_end_time"', MONITOR_PAGE)
+        self.assertIn('id="monitor_runtime_guard_stats_start_time"', MONITOR_PAGE)
         self.assertIn('id="monitor_rolling_hourly_loss_limit"', MONITOR_PAGE)
         self.assertIn('id="monitor_max_cumulative_notional"', MONITOR_PAGE)
         self.assertIn('id="monitor_volume_trigger_enabled"', MONITOR_PAGE)
@@ -829,12 +830,14 @@ class WebSecurityTests(unittest.TestCase):
                 "strategy_profile": "defensive_quasi_neutral_v1",
                 "run_start_time": "2026-03-31T01:00:00+00:00",
                 "run_end_time": "2026-03-31T03:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-03-31T02:00:00+00:00",
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
             }
         )
         self.assertEqual(config["run_start_time"], "2026-03-31T01:00:00+00:00")
         self.assertEqual(config["run_end_time"], "2026-03-31T03:00:00+00:00")
+        self.assertEqual(config["runtime_guard_stats_start_time"], "2026-03-31T02:00:00+00:00")
         self.assertEqual(config["rolling_hourly_loss_limit"], 150.0)
         self.assertEqual(config["max_cumulative_notional"], 100000.0)
 
@@ -1016,6 +1019,7 @@ class WebSecurityTests(unittest.TestCase):
                 "reset_state": True,
                 "run_start_time": "2026-03-31T01:00:00+00:00",
                 "run_end_time": "2026-03-31T03:00:00+00:00",
+                "runtime_guard_stats_start_time": "2026-03-31T02:00:00+00:00",
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
             }
@@ -1023,6 +1027,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--run-start-time", command)
         self.assertIn("2026-03-31T01:00:00+00:00", command)
         self.assertIn("--run-end-time", command)
+        self.assertIn("--runtime-guard-stats-start-time", command)
+        self.assertIn("2026-03-31T02:00:00+00:00", command)
         self.assertIn("--rolling-hourly-loss-limit", command)
         self.assertIn("--max-cumulative-notional", command)
 

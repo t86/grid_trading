@@ -924,6 +924,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "max_total_notional": 1000.0,
     "run_start_time": None,
     "run_end_time": None,
+    "runtime_guard_stats_start_time": None,
     "rolling_hourly_loss_limit": None,
     "max_cumulative_notional": None,
     "max_actual_net_notional": None,
@@ -1502,6 +1503,7 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "max_single_cycle_new_orders": 8,
     "run_start_time": None,
     "run_end_time": None,
+    "runtime_guard_stats_start_time": None,
     "rolling_hourly_loss_limit": None,
     "max_cumulative_notional": None,
 }
@@ -2258,6 +2260,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "summary_jsonl",
         "run_start_time",
         "run_end_time",
+        "runtime_guard_stats_start_time",
         "volume_trigger_window",
     }
     noneable_fields = {
@@ -2284,6 +2287,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_synthetic_drift_notional",
         "run_start_time",
         "run_end_time",
+        "runtime_guard_stats_start_time",
         "volume_trigger_start_threshold",
         "volume_trigger_stop_threshold",
     }
@@ -2343,10 +2347,16 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
 def _runtime_guard_input_summary(
     summary_path: Path,
     *,
+    runtime_guard_stats_start_time: Any = None,
     symbol: str | None = None,
     now: datetime | None = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
-    return summarize_futures_runtime_guard_inputs(summary_path, symbol=symbol, now=now)
+    return summarize_futures_runtime_guard_inputs(
+        summary_path,
+        runtime_guard_stats_start_time=runtime_guard_stats_start_time,
+        symbol=symbol,
+        now=now,
+    )
 
 
 def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
@@ -2372,6 +2382,7 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
     symbol = str(config.get("symbol", "")).upper().strip()
     cumulative_gross_notional, pnl_events, stats_start_time = _runtime_guard_input_summary(
         summary_path,
+        runtime_guard_stats_start_time=config.get("runtime_guard_stats_start_time"),
         symbol=symbol,
         now=current,
     )
@@ -2594,6 +2605,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
         command.extend(["--run-end-time", str(config["run_end_time"])])
+    if config.get("runtime_guard_stats_start_time") is not None:
+        command.extend(["--runtime-guard-stats-start-time", str(config["runtime_guard_stats_start_time"])])
     if config.get("rolling_hourly_loss_limit") is not None:
         command.extend(["--rolling-hourly-loss-limit", str(config["rolling_hourly_loss_limit"])])
     if config.get("max_cumulative_notional") is not None:
@@ -2780,6 +2793,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "max_total_notional",
             "run_start_time",
             "run_end_time",
+            "runtime_guard_stats_start_time",
             "rolling_hourly_loss_limit",
             "max_cumulative_notional",
             "sleep_seconds",
@@ -3552,6 +3566,7 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "max_single_cycle_new_orders": max_single_cycle_new_orders,
             "run_start_time": runtime_guard_config["run_start_time"],
             "run_end_time": runtime_guard_config["run_end_time"],
+            "runtime_guard_stats_start_time": runtime_guard_config["runtime_guard_stats_start_time"],
             "rolling_hourly_loss_limit": runtime_guard_config["rolling_hourly_loss_limit"],
             "max_cumulative_notional": runtime_guard_config["max_cumulative_notional"],
         }
@@ -3610,6 +3625,7 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--max-single-cycle-new-orders", config.get("max_single_cycle_new_orders")),
         ("--run-start-time", config.get("run_start_time")),
         ("--run-end-time", config.get("run_end_time")),
+        ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
         ("--rolling-hourly-loss-limit", config.get("rolling_hourly_loss_limit")),
         ("--max-cumulative-notional", config.get("max_cumulative_notional")),
     ]
@@ -3692,6 +3708,7 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "max_single_cycle_new_orders",
             "run_start_time",
             "run_end_time",
+            "runtime_guard_stats_start_time",
             "rolling_hourly_loss_limit",
             "max_cumulative_notional",
         }
@@ -3906,6 +3923,9 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
             "stop_triggered_at": latest_event.get("stop_triggered_at") if isinstance(latest_event, dict) else None,
             "run_start_time": config.get("run_start_time"),
             "run_end_time": config.get("run_end_time"),
+            "runtime_guard_stats_start_time": (
+                latest_event.get("runtime_guard_stats_start_time") if isinstance(latest_event, dict) else config.get("runtime_guard_stats_start_time")
+            ),
             "rolling_hourly_loss_limit": _float_or_default(config.get("rolling_hourly_loss_limit"), "rolling_hourly_loss_limit"),
             "max_cumulative_notional": _float_or_default(config.get("max_cumulative_notional"), "max_cumulative_notional"),
             "rolling_hourly_loss": _float_or_default(latest_event.get("rolling_hourly_loss"), "rolling_hourly_loss") if isinstance(latest_event, dict) else 0.0,
@@ -9624,6 +9644,9 @@ MONITOR_PAGE = """<!doctype html>
         <label>结束交易时间
           <input id="monitor_run_end_time" type="datetime-local" />
         </label>
+        <label>风控统计起点
+          <input id="monitor_runtime_guard_stats_start_time" type="datetime-local" />
+        </label>
         <label>滚动 60 分钟亏损阈值
           <input id="monitor_rolling_hourly_loss_limit" type="number" min="0" step="0.01" />
         </label>
@@ -9921,6 +9944,7 @@ MONITOR_PAGE = """<!doctype html>
     const runnerParamsGuideBodyEl = document.getElementById("runner_params_guide_body");
     const monitorRunStartTimeEl = document.getElementById("monitor_run_start_time");
     const monitorRunEndTimeEl = document.getElementById("monitor_run_end_time");
+    const monitorRuntimeGuardStatsStartTimeEl = document.getElementById("monitor_runtime_guard_stats_start_time");
     const monitorRollingHourlyLossLimitEl = document.getElementById("monitor_rolling_hourly_loss_limit");
     const monitorMaxCumulativeNotionalEl = document.getElementById("monitor_max_cumulative_notional");
     const monitorVolumeTriggerEnabledEl = document.getElementById("monitor_volume_trigger_enabled");
@@ -10720,6 +10744,7 @@ MONITOR_PAGE = """<!doctype html>
       sleep_seconds: "循环轮询周期。越小越跟价，但撤改单更频繁。",
       run_start_time: "允许开始交易的时间。未到时间前会停止交易、撤策略单并进入清仓逻辑。",
       run_end_time: "允许结束交易的时间。超过时间后会停止交易、撤策略单并进入清仓逻辑。",
+      runtime_guard_stats_start_time: "风控统计起点。累计成交额和滚动亏损只会统计这个时间之后的审计数据；留空时比赛币会尽量跟随当前赛段起点。",
       rolling_hourly_loss_limit: "最近 60 分钟滚动亏损阈值。达到后会自动停机、撤单并清仓。",
       max_cumulative_notional: "累计成交额阈值。达到后会自动停机、撤单并清仓。",
       max_actual_net_notional: "实际净敞口绝对值阈值。达到后会自动停机、撤单并清仓。",
@@ -11011,6 +11036,7 @@ MONITOR_PAGE = """<!doctype html>
       return {
         run_start_time: fromLocalInputValue(monitorRunStartTimeEl.value),
         run_end_time: fromLocalInputValue(monitorRunEndTimeEl.value),
+        runtime_guard_stats_start_time: fromLocalInputValue(monitorRuntimeGuardStatsStartTimeEl.value),
         rolling_hourly_loss_limit: monitorRollingHourlyLossLimitEl.value ? Number(monitorRollingHourlyLossLimitEl.value) : null,
         max_cumulative_notional: monitorMaxCumulativeNotionalEl.value ? Number(monitorMaxCumulativeNotionalEl.value) : null,
         volume_trigger_enabled: Boolean(monitorVolumeTriggerEnabledEl && monitorVolumeTriggerEnabledEl.checked),
@@ -11034,6 +11060,7 @@ MONITOR_PAGE = """<!doctype html>
       const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
       monitorRunStartTimeEl.value = toLocalInputValue(source.run_start_time);
       monitorRunEndTimeEl.value = toLocalInputValue(source.run_end_time);
+      monitorRuntimeGuardStatsStartTimeEl.value = toLocalInputValue(source.runtime_guard_stats_start_time);
       monitorRollingHourlyLossLimitEl.value = source.rolling_hourly_loss_limit ?? "";
       monitorMaxCumulativeNotionalEl.value = source.max_cumulative_notional ?? "";
       monitorVolumeTriggerEnabledEl.checked = Boolean(source.volume_trigger_enabled);
@@ -11587,6 +11614,9 @@ MONITOR_PAGE = """<!doctype html>
       }
       if (config.run_end_time) {
         lines.push(`run_end_time=${fmtTs(config.run_end_time)} 之后会自动停止交易、撤策略单并转入清仓。`);
+      }
+      if (config.runtime_guard_stats_start_time) {
+        lines.push(`runtime_guard_stats_start_time=${fmtTs(config.runtime_guard_stats_start_time)} 之后的审计数据才会参与累计成交额和滚动亏损统计。`);
       }
       if (asGuideNumber(config.rolling_hourly_loss_limit) > 0) {
         lines.push(`最近 60 分钟滚动亏损达到 ${fmtGuideNotional(config.rolling_hourly_loss_limit)} 时，会直接停机并执行撤单清仓。`);

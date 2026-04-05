@@ -1399,10 +1399,16 @@ def _start_futures_flatten_process(symbol: str) -> dict[str, Any]:
 def _load_futures_runtime_guard_inputs(
     summary_path: Path,
     *,
+    runtime_guard_stats_start_time: Any = None,
     symbol: str,
     now: datetime | None = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
-    return summarize_futures_runtime_guard_inputs(summary_path, symbol=symbol, now=now)
+    return summarize_futures_runtime_guard_inputs(
+        summary_path,
+        runtime_guard_stats_start_time=runtime_guard_stats_start_time,
+        symbol=symbol,
+        now=now,
+    )
 
 
 def _cancel_futures_strategy_orders(
@@ -1611,6 +1617,7 @@ def _maybe_handle_runtime_guard(
         return None
     cumulative_gross_notional, pnl_events, stats_start_time = _load_futures_runtime_guard_inputs(
         summary_path,
+        runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
         symbol=args.symbol.upper().strip(),
         now=cycle_started_at,
     )
@@ -4455,6 +4462,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--summary-jsonl", type=str, default="output/night_loop_events.jsonl")
     parser.add_argument("--run-start-time", type=str, default=None)
     parser.add_argument("--run-end-time", type=str, default=None)
+    parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     parser.add_argument("--reset-state", action="store_true")
@@ -4882,6 +4890,7 @@ def main() -> None:
             runtime_guard_config = normalize_runtime_guard_config(vars(args))
             runtime_cumulative_gross_notional, runtime_pnl_events, runtime_stats_start_time = _load_futures_runtime_guard_inputs(
                 summary_path,
+                runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
                 symbol=args.symbol.upper().strip(),
                 now=cycle_started_at,
             )

@@ -48,6 +48,7 @@ class RuntimeGuardConfig:
     max_cumulative_notional: float | None
     max_actual_net_notional: float | None
     max_synthetic_drift_notional: float | None
+    runtime_guard_stats_start_time: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -66,10 +67,17 @@ class RuntimeGuardResult:
 
 def resolve_runtime_guard_stats_start_time(
     *,
+    runtime_guard_stats_start_time: Any = None,
     symbol: str | None = None,
     market: str = "futures",
     now: datetime | None = None,
 ) -> datetime | None:
+    try:
+        explicit_start = _parse_datetime(runtime_guard_stats_start_time, "runtime_guard_stats_start_time")
+    except ValueError:
+        explicit_start = None
+    if explicit_start is not None:
+        return explicit_start
     normalized_symbol = str(symbol or "").upper().strip()
     normalized_market = str(market or "").strip().lower()
     if not normalized_symbol or not normalized_market:
@@ -89,13 +97,19 @@ def resolve_runtime_guard_stats_start_time(
 def summarize_futures_runtime_guard_inputs(
     summary_path: Path,
     *,
+    runtime_guard_stats_start_time: Any = None,
     symbol: str | None = None,
     now: datetime | None = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     audit_paths = build_audit_paths(summary_path)
     trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
     income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
-    metrics_start_time = resolve_runtime_guard_stats_start_time(symbol=symbol, market="futures", now=now)
+    metrics_start_time = resolve_runtime_guard_stats_start_time(
+        runtime_guard_stats_start_time=runtime_guard_stats_start_time,
+        symbol=symbol,
+        market="futures",
+        now=now,
+    )
     cumulative_gross_notional = 0.0
     pnl_events: list[dict[str, Any]] = []
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
@@ -167,6 +181,10 @@ def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
             raw.get("max_synthetic_drift_notional"),
             "max_synthetic_drift_notional",
         ),
+        runtime_guard_stats_start_time=_parse_datetime(
+            raw.get("runtime_guard_stats_start_time"),
+            "runtime_guard_stats_start_time",
+        ),
     )
     if config.run_start_time and config.run_end_time and config.run_start_time >= config.run_end_time:
         raise ValueError("run_start_time must be earlier than run_end_time")
@@ -182,6 +200,9 @@ def normalize_runtime_guard_payload(raw: dict[str, Any]) -> dict[str, Any]:
         "max_cumulative_notional": config.max_cumulative_notional,
         "max_actual_net_notional": config.max_actual_net_notional,
         "max_synthetic_drift_notional": config.max_synthetic_drift_notional,
+        "runtime_guard_stats_start_time": (
+            config.runtime_guard_stats_start_time.isoformat() if config.runtime_guard_stats_start_time else None
+        ),
     }
 
 
@@ -204,6 +225,8 @@ def evaluate_runtime_guards(
     for event in pnl_events:
         event_ts = _parse_datetime(event.get("ts"), "ts")
         if event_ts is None or event_ts < window_start or event_ts > current:
+            continue
+        if config.runtime_guard_stats_start_time and event_ts < config.runtime_guard_stats_start_time:
             continue
         window_net_pnl += _event_net_pnl(event)
     rolling_loss = max(0.0, -window_net_pnl)
