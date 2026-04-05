@@ -18,7 +18,9 @@ from grid_optimizer.web import (
     _default_runtime_paths_for_symbol,
     _get_custom_runner_preset,
     _load_runner_control_config,
+    _normalize_runner_control_payload,
     _parse_allowed_networks,
+    _resolve_runner_volume_trigger_action,
     _resolve_runner_start_config,
     _run_loop_monitor_query,
     _runner_service_name_for_symbol,
@@ -68,6 +70,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_run_end_time"', MONITOR_PAGE)
         self.assertIn('id="monitor_rolling_hourly_loss_limit"', MONITOR_PAGE)
         self.assertIn('id="monitor_max_cumulative_notional"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volume_trigger_enabled"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volume_trigger_window"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volume_trigger_start_threshold"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volume_trigger_stop_threshold"', MONITOR_PAGE)
+        self.assertIn('id="save_params_btn"', MONITOR_PAGE)
 
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
         if "getSelectedSymbol(" in MONITOR_PAGE:
@@ -79,6 +86,11 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_monitor_page_keeps_newline_escape_in_editor_locator(self) -> None:
         self.assertIn('split("\\n").length - 1', MONITOR_PAGE)
+
+    def test_monitor_page_start_button_uses_editor_payload(self) -> None:
+        self.assertIn("function buildRunnerPayloadFromEditor(", MONITOR_PAGE)
+        self.assertIn('? startPayload', MONITOR_PAGE)
+        self.assertIn("正在按当前编辑器参数启动策略", MONITOR_PAGE)
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")
@@ -108,6 +120,25 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["strategy_profile"], "synthetic_neutral_v1")
         self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
         self.assertAlmostEqual(payload["max_short_position_notional"], 500.0)
+
+    def test_runner_preset_payload_applies_volume_neutral_ping_pong_profile(self) -> None:
+        payload = _runner_preset_payload("volume_neutral_ping_pong_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "volume_neutral_ping_pong_v1")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["startup_entry_multiplier"], 4.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 0.0)
+        self.assertTrue(payload["market_bias_enabled"])
+        self.assertAlmostEqual(payload["market_bias_max_shift_steps"], 0.75)
+        self.assertTrue(payload["market_bias_weak_buy_pause_enabled"])
+        self.assertAlmostEqual(payload["market_bias_weak_buy_pause_threshold"], 0.15)
+        self.assertTrue(payload["market_bias_strong_short_pause_enabled"])
+        self.assertAlmostEqual(payload["market_bias_strong_short_pause_threshold"], 0.15)
+        self.assertTrue(payload["market_bias_regime_switch_enabled"])
+        self.assertEqual(payload["market_bias_regime_switch_confirm_cycles"], 2)
+        self.assertAlmostEqual(payload["market_bias_regime_switch_weak_threshold"], 0.15)
+        self.assertAlmostEqual(payload["market_bias_regime_switch_strong_threshold"], 0.15)
+        self.assertAlmostEqual(payload["max_position_notional"], 600.0)
+        self.assertAlmostEqual(payload["sleep_seconds"], 5.0)
 
     def test_runner_preset_payload_applies_volatility_defensive_profile(self) -> None:
         payload = _runner_preset_payload("volatility_defensive_v1", {"symbol": "OPNUSDT"})
@@ -164,6 +195,59 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["inventory_tier_sell_levels"], 3)
         self.assertEqual(payload["inventory_tier_per_order_notional"], 45.0)
         self.assertEqual(payload["inventory_tier_base_position_notional"], 100.0)
+
+    def test_normalize_runner_control_payload_supports_volume_trigger_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "BARDUSDT",
+                "strategy_profile": "bard_volume_long_v2",
+                "volume_trigger_enabled": True,
+                "volume_trigger_window": "15m",
+                "volume_trigger_start_threshold": 250000,
+                "volume_trigger_stop_threshold": 180000,
+                "volume_trigger_stop_cancel_open_orders": False,
+                "volume_trigger_stop_close_all_positions": True,
+            }
+        )
+
+        self.assertTrue(payload["volume_trigger_enabled"])
+        self.assertEqual(payload["volume_trigger_window"], "15m")
+        self.assertEqual(payload["volume_trigger_start_threshold"], 250000)
+        self.assertEqual(payload["volume_trigger_stop_threshold"], 180000)
+        self.assertTrue(payload["volume_trigger_stop_cancel_open_orders"])
+        self.assertTrue(payload["volume_trigger_stop_close_all_positions"])
+
+    def test_resolve_runner_volume_trigger_action_starts_when_volume_above_threshold(self) -> None:
+        decision = _resolve_runner_volume_trigger_action(
+            {
+                "volume_trigger_enabled": True,
+                "volume_trigger_window": "1h",
+                "volume_trigger_start_threshold": 100000,
+                "volume_trigger_stop_threshold": 50000,
+            },
+            current_quote_volume=120000,
+            runner_running=False,
+            flatten_running=False,
+        )
+
+        self.assertEqual(decision["action"], "start")
+        self.assertEqual(decision["reason"], "volume_above_start_threshold")
+
+    def test_resolve_runner_volume_trigger_action_stops_when_volume_below_threshold(self) -> None:
+        decision = _resolve_runner_volume_trigger_action(
+            {
+                "volume_trigger_enabled": True,
+                "volume_trigger_window": "1h",
+                "volume_trigger_start_threshold": 100000,
+                "volume_trigger_stop_threshold": 50000,
+            },
+            current_quote_volume=42000,
+            runner_running=True,
+            flatten_running=False,
+        )
+
+        self.assertEqual(decision["action"], "stop")
+        self.assertEqual(decision["reason"], "volume_below_stop_threshold")
 
     def test_runner_preset_payload_rejects_xaut_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
@@ -351,7 +435,20 @@ class WebSecurityTests(unittest.TestCase):
         config = _resolve_runner_start_config({"symbol": "ENSOUSDT", "strategy_profile": "synthetic_neutral_v1"})
         self.assertEqual(config["strategy_profile"], "synthetic_neutral_v1")
         self.assertEqual(config["strategy_mode"], "synthetic_neutral")
-        self.assertEqual(config["state_path"], "output/ensousdt_loop_state.json")
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_volume_neutral_ping_pong_profile(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config({"symbol": "BASEDUSDT", "strategy_profile": "volume_neutral_ping_pong_v1"})
+        self.assertEqual(config["strategy_profile"], "volume_neutral_ping_pong_v1")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(config["startup_entry_multiplier"], 4.0)
+        self.assertAlmostEqual(config["base_position_notional"], 0.0)
+        self.assertTrue(config["market_bias_enabled"])
+        self.assertAlmostEqual(config["market_bias_max_shift_steps"], 0.75)
+        self.assertEqual(config["state_path"], "output/basedusdt_loop_state.json")
         self.assertGreater(config["step_price"], 0)
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
@@ -622,6 +719,102 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--short-cover-pause-amp-trigger-ratio", command)
         self.assertIn("--short-cover-pause-down-return-trigger-ratio", command)
 
+    def test_build_runner_command_includes_startup_entry_multiplier(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BASEDUSDT",
+                "strategy_profile": "volume_neutral_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0001,
+                "buy_levels": 4,
+                "sell_levels": 4,
+                "per_order_notional": 45.0,
+                "startup_entry_multiplier": 4.0,
+                "base_position_notional": 0.0,
+                "pause_buy_position_notional": 500.0,
+                "pause_short_position_notional": 500.0,
+                "max_position_notional": 600.0,
+                "max_short_position_notional": 600.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 20,
+                "max_total_notional": 1200.0,
+                "sleep_seconds": 5,
+                "state_path": "output/basedusdt_loop_state.json",
+                "plan_json": "output/basedusdt_loop_latest_plan.json",
+                "submit_report_json": "output/basedusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/basedusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+        self.assertIn("--startup-entry-multiplier", command)
+        self.assertIn("4.0", command)
+
+    def test_build_runner_command_includes_market_bias_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BASEDUSDT",
+                "strategy_profile": "volume_neutral_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0002,
+                "buy_levels": 4,
+                "sell_levels": 4,
+                "per_order_notional": 45.0,
+                "startup_entry_multiplier": 4.0,
+                "base_position_notional": 0.0,
+                "market_bias_enabled": True,
+                "market_bias_max_shift_steps": 0.75,
+                "market_bias_signal_steps": 2.0,
+                "market_bias_drift_weight": 0.65,
+                "market_bias_return_weight": 0.35,
+                "market_bias_weak_buy_pause_enabled": True,
+                "market_bias_weak_buy_pause_threshold": 0.15,
+                "market_bias_strong_short_pause_enabled": True,
+                "market_bias_strong_short_pause_threshold": 0.15,
+                "market_bias_regime_switch_enabled": True,
+                "market_bias_regime_switch_confirm_cycles": 2,
+                "market_bias_regime_switch_weak_threshold": 0.15,
+                "market_bias_regime_switch_strong_threshold": 0.15,
+                "pause_buy_position_notional": 500.0,
+                "pause_short_position_notional": 500.0,
+                "max_position_notional": 600.0,
+                "max_short_position_notional": 600.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 20,
+                "max_total_notional": 1200.0,
+                "sleep_seconds": 5,
+                "state_path": "output/basedusdt_loop_state.json",
+                "plan_json": "output/basedusdt_loop_latest_plan.json",
+                "submit_report_json": "output/basedusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/basedusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+        self.assertIn("--market-bias-enabled", command)
+        self.assertIn("--market-bias-max-shift-steps", command)
+        self.assertIn("--market-bias-signal-steps", command)
+        self.assertIn("--market-bias-drift-weight", command)
+        self.assertIn("--market-bias-return-weight", command)
+        self.assertIn("--market-bias-weak-buy-pause-enabled", command)
+        self.assertIn("--market-bias-weak-buy-pause-threshold", command)
+        self.assertIn("--market-bias-strong-short-pause-enabled", command)
+        self.assertIn("--market-bias-strong-short-pause-threshold", command)
+        self.assertIn("--market-bias-regime-switch-enabled", command)
+        self.assertIn("--market-bias-regime-switch-confirm-cycles", command)
+        self.assertIn("--market-bias-regime-switch-weak-threshold", command)
+        self.assertIn("--market-bias-regime-switch-strong-threshold", command)
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -756,10 +949,61 @@ class WebSecurityTests(unittest.TestCase):
             custom_path.unlink(missing_ok=True)
 
     def test_runner_preset_summaries_filter_builtin_symbol_bound_presets(self) -> None:
+        bard_keys = {item["key"] for item in _runner_preset_summaries("BARDUSDT")}
+        based_keys = {item["key"] for item in _runner_preset_summaries("BASEDUSDT")}
         xaut_keys = {item["key"] for item in _runner_preset_summaries("XAUTUSDT")}
         opn_keys = {item["key"] for item in _runner_preset_summaries("OPNUSDT")}
+        self.assertIn("bard_12h_push_neutral_v2", bard_keys)
+        self.assertNotIn("bard_12h_push_neutral_v2", opn_keys)
+        self.assertIn("based_volume_long_trigger_v1", based_keys)
+        self.assertIn("based_volume_push_bard_v1", based_keys)
+        self.assertNotIn("based_volume_long_trigger_v1", opn_keys)
+        self.assertNotIn("based_volume_push_bard_v1", opn_keys)
         self.assertIn("xaut_volume_short_v1", xaut_keys)
         self.assertNotIn("xaut_volume_short_v1", opn_keys)
+
+    def test_runner_preset_payload_for_bard_12h_push_neutral_v2(self) -> None:
+        payload = _runner_preset_payload("bard_12h_push_neutral_v2", {"symbol": "BARDUSDT"})
+        self.assertEqual(payload["symbol"], "BARDUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 0.0001)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 8)
+        self.assertEqual(payload["per_order_notional"], 100.0)
+        self.assertEqual(payload["base_position_notional"], 0.0)
+        self.assertEqual(payload["pause_buy_position_notional"], 2000.0)
+        self.assertEqual(payload["pause_short_position_notional"], 2000.0)
+        self.assertEqual(payload["max_position_notional"], 2400.0)
+        self.assertEqual(payload["max_short_position_notional"], 2400.0)
+        self.assertEqual(payload["max_total_notional"], 3600.0)
+        self.assertEqual(payload["max_new_orders"], 40)
+        self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertIsNone(payload["rolling_hourly_loss_limit"])
+
+    def test_runner_preset_payload_for_based_volume_long_trigger_includes_volume_guard(self) -> None:
+        payload = _runner_preset_payload("based_volume_long_trigger_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["symbol"], "BASEDUSDT")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertTrue(payload["volume_trigger_enabled"])
+        self.assertEqual(payload["volume_trigger_window"], "15m")
+        self.assertEqual(payload["volume_trigger_start_threshold"], 260000.0)
+        self.assertEqual(payload["volume_trigger_stop_threshold"], 180000.0)
+        self.assertTrue(payload["volume_trigger_stop_cancel_open_orders"])
+        self.assertTrue(payload["volume_trigger_stop_close_all_positions"])
+
+    def test_runner_preset_payload_for_based_volume_push_bard_preserves_dense_grid(self) -> None:
+        payload = _runner_preset_payload("based_volume_push_bard_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["symbol"], "BASEDUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 0.0001)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 8)
+        self.assertEqual(payload["per_order_notional"], 100.0)
+        self.assertEqual(payload["base_position_notional"], 0.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
+        self.assertIsNone(payload["rolling_hourly_loss_limit"])
 
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_summaries_include_custom_grid_edit_metadata(self) -> None:

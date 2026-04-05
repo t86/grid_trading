@@ -1349,6 +1349,75 @@ def fetch_futures_klines(
     return candles
 
 
+def fetch_futures_quote_volume_sum(
+    symbol: str,
+    *,
+    window_minutes: int,
+    contract_type: str = "usdm",
+    end_time_ms: int | None = None,
+    interval: str = "1m",
+    limit: int = 1500,
+) -> float:
+    if window_minutes <= 0:
+        raise ValueError("window_minutes must be > 0")
+    if interval != "1m":
+        raise ValueError("only 1m interval is supported for quote volume aggregation")
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+
+    interval_ms = parse_interval_ms(interval)
+    window_ms = int(window_minutes) * 60 * 1000
+    end_ms = int(end_time_ms if end_time_ms is not None else time.time() * 1000)
+    start_ms = end_ms - window_ms
+    if start_ms >= end_ms:
+        return 0.0
+
+    normalized_contract_type = normalize_contract_type(contract_type)
+    cursor = start_ms
+    request_span_ms = max(interval_ms * max(limit - 1, 1), interval_ms)
+    quote_volume_sum = 0.0
+    seen_open_times: set[int] = set()
+
+    while cursor < end_ms:
+        request_end_ms = min(end_ms - 1, cursor + request_span_ms)
+        data = _http_get_json(
+            _market_api_urls(normalized_contract_type)["kline"],
+            {
+                "symbol": symbol.upper(),
+                "interval": interval,
+                "startTime": cursor,
+                "endTime": request_end_ms,
+                "limit": limit,
+            },
+        )
+        if not data:
+            next_cursor = request_end_ms + interval_ms
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            continue
+
+        last_open = cursor
+        for row in data:
+            open_ms = int(row[0])
+            if open_ms < start_ms or open_ms >= end_ms or open_ms in seen_open_times:
+                continue
+            seen_open_times.add(open_ms)
+            quote_volume_sum += float(row[7])
+            last_open = max(last_open, open_ms)
+
+        next_cursor = last_open + interval_ms
+        if next_cursor <= cursor:
+            next_cursor = request_end_ms + interval_ms
+            if next_cursor <= cursor:
+                break
+        cursor = next_cursor
+        if len(data) >= limit:
+            time.sleep(0.03)
+
+    return quote_volume_sum
+
+
 def _cache_file_path(
     cache_dir: Path,
     symbol: str,

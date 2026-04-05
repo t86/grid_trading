@@ -287,6 +287,91 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertTrue(any(item["role"] == "take_profit_short" for item in plan["buy_orders"]))
         self.assertTrue(any(item["role"] == "take_profit_long" for item in plan["sell_orders"]))
 
+    def test_build_hedge_micro_grid_plan_can_enlarge_startup_entry_without_bootstrap(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=4,
+            sell_levels=4,
+            per_order_notional=25.0,
+            startup_entry_multiplier=4.0,
+            startup_large_entry_active=True,
+            base_position_notional=0.0,
+            bid_price=0.999,
+            ask_price=1.001,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+        )
+
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertGreater(plan["buy_orders"][0]["notional"], plan["buy_orders"][1]["notional"] * 3.9)
+        self.assertGreater(plan["sell_orders"][0]["notional"], plan["sell_orders"][1]["notional"] * 3.9)
+
+        regular_plan = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=4,
+            sell_levels=4,
+            per_order_notional=25.0,
+            startup_entry_multiplier=4.0,
+            startup_large_entry_active=False,
+            base_position_notional=0.0,
+            bid_price=0.999,
+            ask_price=1.001,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+        )
+
+        self.assertLess(abs(regular_plan["buy_orders"][0]["notional"] - regular_plan["buy_orders"][1]["notional"]), 0.5)
+        self.assertLess(abs(regular_plan["sell_orders"][0]["notional"] - regular_plan["sell_orders"][1]["notional"]), 0.5)
+
+    def test_build_hedge_micro_grid_plan_can_shift_buy_and_sell_sides_independently(self) -> None:
+        regular = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=0.999,
+            ask_price=1.001,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+        )
+        biased = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=0.999,
+            ask_price=1.001,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+            buy_offset_steps=0.5,
+            sell_offset_steps=-0.5,
+        )
+
+        self.assertLess(biased["buy_orders"][0]["price"], regular["buy_orders"][0]["price"])
+        self.assertLess(biased["sell_orders"][0]["price"], regular["sell_orders"][0]["price"])
+
     def test_build_inventory_target_neutral_plan_builds_band_orders_and_bootstrap(self) -> None:
         plan = build_inventory_target_neutral_plan(
             center_price=1.0,

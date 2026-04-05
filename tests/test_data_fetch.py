@@ -16,6 +16,7 @@ from grid_optimizer.data import (
     _prefer_ipv4,
     fetch_funding_rates,
     fetch_futures_klines,
+    fetch_futures_quote_volume_sum,
     fetch_futures_symbol_config,
     fetch_spot_symbol_config,
     load_or_fetch_candles,
@@ -324,6 +325,26 @@ class DataFetchTests(unittest.TestCase):
         self.assertAlmostEqual(float(config["tick_size"] or 0.0), 0.0001, places=8)
         self.assertAlmostEqual(float(config["step_size"] or 0.0), 0.1, places=8)
         self.assertAlmostEqual(float(config["min_notional"] or 0.0), 5.0, places=8)
+
+    @patch("grid_optimizer.data._http_get_json")
+    def test_fetch_futures_quote_volume_sum_aggregates_quote_volume(self, mock_http_get_json) -> None:
+        end_ms = 5 * 60_000
+        mock_http_get_json.return_value = [
+            [0, "1", "1", "1", "1", "100", 59_999, "11.5", "0", "0", "0", "0"],
+            [60_000, "1", "1", "1", "1", "100", 119_999, "13.0", "0", "0", "0", "0"],
+            [120_000, "1", "1", "1", "1", "100", 179_999, "17.25", "0", "0", "0", "0"],
+            [120_000, "1", "1", "1", "1", "100", 179_999, "99.99", "0", "0", "0", "0"],
+            [180_000, "1", "1", "1", "1", "100", 239_999, "19.75", "0", "0", "0", "0"],
+            [240_000, "1", "1", "1", "1", "100", 299_999, "23.5", "0", "0", "0", "0"],
+        ]
+
+        volume = fetch_futures_quote_volume_sum(
+            "BARDUSDT",
+            window_minutes=5,
+            end_time_ms=end_ms,
+        )
+
+        self.assertAlmostEqual(volume, 85.0, places=8)
 
 
 if __name__ == "__main__":

@@ -152,6 +152,16 @@ XAUT_ADAPTIVE_TRANSITION_CONFIRMATIONS = {
     (XAUT_ADAPTIVE_STATE_REDUCE_ONLY, XAUT_ADAPTIVE_STATE_DEFENSIVE): 2,
     (XAUT_ADAPTIVE_STATE_NORMAL, XAUT_ADAPTIVE_STATE_REDUCE_ONLY): 1,
 }
+XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO = 0.0035
+XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO = 0.0075
+XAUT_ADAPTIVE_DEFENSIVE_15M_AMPLITUDE_RATIO = 0.006
+XAUT_ADAPTIVE_DEFENSIVE_60M_AMPLITUDE_RATIO = 0.012
+XAUT_ADAPTIVE_REDUCE_ONLY_15M_AMPLITUDE_RATIO = 0.009
+XAUT_ADAPTIVE_REDUCE_ONLY_60M_AMPLITUDE_RATIO = 0.016
+XAUT_ADAPTIVE_MIN_STEP_BASE_RATIO = 0.30
+XAUT_ADAPTIVE_MIN_STEP_MID_RATIO = 0.00045
+XAUT_ADAPTIVE_MIN_STEP_TICKS = 20
+XAUT_ADAPTIVE_MIN_STEP_SPREADS = 20.0
 
 
 class StartupProtectionError(RuntimeError):
@@ -901,6 +911,34 @@ def _load_synthetic_ledger(
     return ledger
 
 
+def _reset_synthetic_ledger_to_actual(
+    *,
+    state: dict[str, Any],
+    actual_position_qty: float,
+    entry_price: float,
+    reason: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = now or _utc_now()
+    net_qty = float(actual_position_qty)
+    ledger = {
+        "initialized": True,
+        "virtual_long_qty": max(net_qty, 0.0),
+        "virtual_long_avg_price": max(float(entry_price), 0.0) if net_qty > 0 else 0.0,
+        "virtual_short_qty": max(-net_qty, 0.0),
+        "virtual_short_avg_price": max(float(entry_price), 0.0) if net_qty < 0 else 0.0,
+        "last_trade_time_ms": int(current_time.timestamp() * 1000),
+        "last_trade_keys_at_time": [],
+        "unmatched_trade_count": 0,
+        "resynced_at": current_time.isoformat(),
+        "resync_reason": str(reason or "manual_reset"),
+    }
+    state["synthetic_ledger"] = ledger
+    state["synthetic_order_refs"] = {}
+    state["synthetic_ledger_resync_required"] = False
+    return ledger
+
+
 def _synthetic_order_ref_from_state(state: dict[str, Any], order_id: int | None) -> dict[str, Any] | None:
     refs = state.get("synthetic_order_refs")
     if not isinstance(refs, dict) or order_id is None:
@@ -1067,6 +1105,7 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         buy_levels=args.buy_levels,
         sell_levels=args.sell_levels,
         per_order_notional=args.per_order_notional,
+        startup_entry_multiplier=getattr(args, "startup_entry_multiplier", 1.0),
         base_position_notional=args.base_position_notional,
         center_price=args.center_price,
         fixed_center_enabled=getattr(args, "fixed_center_enabled", False),
@@ -1423,81 +1462,66 @@ def _cancel_futures_strategy_orders(
     return count
 
 
-def _maybe_handle_runtime_guard(
+def _synthetic_drift_notional(mid_price: float, synthetic_drift_qty: float) -> float:
+    return abs(float(synthetic_drift_qty)) * max(float(mid_price), 0.0)
+
+
+def _build_runtime_guard_stop_summary(
     *,
     args: argparse.Namespace,
     cycle: int,
     cycle_started_at: datetime,
-    summary_path: Path,
-) -> dict[str, Any] | None:
-    runtime_guard_config = normalize_runtime_guard_config(vars(args))
-    if not any(
-        (
-            runtime_guard_config.run_start_time,
-            runtime_guard_config.run_end_time,
-            runtime_guard_config.rolling_hourly_loss_limit,
-            runtime_guard_config.max_cumulative_notional,
-        )
-    ):
-        return None
-    cumulative_gross_notional, pnl_events = _load_futures_runtime_guard_inputs(summary_path)
-    runtime_guard_result = evaluate_runtime_guards(
-        config=runtime_guard_config,
-        now=cycle_started_at,
-        cumulative_gross_notional=cumulative_gross_notional,
-        pnl_events=pnl_events,
+    runtime_guard_config: Any,
+    runtime_guard_result: Any,
+    canceled_count: int,
+    flatten_result: dict[str, Any],
+    flatten_snapshot: dict[str, Any],
+    metrics: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    metric_source = dict(metrics or {})
+    live_mid_price = (
+        (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
+        if (_safe_float(flatten_snapshot.get("bid_price")) > 0 and _safe_float(flatten_snapshot.get("ask_price")) > 0)
+        else 0.0
     )
-    if runtime_guard_result.tradable:
-        return None
-    credentials = load_binance_api_credentials()
-    if credentials is None:
-        raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
-    api_key, api_secret = credentials
-    canceled_count = _cancel_futures_strategy_orders(
-        symbol=args.symbol.upper().strip(),
-        api_key=api_key,
-        api_secret=api_secret,
-        recv_window=args.recv_window,
-    )
-    flatten_result = {"started": False, "already_running": False}
-    flatten_snapshot = load_live_flatten_snapshot(args.symbol.upper().strip(), api_key, api_secret)
-    if list(flatten_snapshot.get("orders", [])):
-        flatten_result = _start_futures_flatten_process(args.symbol.upper().strip())
-    summary = {
+    mid_price = _safe_float(metric_source.get("mid_price")) or live_mid_price
+    current_long_qty = _safe_float(metric_source.get("current_long_qty"))
+    if current_long_qty <= 0:
+        current_long_qty = _safe_float(flatten_snapshot.get("long_qty"))
+    current_short_qty = _safe_float(metric_source.get("current_short_qty"))
+    if current_short_qty <= 0:
+        current_short_qty = _safe_float(flatten_snapshot.get("short_qty"))
+    actual_net_qty = _safe_float(metric_source.get("actual_net_qty"))
+    if abs(actual_net_qty) <= 1e-12:
+        actual_net_qty = _safe_float(flatten_snapshot.get("net_qty"))
+    current_long_notional = _safe_float(metric_source.get("current_long_notional")) or (current_long_qty * mid_price)
+    current_short_notional = _safe_float(metric_source.get("current_short_notional")) or (current_short_qty * mid_price)
+    actual_net_notional = _safe_float(metric_source.get("actual_net_notional")) or (actual_net_qty * mid_price)
+    synthetic_net_qty = _safe_float(metric_source.get("synthetic_net_qty"))
+    synthetic_drift_qty = _safe_float(metric_source.get("synthetic_drift_qty"))
+    synthetic_drift_notional = _synthetic_drift_notional(mid_price, synthetic_drift_qty)
+
+    return {
         "ts": cycle_started_at.isoformat(),
         "cycle": cycle,
         "symbol": args.symbol.upper().strip(),
         "strategy_profile": str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)),
-        "effective_strategy_profile": str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)),
-        "strategy_mode": str(getattr(args, "strategy_mode", "one_way_long")),
-        "mid_price": _safe_float(flatten_snapshot.get("bid_price"))
-        and (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
-        or 0.0,
-        "center_price": 0.0,
-        "current_long_qty": _safe_float(flatten_snapshot.get("long_qty")),
-        "current_long_notional": _safe_float(flatten_snapshot.get("long_qty"))
-        * (
-            (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
-            if (_safe_float(flatten_snapshot.get("bid_price")) > 0 and _safe_float(flatten_snapshot.get("ask_price")) > 0)
-            else 0.0
+        "effective_strategy_profile": str(
+            metric_source.get("effective_strategy_profile") or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
         ),
-        "current_short_qty": _safe_float(flatten_snapshot.get("short_qty")),
-        "current_short_notional": _safe_float(flatten_snapshot.get("short_qty"))
-        * (
-            (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
-            if (_safe_float(flatten_snapshot.get("bid_price")) > 0 and _safe_float(flatten_snapshot.get("ask_price")) > 0)
-            else 0.0
-        ),
-        "actual_net_qty": _safe_float(flatten_snapshot.get("net_qty")),
-        "actual_net_notional": _safe_float(flatten_snapshot.get("net_qty"))
-        * (
-            (_safe_float(flatten_snapshot.get("bid_price")) + _safe_float(flatten_snapshot.get("ask_price"))) / 2.0
-            if (_safe_float(flatten_snapshot.get("bid_price")) > 0 and _safe_float(flatten_snapshot.get("ask_price")) > 0)
-            else 0.0
-        ),
-        "synthetic_net_qty": 0.0,
-        "synthetic_drift_qty": 0.0,
-        "synthetic_unmatched_trade_count": 0,
+        "strategy_mode": str(metric_source.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")),
+        "mid_price": mid_price,
+        "center_price": _safe_float(metric_source.get("center_price")),
+        "current_long_qty": current_long_qty,
+        "current_long_notional": current_long_notional,
+        "current_short_qty": current_short_qty,
+        "current_short_notional": current_short_notional,
+        "actual_net_qty": actual_net_qty,
+        "actual_net_notional": actual_net_notional,
+        "synthetic_net_qty": synthetic_net_qty,
+        "synthetic_drift_qty": synthetic_drift_qty,
+        "synthetic_drift_notional": synthetic_drift_notional,
+        "synthetic_unmatched_trade_count": int(metric_source.get("synthetic_unmatched_trade_count", 0) or 0),
         "open_order_count": 0,
         "kept_order_count": 0,
         "missing_order_count": 0,
@@ -1509,11 +1533,11 @@ def _maybe_handle_runtime_guard(
         "buy_cap_applied": False,
         "buy_budget_notional": 0.0,
         "planned_buy_notional": 0.0,
-        "max_position_notional": 0.0,
+        "max_position_notional": _safe_float(metric_source.get("max_position_notional")),
         "short_cap_applied": False,
         "short_budget_notional": 0.0,
         "planned_short_notional": 0.0,
-        "max_short_position_notional": 0.0,
+        "max_short_position_notional": _safe_float(metric_source.get("max_short_position_notional")),
         "inventory_tier_active": False,
         "inventory_tier_ratio": 0.0,
         "volatility_buy_pause": False,
@@ -1588,10 +1612,63 @@ def _maybe_handle_runtime_guard(
         "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+        "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
+        "max_synthetic_drift_notional": runtime_guard_config.max_synthetic_drift_notional,
         "flatten_started": bool(flatten_result.get("started")),
         "flatten_already_running": bool(flatten_result.get("already_running")),
     }
-    return summary
+
+
+def _maybe_handle_runtime_guard(
+    *,
+    args: argparse.Namespace,
+    cycle: int,
+    cycle_started_at: datetime,
+    summary_path: Path,
+) -> dict[str, Any] | None:
+    runtime_guard_config = normalize_runtime_guard_config(vars(args))
+    if not any(
+        (
+            runtime_guard_config.run_start_time,
+            runtime_guard_config.run_end_time,
+            runtime_guard_config.rolling_hourly_loss_limit,
+            runtime_guard_config.max_cumulative_notional,
+        )
+    ):
+        return None
+    cumulative_gross_notional, pnl_events = _load_futures_runtime_guard_inputs(summary_path)
+    runtime_guard_result = evaluate_runtime_guards(
+        config=runtime_guard_config,
+        now=cycle_started_at,
+        cumulative_gross_notional=cumulative_gross_notional,
+        pnl_events=pnl_events,
+    )
+    if runtime_guard_result.tradable:
+        return None
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
+    api_key, api_secret = credentials
+    canceled_count = _cancel_futures_strategy_orders(
+        symbol=args.symbol.upper().strip(),
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+    )
+    flatten_result = {"started": False, "already_running": False}
+    flatten_snapshot = load_live_flatten_snapshot(args.symbol.upper().strip(), api_key, api_secret)
+    if list(flatten_snapshot.get("orders", [])):
+        flatten_result = _start_futures_flatten_process(args.symbol.upper().strip())
+    return _build_runtime_guard_stop_summary(
+        args=args,
+        cycle=cycle,
+        cycle_started_at=cycle_started_at,
+        runtime_guard_config=runtime_guard_config,
+        runtime_guard_result=runtime_guard_result,
+        canceled_count=canceled_count,
+        flatten_result=flatten_result,
+        flatten_snapshot=flatten_snapshot,
+    )
 
 
 def apply_position_controls(
@@ -1695,13 +1772,15 @@ def apply_hedge_position_controls(
     min_mid_price_for_buys: float | None,
     external_long_pause: bool = False,
     external_pause_reasons: list[str] | None = None,
+    external_short_pause: bool = False,
+    external_short_pause_reasons: list[str] | None = None,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
     current_short_notional = max(current_short_qty, 0.0) * max(mid_price, 0.0)
     long_paused = bool(external_long_pause)
-    short_paused = False
+    short_paused = bool(external_short_pause)
     long_reasons: list[str] = list(external_pause_reasons or [])
-    short_reasons: list[str] = []
+    short_reasons: list[str] = list(external_short_pause_reasons or [])
 
     if pause_long_position_notional is not None and current_long_notional >= pause_long_position_notional:
         long_paused = True
@@ -1979,32 +2058,40 @@ def assess_xaut_adaptive_regime(
 
     if normalized_mode == "one_way_short":
         reduce_only = (
-            amp_15m >= 0.009
-            or amp_60m >= 0.016
+            amp_15m >= XAUT_ADAPTIVE_REDUCE_ONLY_15M_AMPLITUDE_RATIO
+            or amp_60m >= XAUT_ADAPTIVE_REDUCE_ONLY_60M_AMPLITUDE_RATIO
             or ret_15m >= 0.007
             or ret_60m >= 0.012
         )
         defensive = (
-            amp_15m >= 0.006
-            or amp_60m >= 0.012
+            amp_15m >= XAUT_ADAPTIVE_DEFENSIVE_15M_AMPLITUDE_RATIO
+            or amp_60m >= XAUT_ADAPTIVE_DEFENSIVE_60M_AMPLITUDE_RATIO
             or ret_15m >= 0.004
             or ret_60m >= 0.008
         )
-        normal = amp_15m <= 0.0035 and amp_60m <= 0.0075 and ret_60m <= 0.003
+        normal = (
+            amp_15m <= XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO
+            and amp_60m <= XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO
+            and ret_60m <= 0.003
+        )
     else:
         reduce_only = (
-            amp_15m >= 0.009
-            or amp_60m >= 0.016
+            amp_15m >= XAUT_ADAPTIVE_REDUCE_ONLY_15M_AMPLITUDE_RATIO
+            or amp_60m >= XAUT_ADAPTIVE_REDUCE_ONLY_60M_AMPLITUDE_RATIO
             or ret_15m <= -0.007
             or ret_60m <= -0.012
         )
         defensive = (
-            amp_15m >= 0.006
-            or amp_60m >= 0.012
+            amp_15m >= XAUT_ADAPTIVE_DEFENSIVE_15M_AMPLITUDE_RATIO
+            or amp_60m >= XAUT_ADAPTIVE_DEFENSIVE_60M_AMPLITUDE_RATIO
             or ret_15m <= -0.004
             or ret_60m <= -0.008
         )
-        normal = amp_15m <= 0.0035 and amp_60m <= 0.0075 and ret_60m >= -0.003
+        normal = (
+            amp_15m <= XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO
+            and amp_60m <= XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO
+            and ret_60m >= -0.003
+        )
 
     if reduce_only:
         candidate_state = XAUT_ADAPTIVE_STATE_REDUCE_ONLY
@@ -2083,13 +2170,92 @@ def build_xaut_adaptive_runner_args(
     *,
     args: argparse.Namespace,
     active_state: str,
+    regime_metrics: dict[str, Any] | None = None,
+    bid_price: float = 0.0,
+    ask_price: float = 0.0,
+    mid_price: float = 0.0,
+    tick_size: float | None = None,
 ) -> argparse.Namespace:
     effective = argparse.Namespace(**vars(args))
     strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     overrides = dict(XAUT_ADAPTIVE_STATE_CONFIGS.get(strategy_mode, {}).get(str(active_state), {}))
     for key, value in overrides.items():
         setattr(effective, key, value)
+    scaled_step = resolve_xaut_adaptive_step_price(
+        strategy_mode=strategy_mode,
+        active_state=active_state,
+        regime_metrics=regime_metrics,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        mid_price=mid_price,
+        tick_size=tick_size,
+    )
+    if scaled_step is not None and scaled_step > 0:
+        effective.step_price = scaled_step
     return effective
+
+
+def resolve_xaut_adaptive_step_price(
+    *,
+    strategy_mode: str,
+    active_state: str,
+    regime_metrics: dict[str, Any] | None,
+    bid_price: float,
+    ask_price: float,
+    mid_price: float,
+    tick_size: float | None,
+) -> float | None:
+    profile_config = XAUT_ADAPTIVE_STATE_CONFIGS.get(str(strategy_mode).strip() or "one_way_long", {})
+    normal_step = _safe_float((profile_config.get(XAUT_ADAPTIVE_STATE_NORMAL) or {}).get("step_price"))
+    max_step = _safe_float((profile_config.get(XAUT_ADAPTIVE_STATE_DEFENSIVE) or {}).get("step_price"))
+    if normal_step <= 0 or max_step <= 0:
+        return None
+
+    safe_tick = max(_safe_float(tick_size), 0.0)
+    spread = max(float(ask_price) - float(bid_price), 0.0)
+    floor_step = max(
+        normal_step * XAUT_ADAPTIVE_MIN_STEP_BASE_RATIO,
+        max(float(mid_price), 0.0) * XAUT_ADAPTIVE_MIN_STEP_MID_RATIO,
+        safe_tick * XAUT_ADAPTIVE_MIN_STEP_TICKS,
+        spread * XAUT_ADAPTIVE_MIN_STEP_SPREADS,
+    )
+
+    metrics = dict(regime_metrics or {})
+    window_15m = metrics.get("window_15m") if isinstance(metrics.get("window_15m"), dict) else {}
+    window_60m = metrics.get("window_60m") if isinstance(metrics.get("window_60m"), dict) else {}
+    amp_15m = _safe_float(window_15m.get("amplitude_ratio"))
+    amp_60m = _safe_float(window_60m.get("amplitude_ratio"))
+    if amp_15m <= 0 and amp_60m <= 0:
+        if str(active_state).strip() == XAUT_ADAPTIVE_STATE_REDUCE_ONLY:
+            return _round_up_to_step(max_step, safe_tick if safe_tick > 0 else None)
+        return None
+
+    calm_ratio = max(
+        amp_15m / XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO if XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO > 0 else 0.0,
+        amp_60m / XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO if XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO > 0 else 0.0,
+    )
+    if calm_ratio <= 1.0:
+        desired_step = floor_step + (normal_step - floor_step) * _clamp_ratio(calm_ratio)
+    else:
+        expansion_ratio = max(
+            _clamp_ratio(
+                (amp_15m - XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO)
+                / (XAUT_ADAPTIVE_REDUCE_ONLY_15M_AMPLITUDE_RATIO - XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO)
+            )
+            if XAUT_ADAPTIVE_REDUCE_ONLY_15M_AMPLITUDE_RATIO > XAUT_ADAPTIVE_NORMAL_15M_AMPLITUDE_RATIO
+            else 0.0,
+            _clamp_ratio(
+                (amp_60m - XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO)
+                / (XAUT_ADAPTIVE_REDUCE_ONLY_60M_AMPLITUDE_RATIO - XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO)
+            )
+            if XAUT_ADAPTIVE_REDUCE_ONLY_60M_AMPLITUDE_RATIO > XAUT_ADAPTIVE_NORMAL_60M_AMPLITUDE_RATIO
+            else 0.0,
+        )
+        desired_step = normal_step + (max_step - normal_step) * expansion_ratio
+
+    if str(active_state).strip() == XAUT_ADAPTIVE_STATE_REDUCE_ONLY:
+        desired_step = max(desired_step, max_step)
+    return _round_up_to_step(desired_step, safe_tick if safe_tick > 0 else None)
 
 
 def apply_xaut_reduce_only_pruning(*, plan: dict[str, Any], strategy_mode: str) -> None:
@@ -2416,6 +2582,205 @@ def _clamp_ratio(value: float) -> float:
     return min(max(value, 0.0), 1.0)
 
 
+def _clamp_signed(value: float, limit: float = 1.0) -> float:
+    safe_limit = max(float(limit), 0.0)
+    if safe_limit <= 0:
+        return 0.0
+    return min(max(float(value), -safe_limit), safe_limit)
+
+
+def resolve_market_bias_offsets(
+    *,
+    enabled: bool,
+    center_price: float,
+    mid_price: float,
+    step_price: float,
+    market_guard_return_ratio: float,
+    max_shift_steps: float,
+    signal_steps: float,
+    drift_weight: float,
+    return_weight: float,
+) -> dict[str, Any]:
+    safe_max_shift = max(float(max_shift_steps), 0.0)
+    safe_signal_steps = max(float(signal_steps), 0.01)
+    safe_step_price = max(float(step_price), 0.0)
+    safe_mid_price = max(float(mid_price), 0.0)
+    drift_steps = ((float(mid_price) - float(center_price)) / safe_step_price) if safe_step_price > 0 else 0.0
+    step_return_ratio = (safe_step_price / safe_mid_price) if safe_mid_price > 0 and safe_step_price > 0 else 0.0
+    return_steps = (float(market_guard_return_ratio) / step_return_ratio) if step_return_ratio > 0 else 0.0
+    safe_drift_weight = max(float(drift_weight), 0.0)
+    safe_return_weight = max(float(return_weight), 0.0)
+    total_weight = safe_drift_weight + safe_return_weight
+    if total_weight <= 1e-12:
+        safe_drift_weight = 1.0
+        safe_return_weight = 0.0
+        total_weight = 1.0
+    normalized_drift_weight = safe_drift_weight / total_weight
+    normalized_return_weight = safe_return_weight / total_weight
+    drift_component = _clamp_signed(drift_steps / safe_signal_steps)
+    return_component = _clamp_signed(return_steps / safe_signal_steps)
+    bias_score = _clamp_signed(
+        (drift_component * normalized_drift_weight) + (return_component * normalized_return_weight)
+    )
+    shift_steps = bias_score * safe_max_shift
+    regime = "neutral"
+    if bias_score >= 0.15:
+        regime = "strong"
+    elif bias_score <= -0.15:
+        regime = "weak"
+
+    report = {
+        "enabled": bool(enabled),
+        "active": bool(enabled and safe_max_shift > 0 and abs(shift_steps) > 1e-9),
+        "regime": regime,
+        "bias_score": bias_score,
+        "shift_steps": shift_steps,
+        "buy_offset_steps": -shift_steps,
+        "sell_offset_steps": shift_steps,
+        "drift_steps": drift_steps,
+        "return_steps": return_steps,
+        "step_return_ratio": step_return_ratio,
+        "signal_steps": safe_signal_steps,
+        "max_shift_steps": safe_max_shift,
+        "drift_weight": normalized_drift_weight,
+        "return_weight": normalized_return_weight,
+    }
+    if not enabled or safe_max_shift <= 0 or safe_step_price <= 0 or safe_mid_price <= 0:
+        report.update(
+            {
+                "active": False,
+                "regime": "disabled" if not enabled else "neutral",
+                "bias_score": 0.0,
+                "shift_steps": 0.0,
+                "buy_offset_steps": 0.0,
+                "sell_offset_steps": 0.0,
+            }
+        )
+    return report
+
+
+def resolve_market_bias_entry_pause(
+    *,
+    buy_pause_enabled: bool,
+    short_pause_enabled: bool,
+    market_bias: dict[str, Any] | None,
+    weak_buy_pause_threshold: float,
+    strong_short_pause_threshold: float,
+) -> dict[str, Any]:
+    buy_threshold = max(float(weak_buy_pause_threshold), 0.0)
+    short_threshold = max(float(strong_short_pause_threshold), 0.0)
+    score = _safe_float((market_bias or {}).get("bias_score"))
+    regime = str(((market_bias or {}).get("regime", "") or "")).strip() or "neutral"
+    buy_pause_active = bool(buy_pause_enabled and score <= (-buy_threshold))
+    short_pause_active = bool(short_pause_enabled and score >= short_threshold)
+    buy_reasons: list[str] = []
+    short_reasons: list[str] = []
+    if buy_pause_active:
+        buy_reasons.append(
+            "market_bias_weak_buy_pause "
+            f"regime={regime} score={score:+.2f} <= -{buy_threshold:.2f}"
+        )
+    if short_pause_active:
+        short_reasons.append(
+            "market_bias_strong_short_pause "
+            f"regime={regime} score={score:+.2f} >= +{short_threshold:.2f}"
+        )
+    return {
+        "enabled": bool(buy_pause_enabled or short_pause_enabled),
+        "buy_pause_active": buy_pause_active,
+        "buy_pause_threshold": buy_threshold,
+        "buy_pause_reasons": buy_reasons,
+        "short_pause_active": short_pause_active,
+        "short_pause_threshold": short_threshold,
+        "short_pause_reasons": short_reasons,
+        "regime": regime,
+        "bias_score": score,
+    }
+
+
+def resolve_market_bias_regime_switch(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    requested_strategy_mode: str,
+    market_bias: dict[str, Any] | None,
+    weak_threshold: float,
+    strong_threshold: float,
+    confirm_cycles: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    requested_mode = str(requested_strategy_mode or "synthetic_neutral").strip() or "synthetic_neutral"
+    supported = requested_mode == "synthetic_neutral"
+    current_time = now or datetime.now(timezone.utc)
+    effective_enabled = bool(enabled and supported)
+    switch_state = dict(state.get("market_bias_regime_switch_state") or {})
+    active_mode = str(switch_state.get("active_mode") or requested_mode).strip() or requested_mode
+    pending_mode = str(switch_state.get("pending_mode") or "").strip() or None
+    pending_count = int(switch_state.get("pending_count") or 0)
+    safe_confirm_cycles = max(int(confirm_cycles), 1)
+    safe_weak_threshold = max(float(weak_threshold), 0.0)
+    safe_strong_threshold = max(float(strong_threshold), 0.0)
+    score = _safe_float((market_bias or {}).get("bias_score"))
+    regime = str(((market_bias or {}).get("regime", "") or "")).strip() or "neutral"
+    candidate_mode = requested_mode
+    reason = "disabled"
+    switched = False
+
+    if effective_enabled:
+        if score <= (-safe_weak_threshold):
+            candidate_mode = "one_way_short"
+            reason = f"weak score={score:+.2f} <= -{safe_weak_threshold:.2f}"
+        elif score >= safe_strong_threshold:
+            candidate_mode = "one_way_long"
+            reason = f"strong score={score:+.2f} >= +{safe_strong_threshold:.2f}"
+        else:
+            reason = (
+                f"neutral score={score:+.2f} within "
+                f"[-{safe_weak_threshold:.2f}, +{safe_strong_threshold:.2f}]"
+            )
+    elif not supported:
+        reason = f"unsupported requested_mode={requested_mode}"
+
+    if candidate_mode != active_mode:
+        if pending_mode == candidate_mode:
+            pending_count += 1
+        else:
+            pending_mode = candidate_mode
+            pending_count = 1
+        if pending_count >= safe_confirm_cycles:
+            active_mode = candidate_mode
+            pending_mode = None
+            pending_count = 0
+            switched = True
+            switch_state["last_switched_at"] = current_time.isoformat()
+            switch_state["last_switch_reason"] = reason
+    else:
+        pending_mode = None
+        pending_count = 0
+
+    switch_state.update(
+        {
+            "enabled": effective_enabled,
+            "supported": supported,
+            "requested_mode": requested_mode,
+            "active_mode": active_mode,
+            "candidate_mode": candidate_mode,
+            "pending_mode": pending_mode,
+            "pending_count": pending_count,
+            "confirm_cycles": safe_confirm_cycles,
+            "weak_threshold": safe_weak_threshold,
+            "strong_threshold": safe_strong_threshold,
+            "regime": regime,
+            "bias_score": score,
+            "reason": reason,
+            "switched": switched,
+            "updated_at": current_time.isoformat(),
+        }
+    )
+    state["market_bias_regime_switch_state"] = switch_state
+    return switch_state
+
+
 def apply_inventory_tiering(
     *,
     current_long_notional: float,
@@ -2696,10 +3061,11 @@ def apply_hedge_position_notional_caps(
 
 def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     symbol = args.symbol.upper().strip()
-    strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    requested_strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    strategy_mode = requested_strategy_mode
     summary_path = Path(args.summary_jsonl)
-    if strategy_mode not in {"one_way_long", "one_way_short", "hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
-        raise RuntimeError(f"Unsupported strategy_mode: {strategy_mode}")
+    if requested_strategy_mode not in {"one_way_long", "one_way_short", "hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
+        raise RuntimeError(f"Unsupported strategy_mode: {requested_strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
     symbol_info = fetch_futures_symbol_config(symbol)
     book_rows = fetch_futures_book_tickers(symbol=symbol)
@@ -2732,22 +3098,28 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if symbol != "XAUTUSDT":
             raise RuntimeError("XAUT adaptive profiles require symbol=XAUTUSDT")
         expected_mode = XAUT_ADAPTIVE_PROFILES.get(requested_strategy_profile)
-        if expected_mode and strategy_mode != expected_mode:
+        if expected_mode and requested_strategy_mode != expected_mode:
             raise RuntimeError(f"{requested_strategy_profile} requires strategy_mode={expected_mode}")
         regime_report = assess_xaut_adaptive_regime(
             symbol=symbol,
-            strategy_mode=strategy_mode,
+            strategy_mode=requested_strategy_mode,
         )
         xaut_adaptive = resolve_xaut_adaptive_state(
             state=state,
             regime_report=regime_report,
-            strategy_mode=strategy_mode,
+            strategy_mode=requested_strategy_mode,
         )
         effective_args = build_xaut_adaptive_runner_args(
             args=args,
             active_state=str(xaut_adaptive.get("active_state") or XAUT_ADAPTIVE_STATE_NORMAL),
+            regime_metrics=xaut_adaptive.get("metrics") if isinstance(xaut_adaptive.get("metrics"), dict) else None,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            mid_price=mid_price,
+            tick_size=_safe_float(symbol_info.get("tick_size")),
         )
-    elif getattr(args, "auto_regime_enabled", False) and strategy_mode == "one_way_long":
+        xaut_adaptive["step_price"] = effective_args.step_price
+    elif getattr(args, "auto_regime_enabled", False) and requested_strategy_mode == "one_way_long":
         regime_report = assess_auto_regime(
             symbol=symbol,
             stable_15m_max_amplitude_ratio=args.auto_regime_stable_15m_max_amplitude_ratio,
@@ -2854,7 +3226,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "interval": "fixed",
                 "reason": "fixed_center_roll",
             }
-    elif _is_inventory_target_neutral_mode(strategy_mode):
+    elif _is_inventory_target_neutral_mode(requested_strategy_mode):
         center_source = determine_interval_center_price(
             symbol=symbol,
             interval_minutes=args.neutral_center_interval_minutes,
@@ -2900,17 +3272,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     actual_position = extract_symbol_position(account_info, symbol)
     actual_net_qty = _safe_float(actual_position.get("positionAmt"))
     actual_entry_price = _safe_float(actual_position.get("entryPrice"))
-    long_position = extract_symbol_position(account_info, symbol, "LONG" if strategy_mode == "hedge_neutral" else None)
-    short_position = extract_symbol_position(account_info, symbol, "SHORT") if strategy_mode == "hedge_neutral" else {}
-    if _is_inventory_target_neutral_mode(strategy_mode):
+    long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
+    short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
+    if _is_inventory_target_neutral_mode(requested_strategy_mode):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
-    elif _is_one_way_short_mode(strategy_mode):
+    elif _is_one_way_short_mode(requested_strategy_mode):
         current_long_qty = 0.0
         current_short_qty = max(-actual_net_qty, 0.0)
     else:
-        current_long_qty = max(_position_qty(long_position, position_side="LONG" if strategy_mode == "hedge_neutral" else None), 0.0)
-        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if strategy_mode == "hedge_neutral" else 0.0
+        current_long_qty = max(_position_qty(long_position, position_side="LONG" if requested_strategy_mode == "hedge_neutral" else None), 0.0)
+        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
     synthetic_ledger_snapshot: dict[str, Any] | None = None
@@ -2943,16 +3315,126 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "suppressed_bootstrap_notional": 0.0,
         "reason": None,
     }
+    market_bias = {
+        "enabled": False,
+        "active": False,
+        "regime": "disabled",
+        "bias_score": 0.0,
+        "shift_steps": 0.0,
+        "buy_offset_steps": 0.0,
+        "sell_offset_steps": 0.0,
+        "drift_steps": 0.0,
+        "return_steps": 0.0,
+        "step_return_ratio": 0.0,
+        "signal_steps": 0.0,
+        "max_shift_steps": 0.0,
+        "drift_weight": 0.0,
+        "return_weight": 0.0,
+        "weak_buy_pause_enabled": False,
+        "weak_buy_pause_active": False,
+        "weak_buy_pause_threshold": 0.0,
+        "weak_buy_pause_reasons": [],
+        "strong_short_pause_enabled": False,
+        "strong_short_pause_active": False,
+        "strong_short_pause_threshold": 0.0,
+        "strong_short_pause_reasons": [],
+    }
+    market_bias_entry_pause = {
+        "enabled": False,
+        "buy_pause_active": False,
+        "buy_pause_threshold": 0.0,
+        "buy_pause_reasons": [],
+        "short_pause_active": False,
+        "short_pause_threshold": 0.0,
+        "short_pause_reasons": [],
+        "regime": "disabled",
+        "bias_score": 0.0,
+    }
+    market_bias_regime_switch = {
+        "enabled": False,
+        "supported": False,
+        "requested_mode": requested_strategy_mode,
+        "active_mode": requested_strategy_mode,
+        "candidate_mode": requested_strategy_mode,
+        "pending_mode": None,
+        "pending_count": 0,
+        "confirm_cycles": 0,
+        "weak_threshold": 0.0,
+        "strong_threshold": 0.0,
+        "regime": "disabled",
+        "bias_score": 0.0,
+        "reason": None,
+        "switched": False,
+    }
 
-    if startup_pending and not _is_custom_grid_mode(args) and strategy_mode in {"one_way_long", "one_way_short"}:
+    if startup_pending and not _is_custom_grid_mode(args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
         flat_start_guard = assess_flat_start_guard(
-            strategy_mode=strategy_mode,
+            strategy_mode=requested_strategy_mode,
             actual_net_qty=actual_net_qty,
             open_orders=open_orders,
             enabled=bool(getattr(args, "flat_start_enabled", True)),
         )
         if flat_start_guard["blocked"]:
             raise StartupProtectionError(str(flat_start_guard["reason"]))
+
+    if requested_strategy_mode in {"hedge_neutral", "synthetic_neutral"}:
+        market_bias = resolve_market_bias_offsets(
+            enabled=bool(getattr(effective_args, "market_bias_enabled", False)),
+            center_price=center_price,
+            mid_price=mid_price,
+            step_price=effective_args.step_price,
+            market_guard_return_ratio=_safe_float((market_guard or {}).get("return_ratio")),
+            max_shift_steps=float(getattr(effective_args, "market_bias_max_shift_steps", 0.75)),
+            signal_steps=float(getattr(effective_args, "market_bias_signal_steps", 2.0)),
+            drift_weight=float(getattr(effective_args, "market_bias_drift_weight", 0.65)),
+            return_weight=float(getattr(effective_args, "market_bias_return_weight", 0.35)),
+        )
+        market_bias_entry_pause = resolve_market_bias_entry_pause(
+            buy_pause_enabled=bool(getattr(effective_args, "market_bias_weak_buy_pause_enabled", False)),
+            short_pause_enabled=bool(getattr(effective_args, "market_bias_strong_short_pause_enabled", False)),
+            market_bias=market_bias,
+            weak_buy_pause_threshold=float(getattr(effective_args, "market_bias_weak_buy_pause_threshold", 0.15)),
+            strong_short_pause_threshold=float(getattr(effective_args, "market_bias_strong_short_pause_threshold", 0.15)),
+        )
+        market_bias.update(
+            {
+                "weak_buy_pause_enabled": bool(getattr(effective_args, "market_bias_weak_buy_pause_enabled", False)),
+                "weak_buy_pause_active": bool(market_bias_entry_pause["buy_pause_active"]),
+                "weak_buy_pause_threshold": float(market_bias_entry_pause["buy_pause_threshold"]),
+                "weak_buy_pause_reasons": list(market_bias_entry_pause["buy_pause_reasons"]),
+                "strong_short_pause_enabled": bool(getattr(effective_args, "market_bias_strong_short_pause_enabled", False)),
+                "strong_short_pause_active": bool(market_bias_entry_pause["short_pause_active"]),
+                "strong_short_pause_threshold": float(market_bias_entry_pause["short_pause_threshold"]),
+                "strong_short_pause_reasons": list(market_bias_entry_pause["short_pause_reasons"]),
+            }
+        )
+        market_bias_regime_switch = resolve_market_bias_regime_switch(
+            state=state,
+            enabled=bool(getattr(effective_args, "market_bias_regime_switch_enabled", False)),
+            requested_strategy_mode=requested_strategy_mode,
+            market_bias=market_bias,
+            weak_threshold=float(getattr(effective_args, "market_bias_regime_switch_weak_threshold", 0.15)),
+            strong_threshold=float(getattr(effective_args, "market_bias_regime_switch_strong_threshold", 0.15)),
+            confirm_cycles=int(getattr(effective_args, "market_bias_regime_switch_confirm_cycles", 2)),
+        )
+        strategy_mode = str(market_bias_regime_switch.get("active_mode") or requested_strategy_mode).strip() or requested_strategy_mode
+        if requested_strategy_mode == "synthetic_neutral" and strategy_mode != "synthetic_neutral":
+            state["synthetic_ledger_resync_required"] = True
+
+    if _is_inventory_target_neutral_mode(strategy_mode):
+        current_long_qty = max(actual_net_qty, 0.0)
+        current_short_qty = max(-actual_net_qty, 0.0)
+    elif strategy_mode == "hedge_neutral":
+        current_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
+        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
+    elif _is_one_way_short_mode(strategy_mode):
+        current_long_qty = 0.0
+        current_short_qty = max(-actual_net_qty, 0.0)
+    else:
+        current_long_qty = max(actual_net_qty, 0.0)
+        current_short_qty = 0.0
+    current_long_notional = current_long_qty * max(mid_price, 0.0)
+    current_short_notional = current_short_qty * max(mid_price, 0.0)
 
     if _is_custom_grid_mode(args):
         excess_inventory_gate["enabled"] = False
@@ -3025,8 +3507,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 pause_long_position_notional=effective_args.pause_buy_position_notional,
                 pause_short_position_notional=effective_args.pause_short_position_notional,
                 min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
-                external_long_pause=bool(market_guard["buy_pause_active"]),
-                external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+                external_long_pause=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
+                external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
+                external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
+                external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
             )
             cap_controls = apply_hedge_position_notional_caps(
                 plan=plan,
@@ -3120,6 +3604,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
+            startup_entry_multiplier=getattr(effective_args, "startup_entry_multiplier", 1.0),
+            startup_large_entry_active=(startup_pending or (current_long_qty <= 1e-12 and current_short_qty <= 1e-12)),
+            buy_offset_steps=float((market_bias or {}).get("buy_offset_steps", 0.0)),
+            sell_offset_steps=float((market_bias or {}).get("sell_offset_steps", 0.0)),
         )
         controls = apply_hedge_position_controls(
             plan=plan,
@@ -3129,8 +3617,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             pause_long_position_notional=effective_args.pause_buy_position_notional,
             pause_short_position_notional=effective_args.pause_short_position_notional,
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
-            external_long_pause=bool(market_guard["buy_pause_active"]),
-            external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            external_long_pause=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
+            external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
+            external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
+            external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -3147,6 +3637,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     elif _is_synthetic_neutral_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("单向 synthetic neutral 要求账户处于单向持仓模式")
+        if _truthy(state.get("synthetic_ledger_resync_required")):
+            _reset_synthetic_ledger_to_actual(
+                state=state,
+                actual_position_qty=actual_net_qty,
+                entry_price=actual_entry_price,
+                reason=str((market_bias_regime_switch or {}).get("reason") or "market_bias_regime_switch_return_to_neutral"),
+            )
         synthetic_ledger_snapshot = sync_synthetic_ledger(
             state=state,
             symbol=symbol,
@@ -3186,6 +3683,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
+            startup_entry_multiplier=getattr(effective_args, "startup_entry_multiplier", 1.0),
+            startup_large_entry_active=(startup_pending or (current_long_qty <= 1e-12 and current_short_qty <= 1e-12)),
+            buy_offset_steps=float((market_bias or {}).get("buy_offset_steps", 0.0)),
+            sell_offset_steps=float((market_bias or {}).get("sell_offset_steps", 0.0)),
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
         controls = apply_hedge_position_controls(
@@ -3196,8 +3697,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             pause_long_position_notional=effective_args.pause_buy_position_notional,
             pause_short_position_notional=effective_args.pause_short_position_notional,
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
-            external_long_pause=bool(market_guard["buy_pause_active"]),
-            external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            external_long_pause=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
+            external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
+            external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
+            external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -3436,7 +3939,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
-    if startup_pending and not _is_custom_grid_mode(args) and strategy_mode in {"one_way_long", "one_way_short"}:
+    if startup_pending and not _is_custom_grid_mode(args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
         warm_start = apply_warm_start_bootstrap_guard(
             plan=plan,
             strategy_mode=strategy_mode,
@@ -3468,6 +3971,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "generated_at": _isoformat(_utc_now()),
         "symbol": symbol,
         "strategy_mode": strategy_mode,
+        "requested_strategy_mode": requested_strategy_mode,
         "requested_strategy_profile": requested_strategy_profile,
         "effective_strategy_profile": effective_strategy_profile,
         "effective_strategy_label": AUTO_REGIME_PROFILE_LABELS.get(effective_strategy_profile),
@@ -3487,6 +3991,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "warm_start": warm_start,
         "excess_inventory_gate": excess_inventory_gate,
         "neutral_hourly_scale": neutral_hourly_scale,
+        "market_bias": market_bias,
+        "market_bias_regime_switch": market_bias_regime_switch,
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "auto_regime": auto_regime,
@@ -3876,7 +4382,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buy-levels", type=int, default=8)
     parser.add_argument("--sell-levels", type=int, default=8)
     parser.add_argument("--per-order-notional", type=float, default=12.6)
+    parser.add_argument("--startup-entry-multiplier", type=float, default=1.0)
     parser.add_argument("--base-position-notional", type=float, default=75.6)
+    parser.add_argument("--market-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--market-bias-max-shift-steps", type=float, default=0.75)
+    parser.add_argument("--market-bias-signal-steps", type=float, default=2.0)
+    parser.add_argument("--market-bias-drift-weight", type=float, default=0.65)
+    parser.add_argument("--market-bias-return-weight", type=float, default=0.35)
+    parser.add_argument("--market-bias-weak-buy-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--market-bias-weak-buy-pause-threshold", type=float, default=0.15)
+    parser.add_argument("--market-bias-strong-short-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--market-bias-strong-short-pause-threshold", type=float, default=0.15)
+    parser.add_argument("--market-bias-regime-switch-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--market-bias-regime-switch-confirm-cycles", type=int, default=2)
+    parser.add_argument("--market-bias-regime-switch-weak-threshold", type=float, default=0.15)
+    parser.add_argument("--market-bias-regime-switch-strong-threshold", type=float, default=0.15)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warm-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -4021,6 +4541,38 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"drift={_float(summary.get('synthetic_drift_qty', 0.0))} "
             f"unmatched_trades={int(summary.get('synthetic_unmatched_trade_count', 0) or 0)}"
         )
+    if summary.get("market_bias_enabled"):
+        print(
+            "  market_bias: "
+            f"{summary.get('market_bias_regime', '--')} "
+            f"score={summary.get('market_bias_score', 0.0):+.2f} "
+            f"buy_shift={summary.get('market_bias_buy_offset_steps', 0.0):+.2f} "
+            f"sell_shift={summary.get('market_bias_sell_offset_steps', 0.0):+.2f} "
+            f"drift={summary.get('market_bias_drift_steps', 0.0):+.2f} "
+            f"ret_steps={summary.get('market_bias_return_steps', 0.0):+.2f}"
+        )
+        guard_flags: list[str] = []
+        if summary.get("market_bias_weak_buy_pause_active"):
+            guard_flags.append(
+                f"weak_buy_pause=yes threshold={summary.get('market_bias_weak_buy_pause_threshold', 0.0):.2f}"
+            )
+        if summary.get("market_bias_strong_short_pause_active"):
+            guard_flags.append(
+                f"strong_short_pause=yes threshold={summary.get('market_bias_strong_short_pause_threshold', 0.0):.2f}"
+            )
+        if guard_flags:
+            print("  market_bias_guard: " + " ".join(guard_flags))
+    if summary.get("market_bias_regime_switch_enabled"):
+        print(
+            "  market_bias_switch: "
+            f"requested={summary.get('requested_strategy_mode', '--')} "
+            f"active={summary.get('market_bias_switch_active_mode', '--')} "
+            f"candidate={summary.get('market_bias_switch_candidate_mode', '--')} "
+            f"(pending={int(summary.get('market_bias_switch_pending_count', 0) or 0)}/"
+            f"{int(summary.get('market_bias_switch_confirm_cycles', 0) or 0)})"
+        )
+        if summary.get("market_bias_switch_reason"):
+            print(f"  switch_reason: {summary['market_bias_switch_reason']}")
     if summary.get("shift_moves"):
         shift_text = ", ".join(f"{item['direction']}->{_price(item['new_center_price'])}" for item in summary["shift_moves"])
         print(f"  shifts: {shift_text}")
@@ -4097,6 +4649,32 @@ def main() -> None:
         raise SystemExit("--buy-levels and --sell-levels must be >= 0")
     if args.per_order_notional <= 0 or args.base_position_notional < 0:
         raise SystemExit("--per-order-notional must be > 0 and --base-position-notional must be >= 0")
+    if args.market_bias_max_shift_steps < 0:
+        raise SystemExit("--market-bias-max-shift-steps must be >= 0")
+    if args.market_bias_signal_steps <= 0:
+        raise SystemExit("--market-bias-signal-steps must be > 0")
+    if args.market_bias_drift_weight < 0 or args.market_bias_return_weight < 0:
+        raise SystemExit("--market-bias-* weights must be >= 0")
+    if args.market_bias_enabled and (args.market_bias_drift_weight + args.market_bias_return_weight) <= 0:
+        raise SystemExit("--market-bias-enabled requires at least one positive weight")
+    if args.market_bias_weak_buy_pause_threshold < 0:
+        raise SystemExit("--market-bias-weak-buy-pause-threshold must be >= 0")
+    if args.market_bias_weak_buy_pause_enabled and not args.market_bias_enabled:
+        raise SystemExit("--market-bias-weak-buy-pause-enabled requires --market-bias-enabled")
+    if args.market_bias_strong_short_pause_threshold < 0:
+        raise SystemExit("--market-bias-strong-short-pause-threshold must be >= 0")
+    if args.market_bias_strong_short_pause_enabled and not args.market_bias_enabled:
+        raise SystemExit("--market-bias-strong-short-pause-enabled requires --market-bias-enabled")
+    if args.market_bias_regime_switch_confirm_cycles <= 0:
+        raise SystemExit("--market-bias-regime-switch-confirm-cycles must be > 0")
+    if args.market_bias_regime_switch_weak_threshold < 0:
+        raise SystemExit("--market-bias-regime-switch-weak-threshold must be >= 0")
+    if args.market_bias_regime_switch_strong_threshold < 0:
+        raise SystemExit("--market-bias-regime-switch-strong-threshold must be >= 0")
+    if args.market_bias_regime_switch_enabled and not args.market_bias_enabled:
+        raise SystemExit("--market-bias-regime-switch-enabled requires --market-bias-enabled")
+    if args.market_bias_regime_switch_enabled and str(args.strategy_mode).strip() != "synthetic_neutral":
+        raise SystemExit("--market-bias-regime-switch-enabled currently requires --strategy-mode synthetic_neutral")
     if args.max_position_notional is not None and args.max_position_notional <= 0:
         raise SystemExit("--max-position-notional must be > 0")
     if args.pause_short_position_notional is not None and args.pause_short_position_notional <= 0:
@@ -4342,7 +4920,10 @@ def main() -> None:
                     plan_report.get("effective_strategy_profile") or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
                 ),
                 "effective_strategy_label": str(plan_report.get("effective_strategy_label") or ""),
-                "strategy_mode": str(getattr(args, "strategy_mode", "one_way_long")),
+                "strategy_mode": str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")),
+                "requested_strategy_mode": str(
+                    plan_report.get("requested_strategy_mode") or getattr(args, "strategy_mode", "one_way_long")
+                ),
                 "mid_price": _safe_float(plan_report.get("mid_price")),
                 "center_price": _safe_float(plan_report.get("center_price")),
                 "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
@@ -4395,6 +4976,28 @@ def main() -> None:
                 "neutral_hourly_regime": str(((plan_report.get("neutral_hourly_scale") or {}).get("regime", "") or "")),
                 "neutral_hourly_reason": (plan_report.get("neutral_hourly_scale") or {}).get("reason"),
                 "neutral_hourly_bucket": (plan_report.get("neutral_hourly_scale") or {}).get("bucket"),
+                "market_bias_enabled": bool(((plan_report.get("market_bias") or {}).get("enabled"))),
+                "market_bias_active": bool(((plan_report.get("market_bias") or {}).get("active"))),
+                "market_bias_regime": str(((plan_report.get("market_bias") or {}).get("regime", "") or "")),
+                "market_bias_score": _safe_float((plan_report.get("market_bias") or {}).get("bias_score")),
+                "market_bias_shift_steps": _safe_float((plan_report.get("market_bias") or {}).get("shift_steps")),
+                "market_bias_buy_offset_steps": _safe_float((plan_report.get("market_bias") or {}).get("buy_offset_steps")),
+                "market_bias_sell_offset_steps": _safe_float((plan_report.get("market_bias") or {}).get("sell_offset_steps")),
+                "market_bias_drift_steps": _safe_float((plan_report.get("market_bias") or {}).get("drift_steps")),
+                "market_bias_return_steps": _safe_float((plan_report.get("market_bias") or {}).get("return_steps")),
+                "market_bias_weak_buy_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_enabled"))),
+                "market_bias_weak_buy_pause_active": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_active"))),
+                "market_bias_weak_buy_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("weak_buy_pause_threshold")),
+                "market_bias_strong_short_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_enabled"))),
+                "market_bias_strong_short_pause_active": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_active"))),
+                "market_bias_strong_short_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("strong_short_pause_threshold")),
+                "market_bias_regime_switch_enabled": bool(((plan_report.get("market_bias_regime_switch") or {}).get("enabled"))),
+                "market_bias_switch_active_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("active_mode", "") or "")),
+                "market_bias_switch_candidate_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("candidate_mode", "") or "")),
+                "market_bias_switch_pending_count": int(((plan_report.get("market_bias_regime_switch") or {}).get("pending_count", 0) or 0)),
+                "market_bias_switch_confirm_cycles": int(((plan_report.get("market_bias_regime_switch") or {}).get("confirm_cycles", 0) or 0)),
+                "market_bias_switch_reason": (plan_report.get("market_bias_regime_switch") or {}).get("reason"),
+                "market_bias_switch_switched": bool(((plan_report.get("market_bias_regime_switch") or {}).get("switched"))),
                 "effective_buy_levels": int(plan_report.get("effective_buy_levels", 0) or 0),
                 "effective_sell_levels": int(plan_report.get("effective_sell_levels", 0) or 0),
                 "effective_per_order_notional": _safe_float(plan_report.get("effective_per_order_notional")),

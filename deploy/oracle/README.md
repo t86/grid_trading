@@ -44,7 +44,42 @@ The server-local `/usr/local/bin/grid-web-update` should match the tracked scrip
 
 Do not use GitHub Actions, `rsync`, or ad hoc copy commands for routine deployment.
 
-## 3) Post-Deploy Checks
+## 3) Runner Ownership Rule
+
+On production Oracle hosts, strategy processes must be started as `ubuntu`, not `root`.
+
+Required rule:
+
+- `grid-web` / `wangge-web` may be managed by `systemd`, but the service itself must run as `ubuntu`.
+- All strategy runner and flatten runner operations should go through the web UI or the authenticated local API while logged in as `ubuntu`.
+- Do not start `grid_optimizer.loop_runner` or `grid_optimizer.maker_flatten_runner` with `sudo`, `root`, or a root shell.
+
+Why this matters:
+
+- The web UI and local control plane operate as `ubuntu`.
+- If a runner is started by `root`, the process and related pid files can become root-owned.
+- Once that happens, the UI may fail to stop/restart the runner with `PermissionError`, and manual sudo cleanup is required.
+
+Safe examples:
+
+```bash
+ssh srv-43-155-163-114 'set -a; source /home/ubuntu/.config/wangge/binance_api_env.env; curl -u "$GRID_WEB_USERNAME:$GRID_WEB_PASSWORD" http://127.0.0.1:8788/api/health'
+```
+
+Unsafe examples:
+
+```bash
+ssh srv-43-155-163-114 'sudo python3 -m grid_optimizer.loop_runner ...'
+ssh srv-43-155-163-114 'sudo /home/ubuntu/wangge/.venv/bin/python -m grid_optimizer.maker_flatten_runner ...'
+```
+
+If someone already started a runner as `root`, fix it in this order:
+
+1. `sudo` stop or kill the wrong process.
+2. Remove the stale root-owned pid file under `output/`.
+3. Re-start via the `ubuntu`-owned web service or UI.
+
+## 4) Post-Deploy Checks
 
 After each deployment, check on the target server:
 
@@ -53,14 +88,14 @@ sudo systemctl status grid-web --no-pager
 sudo journalctl -u grid-web -n 100 --no-pager
 ```
 
-## 4) Access
+## 5) Access
 
 - use the port configured in `grid-web.service`
 - health check path: `/api/health`
 
 For production/public internet, place Nginx/Caddy in front with TLS and basic auth.
 
-## 5) Existing Server Checks
+## 6) Existing Server Checks
 
 Before changing deployment plumbing on an existing server, verify the live systemd unit:
 

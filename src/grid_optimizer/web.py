@@ -44,6 +44,7 @@ from .data import (
     delete_futures_order,
     delete_spot_order,
     fetch_futures_account_info_v3,
+    fetch_futures_quote_volume_sum,
     fetch_futures_open_orders,
     fetch_futures_position_mode,
     fetch_spot_account_info,
@@ -127,6 +128,8 @@ SPOT_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}
 SPOT_SNAPSHOT_CACHE_LOCK = threading.Lock()
 BORROW_LOOKUP_CACHE: dict[str, dict[str, Any]] = {}
 BORROW_LOOKUP_CACHE_LOCK = threading.Lock()
+VOLUME_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
+VOLUME_TRIGGER_STATUS_LOCK = threading.Lock()
 FUNDING_MARGIN_RATIO = 0.5
 GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
@@ -134,6 +137,15 @@ STABLE_SPOT_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD")
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
 MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
 CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
+VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+    "24h": 1440,
+}
+DEFAULT_VOLUME_TRIGGER_WINDOW = "1h"
+VOLUME_TRIGGER_POLL_SECONDS = 20.0
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     "volume_long_v4": {
         "label": "量优先做多 v4",
@@ -260,9 +272,120 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "sleep_seconds": 5.0,
         },
     },
+    "bard_12h_push_neutral_v2": {
+        "label": "BARD 双向冲量 v2",
+        "description": "BARDUSDT 专用双向冲量模板。固定细步长、双边 8 档、零底仓，适合高成交窗口短时冲量。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "BARDUSDT",
+        "config": {
+            "symbol": "BARDUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 100.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 2000.0,
+            "pause_short_position_notional": 2000.0,
+            "max_position_notional": 2400.0,
+            "max_short_position_notional": 2400.0,
+            "max_total_notional": 3600.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "sleep_seconds": 3.0,
+            "rolling_hourly_loss_limit": None,
+            "excess_inventory_reduce_only_enabled": False,
+            "autotune_symbol_enabled": False,
+        },
+    },
+    "based_volume_long_trigger_v1": {
+        "label": "BASED 放量做多 v1",
+        "description": "BASEDUSDT 专用轻仓顺势做多。参考 BARD 的活跃窗口做法，但把步长放宽、仓位缩小，并默认按最近 15m 市场成交额自动启停。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "BASEDUSDT",
+        "config": {
+            "symbol": "BASEDUSDT",
+            "strategy_mode": "one_way_long",
+            "step_price": 0.0002,
+            "buy_levels": 4,
+            "sell_levels": 10,
+            "per_order_notional": 20.0,
+            "base_position_notional": 60.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 2,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 220.0,
+            "max_position_notional": 320.0,
+            "buy_pause_amp_trigger_ratio": 0.0065,
+            "buy_pause_down_return_trigger_ratio": -0.003,
+            "freeze_shift_abs_return_trigger_ratio": 0.0045,
+            "inventory_tier_start_notional": 160.0,
+            "inventory_tier_end_notional": 240.0,
+            "inventory_tier_buy_levels": 2,
+            "inventory_tier_sell_levels": 12,
+            "inventory_tier_per_order_notional": 18.0,
+            "inventory_tier_base_position_notional": 40.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": True,
+            "max_total_notional": 420.0,
+            "sleep_seconds": 5.0,
+            "rolling_hourly_loss_limit": 4.0,
+            "volume_trigger_enabled": True,
+            "volume_trigger_window": "15m",
+            "volume_trigger_start_threshold": 260000.0,
+            "volume_trigger_stop_threshold": 180000.0,
+            "volume_trigger_stop_cancel_open_orders": True,
+            "volume_trigger_stop_close_all_positions": True,
+        },
+    },
+    "based_volume_push_bard_v1": {
+        "label": "BASED 双向冲量(BARD式) v1",
+        "description": "把 BARD 实盘高换手双向冲量结构直接移植到 BASEDUSDT。固定细步长、双边 8 档、零底仓，不再让 autotune 把网格拉稀。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "BASEDUSDT",
+        "config": {
+            "symbol": "BASEDUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 100.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 2000.0,
+            "pause_short_position_notional": 2000.0,
+            "max_position_notional": 2400.0,
+            "max_short_position_notional": 2400.0,
+            "max_total_notional": 3600.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+            "rolling_hourly_loss_limit": None,
+            "sleep_seconds": 3.0,
+        },
+    },
     "xaut_long_adaptive_v1": {
         "label": "XAUT 自适应做多 v1",
-        "description": "仅用于 XAUTUSDT 的三态自适应做多。平稳时刷量，扩振时转防守，极端波动时立即撤买单并只保留卖单减仓。",
+        "description": "仅用于 XAUTUSDT 的三态自适应做多。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤买单并只保留卖单减仓。",
         "startable": True,
         "kind": "one_way",
         "symbol": "XAUTUSDT",
@@ -294,7 +417,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     },
     "xaut_short_adaptive_v1": {
         "label": "XAUT 自适应做空 v1",
-        "description": "仅用于 XAUTUSDT 的三态自适应做空。平稳时刷量，扩振时转防守，极端波动时立即撤卖单并只保留买单回补减仓。",
+        "description": "仅用于 XAUTUSDT 的三态自适应做空。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤卖单并只保留买单回补减仓。",
         "startable": True,
         "kind": "one_way",
         "symbol": "XAUTUSDT",
@@ -603,6 +726,117 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "freeze_shift_abs_return_trigger_ratio": 0.005,
         },
     },
+    "volume_neutral_push_v1": {
+        "label": "中性冲量通用 v1",
+        "description": "参考 BARD 实盘固化出的通用高换手中性方案。零底仓、双边 8 档、1 格追中心，适合高成交时段短时冲量。",
+        "startable": True,
+        "kind": "synthetic",
+        "config": {
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 100.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 2000.0,
+            "pause_short_position_notional": 2000.0,
+            "max_position_notional": 2400.0,
+            "max_short_position_notional": 2400.0,
+            "max_total_notional": 3600.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "sleep_seconds": 3.0,
+            "autotune_symbol_enabled": True,
+        },
+    },
+    "volume_neutral_push_guarded_v1": {
+        "label": "中性冲量护栏 v1",
+        "description": "在通用中性冲量上追加更强护栏。保留高换手结构，但更早停双边新增，并加入净暴露与 synthetic drift 停机线。",
+        "startable": True,
+        "kind": "synthetic",
+        "config": {
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 100.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 1200.0,
+            "pause_short_position_notional": 1200.0,
+            "max_position_notional": 1600.0,
+            "max_short_position_notional": 1600.0,
+            "max_total_notional": 2400.0,
+            "max_new_orders": 32,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "market_bias_enabled": True,
+            "market_bias_max_shift_steps": 0.75,
+            "market_bias_signal_steps": 2.0,
+            "market_bias_drift_weight": 0.65,
+            "market_bias_return_weight": 0.35,
+            "market_bias_weak_buy_pause_enabled": True,
+            "market_bias_weak_buy_pause_threshold": 0.15,
+            "market_bias_strong_short_pause_enabled": True,
+            "market_bias_strong_short_pause_threshold": 0.15,
+            "rolling_hourly_loss_limit": 25.0,
+            "max_cumulative_notional": 150000.0,
+            "max_actual_net_notional": 900.0,
+            "max_synthetic_drift_notional": 250.0,
+            "sleep_seconds": 3.0,
+            "autotune_symbol_enabled": True,
+        },
+    },
+    "volume_neutral_ping_pong_v1": {
+        "label": "量优先中性 v1",
+        "description": "零底仓启动的单向合成中性。启动时买一/卖一放大，后续用更小的反手单回转；弱市切到做空、强市切到做多、震荡时回到中性 ping-pong。",
+        "startable": True,
+        "kind": "synthetic",
+        "config": {
+            "strategy_mode": "synthetic_neutral",
+            "buy_levels": 4,
+            "sell_levels": 4,
+            "per_order_notional": 45.0,
+            "startup_entry_multiplier": 4.0,
+            "base_position_notional": 0.0,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 2,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 500.0,
+            "pause_short_position_notional": 500.0,
+            "max_position_notional": 600.0,
+            "max_short_position_notional": 600.0,
+            "buy_pause_amp_trigger_ratio": 0.0075,
+            "buy_pause_down_return_trigger_ratio": -0.0035,
+            "freeze_shift_abs_return_trigger_ratio": 0.005,
+            "market_bias_enabled": True,
+            "market_bias_max_shift_steps": 0.75,
+            "market_bias_signal_steps": 2.0,
+            "market_bias_drift_weight": 0.65,
+            "market_bias_return_weight": 0.35,
+            "market_bias_weak_buy_pause_enabled": True,
+            "market_bias_weak_buy_pause_threshold": 0.15,
+            "market_bias_strong_short_pause_enabled": True,
+            "market_bias_strong_short_pause_threshold": 0.15,
+            "market_bias_regime_switch_enabled": True,
+            "market_bias_regime_switch_confirm_cycles": 2,
+            "market_bias_regime_switch_weak_threshold": 0.15,
+            "market_bias_regime_switch_strong_threshold": 0.15,
+            "sleep_seconds": 5.0,
+        },
+    },
 }
 RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "strategy_profile": "volume_long_v4",
@@ -612,7 +846,21 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "buy_levels": 8,
     "sell_levels": 8,
     "per_order_notional": 70.0,
+    "startup_entry_multiplier": 1.0,
     "base_position_notional": 420.0,
+    "market_bias_enabled": False,
+    "market_bias_max_shift_steps": 0.75,
+    "market_bias_signal_steps": 2.0,
+    "market_bias_drift_weight": 0.65,
+    "market_bias_return_weight": 0.35,
+    "market_bias_weak_buy_pause_enabled": False,
+    "market_bias_weak_buy_pause_threshold": 0.15,
+    "market_bias_strong_short_pause_enabled": False,
+    "market_bias_strong_short_pause_threshold": 0.15,
+    "market_bias_regime_switch_enabled": False,
+    "market_bias_regime_switch_confirm_cycles": 2,
+    "market_bias_regime_switch_weak_threshold": 0.15,
+    "market_bias_regime_switch_strong_threshold": 0.15,
     "center_price": None,
     "flat_start_enabled": True,
     "warm_start_enabled": True,
@@ -670,6 +918,14 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "run_end_time": None,
     "rolling_hourly_loss_limit": None,
     "max_cumulative_notional": None,
+    "max_actual_net_notional": None,
+    "max_synthetic_drift_notional": None,
+    "volume_trigger_enabled": False,
+    "volume_trigger_window": DEFAULT_VOLUME_TRIGGER_WINDOW,
+    "volume_trigger_start_threshold": None,
+    "volume_trigger_stop_threshold": None,
+    "volume_trigger_stop_cancel_open_orders": True,
+    "volume_trigger_stop_close_all_positions": False,
     "sleep_seconds": 15.0,
     "cancel_stale": True,
     "apply": True,
@@ -678,6 +934,17 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "plan_json": "output/night_loop_latest_plan.json",
     "submit_report_json": "output/night_loop_latest_submit.json",
     "summary_jsonl": "output/night_loop_events.jsonl",
+}
+RUNNER_AUTOTUNE_STEP_HINTS: dict[str, tuple[float, int]] = {
+    "volume_long_v4": (0.0004, 2),
+    "volatility_defensive_v1": (0.0008, 4),
+    "xaut_volume_short_v1": (0.00017, 2),
+    "volume_neutral_target_v1": (0.0006, 3),
+    "neutral_hedge_v1": (0.0005, 3),
+    "synthetic_neutral_v1": (0.0005, 3),
+    "volume_neutral_push_v1": (0.00032, 2),
+    "volume_neutral_push_guarded_v1": (0.00032, 2),
+    "volume_neutral_ping_pong_v1": (0.00035, 2),
 }
 RUNNER_SERVICE_NAME = "grid-loop.service"
 RUNNER_LAUNCH_AGENT_LABEL = "com.tl.grid-optimizer.loop"
@@ -764,6 +1031,45 @@ def _read_json_dict(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _normalize_volume_trigger_window(value: Any) -> str:
+    text = str(value or DEFAULT_VOLUME_TRIGGER_WINDOW).strip().lower()
+    return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLUME_TRIGGER_WINDOW
+
+
+def _normalize_runner_volume_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    normalized["volume_trigger_enabled"] = bool(normalized.get("volume_trigger_enabled", False))
+    normalized["volume_trigger_window"] = _normalize_volume_trigger_window(normalized.get("volume_trigger_window"))
+    for key in {"volume_trigger_start_threshold", "volume_trigger_stop_threshold"}:
+        value = normalized.get(key)
+        if value in {"", None}:
+            normalized[key] = None
+            continue
+        threshold = float(value)
+        if threshold <= 0:
+            raise ValueError(f"{key} must be > 0")
+        normalized[key] = threshold
+    normalized["volume_trigger_stop_cancel_open_orders"] = bool(
+        normalized.get("volume_trigger_stop_cancel_open_orders", True)
+    )
+    normalized["volume_trigger_stop_close_all_positions"] = bool(
+        normalized.get("volume_trigger_stop_close_all_positions", False)
+    )
+    if normalized["volume_trigger_stop_close_all_positions"]:
+        normalized["volume_trigger_stop_cancel_open_orders"] = True
+    if normalized["volume_trigger_enabled"]:
+        if (
+            normalized.get("volume_trigger_start_threshold") is None
+            and normalized.get("volume_trigger_stop_threshold") is None
+        ):
+            raise ValueError("volume trigger enabled requires at least one threshold")
+        start_threshold = normalized.get("volume_trigger_start_threshold")
+        stop_threshold = normalized.get("volume_trigger_stop_threshold")
+        if start_threshold is not None and stop_threshold is not None and stop_threshold > start_threshold:
+            raise ValueError("volume trigger stop threshold cannot exceed start threshold")
+    return normalized
+
+
 def _legacy_runner_symbol() -> str:
     stored = _read_json_dict(RUNNER_CONTROL_PATH) or {}
     symbol = str(stored.get("symbol", "")).upper().strip()
@@ -822,7 +1128,7 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     if runner.get("config"):
         config.update(runner["config"])
     config = _normalize_runner_runtime_paths(config, normalized_symbol)
-    return config
+    return _normalize_runner_volume_trigger_config(config)
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -864,6 +1170,166 @@ def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = 
     control_path = _runner_control_path(normalized_symbol)
     control_path.parent.mkdir(parents=True, exist_ok=True)
     control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _iter_saved_runner_control_configs() -> list[dict[str, Any]]:
+    output_dir = Path("output")
+    paths: list[Path] = []
+    if output_dir.exists():
+        paths.extend(sorted(output_dir.glob("*_loop_runner_control.json")))
+    if RUNNER_CONTROL_PATH.exists() and RUNNER_CONTROL_PATH not in paths:
+        paths.append(RUNNER_CONTROL_PATH)
+
+    seen_symbols: set[str] = set()
+    configs: list[dict[str, Any]] = []
+    for path in paths:
+        stored = _read_json_dict(path)
+        if not stored:
+            continue
+        symbol = str(stored.get("symbol", "")).upper().strip()
+        if not symbol or symbol in seen_symbols:
+            continue
+        try:
+            configs.append(_normalize_runner_control_payload(stored))
+        except Exception:
+            continue
+        seen_symbols.add(symbol)
+    return configs
+
+
+def _resolve_runner_volume_trigger_action(
+    config: dict[str, Any],
+    *,
+    current_quote_volume: float,
+    runner_running: bool,
+    flatten_running: bool,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volume_trigger_config(config)
+    if not normalized_config.get("volume_trigger_enabled"):
+        return {"action": None, "reason": "disabled"}
+
+    start_threshold = normalized_config.get("volume_trigger_start_threshold")
+    stop_threshold = normalized_config.get("volume_trigger_stop_threshold")
+
+    if flatten_running and not runner_running:
+        return {"action": None, "reason": "flatten_running"}
+    if runner_running:
+        if stop_threshold is not None and current_quote_volume < float(stop_threshold):
+            return {
+                "action": "stop",
+                "reason": "volume_below_stop_threshold",
+                "threshold": float(stop_threshold),
+            }
+        return {"action": None, "reason": "runner_running"}
+    if start_threshold is not None and current_quote_volume >= float(start_threshold):
+        return {
+            "action": "start",
+            "reason": "volume_above_start_threshold",
+            "threshold": float(start_threshold),
+        }
+    return {"action": None, "reason": "waiting_for_start_threshold"}
+
+
+def _update_volume_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    with VOLUME_TRIGGER_STATUS_LOCK:
+        VOLUME_TRIGGER_STATUS_CACHE[normalized_symbol] = dict(payload)
+
+
+def _runner_volume_trigger_status(symbol: str) -> dict[str, Any] | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return None
+    with VOLUME_TRIGGER_STATUS_LOCK:
+        status = VOLUME_TRIGGER_STATUS_CACHE.get(normalized_symbol)
+        return dict(status) if isinstance(status, dict) else None
+
+
+def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
+    normalized_config = _normalize_runner_volume_trigger_config(config)
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    if not symbol or not normalized_config.get("volume_trigger_enabled"):
+        return
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    window_key = _normalize_volume_trigger_window(normalized_config.get("volume_trigger_window"))
+    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    quote_volume = fetch_futures_quote_volume_sum(symbol, window_minutes=window_minutes)
+    runner = _read_runner_process_for_symbol(symbol)
+    flatten = _read_flatten_process_for_symbol(symbol)
+    decision = _resolve_runner_volume_trigger_action(
+        normalized_config,
+        current_quote_volume=quote_volume,
+        runner_running=bool(runner.get("is_running")),
+        flatten_running=bool(flatten.get("is_running")),
+    )
+    status: dict[str, Any] = {
+        "checked_at": checked_at,
+        "symbol": symbol,
+        "window": window_key,
+        "window_minutes": window_minutes,
+        "current_quote_volume": quote_volume,
+        "start_threshold": normalized_config.get("volume_trigger_start_threshold"),
+        "stop_threshold": normalized_config.get("volume_trigger_stop_threshold"),
+        "runner_running": bool(runner.get("is_running")),
+        "flatten_running": bool(flatten.get("is_running")),
+        "action": decision.get("action"),
+        "reason": decision.get("reason"),
+        "last_error": None,
+    }
+    try:
+        if decision.get("action") == "start":
+            result = _start_runner_process(normalized_config)
+            status["result"] = {
+                "started": bool(result.get("started")),
+                "already_running": bool(result.get("already_running")),
+                "restarted": bool(result.get("restarted")),
+            }
+            print(
+                f"[volume-trigger] {symbol} start window={window_key} quote_volume={quote_volume:.4f} "
+                f">= {float(decision.get('threshold') or 0.0):.4f}"
+            )
+        elif decision.get("action") == "stop":
+            result = _stop_runner_process(
+                symbol,
+                cancel_open_orders=bool(normalized_config.get("volume_trigger_stop_cancel_open_orders", True)),
+                close_all_positions=bool(normalized_config.get("volume_trigger_stop_close_all_positions", False)),
+            )
+            status["result"] = {
+                "stopped": bool(result.get("stopped")),
+                "already_stopped": bool(result.get("already_stopped")),
+            }
+            print(
+                f"[volume-trigger] {symbol} stop window={window_key} quote_volume={quote_volume:.4f} "
+                f"< {float(decision.get('threshold') or 0.0):.4f}"
+            )
+    except Exception as exc:  # pragma: no cover
+        status["last_error"] = f"{type(exc).__name__}: {exc}"
+    _update_volume_trigger_status(symbol, status)
+
+
+def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        for config in _iter_saved_runner_control_configs():
+            if not config.get("volume_trigger_enabled"):
+                continue
+            try:
+                _reconcile_runner_volume_trigger(config)
+            except Exception as exc:  # pragma: no cover
+                symbol = str(config.get("symbol", "")).upper().strip()
+                _update_volume_trigger_status(
+                    symbol,
+                    {
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "symbol": symbol,
+                        "action": None,
+                        "reason": "error",
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+        stop_event.wait(VOLUME_TRIGGER_POLL_SECONDS)
 
 
 def _symbol_output_slug(symbol: str) -> str:
@@ -1123,20 +1589,7 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
     spread = max(ask_price - bid_price, 0.0)
 
     profile = str(tuned.get("strategy_profile", "volume_long_v4")).strip() or "volume_long_v4"
-    step_ratio = 0.0004
-    min_ticks = 2
-    if profile == "volatility_defensive_v1":
-        step_ratio = 0.0008
-        min_ticks = 4
-    elif profile == "xaut_volume_short_v1":
-        step_ratio = 0.00017
-        min_ticks = 2
-    elif profile == "volume_neutral_target_v1":
-        step_ratio = 0.0006
-        min_ticks = 3
-    elif profile in {"neutral_hedge_v1", "synthetic_neutral_v1"}:
-        step_ratio = 0.0005
-        min_ticks = 3
+    step_ratio, min_ticks = RUNNER_AUTOTUNE_STEP_HINTS.get(profile, RUNNER_AUTOTUNE_STEP_HINTS["volume_long_v4"])
     desired_step = max(mid_price * step_ratio, tick_size * min_ticks, spread * 2.0)
     if desired_step > 0:
         tuned["step_price"] = _round_up_to_step(desired_step, tick_size if tick_size > 0 else None)
@@ -1654,7 +2107,16 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "center_price",
         "step_price",
         "per_order_notional",
+        "startup_entry_multiplier",
         "base_position_notional",
+        "market_bias_max_shift_steps",
+        "market_bias_signal_steps",
+        "market_bias_drift_weight",
+        "market_bias_return_weight",
+        "market_bias_weak_buy_pause_threshold",
+        "market_bias_strong_short_pause_threshold",
+        "market_bias_regime_switch_weak_threshold",
+        "market_bias_regime_switch_strong_threshold",
         "pause_buy_position_notional",
         "pause_short_position_notional",
         "max_position_notional",
@@ -1690,6 +2152,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_total_notional",
         "rolling_hourly_loss_limit",
         "max_cumulative_notional",
+        "max_actual_net_notional",
+        "max_synthetic_drift_notional",
+        "volume_trigger_start_threshold",
+        "volume_trigger_stop_threshold",
         "sleep_seconds",
     }
     int_fields = {
@@ -1702,6 +2168,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "maker_retries",
         "max_new_orders",
         "auto_regime_confirm_cycles",
+        "market_bias_regime_switch_confirm_cycles",
         "neutral_center_interval_minutes",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
@@ -1712,12 +2179,19 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "reset_state",
         "flat_start_enabled",
         "warm_start_enabled",
+        "market_bias_enabled",
+        "market_bias_weak_buy_pause_enabled",
+        "market_bias_strong_short_pause_enabled",
+        "market_bias_regime_switch_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
         "fixed_center_roll_enabled",
         "excess_inventory_reduce_only_enabled",
         "autotune_symbol_enabled",
+        "volume_trigger_enabled",
+        "volume_trigger_stop_cancel_open_orders",
+        "volume_trigger_stop_close_all_positions",
     }
     str_fields = {
         "strategy_profile",
@@ -1730,6 +2204,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "summary_jsonl",
         "run_start_time",
         "run_end_time",
+        "volume_trigger_window",
     }
     noneable_fields = {
         "center_price",
@@ -1751,8 +2226,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "inventory_tier_sell_levels",
         "rolling_hourly_loss_limit",
         "max_cumulative_notional",
+        "max_actual_net_notional",
+        "max_synthetic_drift_notional",
         "run_start_time",
         "run_end_time",
+        "volume_trigger_start_threshold",
+        "volume_trigger_stop_threshold",
     }
 
     for key, value in payload.items():
@@ -1779,7 +2258,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"
     config["margin_type"] = str(config.get("margin_type", "KEEP")).upper().strip() or "KEEP"
     config.update(normalize_runtime_guard_payload(config))
-    return config
+    return _normalize_runner_volume_trigger_config(config)
 
 
 def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1807,6 +2286,18 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
     return _autotune_runner_symbol_config(resolved)
 
 
+def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
+    config = _resolve_runner_start_config(payload)
+    symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
+    _save_runner_control_config(config, symbol=symbol)
+    return {
+        "saved": True,
+        "symbol": symbol,
+        "config": config,
+        "runner": _read_runner_process_for_symbol(symbol),
+    }
+
+
 def _build_runner_command(config: dict[str, Any]) -> list[str]:
     command = [
         sys.executable,
@@ -1826,6 +2317,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config["sell_levels"]),
         "--per-order-notional",
         str(config["per_order_notional"]),
+        "--startup-entry-multiplier",
+        str(config.get("startup_entry_multiplier", 1.0)),
         "--base-position-notional",
         str(config["base_position_notional"]),
         "--margin-type",
@@ -1855,6 +2348,40 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
     ]
     if config.get("center_price") is not None:
         command.extend(["--center-price", str(config["center_price"])])
+    command.append("--market-bias-enabled" if config.get("market_bias_enabled", False) else "--no-market-bias-enabled")
+    if config.get("market_bias_max_shift_steps") is not None:
+        command.extend(["--market-bias-max-shift-steps", str(config["market_bias_max_shift_steps"])])
+    if config.get("market_bias_signal_steps") is not None:
+        command.extend(["--market-bias-signal-steps", str(config["market_bias_signal_steps"])])
+    if config.get("market_bias_drift_weight") is not None:
+        command.extend(["--market-bias-drift-weight", str(config["market_bias_drift_weight"])])
+    if config.get("market_bias_return_weight") is not None:
+        command.extend(["--market-bias-return-weight", str(config["market_bias_return_weight"])])
+    command.append(
+        "--market-bias-weak-buy-pause-enabled"
+        if config.get("market_bias_weak_buy_pause_enabled", False)
+        else "--no-market-bias-weak-buy-pause-enabled"
+    )
+    if config.get("market_bias_weak_buy_pause_threshold") is not None:
+        command.extend(["--market-bias-weak-buy-pause-threshold", str(config["market_bias_weak_buy_pause_threshold"])])
+    command.append(
+        "--market-bias-strong-short-pause-enabled"
+        if config.get("market_bias_strong_short_pause_enabled", False)
+        else "--no-market-bias-strong-short-pause-enabled"
+    )
+    if config.get("market_bias_strong_short_pause_threshold") is not None:
+        command.extend(["--market-bias-strong-short-pause-threshold", str(config["market_bias_strong_short_pause_threshold"])])
+    command.append(
+        "--market-bias-regime-switch-enabled"
+        if config.get("market_bias_regime_switch_enabled", False)
+        else "--no-market-bias-regime-switch-enabled"
+    )
+    if config.get("market_bias_regime_switch_confirm_cycles") is not None:
+        command.extend(["--market-bias-regime-switch-confirm-cycles", str(config["market_bias_regime_switch_confirm_cycles"])])
+    if config.get("market_bias_regime_switch_weak_threshold") is not None:
+        command.extend(["--market-bias-regime-switch-weak-threshold", str(config["market_bias_regime_switch_weak_threshold"])])
+    if config.get("market_bias_regime_switch_strong_threshold") is not None:
+        command.extend(["--market-bias-regime-switch-strong-threshold", str(config["market_bias_regime_switch_strong_threshold"])])
     command.append("--flat-start-enabled" if config.get("flat_start_enabled", True) else "--no-flat-start-enabled")
     command.append("--warm-start-enabled" if config.get("warm_start_enabled", True) else "--no-warm-start-enabled")
     command.append("--fixed-center-enabled" if config.get("fixed_center_enabled", False) else "--no-fixed-center-enabled")
@@ -1932,6 +2459,10 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--rolling-hourly-loss-limit", str(config["rolling_hourly_loss_limit"])])
     if config.get("max_cumulative_notional") is not None:
         command.extend(["--max-cumulative-notional", str(config["max_cumulative_notional"])])
+    if config.get("max_actual_net_notional") is not None:
+        command.extend(["--max-actual-net-notional", str(config["max_actual_net_notional"])])
+    if config.get("max_synthetic_drift_notional") is not None:
+        command.extend(["--max-synthetic-drift-notional", str(config["max_synthetic_drift_notional"])])
     command.append("--auto-regime-enabled" if config.get("auto_regime_enabled", False) else "--no-auto-regime-enabled")
     if config.get("auto_regime_confirm_cycles") is not None:
         command.extend(["--auto-regime-confirm-cycles", str(config["auto_regime_confirm_cycles"])])
@@ -2041,7 +2572,21 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "buy_levels",
             "sell_levels",
             "per_order_notional",
+            "startup_entry_multiplier",
             "base_position_notional",
+            "market_bias_enabled",
+            "market_bias_max_shift_steps",
+            "market_bias_signal_steps",
+            "market_bias_drift_weight",
+            "market_bias_return_weight",
+            "market_bias_weak_buy_pause_enabled",
+            "market_bias_weak_buy_pause_threshold",
+            "market_bias_strong_short_pause_enabled",
+            "market_bias_strong_short_pause_threshold",
+            "market_bias_regime_switch_enabled",
+            "market_bias_regime_switch_confirm_cycles",
+            "market_bias_regime_switch_weak_threshold",
+            "market_bias_regime_switch_strong_threshold",
             "up_trigger_steps",
             "down_trigger_steps",
             "shift_steps",
@@ -2108,6 +2653,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
         }
         config_changed = any(current_config.get(field) != config.get(field) for field in compare_fields)
         if not config_changed:
+            _save_runner_control_config(config, symbol=symbol)
             return {"started": False, "already_running": True, "runner": runner, "symbol": symbol, "restarted": False}
         _stop_runner_process(symbol)
         restarted = True
@@ -8928,6 +9474,7 @@ MONITOR_PAGE = """<!doctype html>
       <div class="editor-toolbar">
         <button id="load_running_params_btn">载入运行参数</button>
         <button id="load_preset_params_btn">载入预设参数</button>
+        <button id="save_params_btn">保存参数不启动</button>
         <button id="apply_params_btn" class="primary">应用参数并启动</button>
       </div>
       <div class="toolbar runtime-guard-toolbar">
@@ -8944,7 +9491,42 @@ MONITOR_PAGE = """<!doctype html>
           <input id="monitor_max_cumulative_notional" type="number" min="0" step="0.01" />
         </label>
       </div>
-      <div class="tiny">这四项会和下方 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
+      <div class="toolbar runtime-guard-toolbar">
+        <label class="inline-check" title="启用后，web 服务会按市场成交额自动启动或停止这套策略">
+          <span class="check-row">
+            <input id="monitor_volume_trigger_enabled" type="checkbox" />
+            <span>启用量能自动启停</span>
+          </span>
+        </label>
+        <label>量能窗口
+          <select id="monitor_volume_trigger_window">
+            <option value="15m">最近 15 分钟</option>
+            <option value="30m">最近 30 分钟</option>
+            <option value="1h">最近 1 小时</option>
+            <option value="4h">最近 4 小时</option>
+            <option value="24h">最近 24 小时</option>
+          </select>
+        </label>
+        <label>自动启动成交额阈值
+          <input id="monitor_volume_trigger_start_threshold" type="number" min="0" step="0.01" />
+        </label>
+        <label>自动停止成交额阈值
+          <input id="monitor_volume_trigger_stop_threshold" type="number" min="0" step="0.01" />
+        </label>
+        <label class="inline-check" title="量能低于停止阈值后，自动停机时先撤掉当前交易对全部未成交委托">
+          <span class="check-row">
+            <input id="monitor_volume_trigger_stop_cancel_orders" type="checkbox" />
+            <span>低量停机时自动撤单</span>
+          </span>
+        </label>
+        <label class="inline-check" title="量能低于停止阈值后，自动停机时再启动 maker 跟价平仓，直到仓位归零">
+          <span class="check-row">
+            <input id="monitor_volume_trigger_stop_close_positions" type="checkbox" />
+            <span>低量停机时自动清仓</span>
+          </span>
+        </label>
+      </div>
+      <div class="tiny">上面的运行保护和量能自动启停参数会和下方 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
       <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改 JSON。</div>
       <div class="editor-grid">
         <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
@@ -9192,6 +9774,7 @@ MONITOR_PAGE = """<!doctype html>
     const strategyPresetMetaEl = document.getElementById("strategy_preset_meta");
     const loadRunningParamsBtn = document.getElementById("load_running_params_btn");
     const loadPresetParamsBtn = document.getElementById("load_preset_params_btn");
+    const saveParamsBtn = document.getElementById("save_params_btn");
     const applyParamsBtn = document.getElementById("apply_params_btn");
     const runnerParamsMetaEl = document.getElementById("runner_params_meta");
     const runnerParamsEditorEl = document.getElementById("runner_params_editor");
@@ -9200,6 +9783,12 @@ MONITOR_PAGE = """<!doctype html>
     const monitorRunEndTimeEl = document.getElementById("monitor_run_end_time");
     const monitorRollingHourlyLossLimitEl = document.getElementById("monitor_rolling_hourly_loss_limit");
     const monitorMaxCumulativeNotionalEl = document.getElementById("monitor_max_cumulative_notional");
+    const monitorVolumeTriggerEnabledEl = document.getElementById("monitor_volume_trigger_enabled");
+    const monitorVolumeTriggerWindowEl = document.getElementById("monitor_volume_trigger_window");
+    const monitorVolumeTriggerStartThresholdEl = document.getElementById("monitor_volume_trigger_start_threshold");
+    const monitorVolumeTriggerStopThresholdEl = document.getElementById("monitor_volume_trigger_stop_threshold");
+    const monitorVolumeTriggerStopCancelOrdersEl = document.getElementById("monitor_volume_trigger_stop_cancel_orders");
+    const monitorVolumeTriggerStopClosePositionsEl = document.getElementById("monitor_volume_trigger_stop_close_positions");
     const customGridNameEl = document.getElementById("custom_grid_name");
     const customGridDirectionEl = document.getElementById("custom_grid_direction");
     const customGridLevelModeEl = document.getElementById("custom_grid_level_mode");
@@ -9349,9 +9938,123 @@ MONITOR_PAGE = """<!doctype html>
         },
       },
       {
+        key: "bard_12h_push_neutral_v2",
+        label: "BARD 双向冲量 v2",
+        description: "BARDUSDT 专用双向冲量模板。固定细步长、双边 8 档、零底仓，适合高成交窗口短时冲量。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "BARDUSDT",
+        config: {
+          symbol: "BARDUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 100.0,
+          base_position_notional: 0.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 2000.0,
+          pause_short_position_notional: 2000.0,
+          max_position_notional: 2400.0,
+          max_short_position_notional: 2400.0,
+          max_total_notional: 3600.0,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          sleep_seconds: 3.0,
+          rolling_hourly_loss_limit: null,
+          excess_inventory_reduce_only_enabled: false,
+          autotune_symbol_enabled: false,
+        },
+      },
+      {
+        key: "based_volume_long_trigger_v1",
+        label: "BASED 放量做多 v1",
+        description: "BASEDUSDT 专用轻仓顺势做多。参考 BARD 的活跃窗口做法，但把步长放宽、仓位缩小，并默认按最近 15m 市场成交额自动启停。",
+        startable: true,
+        kind: "one_way",
+        symbol: "BASEDUSDT",
+        config: {
+          symbol: "BASEDUSDT",
+          strategy_mode: "one_way_long",
+          step_price: 0.0002,
+          buy_levels: 4,
+          sell_levels: 10,
+          per_order_notional: 20.0,
+          base_position_notional: 60.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 2,
+          down_trigger_steps: 2,
+          shift_steps: 1,
+          pause_buy_position_notional: 220.0,
+          max_position_notional: 320.0,
+          buy_pause_amp_trigger_ratio: 0.0065,
+          buy_pause_down_return_trigger_ratio: -0.003,
+          freeze_shift_abs_return_trigger_ratio: 0.0045,
+          inventory_tier_start_notional: 160.0,
+          inventory_tier_end_notional: 240.0,
+          inventory_tier_buy_levels: 2,
+          inventory_tier_sell_levels: 12,
+          inventory_tier_per_order_notional: 18.0,
+          inventory_tier_base_position_notional: 40.0,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: true,
+          max_total_notional: 420.0,
+          sleep_seconds: 5.0,
+          rolling_hourly_loss_limit: 4.0,
+          volume_trigger_enabled: true,
+          volume_trigger_window: "15m",
+          volume_trigger_start_threshold: 260000.0,
+          volume_trigger_stop_threshold: 180000.0,
+          volume_trigger_stop_cancel_open_orders: true,
+          volume_trigger_stop_close_all_positions: true,
+        },
+      },
+      {
+        key: "based_volume_push_bard_v1",
+        label: "BASED 双向冲量(BARD式) v1",
+        description: "把 BARD 实盘高换手双向冲量结构直接移植到 BASEDUSDT。固定细步长、双边 8 档、零底仓，不再让 autotune 把网格拉稀。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "BASEDUSDT",
+        config: {
+          symbol: "BASEDUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 100.0,
+          base_position_notional: 0.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 2000.0,
+          pause_short_position_notional: 2000.0,
+          max_position_notional: 2400.0,
+          max_short_position_notional: 2400.0,
+          max_total_notional: 3600.0,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+          rolling_hourly_loss_limit: null,
+          sleep_seconds: 3.0,
+        },
+      },
+      {
         key: "xaut_long_adaptive_v1",
         label: "XAUT 自适应做多 v1",
-        description: "仅用于 XAUTUSDT 的三态自适应做多。平稳时刷量，扩振时转防守，极端波动时立即撤买单并只保留卖单减仓。",
+        description: "仅用于 XAUTUSDT 的三态自适应做多。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤买单并只保留卖单减仓。",
         startable: true,
         kind: "one_way",
         symbol: "XAUTUSDT",
@@ -9384,7 +10087,7 @@ MONITOR_PAGE = """<!doctype html>
       {
         key: "xaut_short_adaptive_v1",
         label: "XAUT 自适应做空 v1",
-        description: "仅用于 XAUTUSDT 的三态自适应做空。平稳时刷量，扩振时转防守，极端波动时立即撤卖单并只保留买单回补减仓。",
+        description: "仅用于 XAUTUSDT 的三态自适应做空。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤卖单并只保留买单回补减仓。",
         startable: true,
         kind: "one_way",
         symbol: "XAUTUSDT",
@@ -9691,6 +10394,117 @@ MONITOR_PAGE = """<!doctype html>
           max_short_position_notional: 500,
         },
       },
+      {
+        key: "volume_neutral_push_v1",
+        label: "中性冲量通用 v1",
+        description: "参考 BARD 实盘固化出的通用高换手中性方案。零底仓、双边 8 档、1 格追中心，适合高成交时段短时冲量。",
+        startable: true,
+        kind: "synthetic",
+        config: {
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 100,
+          base_position_notional: 0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 2000,
+          pause_short_position_notional: 2000,
+          max_position_notional: 2400,
+          max_short_position_notional: 2400,
+          max_total_notional: 3600,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          sleep_seconds: 3,
+          autotune_symbol_enabled: true,
+        },
+      },
+      {
+        key: "volume_neutral_push_guarded_v1",
+        label: "中性冲量护栏 v1",
+        description: "在通用中性冲量上追加更强护栏。保留高换手结构，但更早停双边新增，并加入净暴露与 synthetic drift 停机线。",
+        startable: true,
+        kind: "synthetic",
+        config: {
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 100,
+          base_position_notional: 0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 1200,
+          pause_short_position_notional: 1200,
+          max_position_notional: 1600,
+          max_short_position_notional: 1600,
+          max_total_notional: 2400,
+          max_new_orders: 32,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          market_bias_enabled: true,
+          market_bias_max_shift_steps: 0.75,
+          market_bias_signal_steps: 2,
+          market_bias_drift_weight: 0.65,
+          market_bias_return_weight: 0.35,
+          market_bias_weak_buy_pause_enabled: true,
+          market_bias_weak_buy_pause_threshold: 0.15,
+          market_bias_strong_short_pause_enabled: true,
+          market_bias_strong_short_pause_threshold: 0.15,
+          rolling_hourly_loss_limit: 25,
+          max_cumulative_notional: 150000,
+          max_actual_net_notional: 900,
+          max_synthetic_drift_notional: 250,
+          sleep_seconds: 3,
+          autotune_symbol_enabled: true,
+        },
+      },
+      {
+        key: "volume_neutral_ping_pong_v1",
+        label: "量优先中性 v1",
+        description: "零底仓启动的单向合成中性。启动时买一/卖一放大，后续用更小的反手单回转；弱市切到做空、强市切到做多、震荡时回到中性 ping-pong。",
+        startable: true,
+        kind: "synthetic",
+        config: {
+          strategy_mode: "synthetic_neutral",
+          buy_levels: 4,
+          sell_levels: 4,
+          per_order_notional: 45,
+          startup_entry_multiplier: 4,
+          base_position_notional: 0,
+          up_trigger_steps: 2,
+          down_trigger_steps: 2,
+          shift_steps: 1,
+          pause_buy_position_notional: 500,
+          pause_short_position_notional: 500,
+          max_position_notional: 600,
+          max_short_position_notional: 600,
+          market_bias_enabled: true,
+          market_bias_max_shift_steps: 0.75,
+          market_bias_signal_steps: 2,
+          market_bias_drift_weight: 0.65,
+          market_bias_return_weight: 0.35,
+          market_bias_weak_buy_pause_enabled: true,
+          market_bias_weak_buy_pause_threshold: 0.15,
+          market_bias_strong_short_pause_enabled: true,
+          market_bias_strong_short_pause_threshold: 0.15,
+          market_bias_regime_switch_enabled: true,
+          market_bias_regime_switch_confirm_cycles: 2,
+          market_bias_regime_switch_weak_threshold: 0.15,
+          market_bias_regime_switch_strong_threshold: 0.15,
+          sleep_seconds: 5,
+        },
+      },
     ];
 
     let timer = null;
@@ -9711,6 +10525,7 @@ MONITOR_PAGE = """<!doctype html>
       buy_levels: "买单层数。层数越多，向下承接更深，但资金占用也更高。",
       sell_levels: "卖单层数。层数越多，向上卸仓或开空覆盖更广。",
       per_order_notional: "每笔挂单的目标名义金额（U）。直接决定单笔成交额大小。",
+      startup_entry_multiplier: "启动首轮放大倍数。仅在首轮零持仓时把买一/卖一放大成常规单的倍数，后续恢复普通单量。",
       base_position_notional: "基础持仓目标名义。做多会优先建立底仓，做空则对应基础空仓。",
       center_price: "固定中心价；为空时由运行时根据中价和偏移逻辑动态计算。",
       fixed_center_enabled: "是否启用固定中心价。开启后不会按常规触发逻辑自动迁移中心。",
@@ -9767,6 +10582,14 @@ MONITOR_PAGE = """<!doctype html>
       run_end_time: "允许结束交易的时间。超过时间后会停止交易、撤策略单并进入清仓逻辑。",
       rolling_hourly_loss_limit: "最近 60 分钟滚动亏损阈值。达到后会自动停机、撤单并清仓。",
       max_cumulative_notional: "累计成交额阈值。达到后会自动停机、撤单并清仓。",
+      max_actual_net_notional: "实际净敞口绝对值阈值。达到后会自动停机、撤单并清仓。",
+      max_synthetic_drift_notional: "synthetic 虚拟净仓和实际净仓偏差折算成名义金额后的阈值。达到后会自动停机、撤单并清仓。",
+      volume_trigger_enabled: "是否启用按市场成交额自动启动/停止策略的后台巡检。",
+      volume_trigger_window: "量能观察窗口。当前按 Binance 合约 1 分钟 K 线的 quote volume 汇总。",
+      volume_trigger_start_threshold: "最近窗口市场成交额达到这个阈值后，后台会自动启动策略。",
+      volume_trigger_stop_threshold: "最近窗口市场成交额低于这个阈值后，后台会自动停止策略。",
+      volume_trigger_stop_cancel_open_orders: "自动停机时是否先撤销当前交易对全部未成交委托。",
+      volume_trigger_stop_close_all_positions: "自动停机时是否继续启动 maker 跟价平仓，直到仓位归零。",
       cancel_stale: "是否撤掉与当前目标计划不一致的旧单。",
       apply: "是否真实下单。关闭时仅做 dry-run。",
       reset_state: "启动时是否重置本地状态文件。",
@@ -9910,6 +10733,15 @@ MONITOR_PAGE = """<!doctype html>
       return `${wan.toFixed(2)}万`;
     }
 
+    function formatVolumeTriggerWindowLabel(windowKey) {
+      const normalized = String(windowKey || "1h").trim().toLowerCase();
+      if (normalized === "15m") return "15 分钟";
+      if (normalized === "30m") return "30 分钟";
+      if (normalized === "4h") return "4 小时";
+      if (normalized === "24h") return "24 小时";
+      return "1 小时";
+    }
+
     function formatStartupInventory(summary, quantityDigits = 4, notionalDigits = 4) {
       const direction = String(summary.strategy_direction || "");
       const longQty = Number(summary.startup_long_qty || 0);
@@ -10041,6 +10873,20 @@ MONITOR_PAGE = """<!doctype html>
         run_end_time: fromLocalInputValue(monitorRunEndTimeEl.value),
         rolling_hourly_loss_limit: monitorRollingHourlyLossLimitEl.value ? Number(monitorRollingHourlyLossLimitEl.value) : null,
         max_cumulative_notional: monitorMaxCumulativeNotionalEl.value ? Number(monitorMaxCumulativeNotionalEl.value) : null,
+        volume_trigger_enabled: Boolean(monitorVolumeTriggerEnabledEl && monitorVolumeTriggerEnabledEl.checked),
+        volume_trigger_window: monitorVolumeTriggerWindowEl ? String(monitorVolumeTriggerWindowEl.value || "1h") : "1h",
+        volume_trigger_start_threshold: monitorVolumeTriggerStartThresholdEl && monitorVolumeTriggerStartThresholdEl.value
+          ? Number(monitorVolumeTriggerStartThresholdEl.value)
+          : null,
+        volume_trigger_stop_threshold: monitorVolumeTriggerStopThresholdEl && monitorVolumeTriggerStopThresholdEl.value
+          ? Number(monitorVolumeTriggerStopThresholdEl.value)
+          : null,
+        volume_trigger_stop_cancel_open_orders: Boolean(
+          monitorVolumeTriggerStopCancelOrdersEl && monitorVolumeTriggerStopCancelOrdersEl.checked
+        ),
+        volume_trigger_stop_close_all_positions: Boolean(
+          monitorVolumeTriggerStopClosePositionsEl && monitorVolumeTriggerStopClosePositionsEl.checked
+        ),
       };
     }
 
@@ -10050,6 +10896,12 @@ MONITOR_PAGE = """<!doctype html>
       monitorRunEndTimeEl.value = toLocalInputValue(source.run_end_time);
       monitorRollingHourlyLossLimitEl.value = source.rolling_hourly_loss_limit ?? "";
       monitorMaxCumulativeNotionalEl.value = source.max_cumulative_notional ?? "";
+      monitorVolumeTriggerEnabledEl.checked = Boolean(source.volume_trigger_enabled);
+      monitorVolumeTriggerWindowEl.value = source.volume_trigger_window || "1h";
+      monitorVolumeTriggerStartThresholdEl.value = source.volume_trigger_start_threshold ?? "";
+      monitorVolumeTriggerStopThresholdEl.value = source.volume_trigger_stop_threshold ?? "";
+      monitorVolumeTriggerStopCancelOrdersEl.checked = Boolean(source.volume_trigger_stop_cancel_open_orders);
+      monitorVolumeTriggerStopClosePositionsEl.checked = Boolean(source.volume_trigger_stop_close_all_positions);
     }
 
     function mergeRuntimeGuardConfig(payload) {
@@ -10073,7 +10925,7 @@ MONITOR_PAGE = """<!doctype html>
       latestRunnerEditorConfig = nextConfig;
       runnerParamsEditorEl.value = JSON.stringify(nextConfig, null, 2);
       renderRunnerParamGuide(nextConfig);
-      runnerParamsMetaEl.textContent = "运行保护参数已同步到 JSON，可继续修改后应用。";
+      runnerParamsMetaEl.textContent = "运行保护和量能自动启停参数已同步到 JSON，可继续修改后保存或应用。";
     }
 
     async function ensureEditorConfigForAlert() {
@@ -10231,14 +11083,32 @@ MONITOR_PAGE = """<!doctype html>
           "如果启动时已经有同向多仓，首轮会先禁掉 bootstrap，只让网格顺着现有库存继续运转。",
         ],
       },
-      xaut_long_adaptive_v1: {
-        summary: "XAUT 专用三态做多。除了 normal / defensive 外，还会在极端下跌或扩振时进入 reduce_only，立即撤买单，只保留卖单减仓。",
+      bard_12h_push_neutral_v2: {
+        summary: "BARDUSDT 的双向冲量 v2。固定细步长、双边 8 档、零底仓，目标是把高成交窗口里的双边回转密度堆高。",
         focus: [
-          "这套只允许在 XAUTUSDT 上使用，目的是把高波动时的继续接仓速度压到最低。",
+          "这套关闭了 autotune 和 reduce_only 护栏，适合短时冲量，不适合长期常开。",
+        ],
+      },
+      based_volume_long_trigger_v1: {
+        summary: "参考 BARD 放量窗口思路做的 BASED 顺势做多版。默认只在最近 15 分钟市场成交额抬升后自动启动，量能回落就撤单并清仓。",
+        focus: [
+          "和 BARD 相比，这套把步长放宽、底仓和单笔都压低，用更小的库存去承受 BASED 更宽的点差和更大的短线振幅。",
+        ],
+      },
+      based_volume_push_bard_v1: {
+        summary: "把 BARD 的高换手双向冲量骨架原样绑定到 BASEDUSDT。关键不是放大仓位，而是固定细步长并关闭 autotune，避免挂单被自动拉稀。",
+        focus: [
+          "这套是 burst 型双边冲量模板，更适合交投明显抬升时段短开，不适合长期常驻。",
+        ],
+      },
+      xaut_long_adaptive_v1: {
+        summary: "XAUT 专用三态做多。除了 normal / defensive 外，还会按 15m/60m 振幅连续缩放 step_price；极端下跌或扩振时进入 reduce_only，立即撤买单，只保留卖单减仓。",
+        focus: [
+          "这套只允许在 XAUTUSDT 上使用，目的是在平静时把挂单贴近一点、在扩振时把继续接仓速度压低。",
         ],
       },
       xaut_short_adaptive_v1: {
-        summary: "XAUT 专用三态做空。极端上冲或扩振时进入 reduce_only，立即撤卖单，只保留买单回补减空仓。",
+        summary: "XAUT 专用三态做空。除了 normal / defensive 外，还会按 15m/60m 振幅连续缩放 step_price；极端上冲或扩振时进入 reduce_only，立即撤卖单，只保留买单回补减空仓。",
         focus: [
           "结构上镜像 xaut_long_adaptive_v1，但风险触发方向反过来。",
         ],
@@ -10303,6 +11173,24 @@ MONITOR_PAGE = """<!doctype html>
           "优点是不需要切 hedge mode；代价是实际净仓和虚拟账本需要持续对齐。",
         ],
       },
+      volume_neutral_push_v1: {
+        summary: "参考 BARD 实盘固化出的高换手中性冲量模板。核心不是预测方向，而是用更近的双边双层挂单把回转密度堆起来。",
+        focus: [
+          "零底仓启动、双边 8 档、1 格迁移中心，适合高成交窗口短时冲榜；更像 burst 工具，不适合长期常开。",
+        ],
+      },
+      volume_neutral_push_guarded_v1: {
+        summary: "通用中性冲量的护栏版。保留高换手结构，但更早停新增，并加上净敞口和 synthetic drift 的停机线。",
+        focus: [
+          "当实际净敞口或虚拟账本偏差扩大到阈值时，会直接撤单并转入清仓，比单纯缩单笔更像真正的风控护栏。",
+        ],
+      },
+      volume_neutral_ping_pong_v1: {
+        summary: "量优先的单向合成中性。不开底仓，启动先挂一对更大的近端买卖单；弱市切到做空、强市切到做多，震荡再回到中性回转。",
+        focus: [
+          "如果把 `startup_entry_multiplier` 设成 4，就相当于首轮大单成交后，用约四笔常规小单去拆回；再叠加 bias 三态换挡，就能少扛单边库存。",
+        ],
+      },
     };
     const AUTOTUNE_STEP_HINTS = {
       volume_long_v4: { stepRatio: 0.0004, minTicks: 2 },
@@ -10311,6 +11199,9 @@ MONITOR_PAGE = """<!doctype html>
       volume_neutral_target_v1: { stepRatio: 0.0006, minTicks: 3 },
       neutral_hedge_v1: { stepRatio: 0.0005, minTicks: 3 },
       synthetic_neutral_v1: { stepRatio: 0.0005, minTicks: 3 },
+      volume_neutral_push_v1: { stepRatio: 0.00032, minTicks: 2 },
+      volume_neutral_push_guarded_v1: { stepRatio: 0.00032, minTicks: 2 },
+      volume_neutral_ping_pong_v1: { stepRatio: 0.00035, minTicks: 2 },
     };
 
     function asGuideNumber(value) {
@@ -10563,6 +11454,26 @@ MONITOR_PAGE = """<!doctype html>
       if (asGuideNumber(config.max_cumulative_notional) > 0) {
         lines.push(`累计成交额达到 ${fmtGuideNotional(config.max_cumulative_notional)} 时，会直接停机并执行撤单清仓。`);
       }
+      if (asGuideNumber(config.max_actual_net_notional) > 0) {
+        lines.push(`实际净敞口绝对值达到 ${fmtGuideNotional(config.max_actual_net_notional)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (asGuideNumber(config.max_synthetic_drift_notional) > 0) {
+        lines.push(`synthetic 虚拟净仓和真实净仓的偏差折算名义达到 ${fmtGuideNotional(config.max_synthetic_drift_notional)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (config.volume_trigger_enabled) {
+        const windowLabel = formatVolumeTriggerWindowLabel(config.volume_trigger_window);
+        if (asGuideNumber(config.volume_trigger_start_threshold) > 0) {
+          lines.push(`web 后台会持续观察最近 ${windowLabel} 的市场成交额；达到 ${fmtGuideNotional(config.volume_trigger_start_threshold)} 后，会自动启动策略。`);
+        }
+        if (asGuideNumber(config.volume_trigger_stop_threshold) > 0) {
+          const stopActions = [];
+          if (config.volume_trigger_stop_cancel_open_orders) stopActions.push("撤策略单");
+          if (config.volume_trigger_stop_close_all_positions) stopActions.push("清仓");
+          lines.push(
+            `最近 ${windowLabel} 的市场成交额低于 ${fmtGuideNotional(config.volume_trigger_stop_threshold)} 时，会自动停机${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`
+          );
+        }
+      }
       if (config.cancel_stale === false) {
         lines.push("当前 cancel_stale=false：如果新计划和旧挂单不一致，提交器会直接拒绝执行，而不是替你撤单。");
       } else {
@@ -10729,24 +11640,53 @@ MONITOR_PAGE = """<!doctype html>
       );
     }
 
-    async function applyRunnerParams() {
+    async function saveRunnerParams() {
       const selectedPreset = getPresetByKey(strategyPresetEl.value);
-      const fallbackProfile = selectedPreset
-        ? selectedPreset.key
-        : String((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
       let payload;
       try {
-        payload = readRunnerEditorConfigFromTextarea();
+        payload = buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset);
       } catch (err) {
         runnerParamsMetaEl.textContent = `JSON 解析失败: ${err}`;
         return;
       }
-      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
-      payload = mergeRuntimeGuardConfig(payload);
-      payload.symbol = selectedSymbol;
-      if (!payload.strategy_profile) {
-        payload.strategy_profile = fallbackProfile;
+      saveParamsBtn.disabled = true;
+      applyParamsBtn.disabled = true;
+      loadRunningParamsBtn.disabled = true;
+      loadPresetParamsBtn.disabled = true;
+      runnerParamsMetaEl.textContent = `正在保存 ${selectedSymbol} 参数，不启动策略...`;
+      try {
+        const resp = await fetch("/api/runner/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        runnerParamsMetaEl.textContent = `参数已保存到 ${selectedSymbol} 控制配置，当前不会自动启动。`;
+        setRunnerEditorConfig((data && data.config) || payload, `已保存 ${selectedSymbol} 控制参数。`);
+        await loadMonitor();
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `保存失败: ${err}`;
+      } finally {
+        saveParamsBtn.disabled = false;
+        applyParamsBtn.disabled = false;
+        loadRunningParamsBtn.disabled = false;
+        loadPresetParamsBtn.disabled = false;
       }
+    }
+
+    async function applyRunnerParams() {
+      const selectedPreset = getPresetByKey(strategyPresetEl.value);
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      let payload;
+      try {
+        payload = buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset);
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `JSON 解析失败: ${err}`;
+        return;
+      }
+      saveParamsBtn.disabled = true;
       applyParamsBtn.disabled = true;
       loadRunningParamsBtn.disabled = true;
       loadPresetParamsBtn.disabled = true;
@@ -10766,6 +11706,7 @@ MONITOR_PAGE = """<!doctype html>
       } catch (err) {
         runnerParamsMetaEl.textContent = `应用失败: ${err}`;
       } finally {
+        saveParamsBtn.disabled = false;
         applyParamsBtn.disabled = false;
         loadRunningParamsBtn.disabled = false;
         loadPresetParamsBtn.disabled = false;
@@ -10778,6 +11719,26 @@ MONITOR_PAGE = """<!doctype html>
       customGridLoadBtn.disabled = strategyActionPending || !hasCustom;
       customGridUpdateBtn.disabled = strategyActionPending || !hasCustom;
       customGridDeleteBtn.disabled = strategyActionPending || !hasCustom;
+    }
+
+    function runnerFallbackProfile(selectedPreset = null) {
+      return selectedPreset
+        ? selectedPreset.key
+        : String((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
+    }
+
+    function buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset = null) {
+      let payload = readRunnerEditorConfigFromTextarea();
+      const payloadSymbol = String(payload.symbol || "").trim().toUpperCase();
+      if (payloadSymbol && payloadSymbol !== selectedSymbol) {
+        throw new Error(`参数编辑器当前是 ${payloadSymbol}，请先载入 ${selectedSymbol} 的运行参数或预设`);
+      }
+      payload = mergeRuntimeGuardConfig(payload);
+      payload.symbol = selectedSymbol;
+      if (!payload.strategy_profile) {
+        payload.strategy_profile = runnerFallbackProfile(selectedPreset);
+      }
+      return payload;
     }
 
     function populatePresetOptions(data) {
@@ -11134,6 +12095,7 @@ MONITOR_PAGE = """<!doctype html>
       const runnerCfg = runner.config || {};
       const competitionWindow = data.competition_window || {};
       const competitionRewardTargets = data.competition_reward_targets || {};
+      const volumeTrigger = data.volume_trigger || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const selectedPreset = getPresetByKey(String(strategyPresetEl.value || runnerCfg.strategy_profile || "volume_long_v4"));
       const risk = data.risk_controls || {};
@@ -11171,6 +12133,7 @@ MONITOR_PAGE = """<!doctype html>
         `模式: ${modeLabel}`,
         `最近事件: ${fmtTs(data.session && data.session.last_event)}`,
         `PID: ${runner.pid || "--"}`,
+        `量能自动启停: ${volumeTrigger.enabled ? "开" : "关"}`,
         isOneWayShort ? `停空: ${risk.short_paused ? "是" : "否"}` : `停买: ${risk.buy_paused ? "是" : "否"}`,
         isNeutralMode ? `停空: ${risk.short_paused ? "是" : "否"}` : (isOneWayShort ? `空裁单: ${risk.short_cap_applied ? "是" : "否"}` : `硬裁单: ${risk.buy_cap_applied ? "是" : "否"}`),
       ].join(" · ");
@@ -11188,6 +12151,9 @@ MONITOR_PAGE = """<!doctype html>
         `运行状态: ${risk.runtime_status || "--"}`,
         `滚动亏损: ${fmtNum(risk.rolling_hourly_loss || 0, 4)} / ${fmtNum(risk.rolling_hourly_loss_limit || 0, 4)}`,
         `累计成交额: ${fmtNum(risk.cumulative_gross_notional || 0, 4)} / ${fmtNum(risk.max_cumulative_notional || 0, 4)}`,
+        volumeTrigger.enabled
+          ? `量能 ${formatVolumeTriggerWindowLabel(volumeTrigger.window)}: ${fmtNum(volumeTrigger.current_quote_volume, 4)} / 启 ${fmtNum(volumeTrigger.start_threshold, 4)} / 停 ${fmtNum(volumeTrigger.stop_threshold, 4)}`
+          : "量能自动启停: 关闭",
         `停止原因: ${risk.stop_reason || "--"}`,
         `自适应状态: ${autoRegimeEnabled ? `${autoRegimeRegime} (${autoRegimePending})` : "关闭"}`,
         `XAUT 三态: ${xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"}`,
@@ -11599,24 +12565,28 @@ MONITOR_PAGE = """<!doctype html>
     async function controlStrategy(action) {
       if (strategyActionPending) return;
       const selectedPreset = getPresetByKey(strategyPresetEl.value);
-      if (action === "start" && (!selectedPreset || !selectedPreset.startable)) {
-        strategyActionMetaEl.textContent = selectedPreset
-          ? `${selectedPreset.label} 当前是模板预设，页面已展示参数，但还不能直接启动。`
-          : "请选择可启动的策略预设";
-        return;
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      let startPayload = null;
+      if (action === "start") {
+        try {
+          startPayload = buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset);
+        } catch (err) {
+          strategyActionMetaEl.textContent = `启动失败: ${err}`;
+          return;
+        }
+        const effectivePreset = getPresetByKey(String(startPayload.strategy_profile || ""));
+        if (effectivePreset && !effectivePreset.startable) {
+          strategyActionMetaEl.textContent = `${effectivePreset.label} 当前是模板预设，页面已展示参数，但还不能直接启动。`;
+          return;
+        }
       }
       strategyActionPending = true;
-      strategyActionMetaEl.textContent = action === "start" ? "正在启动策略..." : "正在停止策略...";
+      strategyActionMetaEl.textContent = action === "start" ? "正在按当前编辑器参数启动策略..." : "正在停止策略...";
       startStrategyBtn.disabled = true;
       stopStrategyBtn.disabled = true;
       try {
-        const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
         const payload = action === "start"
-          ? {
-              ...(selectedPreset ? (selectedPreset.config || {}) : {}),
-              symbol: selectedSymbol,
-              strategy_profile: selectedPreset ? selectedPreset.key : ((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4"),
-            }
+          ? startPayload
           : {
               symbol: selectedSymbol,
               cancel_open_orders: Boolean(stopCancelOrdersEl && stopCancelOrdersEl.checked),
@@ -11632,6 +12602,10 @@ MONITOR_PAGE = """<!doctype html>
         strategyActionMetaEl.textContent = action === "start"
           ? `策略已启动${data.restarted ? "（已重启应用新配置）" : (data.already_running ? "（已在运行）" : "")}`
           : `策略已停止${data.already_stopped ? "（原本就未运行）" : ""}${formatStopActionSummary(data.post_stop_actions) ? ` · ${formatStopActionSummary(data.post_stop_actions)}` : ""}`;
+        if (action === "start") {
+          const appliedConfig = ((((data || {}).runner || {}).config) || payload);
+          setRunnerEditorConfig(appliedConfig, `已载入 ${selectedSymbol} 当前生效参数。`);
+        }
       } catch (err) {
         strategyActionMetaEl.textContent = `${action === "start" ? "启动" : "停止"}失败: ${err}`;
       } finally {
@@ -11663,9 +12637,21 @@ MONITOR_PAGE = """<!doctype html>
     strategyPresetEl.addEventListener("change", () => renderPresetMeta(latestMonitorData));
     loadRunningParamsBtn.addEventListener("click", loadRunningConfigToEditor);
     loadPresetParamsBtn.addEventListener("click", loadPresetConfigToEditor);
+    saveParamsBtn.addEventListener("click", saveRunnerParams);
     applyParamsBtn.addEventListener("click", applyRunnerParams);
     runnerParamsEditorEl.addEventListener("input", syncRunnerParamGuideFromEditor);
-    [monitorRunStartTimeEl, monitorRunEndTimeEl, monitorRollingHourlyLossLimitEl, monitorMaxCumulativeNotionalEl]
+    [
+      monitorRunStartTimeEl,
+      monitorRunEndTimeEl,
+      monitorRollingHourlyLossLimitEl,
+      monitorMaxCumulativeNotionalEl,
+      monitorVolumeTriggerEnabledEl,
+      monitorVolumeTriggerWindowEl,
+      monitorVolumeTriggerStartThresholdEl,
+      monitorVolumeTriggerStopThresholdEl,
+      monitorVolumeTriggerStopCancelOrdersEl,
+      monitorVolumeTriggerStopClosePositionsEl,
+    ]
       .forEach((el) => el.addEventListener("change", syncRuntimeGuardInputsToEditor));
     alertBoxEl.addEventListener("click", async (event) => {
       const button = event.target.closest("[data-alert-action]");
@@ -17092,6 +18078,14 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
         summary_limit=summary_limit,
         runner_process=runner,
     )
+    volume_trigger_status = _runner_volume_trigger_status(symbol) or {}
+    snapshot["volume_trigger"] = {
+        "enabled": bool(runner_config.get("volume_trigger_enabled", False)),
+        "window": runner_config.get("volume_trigger_window"),
+        "start_threshold": runner_config.get("volume_trigger_start_threshold"),
+        "stop_threshold": runner_config.get("volume_trigger_stop_threshold"),
+        **volume_trigger_status,
+    }
     snapshot["runner_presets"] = _runner_preset_summaries(symbol)
     return snapshot
 
@@ -17518,7 +18512,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
-        if path in {"/api/runner/start", "/api/runner/stop"}:
+        if path in {"/api/runner/start", "/api/runner/stop", "/api/runner/save"}:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -17542,6 +18536,8 @@ class _Handler(BaseHTTPRequestHandler):
                 if path.endswith("/start"):
                     config = _resolve_runner_start_config(payload)
                     result = _start_runner_process(config)
+                elif path.endswith("/save"):
+                    result = _save_runner_config_without_start(payload)
                 else:
                     result = _stop_runner_process(
                         payload.get("symbol"),
@@ -17549,6 +18545,8 @@ class _Handler(BaseHTTPRequestHandler):
                         close_all_positions=_safe_bool(payload.get("close_all_positions", False), "close_all_positions"),
                     )
                 self._send_json({"ok": True, **result}, status=200)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
@@ -17880,6 +18878,14 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
 
+    volume_trigger_stop_event = threading.Event()
+    volume_trigger_thread = threading.Thread(
+        target=_run_volume_trigger_loop,
+        args=(volume_trigger_stop_event,),
+        daemon=True,
+        name="runner-volume-trigger",
+    )
+    volume_trigger_thread.start()
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(f"Grid Web UI running at http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop.")
@@ -17888,6 +18894,7 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        volume_trigger_stop_event.set()
         server.server_close()
 
 

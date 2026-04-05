@@ -51,6 +51,44 @@
 - `maker_retries`
   - post-only 被拒时，最多重试这么多次。
 
+### 市场成交额自动启停
+
+这套能力运行在 `web.py` 的后台巡检线程里，不属于 `loop_runner` 主循环本身。
+
+- 量能来源
+  - 取 Binance 合约最近 `1m` K 线的 `quote volume`，按窗口汇总成“市场成交额”。
+  - 当前支持 `15m / 30m / 1h / 4h / 24h`。
+- 自动启动
+  - 当策略当前未运行，且最近窗口市场成交额 `>= volume_trigger_start_threshold` 时，后台会按保存下来的控制参数自动拉起 runner。
+- 自动停止
+  - 当策略当前正在运行，且最近窗口市场成交额 `< volume_trigger_stop_threshold` 时，后台会自动停机。
+  - 如果启用了 `volume_trigger_stop_cancel_open_orders`，停机前会先撤当前交易对的未成交委托。
+  - 如果启用了 `volume_trigger_stop_close_all_positions`，停机时会继续启动 maker flatten，直到仓位归零。
+
+实盘建议：
+
+- `start_threshold` 和 `stop_threshold` 最好不要相同。
+- 常见做法是 `stop_threshold < start_threshold`，留一段回差，减少高低边界反复穿越时的频繁启停。
+- 如果你想等放量后再入场，通常配合“保存参数不启动”更顺手。
+
+### 生产操作约束
+
+- 生产机器上的策略 runner、flatten runner、`output/*_loop_runner.pid`、`output/*_loop_runner_control.json` 必须由 `ubuntu` 用户持有和启动。
+- 日常启动、停止、重启，优先走监控台页面，或由 `ubuntu` 用户调用本机 `grid-web` / `wangge-web` 提供的 `/api/runner/start`、`/api/runner/stop`。
+- 不要用 `root` 直接执行 `python -m grid_optimizer.loop_runner`、`python -m grid_optimizer.maker_flatten_runner`，也不要让 `root` 写入 runner 的 pid / control / state 文件。
+
+原因：
+
+- 当前页面和 web 进程在生产上默认由 `ubuntu` 运行。
+- 如果 runner 是 `root` 拉起，pid 文件或进程本身会变成 `root` 所有，页面停机、撤单、重启时会出现权限错误。
+- 结果会变成“策略还在跑，但界面按钮失效”，只能再用 `sudo` 手工清理。
+
+如果发现进程已经被 `root` 拉起，处理顺序应当是：
+
+1. 用 `sudo` 停掉错误的 `root` 进程。
+2. 清理对应的 `output/*_loop_runner.pid`，必要时检查 control / state 文件所有者。
+3. 切回 `ubuntu` 用户，通过页面或本机鉴权 API 重新启动。
+
 ## 策略模式
 
 ### 1. `one_way_long`
@@ -146,12 +184,15 @@
 典型预设：
 
 - `synthetic_neutral_v1`
+- `volume_neutral_ping_pong_v1`
 
 执行方式：
 
 - 先像 `hedge_neutral` 一样生成一套双边计划。
 - 再把 LONG / SHORT 两本账折成单向账户可以提交的委托。
 - 系统会持续同步一份“虚拟 long/short 账本”，用来判断当前应该补哪边。
+- 如果启用了 `startup_entry_multiplier`，首轮 `startup_pending` 时会把买一 / 卖一放大；
+  首轮之后恢复为普通 `per_order_notional`。
 
 适用场景：
 
@@ -267,6 +308,36 @@
 - 核心：单向账户里的合成双边中性。
 - 用虚拟账本模拟 hedge。
 
+### `volume_neutral_ping_pong_v1`
+
+- 核心：量优先的单向合成中性。
+- 不持有初始底仓，首轮买一 / 卖一可放大，后续反手单回到常规尺寸。
+- 更适合想保留中性结构、又不想一上来先 bootstrap 出库存的场景。
+
+### `bard_volume_long_v2`
+
+- 核心：BARDUSDT 专用做多预设。
+- 启动前先做 `flat_start` 门禁，避免旧挂单或反向仓位直接混进来。
+- 如果账户已经带着同向多仓启动，首轮会先禁掉 `bootstrap`，让网格先顺着现有库存运转。
+
+### `bard_12h_push_neutral_v2`
+
+- 核心：BARDUSDT 的双向冲量模板。
+- 固定 `step_price=0.0001`、双边 `8x8`、零底仓、`1` 格追中心，优先把高成交窗口里的双边回转密度堆高。
+- 关闭 `autotune_symbol_enabled` 和 `excess_inventory_reduce_only_enabled`，更适合短时冲量，不建议长期常开。
+
+### `based_volume_long_trigger_v1`
+
+- 核心：BASEDUSDT 的放量启动做多。
+- 思路参考 BARD 的活跃窗口做法，但把步长放宽、仓位缩小、卖侧加重。
+- 默认只在最近 `15m` 市场成交额达到阈值后自动启动；量能回落后自动停机、撤单并清仓。
+
+### `based_volume_push_bard_v1`
+
+- 核心：把 BARD 的高换手双向冲量骨架直接移植到 BASEDUSDT。
+- 固定 `step_price=0.0001`、双边 `8x8`、零底仓、`1` 格追中心，避免通用 autotune 把 BASED 的网格自动拉稀。
+- 这是短时 burst 型双边冲量模板，适合交投明显抬升时段临时开，不建议长期常开。
+
 ## 额外说明
 
 ### `autotune_symbol_enabled`
@@ -276,6 +347,7 @@
 - `step_price`
 - `per_order_notional`
 - `base_position_notional`
+- `startup_entry_multiplier` 不会被自动改写，但它实际对应的首轮大单名义会跟着 `per_order_notional` 一起变化。
 
 所以：
 

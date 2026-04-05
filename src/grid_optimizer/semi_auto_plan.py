@@ -690,6 +690,10 @@ def build_hedge_micro_grid_plan(
     min_notional: float | None,
     current_long_qty: float,
     current_short_qty: float,
+    startup_entry_multiplier: float = 1.0,
+    startup_large_entry_active: bool = False,
+    buy_offset_steps: float = 0.0,
+    sell_offset_steps: float = 0.0,
 ) -> dict[str, Any]:
     if center_price <= 0 or step_price <= 0:
         raise ValueError("center_price and step_price must be > 0")
@@ -702,13 +706,29 @@ def build_hedge_micro_grid_plan(
     sell_orders: list[PlanOrder] = []
     current_long_qty = max(float(current_long_qty), 0.0)
     current_short_qty = max(float(current_short_qty), 0.0)
+    startup_multiplier = max(float(startup_entry_multiplier), 1.0)
+    buy_offset_steps = float(buy_offset_steps)
+    sell_offset_steps = float(sell_offset_steps)
+    min_distance_steps = 0.25
+
+    def _entry_notional(*, level: int, current_qty: float) -> float:
+        if startup_large_entry_active and level == 1 and current_qty <= 1e-12:
+            return per_order_notional * startup_multiplier
+        return per_order_notional
+
+    def _buy_price(level: int) -> float:
+        distance_steps = max(float(level) + buy_offset_steps, min_distance_steps)
+        return _round_order_price(center_price - (distance_steps * step_price), tick_size, "BUY")
+
+    def _sell_price(level: int) -> float:
+        distance_steps = max(float(level) + sell_offset_steps, min_distance_steps)
+        return _round_order_price(center_price + (distance_steps * step_price), tick_size, "SELL")
 
     remaining_short_exit_qty = _round_order_qty(current_short_qty, step_size)
     for level in range(1, buy_levels + 1):
         if remaining_short_exit_qty <= 0:
             break
-        price_raw = center_price - (level * step_price)
-        price = _round_order_price(price_raw, tick_size, "BUY")
+        price = _buy_price(level)
         desired_qty = _round_order_qty(per_order_notional / price, step_size)
         qty = _round_order_qty(min(desired_qty, remaining_short_exit_qty), step_size)
         notional = price * qty
@@ -733,9 +753,8 @@ def build_hedge_micro_grid_plan(
         remaining_short_exit_qty = max(remaining_short_exit_qty - qty, 0.0)
 
     for level in range(1, buy_levels + 1):
-        price_raw = center_price - (level * step_price)
-        price = _round_order_price(price_raw, tick_size, "BUY")
-        qty = _round_order_qty(per_order_notional / price, step_size)
+        price = _buy_price(level)
+        qty = _round_order_qty(_entry_notional(level=level, current_qty=current_long_qty) / price, step_size)
         notional = price * qty
         if price >= ask_price:
             continue
@@ -760,8 +779,7 @@ def build_hedge_micro_grid_plan(
     for level in range(1, sell_levels + 1):
         if remaining_long_exit_qty <= 0:
             break
-        price_raw = center_price + (level * step_price)
-        price = _round_order_price(price_raw, tick_size, "SELL")
+        price = _sell_price(level)
         desired_qty = _round_order_qty(per_order_notional / price, step_size)
         qty = _round_order_qty(min(desired_qty, remaining_long_exit_qty), step_size)
         notional = price * qty
@@ -786,9 +804,8 @@ def build_hedge_micro_grid_plan(
         remaining_long_exit_qty = max(remaining_long_exit_qty - qty, 0.0)
 
     for level in range(1, sell_levels + 1):
-        price_raw = center_price + (level * step_price)
-        price = _round_order_price(price_raw, tick_size, "SELL")
-        qty = _round_order_qty(per_order_notional / price, step_size)
+        price = _sell_price(level)
+        qty = _round_order_qty(_entry_notional(level=level, current_qty=current_short_qty) / price, step_size)
         notional = price * qty
         if price <= bid_price:
             continue

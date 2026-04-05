@@ -37,6 +37,9 @@ from grid_optimizer.loop_runner import (
     generate_plan_report,
     execute_plan_report,
     resolve_neutral_hourly_scale,
+    resolve_market_bias_entry_pause,
+    resolve_market_bias_offsets,
+    resolve_market_bias_regime_switch,
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
     update_synthetic_order_refs,
@@ -562,6 +565,93 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(state["startup_pending"])
         self.assertIsNotNone(state["startup_completed_at"])
 
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_market_bias_regime_switch_uses_directional_short_inventory(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.0700", "ask_price": "0.0702"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "BASEDUSDT", "positionAmt": "-3200", "entryPrice": "0.0710"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "return_ratio": -0.004,
+            "amplitude_ratio": 0.003,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BASEDUSDT",
+                strategy_profile="volume_neutral_ping_pong_v1",
+                strategy_mode="synthetic_neutral",
+                base_position_notional=0.0,
+                buy_levels=4,
+                sell_levels=4,
+                per_order_notional=45.0,
+                startup_entry_multiplier=4.0,
+                step_price=0.0002,
+                market_bias_enabled=True,
+                market_bias_max_shift_steps=0.75,
+                market_bias_signal_steps=2.0,
+                market_bias_drift_weight=0.65,
+                market_bias_return_weight=0.35,
+                market_bias_weak_buy_pause_enabled=True,
+                market_bias_weak_buy_pause_threshold=0.15,
+                market_bias_strong_short_pause_enabled=True,
+                market_bias_strong_short_pause_threshold=0.15,
+                market_bias_regime_switch_enabled=True,
+                market_bias_regime_switch_confirm_cycles=1,
+                market_bias_regime_switch_weak_threshold=0.15,
+                market_bias_regime_switch_strong_threshold=0.15,
+                pause_buy_position_notional=500.0,
+                pause_short_position_notional=500.0,
+                max_position_notional=600.0,
+                max_short_position_notional=600.0,
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["requested_strategy_mode"], "synthetic_neutral")
+        self.assertEqual(report["strategy_mode"], "one_way_short")
+        self.assertEqual(report["market_bias"]["regime"], "weak")
+        self.assertEqual(report["market_bias_regime_switch"]["active_mode"], "one_way_short")
+        self.assertAlmostEqual(report["current_long_qty"], 0.0)
+        self.assertAlmostEqual(report["current_short_qty"], 3200.0)
+        self.assertIsNone(report["synthetic_ledger"])
+
     def test_apply_synthetic_trade_fill_tracks_virtual_long_and_short_books(self) -> None:
         ledger = {
             "virtual_long_qty": 0.0,
@@ -668,6 +758,36 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
         self.assertEqual(len(plan["sell_orders"]), 1)
         self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+
+    def test_apply_hedge_position_controls_respects_external_short_pause(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "SELL", "price": 1.21, "qty": 10, "notional": 12.1, "role": "bootstrap_short", "position_side": "SHORT"}],
+            "buy_orders": [{"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.23, "qty": 10, "notional": 12.3, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+            mid_price=1.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=None,
+            min_mid_price_for_buys=None,
+            external_short_pause=True,
+            external_short_pause_reasons=["market_bias_strong_short_pause regime=strong score=+0.24 >= +0.15"],
+        )
+
+        self.assertFalse(result["long_paused"])
+        self.assertTrue(result["short_paused"])
+        self.assertEqual(result["short_pause_reasons"], ["market_bias_strong_short_pause regime=strong score=+0.24 >= +0.15"])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
 
     def test_apply_hedge_position_notional_caps_trim_long_and_short_entries(self) -> None:
         plan = {
@@ -1388,6 +1508,151 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(effective.max_position_notional, 420.0)
         self.assertGreaterEqual(effective.step_price, 0.0004)
 
+    def test_resolve_market_bias_offsets_pushes_sell_side_closer_in_weak_market(self) -> None:
+        report = resolve_market_bias_offsets(
+            enabled=True,
+            center_price=1.0,
+            mid_price=0.99,
+            step_price=0.01,
+            market_guard_return_ratio=-0.008,
+            max_shift_steps=0.75,
+            signal_steps=2.0,
+            drift_weight=0.65,
+            return_weight=0.35,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["regime"], "weak")
+        self.assertGreater(report["buy_offset_steps"], 0.0)
+        self.assertLess(report["sell_offset_steps"], 0.0)
+
+    def test_resolve_market_bias_offsets_pushes_buy_side_closer_in_strong_market(self) -> None:
+        report = resolve_market_bias_offsets(
+            enabled=True,
+            center_price=1.0,
+            mid_price=1.01,
+            step_price=0.01,
+            market_guard_return_ratio=0.008,
+            max_shift_steps=0.75,
+            signal_steps=2.0,
+            drift_weight=0.65,
+            return_weight=0.35,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["regime"], "strong")
+        self.assertLess(report["buy_offset_steps"], 0.0)
+        self.assertGreater(report["sell_offset_steps"], 0.0)
+
+    def test_resolve_market_bias_entry_pause_activates_in_weak_market(self) -> None:
+        report = resolve_market_bias_entry_pause(
+            buy_pause_enabled=True,
+            short_pause_enabled=True,
+            market_bias={"regime": "weak", "bias_score": -0.23},
+            weak_buy_pause_threshold=0.15,
+            strong_short_pause_threshold=0.15,
+        )
+
+        self.assertTrue(report["buy_pause_active"])
+        self.assertEqual(report["buy_pause_threshold"], 0.15)
+        self.assertEqual(len(report["buy_pause_reasons"]), 1)
+        self.assertFalse(report["short_pause_active"])
+
+    def test_resolve_market_bias_entry_pause_stays_inactive_above_threshold(self) -> None:
+        report = resolve_market_bias_entry_pause(
+            buy_pause_enabled=True,
+            short_pause_enabled=True,
+            market_bias={"regime": "weak", "bias_score": -0.12},
+            weak_buy_pause_threshold=0.15,
+            strong_short_pause_threshold=0.15,
+        )
+
+        self.assertFalse(report["buy_pause_active"])
+        self.assertEqual(report["buy_pause_reasons"], [])
+        self.assertFalse(report["short_pause_active"])
+
+    def test_resolve_market_bias_entry_pause_activates_short_pause_in_strong_market(self) -> None:
+        report = resolve_market_bias_entry_pause(
+            buy_pause_enabled=True,
+            short_pause_enabled=True,
+            market_bias={"regime": "strong", "bias_score": 0.27},
+            weak_buy_pause_threshold=0.15,
+            strong_short_pause_threshold=0.15,
+        )
+
+        self.assertFalse(report["buy_pause_active"])
+        self.assertTrue(report["short_pause_active"])
+        self.assertEqual(report["short_pause_threshold"], 0.15)
+        self.assertEqual(len(report["short_pause_reasons"]), 1)
+
+    def test_resolve_market_bias_entry_pause_keeps_buy_side_off_when_only_short_pause_enabled(self) -> None:
+        report = resolve_market_bias_entry_pause(
+            buy_pause_enabled=False,
+            short_pause_enabled=True,
+            market_bias={"regime": "weak", "bias_score": -0.30},
+            weak_buy_pause_threshold=0.15,
+            strong_short_pause_threshold=0.15,
+        )
+
+        self.assertFalse(report["buy_pause_active"])
+        self.assertFalse(report["short_pause_active"])
+
+    def test_resolve_market_bias_regime_switch_requires_confirm_cycles(self) -> None:
+        state: dict[str, object] = {}
+        first = resolve_market_bias_regime_switch(
+            state=state,
+            enabled=True,
+            requested_strategy_mode="synthetic_neutral",
+            market_bias={"regime": "weak", "bias_score": -0.28},
+            weak_threshold=0.15,
+            strong_threshold=0.15,
+            confirm_cycles=2,
+            now=datetime(2026, 4, 4, 4, 0, tzinfo=timezone.utc),
+        )
+        self.assertEqual(first["active_mode"], "synthetic_neutral")
+        self.assertEqual(first["candidate_mode"], "one_way_short")
+        self.assertEqual(first["pending_count"], 1)
+
+        second = resolve_market_bias_regime_switch(
+            state=state,
+            enabled=True,
+            requested_strategy_mode="synthetic_neutral",
+            market_bias={"regime": "weak", "bias_score": -0.31},
+            weak_threshold=0.15,
+            strong_threshold=0.15,
+            confirm_cycles=2,
+            now=datetime(2026, 4, 4, 4, 5, tzinfo=timezone.utc),
+        )
+        self.assertEqual(second["active_mode"], "one_way_short")
+        self.assertTrue(second["switched"])
+
+        third = resolve_market_bias_regime_switch(
+            state=state,
+            enabled=True,
+            requested_strategy_mode="synthetic_neutral",
+            market_bias={"regime": "neutral", "bias_score": 0.02},
+            weak_threshold=0.15,
+            strong_threshold=0.15,
+            confirm_cycles=2,
+            now=datetime(2026, 4, 4, 4, 10, tzinfo=timezone.utc),
+        )
+        self.assertEqual(third["active_mode"], "one_way_short")
+        self.assertEqual(third["candidate_mode"], "synthetic_neutral")
+        self.assertEqual(third["pending_count"], 1)
+
+        fourth = resolve_market_bias_regime_switch(
+            state=state,
+            enabled=True,
+            requested_strategy_mode="synthetic_neutral",
+            market_bias={"regime": "neutral", "bias_score": 0.01},
+            weak_threshold=0.15,
+            strong_threshold=0.15,
+            confirm_cycles=2,
+            now=datetime(2026, 4, 4, 4, 15, tzinfo=timezone.utc),
+        )
+        self.assertEqual(fourth["active_mode"], "synthetic_neutral")
+        self.assertTrue(fourth["switched"])
+
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     def test_assess_xaut_adaptive_regime_prefers_reduce_only_for_long_extreme_drop(self, mock_fetch_futures_klines) -> None:
         now = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
@@ -1610,27 +1875,112 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(effective.max_position_notional, 260.0)
         self.assertEqual(effective.step_price, 12.0)
 
+    def test_build_xaut_adaptive_runner_args_scales_step_down_in_calm_regime(self) -> None:
+        args = Namespace(
+            strategy_profile="xaut_long_adaptive_v1",
+            strategy_mode="one_way_long",
+            symbol="XAUTUSDT",
+            step_price=7.5,
+            buy_levels=6,
+            sell_levels=10,
+            per_order_notional=80.0,
+            base_position_notional=320.0,
+            up_trigger_steps=5,
+            down_trigger_steps=4,
+            shift_steps=3,
+            pause_buy_position_notional=520.0,
+            max_position_notional=680.0,
+            buy_pause_amp_trigger_ratio=0.0060,
+            buy_pause_down_return_trigger_ratio=-0.0045,
+            freeze_shift_abs_return_trigger_ratio=0.0048,
+            inventory_tier_start_notional=420.0,
+            inventory_tier_end_notional=520.0,
+            inventory_tier_buy_levels=3,
+            inventory_tier_sell_levels=12,
+            inventory_tier_per_order_notional=70.0,
+            inventory_tier_base_position_notional=160.0,
+        )
+
+        effective = build_xaut_adaptive_runner_args(
+            args=args,
+            active_state="normal",
+            regime_metrics={
+                "window_15m": {"amplitude_ratio": 0.00022},
+                "window_60m": {"amplitude_ratio": 0.00086},
+            },
+            bid_price=4629.37,
+            ask_price=4629.38,
+            mid_price=4629.38,
+            tick_size=0.01,
+        )
+
+        self.assertLess(effective.step_price, 7.5)
+        self.assertAlmostEqual(effective.step_price, 2.86, places=2)
+
+    def test_build_xaut_adaptive_runner_args_scales_step_up_gradually_before_reduce_only(self) -> None:
+        args = Namespace(
+            strategy_profile="xaut_long_adaptive_v1",
+            strategy_mode="one_way_long",
+            symbol="XAUTUSDT",
+            step_price=7.5,
+            buy_levels=6,
+            sell_levels=10,
+            per_order_notional=80.0,
+            base_position_notional=320.0,
+            up_trigger_steps=5,
+            down_trigger_steps=4,
+            shift_steps=3,
+            pause_buy_position_notional=520.0,
+            max_position_notional=680.0,
+            buy_pause_amp_trigger_ratio=0.0060,
+            buy_pause_down_return_trigger_ratio=-0.0045,
+            freeze_shift_abs_return_trigger_ratio=0.0048,
+            inventory_tier_start_notional=420.0,
+            inventory_tier_end_notional=520.0,
+            inventory_tier_buy_levels=3,
+            inventory_tier_sell_levels=12,
+            inventory_tier_per_order_notional=70.0,
+            inventory_tier_base_position_notional=160.0,
+        )
+
+        effective = build_xaut_adaptive_runner_args(
+            args=args,
+            active_state="defensive",
+            regime_metrics={
+                "window_15m": {"amplitude_ratio": 0.0050},
+                "window_60m": {"amplitude_ratio": 0.0100},
+            },
+            bid_price=4629.30,
+            ask_price=4629.40,
+            mid_price=4629.35,
+            tick_size=0.01,
+        )
+
+        self.assertGreater(effective.step_price, 7.5)
+        self.assertLess(effective.step_price, 12.0)
+        self.assertAlmostEqual(effective.step_price, 8.83, places=2)
+
     def test_build_xaut_adaptive_runner_args_applies_short_normal_profile(self) -> None:
         args = Namespace(
             strategy_profile="xaut_short_adaptive_v1",
             strategy_mode="one_way_short",
             symbol="XAUTUSDT",
-            step_price=7.5,
+            step_price=7.4,
             buy_levels=10,
             sell_levels=6,
-            per_order_notional=80.0,
-            base_position_notional=320.0,
+            per_order_notional=60.0,
+            base_position_notional=220.0,
             up_trigger_steps=4,
             down_trigger_steps=5,
             shift_steps=3,
-            pause_short_position_notional=520.0,
-            max_short_position_notional=680.0,
-            inventory_tier_start_notional=420.0,
+            pause_short_position_notional=620.0,
+            max_short_position_notional=720.0,
+            inventory_tier_start_notional=320.0,
             inventory_tier_end_notional=520.0,
-            inventory_tier_buy_levels=12,
+            inventory_tier_buy_levels=14,
             inventory_tier_sell_levels=3,
-            inventory_tier_per_order_notional=70.0,
-            inventory_tier_base_position_notional=160.0,
+            inventory_tier_per_order_notional=45.0,
+            inventory_tier_base_position_notional=100.0,
             short_cover_pause_amp_trigger_ratio=0.0060,
             short_cover_pause_down_return_trigger_ratio=-0.0045,
         )
@@ -1657,22 +2007,22 @@ class LoopRunnerTests(unittest.TestCase):
             strategy_profile="xaut_short_adaptive_v1",
             strategy_mode="one_way_short",
             symbol="XAUTUSDT",
-            step_price=8.5,
+            step_price=7.4,
             buy_levels=10,
             sell_levels=6,
-            per_order_notional=80.0,
-            base_position_notional=280.0,
+            per_order_notional=60.0,
+            base_position_notional=220.0,
             up_trigger_steps=4,
             down_trigger_steps=5,
             shift_steps=3,
-            pause_short_position_notional=560.0,
-            max_short_position_notional=620.0,
-            inventory_tier_start_notional=360.0,
-            inventory_tier_end_notional=450.0,
+            pause_short_position_notional=620.0,
+            max_short_position_notional=720.0,
+            inventory_tier_start_notional=320.0,
+            inventory_tier_end_notional=520.0,
             inventory_tier_buy_levels=14,
-            inventory_tier_sell_levels=2,
-            inventory_tier_per_order_notional=65.0,
-            inventory_tier_base_position_notional=120.0,
+            inventory_tier_sell_levels=3,
+            inventory_tier_per_order_notional=45.0,
+            inventory_tier_base_position_notional=100.0,
             short_cover_pause_amp_trigger_ratio=0.0060,
             short_cover_pause_down_return_trigger_ratio=-0.0045,
         )

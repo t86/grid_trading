@@ -42,6 +42,8 @@ class RuntimeGuardConfig:
     run_end_time: datetime | None
     rolling_hourly_loss_limit: float | None
     max_cumulative_notional: float | None
+    max_actual_net_notional: float | None
+    max_synthetic_drift_notional: float | None
 
 
 @dataclass(frozen=True)
@@ -54,6 +56,8 @@ class RuntimeGuardResult:
     triggered_at: str | None
     rolling_hourly_loss: float
     cumulative_gross_notional: float
+    actual_net_notional_abs: float
+    synthetic_drift_notional: float
 
 
 def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
@@ -68,6 +72,14 @@ def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
             raw.get("max_cumulative_notional"),
             "max_cumulative_notional",
         ),
+        max_actual_net_notional=_parse_positive_float(
+            raw.get("max_actual_net_notional"),
+            "max_actual_net_notional",
+        ),
+        max_synthetic_drift_notional=_parse_positive_float(
+            raw.get("max_synthetic_drift_notional"),
+            "max_synthetic_drift_notional",
+        ),
     )
     if config.run_start_time and config.run_end_time and config.run_start_time >= config.run_end_time:
         raise ValueError("run_start_time must be earlier than run_end_time")
@@ -81,6 +93,8 @@ def normalize_runtime_guard_payload(raw: dict[str, Any]) -> dict[str, Any]:
         "run_end_time": config.run_end_time.isoformat() if config.run_end_time else None,
         "rolling_hourly_loss_limit": config.rolling_hourly_loss_limit,
         "max_cumulative_notional": config.max_cumulative_notional,
+        "max_actual_net_notional": config.max_actual_net_notional,
+        "max_synthetic_drift_notional": config.max_synthetic_drift_notional,
     }
 
 
@@ -90,9 +104,13 @@ def evaluate_runtime_guards(
     now: datetime,
     cumulative_gross_notional: float,
     pnl_events: list[dict[str, Any]],
+    actual_net_notional: float | None = None,
+    synthetic_drift_notional: float | None = None,
 ) -> RuntimeGuardResult:
     current = now.astimezone(timezone.utc)
     reasons: list[str] = []
+    actual_net_notional_abs = abs(float(actual_net_notional or 0.0))
+    safe_synthetic_drift_notional = max(float(synthetic_drift_notional or 0.0), 0.0)
 
     window_start = current - timedelta(minutes=60)
     window_net_pnl = 0.0
@@ -113,6 +131,8 @@ def evaluate_runtime_guards(
             triggered_at=None,
             rolling_hourly_loss=rolling_loss,
             cumulative_gross_notional=float(cumulative_gross_notional),
+            actual_net_notional_abs=actual_net_notional_abs,
+            synthetic_drift_notional=safe_synthetic_drift_notional,
         )
 
     if config.run_end_time and current >= config.run_end_time:
@@ -121,6 +141,13 @@ def evaluate_runtime_guards(
         reasons.append("rolling_hourly_loss_limit_hit")
     if config.max_cumulative_notional is not None and float(cumulative_gross_notional) >= config.max_cumulative_notional:
         reasons.append("max_cumulative_notional_hit")
+    if config.max_actual_net_notional is not None and actual_net_notional_abs >= config.max_actual_net_notional:
+        reasons.append("max_actual_net_notional_hit")
+    if (
+        config.max_synthetic_drift_notional is not None
+        and safe_synthetic_drift_notional >= config.max_synthetic_drift_notional
+    ):
+        reasons.append("max_synthetic_drift_notional_hit")
 
     return RuntimeGuardResult(
         tradable=not reasons,
@@ -131,4 +158,6 @@ def evaluate_runtime_guards(
         triggered_at=current.isoformat() if reasons else None,
         rolling_hourly_loss=rolling_loss,
         cumulative_gross_notional=float(cumulative_gross_notional),
+        actual_net_notional_abs=actual_net_notional_abs,
+        synthetic_drift_notional=safe_synthetic_drift_notional,
     )
