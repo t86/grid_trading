@@ -870,10 +870,81 @@ class WebSecurityTests(unittest.TestCase):
             )
             events_path.write_text("", encoding="utf-8")
 
-            gross, pnl_events = _runtime_guard_input_summary(events_path)
+            gross, pnl_events, stats_start_time = _runtime_guard_input_summary(events_path)
 
             self.assertAlmostEqual(gross, 25.0, places=8)
             self.assertEqual(len(pnl_events), 2)
+            self.assertIsNone(stats_start_time)
+
+    @patch("grid_optimizer.runtime_guards.resolve_active_competition_board")
+    def test_runtime_guard_input_summary_uses_active_competition_phase_start(
+        self,
+        mock_board,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "bardusdt_loop_events.jsonl"
+            phase_start = datetime(2026, 4, 5, 1, 0, tzinfo=timezone.utc)
+            before_phase_ms = int(datetime(2026, 4, 5, 0, 30, tzinfo=timezone.utc).timestamp() * 1000)
+            after_phase_ms = int(datetime(2026, 4, 5, 1, 30, tzinfo=timezone.utc).timestamp() * 1000)
+            (root / "bardusdt_loop_trade_audit.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "price": "10",
+                                "qty": "10",
+                                "time": before_phase_ms,
+                                "realizedPnl": "1",
+                                "commission": "0.1",
+                                "commissionAsset": "USDT",
+                            },
+                            ensure_ascii=False,
+                        ),
+                        json.dumps(
+                            {
+                                "price": "20",
+                                "qty": "5",
+                                "time": after_phase_ms,
+                                "realizedPnl": "2",
+                                "commission": "0.2",
+                                "commissionAsset": "USDT",
+                            },
+                            ensure_ascii=False,
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "bardusdt_loop_income_audit.jsonl").write_text(
+                json.dumps(
+                    {
+                        "time": after_phase_ms,
+                        "income": "0.8",
+                    },
+                    ensure_ascii=False,
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            events_path.write_text("", encoding="utf-8")
+            mock_board.return_value = {
+                "symbol": "BARD",
+                "market": "futures",
+                "activity_start_at": phase_start.isoformat(),
+                "activity_end_at": datetime(2026, 4, 15, 1, 0, tzinfo=timezone.utc).isoformat(),
+            }
+
+            gross, pnl_events, stats_start_time = _runtime_guard_input_summary(
+                events_path,
+                symbol="BARDUSDT",
+                now=datetime(2026, 4, 5, 2, 0, tzinfo=timezone.utc),
+            )
+
+            self.assertAlmostEqual(gross, 100.0, places=8)
+            self.assertEqual(len(pnl_events), 2)
+            self.assertEqual(stats_start_time, phase_start)
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")

@@ -53,7 +53,7 @@ from .maker_flatten_runner import (
     is_flatten_order,
     load_live_flatten_snapshot,
 )
-from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config
+from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config, summarize_futures_runtime_guard_inputs
 from .semi_auto_plan import (
     STATE_VERSION,
     _isoformat,
@@ -1396,41 +1396,13 @@ def _start_futures_flatten_process(symbol: str) -> dict[str, Any]:
     return {"started": True, "already_running": False, "pid": proc.pid}
 
 
-def _load_futures_runtime_guard_inputs(summary_path: Path) -> tuple[float, list[dict[str, Any]]]:
-    audit_paths = build_audit_paths(summary_path)
-    trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
-    income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
-    cumulative_gross_notional = 0.0
-    pnl_events: list[dict[str, Any]] = []
-    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
-    for row in trade_rows:
-        price = _safe_float(row.get("price"))
-        qty = abs(_safe_float(row.get("qty")))
-        cumulative_gross_notional += price * qty
-        trade_time_ms = trade_row_time_ms(row)
-        if trade_time_ms <= 0:
-            continue
-        realized_pnl = _safe_float(row.get("realizedPnl"))
-        commission = _safe_float(row.get("commission"))
-        commission_asset = str(row.get("commissionAsset", "")).upper().strip()
-        net_pnl = realized_pnl - (commission if commission_asset in stable_assets else 0.0)
-        pnl_events.append(
-            {
-                "ts": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
-                "net_pnl": net_pnl,
-            }
-        )
-    for row in income_rows:
-        income_time_ms = income_row_time_ms(row)
-        if income_time_ms <= 0:
-            continue
-        pnl_events.append(
-            {
-                "ts": datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc).isoformat(),
-                "net_pnl": _safe_float(row.get("income")),
-            }
-        )
-    return cumulative_gross_notional, pnl_events
+def _load_futures_runtime_guard_inputs(
+    summary_path: Path,
+    *,
+    symbol: str,
+    now: datetime | None = None,
+) -> tuple[float, list[dict[str, Any]], datetime | None]:
+    return summarize_futures_runtime_guard_inputs(summary_path, symbol=symbol, now=now)
 
 
 def _cancel_futures_strategy_orders(
@@ -1608,6 +1580,7 @@ def _build_runtime_guard_stop_summary(
         "stop_triggered_at": runtime_guard_result.triggered_at,
         "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
         "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
+        "runtime_guard_stats_start_time": stats_start_time.isoformat() if stats_start_time else None,
         "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
         "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
@@ -1636,7 +1609,11 @@ def _maybe_handle_runtime_guard(
         )
     ):
         return None
-    cumulative_gross_notional, pnl_events = _load_futures_runtime_guard_inputs(summary_path)
+    cumulative_gross_notional, pnl_events, stats_start_time = _load_futures_runtime_guard_inputs(
+        summary_path,
+        symbol=args.symbol.upper().strip(),
+        now=cycle_started_at,
+    )
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=cycle_started_at,
@@ -4903,7 +4880,11 @@ def main() -> None:
             state["last_reconcile"] = reconcile_snapshot
             _write_json(state_path, state)
             runtime_guard_config = normalize_runtime_guard_config(vars(args))
-            runtime_cumulative_gross_notional, runtime_pnl_events = _load_futures_runtime_guard_inputs(summary_path)
+            runtime_cumulative_gross_notional, runtime_pnl_events, runtime_stats_start_time = _load_futures_runtime_guard_inputs(
+                summary_path,
+                symbol=args.symbol.upper().strip(),
+                now=cycle_started_at,
+            )
             runtime_guard_result = evaluate_runtime_guards(
                 config=runtime_guard_config,
                 now=cycle_started_at,
@@ -5051,6 +5032,7 @@ def main() -> None:
                 "stop_triggered_at": runtime_guard_result.triggered_at,
                 "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
                 "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
+                "runtime_guard_stats_start_time": runtime_stats_start_time.isoformat() if runtime_stats_start_time else None,
                 "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
                 "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
                 "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,

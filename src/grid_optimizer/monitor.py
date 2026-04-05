@@ -1715,6 +1715,7 @@ def _build_monitor_snapshot_uncached(
         "stop_triggered_at": latest_loop.get("stop_triggered_at"),
         "run_start_time": runner_config.get("run_start_time"),
         "run_end_time": runner_config.get("run_end_time"),
+        "runtime_guard_stats_start_time": latest_loop.get("runtime_guard_stats_start_time"),
         "rolling_hourly_loss": _safe_float(latest_loop.get("rolling_hourly_loss")),
         "rolling_hourly_loss_limit": _safe_float(runner_config.get("rolling_hourly_loss_limit")),
         "cumulative_gross_notional": _safe_float(latest_loop.get("cumulative_gross_notional")),

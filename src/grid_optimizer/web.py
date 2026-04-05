@@ -26,7 +26,7 @@ from statistics import mean
 from typing import Any, Union
 from urllib.parse import parse_qs, urlparse
 
-from .audit import build_audit_paths, income_row_time_ms, read_jsonl, trade_row_time_ms
+from .audit import build_audit_paths
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -107,6 +107,7 @@ from .runtime_guards import (
     evaluate_runtime_guards,
     normalize_runtime_guard_config,
     normalize_runtime_guard_payload,
+    summarize_futures_runtime_guard_inputs,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
@@ -2339,51 +2340,13 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
     return _autotune_runner_symbol_config(resolved)
 
 
-def _runtime_guard_input_summary(summary_path: Path) -> tuple[float, list[dict[str, Any]]]:
-    audit_paths = build_audit_paths(summary_path)
-    trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
-    income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
-
-    cumulative_gross_notional = 0.0
-    pnl_events: list[dict[str, Any]] = []
-    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
-
-    def _as_float(value: Any) -> float:
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            return 0.0
-
-    for row in trade_rows:
-        price = _as_float(row.get("price"))
-        qty = abs(_as_float(row.get("qty")))
-        cumulative_gross_notional += price * qty
-        trade_time_ms = trade_row_time_ms(row)
-        if trade_time_ms <= 0:
-            continue
-        realized_pnl = _as_float(row.get("realizedPnl"))
-        commission = _as_float(row.get("commission"))
-        commission_asset = str(row.get("commissionAsset", "")).upper().strip()
-        net_pnl = realized_pnl - (commission if commission_asset in stable_assets else 0.0)
-        pnl_events.append(
-            {
-                "ts": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
-                "net_pnl": net_pnl,
-            }
-        )
-
-    for row in income_rows:
-        income_time_ms = income_row_time_ms(row)
-        if income_time_ms <= 0:
-            continue
-        pnl_events.append(
-            {
-                "ts": datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc).isoformat(),
-                "net_pnl": _as_float(row.get("income")),
-            }
-        )
-
-    return cumulative_gross_notional, pnl_events
+def _runtime_guard_input_summary(
+    summary_path: Path,
+    *,
+    symbol: str | None = None,
+    now: datetime | None = None,
+) -> tuple[float, list[dict[str, Any]], datetime | None]:
+    return summarize_futures_runtime_guard_inputs(summary_path, symbol=symbol, now=now)
 
 
 def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
@@ -2405,10 +2368,16 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
         return
 
     summary_path = Path(summary_text)
-    cumulative_gross_notional, pnl_events = _runtime_guard_input_summary(summary_path)
+    current = datetime.now(timezone.utc)
+    symbol = str(config.get("symbol", "")).upper().strip()
+    cumulative_gross_notional, pnl_events, stats_start_time = _runtime_guard_input_summary(
+        summary_path,
+        symbol=symbol,
+        now=current,
+    )
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
-        now=datetime.now(timezone.utc),
+        now=current,
         cumulative_gross_notional=cumulative_gross_notional,
         pnl_events=pnl_events,
     )
@@ -2427,7 +2396,7 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
         )
     if "max_cumulative_notional_hit" in reasons and runtime_guard_config.max_cumulative_notional is not None:
         detail_lines.append(
-            "累计成交额 "
+            f"累计成交额{f'（自 {stats_start_time.isoformat()} 起）' if stats_start_time else ''} "
             f"{runtime_guard_result.cumulative_gross_notional:.4f} >= 阈值 {runtime_guard_config.max_cumulative_notional:.4f}"
         )
     if "max_actual_net_notional_hit" in reasons and runtime_guard_config.max_actual_net_notional is not None:
@@ -2445,6 +2414,8 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
         )
     if not detail_lines:
         detail_lines.append(f"stop_reason={runtime_guard_result.primary_reason}")
+    if stats_start_time is not None:
+        detail_lines.append(f"风控统计起点 {stats_start_time.isoformat()}")
 
     raise ValueError(
         "启动前风控预检已拦截："
@@ -12318,6 +12289,7 @@ MONITOR_PAGE = """<!doctype html>
         isNeutralMode ? `计划多/空: ${fmtNum(risk.planned_buy_notional, 4)} / ${fmtNum(risk.planned_short_notional, 4)}` : (isOneWayShort ? `计划卖空: ${fmtNum(risk.planned_short_notional, 4)}` : `计划买单: ${fmtNum(risk.planned_buy_notional, 4)}`),
         isNeutralMode ? `多/空预算: ${fmtNum(risk.buy_budget_notional, 4)} / ${fmtNum(risk.short_budget_notional, 4)}` : (isOneWayShort ? `卖空预算: ${fmtNum(risk.short_budget_notional, 4)}` : `买单预算: ${fmtNum(risk.buy_budget_notional, 4)}`),
         `运行状态: ${risk.runtime_status || "--"}`,
+        `风控统计起点: ${fmtTs(risk.runtime_guard_stats_start_time || competitionWindow.stats_start_at || risk.run_start_time)}`,
         `滚动亏损: ${fmtNum(risk.rolling_hourly_loss || 0, 4)} / ${fmtNum(risk.rolling_hourly_loss_limit || 0, 4)}`,
         `累计成交额: ${fmtNum(risk.cumulative_gross_notional || 0, 4)} / ${fmtNum(risk.max_cumulative_notional || 0, 4)}`,
         volumeTrigger.enabled
@@ -12494,6 +12466,7 @@ MONITOR_PAGE = """<!doctype html>
         ["运行状态", risk.runtime_status || "--"],
         ["起始时间", risk.run_start_time ? fmtTs(risk.run_start_time) : "--"],
         ["结束时间", risk.run_end_time ? fmtTs(risk.run_end_time) : "--"],
+        ["风控统计起点", risk.runtime_guard_stats_start_time ? fmtTs(risk.runtime_guard_stats_start_time) : "--"],
         ["滚动亏损", fmtNum(risk.rolling_hourly_loss, 4)],
         ["滚动亏损阈值", fmtNum(risk.rolling_hourly_loss_limit, 4)],
         ["累计成交额", fmtNum(risk.cumulative_gross_notional, 4)],

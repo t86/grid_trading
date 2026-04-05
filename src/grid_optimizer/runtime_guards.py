@@ -2,7 +2,11 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any
+
+from .audit import build_audit_paths, income_row_time_ms, read_jsonl, trade_row_time_ms
+from .competition_board import resolve_active_competition_board
 
 
 def _parse_datetime(value: Any, field_name: str) -> datetime | None:
@@ -58,6 +62,89 @@ class RuntimeGuardResult:
     cumulative_gross_notional: float
     actual_net_notional_abs: float
     synthetic_drift_notional: float
+
+
+def resolve_runtime_guard_stats_start_time(
+    *,
+    symbol: str | None = None,
+    market: str = "futures",
+    now: datetime | None = None,
+) -> datetime | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_market = str(market or "").strip().lower()
+    if not normalized_symbol or not normalized_market:
+        return None
+    try:
+        board = resolve_active_competition_board(normalized_symbol, normalized_market, now=now)
+    except Exception:
+        return None
+    if not isinstance(board, dict):
+        return None
+    try:
+        return _parse_datetime(board.get("activity_start_at"), "activity_start_at")
+    except ValueError:
+        return None
+
+
+def summarize_futures_runtime_guard_inputs(
+    summary_path: Path,
+    *,
+    symbol: str | None = None,
+    now: datetime | None = None,
+) -> tuple[float, list[dict[str, Any]], datetime | None]:
+    audit_paths = build_audit_paths(summary_path)
+    trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
+    income_rows = read_jsonl(audit_paths["income_audit"], limit=0)
+    metrics_start_time = resolve_runtime_guard_stats_start_time(symbol=symbol, market="futures", now=now)
+    cumulative_gross_notional = 0.0
+    pnl_events: list[dict[str, Any]] = []
+    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for row in trade_rows:
+        trade_time_ms = trade_row_time_ms(row)
+        trade_ts: datetime | None = None
+        if trade_time_ms > 0:
+            trade_ts = datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc)
+        if metrics_start_time is not None:
+            if trade_ts is None or trade_ts < metrics_start_time:
+                continue
+        price = _as_float(row.get("price"))
+        qty = abs(_as_float(row.get("qty")))
+        cumulative_gross_notional += price * qty
+        if trade_ts is None:
+            continue
+        realized_pnl = _as_float(row.get("realizedPnl"))
+        commission = _as_float(row.get("commission"))
+        commission_asset = str(row.get("commissionAsset", "")).upper().strip()
+        net_pnl = realized_pnl - (commission if commission_asset in stable_assets else 0.0)
+        pnl_events.append(
+            {
+                "ts": trade_ts.isoformat(),
+                "net_pnl": net_pnl,
+            }
+        )
+
+    for row in income_rows:
+        income_time_ms = income_row_time_ms(row)
+        if income_time_ms <= 0:
+            continue
+        income_ts = datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc)
+        if metrics_start_time is not None and income_ts < metrics_start_time:
+            continue
+        pnl_events.append(
+            {
+                "ts": income_ts.isoformat(),
+                "net_pnl": _as_float(row.get("income")),
+            }
+        )
+
+    return cumulative_gross_notional, pnl_events, metrics_start_time
 
 
 def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
