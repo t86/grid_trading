@@ -46,6 +46,7 @@ from .data import (
     delete_spot_order,
     fetch_futures_account_info_v3,
     fetch_futures_quote_volume_sum,
+    fetch_futures_window_price_stats,
     fetch_futures_open_orders,
     fetch_futures_position_mode,
     fetch_spot_account_info,
@@ -138,6 +139,8 @@ BORROW_LOOKUP_CACHE: dict[str, dict[str, Any]] = {}
 BORROW_LOOKUP_CACHE_LOCK = threading.Lock()
 VOLUME_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
 VOLUME_TRIGGER_STATUS_LOCK = threading.Lock()
+VOLATILITY_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
+VOLATILITY_TRIGGER_STATUS_LOCK = threading.Lock()
 FUNDING_MARGIN_RATIO = 0.5
 GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
@@ -154,6 +157,8 @@ VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
 }
 DEFAULT_VOLUME_TRIGGER_WINDOW = "1h"
 VOLUME_TRIGGER_POLL_SECONDS = 20.0
+DEFAULT_VOLATILITY_TRIGGER_WINDOW = "1h"
+VOLATILITY_TRIGGER_POLL_SECONDS = 20.0
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     "volume_long_v4": {
         "label": "量优先做多 v4",
@@ -937,6 +942,12 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volume_trigger_stop_threshold": None,
     "volume_trigger_stop_cancel_open_orders": True,
     "volume_trigger_stop_close_all_positions": False,
+    "volatility_trigger_enabled": True,
+    "volatility_trigger_window": DEFAULT_VOLATILITY_TRIGGER_WINDOW,
+    "volatility_trigger_amplitude_ratio": 0.04,
+    "volatility_trigger_abs_return_ratio": 0.02,
+    "volatility_trigger_stop_cancel_open_orders": True,
+    "volatility_trigger_stop_close_all_positions": True,
     "sleep_seconds": 15.0,
     "cancel_stale": True,
     "apply": True,
@@ -1067,6 +1078,11 @@ def _normalize_volume_trigger_window(value: Any) -> str:
     return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLUME_TRIGGER_WINDOW
 
 
+def _normalize_volatility_trigger_window(value: Any) -> str:
+    text = str(value or DEFAULT_VOLATILITY_TRIGGER_WINDOW).strip().lower()
+    return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLATILITY_TRIGGER_WINDOW
+
+
 def _normalize_runner_volume_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(config)
     normalized["volume_trigger_enabled"] = bool(normalized.get("volume_trigger_enabled", False))
@@ -1098,6 +1114,38 @@ def _normalize_runner_volume_trigger_config(config: dict[str, Any]) -> dict[str,
         stop_threshold = normalized.get("volume_trigger_stop_threshold")
         if start_threshold is not None and stop_threshold is not None and stop_threshold > start_threshold:
             raise ValueError("volume trigger stop threshold cannot exceed start threshold")
+    return normalized
+
+
+def _normalize_runner_volatility_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    normalized["volatility_trigger_enabled"] = bool(normalized.get("volatility_trigger_enabled", True))
+    normalized["volatility_trigger_window"] = _normalize_volatility_trigger_window(
+        normalized.get("volatility_trigger_window")
+    )
+    for key in {"volatility_trigger_amplitude_ratio", "volatility_trigger_abs_return_ratio"}:
+        value = normalized.get(key)
+        if value in {"", None}:
+            normalized[key] = None
+            continue
+        threshold = float(value)
+        if threshold <= 0:
+            raise ValueError(f"{key} must be > 0")
+        normalized[key] = threshold
+    normalized["volatility_trigger_stop_cancel_open_orders"] = bool(
+        normalized.get("volatility_trigger_stop_cancel_open_orders", True)
+    )
+    normalized["volatility_trigger_stop_close_all_positions"] = bool(
+        normalized.get("volatility_trigger_stop_close_all_positions", True)
+    )
+    if normalized["volatility_trigger_stop_close_all_positions"]:
+        normalized["volatility_trigger_stop_cancel_open_orders"] = True
+    if normalized["volatility_trigger_enabled"]:
+        if (
+            normalized.get("volatility_trigger_amplitude_ratio") is None
+            and normalized.get("volatility_trigger_abs_return_ratio") is None
+        ):
+            raise ValueError("volatility trigger enabled requires at least one threshold")
     return normalized
 
 
@@ -1159,7 +1207,7 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     if runner.get("config"):
         config.update(runner["config"])
     config = _normalize_runner_runtime_paths(config, normalized_symbol)
-    return _normalize_runner_volume_trigger_config(config)
+    return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -1228,6 +1276,10 @@ def _iter_saved_runner_control_configs() -> list[dict[str, Any]]:
     return configs
 
 
+def _volatility_trigger_status_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_volatility_trigger_status.json")
+
+
 def _resolve_runner_volume_trigger_action(
     config: dict[str, Any],
     *,
@@ -1278,6 +1330,164 @@ def _runner_volume_trigger_status(symbol: str) -> dict[str, Any] | None:
         return dict(status) if isinstance(status, dict) else None
 
 
+def _update_volatility_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    normalized_payload = dict(payload)
+    status_path = _volatility_trigger_status_path(normalized_symbol)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(normalized_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with VOLATILITY_TRIGGER_STATUS_LOCK:
+        VOLATILITY_TRIGGER_STATUS_CACHE[normalized_symbol] = normalized_payload
+
+
+def _runner_volatility_trigger_status(symbol: str) -> dict[str, Any] | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return None
+    with VOLATILITY_TRIGGER_STATUS_LOCK:
+        cached = VOLATILITY_TRIGGER_STATUS_CACHE.get(normalized_symbol)
+        if isinstance(cached, dict):
+            return dict(cached)
+    payload = _read_json_dict(_volatility_trigger_status_path(normalized_symbol))
+    if isinstance(payload, dict):
+        with VOLATILITY_TRIGGER_STATUS_LOCK:
+            VOLATILITY_TRIGGER_STATUS_CACHE[normalized_symbol] = dict(payload)
+        return dict(payload)
+    return None
+
+
+def _clear_volatility_trigger_status(symbol: str, *, reason: str = "manual_clear") -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    status = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": normalized_symbol,
+        "action": None,
+        "reason": reason,
+        "paused_by_trigger": False,
+        "last_error": None,
+    }
+    _update_volatility_trigger_status(normalized_symbol, status)
+
+
+def _runner_volume_trigger_start_allowed(config: dict[str, Any], *, current_quote_volume: float) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volume_trigger_config(config)
+    if not normalized_config.get("volume_trigger_enabled"):
+        return {"allowed": True, "reason": "disabled"}
+    start_threshold = normalized_config.get("volume_trigger_start_threshold")
+    if start_threshold is None:
+        return {"allowed": True, "reason": "no_start_threshold"}
+    if current_quote_volume >= float(start_threshold):
+        return {
+            "allowed": True,
+            "reason": "volume_above_start_threshold",
+            "threshold": float(start_threshold),
+        }
+    return {
+        "allowed": False,
+        "reason": "volume_below_start_threshold",
+        "threshold": float(start_threshold),
+    }
+
+
+def _evaluate_runner_volatility_trigger_signal(
+    config: dict[str, Any],
+    *,
+    current_amplitude_ratio: float,
+    current_return_ratio: float,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    amplitude_threshold = normalized_config.get("volatility_trigger_amplitude_ratio")
+    abs_return_threshold = normalized_config.get("volatility_trigger_abs_return_ratio")
+    matched_reasons: list[str] = []
+    if amplitude_threshold is not None and float(current_amplitude_ratio) >= float(amplitude_threshold):
+        matched_reasons.append("amplitude_above_threshold")
+    if abs_return_threshold is not None and abs(float(current_return_ratio)) >= float(abs_return_threshold):
+        matched_reasons.append("abs_return_above_threshold")
+    return {
+        "hit": bool(matched_reasons),
+        "matched_reasons": matched_reasons,
+        "amplitude_threshold": amplitude_threshold,
+        "abs_return_threshold": abs_return_threshold,
+    }
+
+
+def _resolve_runner_volatility_trigger_action(
+    config: dict[str, Any],
+    *,
+    current_amplitude_ratio: float,
+    current_return_ratio: float,
+    runner_running: bool,
+    flatten_running: bool,
+    paused_by_trigger: bool,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    if not normalized_config.get("volatility_trigger_enabled"):
+        return {"action": None, "reason": "disabled"}
+
+    signal_summary = _evaluate_runner_volatility_trigger_signal(
+        normalized_config,
+        current_amplitude_ratio=current_amplitude_ratio,
+        current_return_ratio=current_return_ratio,
+    )
+    if flatten_running and not runner_running:
+        return {"action": None, "reason": "flatten_running", **signal_summary}
+    if runner_running:
+        if signal_summary["hit"]:
+            return {
+                "action": "stop",
+                "reason": "volatility_above_threshold",
+                **signal_summary,
+            }
+        return {"action": None, "reason": "runner_running", **signal_summary}
+    if paused_by_trigger:
+        if signal_summary["hit"]:
+            return {"action": None, "reason": "waiting_for_volatility_cooldown", **signal_summary}
+        return {"action": "start", "reason": "volatility_back_within_threshold", **signal_summary}
+    if signal_summary["hit"]:
+        return {"action": None, "reason": "volatility_above_threshold", **signal_summary}
+    return {"action": None, "reason": "runner_stopped", **signal_summary}
+
+
+def _volatility_trigger_start_allowed(config: dict[str, Any]) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    if not normalized_config.get("volatility_trigger_enabled"):
+        return {"allowed": True, "reason": "disabled"}
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    if not symbol:
+        return {"allowed": True, "reason": "missing_symbol"}
+    window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
+    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
+    signal_summary = _evaluate_runner_volatility_trigger_signal(
+        normalized_config,
+        current_amplitude_ratio=float(stats.get("amplitude_ratio") or 0.0),
+        current_return_ratio=float(stats.get("return_ratio") or 0.0),
+    )
+    if signal_summary["hit"]:
+        return {
+            "allowed": False,
+            "reason": "volatility_above_threshold",
+            "window": window_key,
+            "window_minutes": window_minutes,
+            "current_amplitude_ratio": float(stats.get("amplitude_ratio") or 0.0),
+            "current_return_ratio": float(stats.get("return_ratio") or 0.0),
+            **signal_summary,
+        }
+    return {
+        "allowed": True,
+        "reason": "volatility_within_threshold",
+        "window": window_key,
+        "window_minutes": window_minutes,
+        "current_amplitude_ratio": float(stats.get("amplitude_ratio") or 0.0),
+        "current_return_ratio": float(stats.get("return_ratio") or 0.0),
+        **signal_summary,
+    }
+
+
 def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
     normalized_config = _normalize_runner_volume_trigger_config(config)
     symbol = str(normalized_config.get("symbol", "")).upper().strip()
@@ -1312,6 +1522,13 @@ def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
     }
     try:
         if decision.get("action") == "start":
+            volatility_gate = _volatility_trigger_start_allowed(normalized_config)
+            if not volatility_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "blocked_by_volatility_trigger"
+                status["volatility_block"] = volatility_gate
+                _update_volume_trigger_status(symbol, status)
+                return
             result = _start_runner_process(normalized_config)
             status["result"] = {
                 "started": bool(result.get("started")),
@@ -1361,6 +1578,121 @@ def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
                     },
                 )
         stop_event.wait(VOLUME_TRIGGER_POLL_SECONDS)
+
+
+def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    if not symbol or not normalized_config.get("volatility_trigger_enabled"):
+        return
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
+    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    price_stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
+    current_amplitude_ratio = float(price_stats.get("amplitude_ratio") or 0.0)
+    current_return_ratio = float(price_stats.get("return_ratio") or 0.0)
+    runner = _read_runner_process_for_symbol(symbol)
+    flatten = _read_flatten_process_for_symbol(symbol)
+    previous_status = _runner_volatility_trigger_status(symbol) or {}
+    decision = _resolve_runner_volatility_trigger_action(
+        normalized_config,
+        current_amplitude_ratio=current_amplitude_ratio,
+        current_return_ratio=current_return_ratio,
+        runner_running=bool(runner.get("is_running")),
+        flatten_running=bool(flatten.get("is_running")),
+        paused_by_trigger=bool(previous_status.get("paused_by_trigger", False)),
+    )
+    status: dict[str, Any] = {
+        "checked_at": checked_at,
+        "symbol": symbol,
+        "window": window_key,
+        "window_minutes": window_minutes,
+        "current_amplitude_ratio": current_amplitude_ratio,
+        "current_return_ratio": current_return_ratio,
+        "amplitude_ratio": normalized_config.get("volatility_trigger_amplitude_ratio"),
+        "abs_return_ratio": normalized_config.get("volatility_trigger_abs_return_ratio"),
+        "runner_running": bool(runner.get("is_running")),
+        "flatten_running": bool(flatten.get("is_running")),
+        "action": decision.get("action"),
+        "reason": decision.get("reason"),
+        "matched_reasons": decision.get("matched_reasons") or [],
+        "paused_by_trigger": bool(previous_status.get("paused_by_trigger", False)),
+        "last_error": None,
+    }
+    try:
+        if decision.get("action") == "start":
+            volume_gate = {"allowed": True, "reason": "disabled"}
+            if normalized_config.get("volume_trigger_enabled"):
+                volume_window_key = _normalize_volume_trigger_window(normalized_config.get("volume_trigger_window"))
+                volume_window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[volume_window_key]
+                quote_volume = fetch_futures_quote_volume_sum(symbol, window_minutes=volume_window_minutes)
+                volume_gate = {
+                    **_runner_volume_trigger_start_allowed(normalized_config, current_quote_volume=quote_volume),
+                    "window": volume_window_key,
+                    "window_minutes": volume_window_minutes,
+                    "current_quote_volume": quote_volume,
+                }
+            if not volume_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "resume_blocked_by_volume_trigger"
+                status["volume_block"] = volume_gate
+                _update_volatility_trigger_status(symbol, status)
+                return
+            result = _start_runner_process(normalized_config)
+            status["result"] = {
+                "started": bool(result.get("started")),
+                "already_running": bool(result.get("already_running")),
+                "restarted": bool(result.get("restarted")),
+            }
+            status["paused_by_trigger"] = False
+            print(
+                f"[volatility-trigger] {symbol} resume window={window_key} "
+                f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%}"
+            )
+        elif decision.get("action") == "stop":
+            result = _stop_runner_process(
+                symbol,
+                cancel_open_orders=bool(normalized_config.get("volatility_trigger_stop_cancel_open_orders", True)),
+                close_all_positions=bool(normalized_config.get("volatility_trigger_stop_close_all_positions", True)),
+            )
+            status["result"] = {
+                "stopped": bool(result.get("stopped")),
+                "already_stopped": bool(result.get("already_stopped")),
+            }
+            status["paused_by_trigger"] = True
+            print(
+                f"[volatility-trigger] {symbol} stop window={window_key} "
+                f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%}"
+            )
+        elif bool(runner.get("is_running")):
+            status["paused_by_trigger"] = False
+    except Exception as exc:  # pragma: no cover
+        status["last_error"] = f"{type(exc).__name__}: {exc}"
+    _update_volatility_trigger_status(symbol, status)
+
+
+def _run_volatility_trigger_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        for config in _iter_saved_runner_control_configs():
+            if not config.get("volatility_trigger_enabled"):
+                continue
+            try:
+                _reconcile_runner_volatility_trigger(config)
+            except Exception as exc:  # pragma: no cover
+                symbol = str(config.get("symbol", "")).upper().strip()
+                _update_volatility_trigger_status(
+                    symbol,
+                    {
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "symbol": symbol,
+                        "action": None,
+                        "reason": "error",
+                        "paused_by_trigger": bool((_runner_volatility_trigger_status(symbol) or {}).get("paused_by_trigger")),
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+        stop_event.wait(VOLATILITY_TRIGGER_POLL_SECONDS)
 
 
 def _run_competition_board_auto_refresh_loop(stop_event: threading.Event, interval_seconds: float) -> None:
@@ -2214,6 +2546,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_synthetic_drift_notional",
         "volume_trigger_start_threshold",
         "volume_trigger_stop_threshold",
+        "volatility_trigger_amplitude_ratio",
+        "volatility_trigger_abs_return_ratio",
         "sleep_seconds",
     }
     int_fields = {
@@ -2250,6 +2584,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_trigger_enabled",
         "volume_trigger_stop_cancel_open_orders",
         "volume_trigger_stop_close_all_positions",
+        "volatility_trigger_enabled",
+        "volatility_trigger_stop_cancel_open_orders",
+        "volatility_trigger_stop_close_all_positions",
     }
     str_fields = {
         "strategy_profile",
@@ -2264,6 +2601,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "run_end_time",
         "runtime_guard_stats_start_time",
         "volume_trigger_window",
+        "volatility_trigger_window",
     }
     noneable_fields = {
         "center_price",
@@ -2292,6 +2630,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "runtime_guard_stats_start_time",
         "volume_trigger_start_threshold",
         "volume_trigger_stop_threshold",
+        "volatility_trigger_amplitude_ratio",
+        "volatility_trigger_abs_return_ratio",
     }
 
     for key, value in payload.items():
@@ -2318,7 +2658,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"
     config["margin_type"] = str(config.get("margin_type", "KEEP")).upper().strip() or "KEEP"
     config.update(normalize_runtime_guard_payload(config))
-    return _normalize_runner_volume_trigger_config(config)
+    return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 
 
 def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -2442,6 +2782,7 @@ def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]
     config = _resolve_runner_start_config(payload)
     symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     _save_runner_control_config(config, symbol=symbol)
+    _clear_volatility_trigger_status(symbol, reason="saved_without_start")
     return {
         "saved": True,
         "symbol": symbol,
@@ -2810,11 +3151,13 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
         config_changed = any(current_config.get(field) != config.get(field) for field in compare_fields)
         if not config_changed:
             _save_runner_control_config(config, symbol=symbol)
+            _clear_volatility_trigger_status(symbol, reason="runner_running")
             return {"started": False, "already_running": True, "runner": runner, "symbol": symbol, "restarted": False}
         _stop_runner_process(symbol)
         restarted = True
 
     _save_runner_control_config(config, symbol=symbol)
+    _clear_volatility_trigger_status(symbol, reason="runner_started")
     use_legacy_runner = _uses_legacy_runner(symbol)
     service_name = _runner_service_name_for_symbol(symbol)
     if use_legacy_runner and _runner_launch_agent_available():
@@ -3011,6 +3354,7 @@ def _stop_runner_process(
     *,
     cancel_open_orders: bool = False,
     close_all_positions: bool = False,
+    clear_volatility_resume_state: bool = False,
 ) -> dict[str, Any]:
     normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
     runner = _read_runner_process_for_symbol(normalized_symbol)
@@ -3027,6 +3371,8 @@ def _stop_runner_process(
                     pid_path.unlink()
                 except OSError:
                     pass
+            if clear_volatility_resume_state:
+                _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": False,
                 "already_stopped": True,
@@ -3046,6 +3392,8 @@ def _stop_runner_process(
                 pid_path.unlink()
             except OSError:
                 pass
+        if clear_volatility_resume_state:
+            _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
         post_stop_actions = _execute_stop_actions(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
@@ -3068,6 +3416,8 @@ def _stop_runner_process(
                     pid_path.unlink()
                 except OSError:
                     pass
+            if clear_volatility_resume_state:
+                _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": False,
                 "already_stopped": True,
@@ -3087,6 +3437,8 @@ def _stop_runner_process(
                 pid_path.unlink()
             except OSError:
                 pass
+        if clear_volatility_resume_state:
+            _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
         post_stop_actions = _execute_stop_actions(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
@@ -3108,6 +3460,8 @@ def _stop_runner_process(
                 pid_path.unlink()
             except OSError:
                 pass
+        if clear_volatility_resume_state:
+            _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
         return {
             "stopped": False,
             "already_stopped": True,
@@ -3130,6 +3484,8 @@ def _stop_runner_process(
                     pid_path.unlink()
                 except OSError:
                     pass
+            if clear_volatility_resume_state:
+                _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": True,
                 "killed": False,
@@ -3150,6 +3506,8 @@ def _stop_runner_process(
             pid_path.unlink()
         except OSError:
             pass
+    if clear_volatility_resume_state:
+        _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
     post_stop_actions = _execute_stop_actions(
         symbol=normalized_symbol,
         cancel_open_orders=cancel_open_orders,
@@ -9691,7 +10049,42 @@ MONITOR_PAGE = """<!doctype html>
           </span>
         </label>
       </div>
-      <div class="tiny">上面的运行保护和量能自动启停参数会和下方 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
+      <div class="toolbar runtime-guard-toolbar">
+        <label class="inline-check" title="启用后，web 服务会持续观察最近窗口的振幅和涨跌幅；超过阈值自动暂停，回落后自动恢复">
+          <span class="check-row">
+            <input id="monitor_volatility_trigger_enabled" type="checkbox" />
+            <span>启用波动自动暂停</span>
+          </span>
+        </label>
+        <label>波动窗口
+          <select id="monitor_volatility_trigger_window">
+            <option value="15m">最近 15 分钟</option>
+            <option value="30m">最近 30 分钟</option>
+            <option value="1h">最近 1 小时</option>
+            <option value="4h">最近 4 小时</option>
+            <option value="24h">最近 24 小时</option>
+          </select>
+        </label>
+        <label>振幅阈值
+          <input id="monitor_volatility_trigger_amplitude_ratio" type="number" min="0" step="0.0001" />
+        </label>
+        <label>绝对涨跌阈值
+          <input id="monitor_volatility_trigger_abs_return_ratio" type="number" min="0" step="0.0001" />
+        </label>
+        <label class="inline-check" title="高波动自动暂停时，先撤掉当前交易对全部未成交委托">
+          <span class="check-row">
+            <input id="monitor_volatility_trigger_stop_cancel_orders" type="checkbox" />
+            <span>高波动停机时自动撤单</span>
+          </span>
+        </label>
+        <label class="inline-check" title="高波动自动暂停时，再启动 maker 跟价平仓，直到仓位归零；关闭时只撤单并保留仓位，等波动回落后再恢复">
+          <span class="check-row">
+            <input id="monitor_volatility_trigger_stop_close_positions" type="checkbox" />
+            <span>高波动停机时自动清仓</span>
+          </span>
+        </label>
+      </div>
+      <div class="tiny">上面的运行保护、量能自动启停和波动自动暂停参数会和下方 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
       <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改 JSON。</div>
       <div class="editor-grid">
         <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
@@ -9955,6 +10348,12 @@ MONITOR_PAGE = """<!doctype html>
     const monitorVolumeTriggerStopThresholdEl = document.getElementById("monitor_volume_trigger_stop_threshold");
     const monitorVolumeTriggerStopCancelOrdersEl = document.getElementById("monitor_volume_trigger_stop_cancel_orders");
     const monitorVolumeTriggerStopClosePositionsEl = document.getElementById("monitor_volume_trigger_stop_close_positions");
+    const monitorVolatilityTriggerEnabledEl = document.getElementById("monitor_volatility_trigger_enabled");
+    const monitorVolatilityTriggerWindowEl = document.getElementById("monitor_volatility_trigger_window");
+    const monitorVolatilityTriggerAmplitudeRatioEl = document.getElementById("monitor_volatility_trigger_amplitude_ratio");
+    const monitorVolatilityTriggerAbsReturnRatioEl = document.getElementById("monitor_volatility_trigger_abs_return_ratio");
+    const monitorVolatilityTriggerStopCancelOrdersEl = document.getElementById("monitor_volatility_trigger_stop_cancel_orders");
+    const monitorVolatilityTriggerStopClosePositionsEl = document.getElementById("monitor_volatility_trigger_stop_close_positions");
     const customGridNameEl = document.getElementById("custom_grid_name");
     const customGridDirectionEl = document.getElementById("custom_grid_direction");
     const customGridLevelModeEl = document.getElementById("custom_grid_level_mode");
@@ -10759,6 +11158,12 @@ MONITOR_PAGE = """<!doctype html>
       volume_trigger_stop_threshold: "最近窗口市场成交额低于这个阈值后，后台会自动停止策略。",
       volume_trigger_stop_cancel_open_orders: "自动停机时是否先撤销当前交易对全部未成交委托。",
       volume_trigger_stop_close_all_positions: "自动停机时是否继续启动 maker 跟价平仓，直到仓位归零。",
+      volatility_trigger_enabled: "是否启用按最近窗口振幅和绝对涨跌自动暂停/恢复策略的后台巡检。",
+      volatility_trigger_window: "波动观察窗口。按 Binance 合约 1 分钟 K 线聚合整窗的开高低收后计算振幅和涨跌。",
+      volatility_trigger_amplitude_ratio: "最近窗口振幅阈值。整窗最高价 / 最低价 - 1 达到这个值后会自动暂停。",
+      volatility_trigger_abs_return_ratio: "最近窗口绝对涨跌阈值。整窗收盘 / 开盘 - 1 的绝对值达到这个值后会自动暂停。",
+      volatility_trigger_stop_cancel_open_orders: "高波动自动暂停时是否先撤销当前交易对全部未成交委托。",
+      volatility_trigger_stop_close_all_positions: "高波动自动暂停时是否继续启动 maker 跟价平仓，直到仓位归零。",
       cancel_stale: "是否撤掉与当前目标计划不一致的旧单。",
       apply: "是否真实下单。关闭时仅做 dry-run。",
       reset_state: "启动时是否重置本地状态文件。",
@@ -11057,6 +11462,20 @@ MONITOR_PAGE = """<!doctype html>
         volume_trigger_stop_close_all_positions: Boolean(
           monitorVolumeTriggerStopClosePositionsEl && monitorVolumeTriggerStopClosePositionsEl.checked
         ),
+        volatility_trigger_enabled: Boolean(monitorVolatilityTriggerEnabledEl && monitorVolatilityTriggerEnabledEl.checked),
+        volatility_trigger_window: monitorVolatilityTriggerWindowEl ? String(monitorVolatilityTriggerWindowEl.value || "1h") : "1h",
+        volatility_trigger_amplitude_ratio: monitorVolatilityTriggerAmplitudeRatioEl && monitorVolatilityTriggerAmplitudeRatioEl.value
+          ? Number(monitorVolatilityTriggerAmplitudeRatioEl.value)
+          : null,
+        volatility_trigger_abs_return_ratio: monitorVolatilityTriggerAbsReturnRatioEl && monitorVolatilityTriggerAbsReturnRatioEl.value
+          ? Number(monitorVolatilityTriggerAbsReturnRatioEl.value)
+          : null,
+        volatility_trigger_stop_cancel_open_orders: Boolean(
+          monitorVolatilityTriggerStopCancelOrdersEl && monitorVolatilityTriggerStopCancelOrdersEl.checked
+        ),
+        volatility_trigger_stop_close_all_positions: Boolean(
+          monitorVolatilityTriggerStopClosePositionsEl && monitorVolatilityTriggerStopClosePositionsEl.checked
+        ),
       };
     }
 
@@ -11073,6 +11492,12 @@ MONITOR_PAGE = """<!doctype html>
       monitorVolumeTriggerStopThresholdEl.value = source.volume_trigger_stop_threshold ?? "";
       monitorVolumeTriggerStopCancelOrdersEl.checked = Boolean(source.volume_trigger_stop_cancel_open_orders);
       monitorVolumeTriggerStopClosePositionsEl.checked = Boolean(source.volume_trigger_stop_close_all_positions);
+      monitorVolatilityTriggerEnabledEl.checked = Boolean(source.volatility_trigger_enabled);
+      monitorVolatilityTriggerWindowEl.value = source.volatility_trigger_window || "1h";
+      monitorVolatilityTriggerAmplitudeRatioEl.value = source.volatility_trigger_amplitude_ratio ?? "";
+      monitorVolatilityTriggerAbsReturnRatioEl.value = source.volatility_trigger_abs_return_ratio ?? "";
+      monitorVolatilityTriggerStopCancelOrdersEl.checked = Boolean(source.volatility_trigger_stop_cancel_open_orders);
+      monitorVolatilityTriggerStopClosePositionsEl.checked = Boolean(source.volatility_trigger_stop_close_all_positions);
     }
 
     function mergeRuntimeGuardConfig(payload) {
@@ -11096,7 +11521,7 @@ MONITOR_PAGE = """<!doctype html>
       latestRunnerEditorConfig = nextConfig;
       runnerParamsEditorEl.value = JSON.stringify(nextConfig, null, 2);
       renderRunnerParamGuide(nextConfig);
-      runnerParamsMetaEl.textContent = "运行保护和量能自动启停参数已同步到 JSON，可继续修改后保存或应用。";
+      runnerParamsMetaEl.textContent = "运行保护、量能自动启停和波动自动暂停参数已同步到 JSON，可继续修改后保存或应用。";
     }
 
     async function ensureEditorConfigForAlert() {
@@ -11647,6 +12072,19 @@ MONITOR_PAGE = """<!doctype html>
             `最近 ${windowLabel} 的市场成交额低于 ${fmtGuideNotional(config.volume_trigger_stop_threshold)} 时，会自动停机${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`
           );
         }
+      }
+      if (config.volatility_trigger_enabled) {
+        const windowLabel = formatVolumeTriggerWindowLabel(config.volatility_trigger_window);
+        const stopActions = [];
+        if (config.volatility_trigger_stop_cancel_open_orders) stopActions.push("撤策略单");
+        if (config.volatility_trigger_stop_close_all_positions) stopActions.push("清仓");
+        if (asGuideNumber(config.volatility_trigger_amplitude_ratio) > 0) {
+          lines.push(`web 后台会持续观察最近 ${windowLabel} 的整窗振幅；达到 ${fmtGuidePctFromRatio(config.volatility_trigger_amplitude_ratio)} 时，会自动暂停策略${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`);
+        }
+        if (asGuideNumber(config.volatility_trigger_abs_return_ratio) > 0) {
+          lines.push(`最近 ${windowLabel} 的绝对涨跌达到 ${fmtGuidePctFromRatio(config.volatility_trigger_abs_return_ratio)} 时，也会触发同样的自动暂停。`);
+        }
+        lines.push("如果这次停机是由波动触发的，后台会在波动回落到阈值以内后自动恢复；手动点“停止策略”或“保存参数不启动”则会清掉这个自动恢复状态。");
       }
       if (config.cancel_stale === false) {
         lines.push("当前 cancel_stale=false：如果新计划和旧挂单不一致，提交器会直接拒绝执行，而不是替你撤单。");
@@ -12270,6 +12708,7 @@ MONITOR_PAGE = """<!doctype html>
       const competitionWindow = data.competition_window || {};
       const competitionRewardTargets = data.competition_reward_targets || {};
       const volumeTrigger = data.volume_trigger || {};
+      const volatilityTrigger = data.volatility_trigger || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const selectedPreset = getPresetByKey(String(strategyPresetEl.value || runnerCfg.strategy_profile || "volume_long_v4"));
       const risk = data.risk_controls || {};
@@ -12308,6 +12747,7 @@ MONITOR_PAGE = """<!doctype html>
         `最近事件: ${fmtTs(data.session && data.session.last_event)}`,
         `PID: ${runner.pid || "--"}`,
         `量能自动启停: ${volumeTrigger.enabled ? "开" : "关"}`,
+        `波动自动暂停: ${volatilityTrigger.enabled ? "开" : "关"}`,
         isOneWayShort ? `停空: ${risk.short_paused ? "是" : "否"}` : `停买: ${risk.buy_paused ? "是" : "否"}`,
         isNeutralMode ? `停空: ${risk.short_paused ? "是" : "否"}` : (isOneWayShort ? `空裁单: ${risk.short_cap_applied ? "是" : "否"}` : `硬裁单: ${risk.buy_cap_applied ? "是" : "否"}`),
       ].join(" · ");
@@ -12329,6 +12769,9 @@ MONITOR_PAGE = """<!doctype html>
         volumeTrigger.enabled
           ? `量能 ${formatVolumeTriggerWindowLabel(volumeTrigger.window)}: ${fmtNum(volumeTrigger.current_quote_volume, 4)} / 启 ${fmtNum(volumeTrigger.start_threshold, 4)} / 停 ${fmtNum(volumeTrigger.stop_threshold, 4)}`
           : "量能自动启停: 关闭",
+        volatilityTrigger.enabled
+          ? `波动 ${formatVolumeTriggerWindowLabel(volatilityTrigger.window)}: 振幅 ${fmtPct(volatilityTrigger.current_amplitude_ratio || 0)} / 阈 ${fmtPct(volatilityTrigger.amplitude_ratio || 0)} · 绝对涨跌 ${fmtPct(Math.abs(volatilityTrigger.current_return_ratio || 0))} / 阈 ${fmtPct(volatilityTrigger.abs_return_ratio || 0)} · 自动恢复 ${volatilityTrigger.paused_by_trigger ? "待恢复" : "未挂起"}`
+          : "波动自动暂停: 关闭",
         `停止原因: ${risk.stop_reason || "--"}`,
         `自适应状态: ${autoRegimeEnabled ? `${autoRegimeRegime} (${autoRegimePending})` : "关闭"}`,
         `XAUT 三态: ${xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"}`,
@@ -12827,6 +13270,12 @@ MONITOR_PAGE = """<!doctype html>
       monitorVolumeTriggerStopThresholdEl,
       monitorVolumeTriggerStopCancelOrdersEl,
       monitorVolumeTriggerStopClosePositionsEl,
+      monitorVolatilityTriggerEnabledEl,
+      monitorVolatilityTriggerWindowEl,
+      monitorVolatilityTriggerAmplitudeRatioEl,
+      monitorVolatilityTriggerAbsReturnRatioEl,
+      monitorVolatilityTriggerStopCancelOrdersEl,
+      monitorVolatilityTriggerStopClosePositionsEl,
     ]
       .forEach((el) => el.addEventListener("change", syncRuntimeGuardInputsToEditor));
     alertBoxEl.addEventListener("click", async (event) => {
@@ -18262,6 +18711,14 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
         "stop_threshold": runner_config.get("volume_trigger_stop_threshold"),
         **volume_trigger_status,
     }
+    volatility_trigger_status = _runner_volatility_trigger_status(symbol) or {}
+    snapshot["volatility_trigger"] = {
+        "enabled": bool(runner_config.get("volatility_trigger_enabled", False)),
+        "window": runner_config.get("volatility_trigger_window"),
+        "amplitude_ratio": runner_config.get("volatility_trigger_amplitude_ratio"),
+        "abs_return_ratio": runner_config.get("volatility_trigger_abs_return_ratio"),
+        **volatility_trigger_status,
+    }
     snapshot["runner_presets"] = _runner_preset_summaries(symbol)
     return snapshot
 
@@ -18719,6 +19176,7 @@ class _Handler(BaseHTTPRequestHandler):
                         payload.get("symbol"),
                         cancel_open_orders=_safe_bool(payload.get("cancel_open_orders", False), "cancel_open_orders"),
                         close_all_positions=_safe_bool(payload.get("close_all_positions", False), "close_all_positions"),
+                        clear_volatility_resume_state=True,
                     )
                 self._send_json({"ok": True, **result}, status=200)
             except ValueError as exc:
@@ -19062,6 +19520,14 @@ def main() -> None:
         name="runner-volume-trigger",
     )
     volume_trigger_thread.start()
+    volatility_trigger_stop_event = threading.Event()
+    volatility_trigger_thread = threading.Thread(
+        target=_run_volatility_trigger_loop,
+        args=(volatility_trigger_stop_event,),
+        daemon=True,
+        name="runner-volatility-trigger",
+    )
+    volatility_trigger_thread.start()
     competition_refresh_stop_event = threading.Event()
     if _competition_board_auto_refresh_enabled():
         refresh_interval = _competition_board_auto_refresh_interval_seconds()
@@ -19085,6 +19551,7 @@ def main() -> None:
         pass
     finally:
         volume_trigger_stop_event.set()
+        volatility_trigger_stop_event.set()
         competition_refresh_stop_event.set()
         server.server_close()
 

@@ -17,6 +17,7 @@ from grid_optimizer.data import (
     fetch_funding_rates,
     fetch_futures_klines,
     fetch_futures_quote_volume_sum,
+    fetch_futures_window_price_stats,
     fetch_futures_symbol_config,
     fetch_spot_symbol_config,
     load_or_fetch_candles,
@@ -345,6 +346,31 @@ class DataFetchTests(unittest.TestCase):
         )
 
         self.assertAlmostEqual(volume, 85.0, places=8)
+
+    @patch("grid_optimizer.data._http_get_json")
+    def test_fetch_futures_window_price_stats_aggregates_return_and_amplitude(self, mock_http_get_json) -> None:
+        end_ms = 5 * 60_000
+        mock_http_get_json.return_value = [
+            [0, "10", "11", "9.8", "10.5", "100", 59_999, "11.5", "0", "0", "0", "0"],
+            [60_000, "10.5", "10.7", "10.1", "10.2", "100", 119_999, "13.0", "0", "0", "0", "0"],
+            [120_000, "10.2", "11.4", "10.0", "11.0", "100", 179_999, "17.25", "0", "0", "0", "0"],
+            [180_000, "11.0", "11.1", "10.4", "10.8", "100", 239_999, "19.75", "0", "0", "0", "0"],
+            [240_000, "10.8", "11.2", "10.6", "11.1", "100", 299_999, "23.5", "0", "0", "0", "0"],
+        ]
+
+        stats = fetch_futures_window_price_stats(
+            "BARDUSDT",
+            window_minutes=5,
+            end_time_ms=end_ms,
+        )
+
+        self.assertEqual(stats["candle_count"], 5)
+        self.assertAlmostEqual(float(stats["open_price"] or 0.0), 10.0, places=8)
+        self.assertAlmostEqual(float(stats["close_price"] or 0.0), 11.1, places=8)
+        self.assertAlmostEqual(float(stats["high_price"] or 0.0), 11.4, places=8)
+        self.assertAlmostEqual(float(stats["low_price"] or 0.0), 9.8, places=8)
+        self.assertAlmostEqual(float(stats["return_ratio"] or 0.0), 0.11, places=8)
+        self.assertAlmostEqual(float(stats["amplitude_ratio"] or 0.0), 11.4 / 9.8 - 1.0, places=8)
 
 
 if __name__ == "__main__":

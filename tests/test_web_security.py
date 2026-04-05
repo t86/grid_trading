@@ -23,6 +23,7 @@ from grid_optimizer.web import (
     _normalize_runner_control_payload,
     _parse_allowed_networks,
     _resolve_runner_volume_trigger_action,
+    _resolve_runner_volatility_trigger_action,
     _resolve_runner_start_config,
     _run_loop_monitor_query,
     _runtime_guard_input_summary,
@@ -78,6 +79,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_volume_trigger_window"', MONITOR_PAGE)
         self.assertIn('id="monitor_volume_trigger_start_threshold"', MONITOR_PAGE)
         self.assertIn('id="monitor_volume_trigger_stop_threshold"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volatility_trigger_enabled"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volatility_trigger_window"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volatility_trigger_amplitude_ratio"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volatility_trigger_abs_return_ratio"', MONITOR_PAGE)
         self.assertIn('id="save_params_btn"', MONITOR_PAGE)
 
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
@@ -221,6 +226,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(payload["volume_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volume_trigger_stop_close_all_positions"])
 
+    def test_normalize_runner_control_payload_supports_volatility_trigger_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "BARDUSDT",
+                "strategy_profile": "bard_volume_long_v2",
+                "volatility_trigger_enabled": True,
+                "volatility_trigger_window": "1h",
+                "volatility_trigger_amplitude_ratio": 0.04,
+                "volatility_trigger_abs_return_ratio": 0.02,
+                "volatility_trigger_stop_cancel_open_orders": False,
+                "volatility_trigger_stop_close_all_positions": True,
+            }
+        )
+
+        self.assertTrue(payload["volatility_trigger_enabled"])
+        self.assertEqual(payload["volatility_trigger_window"], "1h")
+        self.assertEqual(payload["volatility_trigger_amplitude_ratio"], 0.04)
+        self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
+        self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+        self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+
     def test_resolve_runner_volume_trigger_action_starts_when_volume_above_threshold(self) -> None:
         decision = _resolve_runner_volume_trigger_action(
             {
@@ -252,6 +280,43 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(decision["action"], "stop")
         self.assertEqual(decision["reason"], "volume_below_stop_threshold")
+
+    def test_resolve_runner_volatility_trigger_action_stops_when_threshold_hit(self) -> None:
+        decision = _resolve_runner_volatility_trigger_action(
+            {
+                "volatility_trigger_enabled": True,
+                "volatility_trigger_window": "1h",
+                "volatility_trigger_amplitude_ratio": 0.04,
+                "volatility_trigger_abs_return_ratio": 0.02,
+            },
+            current_amplitude_ratio=0.051,
+            current_return_ratio=0.018,
+            runner_running=True,
+            flatten_running=False,
+            paused_by_trigger=False,
+        )
+
+        self.assertEqual(decision["action"], "stop")
+        self.assertEqual(decision["reason"], "volatility_above_threshold")
+        self.assertIn("amplitude_above_threshold", decision["matched_reasons"])
+
+    def test_resolve_runner_volatility_trigger_action_resumes_after_cooldown(self) -> None:
+        decision = _resolve_runner_volatility_trigger_action(
+            {
+                "volatility_trigger_enabled": True,
+                "volatility_trigger_window": "1h",
+                "volatility_trigger_amplitude_ratio": 0.04,
+                "volatility_trigger_abs_return_ratio": 0.02,
+            },
+            current_amplitude_ratio=0.018,
+            current_return_ratio=0.007,
+            runner_running=False,
+            flatten_running=False,
+            paused_by_trigger=True,
+        )
+
+        self.assertEqual(decision["action"], "start")
+        self.assertEqual(decision["reason"], "volatility_back_within_threshold")
 
     def test_runner_preset_payload_rejects_xaut_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
@@ -1139,6 +1204,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
         self.assertFalse(payload["autotune_symbol_enabled"])
         self.assertIsNone(payload["rolling_hourly_loss_limit"])
+        self.assertTrue(payload["volatility_trigger_enabled"])
+        self.assertEqual(payload["volatility_trigger_window"], "1h")
+        self.assertEqual(payload["volatility_trigger_amplitude_ratio"], 0.04)
+        self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
+        self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
 
     def test_runner_preset_payload_for_based_volume_long_trigger_includes_volume_guard(self) -> None:
         payload = _runner_preset_payload("based_volume_long_trigger_v1", {"symbol": "BASEDUSDT"})
@@ -1151,6 +1222,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volume_trigger_stop_threshold"], 180000.0)
         self.assertTrue(payload["volume_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volume_trigger_stop_close_all_positions"])
+        self.assertTrue(payload["volatility_trigger_enabled"])
+        self.assertEqual(payload["volatility_trigger_window"], "1h")
+        self.assertEqual(payload["volatility_trigger_amplitude_ratio"], 0.04)
+        self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
 
     def test_runner_preset_payload_for_based_volume_push_bard_preserves_dense_grid(self) -> None:
         payload = _runner_preset_payload("based_volume_push_bard_v1", {"symbol": "BASEDUSDT"})

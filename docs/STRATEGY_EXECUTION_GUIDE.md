@@ -71,6 +71,28 @@
 - 常见做法是 `stop_threshold < start_threshold`，留一段回差，减少高低边界反复穿越时的频繁启停。
 - 如果你想等放量后再入场，通常配合“保存参数不启动”更顺手。
 
+### 市场波动自动暂停
+
+这套能力同样运行在 `web.py` 的后台巡检线程里，用最近窗口聚合后的整窗波动来决定是否暂停策略。
+
+- 波动来源
+  - 取 Binance 合约最近 `1m` K 线，聚合成最近窗口的开高低收。
+  - 当前支持 `15m / 30m / 1h / 4h / 24h`。
+  - `volatility_trigger_amplitude_ratio` 口径是 `window_high / window_low - 1`。
+  - `volatility_trigger_abs_return_ratio` 口径是 `abs(window_close / window_open - 1)`。
+- 自动暂停
+  - 当策略当前正在运行，且最近窗口振幅或绝对涨跌达到阈值时，后台会自动停机。
+  - 如果启用了 `volatility_trigger_stop_cancel_open_orders`，停机前会先撤当前交易对的未成交委托。
+  - 如果启用了 `volatility_trigger_stop_close_all_positions`，停机时会继续启动 maker flatten，直到仓位归零。
+- 自动恢复
+  - 如果这次停机是由波动触发的，后台会在波动回落到阈值以内后自动恢复。
+  - 手动点“停止策略”或“保存参数不启动”会清掉这个自动恢复状态，避免用户明明手停了，后台又自己拉起。
+- 默认值
+  - 默认窗口是 `1h`。
+  - 默认振幅阈值是 `4%`。
+  - 默认绝对涨跌阈值是 `2%`。
+  - 默认动作是“撤单并清仓”，这样单边快速扩展时不会因为保留仓位继续扩大亏损；如果你想只做保护性暂停，也可以手动关掉自动清仓。
+
 ### 生产操作约束
 
 - 生产机器上的策略 runner、flatten runner、`output/*_loop_runner.pid`、`output/*_loop_runner_control.json` 必须由 `ubuntu` 用户持有和启动。

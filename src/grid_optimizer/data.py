@@ -1418,6 +1418,74 @@ def fetch_futures_quote_volume_sum(
     return quote_volume_sum
 
 
+def fetch_futures_window_price_stats(
+    symbol: str,
+    *,
+    window_minutes: int,
+    contract_type: str = "usdm",
+    end_time_ms: int | None = None,
+    interval: str = "1m",
+    limit: int = 1500,
+) -> dict[str, float | int | None]:
+    if window_minutes <= 0:
+        raise ValueError("window_minutes must be > 0")
+    if interval != "1m":
+        raise ValueError("only 1m interval is supported for window price stats")
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+
+    end_ms = int(end_time_ms if end_time_ms is not None else time.time() * 1000)
+    start_ms = end_ms - int(window_minutes) * 60 * 1000
+    if start_ms >= end_ms:
+        return {
+            "window_minutes": int(window_minutes),
+            "candle_count": 0,
+            "open_price": None,
+            "close_price": None,
+            "high_price": None,
+            "low_price": None,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+
+    candles = fetch_futures_klines(
+        symbol=symbol,
+        interval=interval,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        contract_type=contract_type,
+        limit=limit,
+    )
+    if not candles:
+        return {
+            "window_minutes": int(window_minutes),
+            "candle_count": 0,
+            "open_price": None,
+            "close_price": None,
+            "high_price": None,
+            "low_price": None,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+
+    open_price = float(candles[0].open)
+    close_price = float(candles[-1].close)
+    high_price = max(float(candle.high) for candle in candles)
+    low_price = min(float(candle.low) for candle in candles)
+    return_ratio = close_price / open_price - 1.0 if open_price > 0 else 0.0
+    amplitude_ratio = high_price / low_price - 1.0 if low_price > 0 else 0.0
+    return {
+        "window_minutes": int(window_minutes),
+        "candle_count": len(candles),
+        "open_price": open_price,
+        "close_price": close_price,
+        "high_price": high_price,
+        "low_price": low_price,
+        "return_ratio": return_ratio,
+        "amplitude_ratio": amplitude_ratio,
+    }
+
+
 def _cache_file_path(
     cache_dir: Path,
     symbol: str,
