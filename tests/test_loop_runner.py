@@ -13,6 +13,7 @@ from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _should_sync_account_audit,
     _apply_synthetic_trade_fill,
+    _build_parser,
     _current_check_bucket,
     _custom_grid_levels_above_current,
     _read_custom_grid_trade_count,
@@ -41,8 +42,10 @@ from grid_optimizer.loop_runner import (
     resolve_market_bias_offsets,
     resolve_market_bias_regime_switch,
     resolve_adaptive_step_price,
+    resolve_synthetic_trend_follow,
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
+    apply_synthetic_trend_follow_guard,
     update_synthetic_order_refs,
 )
 from grid_optimizer.semi_auto_plan import build_static_binance_grid_plan
@@ -1400,6 +1403,149 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(result["buy_pause_active"])
         self.assertTrue(result["short_cover_pause_active"])
         self.assertFalse(result["shift_frozen"])
+
+    def test_resolve_synthetic_trend_follow_uses_single_side_entry_when_flat(self) -> None:
+        state = {
+            "synthetic_ledger": {
+                "last_trade_time_ms": int(datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc).timestamp() * 1000),
+            }
+        }
+        report = resolve_synthetic_trend_follow(
+            state=state,
+            market_guard={
+                "window_1m": {"return_ratio": 0.00062, "amplitude_ratio": 0.00086},
+                "window_3m": {"return_ratio": 0.00118, "amplitude_ratio": 0.00152},
+            },
+            now=datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc),
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+            enabled=True,
+            window_1m_abs_return_ratio=0.00045,
+            window_1m_amplitude_ratio=0.00070,
+            window_3m_abs_return_ratio=0.00090,
+            window_3m_amplitude_ratio=0.00120,
+            min_efficiency_ratio=0.58,
+            reverse_delay_seconds=18.0,
+        )
+
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"role": "entry_long", "side": "BUY"}],
+            "sell_orders": [{"role": "entry_short", "side": "SELL"}],
+        }
+        applied = apply_synthetic_trend_follow_guard(plan=plan, trend_follow=report)
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["mode"], "flat_follow_short")
+        self.assertEqual(report["flow_entry_side"], "SELL")
+        self.assertTrue(applied["applied"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "entry_short")
+
+    def test_resolve_synthetic_trend_follow_delays_reverse_order_for_fresh_short_inventory(self) -> None:
+        now = datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc)
+        state = {
+            "synthetic_ledger": {
+                "last_trade_time_ms": int(now.timestamp() * 1000),
+            },
+            "synthetic_trend_follow_state": {
+                "inventory_direction": None,
+                "inventory_qty": 0.0,
+                "cooldown_until_ms": 0,
+                "last_trade_time_ms": 0,
+            },
+        }
+        report = resolve_synthetic_trend_follow(
+            state=state,
+            market_guard={
+                "window_1m": {"return_ratio": 0.00058, "amplitude_ratio": 0.00082},
+                "window_3m": {"return_ratio": 0.00102, "amplitude_ratio": 0.00135},
+            },
+            now=now,
+            current_long_qty=0.0,
+            current_short_qty=0.021,
+            enabled=True,
+            window_1m_abs_return_ratio=0.00045,
+            window_1m_amplitude_ratio=0.00070,
+            window_3m_abs_return_ratio=0.00090,
+            window_3m_amplitude_ratio=0.00120,
+            min_efficiency_ratio=0.58,
+            reverse_delay_seconds=18.0,
+        )
+
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"role": "take_profit_short", "side": "BUY"}],
+            "sell_orders": [{"role": "entry_short", "side": "SELL"}],
+        }
+        apply_synthetic_trend_follow_guard(plan=plan, trend_follow=report)
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["mode"], "hold_short_wait")
+        self.assertTrue(report["reverse_delay_active"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_resolve_synthetic_trend_follow_releases_exit_only_after_delay(self) -> None:
+        now = datetime(2026, 3, 18, 10, 0, 25, tzinfo=timezone.utc)
+        state = {
+            "synthetic_ledger": {
+                "last_trade_time_ms": int((now - timedelta(seconds=25)).timestamp() * 1000),
+            },
+            "synthetic_trend_follow_state": {
+                "inventory_direction": "short",
+                "inventory_qty": 0.021,
+                "cooldown_until_ms": int((now - timedelta(seconds=5)).timestamp() * 1000),
+                "last_trade_time_ms": int((now - timedelta(seconds=25)).timestamp() * 1000),
+            },
+        }
+        report = resolve_synthetic_trend_follow(
+            state=state,
+            market_guard={
+                "window_1m": {"return_ratio": 0.00058, "amplitude_ratio": 0.00082},
+                "window_3m": {"return_ratio": 0.00102, "amplitude_ratio": 0.00135},
+            },
+            now=now,
+            current_long_qty=0.0,
+            current_short_qty=0.021,
+            enabled=True,
+            window_1m_abs_return_ratio=0.00045,
+            window_1m_amplitude_ratio=0.00070,
+            window_3m_abs_return_ratio=0.00090,
+            window_3m_amplitude_ratio=0.00120,
+            min_efficiency_ratio=0.58,
+            reverse_delay_seconds=18.0,
+        )
+
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"role": "take_profit_short", "side": "BUY"},
+                {"role": "entry_long", "side": "BUY"},
+            ],
+            "sell_orders": [{"role": "entry_short", "side": "SELL"}],
+        }
+        apply_synthetic_trend_follow_guard(plan=plan, trend_follow=report)
+
+        self.assertEqual(report["mode"], "hold_short_exit")
+        self.assertFalse(report["reverse_delay_active"])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_build_parser_accepts_runtime_guard_notional_thresholds(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--max-actual-net-notional",
+                "120",
+                "--max-synthetic-drift-notional",
+                "60",
+            ]
+        )
+
+        self.assertEqual(args.max_actual_net_notional, 120.0)
+        self.assertEqual(args.max_synthetic_drift_notional, 60.0)
 
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     def test_assess_auto_regime_prefers_defensive_when_recent_drop_and_amp_expand(self, mock_fetch_futures_klines) -> None:

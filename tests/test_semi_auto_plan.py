@@ -370,7 +370,31 @@ class SemiAutoPlanTests(unittest.TestCase):
         )
 
         self.assertLess(biased["buy_orders"][0]["price"], regular["buy_orders"][0]["price"])
-        self.assertLess(biased["sell_orders"][0]["price"], regular["sell_orders"][0]["price"])
+        self.assertEqual(biased["sell_orders"][0]["price"], regular["sell_orders"][0]["price"])
+        self.assertLess(biased["sell_orders"][1]["price"], regular["sell_orders"][1]["price"])
+
+    def test_build_hedge_micro_grid_plan_anchors_first_level_to_best_quote(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=4600.005,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=4600.01,
+            ask_price=4600.02,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+        )
+
+        self.assertEqual(plan["buy_orders"][0]["price"], 4600.01)
+        self.assertEqual(plan["buy_orders"][1]["price"], 4600.0)
+        self.assertEqual(plan["sell_orders"][0]["price"], 4600.02)
+        self.assertEqual(plan["sell_orders"][1]["price"], 4600.03)
 
     def test_build_inventory_target_neutral_plan_builds_band_orders_and_bootstrap(self) -> None:
         plan = build_inventory_target_neutral_plan(

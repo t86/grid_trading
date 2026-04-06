@@ -709,20 +709,20 @@ def build_hedge_micro_grid_plan(
     startup_multiplier = max(float(startup_entry_multiplier), 1.0)
     buy_offset_steps = float(buy_offset_steps)
     sell_offset_steps = float(sell_offset_steps)
-    min_distance_steps = 0.25
-
     def _entry_notional(*, level: int, current_qty: float) -> float:
         if startup_large_entry_active and level == 1 and current_qty <= 1e-12:
             return per_order_notional * startup_multiplier
         return per_order_notional
 
     def _buy_price(level: int) -> float:
-        distance_steps = max(float(level) + buy_offset_steps, min_distance_steps)
-        return _round_order_price(center_price - (distance_steps * step_price), tick_size, "BUY")
+        distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
+        price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        return _round_order_price(price_raw, tick_size, "BUY")
 
     def _sell_price(level: int) -> float:
-        distance_steps = max(float(level) + sell_offset_steps, min_distance_steps)
-        return _round_order_price(center_price + (distance_steps * step_price), tick_size, "SELL")
+        distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
+        price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        return _round_order_price(price_raw, tick_size, "SELL")
 
     remaining_short_exit_qty = _round_order_qty(current_short_qty, step_size)
     for level in range(1, buy_levels + 1):

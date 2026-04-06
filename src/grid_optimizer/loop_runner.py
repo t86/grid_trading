@@ -980,6 +980,31 @@ def _is_short_entry_order(order: dict[str, Any]) -> bool:
     return role in {"bootstrap_short", "entry_short"}
 
 
+def _is_long_exit_order(order: dict[str, Any]) -> bool:
+    return _order_role(order) == "take_profit_long"
+
+
+def _is_short_exit_order(order: dict[str, Any]) -> bool:
+    return _order_role(order) == "take_profit_short"
+
+
+def _direction_from_return_ratio(return_ratio: float, *, tolerance: float = 1e-12) -> str | None:
+    if return_ratio > tolerance:
+        return "up"
+    if return_ratio < -tolerance:
+        return "down"
+    return None
+
+
+def _window_directional_efficiency(window: dict[str, Any] | None) -> float:
+    if not isinstance(window, dict):
+        return 0.0
+    amplitude_ratio = max(_safe_float(window.get("amplitude_ratio")), 0.0)
+    if amplitude_ratio <= 0:
+        return 0.0
+    return min(abs(_safe_float(window.get("return_ratio"))) / amplitude_ratio, 1.0)
+
+
 def _is_synthetic_neutral_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "synthetic_neutral"
 
@@ -1428,6 +1453,13 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         adaptive_step_max_scale=getattr(args, "adaptive_step_max_scale", 1.0),
         adaptive_step_min_per_order_scale=getattr(args, "adaptive_step_min_per_order_scale", 1.0),
         adaptive_step_min_position_limit_scale=getattr(args, "adaptive_step_min_position_limit_scale", 1.0),
+        synthetic_trend_follow_enabled=getattr(args, "synthetic_trend_follow_enabled", False),
+        synthetic_trend_follow_1m_abs_return_ratio=getattr(args, "synthetic_trend_follow_1m_abs_return_ratio", 0.0),
+        synthetic_trend_follow_1m_amplitude_ratio=getattr(args, "synthetic_trend_follow_1m_amplitude_ratio", 0.0),
+        synthetic_trend_follow_3m_abs_return_ratio=getattr(args, "synthetic_trend_follow_3m_abs_return_ratio", 0.0),
+        synthetic_trend_follow_3m_amplitude_ratio=getattr(args, "synthetic_trend_follow_3m_amplitude_ratio", 0.0),
+        synthetic_trend_follow_min_efficiency_ratio=getattr(args, "synthetic_trend_follow_min_efficiency_ratio", 0.0),
+        synthetic_trend_follow_reverse_delay_seconds=getattr(args, "synthetic_trend_follow_reverse_delay_seconds", 0.0),
     )
 
 
@@ -2136,6 +2168,9 @@ def assess_market_guard(
         "short_cover_pause_reasons": [],
         "shift_freeze_reasons": [],
         "candle": None,
+        "window_1m": None,
+        "window_3m": None,
+        "closed_candle_count": 0,
         "return_ratio": 0.0,
         "amplitude_ratio": 0.0,
     }
@@ -2214,6 +2249,7 @@ def assess_market_guard(
             "buy_pause_reasons": buy_pause_reasons,
             "short_cover_pause_reasons": short_cover_pause_reasons,
             "shift_freeze_reasons": shift_freeze_reasons,
+            "closed_candle_count": len(closed_candles),
             "candle": {
                 "open_time": candle.open_time.isoformat(),
                 "close_time": candle.close_time.isoformat(),
@@ -2222,6 +2258,17 @@ def assess_market_guard(
                 "low": low_price,
                 "close": close_price,
             },
+            "window_1m": {
+                "open_time": candle.open_time.isoformat(),
+                "close_time": candle.close_time.isoformat(),
+                "open": open_price,
+                "high": high_price,
+                "low": low_price,
+                "close": close_price,
+                "return_ratio": return_ratio,
+                "amplitude_ratio": amplitude_ratio,
+            },
+            "window_3m": _aggregate_recent_window(closed_candles, count=3),
             "return_ratio": return_ratio,
             "amplitude_ratio": amplitude_ratio,
         }
@@ -2273,6 +2320,244 @@ def _latest_closed_window(candles: list[Any], *, now: datetime | None = None) ->
         "amplitude_ratio": amplitude_ratio,
         "return_ratio": return_ratio,
     }
+
+
+def resolve_synthetic_trend_follow(
+    *,
+    state: dict[str, Any],
+    market_guard: dict[str, Any] | None,
+    now: datetime,
+    current_long_qty: float,
+    current_short_qty: float,
+    enabled: bool,
+    window_1m_abs_return_ratio: float | None,
+    window_1m_amplitude_ratio: float | None,
+    window_3m_abs_return_ratio: float | None,
+    window_3m_amplitude_ratio: float | None,
+    min_efficiency_ratio: float | None,
+    reverse_delay_seconds: float | None,
+) -> dict[str, Any]:
+    tracker = dict(state.get("synthetic_trend_follow_state") or {})
+    now_ms = int(now.timestamp() * 1000)
+    tolerance = 1e-9
+    safe_min_efficiency_ratio = max(min(_safe_float(min_efficiency_ratio), 1.0), 0.0)
+    safe_reverse_delay_seconds = max(_safe_float(reverse_delay_seconds), 0.0)
+    safe_window_1m_abs_return_ratio = max(_safe_float(window_1m_abs_return_ratio), 0.0)
+    safe_window_1m_amplitude_ratio = max(_safe_float(window_1m_amplitude_ratio), 0.0)
+    safe_window_3m_abs_return_ratio = max(_safe_float(window_3m_abs_return_ratio), 0.0)
+    safe_window_3m_amplitude_ratio = max(_safe_float(window_3m_amplitude_ratio), 0.0)
+
+    current_inventory_direction: str | None = None
+    current_inventory_qty = 0.0
+    if float(current_short_qty) > tolerance and float(current_long_qty) <= tolerance:
+        current_inventory_direction = "short"
+        current_inventory_qty = float(current_short_qty)
+    elif float(current_long_qty) > tolerance and float(current_short_qty) <= tolerance:
+        current_inventory_direction = "long"
+        current_inventory_qty = float(current_long_qty)
+
+    report = {
+        "enabled": bool(enabled),
+        "available": False,
+        "active": False,
+        "direction": None,
+        "reason": "disabled" if not enabled else "insufficient_market_guard_data",
+        "mode": "disabled" if not enabled else "inactive",
+        "window_1m": None,
+        "window_3m": None,
+        "window_1m_efficiency_ratio": 0.0,
+        "window_3m_efficiency_ratio": 0.0,
+        "min_efficiency_ratio": safe_min_efficiency_ratio,
+        "reverse_delay_seconds": safe_reverse_delay_seconds,
+        "reverse_delay_active": False,
+        "reverse_delay_remaining_seconds": 0.0,
+        "cooldown_until": None,
+        "flow_entry_side": None,
+        "flow_inventory_direction": None,
+        "current_inventory_direction": current_inventory_direction,
+        "current_inventory_qty": current_inventory_qty,
+    }
+
+    if not enabled:
+        state["synthetic_trend_follow_state"] = {
+            "enabled": False,
+            "inventory_direction": current_inventory_direction,
+            "inventory_qty": current_inventory_qty,
+            "cooldown_until_ms": 0,
+            "last_trade_time_ms": int(((state.get("synthetic_ledger") or {}).get("last_trade_time_ms")) or 0),
+            "updated_at": now.isoformat(),
+        }
+        return report
+
+    window_1m = (market_guard or {}).get("window_1m")
+    window_3m = (market_guard or {}).get("window_3m")
+    report["window_1m"] = dict(window_1m) if isinstance(window_1m, dict) else None
+    report["window_3m"] = dict(window_3m) if isinstance(window_3m, dict) else None
+    available = isinstance(window_1m, dict) and isinstance(window_3m, dict)
+    report["available"] = available
+    if not available:
+        state["synthetic_trend_follow_state"] = {
+            "enabled": True,
+            "inventory_direction": current_inventory_direction,
+            "inventory_qty": current_inventory_qty,
+            "cooldown_until_ms": 0,
+            "last_trade_time_ms": int(((state.get("synthetic_ledger") or {}).get("last_trade_time_ms")) or 0),
+            "updated_at": now.isoformat(),
+        }
+        return report
+
+    one_min_return_ratio = _safe_float(window_1m.get("return_ratio"))
+    one_min_amplitude_ratio = max(_safe_float(window_1m.get("amplitude_ratio")), 0.0)
+    three_min_return_ratio = _safe_float(window_3m.get("return_ratio"))
+    three_min_amplitude_ratio = max(_safe_float(window_3m.get("amplitude_ratio")), 0.0)
+    one_min_efficiency = _window_directional_efficiency(window_1m)
+    three_min_efficiency = _window_directional_efficiency(window_3m)
+    report["window_1m_efficiency_ratio"] = one_min_efficiency
+    report["window_3m_efficiency_ratio"] = three_min_efficiency
+
+    one_min_direction = _direction_from_return_ratio(one_min_return_ratio)
+    three_min_direction = _direction_from_return_ratio(three_min_return_ratio)
+    active = (
+        one_min_direction is not None
+        and one_min_direction == three_min_direction
+        and abs(one_min_return_ratio) >= safe_window_1m_abs_return_ratio
+        and one_min_amplitude_ratio >= safe_window_1m_amplitude_ratio
+        and abs(three_min_return_ratio) >= safe_window_3m_abs_return_ratio
+        and three_min_amplitude_ratio >= safe_window_3m_amplitude_ratio
+        and one_min_efficiency >= safe_min_efficiency_ratio
+        and three_min_efficiency >= safe_min_efficiency_ratio
+    )
+    direction = one_min_direction if active else None
+    flow_entry_side = "SELL" if direction == "up" else "BUY" if direction == "down" else None
+    flow_inventory_direction = "short" if direction == "up" else "long" if direction == "down" else None
+    report["active"] = active
+    report["direction"] = direction
+    report["flow_entry_side"] = flow_entry_side
+    report["flow_inventory_direction"] = flow_inventory_direction
+
+    last_trade_time_ms = int(((state.get("synthetic_ledger") or {}).get("last_trade_time_ms")) or 0)
+    previous_inventory_direction = str(tracker.get("inventory_direction") or "").strip() or None
+    previous_inventory_qty = max(_safe_float(tracker.get("inventory_qty")), 0.0)
+    previous_trade_time_ms = int(tracker.get("last_trade_time_ms") or 0)
+    cooldown_until_ms = int(tracker.get("cooldown_until_ms") or 0)
+
+    if not active or current_inventory_direction is None or current_inventory_direction != flow_inventory_direction:
+        cooldown_until_ms = 0
+    elif safe_reverse_delay_seconds > 0:
+        entry_fill_detected = (
+            current_inventory_direction != previous_inventory_direction
+            or current_inventory_qty > previous_inventory_qty + tolerance
+            or last_trade_time_ms > previous_trade_time_ms
+        )
+        if entry_fill_detected:
+            base_trade_time_ms = last_trade_time_ms if last_trade_time_ms > 0 else now_ms
+            cooldown_until_ms = max(base_trade_time_ms, now_ms) + int(safe_reverse_delay_seconds * 1000)
+
+    reverse_delay_active = cooldown_until_ms > now_ms
+    reverse_delay_remaining_seconds = max((cooldown_until_ms - now_ms) / 1000.0, 0.0) if reverse_delay_active else 0.0
+    report["reverse_delay_active"] = reverse_delay_active
+    report["reverse_delay_remaining_seconds"] = reverse_delay_remaining_seconds
+    report["cooldown_until"] = (
+        datetime.fromtimestamp(cooldown_until_ms / 1000.0, tz=timezone.utc).isoformat()
+        if cooldown_until_ms > 0
+        else None
+    )
+
+    if active:
+        if current_inventory_direction is None:
+            report["mode"] = "flat_follow_short" if flow_inventory_direction == "short" else "flat_follow_long"
+            report["reason"] = (
+                f"{direction}_trend flat_only_follow flow={flow_entry_side.lower()} "
+                f"1m_ret={one_min_return_ratio * 100:.3f}% "
+                f"3m_ret={three_min_return_ratio * 100:.3f}%"
+            )
+        elif current_inventory_direction == "short":
+            report["mode"] = "hold_short_wait" if reverse_delay_active else "hold_short_exit"
+            report["reason"] = (
+                f"{direction}_trend short_inventory delay={reverse_delay_remaining_seconds:.1f}s"
+                if reverse_delay_active
+                else f"{direction}_trend short_inventory exit_only"
+            )
+        else:
+            report["mode"] = "hold_long_wait" if reverse_delay_active else "hold_long_exit"
+            report["reason"] = (
+                f"{direction}_trend long_inventory delay={reverse_delay_remaining_seconds:.1f}s"
+                if reverse_delay_active
+                else f"{direction}_trend long_inventory exit_only"
+            )
+    else:
+        report["reason"] = (
+            "trend_threshold_not_met "
+            f"1m_ret={one_min_return_ratio * 100:.3f}% "
+            f"1m_amp={one_min_amplitude_ratio * 100:.3f}% "
+            f"3m_ret={three_min_return_ratio * 100:.3f}% "
+            f"3m_amp={three_min_amplitude_ratio * 100:.3f}%"
+        )
+
+    state["synthetic_trend_follow_state"] = {
+        "enabled": True,
+        "active": active,
+        "direction": direction,
+        "mode": report["mode"],
+        "inventory_direction": current_inventory_direction,
+        "inventory_qty": current_inventory_qty,
+        "flow_inventory_direction": flow_inventory_direction,
+        "cooldown_until_ms": cooldown_until_ms,
+        "last_trade_time_ms": last_trade_time_ms,
+        "updated_at": now.isoformat(),
+    }
+    return report
+
+
+def apply_synthetic_trend_follow_guard(
+    *,
+    plan: dict[str, Any],
+    trend_follow: dict[str, Any] | None,
+) -> dict[str, Any]:
+    mode = str((trend_follow or {}).get("mode") or "inactive").strip() or "inactive"
+    result = {
+        "applied": False,
+        "mode": mode,
+        "buy_orders_before": len(plan.get("buy_orders", [])),
+        "sell_orders_before": len(plan.get("sell_orders", [])),
+        "bootstrap_orders_before": len(plan.get("bootstrap_orders", [])),
+        "buy_orders_after": len(plan.get("buy_orders", [])),
+        "sell_orders_after": len(plan.get("sell_orders", [])),
+        "bootstrap_orders_after": len(plan.get("bootstrap_orders", [])),
+    }
+    if mode in {"disabled", "inactive"}:
+        return result
+
+    if mode == "flat_follow_short":
+        plan["bootstrap_orders"] = []
+        plan["buy_orders"] = []
+        plan["sell_orders"] = [item for item in plan.get("sell_orders", []) if _is_short_entry_order(item)]
+    elif mode == "flat_follow_long":
+        plan["bootstrap_orders"] = []
+        plan["sell_orders"] = []
+        plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if _is_long_entry_order(item)]
+    elif mode == "hold_short_wait":
+        plan["bootstrap_orders"] = []
+        plan["buy_orders"] = []
+        plan["sell_orders"] = []
+    elif mode == "hold_short_exit":
+        plan["bootstrap_orders"] = []
+        plan["sell_orders"] = []
+        plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if _is_short_exit_order(item)]
+    elif mode == "hold_long_wait":
+        plan["bootstrap_orders"] = []
+        plan["buy_orders"] = []
+        plan["sell_orders"] = []
+    elif mode == "hold_long_exit":
+        plan["bootstrap_orders"] = []
+        plan["buy_orders"] = []
+        plan["sell_orders"] = [item for item in plan.get("sell_orders", []) if _is_long_exit_order(item)]
+
+    result["applied"] = True
+    result["buy_orders_after"] = len(plan.get("buy_orders", []))
+    result["sell_orders_after"] = len(plan.get("sell_orders", []))
+    result["bootstrap_orders_after"] = len(plan.get("bootstrap_orders", []))
+    return result
 
 
 def assess_xaut_adaptive_regime(
@@ -3695,6 +3980,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "reason": None,
         "switched": False,
     }
+    synthetic_trend_follow = {
+        "enabled": bool(getattr(args, "synthetic_trend_follow_enabled", False)),
+        "available": False,
+        "active": False,
+        "direction": None,
+        "reason": "disabled" if not getattr(args, "synthetic_trend_follow_enabled", False) else "pending",
+        "mode": "disabled" if not getattr(args, "synthetic_trend_follow_enabled", False) else "inactive",
+        "window_1m": None,
+        "window_3m": None,
+        "window_1m_efficiency_ratio": 0.0,
+        "window_3m_efficiency_ratio": 0.0,
+        "min_efficiency_ratio": max(_safe_float(getattr(args, "synthetic_trend_follow_min_efficiency_ratio", 0.0)), 0.0),
+        "reverse_delay_seconds": max(_safe_float(getattr(args, "synthetic_trend_follow_reverse_delay_seconds", 0.0)), 0.0),
+        "reverse_delay_active": False,
+        "reverse_delay_remaining_seconds": 0.0,
+        "cooldown_until": None,
+        "flow_entry_side": None,
+        "flow_inventory_direction": None,
+        "current_inventory_direction": None,
+        "current_inventory_qty": 0.0,
+    }
 
     if startup_pending and not _is_custom_grid_mode(args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
         flat_start_guard = assess_flat_start_guard(
@@ -4018,6 +4324,26 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             sell_offset_steps=float((market_bias or {}).get("sell_offset_steps", 0.0)),
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
+        synthetic_trend_follow = resolve_synthetic_trend_follow(
+            state=state,
+            market_guard=market_guard,
+            now=plan_now,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            enabled=bool(getattr(effective_args, "synthetic_trend_follow_enabled", False)),
+            window_1m_abs_return_ratio=getattr(effective_args, "synthetic_trend_follow_1m_abs_return_ratio", None),
+            window_1m_amplitude_ratio=getattr(effective_args, "synthetic_trend_follow_1m_amplitude_ratio", None),
+            window_3m_abs_return_ratio=getattr(effective_args, "synthetic_trend_follow_3m_abs_return_ratio", None),
+            window_3m_amplitude_ratio=getattr(effective_args, "synthetic_trend_follow_3m_amplitude_ratio", None),
+            min_efficiency_ratio=getattr(effective_args, "synthetic_trend_follow_min_efficiency_ratio", None),
+            reverse_delay_seconds=getattr(effective_args, "synthetic_trend_follow_reverse_delay_seconds", None),
+        )
+        synthetic_trend_follow.update(
+            apply_synthetic_trend_follow_guard(
+                plan=plan,
+                trend_follow=synthetic_trend_follow,
+            )
+        )
         controls = apply_hedge_position_controls(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -4325,6 +4651,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
+        "synthetic_trend_follow": synthetic_trend_follow,
         "auto_regime": auto_regime,
         "xaut_adaptive": xaut_adaptive,
         "current_long_qty": current_long_qty,
@@ -4778,6 +5105,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--synthetic-trend-follow-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--synthetic-trend-follow-1m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--synthetic-trend-follow-1m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--synthetic-trend-follow-3m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--synthetic-trend-follow-3m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--synthetic-trend-follow-min-efficiency-ratio", type=float, default=0.0)
+    parser.add_argument("--synthetic-trend-follow-reverse-delay-seconds", type=float, default=0.0)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -4827,6 +5161,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
+    parser.add_argument("--max-actual-net-notional", type=float, default=None)
+    parser.add_argument("--max-synthetic-drift-notional", type=float, default=None)
     parser.add_argument("--reset-state", action="store_true")
     return parser
 
@@ -4934,6 +5270,16 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         )
         if summary.get("market_bias_switch_reason"):
             print(f"  switch_reason: {summary['market_bias_switch_reason']}")
+    if summary.get("synthetic_trend_follow_enabled"):
+        print(
+            "  synthetic_trend: "
+            f"mode={summary.get('synthetic_trend_follow_mode', '--')} "
+            f"active={'yes' if summary.get('synthetic_trend_follow_active') else 'no'} "
+            f"dir={summary.get('synthetic_trend_follow_direction', '--')} "
+            f"delay={'yes' if summary.get('synthetic_trend_follow_reverse_delay_active') else 'no'}"
+        )
+        if summary.get("synthetic_trend_follow_reason"):
+            print(f"  trend_reason: {summary['synthetic_trend_follow_reason']}")
     if summary.get("shift_moves"):
         shift_text = ", ".join(f"{item['direction']}->{_price(item['new_center_price'])}" for item in summary["shift_moves"])
         print(f"  shifts: {shift_text}")
@@ -5076,6 +5422,29 @@ def main() -> None:
         )
     ):
         raise SystemExit("adaptive step requires at least one positive shock/trend trigger threshold")
+    if args.synthetic_trend_follow_1m_abs_return_ratio < 0 or args.synthetic_trend_follow_1m_amplitude_ratio < 0:
+        raise SystemExit("--synthetic-trend-follow 1m thresholds must be >= 0")
+    if args.synthetic_trend_follow_3m_abs_return_ratio < 0 or args.synthetic_trend_follow_3m_amplitude_ratio < 0:
+        raise SystemExit("--synthetic-trend-follow 3m thresholds must be >= 0")
+    if (
+        args.synthetic_trend_follow_min_efficiency_ratio < 0
+        or args.synthetic_trend_follow_min_efficiency_ratio > 1.0
+    ):
+        raise SystemExit("--synthetic-trend-follow-min-efficiency-ratio must be within [0, 1]")
+    if args.synthetic_trend_follow_reverse_delay_seconds < 0:
+        raise SystemExit("--synthetic-trend-follow-reverse-delay-seconds must be >= 0")
+    if args.synthetic_trend_follow_enabled and str(args.strategy_mode).strip() != "synthetic_neutral":
+        raise SystemExit("--synthetic-trend-follow-enabled currently requires --strategy-mode synthetic_neutral")
+    if args.synthetic_trend_follow_enabled and not any(
+        threshold > 0
+        for threshold in (
+            args.synthetic_trend_follow_1m_abs_return_ratio,
+            args.synthetic_trend_follow_1m_amplitude_ratio,
+            args.synthetic_trend_follow_3m_abs_return_ratio,
+            args.synthetic_trend_follow_3m_amplitude_ratio,
+        )
+    ):
+        raise SystemExit("synthetic trend follow requires at least one positive trigger threshold")
     if args.auto_regime_confirm_cycles <= 0:
         raise SystemExit("--auto-regime-confirm-cycles must be > 0")
     if args.auto_regime_stable_15m_max_amplitude_ratio <= 0 or args.auto_regime_stable_60m_max_amplitude_ratio <= 0:
@@ -5388,6 +5757,17 @@ def main() -> None:
                 "market_bias_switch_confirm_cycles": int(((plan_report.get("market_bias_regime_switch") or {}).get("confirm_cycles", 0) or 0)),
                 "market_bias_switch_reason": (plan_report.get("market_bias_regime_switch") or {}).get("reason"),
                 "market_bias_switch_switched": bool(((plan_report.get("market_bias_regime_switch") or {}).get("switched"))),
+                "synthetic_trend_follow_enabled": bool(((plan_report.get("synthetic_trend_follow") or {}).get("enabled"))),
+                "synthetic_trend_follow_active": bool(((plan_report.get("synthetic_trend_follow") or {}).get("active"))),
+                "synthetic_trend_follow_mode": str(((plan_report.get("synthetic_trend_follow") or {}).get("mode", "") or "")),
+                "synthetic_trend_follow_direction": str(((plan_report.get("synthetic_trend_follow") or {}).get("direction", "") or "")),
+                "synthetic_trend_follow_reason": (plan_report.get("synthetic_trend_follow") or {}).get("reason"),
+                "synthetic_trend_follow_reverse_delay_active": bool(
+                    ((plan_report.get("synthetic_trend_follow") or {}).get("reverse_delay_active"))
+                ),
+                "synthetic_trend_follow_reverse_delay_remaining_seconds": _safe_float(
+                    (plan_report.get("synthetic_trend_follow") or {}).get("reverse_delay_remaining_seconds")
+                ),
                 "effective_buy_levels": int(plan_report.get("effective_buy_levels", 0) or 0),
                 "effective_sell_levels": int(plan_report.get("effective_sell_levels", 0) or 0),
                 "effective_per_order_notional": _safe_float(plan_report.get("effective_per_order_notional")),

@@ -206,6 +206,30 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["inventory_tier_per_order_notional"], 45.0)
         self.assertEqual(payload["inventory_tier_base_position_notional"], 100.0)
 
+    def test_runner_preset_payload_applies_xaut_guarded_ping_pong_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_guarded_ping_pong_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_guarded_ping_pong_v1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 2.2)
+        self.assertEqual(payload["buy_levels"], 1)
+        self.assertEqual(payload["sell_levels"], 1)
+        self.assertEqual(payload["per_order_notional"], 100.0)
+        self.assertEqual(payload["base_position_notional"], 0.0)
+        self.assertTrue(payload["market_bias_enabled"])
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["synthetic_trend_follow_enabled"])
+        self.assertEqual(payload["synthetic_trend_follow_1m_abs_return_ratio"], 0.00045)
+        self.assertEqual(payload["synthetic_trend_follow_1m_amplitude_ratio"], 0.00070)
+        self.assertEqual(payload["synthetic_trend_follow_3m_abs_return_ratio"], 0.00090)
+        self.assertEqual(payload["synthetic_trend_follow_3m_amplitude_ratio"], 0.00120)
+        self.assertEqual(payload["synthetic_trend_follow_min_efficiency_ratio"], 0.58)
+        self.assertEqual(payload["synthetic_trend_follow_reverse_delay_seconds"], 18.0)
+        self.assertEqual(payload["max_position_notional"], 220.0)
+        self.assertEqual(payload["max_short_position_notional"], 220.0)
+        self.assertEqual(payload["max_actual_net_notional"], 120.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+
     def test_normalize_runner_control_payload_supports_volume_trigger_fields(self) -> None:
         payload = _normalize_runner_control_payload(
             {
@@ -278,6 +302,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["adaptive_step_max_scale"], 3.0)
         self.assertEqual(payload["adaptive_step_min_per_order_scale"], 0.35)
         self.assertEqual(payload["adaptive_step_min_position_limit_scale"], 0.45)
+
+    def test_normalize_runner_control_payload_supports_synthetic_trend_follow_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "XAUTUSDT",
+                "strategy_profile": "xaut_guarded_ping_pong_v1",
+                "synthetic_trend_follow_enabled": True,
+                "synthetic_trend_follow_1m_abs_return_ratio": 0.00045,
+                "synthetic_trend_follow_1m_amplitude_ratio": 0.00070,
+                "synthetic_trend_follow_3m_abs_return_ratio": 0.00090,
+                "synthetic_trend_follow_3m_amplitude_ratio": 0.00120,
+                "synthetic_trend_follow_min_efficiency_ratio": 0.58,
+                "synthetic_trend_follow_reverse_delay_seconds": 18.0,
+            }
+        )
+
+        self.assertTrue(payload["synthetic_trend_follow_enabled"])
+        self.assertEqual(payload["synthetic_trend_follow_1m_abs_return_ratio"], 0.00045)
+        self.assertEqual(payload["synthetic_trend_follow_1m_amplitude_ratio"], 0.00070)
+        self.assertEqual(payload["synthetic_trend_follow_3m_abs_return_ratio"], 0.00090)
+        self.assertEqual(payload["synthetic_trend_follow_3m_amplitude_ratio"], 0.00120)
+        self.assertEqual(payload["synthetic_trend_follow_min_efficiency_ratio"], 0.58)
+        self.assertEqual(payload["synthetic_trend_follow_reverse_delay_seconds"], 18.0)
 
     def test_resolve_runner_volume_trigger_action_starts_when_volume_above_threshold(self) -> None:
         decision = _resolve_runner_volume_trigger_action(
@@ -574,6 +621,27 @@ class WebSecurityTests(unittest.TestCase):
     def test_resolve_runner_start_config_rejects_xaut_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
             _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_long_adaptive_v1"})
+
+    def test_resolve_runner_start_config_rejects_xaut_guarded_ping_pong_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_guarded_ping_pong_v1"})
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_xaut_guarded_ping_pong_profile(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config({"symbol": "XAUTUSDT", "strategy_profile": "xaut_guarded_ping_pong_v1"})
+        self.assertEqual(config["strategy_profile"], "xaut_guarded_ping_pong_v1")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(config["state_path"], "output/xautusdt_loop_state.json")
+        self.assertAlmostEqual(config["step_price"], 2.2)
+        self.assertEqual(config["buy_levels"], 1)
+        self.assertEqual(config["sell_levels"], 1)
+        self.assertTrue(config["adaptive_step_enabled"])
+        self.assertTrue(config["market_bias_enabled"])
+        self.assertTrue(config["synthetic_trend_follow_enabled"])
+        self.assertEqual(config["synthetic_trend_follow_reverse_delay_seconds"], 18.0)
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
@@ -964,6 +1032,49 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adaptive-step-min-per-order-scale", command)
         self.assertIn("--adaptive-step-min-position-limit-scale", command)
 
+    def test_build_runner_command_includes_synthetic_trend_follow_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "XAUTUSDT",
+                "strategy_profile": "xaut_guarded_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 2.2,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 100.0,
+                "base_position_notional": 0.0,
+                "synthetic_trend_follow_enabled": True,
+                "synthetic_trend_follow_1m_abs_return_ratio": 0.00045,
+                "synthetic_trend_follow_1m_amplitude_ratio": 0.00070,
+                "synthetic_trend_follow_3m_abs_return_ratio": 0.00090,
+                "synthetic_trend_follow_3m_amplitude_ratio": 0.00120,
+                "synthetic_trend_follow_min_efficiency_ratio": 0.58,
+                "synthetic_trend_follow_reverse_delay_seconds": 18.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 6,
+                "max_total_notional": 260.0,
+                "sleep_seconds": 3.0,
+                "state_path": "output/xautusdt_loop_state.json",
+                "plan_json": "output/xautusdt_loop_latest_plan.json",
+                "submit_report_json": "output/xautusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/xautusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+        self.assertIn("--synthetic-trend-follow-enabled", command)
+        self.assertIn("--synthetic-trend-follow-1m-abs-return-ratio", command)
+        self.assertIn("--synthetic-trend-follow-1m-amplitude-ratio", command)
+        self.assertIn("--synthetic-trend-follow-3m-abs-return-ratio", command)
+        self.assertIn("--synthetic-trend-follow-3m-amplitude-ratio", command)
+        self.assertIn("--synthetic-trend-follow-min-efficiency-ratio", command)
+        self.assertIn("--synthetic-trend-follow-reverse-delay-seconds", command)
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -1264,7 +1375,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertNotIn("based_volume_long_trigger_v1", opn_keys)
         self.assertIn("based_volume_push_bard_v1", opn_keys)
         self.assertIn("xaut_volume_short_v1", xaut_keys)
+        self.assertIn("xaut_guarded_ping_pong_v1", xaut_keys)
         self.assertNotIn("xaut_volume_short_v1", opn_keys)
+        self.assertNotIn("xaut_guarded_ping_pong_v1", opn_keys)
 
     def test_runner_preset_payload_for_bard_12h_push_neutral_v2(self) -> None:
         payload = _runner_preset_payload("bard_12h_push_neutral_v2", {"symbol": "BARDUSDT"})
