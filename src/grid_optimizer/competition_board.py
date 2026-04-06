@@ -557,7 +557,7 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
             },
             {
                 "tabLabel": "交易量挑战赛 - 第二阶段",
-                "resourceId": 46948,
+                "resourceId": 46951,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "KAT",
@@ -702,14 +702,48 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 第 51 - 200 名
 平分 150,000 BARD
 """,
-            }
+            },
+            {
+                "tabLabel": "交易量挑战赛 - 第二阶段",
+                "resourceId": 47459,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BARD",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/05 08:00 - 2026/04/15 07:59",
+                "activityEndAt": "2026-04-15T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/05 08:00 - 2026/04/15 07:59
+累计 BARD U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+75,000 BARD
+第 2 名
+60,000 BARD
+第 3 名
+35,000 BARD
+第 4 名
+20,000 BARD
+第 5 名
+10,000 BARD
+第 6 - 20 名
+平分 75,000 BARD
+第 21 - 50 名
+平分 75,000 BARD
+第 51 - 200 名
+平分 150,000 BARD
+""",
+            },
         ]
     },
     "futures_based": {
         "boards": [
             {
                 "tabLabel": "交易量挑战赛 - 第一阶段",
-                "resourceId": 0,
+                "resourceId": 47866,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "BASED",
@@ -743,7 +777,7 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
             },
             {
                 "tabLabel": "交易量挑战赛 - 第二阶段",
-                "resourceId": 0,
+                "resourceId": 47868,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "BASED",
@@ -2052,19 +2086,28 @@ def _fetch_symbol_close_price_usdt(symbol: str, end_at: datetime) -> float | Non
         "limit": 1,
         "endTime": int(end_at.astimezone(timezone.utc).timestamp() * 1000),
     }
-    try:
-        resp = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=10)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception:
-        return None
-    if not isinstance(payload, list) or not payload:
-        return None
-    row = payload[-1]
-    if not isinstance(row, list) or len(row) < 5:
-        return None
-    price = _safe_float(row[4])
-    if price is None or price <= 0:
+    def _fetch_from(url: str) -> float | None:
+        try:
+            resp = requests.get(url, params=params, timeout=10)
+            resp.raise_for_status()
+            payload = resp.json()
+        except Exception:
+            return None
+        if not isinstance(payload, list) or not payload:
+            return None
+        row = payload[-1]
+        if not isinstance(row, list) or len(row) < 5:
+            return None
+        price = _safe_float(row[4])
+        if price is None or price <= 0:
+            return None
+        return float(price)
+
+    price = _fetch_from("https://api.binance.com/api/v3/klines")
+    if price is None:
+        # Spot may not list some newer futures tokens; fall back to USDT-m futures.
+        price = _fetch_from("https://fapi.binance.com/fapi/v1/klines")
+    if price is None:
         return None
     with _PRICE_CACHE_LOCK:
         cached = _load_reward_price_cache()
@@ -2280,6 +2323,12 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
             continue
         end_at = _parse_iso_datetime(board.get("activity_end_at"))
         if end_at is None or end_at.astimezone(timezone.utc) <= now:
+            continue
+        start_at = _parse_iso_datetime(board.get("activity_start_at"))
+        if start_at is None:
+            start_raw, _ = _parse_activity_period_bounds(str(board.get("activity_period_text", "")).strip())
+            start_at = _parse_iso_datetime(start_raw)
+        if start_at is not None and start_at.astimezone(timezone.utc) > now:
             continue
         if str(board.get("market", "")).strip() != "futures":
             continue

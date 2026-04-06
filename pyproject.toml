@@ -10,6 +10,13 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = ["requests>=2.31"]
 
+[project.optional-dependencies]
+platform-db = [
+    "SQLAlchemy>=2.0,<3",
+    "alembic>=1.13,<2",
+    "psycopg[binary]>=3.1,<4",
+]
+
 [project.scripts]
 grid-opt = "grid_optimizer.cli:main"
 grid-competition-report = "grid_optimizer.competition_report:main"
