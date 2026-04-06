@@ -40,6 +40,7 @@ from grid_optimizer.loop_runner import (
     resolve_market_bias_entry_pause,
     resolve_market_bias_offsets,
     resolve_market_bias_regime_switch,
+    resolve_adaptive_step_price,
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
     update_synthetic_order_refs,
@@ -2045,6 +2046,125 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(effective.inventory_tier_sell_levels, 2)
         self.assertEqual(effective.inventory_tier_per_order_notional, 30.0)
         self.assertEqual(effective.inventory_tier_base_position_notional, 50.0)
+
+    def test_resolve_adaptive_step_price_widens_step_for_fast_move(self) -> None:
+        state = {
+            "adaptive_step_history": [
+                {"ts": "2026-04-05T16:06:49+00:00", "mid_price": 0.06665},
+                {"ts": "2026-04-05T16:06:56+00:00", "mid_price": 0.06685},
+                {"ts": "2026-04-05T16:07:03+00:00", "mid_price": 0.06655},
+                {"ts": "2026-04-05T16:07:10+00:00", "mid_price": 0.06635},
+                {"ts": "2026-04-05T16:07:17+00:00", "mid_price": 0.06625},
+            ]
+        }
+
+        result = resolve_adaptive_step_price(
+            state=state,
+            now=datetime(2026, 4, 5, 16, 7, 19, tzinfo=timezone.utc),
+            mid_price=0.06625,
+            base_step_price=0.0001,
+            tick_size=0.00001,
+            enabled=True,
+            window_30s_abs_return_ratio=0.0028,
+            window_30s_amplitude_ratio=0.0035,
+            window_1m_abs_return_ratio=0.0045,
+            window_1m_amplitude_ratio=0.0065,
+            window_3m_abs_return_ratio=0.0100,
+            window_5m_abs_return_ratio=0.0140,
+            max_scale=3.0,
+            base_per_order_notional=100.0,
+            base_pause_buy_position_notional=2000.0,
+            base_max_position_notional=2400.0,
+            min_per_order_scale=0.35,
+            min_position_limit_scale=0.45,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertTrue(result["controls_active"])
+        self.assertEqual(result["dominant_window"], "window_30s")
+        self.assertEqual(result["dominant_metric"], "amplitude_ratio")
+        self.assertGreater(result["scale"], 2.0)
+        self.assertAlmostEqual(result["effective_step_price"], 0.00026, places=8)
+        self.assertAlmostEqual(result["effective_per_order_notional"], 38.64583333, places=6)
+        self.assertAlmostEqual(result["effective_pause_buy_position_notional"], 900.0, places=6)
+        self.assertAlmostEqual(result["effective_max_position_notional"], 1080.0, places=6)
+
+    def test_resolve_adaptive_step_price_keeps_widened_step_during_sustained_trend(self) -> None:
+        state = {
+            "adaptive_step_history": [
+                {"ts": "2026-04-05T16:00:00+00:00", "mid_price": 0.06000},
+                {"ts": "2026-04-05T16:01:00+00:00", "mid_price": 0.06024},
+                {"ts": "2026-04-05T16:02:00+00:00", "mid_price": 0.06045},
+                {"ts": "2026-04-05T16:03:00+00:00", "mid_price": 0.06058},
+                {"ts": "2026-04-05T16:04:00+00:00", "mid_price": 0.06078},
+                {"ts": "2026-04-05T16:04:45+00:00", "mid_price": 0.06082},
+            ]
+        }
+
+        result = resolve_adaptive_step_price(
+            state=state,
+            now=datetime(2026, 4, 5, 16, 4, 55, tzinfo=timezone.utc),
+            mid_price=0.06084,
+            base_step_price=0.0001,
+            tick_size=0.00001,
+            enabled=True,
+            window_30s_abs_return_ratio=0.0028,
+            window_30s_amplitude_ratio=0.0035,
+            window_1m_abs_return_ratio=0.0045,
+            window_1m_amplitude_ratio=0.0065,
+            window_3m_abs_return_ratio=0.0100,
+            window_5m_abs_return_ratio=0.0140,
+            max_scale=3.0,
+            base_per_order_notional=100.0,
+            base_pause_buy_position_notional=2000.0,
+            min_per_order_scale=0.35,
+            min_position_limit_scale=0.45,
+        )
+
+        self.assertTrue(result["active"])
+        self.assertTrue(result["controls_active"])
+        self.assertIn(result["dominant_window"], {"window_3m", "window_5m"})
+        self.assertEqual(result["dominant_metric"], "abs_return_ratio")
+        self.assertGreater(result["effective_step_price"], 0.0001)
+        self.assertLess(result["effective_per_order_notional"], 100.0)
+        self.assertLess(result["effective_pause_buy_position_notional"], 2000.0)
+
+    def test_resolve_adaptive_step_price_returns_to_base_when_market_calms(self) -> None:
+        state = {
+            "adaptive_step_history": [
+                {"ts": "2026-04-05T16:20:00+00:00", "mid_price": 0.06620},
+                {"ts": "2026-04-05T16:20:15+00:00", "mid_price": 0.06621},
+                {"ts": "2026-04-05T16:20:30+00:00", "mid_price": 0.06622},
+                {"ts": "2026-04-05T16:20:45+00:00", "mid_price": 0.06622},
+            ]
+        }
+
+        result = resolve_adaptive_step_price(
+            state=state,
+            now=datetime(2026, 4, 5, 16, 20, 55, tzinfo=timezone.utc),
+            mid_price=0.06621,
+            base_step_price=0.0001,
+            tick_size=0.00001,
+            enabled=True,
+            window_30s_abs_return_ratio=0.0028,
+            window_30s_amplitude_ratio=0.0035,
+            window_1m_abs_return_ratio=0.0045,
+            window_1m_amplitude_ratio=0.0065,
+            window_3m_abs_return_ratio=0.0100,
+            window_5m_abs_return_ratio=0.0140,
+            max_scale=3.0,
+            base_per_order_notional=100.0,
+            base_pause_buy_position_notional=2000.0,
+            min_per_order_scale=0.35,
+            min_position_limit_scale=0.45,
+        )
+
+        self.assertFalse(result["active"])
+        self.assertFalse(result["controls_active"])
+        self.assertAlmostEqual(result["scale"], 1.0, places=8)
+        self.assertAlmostEqual(result["effective_step_price"], 0.0001, places=8)
+        self.assertAlmostEqual(result["effective_per_order_notional"], 100.0, places=8)
+        self.assertAlmostEqual(result["effective_pause_buy_position_notional"], 2000.0, places=8)
 
 
 if __name__ == "__main__":

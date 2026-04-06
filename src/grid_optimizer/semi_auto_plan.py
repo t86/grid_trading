@@ -1170,6 +1170,16 @@ def _config_payload(args: argparse.Namespace, symbol_info: dict[str, Any]) -> di
         "neutral_hourly_scale_defensive",
         "max_position_notional",
         "max_short_position_notional",
+        "adaptive_step_enabled",
+        "adaptive_step_30s_abs_return_ratio",
+        "adaptive_step_30s_amplitude_ratio",
+        "adaptive_step_1m_abs_return_ratio",
+        "adaptive_step_1m_amplitude_ratio",
+        "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_max_scale",
+        "adaptive_step_min_per_order_scale",
+        "adaptive_step_min_position_limit_scale",
     )
     for key in optional_fields:
         if hasattr(args, key):

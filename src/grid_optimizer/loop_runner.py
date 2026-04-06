@@ -162,6 +162,8 @@ XAUT_ADAPTIVE_MIN_STEP_BASE_RATIO = 0.30
 XAUT_ADAPTIVE_MIN_STEP_MID_RATIO = 0.00045
 XAUT_ADAPTIVE_MIN_STEP_TICKS = 20
 XAUT_ADAPTIVE_MIN_STEP_SPREADS = 20.0
+ADAPTIVE_STEP_HISTORY_RETENTION_SECONDS = 10 * 60
+ADAPTIVE_STEP_MIN_COVERAGE_RATIO = 0.5
 
 
 class StartupProtectionError(RuntimeError):
@@ -332,6 +334,284 @@ def _round_up_to_step(value: float, step: float | None) -> float:
         return float(value)
     units = max(int(math.ceil(max(float(value), 0.0) / float(step))), 0)
     return units * float(step)
+
+
+def _normalize_adaptive_step_history(
+    raw: Any,
+    *,
+    now: datetime,
+    retention_seconds: int = ADAPTIVE_STEP_HISTORY_RETENTION_SECONDS,
+) -> list[tuple[datetime, float]]:
+    if not isinstance(raw, list):
+        return []
+    cutoff = now - timedelta(seconds=max(int(retention_seconds), 60))
+    future_tolerance = now + timedelta(seconds=5)
+    dedup: dict[datetime, float] = {}
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        ts_raw = item.get("ts")
+        mid_price = _safe_float(item.get("mid_price"))
+        if not ts_raw or mid_price <= 0:
+            continue
+        try:
+            ts = datetime.fromisoformat(str(ts_raw))
+        except (TypeError, ValueError):
+            continue
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        else:
+            ts = ts.astimezone(timezone.utc)
+        if ts < cutoff or ts > future_tolerance:
+            continue
+        dedup[ts] = mid_price
+    return sorted(dedup.items(), key=lambda item: item[0])
+
+
+def _serialize_adaptive_step_history(history: list[tuple[datetime, float]]) -> list[dict[str, Any]]:
+    return [{"ts": ts.isoformat(), "mid_price": float(price)} for ts, price in history]
+
+
+def _append_adaptive_step_sample(
+    *,
+    state: dict[str, Any],
+    now: datetime,
+    mid_price: float,
+) -> list[tuple[datetime, float]]:
+    history = _normalize_adaptive_step_history(state.get("adaptive_step_history"), now=now)
+    safe_mid_price = max(float(mid_price), 0.0)
+    if safe_mid_price > 0:
+        history.append((now, safe_mid_price))
+        dedup: dict[datetime, float] = {}
+        for ts, price in history:
+            dedup[ts] = price
+        history = sorted(dedup.items(), key=lambda item: item[0])
+    state["adaptive_step_history"] = _serialize_adaptive_step_history(history)
+    return history
+
+
+def _resolve_adaptive_step_window_stats(
+    history: list[tuple[datetime, float]],
+    *,
+    now: datetime,
+    window_seconds: int,
+) -> dict[str, Any] | None:
+    safe_window_seconds = max(int(window_seconds), 0)
+    if safe_window_seconds <= 0 or len(history) < 2:
+        return None
+    boundary = now - timedelta(seconds=safe_window_seconds)
+    timestamps = [ts for ts, _ in history]
+    start_index = bisect.bisect_left(timestamps, boundary)
+    if start_index > 0:
+        start_index -= 1
+    window = [(ts, price) for ts, price in history[start_index:] if ts <= now]
+    if len(window) < 2:
+        return None
+    coverage_seconds = max((window[-1][0] - window[0][0]).total_seconds(), 0.0)
+    if coverage_seconds < safe_window_seconds * ADAPTIVE_STEP_MIN_COVERAGE_RATIO:
+        return None
+    prices = [price for _, price in window]
+    open_price = prices[0]
+    close_price = prices[-1]
+    high_price = max(prices)
+    low_price = min(prices)
+    return {
+        "window_seconds": safe_window_seconds,
+        "sample_count": len(window),
+        "coverage_seconds": coverage_seconds,
+        "open_time": window[0][0].isoformat(),
+        "close_time": window[-1][0].isoformat(),
+        "open": open_price,
+        "close": close_price,
+        "high": high_price,
+        "low": low_price,
+        "return_ratio": (close_price / open_price - 1.0) if open_price > 0 else 0.0,
+        "amplitude_ratio": (high_price / low_price - 1.0) if low_price > 0 else 0.0,
+    }
+
+
+def resolve_adaptive_step_price(
+    *,
+    state: dict[str, Any],
+    now: datetime,
+    mid_price: float,
+    base_step_price: float,
+    tick_size: float | None,
+    enabled: bool,
+    window_30s_abs_return_ratio: float | None,
+    window_30s_amplitude_ratio: float | None,
+    window_1m_abs_return_ratio: float | None,
+    window_1m_amplitude_ratio: float | None,
+    window_3m_abs_return_ratio: float | None,
+    window_5m_abs_return_ratio: float | None,
+    max_scale: float,
+    base_per_order_notional: float | None = None,
+    base_base_position_notional: float | None = None,
+    base_inventory_tier_start_notional: float | None = None,
+    base_inventory_tier_end_notional: float | None = None,
+    base_inventory_tier_per_order_notional: float | None = None,
+    base_inventory_tier_base_position_notional: float | None = None,
+    base_pause_buy_position_notional: float | None = None,
+    base_pause_short_position_notional: float | None = None,
+    base_max_position_notional: float | None = None,
+    base_max_short_position_notional: float | None = None,
+    base_max_total_notional: float | None = None,
+    min_per_order_scale: float = 1.0,
+    min_position_limit_scale: float = 1.0,
+) -> dict[str, Any]:
+    def _safe_min_scale(value: float | None) -> float:
+        return min(max(_safe_float(value), 0.0), 1.0) or 0.0
+
+    def _scale_if_positive(value: float | None, ratio: float) -> float | None:
+        if value is None:
+            return None
+        safe_value = float(value)
+        if safe_value <= 0:
+            return safe_value
+        return safe_value * ratio
+
+    history = _append_adaptive_step_sample(
+        state=state,
+        now=now,
+        mid_price=mid_price,
+    )
+    safe_base_step = max(float(base_step_price), 0.0)
+    safe_tick = max(_safe_float(tick_size), 0.0)
+    safe_max_scale = max(float(max_scale), 1.0)
+    safe_min_per_order_scale = _safe_min_scale(min_per_order_scale) or 1.0
+    safe_min_position_limit_scale = _safe_min_scale(min_position_limit_scale) or 1.0
+    report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "controls_active": False,
+        "base_step_price": safe_base_step,
+        "effective_step_price": safe_base_step,
+        "scale": 1.0,
+        "raw_scale": 1.0,
+        "per_order_scale": 1.0,
+        "position_limit_scale": 1.0,
+        "dominant_window": None,
+        "dominant_metric": None,
+        "dominant_value": 0.0,
+        "dominant_threshold": 0.0,
+        "reason": None,
+        "history_count": len(history),
+        "metrics": {
+            "window_30s": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=30),
+            "window_1m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=60),
+            "window_3m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=180),
+            "window_5m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=300),
+        },
+        "effective_per_order_notional": _scale_if_positive(base_per_order_notional, 1.0),
+        "effective_base_position_notional": _scale_if_positive(base_base_position_notional, 1.0),
+        "effective_inventory_tier_start_notional": _scale_if_positive(base_inventory_tier_start_notional, 1.0),
+        "effective_inventory_tier_end_notional": _scale_if_positive(base_inventory_tier_end_notional, 1.0),
+        "effective_inventory_tier_per_order_notional": _scale_if_positive(base_inventory_tier_per_order_notional, 1.0),
+        "effective_inventory_tier_base_position_notional": _scale_if_positive(base_inventory_tier_base_position_notional, 1.0),
+        "effective_pause_buy_position_notional": _scale_if_positive(base_pause_buy_position_notional, 1.0),
+        "effective_pause_short_position_notional": _scale_if_positive(base_pause_short_position_notional, 1.0),
+        "effective_max_position_notional": _scale_if_positive(base_max_position_notional, 1.0),
+        "effective_max_short_position_notional": _scale_if_positive(base_max_short_position_notional, 1.0),
+        "effective_max_total_notional": _scale_if_positive(base_max_total_notional, 1.0),
+    }
+    if not enabled or safe_base_step <= 0:
+        return report
+
+    thresholds = {
+        "window_30s": {
+            "abs_return_ratio": _safe_float(window_30s_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_30s_amplitude_ratio),
+        },
+        "window_1m": {
+            "abs_return_ratio": _safe_float(window_1m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_1m_amplitude_ratio),
+        },
+        "window_3m": {
+            "abs_return_ratio": _safe_float(window_3m_abs_return_ratio),
+        },
+        "window_5m": {
+            "abs_return_ratio": _safe_float(window_5m_abs_return_ratio),
+        },
+    }
+    candidates: list[tuple[float, str, str, float, float]] = []
+    for window_key, window_stats in report["metrics"].items():
+        if not isinstance(window_stats, dict):
+            continue
+        abs_return_ratio = abs(_safe_float(window_stats.get("return_ratio")))
+        amplitude_ratio = _safe_float(window_stats.get("amplitude_ratio"))
+        return_threshold = _safe_float((thresholds.get(window_key) or {}).get("abs_return_ratio"))
+        amplitude_threshold = _safe_float((thresholds.get(window_key) or {}).get("amplitude_ratio"))
+        if return_threshold > 0:
+            candidates.append(
+                (
+                    abs_return_ratio / return_threshold,
+                    window_key,
+                    "abs_return_ratio",
+                    abs_return_ratio,
+                    return_threshold,
+                )
+            )
+        if amplitude_threshold > 0:
+            candidates.append(
+                (
+                    amplitude_ratio / amplitude_threshold,
+                    window_key,
+                    "amplitude_ratio",
+                    amplitude_ratio,
+                    amplitude_threshold,
+                )
+            )
+    if not candidates:
+        return report
+
+    raw_scale, dominant_window, dominant_metric, dominant_value, dominant_threshold = max(
+        candidates,
+        key=lambda item: item[0],
+    )
+    report.update(
+        {
+            "raw_scale": raw_scale,
+            "dominant_window": dominant_window,
+            "dominant_metric": dominant_metric,
+            "dominant_value": dominant_value,
+            "dominant_threshold": dominant_threshold,
+        }
+    )
+    if raw_scale <= 1.0:
+        return report
+
+    effective_scale = min(raw_scale, safe_max_scale)
+    desired_step = safe_base_step * effective_scale
+    effective_step_price = _round_up_to_step(desired_step, safe_tick if safe_tick > 0 else None)
+    scale = (effective_step_price / safe_base_step) if safe_base_step > 0 else 1.0
+    per_order_scale = max(1.0 / effective_scale, safe_min_per_order_scale)
+    position_limit_scale = max(1.0 / effective_scale, safe_min_position_limit_scale)
+    report.update(
+        {
+            "controls_active": True,
+            "active": effective_step_price > safe_base_step + 1e-12,
+            "effective_step_price": effective_step_price,
+            "scale": scale,
+            "per_order_scale": per_order_scale,
+            "position_limit_scale": position_limit_scale,
+            "reason": (
+                f"{dominant_window} {dominant_metric}={dominant_value * 100:.2f}% "
+                f">= {dominant_threshold * 100:.2f}%"
+            ),
+            "effective_per_order_notional": _scale_if_positive(base_per_order_notional, per_order_scale),
+            "effective_base_position_notional": _scale_if_positive(base_base_position_notional, position_limit_scale),
+            "effective_inventory_tier_start_notional": _scale_if_positive(base_inventory_tier_start_notional, position_limit_scale),
+            "effective_inventory_tier_end_notional": _scale_if_positive(base_inventory_tier_end_notional, position_limit_scale),
+            "effective_inventory_tier_per_order_notional": _scale_if_positive(base_inventory_tier_per_order_notional, per_order_scale),
+            "effective_inventory_tier_base_position_notional": _scale_if_positive(base_inventory_tier_base_position_notional, position_limit_scale),
+            "effective_pause_buy_position_notional": _scale_if_positive(base_pause_buy_position_notional, position_limit_scale),
+            "effective_pause_short_position_notional": _scale_if_positive(base_pause_short_position_notional, position_limit_scale),
+            "effective_max_position_notional": _scale_if_positive(base_max_position_notional, position_limit_scale),
+            "effective_max_short_position_notional": _scale_if_positive(base_max_short_position_notional, position_limit_scale),
+            "effective_max_total_notional": _scale_if_positive(base_max_total_notional, position_limit_scale),
+        }
+    )
+    return report
 
 
 def _resolve_fixed_center_roll(
@@ -1138,6 +1418,16 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         neutral_hourly_scale_defensive=getattr(args, "neutral_hourly_scale_defensive", 0.65),
         max_position_notional=getattr(args, "max_position_notional", None),
         max_short_position_notional=getattr(args, "max_short_position_notional", None),
+        adaptive_step_enabled=getattr(args, "adaptive_step_enabled", False),
+        adaptive_step_30s_abs_return_ratio=getattr(args, "adaptive_step_30s_abs_return_ratio", 0.0),
+        adaptive_step_30s_amplitude_ratio=getattr(args, "adaptive_step_30s_amplitude_ratio", 0.0),
+        adaptive_step_1m_abs_return_ratio=getattr(args, "adaptive_step_1m_abs_return_ratio", 0.0),
+        adaptive_step_1m_amplitude_ratio=getattr(args, "adaptive_step_1m_amplitude_ratio", 0.0),
+        adaptive_step_3m_abs_return_ratio=getattr(args, "adaptive_step_3m_abs_return_ratio", 0.0),
+        adaptive_step_5m_abs_return_ratio=getattr(args, "adaptive_step_5m_abs_return_ratio", 0.0),
+        adaptive_step_max_scale=getattr(args, "adaptive_step_max_scale", 1.0),
+        adaptive_step_min_per_order_scale=getattr(args, "adaptive_step_min_per_order_scale", 1.0),
+        adaptive_step_min_position_limit_scale=getattr(args, "adaptive_step_min_position_limit_scale", 1.0),
     )
 
 
@@ -3045,6 +3335,7 @@ def apply_hedge_position_notional_caps(
 
 def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     symbol = args.symbol.upper().strip()
+    plan_now = _utc_now()
     requested_strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     strategy_mode = requested_strategy_mode
     summary_path = Path(args.summary_jsonl)
@@ -3128,6 +3419,59 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ask_price=ask_price,
             mid_price=mid_price,
         )
+    adaptive_step = resolve_adaptive_step_price(
+        state=state,
+        now=plan_now,
+        mid_price=mid_price,
+        base_step_price=effective_args.step_price,
+        tick_size=symbol_info.get("tick_size"),
+        enabled=bool(getattr(effective_args, "adaptive_step_enabled", False)),
+        window_30s_abs_return_ratio=getattr(effective_args, "adaptive_step_30s_abs_return_ratio", None),
+        window_30s_amplitude_ratio=getattr(effective_args, "adaptive_step_30s_amplitude_ratio", None),
+        window_1m_abs_return_ratio=getattr(effective_args, "adaptive_step_1m_abs_return_ratio", None),
+        window_1m_amplitude_ratio=getattr(effective_args, "adaptive_step_1m_amplitude_ratio", None),
+        window_3m_abs_return_ratio=getattr(effective_args, "adaptive_step_3m_abs_return_ratio", None),
+        window_5m_abs_return_ratio=getattr(effective_args, "adaptive_step_5m_abs_return_ratio", None),
+        max_scale=float(getattr(effective_args, "adaptive_step_max_scale", 1.0)),
+        base_per_order_notional=getattr(effective_args, "per_order_notional", None),
+        base_base_position_notional=getattr(effective_args, "base_position_notional", None),
+        base_inventory_tier_start_notional=getattr(effective_args, "inventory_tier_start_notional", None),
+        base_inventory_tier_end_notional=getattr(effective_args, "inventory_tier_end_notional", None),
+        base_inventory_tier_per_order_notional=getattr(effective_args, "inventory_tier_per_order_notional", None),
+        base_inventory_tier_base_position_notional=getattr(effective_args, "inventory_tier_base_position_notional", None),
+        base_pause_buy_position_notional=getattr(effective_args, "pause_buy_position_notional", None),
+        base_pause_short_position_notional=getattr(effective_args, "pause_short_position_notional", None),
+        base_max_position_notional=getattr(effective_args, "max_position_notional", None),
+        base_max_short_position_notional=getattr(effective_args, "max_short_position_notional", None),
+        base_max_total_notional=getattr(effective_args, "max_total_notional", None),
+        min_per_order_scale=float(getattr(effective_args, "adaptive_step_min_per_order_scale", 1.0)),
+        min_position_limit_scale=float(getattr(effective_args, "adaptive_step_min_position_limit_scale", 1.0)),
+    )
+    if adaptive_step["controls_active"]:
+        effective_args = argparse.Namespace(**vars(effective_args))
+        effective_args.step_price = float(adaptive_step["effective_step_price"])
+        if adaptive_step.get("effective_per_order_notional") is not None:
+            effective_args.per_order_notional = float(adaptive_step["effective_per_order_notional"])
+        if adaptive_step.get("effective_base_position_notional") is not None:
+            effective_args.base_position_notional = float(adaptive_step["effective_base_position_notional"])
+        if adaptive_step.get("effective_inventory_tier_start_notional") is not None:
+            effective_args.inventory_tier_start_notional = float(adaptive_step["effective_inventory_tier_start_notional"])
+        if adaptive_step.get("effective_inventory_tier_end_notional") is not None:
+            effective_args.inventory_tier_end_notional = float(adaptive_step["effective_inventory_tier_end_notional"])
+        if adaptive_step.get("effective_inventory_tier_per_order_notional") is not None:
+            effective_args.inventory_tier_per_order_notional = float(adaptive_step["effective_inventory_tier_per_order_notional"])
+        if adaptive_step.get("effective_inventory_tier_base_position_notional") is not None:
+            effective_args.inventory_tier_base_position_notional = float(adaptive_step["effective_inventory_tier_base_position_notional"])
+        if adaptive_step.get("effective_pause_buy_position_notional") is not None:
+            effective_args.pause_buy_position_notional = float(adaptive_step["effective_pause_buy_position_notional"])
+        if adaptive_step.get("effective_pause_short_position_notional") is not None:
+            effective_args.pause_short_position_notional = float(adaptive_step["effective_pause_short_position_notional"])
+        if adaptive_step.get("effective_max_position_notional") is not None:
+            effective_args.max_position_notional = float(adaptive_step["effective_max_position_notional"])
+        if adaptive_step.get("effective_max_short_position_notional") is not None:
+            effective_args.max_short_position_notional = float(adaptive_step["effective_max_short_position_notional"])
+        if adaptive_step.get("effective_max_total_notional") is not None:
+            effective_args.max_total_notional = float(adaptive_step["effective_max_total_notional"])
     market_guard = assess_market_guard(
         symbol=symbol,
         buy_pause_amp_trigger_ratio=effective_args.buy_pause_amp_trigger_ratio,
@@ -3135,6 +3479,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         short_cover_pause_amp_trigger_ratio=getattr(effective_args, "short_cover_pause_amp_trigger_ratio", None),
         short_cover_pause_down_return_trigger_ratio=getattr(effective_args, "short_cover_pause_down_return_trigger_ratio", None),
         freeze_shift_abs_return_trigger_ratio=effective_args.freeze_shift_abs_return_trigger_ratio,
+        now=plan_now,
     )
     center_price = float(state["center_price"])
     shift_moves: list[dict[str, Any]] = []
@@ -3979,6 +4324,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "market_bias_regime_switch": market_bias_regime_switch,
         "shift_moves": shift_moves,
         "market_guard": market_guard,
+        "adaptive_step": adaptive_step,
         "auto_regime": auto_regime,
         "xaut_adaptive": xaut_adaptive,
         "current_long_qty": current_long_qty,
@@ -3999,6 +4345,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_sell_levels": inventory_tier["effective_sell_levels"],
         "effective_per_order_notional": inventory_tier["effective_per_order_notional"],
         "effective_base_position_notional": inventory_tier["effective_base_position_notional"],
+        "effective_pause_buy_position_notional": getattr(effective_args, "pause_buy_position_notional", None),
+        "effective_pause_short_position_notional": getattr(effective_args, "pause_short_position_notional", None),
+        "effective_max_position_notional": getattr(effective_args, "max_position_notional", None),
+        "effective_max_short_position_notional": getattr(effective_args, "max_short_position_notional", None),
+        "effective_max_total_notional": getattr(effective_args, "max_total_notional", None),
         "inventory_target_bands": (
             {
                 "offsets": [
@@ -4055,11 +4406,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
 
 def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
     strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    effective_max_total_notional = _safe_float(plan_report.get("effective_max_total_notional"))
     validation = validate_plan_report(
         plan_report=plan_report,
         allow_symbol=args.symbol,
         max_new_orders=args.max_new_orders,
-        max_total_notional=args.max_total_notional,
+        max_total_notional=effective_max_total_notional if effective_max_total_notional > 0 else args.max_total_notional,
         cancel_stale=args.cancel_stale,
         max_plan_age_seconds=args.max_plan_age_seconds,
         now=datetime.now(timezone.utc),
@@ -4416,6 +4768,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--short-cover-pause-amp-trigger-ratio", type=float, default=None)
     parser.add_argument("--short-cover-pause-down-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--freeze-shift-abs-return-trigger-ratio", type=float, default=None)
+    parser.add_argument("--adaptive-step-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--adaptive-step-30s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-30s-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-1m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-1m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-3m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-5m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -4502,6 +4864,20 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"shift_frozen={'yes' if summary.get('shift_frozen') else 'no'} "
             f"ret={summary.get('market_guard_return_ratio', 0.0) * 100:.2f}% "
             f"amp={summary.get('market_guard_amplitude_ratio', 0.0) * 100:.2f}%"
+        )
+    adaptive_step = summary.get("adaptive_step") if isinstance(summary.get("adaptive_step"), dict) else {}
+    if adaptive_step.get("controls_active"):
+        print(
+            "  adaptive_step: "
+            f"base={_price(_safe_float(adaptive_step.get('base_step_price')))} "
+            f"effective={_price(_safe_float(adaptive_step.get('effective_step_price')))} "
+            f"scale={_safe_float(adaptive_step.get('scale')):.2f} "
+            f"reason={adaptive_step.get('reason')}"
+        )
+        print(
+            "  adaptive_risk: "
+            f"per_order_scale={_safe_float(adaptive_step.get('per_order_scale')):.2f} "
+            f"position_limit_scale={_safe_float(adaptive_step.get('position_limit_scale')):.2f}"
         )
     if summary.get("max_position_notional"):
         print(
@@ -4676,6 +5052,30 @@ def main() -> None:
         raise SystemExit("--short-cover-pause-down-return-trigger-ratio must be < 0")
     if args.freeze_shift_abs_return_trigger_ratio is not None and args.freeze_shift_abs_return_trigger_ratio <= 0:
         raise SystemExit("--freeze-shift-abs-return-trigger-ratio must be > 0")
+    if args.adaptive_step_30s_abs_return_ratio < 0 or args.adaptive_step_30s_amplitude_ratio < 0:
+        raise SystemExit("--adaptive-step 30s thresholds must be >= 0")
+    if args.adaptive_step_1m_abs_return_ratio < 0 or args.adaptive_step_1m_amplitude_ratio < 0:
+        raise SystemExit("--adaptive-step 1m thresholds must be >= 0")
+    if args.adaptive_step_3m_abs_return_ratio < 0 or args.adaptive_step_5m_abs_return_ratio < 0:
+        raise SystemExit("--adaptive-step trend thresholds must be >= 0")
+    if args.adaptive_step_enabled and args.adaptive_step_max_scale <= 1.0:
+        raise SystemExit("--adaptive-step-max-scale must be > 1 when adaptive step is enabled")
+    if args.adaptive_step_min_per_order_scale <= 0 or args.adaptive_step_min_per_order_scale > 1.0:
+        raise SystemExit("--adaptive-step-min-per-order-scale must be within (0, 1]")
+    if args.adaptive_step_min_position_limit_scale <= 0 or args.adaptive_step_min_position_limit_scale > 1.0:
+        raise SystemExit("--adaptive-step-min-position-limit-scale must be within (0, 1]")
+    if args.adaptive_step_enabled and not any(
+        threshold > 0
+        for threshold in (
+            args.adaptive_step_30s_abs_return_ratio,
+            args.adaptive_step_30s_amplitude_ratio,
+            args.adaptive_step_1m_abs_return_ratio,
+            args.adaptive_step_1m_amplitude_ratio,
+            args.adaptive_step_3m_abs_return_ratio,
+            args.adaptive_step_5m_abs_return_ratio,
+        )
+    ):
+        raise SystemExit("adaptive step requires at least one positive shock/trend trigger threshold")
     if args.auto_regime_confirm_cycles <= 0:
         raise SystemExit("--auto-regime-confirm-cycles must be > 0")
     if args.auto_regime_stable_15m_max_amplitude_ratio <= 0 or args.auto_regime_stable_60m_max_amplitude_ratio <= 0:

@@ -96,10 +96,11 @@ class WebSecurityTests(unittest.TestCase):
     def test_monitor_page_keeps_newline_escape_in_editor_locator(self) -> None:
         self.assertIn('split("\\n").length - 1', MONITOR_PAGE)
 
-    def test_monitor_page_start_button_uses_editor_payload(self) -> None:
+    def test_monitor_page_start_button_uses_selected_preset_payload(self) -> None:
         self.assertIn("function buildRunnerPayloadFromEditor(", MONITOR_PAGE)
+        self.assertIn("function buildRunnerStartPayload(", MONITOR_PAGE)
         self.assertIn('? startPayload', MONITOR_PAGE)
-        self.assertIn("正在按当前编辑器参数启动策略", MONITOR_PAGE)
+        self.assertIn("正在按当前选中预设启动策略", MONITOR_PAGE)
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")
@@ -248,6 +249,35 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
         self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+
+    def test_normalize_runner_control_payload_supports_adaptive_step_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "BASEDUSDT",
+                "strategy_profile": "based_volume_push_bard_v1",
+                "adaptive_step_enabled": True,
+                "adaptive_step_30s_abs_return_ratio": 0.0028,
+                "adaptive_step_30s_amplitude_ratio": 0.0035,
+                "adaptive_step_1m_abs_return_ratio": 0.0045,
+                "adaptive_step_1m_amplitude_ratio": 0.0065,
+                "adaptive_step_3m_abs_return_ratio": 0.0100,
+                "adaptive_step_5m_abs_return_ratio": 0.0140,
+                "adaptive_step_max_scale": 3.0,
+                "adaptive_step_min_per_order_scale": 0.35,
+                "adaptive_step_min_position_limit_scale": 0.45,
+            }
+        )
+
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertEqual(payload["adaptive_step_30s_abs_return_ratio"], 0.0028)
+        self.assertEqual(payload["adaptive_step_30s_amplitude_ratio"], 0.0035)
+        self.assertEqual(payload["adaptive_step_1m_abs_return_ratio"], 0.0045)
+        self.assertEqual(payload["adaptive_step_1m_amplitude_ratio"], 0.0065)
+        self.assertEqual(payload["adaptive_step_3m_abs_return_ratio"], 0.0100)
+        self.assertEqual(payload["adaptive_step_5m_abs_return_ratio"], 0.0140)
+        self.assertEqual(payload["adaptive_step_max_scale"], 3.0)
+        self.assertEqual(payload["adaptive_step_min_per_order_scale"], 0.35)
+        self.assertEqual(payload["adaptive_step_min_position_limit_scale"], 0.45)
 
     def test_resolve_runner_volume_trigger_action_starts_when_volume_above_threshold(self) -> None:
         decision = _resolve_runner_volume_trigger_action(
@@ -884,6 +914,56 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--market-bias-regime-switch-weak-threshold", command)
         self.assertIn("--market-bias-regime-switch-strong-threshold", command)
 
+    def test_build_runner_command_includes_adaptive_step_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BASEDUSDT",
+                "strategy_profile": "based_volume_push_bard_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0001,
+                "buy_levels": 8,
+                "sell_levels": 8,
+                "per_order_notional": 100.0,
+                "base_position_notional": 0.0,
+                "adaptive_step_enabled": True,
+                "adaptive_step_30s_abs_return_ratio": 0.0028,
+                "adaptive_step_30s_amplitude_ratio": 0.0035,
+                "adaptive_step_1m_abs_return_ratio": 0.0045,
+                "adaptive_step_1m_amplitude_ratio": 0.0065,
+                "adaptive_step_3m_abs_return_ratio": 0.0100,
+                "adaptive_step_5m_abs_return_ratio": 0.0140,
+                "adaptive_step_max_scale": 3.0,
+                "adaptive_step_min_per_order_scale": 0.35,
+                "adaptive_step_min_position_limit_scale": 0.45,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 40,
+                "max_total_notional": 3600.0,
+                "sleep_seconds": 3,
+                "state_path": "output/basedusdt_loop_state.json",
+                "plan_json": "output/basedusdt_loop_latest_plan.json",
+                "submit_report_json": "output/basedusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/basedusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+
+        self.assertIn("--adaptive-step-enabled", command)
+        self.assertIn("--adaptive-step-30s-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-30s-amplitude-ratio", command)
+        self.assertIn("--adaptive-step-1m-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-1m-amplitude-ratio", command)
+        self.assertIn("--adaptive-step-3m-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-5m-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-max-scale", command)
+        self.assertIn("--adaptive-step-min-per-order-scale", command)
+        self.assertIn("--adaptive-step-min-position-limit-scale", command)
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -1182,7 +1262,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("based_volume_long_trigger_v1", based_keys)
         self.assertIn("based_volume_push_bard_v1", based_keys)
         self.assertNotIn("based_volume_long_trigger_v1", opn_keys)
-        self.assertNotIn("based_volume_push_bard_v1", opn_keys)
+        self.assertIn("based_volume_push_bard_v1", opn_keys)
         self.assertIn("xaut_volume_short_v1", xaut_keys)
         self.assertNotIn("xaut_volume_short_v1", opn_keys)
 
@@ -1227,19 +1307,42 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_amplitude_ratio"], 0.04)
         self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
 
-    def test_runner_preset_payload_for_based_volume_push_bard_preserves_dense_grid(self) -> None:
-        payload = _runner_preset_payload("based_volume_push_bard_v1", {"symbol": "BASEDUSDT"})
-        self.assertEqual(payload["symbol"], "BASEDUSDT")
+    def test_runner_preset_payload_for_based_volume_push_bard_is_generic(self) -> None:
+        payload = _runner_preset_payload("based_volume_push_bard_v1", {"symbol": "OPNUSDT"})
+        self.assertEqual(payload["symbol"], "OPNUSDT")
         self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
         self.assertEqual(payload["step_price"], 0.0001)
         self.assertEqual(payload["buy_levels"], 8)
         self.assertEqual(payload["sell_levels"], 8)
         self.assertEqual(payload["per_order_notional"], 100.0)
         self.assertEqual(payload["base_position_notional"], 0.0)
-        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertTrue(payload["autotune_symbol_enabled"])
         self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
-        self.assertEqual(payload["runtime_guard_stats_start_time"], "2026-03-31T18:00:00+08:00")
+        self.assertIsNone(payload["runtime_guard_stats_start_time"])
         self.assertIsNone(payload["rolling_hourly_loss_limit"])
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertEqual(payload["adaptive_step_30s_abs_return_ratio"], 0.0028)
+        self.assertEqual(payload["adaptive_step_30s_amplitude_ratio"], 0.0035)
+        self.assertEqual(payload["adaptive_step_1m_abs_return_ratio"], 0.0045)
+        self.assertEqual(payload["adaptive_step_1m_amplitude_ratio"], 0.0065)
+        self.assertEqual(payload["adaptive_step_3m_abs_return_ratio"], 0.0100)
+        self.assertEqual(payload["adaptive_step_5m_abs_return_ratio"], 0.0140)
+        self.assertEqual(payload["adaptive_step_max_scale"], 3.0)
+        self.assertEqual(payload["adaptive_step_min_per_order_scale"], 1.0)
+        self.assertEqual(payload["adaptive_step_min_position_limit_scale"], 0.65)
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_generic_based_push_profile_for_other_symbol(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config({"symbol": "OPNUSDT", "strategy_profile": "based_volume_push_bard_v1"})
+        self.assertEqual(config["strategy_profile"], "based_volume_push_bard_v1")
+        self.assertEqual(config["symbol"], "OPNUSDT")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertTrue(config["autotune_symbol_enabled"])
+        self.assertEqual(config["state_path"], "output/opnusdt_loop_state.json")
+        self.assertGreater(config["step_price"], 0)
 
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_summaries_include_custom_grid_edit_metadata(self) -> None:

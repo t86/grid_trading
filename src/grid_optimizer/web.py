@@ -364,13 +364,11 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
         },
     },
     "based_volume_push_bard_v1": {
-        "label": "BASED 双向冲量(BARD式) v1",
-        "description": "把 BARD 实盘高换手双向冲量结构直接移植到 BASEDUSDT。固定细步长、双边 8 档、零底仓，不再让 autotune 把网格拉稀。",
+        "label": "通用双向冲量自适应 v1",
+        "description": "通用的 synthetic_neutral 双向冲量模板。启动时会按币价、tick、点差和最小下单约束自动重设基础步长与单笔名义，并在 30s/1m 急波动和 3m/5m 持续单边时动态放大 step_price、收紧仓位阈值。",
         "startable": True,
         "kind": "synthetic",
-        "symbol": "BASEDUSDT",
         "config": {
-            "symbol": "BASEDUSDT",
             "strategy_mode": "synthetic_neutral",
             "step_price": 0.0001,
             "buy_levels": 8,
@@ -391,9 +389,18 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "buy_pause_amp_trigger_ratio": 0.009,
             "buy_pause_down_return_trigger_ratio": -0.005,
             "freeze_shift_abs_return_trigger_ratio": 0.006,
-            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": True,
+            "adaptive_step_30s_abs_return_ratio": 0.0028,
+            "adaptive_step_30s_amplitude_ratio": 0.0035,
+            "adaptive_step_1m_abs_return_ratio": 0.0045,
+            "adaptive_step_1m_amplitude_ratio": 0.0065,
+            "adaptive_step_3m_abs_return_ratio": 0.0100,
+            "adaptive_step_5m_abs_return_ratio": 0.0140,
+            "adaptive_step_max_scale": 3.0,
+            "adaptive_step_min_per_order_scale": 1.0,
+            "adaptive_step_min_position_limit_scale": 0.65,
+            "autotune_symbol_enabled": True,
             "excess_inventory_reduce_only_enabled": False,
-            "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
             "rolling_hourly_loss_limit": None,
             "sleep_seconds": 3.0,
         },
@@ -896,6 +903,16 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "buy_pause_amp_trigger_ratio": 0.0075,
     "buy_pause_down_return_trigger_ratio": -0.0035,
     "freeze_shift_abs_return_trigger_ratio": 0.005,
+    "adaptive_step_enabled": False,
+    "adaptive_step_30s_abs_return_ratio": 0.0,
+    "adaptive_step_30s_amplitude_ratio": 0.0,
+    "adaptive_step_1m_abs_return_ratio": 0.0,
+    "adaptive_step_1m_amplitude_ratio": 0.0,
+    "adaptive_step_3m_abs_return_ratio": 0.0,
+    "adaptive_step_5m_abs_return_ratio": 0.0,
+    "adaptive_step_max_scale": 1.0,
+    "adaptive_step_min_per_order_scale": 1.0,
+    "adaptive_step_min_position_limit_scale": 1.0,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -964,6 +981,7 @@ RUNNER_AUTOTUNE_STEP_HINTS: dict[str, tuple[float, int]] = {
     "volume_neutral_target_v1": (0.0006, 3),
     "neutral_hedge_v1": (0.0005, 3),
     "synthetic_neutral_v1": (0.0005, 3),
+    "based_volume_push_bard_v1": (0.00028, 1),
     "volume_neutral_push_v1": (0.00032, 2),
     "volume_neutral_push_guarded_v1": (0.00032, 2),
     "volume_neutral_ping_pong_v1": (0.00035, 2),
@@ -2517,6 +2535,15 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "short_cover_pause_amp_trigger_ratio",
         "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
+        "adaptive_step_30s_abs_return_ratio",
+        "adaptive_step_30s_amplitude_ratio",
+        "adaptive_step_1m_abs_return_ratio",
+        "adaptive_step_1m_amplitude_ratio",
+        "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_max_scale",
+        "adaptive_step_min_per_order_scale",
+        "adaptive_step_min_position_limit_scale",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -2575,6 +2602,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_weak_buy_pause_enabled",
         "market_bias_strong_short_pause_enabled",
         "market_bias_regime_switch_enabled",
+        "adaptive_step_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
@@ -2615,6 +2643,15 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "short_cover_pause_amp_trigger_ratio",
         "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
+        "adaptive_step_30s_abs_return_ratio",
+        "adaptive_step_30s_amplitude_ratio",
+        "adaptive_step_1m_abs_return_ratio",
+        "adaptive_step_1m_amplitude_ratio",
+        "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_max_scale",
+        "adaptive_step_min_per_order_scale",
+        "adaptive_step_min_position_limit_scale",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -2950,6 +2987,25 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--short-cover-pause-down-return-trigger-ratio", str(config["short_cover_pause_down_return_trigger_ratio"])])
     if config.get("freeze_shift_abs_return_trigger_ratio") is not None:
         command.extend(["--freeze-shift-abs-return-trigger-ratio", str(config["freeze_shift_abs_return_trigger_ratio"])])
+    command.append("--adaptive-step-enabled" if config.get("adaptive_step_enabled", False) else "--no-adaptive-step-enabled")
+    if config.get("adaptive_step_30s_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-30s-abs-return-ratio", str(config["adaptive_step_30s_abs_return_ratio"])])
+    if config.get("adaptive_step_30s_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-30s-amplitude-ratio", str(config["adaptive_step_30s_amplitude_ratio"])])
+    if config.get("adaptive_step_1m_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-1m-abs-return-ratio", str(config["adaptive_step_1m_abs_return_ratio"])])
+    if config.get("adaptive_step_1m_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-1m-amplitude-ratio", str(config["adaptive_step_1m_amplitude_ratio"])])
+    if config.get("adaptive_step_3m_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-3m-abs-return-ratio", str(config["adaptive_step_3m_abs_return_ratio"])])
+    if config.get("adaptive_step_5m_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-5m-abs-return-ratio", str(config["adaptive_step_5m_abs_return_ratio"])])
+    if config.get("adaptive_step_max_scale") is not None:
+        command.extend(["--adaptive-step-max-scale", str(config["adaptive_step_max_scale"])])
+    if config.get("adaptive_step_min_per_order_scale") is not None:
+        command.extend(["--adaptive-step-min-per-order-scale", str(config["adaptive_step_min_per_order_scale"])])
+    if config.get("adaptive_step_min_position_limit_scale") is not None:
+        command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -3107,6 +3163,16 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "short_cover_pause_amp_trigger_ratio",
             "short_cover_pause_down_return_trigger_ratio",
             "freeze_shift_abs_return_trigger_ratio",
+            "adaptive_step_enabled",
+            "adaptive_step_30s_abs_return_ratio",
+            "adaptive_step_30s_amplitude_ratio",
+            "adaptive_step_1m_abs_return_ratio",
+            "adaptive_step_1m_amplitude_ratio",
+            "adaptive_step_3m_abs_return_ratio",
+            "adaptive_step_5m_abs_return_ratio",
+            "adaptive_step_max_scale",
+            "adaptive_step_min_per_order_scale",
+            "adaptive_step_min_position_limit_scale",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",
@@ -10594,13 +10660,11 @@ MONITOR_PAGE = """<!doctype html>
       },
       {
         key: "based_volume_push_bard_v1",
-        label: "BASED 双向冲量(BARD式) v1",
-        description: "把 BARD 实盘高换手双向冲量结构直接移植到 BASEDUSDT。固定细步长、双边 8 档、零底仓，不再让 autotune 把网格拉稀。",
+        label: "通用双向冲量自适应 v1",
+        description: "通用的 synthetic_neutral 双向冲量模板。启动时会按币价、tick、点差和最小下单约束自动重设基础步长与单笔名义，并在 30s/1m 急波动和 3m/5m 持续单边时动态放大 step_price、收紧仓位阈值。",
         startable: true,
         kind: "synthetic",
-        symbol: "BASEDUSDT",
         config: {
-          symbol: "BASEDUSDT",
           strategy_mode: "synthetic_neutral",
           step_price: 0.0001,
           buy_levels: 8,
@@ -10621,9 +10685,18 @@ MONITOR_PAGE = """<!doctype html>
           buy_pause_amp_trigger_ratio: 0.009,
           buy_pause_down_return_trigger_ratio: -0.005,
           freeze_shift_abs_return_trigger_ratio: 0.006,
-          autotune_symbol_enabled: false,
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.0028,
+          adaptive_step_30s_amplitude_ratio: 0.0035,
+          adaptive_step_1m_abs_return_ratio: 0.0045,
+          adaptive_step_1m_amplitude_ratio: 0.0065,
+          adaptive_step_3m_abs_return_ratio: 0.0100,
+          adaptive_step_5m_abs_return_ratio: 0.0140,
+          adaptive_step_max_scale: 3.0,
+          adaptive_step_min_per_order_scale: 1.0,
+          adaptive_step_min_position_limit_scale: 0.65,
+          autotune_symbol_enabled: true,
           excess_inventory_reduce_only_enabled: false,
-          runtime_guard_stats_start_time: "2026-03-31T18:00:00+08:00",
           rolling_hourly_loss_limit: null,
           sleep_seconds: 3.0,
         },
@@ -11702,9 +11775,9 @@ MONITOR_PAGE = """<!doctype html>
         ],
       },
       based_volume_push_bard_v1: {
-        summary: "把 BARD 的高换手双向冲量骨架原样绑定到 BASEDUSDT。关键不是放大仓位，而是固定细步长并关闭 autotune，避免挂单被自动拉稀。",
+        summary: "通用的双向冲量自适应模板。先按当前币种的价位、tick 和点差自动估一个能工作的基础步长，再用 adaptive step 在急波动和持续单边时把继续接仓速度压下去。",
         focus: [
-          "这套是 burst 型双边冲量模板，更适合交投明显抬升时段短开，不适合长期常驻。",
+          "这套更适合成交明显抬升时段的 burst 型短开；它不是固定参数集，换币后建议先看 autotune 出来的基础步长和单笔名义是否符合该币的盘口密度。",
         ],
       },
       xaut_long_adaptive_v1: {
@@ -11805,6 +11878,7 @@ MONITOR_PAGE = """<!doctype html>
       volume_neutral_target_v1: { stepRatio: 0.0006, minTicks: 3 },
       neutral_hedge_v1: { stepRatio: 0.0005, minTicks: 3 },
       synthetic_neutral_v1: { stepRatio: 0.0005, minTicks: 3 },
+      based_volume_push_bard_v1: { stepRatio: 0.00028, minTicks: 1 },
       volume_neutral_push_v1: { stepRatio: 0.00032, minTicks: 2 },
       volume_neutral_push_guarded_v1: { stepRatio: 0.00032, minTicks: 2 },
       volume_neutral_ping_pong_v1: { stepRatio: 0.00035, minTicks: 2 },
