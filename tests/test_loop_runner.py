@@ -48,7 +48,7 @@ from grid_optimizer.loop_runner import (
     apply_synthetic_trend_follow_guard,
     update_synthetic_order_refs,
 )
-from grid_optimizer.semi_auto_plan import build_static_binance_grid_plan
+from grid_optimizer.semi_auto_plan import build_hedge_micro_grid_plan, build_static_binance_grid_plan
 from grid_optimizer.types import Candle
 
 
@@ -1546,6 +1546,42 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.max_actual_net_notional, 120.0)
         self.assertEqual(args.max_synthetic_drift_notional, 60.0)
+
+    def test_build_parser_accepts_static_quote_offset_thresholds(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--static-buy-offset-steps",
+                "0.5",
+                "--static-sell-offset-steps",
+                "1.0",
+            ]
+        )
+
+        self.assertEqual(args.static_buy_offset_steps, 0.5)
+        self.assertEqual(args.static_sell_offset_steps, 1.0)
+
+    def test_build_hedge_micro_grid_plan_respects_near_price_offsets(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=100.0,
+            step_price=0.02,
+            buy_levels=1,
+            sell_levels=1,
+            per_order_notional=10.0,
+            base_position_notional=0.0,
+            bid_price=100.0,
+            ask_price=100.01,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=None,
+            min_notional=None,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+            buy_offset_steps=0.5,
+            sell_offset_steps=0.5,
+        )
+
+        self.assertEqual(plan["buy_orders"][0]["price"], 99.99)
+        self.assertEqual(plan["sell_orders"][0]["price"], 100.02)
 
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     def test_assess_auto_regime_prefers_defensive_when_recent_drop_and_amp_expand(self, mock_fetch_futures_klines) -> None:

@@ -1132,6 +1132,8 @@ def _config_payload(args: argparse.Namespace, symbol_info: dict[str, Any]) -> di
         "per_order_notional": args.per_order_notional,
         "base_position_notional": args.base_position_notional,
         "center_price": getattr(args, "center_price", None),
+        "static_buy_offset_steps": getattr(args, "static_buy_offset_steps", 0.0),
+        "static_sell_offset_steps": getattr(args, "static_sell_offset_steps", 0.0),
         "down_trigger_steps": args.down_trigger_steps,
         "up_trigger_steps": args.up_trigger_steps,
         "shift_steps": args.shift_steps,

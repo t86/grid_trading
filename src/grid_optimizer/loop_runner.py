@@ -139,6 +139,7 @@ AUTO_REGIME_PROFILE_LABELS = {
     AUTO_REGIME_DEFENSIVE_PROFILE: "高波动防守 v1",
     XAUT_LONG_ADAPTIVE_PROFILE: "XAUT 自适应做多 v1",
     XAUT_SHORT_ADAPTIVE_PROFILE: "XAUT 自适应做空 v1",
+    "xaut_near_price_guarded_v1": "XAUT 近价护栏 v1",
 }
 AUTO_REGIME_PROFILE_STEP_HINTS: dict[str, tuple[float, int]] = {
     AUTO_REGIME_STABLE_PROFILE: (0.0004, 2),
@@ -1413,6 +1414,8 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         startup_entry_multiplier=getattr(args, "startup_entry_multiplier", 1.0),
         base_position_notional=args.base_position_notional,
         center_price=args.center_price,
+        static_buy_offset_steps=getattr(args, "static_buy_offset_steps", 0.0),
+        static_sell_offset_steps=getattr(args, "static_sell_offset_steps", 0.0),
         fixed_center_enabled=getattr(args, "fixed_center_enabled", False),
         custom_grid_enabled=getattr(args, "custom_grid_enabled", False),
         custom_grid_direction=getattr(args, "custom_grid_direction", None),
@@ -4241,8 +4244,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_qty=current_short_qty,
             startup_entry_multiplier=getattr(effective_args, "startup_entry_multiplier", 1.0),
             startup_large_entry_active=(startup_pending or (current_long_qty <= 1e-12 and current_short_qty <= 1e-12)),
-            buy_offset_steps=float((market_bias or {}).get("buy_offset_steps", 0.0)),
-            sell_offset_steps=float((market_bias or {}).get("sell_offset_steps", 0.0)),
+            buy_offset_steps=(
+                float(getattr(effective_args, "static_buy_offset_steps", 0.0))
+                + float((market_bias or {}).get("buy_offset_steps", 0.0))
+            ),
+            sell_offset_steps=(
+                float(getattr(effective_args, "static_sell_offset_steps", 0.0))
+                + float((market_bias or {}).get("sell_offset_steps", 0.0))
+            ),
         )
         controls = apply_hedge_position_controls(
             plan=plan,
@@ -4320,8 +4329,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_qty=current_short_qty,
             startup_entry_multiplier=getattr(effective_args, "startup_entry_multiplier", 1.0),
             startup_large_entry_active=(startup_pending or (current_long_qty <= 1e-12 and current_short_qty <= 1e-12)),
-            buy_offset_steps=float((market_bias or {}).get("buy_offset_steps", 0.0)),
-            sell_offset_steps=float((market_bias or {}).get("sell_offset_steps", 0.0)),
+            buy_offset_steps=(
+                float(getattr(effective_args, "static_buy_offset_steps", 0.0))
+                + float((market_bias or {}).get("buy_offset_steps", 0.0))
+            ),
+            sell_offset_steps=(
+                float(getattr(effective_args, "static_sell_offset_steps", 0.0))
+                + float((market_bias or {}).get("sell_offset_steps", 0.0))
+            ),
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
         synthetic_trend_follow = resolve_synthetic_trend_follow(
@@ -5047,6 +5062,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-order-notional", type=float, default=12.6)
     parser.add_argument("--startup-entry-multiplier", type=float, default=1.0)
     parser.add_argument("--base-position-notional", type=float, default=75.6)
+    parser.add_argument("--static-buy-offset-steps", type=float, default=0.0)
+    parser.add_argument("--static-sell-offset-steps", type=float, default=0.0)
     parser.add_argument("--market-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--market-bias-max-shift-steps", type=float, default=0.75)
     parser.add_argument("--market-bias-signal-steps", type=float, default=2.0)
@@ -5356,6 +5373,8 @@ def main() -> None:
         raise SystemExit("--buy-levels and --sell-levels must be >= 0")
     if args.per_order_notional <= 0 or args.base_position_notional < 0:
         raise SystemExit("--per-order-notional must be > 0 and --base-position-notional must be >= 0")
+    if args.static_buy_offset_steps < 0 or args.static_sell_offset_steps < 0:
+        raise SystemExit("--static-buy-offset-steps and --static-sell-offset-steps must be >= 0")
     if args.market_bias_max_shift_steps < 0:
         raise SystemExit("--market-bias-max-shift-steps must be >= 0")
     if args.market_bias_signal_steps <= 0:

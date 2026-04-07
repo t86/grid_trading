@@ -230,6 +230,20 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["max_actual_net_notional"], 120.0)
         self.assertFalse(payload["autotune_symbol_enabled"])
 
+    def test_runner_preset_payload_applies_xaut_near_price_guarded_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_near_price_guarded_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_near_price_guarded_v1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 0.02)
+        self.assertEqual(payload["static_buy_offset_steps"], 0.5)
+        self.assertEqual(payload["static_sell_offset_steps"], 0.5)
+        self.assertFalse(payload["market_bias_enabled"])
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["synthetic_trend_follow_enabled"])
+        self.assertEqual(payload["max_actual_net_notional"], 90.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+
     def test_normalize_runner_control_payload_supports_volume_trigger_fields(self) -> None:
         payload = _normalize_runner_control_payload(
             {
@@ -626,6 +640,10 @@ class WebSecurityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
             _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_guarded_ping_pong_v1"})
 
+    def test_resolve_runner_start_config_rejects_xaut_near_price_guarded_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_near_price_guarded_v1"})
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_starts_xaut_guarded_ping_pong_profile(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -638,10 +656,23 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(config["step_price"], 2.2)
         self.assertEqual(config["buy_levels"], 1)
         self.assertEqual(config["sell_levels"], 1)
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_xaut_near_price_guarded_profile(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config({"symbol": "XAUTUSDT", "strategy_profile": "xaut_near_price_guarded_v1"})
+        self.assertEqual(config["strategy_profile"], "xaut_near_price_guarded_v1")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(config["step_price"], 0.02)
+        self.assertEqual(config["static_buy_offset_steps"], 0.5)
+        self.assertEqual(config["static_sell_offset_steps"], 0.5)
+        self.assertEqual(config["state_path"], "output/xautusdt_loop_state.json")
         self.assertTrue(config["adaptive_step_enabled"])
-        self.assertTrue(config["market_bias_enabled"])
+        self.assertFalse(config["market_bias_enabled"])
         self.assertTrue(config["synthetic_trend_follow_enabled"])
-        self.assertEqual(config["synthetic_trend_follow_reverse_delay_seconds"], 18.0)
+        self.assertEqual(config["synthetic_trend_follow_reverse_delay_seconds"], 12.0)
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
@@ -1075,6 +1106,42 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--synthetic-trend-follow-min-efficiency-ratio", command)
         self.assertIn("--synthetic-trend-follow-reverse-delay-seconds", command)
 
+    def test_build_runner_command_includes_static_quote_offset_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "XAUTUSDT",
+                "strategy_profile": "xaut_near_price_guarded_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.02,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 80.0,
+                "startup_entry_multiplier": 1.0,
+                "base_position_notional": 0.0,
+                "static_buy_offset_steps": 0.5,
+                "static_sell_offset_steps": 0.5,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 4,
+                "max_total_notional": 220.0,
+                "sleep_seconds": 2.0,
+                "state_path": "output/xautusdt_loop_state.json",
+                "plan_json": "output/xautusdt_loop_latest_plan.json",
+                "submit_report_json": "output/xautusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/xautusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": False,
+                "reset_state": True,
+            }
+        )
+
+        self.assertIn("--static-buy-offset-steps", command)
+        self.assertIn("0.5", command)
+        self.assertIn("--static-sell-offset-steps", command)
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -1376,8 +1443,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("based_volume_push_bard_v1", opn_keys)
         self.assertIn("xaut_volume_short_v1", xaut_keys)
         self.assertIn("xaut_guarded_ping_pong_v1", xaut_keys)
+        self.assertIn("xaut_near_price_guarded_v1", xaut_keys)
         self.assertNotIn("xaut_volume_short_v1", opn_keys)
         self.assertNotIn("xaut_guarded_ping_pong_v1", opn_keys)
+        self.assertNotIn("xaut_near_price_guarded_v1", opn_keys)
 
     def test_runner_preset_payload_for_bard_12h_push_neutral_v2(self) -> None:
         payload = _runner_preset_payload("bard_12h_push_neutral_v2", {"symbol": "BARDUSDT"})
