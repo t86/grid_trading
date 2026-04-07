@@ -1437,6 +1437,9 @@ class WebSecurityTests(unittest.TestCase):
         opn_keys = {item["key"] for item in _runner_preset_summaries("OPNUSDT")}
         self.assertIn("bard_12h_push_neutral_v2", bard_keys)
         self.assertNotIn("bard_12h_push_neutral_v2", opn_keys)
+        self.assertIn("synthetic_neutral_bard_style_v1", bard_keys)
+        self.assertIn("synthetic_neutral_bard_style_v1", based_keys)
+        self.assertIn("synthetic_neutral_bard_style_v1", opn_keys)
         self.assertIn("based_volume_long_trigger_v1", based_keys)
         self.assertIn("based_volume_push_bard_v1", based_keys)
         self.assertNotIn("based_volume_long_trigger_v1", opn_keys)
@@ -1472,6 +1475,28 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
         self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+
+    def test_runner_preset_payload_for_synthetic_neutral_bard_style_v1(self) -> None:
+        payload = _runner_preset_payload("synthetic_neutral_bard_style_v1", {"symbol": "OPNUSDT"})
+        self.assertEqual(payload["symbol"], "OPNUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 0.0007)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 4)
+        self.assertEqual(payload["per_order_notional"], 45.0)
+        self.assertEqual(payload["base_position_notional"], 0.0)
+        self.assertEqual(payload["pause_buy_position_notional"], 2000.0)
+        self.assertEqual(payload["pause_short_position_notional"], 220.0)
+        self.assertEqual(payload["max_position_notional"], 2400.0)
+        self.assertEqual(payload["max_short_position_notional"], 320.0)
+        self.assertEqual(payload["max_total_notional"], 3600.0)
+        self.assertEqual(payload["max_new_orders"], 40)
+        self.assertEqual(payload["short_cover_pause_amp_trigger_ratio"], 0.004)
+        self.assertEqual(payload["short_cover_pause_down_return_trigger_ratio"], -0.0018)
+        self.assertFalse(payload["volatility_trigger_enabled"])
+        self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertIsNone(payload["rolling_hourly_loss_limit"])
 
     def test_runner_preset_payload_for_based_volume_long_trigger_includes_volume_guard(self) -> None:
         payload = _runner_preset_payload("based_volume_long_trigger_v1", {"symbol": "BASEDUSDT"})
@@ -1525,6 +1550,16 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(config["autotune_symbol_enabled"])
         self.assertEqual(config["state_path"], "output/opnusdt_loop_state.json")
         self.assertGreater(config["step_price"], 0)
+
+    def test_resolve_runner_start_config_starts_bard_style_template_for_other_symbol(self) -> None:
+        config = _resolve_runner_start_config({"symbol": "OPNUSDT", "strategy_profile": "synthetic_neutral_bard_style_v1"})
+        self.assertEqual(config["strategy_profile"], "synthetic_neutral_bard_style_v1")
+        self.assertEqual(config["symbol"], "OPNUSDT")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertFalse(config["autotune_symbol_enabled"])
+        self.assertFalse(config["volatility_trigger_enabled"])
+        self.assertEqual(config["step_price"], 0.0007)
+        self.assertEqual(config["state_path"], "output/opnusdt_loop_state.json")
 
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_summaries_include_custom_grid_edit_metadata(self) -> None:

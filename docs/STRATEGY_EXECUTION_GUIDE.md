@@ -345,9 +345,18 @@
 
 ### `bard_12h_push_neutral_v2`
 
-- 核心：BARDUSDT 的双向冲量模板。
+- 核心：BARDUSDT 的旧版双向冲量模板。
 - 固定 `step_price=0.0001`、双边 `8x8`、零底仓、`1` 格追中心，优先把高成交窗口里的双边回转密度堆高。
 - 关闭 `autotune_symbol_enabled` 和 `excess_inventory_reduce_only_enabled`，更适合短时冲量，不建议长期常开。
+- 后续如果要把这套骨架复用到其他币种，优先改用 `synthetic_neutral_bard_style_v1`。
+
+### `synthetic_neutral_bard_style_v1`
+
+- 核心：把 `114/150` 上验证过的 BARD 实盘骨架整理成通用模板。
+- 固定 `step_price=0.0007`、`8` 买 `4` 卖、零底仓、`1` 格追中心，`per_order_notional=45`，长侧上限 `2000/2400`、短侧回补护栏 `220/320`。
+- 默认关闭 `autotune_symbol_enabled` 和 `volatility_trigger_enabled`，先保留验证过的固定节奏；更适合复制给同价位低价币后，再按 tick、点差和库存承受能力细调。
+- 仓库里附了一个可复制模板文件：
+  `deploy/oracle/runtime_configs/synthetic_neutral_bard_style_v1.template.json`
 
 ### `based_volume_long_trigger_v1`
 
@@ -357,9 +366,17 @@
 
 ### `based_volume_push_bard_v1`
 
-- 核心：把 BARD 的高换手双向冲量骨架直接移植到 BASEDUSDT。
-- 固定 `step_price=0.0001`、双边 `8x8`、零底仓、`1` 格追中心，避免通用 autotune 把 BASED 的网格自动拉稀。
-- 这是短时 burst 型双边冲量模板，适合交投明显抬升时段临时开，不建议长期常开。
+- 核心：通用的双向冲量自适应模板。
+- 启动时会按币价、tick、点差和最小下单约束自动重设基础 `step_price` 与 `per_order_notional`，并在急波动和持续单边时动态放大步长、收紧仓位。
+- 更适合拿来快速试一个“能工作”的 burst 型通用框架；如果你要复用 `114/150` 那套固定节奏，应该从 `synthetic_neutral_bard_style_v1` 出发，而不是从这套自适应模板出发。
+
+### 迁移 `synthetic_neutral_bard_style_v1` 到其他币种时先改什么
+
+- `symbol` 和四个输出路径：避免和原币种共用 state / plan / submit / summary 文件。
+- `step_price`：先确认最小 tick、常态点差和盘口密度，别机械照搬 `0.0007`。
+- `per_order_notional`：至少要覆盖最小下单名义，还要和盘口深度匹配，避免一笔过大把库存抬太快。
+- `pause_buy_position_notional` / `max_position_notional` / `pause_short_position_notional` / `max_short_position_notional`：这四个阈值要按你愿意承受的多空库存重算，不建议直接套用。
+- 如果币种波动更大或盘口更稀，优先先放宽 `step_price`，而不是先把层数和仓位上限抬高。
 
 ## 额外说明
 
