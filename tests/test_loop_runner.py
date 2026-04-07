@@ -793,6 +793,64 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["buy_orders"]), 1)
         self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
 
+    def test_apply_hedge_position_controls_keeps_probe_short_on_external_short_pause_when_allowed(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "SELL", "price": 1.21, "qty": 10, "notional": 12.1, "role": "bootstrap_short", "position_side": "SHORT"}],
+            "buy_orders": [{"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.23, "qty": 10, "notional": 12.3, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=120.0,
+            current_short_qty=0.0,
+            mid_price=1.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=None,
+            min_mid_price_for_buys=None,
+            external_short_pause=True,
+            external_short_pause_reasons=["market_bias_strong_short_pause regime=strong score=+0.24 >= +0.15"],
+            preserve_short_entry_on_external_pause=True,
+        )
+
+        self.assertTrue(result["short_paused"])
+        self.assertEqual(result["short_pause_reasons"], ["market_bias_strong_short_pause regime=strong score=+0.24 >= +0.15"])
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 2)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+        self.assertEqual(plan["sell_orders"][1]["role"], "entry_short")
+
+    def test_apply_hedge_position_controls_hard_short_pause_still_removes_probe_short(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.23, "qty": 10, "notional": 12.3, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=150.0,
+            mid_price=1.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=100.0,
+            min_mid_price_for_buys=None,
+            external_short_pause=True,
+            external_short_pause_reasons=["market_bias_strong_short_pause regime=strong score=+0.24 >= +0.15"],
+            preserve_short_entry_on_external_pause=True,
+        )
+
+        self.assertTrue(result["short_paused"])
+        self.assertTrue(any("pause_short_position_notional" in reason for reason in result["short_pause_reasons"]))
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+
     def test_apply_hedge_position_notional_caps_trim_long_and_short_entries(self) -> None:
         plan = {
             "bootstrap_orders": [

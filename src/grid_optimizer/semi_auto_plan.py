@@ -694,6 +694,9 @@ def build_hedge_micro_grid_plan(
     startup_large_entry_active: bool = False,
     buy_offset_steps: float = 0.0,
     sell_offset_steps: float = 0.0,
+    entry_long_paused: bool = False,
+    entry_short_paused: bool = False,
+    paused_entry_short_scale: float = 0.0,
 ) -> dict[str, Any]:
     if center_price <= 0 or step_price <= 0:
         raise ValueError("center_price and step_price must be > 0")
@@ -709,6 +712,8 @@ def build_hedge_micro_grid_plan(
     startup_multiplier = max(float(startup_entry_multiplier), 1.0)
     buy_offset_steps = float(buy_offset_steps)
     sell_offset_steps = float(sell_offset_steps)
+    paused_entry_short_scale = min(max(float(paused_entry_short_scale), 0.0), 1.0)
+
     def _entry_notional(*, level: int, current_qty: float) -> float:
         if startup_large_entry_active and level == 1 and current_qty <= 1e-12:
             return per_order_notional * startup_multiplier
@@ -752,28 +757,29 @@ def build_hedge_micro_grid_plan(
         )
         remaining_short_exit_qty = max(remaining_short_exit_qty - qty, 0.0)
 
-    for level in range(1, buy_levels + 1):
-        price = _buy_price(level)
-        qty = _round_order_qty(_entry_notional(level=level, current_qty=current_long_qty) / price, step_size)
-        notional = price * qty
-        if price >= ask_price:
-            continue
-        if min_qty is not None and qty < min_qty:
-            continue
-        if min_notional is not None and notional < min_notional:
-            continue
-        if qty <= 0:
-            continue
-        buy_orders.append(
-            _build_order(
-                side="BUY",
-                price=price,
-                qty=qty,
-                level=level,
-                role="entry_long",
-                position_side="LONG",
+    if not bool(entry_long_paused):
+        for level in range(1, buy_levels + 1):
+            price = _buy_price(level)
+            qty = _round_order_qty(_entry_notional(level=level, current_qty=current_long_qty) / price, step_size)
+            notional = price * qty
+            if price >= ask_price:
+                continue
+            if min_qty is not None and qty < min_qty:
+                continue
+            if min_notional is not None and notional < min_notional:
+                continue
+            if qty <= 0:
+                continue
+            buy_orders.append(
+                _build_order(
+                    side="BUY",
+                    price=price,
+                    qty=qty,
+                    level=level,
+                    role="entry_long",
+                    position_side="LONG",
+                )
             )
-        )
 
     remaining_long_exit_qty = _round_order_qty(current_long_qty, step_size)
     for level in range(1, sell_levels + 1):
@@ -803,28 +809,36 @@ def build_hedge_micro_grid_plan(
         )
         remaining_long_exit_qty = max(remaining_long_exit_qty - qty, 0.0)
 
-    for level in range(1, sell_levels + 1):
-        price = _sell_price(level)
-        qty = _round_order_qty(_entry_notional(level=level, current_qty=current_short_qty) / price, step_size)
-        notional = price * qty
-        if price <= bid_price:
-            continue
-        if min_qty is not None and qty < min_qty:
-            continue
-        if min_notional is not None and notional < min_notional:
-            continue
-        if qty <= 0:
-            continue
-        sell_orders.append(
-            _build_order(
-                side="SELL",
-                price=price,
-                qty=qty,
-                level=level,
-                role="entry_short",
-                position_side="SHORT",
+    allow_paused_short_probe = bool(entry_short_paused and paused_entry_short_scale > 0)
+    if not bool(entry_short_paused) or allow_paused_short_probe:
+        entry_sell_max_level = 1 if allow_paused_short_probe else sell_levels
+        for level in range(1, entry_sell_max_level + 1):
+            price = _sell_price(level)
+            entry_notional = _entry_notional(level=level, current_qty=current_short_qty)
+            if allow_paused_short_probe:
+                entry_notional *= paused_entry_short_scale
+            qty = _round_order_qty(entry_notional / price, step_size)
+            notional = price * qty
+            if price <= bid_price:
+                continue
+            if min_qty is not None and qty < min_qty:
+                continue
+            if min_notional is not None and notional < min_notional:
+                continue
+            if qty <= 0:
+                continue
+            sell_orders.append(
+                _build_order(
+                    side="SELL",
+                    price=price,
+                    qty=qty,
+                    level=level,
+                    role="entry_short",
+                    position_side="SHORT",
+                )
             )
-        )
+            if allow_paused_short_probe:
+                break
 
     target_long_base_qty = _round_order_qty(base_position_notional / center_price, step_size)
     target_short_base_qty = _round_order_qty(base_position_notional / center_price, step_size)

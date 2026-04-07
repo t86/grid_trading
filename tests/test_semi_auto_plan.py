@@ -396,6 +396,32 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["price"], 4600.02)
         self.assertEqual(plan["sell_orders"][1]["price"], 4600.03)
 
+    def test_build_hedge_micro_grid_plan_keeps_one_small_short_probe_when_short_entries_paused(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=4,
+            sell_levels=4,
+            per_order_notional=40.0,
+            base_position_notional=0.0,
+            bid_price=0.999,
+            ask_price=1.001,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=300.0,
+            current_short_qty=0.0,
+            entry_short_paused=True,
+            paused_entry_short_scale=0.25,
+        )
+
+        entry_short_orders = [item for item in plan["sell_orders"] if item["role"] == "entry_short"]
+
+        self.assertEqual(len(entry_short_orders), 1)
+        self.assertEqual(entry_short_orders[0]["level"], 1)
+        self.assertAlmostEqual(entry_short_orders[0]["notional"], 10.0, delta=1.0)
+
     def test_build_inventory_target_neutral_plan_builds_band_orders_and_bootstrap(self) -> None:
         plan = build_inventory_target_neutral_plan(
             center_price=1.0,

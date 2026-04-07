@@ -2083,11 +2083,13 @@ def apply_hedge_position_controls(
     external_pause_reasons: list[str] | None = None,
     external_short_pause: bool = False,
     external_short_pause_reasons: list[str] | None = None,
+    preserve_short_entry_on_external_pause: bool = False,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
     current_short_notional = max(current_short_qty, 0.0) * max(mid_price, 0.0)
     long_paused = bool(external_long_pause)
     short_paused = bool(external_short_pause)
+    inventory_short_paused = False
     long_reasons: list[str] = list(external_pause_reasons or [])
     short_reasons: list[str] = list(external_short_pause_reasons or [])
 
@@ -2098,6 +2100,7 @@ def apply_hedge_position_controls(
         )
     if pause_short_position_notional is not None and current_short_notional >= pause_short_position_notional:
         short_paused = True
+        inventory_short_paused = True
         short_reasons.append(
             f"current_short_notional={_float(current_short_notional)} >= pause_short_position_notional={_float(pause_short_position_notional)}"
         )
@@ -2112,7 +2115,8 @@ def apply_hedge_position_controls(
         plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
     if short_paused:
         plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
-        plan["sell_orders"] = [item for item in plan.get("sell_orders", []) if not _is_short_entry_order(item)]
+        if inventory_short_paused or not preserve_short_entry_on_external_pause:
+            plan["sell_orders"] = [item for item in plan.get("sell_orders", []) if not _is_short_entry_order(item)]
 
     return {
         "long_paused": long_paused,
@@ -4034,6 +4038,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             weak_buy_pause_threshold=float(getattr(effective_args, "market_bias_weak_buy_pause_threshold", 0.15)),
             strong_short_pause_threshold=float(getattr(effective_args, "market_bias_strong_short_pause_threshold", 0.15)),
         )
+        strong_short_probe_scale = (
+            _clamp_ratio(float(getattr(effective_args, "market_bias_strong_short_probe_scale", 0.25)))
+            if bool(market_bias_entry_pause["short_pause_active"])
+            else 0.0
+        )
         market_bias.update(
             {
                 "weak_buy_pause_enabled": bool(getattr(effective_args, "market_bias_weak_buy_pause_enabled", False)),
@@ -4044,6 +4053,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "strong_short_pause_active": bool(market_bias_entry_pause["short_pause_active"]),
                 "strong_short_pause_threshold": float(market_bias_entry_pause["short_pause_threshold"]),
                 "strong_short_pause_reasons": list(market_bias_entry_pause["short_pause_reasons"]),
+                "strong_short_probe_scale": float(strong_short_probe_scale),
             }
         )
         market_bias_regime_switch = resolve_market_bias_regime_switch(
@@ -4252,6 +4262,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 float(getattr(effective_args, "static_sell_offset_steps", 0.0))
                 + float((market_bias or {}).get("sell_offset_steps", 0.0))
             ),
+            entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
+            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
+            paused_entry_short_scale=strong_short_probe_scale,
         )
         controls = apply_hedge_position_controls(
             plan=plan,
@@ -4265,6 +4278,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
             external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
             external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
+            preserve_short_entry_on_external_pause=strong_short_probe_scale > 0,
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -4337,6 +4351,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 float(getattr(effective_args, "static_sell_offset_steps", 0.0))
                 + float((market_bias or {}).get("sell_offset_steps", 0.0))
             ),
+            entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
+            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
+            paused_entry_short_scale=strong_short_probe_scale,
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
         synthetic_trend_follow = resolve_synthetic_trend_follow(
@@ -4371,6 +4388,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
             external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
             external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
+            preserve_short_entry_on_external_pause=strong_short_probe_scale > 0,
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
