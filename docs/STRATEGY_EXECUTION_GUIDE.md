@@ -98,6 +98,7 @@
 - 生产机器上的策略 runner、flatten runner、`output/*_loop_runner.pid`、`output/*_loop_runner_control.json` 必须由 `ubuntu` 用户持有和启动。
 - 日常启动、停止、重启，优先走监控台页面，或由 `ubuntu` 用户调用本机 `grid-web` / `wangge-web` 提供的 `/api/runner/start`、`/api/runner/stop`。
 - 不要用 `root` 直接执行 `python -m grid_optimizer.loop_runner`、`python -m grid_optimizer.maker_flatten_runner`，也不要让 `root` 写入 runner 的 pid / control / state 文件。
+- 如果需要跨电脑查看 `KAT` 巡检结果，使用 [`docs/KAT_GUARD_AUTOMATION.md`](./KAT_GUARD_AUTOMATION.md) 里约定的远端落盘路径，不要依赖本机 automation 列表。
 
 原因：
 
