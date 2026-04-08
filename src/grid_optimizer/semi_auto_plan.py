@@ -768,6 +768,8 @@ def build_hedge_micro_grid_plan(
     )
     latest_long_lot_price = current_long_lots[-1]["price"] if current_long_lots else None
     latest_short_lot_price = current_short_lots[-1]["price"] if current_short_lots else None
+    held_long_same_side_entry = current_long_qty > 0 and current_short_qty <= 0
+    held_short_same_side_entry = current_short_qty > 0 and current_long_qty <= 0
     light_long_entry_max_price = (
         _round_order_price(max(float(bid_price) - float(step_price), 0.0), tick_size, "BUY")
         if long_entry_cost_guard_active and bid_price is not None and bid_price > 0
@@ -795,7 +797,7 @@ def build_hedge_micro_grid_plan(
         return _round_order_price(price_raw, tick_size, "SELL")
 
     def _entry_buy_price(level: int) -> float:
-        if flat_inventory:
+        if flat_inventory or held_long_same_side_entry:
             distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
         else:
             distance_steps = max(float(level) + buy_offset_steps, 1.0)
@@ -803,7 +805,7 @@ def build_hedge_micro_grid_plan(
         return _round_order_price(price_raw, tick_size, "BUY")
 
     def _entry_sell_price(level: int) -> float:
-        if flat_inventory:
+        if flat_inventory or held_short_same_side_entry:
             distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
         else:
             distance_steps = max(float(level) + sell_offset_steps, 1.0)
@@ -853,7 +855,11 @@ def build_hedge_micro_grid_plan(
             if current_short_qty > 0 and f"BUY:{price:.10f}" in take_profit_short_price_keys:
                 continue
             if long_entry_cost_guard_active:
-                if light_long_entry_max_price is not None and price > light_long_entry_max_price:
+                if (
+                    light_long_entry_max_price is not None
+                    and not held_long_same_side_entry
+                    and price > light_long_entry_max_price
+                ):
                     continue
                 if latest_long_lot_price is not None and price > latest_long_lot_price:
                     continue
@@ -933,7 +939,11 @@ def build_hedge_micro_grid_plan(
             if current_long_qty > 0 and f"SELL:{price:.10f}" in take_profit_long_price_keys:
                 continue
             if short_entry_cost_guard_active:
-                if light_short_entry_min_price is not None and price < light_short_entry_min_price:
+                if (
+                    light_short_entry_min_price is not None
+                    and not held_short_same_side_entry
+                    and price < light_short_entry_min_price
+                ):
                     continue
                 if latest_short_lot_price is not None and price < latest_short_lot_price:
                     continue

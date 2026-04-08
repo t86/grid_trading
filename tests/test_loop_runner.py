@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from grid_optimizer.audit import build_audit_paths
 from grid_optimizer.loop_runner import (
+    AUTO_REGIME_PROFILE_LABELS,
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _should_sync_account_audit,
     _apply_synthetic_trade_fill,
@@ -56,6 +57,9 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_bard_profile_has_human_readable_label(self) -> None:
+        self.assertEqual(AUTO_REGIME_PROFILE_LABELS["bard_12h_push_neutral_v2"], "BARD 双向冲量 v2")
+
     def test_current_check_bucket_rounds_down_to_interval(self) -> None:
         bucket = _current_check_bucket(
             datetime(2026, 3, 31, 14, 27, 12, tzinfo=timezone.utc),

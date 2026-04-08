@@ -2,6 +2,12 @@
 
 This tool optimizes arithmetic long-grid count (`N`) on Binance perpetual klines.
 
+## Development Rules
+
+- Any strategy/runtime change that has been verified as correct must be committed to `main` immediately and pushed to `origin/main` in the same work session.
+- Do not leave validated local fixes uncommitted while continuing to iterate on live strategy parameters; repo state and deployed state must stay aligned.
+- Before pushing, run the relevant automated tests for the changed modules and confirm they pass.
+
 Strategy assumptions (V1):
 - Arithmetic grid between `min_price` and `max_price`.
 - Long-only grid:
