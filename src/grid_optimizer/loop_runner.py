@@ -138,7 +138,7 @@ AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
 AUTO_REGIME_PROFILE_LABELS = {
     AUTO_REGIME_STABLE_PROFILE: "量优先做多 v4",
     AUTO_REGIME_DEFENSIVE_PROFILE: "高波动防守 v1",
-    "bard_12h_push_neutral_v2": "BARD 双向冲量 v2",
+    "bard_12h_push_neutral_v2": "通用刷量V1",
     XAUT_LONG_ADAPTIVE_PROFILE: "XAUT 自适应做多 v1",
     XAUT_SHORT_ADAPTIVE_PROFILE: "XAUT 自适应做空 v1",
     "xaut_near_price_guarded_v1": "XAUT 近价护栏 v1",

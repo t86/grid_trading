@@ -286,15 +286,15 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
         },
     },
     "bard_12h_push_neutral_v2": {
-        "label": "BARD 双向冲量 v2",
-        "description": "BARDUSDT 专用固定节奏双向冲量模板。当前默认采用 0.0002 步长、8 买 4 卖、零底仓，并沿用轻仓 lot 成本保护与最近 15m 市场成交额自动启停。",
+        "label": "通用刷量V1",
+        "description": "当前 111/150 在跑的通用刷量模板。采用 0.0003 步长、8 买 4 卖、零底仓，并沿用轻仓 lot 成本保护与累计成交额停机线。",
         "startable": True,
         "kind": "synthetic",
         "symbol": "BARDUSDT",
         "config": {
             "symbol": "BARDUSDT",
             "strategy_mode": "synthetic_neutral",
-            "step_price": 0.0002,
+            "step_price": 0.0003,
             "buy_levels": 8,
             "sell_levels": 4,
             "per_order_notional": 45.0,
@@ -10834,15 +10834,15 @@ MONITOR_PAGE = """<!doctype html>
       },
       {
         key: "bard_12h_push_neutral_v2",
-        label: "BARD 双向冲量 v2",
-        description: "BARDUSDT 专用固定节奏双向冲量模板。沿用当前线上 0.0007 步长、8 买 4 卖、零底仓，并默认启用最近 15m 市场成交额自动启停；后续跨币复用建议改用 BARD 风格双向冲量模板 v1。",
+        label: "通用刷量V1",
+        description: "当前 111/150 在跑的通用刷量模板。采用 0.0003 步长、8 买 4 卖、零底仓，并沿用轻仓 lot 成本保护与累计成交额停机线。",
         startable: true,
         kind: "synthetic",
         symbol: "BARDUSDT",
         config: {
           symbol: "BARDUSDT",
           strategy_mode: "synthetic_neutral",
-          step_price: 0.0007,
+          step_price: 0.0003,
           buy_levels: 8,
           sell_levels: 4,
           per_order_notional: 45.0,
@@ -12197,10 +12197,10 @@ MONITOR_PAGE = """<!doctype html>
         ],
       },
       bard_12h_push_neutral_v2: {
-        summary: "BARDUSDT 的固定节奏双向冲量 v2。沿用线上 0.0007 步长、8 买 4 卖，并加上最近 15 分钟成交额自动启停门禁。",
+        summary: "当前 111/150 在跑的通用刷量V1。固定 0.0003 步长、8 买 4 卖、零底仓，保留轻仓 lot 成本保护和累计成交额停机线。",
         focus: [
-          "量能掉到阈值以下时，后台会自动撤掉当前策略单并停机，但不会直接替你平仓；适合高成交窗口短开，不适合彻底无人值守。",
-          "这套关闭了 autotune 和 reduce_only 护栏，后续跨币复用建议优先用 BARD 风格双向冲量模板 v1。",
+          "这套就是当前线上通用刷量基线，目标是保持成交密度，同时避免轻仓阶段高买低卖刷量。",
+          "标签改名后，后续部署和观察都统一按 通用刷量V1 识别，不再和旧的 BARD 双向冲量 v2 混用。",
         ],
       },
       synthetic_neutral_bard_style_v1: {

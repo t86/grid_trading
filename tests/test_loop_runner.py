@@ -58,7 +58,7 @@ from grid_optimizer.types import Candle
 
 class LoopRunnerTests(unittest.TestCase):
     def test_bard_profile_has_human_readable_label(self) -> None:
-        self.assertEqual(AUTO_REGIME_PROFILE_LABELS["bard_12h_push_neutral_v2"], "BARD 双向冲量 v2")
+        self.assertEqual(AUTO_REGIME_PROFILE_LABELS["bard_12h_push_neutral_v2"], "通用刷量V1")
 
     def test_current_check_bucket_rounds_down_to_interval(self) -> None:
         bucket = _current_check_bucket(

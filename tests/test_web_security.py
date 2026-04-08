@@ -1455,7 +1455,7 @@ class WebSecurityTests(unittest.TestCase):
         payload = _runner_preset_payload("bard_12h_push_neutral_v2", {"symbol": "BARDUSDT"})
         self.assertEqual(payload["symbol"], "BARDUSDT")
         self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
-        self.assertEqual(payload["step_price"], 0.0002)
+        self.assertEqual(payload["step_price"], 0.0003)
         self.assertEqual(payload["buy_levels"], 8)
         self.assertEqual(payload["sell_levels"], 4)
         self.assertEqual(payload["per_order_notional"], 45.0)
