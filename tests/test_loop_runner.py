@@ -13,6 +13,7 @@ from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _should_sync_account_audit,
     _apply_synthetic_trade_fill,
+    _decorate_synthetic_open_orders,
     _load_synthetic_ledger,
     _build_parser,
     _current_check_bucket,
@@ -801,6 +802,31 @@ class LoopRunnerTests(unittest.TestCase):
             payload = state_path.read_text(encoding="utf-8")
             self.assertIn("synthetic_order_refs", payload)
             self.assertIn("12345", payload)
+
+    def test_decorate_synthetic_open_orders_applies_role_metadata(self) -> None:
+        state = {
+            "synthetic_order_refs": {
+                "12345": {
+                    "role": "entry_long",
+                    "position_side": "BOTH",
+                    "client_order_id": "gx-test",
+                }
+            }
+        }
+        open_orders = [
+            {
+                "orderId": 12345,
+                "clientOrderId": "gx-test",
+                "side": "BUY",
+                "price": "0.3173",
+                "origQty": "141",
+            }
+        ]
+
+        decorated = _decorate_synthetic_open_orders(state=state, open_orders=open_orders)
+
+        self.assertEqual(decorated[0]["role"], "entry_long")
+        self.assertEqual(decorated[0]["positionSide"], "BOTH")
 
     def test_apply_hedge_position_controls_can_pause_long_or_short_side_independently(self) -> None:
         plan = {
@@ -1711,8 +1737,8 @@ class LoopRunnerTests(unittest.TestCase):
             sell_offset_steps=0.5,
         )
 
-        self.assertEqual(plan["buy_orders"][0]["price"], 99.97)
-        self.assertEqual(plan["sell_orders"][0]["price"], 100.04)
+        self.assertEqual(plan["buy_orders"][0]["price"], 99.99)
+        self.assertEqual(plan["sell_orders"][0]["price"], 100.02)
 
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     def test_assess_auto_regime_prefers_defensive_when_recent_drop_and_amp_expand(self, mock_fetch_futures_klines) -> None:

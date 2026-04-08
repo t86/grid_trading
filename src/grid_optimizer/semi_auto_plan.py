@@ -741,13 +741,28 @@ def build_hedge_micro_grid_plan(
         if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0
         else float(center_price)
     )
+    flat_inventory = current_long_qty <= 1e-12 and current_short_qty <= 1e-12
     long_entry_cost_guard_active = (
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
+        and current_long_qty > 0
         and current_short_qty <= 0
         and current_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
     )
     short_entry_cost_guard_active = (
         max(float(entry_short_cost_guard_release_notional), 0.0) > 0
+        and current_short_qty > 0
+        and current_long_qty <= 0
+        and current_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
+    )
+    long_exit_profit_guard_active = (
+        max(float(entry_long_cost_guard_release_notional), 0.0) > 0
+        and current_long_qty > 0
+        and current_short_qty <= 0
+        and current_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
+    )
+    short_exit_profit_guard_active = (
+        max(float(entry_short_cost_guard_release_notional), 0.0) > 0
+        and current_short_qty > 0
         and current_long_qty <= 0
         and current_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
@@ -780,12 +795,18 @@ def build_hedge_micro_grid_plan(
         return _round_order_price(price_raw, tick_size, "SELL")
 
     def _entry_buy_price(level: int) -> float:
-        distance_steps = max(float(level) + buy_offset_steps, 1.0)
+        if flat_inventory:
+            distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
+        else:
+            distance_steps = max(float(level) + buy_offset_steps, 1.0)
         price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "BUY")
 
     def _entry_sell_price(level: int) -> float:
-        distance_steps = max(float(level) + sell_offset_steps, 1.0)
+        if flat_inventory:
+            distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
+        else:
+            distance_steps = max(float(level) + sell_offset_steps, 1.0)
         price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "SELL")
 
@@ -797,6 +818,11 @@ def build_hedge_micro_grid_plan(
         desired_qty = _round_order_qty(per_order_notional / price, step_size)
         qty = _round_order_qty(min(desired_qty, remaining_short_exit_qty), step_size)
         notional = price * qty
+        if short_exit_profit_guard_active:
+            if latest_short_lot_price is not None and price >= latest_short_lot_price:
+                continue
+            if latest_short_lot_price is None and current_short_avg_price > 0 and price >= current_short_avg_price:
+                continue
         if price >= ask_price:
             continue
         if min_qty is not None and qty < min_qty:
@@ -833,6 +859,11 @@ def build_hedge_micro_grid_plan(
                     continue
                 if latest_long_lot_price is None and current_long_avg_price > 0 and price > current_long_avg_price:
                     continue
+            if short_exit_profit_guard_active:
+                if latest_short_lot_price is not None and price >= latest_short_lot_price:
+                    continue
+                if latest_short_lot_price is None and current_short_avg_price > 0 and price >= current_short_avg_price:
+                    continue
             qty = _round_order_qty(_entry_notional(level=level, current_qty=current_long_qty) / price, step_size)
             notional = price * qty
             if price >= ask_price:
@@ -864,6 +895,11 @@ def build_hedge_micro_grid_plan(
         desired_qty = _round_order_qty(per_order_notional / price, step_size)
         qty = _round_order_qty(min(desired_qty, remaining_long_exit_qty), step_size)
         notional = price * qty
+        if long_exit_profit_guard_active:
+            if latest_long_lot_price is not None and price <= latest_long_lot_price:
+                continue
+            if latest_long_lot_price is None and current_long_avg_price > 0 and price <= current_long_avg_price:
+                continue
         if price <= bid_price:
             continue
         if min_qty is not None and qty < min_qty:
@@ -902,6 +938,11 @@ def build_hedge_micro_grid_plan(
                 if latest_short_lot_price is not None and price < latest_short_lot_price:
                     continue
                 if latest_short_lot_price is None and current_short_avg_price > 0 and price < current_short_avg_price:
+                    continue
+            if long_exit_profit_guard_active:
+                if latest_long_lot_price is not None and price <= latest_long_lot_price:
+                    continue
+                if latest_long_lot_price is None and current_long_avg_price > 0 and price <= current_long_avg_price:
                     continue
             entry_notional = _entry_notional(level=level, current_qty=current_short_qty)
             if allow_paused_short_probe:
@@ -1223,6 +1264,109 @@ def diff_open_orders(
         "stale_orders": stale_orders,
         "kept_orders": kept_orders,
     }
+
+
+def preserve_sticky_entry_orders(
+    *,
+    existing_orders: list[dict[str, Any]],
+    desired_orders: list[dict[str, Any]],
+    price_tolerance: float,
+) -> list[dict[str, Any]]:
+    tolerance = max(_safe_float(price_tolerance), 0.0)
+    if tolerance <= 0:
+        return [dict(order) for order in desired_orders]
+
+    adjusted_orders = [dict(order) for order in desired_orders]
+    entry_roles = {"entry_long", "entry_short"}
+    take_profit_roles = {"take_profit_long", "take_profit_short"}
+
+    def _position_side(order: dict[str, Any]) -> str:
+        raw = str(order.get("position_side", order.get("positionSide", "BOTH"))).upper().strip()
+        return raw or "BOTH"
+
+    def _price(order: dict[str, Any]) -> float:
+        return _safe_float(order.get("price"))
+
+    def _qty(order: dict[str, Any]) -> float:
+        return _safe_float(order.get("qty", order.get("quantity", order.get("origQty"))))
+
+    def _sort_key(order: dict[str, Any]) -> tuple[float, float]:
+        side = str(order.get("side", "")).upper().strip()
+        price = _price(order)
+        if side == "BUY":
+            return (-price, price)
+        return (price, price)
+
+    def _existing_is_closer(existing_order: dict[str, Any], desired_order: dict[str, Any]) -> bool:
+        side = str(desired_order.get("side", "")).upper().strip()
+        existing_price = _price(existing_order)
+        desired_price = _price(desired_order)
+        if side == "BUY":
+            return existing_price > desired_price + 1e-12
+        if side == "SELL":
+            return existing_price + 1e-12 < desired_price
+        return False
+
+    occupied_buckets = {
+        _order_bucket_key(str(order.get("side", "")), _price(order), _position_side(order))
+        for order in adjusted_orders
+        if str(order.get("role", "")).strip() in take_profit_roles and _price(order) > 0
+    }
+
+    desired_groups: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
+    for index, order in enumerate(adjusted_orders):
+        role = str(order.get("role", "")).strip()
+        if role not in entry_roles:
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            continue
+        key = (role, side, _position_side(order))
+        desired_groups.setdefault(key, []).append((index, order))
+
+    existing_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for order in existing_orders:
+        role = str(order.get("role", "")).strip()
+        if role not in entry_roles:
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            continue
+        if _price(order) <= 0 or _qty(order) <= 0:
+            continue
+        key = (role, side, _position_side(order))
+        existing_groups.setdefault(key, []).append(order)
+
+    for key, desired_group in desired_groups.items():
+        existing_group = existing_groups.get(key, [])
+        if not existing_group:
+            continue
+        desired_sorted = sorted(desired_group, key=lambda item: _sort_key(item[1]))
+        existing_sorted = sorted(existing_group, key=_sort_key)
+        for (index, desired_order), existing_order in zip(desired_sorted, existing_sorted):
+            desired_price = _price(desired_order)
+            existing_price = _price(existing_order)
+            if desired_price <= 0 or existing_price <= 0:
+                continue
+            if abs(existing_price - desired_price) > tolerance + 1e-12:
+                continue
+            if not _existing_is_closer(existing_order, desired_order):
+                continue
+            bucket = _order_bucket_key(
+                str(desired_order.get("side", "")),
+                existing_price,
+                _position_side(desired_order),
+            )
+            if bucket in occupied_buckets:
+                continue
+            adjusted_order = dict(adjusted_orders[index])
+            qty = _qty(adjusted_order)
+            adjusted_order["price"] = existing_price
+            if "notional" in adjusted_order:
+                adjusted_order["notional"] = existing_price * qty
+            adjusted_orders[index] = adjusted_order
+
+    return adjusted_orders
 
 
 def _config_payload(args: argparse.Namespace, symbol_info: dict[str, Any]) -> dict[str, Any]:

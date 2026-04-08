@@ -69,6 +69,7 @@ from .semi_auto_plan import (
     build_best_quote_short_flip_plan,
     diff_open_orders,
     load_or_initialize_state,
+    preserve_sticky_entry_orders,
     shift_center_price,
 )
 from .submit_plan import (
@@ -1280,6 +1281,42 @@ def _synthetic_order_ref_from_state(state: dict[str, Any], order_id: int | None)
         return None
     item = refs.get(str(int(order_id)))
     return dict(item) if isinstance(item, dict) else None
+
+
+def _decorate_synthetic_open_orders(
+    *,
+    state: dict[str, Any],
+    open_orders: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    refs = state.get("synthetic_order_refs")
+    client_refs: dict[str, dict[str, Any]] = {}
+    if isinstance(refs, dict):
+        for item in refs.values():
+            if not isinstance(item, dict):
+                continue
+            client_order_id = str(item.get("client_order_id", "")).strip()
+            if client_order_id and client_order_id not in client_refs:
+                client_refs[client_order_id] = dict(item)
+
+    decorated_orders: list[dict[str, Any]] = []
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        decorated = dict(order)
+        order_id = epoch_ms(order.get("orderId"))
+        ref = _synthetic_order_ref_from_state(state, order_id)
+        if ref is None:
+            client_order_id = str(order.get("clientOrderId", "")).strip()
+            ref = client_refs.get(client_order_id)
+        if isinstance(ref, dict):
+            role = str(ref.get("role", "")).strip()
+            if role:
+                decorated["role"] = role
+            position_side = str(ref.get("position_side", "")).upper().strip()
+            if position_side:
+                decorated["positionSide"] = position_side
+        decorated_orders.append(decorated)
+    return decorated_orders
 
 
 def _normalize_synthetic_lots(
@@ -4727,7 +4764,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         *plan["buy_orders"],
         *plan["sell_orders"],
     ]
-    diff = diff_open_orders(existing_orders=open_orders, desired_orders=desired_orders)
+    open_orders_for_diff = open_orders
+    if _is_synthetic_neutral_mode(strategy_mode):
+        open_orders_for_diff = _decorate_synthetic_open_orders(state=state, open_orders=open_orders)
+        desired_orders = preserve_sticky_entry_orders(
+            existing_orders=open_orders_for_diff,
+            desired_orders=desired_orders,
+            price_tolerance=effective_args.step_price,
+        )
+    diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
     state_now = _isoformat(_utc_now())
     if startup_pending:
