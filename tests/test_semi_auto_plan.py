@@ -422,6 +422,106 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(entry_short_orders[0]["level"], 1)
         self.assertAlmostEqual(entry_short_orders[0]["notional"], 10.0, delta=1.0)
 
+    def test_build_hedge_micro_grid_plan_light_long_blocks_worse_avg_cost_same_side_reentries(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.02,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=1.019,
+            ask_price=1.021,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=40.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.995,
+            entry_long_cost_guard_release_notional=100.0,
+        )
+
+        entry_long_orders = [item for item in plan["buy_orders"] if item["role"] == "entry_long"]
+
+        self.assertEqual(entry_long_orders, [])
+
+    def test_build_hedge_micro_grid_plan_light_short_blocks_worse_avg_cost_same_side_reentries(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=0.98,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=0.979,
+            ask_price=0.981,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=40.0,
+            current_short_avg_price=1.005,
+            entry_short_cost_guard_release_notional=100.0,
+        )
+
+        entry_short_orders = [item for item in plan["sell_orders"] if item["role"] == "entry_short"]
+
+        self.assertEqual(entry_short_orders, [])
+
+    def test_build_hedge_micro_grid_plan_light_inventory_skips_top_of_book_entries(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.01,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=1.000,
+            ask_price=1.020,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+            entry_long_cost_guard_release_notional=100.0,
+            entry_short_cost_guard_release_notional=100.0,
+        )
+
+        entry_long_prices = {item["price"] for item in plan["buy_orders"] if item["role"] == "entry_long"}
+        entry_short_prices = {item["price"] for item in plan["sell_orders"] if item["role"] == "entry_short"}
+
+        self.assertNotIn(1.0, entry_long_prices)
+        self.assertNotIn(1.02, entry_short_prices)
+        self.assertIn(0.99, entry_long_prices)
+        self.assertIn(1.03, entry_short_prices)
+
+    def test_build_hedge_micro_grid_plan_heavy_long_relaxes_same_side_entry_guard(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.02,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=1.019,
+            ask_price=1.021,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=120.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.995,
+            entry_long_cost_guard_release_notional=100.0,
+        )
+
+        entry_long_prices = {item["price"] for item in plan["buy_orders"] if item["role"] == "entry_long"}
+
+        self.assertIn(1.019, entry_long_prices)
+
     def test_build_inventory_target_neutral_plan_builds_band_orders_and_bootstrap(self) -> None:
         plan = build_inventory_target_neutral_plan(
             center_price=1.0,

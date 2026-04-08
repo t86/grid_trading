@@ -690,10 +690,14 @@ def build_hedge_micro_grid_plan(
     min_notional: float | None,
     current_long_qty: float,
     current_short_qty: float,
+    current_long_avg_price: float = 0.0,
+    current_short_avg_price: float = 0.0,
     startup_entry_multiplier: float = 1.0,
     startup_large_entry_active: bool = False,
     buy_offset_steps: float = 0.0,
     sell_offset_steps: float = 0.0,
+    entry_long_cost_guard_release_notional: float = 0.0,
+    entry_short_cost_guard_release_notional: float = 0.0,
     entry_long_paused: bool = False,
     entry_short_paused: bool = False,
     paused_entry_short_scale: float = 0.0,
@@ -713,6 +717,33 @@ def build_hedge_micro_grid_plan(
     buy_offset_steps = float(buy_offset_steps)
     sell_offset_steps = float(sell_offset_steps)
     paused_entry_short_scale = min(max(float(paused_entry_short_scale), 0.0), 1.0)
+    mid_price = (
+        (float(bid_price) + float(ask_price)) / 2.0
+        if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0
+        else float(center_price)
+    )
+    long_entry_cost_guard_active = (
+        max(float(entry_long_cost_guard_release_notional), 0.0) > 0
+        and current_short_qty <= 0
+        and current_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
+    )
+    short_entry_cost_guard_active = (
+        max(float(entry_short_cost_guard_release_notional), 0.0) > 0
+        and current_long_qty <= 0
+        and current_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
+    )
+    current_long_avg_price = max(float(current_long_avg_price), 0.0)
+    current_short_avg_price = max(float(current_short_avg_price), 0.0)
+    light_long_entry_max_price = (
+        _round_order_price(max(float(bid_price) - float(step_price), 0.0), tick_size, "BUY")
+        if long_entry_cost_guard_active and bid_price is not None and bid_price > 0
+        else None
+    )
+    light_short_entry_min_price = (
+        _round_order_price(float(ask_price) + float(step_price), tick_size, "SELL")
+        if short_entry_cost_guard_active and ask_price is not None and ask_price > 0
+        else None
+    )
 
     def _entry_notional(*, level: int, current_qty: float) -> float:
         if startup_large_entry_active and level == 1 and current_qty <= 1e-12:
@@ -760,6 +791,11 @@ def build_hedge_micro_grid_plan(
     if not bool(entry_long_paused):
         for level in range(1, buy_levels + 1):
             price = _buy_price(level)
+            if long_entry_cost_guard_active:
+                if light_long_entry_max_price is not None and price > light_long_entry_max_price:
+                    continue
+                if current_long_avg_price > 0 and price > current_long_avg_price:
+                    continue
             qty = _round_order_qty(_entry_notional(level=level, current_qty=current_long_qty) / price, step_size)
             notional = price * qty
             if price >= ask_price:
@@ -814,6 +850,11 @@ def build_hedge_micro_grid_plan(
         entry_sell_max_level = 1 if allow_paused_short_probe else sell_levels
         for level in range(1, entry_sell_max_level + 1):
             price = _sell_price(level)
+            if short_entry_cost_guard_active:
+                if light_short_entry_min_price is not None and price < light_short_entry_min_price:
+                    continue
+                if current_short_avg_price > 0 and price < current_short_avg_price:
+                    continue
             entry_notional = _entry_notional(level=level, current_qty=current_short_qty)
             if allow_paused_short_probe:
                 entry_notional *= paused_entry_short_scale
