@@ -908,6 +908,58 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertTrue(any(item["role"] == "take_profit_long" for item in plan["sell_orders"]))
         self.assertFalse(any(item["role"] == "entry_short" for item in plan["sell_orders"]))
 
+    def test_build_hedge_micro_grid_plan_dust_long_inventory_uses_flat_entry_spacing(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.02,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=1.019,
+            ask_price=1.021,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=2.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.03,
+            current_long_lots=[{"qty": 2.0, "price": 1.03}],
+            entry_long_cost_guard_release_notional=100.0,
+        )
+
+        entry_long_prices = [item["price"] for item in plan["buy_orders"] if item["role"] == "entry_long"]
+
+        self.assertEqual(entry_long_prices, [1.019, 1.009])
+        self.assertFalse(any(item["role"] == "take_profit_long" for item in plan["sell_orders"]))
+
+    def test_build_hedge_micro_grid_plan_dust_short_inventory_uses_flat_entry_spacing(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=0.98,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=0.979,
+            ask_price=0.981,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=2.0,
+            current_short_avg_price=0.97,
+            current_short_lots=[{"qty": 2.0, "price": 0.97}],
+            entry_short_cost_guard_release_notional=100.0,
+        )
+
+        entry_short_prices = [item["price"] for item in plan["sell_orders"] if item["role"] == "entry_short"]
+
+        self.assertEqual(entry_short_prices, [0.981, 0.991])
+        self.assertFalse(any(item["role"] == "take_profit_short" for item in plan["buy_orders"]))
+
     def test_build_hedge_micro_grid_plan_heavy_long_relaxes_same_side_entry_guard(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=1.02,

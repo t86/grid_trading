@@ -741,35 +741,49 @@ def build_hedge_micro_grid_plan(
         if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0
         else float(center_price)
     )
-    flat_inventory = current_long_qty <= 1e-12 and current_short_qty <= 1e-12
+    long_inventory_dust = (
+        current_long_qty > 0
+        and min_notional is not None
+        and min_notional > 0
+        and (current_long_qty * mid_price) < float(min_notional)
+    )
+    short_inventory_dust = (
+        current_short_qty > 0
+        and min_notional is not None
+        and min_notional > 0
+        and (current_short_qty * mid_price) < float(min_notional)
+    )
+    effective_long_qty = 0.0 if long_inventory_dust else current_long_qty
+    effective_short_qty = 0.0 if short_inventory_dust else current_short_qty
+    flat_inventory = effective_long_qty <= 1e-12 and effective_short_qty <= 1e-12
     long_entry_cost_guard_active = (
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
-        and current_long_qty > 0
-        and current_short_qty <= 0
-        and current_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
+        and effective_long_qty > 0
+        and effective_short_qty <= 0
+        and effective_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
     )
     short_entry_cost_guard_active = (
         max(float(entry_short_cost_guard_release_notional), 0.0) > 0
-        and current_short_qty > 0
-        and current_long_qty <= 0
-        and current_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
+        and effective_short_qty > 0
+        and effective_long_qty <= 0
+        and effective_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
     long_exit_profit_guard_active = (
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
-        and current_long_qty > 0
-        and current_short_qty <= 0
-        and current_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
+        and effective_long_qty > 0
+        and effective_short_qty <= 0
+        and effective_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
     )
     short_exit_profit_guard_active = (
         max(float(entry_short_cost_guard_release_notional), 0.0) > 0
-        and current_short_qty > 0
-        and current_long_qty <= 0
-        and current_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
+        and effective_short_qty > 0
+        and effective_long_qty <= 0
+        and effective_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
     latest_long_lot_price = current_long_lots[-1]["price"] if current_long_lots else None
     latest_short_lot_price = current_short_lots[-1]["price"] if current_short_lots else None
-    held_long_same_side_entry = current_long_qty > 0 and current_short_qty <= 0
-    held_short_same_side_entry = current_short_qty > 0 and current_long_qty <= 0
+    held_long_same_side_entry = effective_long_qty > 0 and effective_short_qty <= 0
+    held_short_same_side_entry = effective_short_qty > 0 and effective_long_qty <= 0
     light_long_entry_max_price = (
         _round_order_price(max(float(bid_price) - float(step_price), 0.0), tick_size, "BUY")
         if long_entry_cost_guard_active and bid_price is not None and bid_price > 0
@@ -853,7 +867,7 @@ def build_hedge_micro_grid_plan(
             price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "SELL")
 
-    remaining_short_exit_qty = _round_order_qty(current_short_qty, step_size)
+    remaining_short_exit_qty = _round_order_qty(effective_short_qty, step_size)
     for level in range(1, buy_levels + 1):
         if remaining_short_exit_qty <= 0:
             break
@@ -889,11 +903,11 @@ def build_hedge_micro_grid_plan(
     take_profit_short_price_keys = {
         f"{order.side}:{order.price:.10f}" for order in buy_orders if order.role == "take_profit_short"
     }
-    if not bool(entry_long_paused) and current_short_qty <= 0:
-        entry_buy_max_level = buy_levels + (1 if current_short_qty > 0 else 0)
+    if not bool(entry_long_paused) and effective_short_qty <= 0:
+        entry_buy_max_level = buy_levels + (1 if effective_short_qty > 0 else 0)
         for level in range(1, entry_buy_max_level + 1):
             price = _entry_buy_price(level)
-            if current_short_qty > 0 and f"BUY:{price:.10f}" in take_profit_short_price_keys:
+            if effective_short_qty > 0 and f"BUY:{price:.10f}" in take_profit_short_price_keys:
                 continue
             if long_entry_cost_guard_active:
                 if (
@@ -911,7 +925,7 @@ def build_hedge_micro_grid_plan(
                     continue
                 if latest_short_lot_price is None and current_short_avg_price > 0 and price >= current_short_avg_price:
                     continue
-            qty = _round_order_qty(_entry_notional(level=level, current_qty=current_long_qty) / price, step_size)
+            qty = _round_order_qty(_entry_notional(level=level, current_qty=effective_long_qty) / price, step_size)
             notional = price * qty
             if price >= ask_price:
                 continue
@@ -931,10 +945,10 @@ def build_hedge_micro_grid_plan(
                     position_side="LONG",
                 )
             )
-            if current_short_qty > 0:
+            if effective_short_qty > 0:
                 break
 
-    remaining_long_exit_qty = _round_order_qty(current_long_qty, step_size)
+    remaining_long_exit_qty = _round_order_qty(effective_long_qty, step_size)
     for level in range(1, sell_levels + 1):
         if remaining_long_exit_qty <= 0:
             break
@@ -971,13 +985,13 @@ def build_hedge_micro_grid_plan(
         f"{order.side}:{order.price:.10f}" for order in sell_orders if order.role == "take_profit_long"
     }
     allow_paused_short_probe = bool(entry_short_paused and paused_entry_short_scale > 0)
-    if (not bool(entry_short_paused) or allow_paused_short_probe) and current_long_qty <= 0:
-        entry_sell_max_level = sell_levels + (1 if current_long_qty > 0 else 0)
-        if allow_paused_short_probe and current_long_qty <= 0:
+    if (not bool(entry_short_paused) or allow_paused_short_probe) and effective_long_qty <= 0:
+        entry_sell_max_level = sell_levels + (1 if effective_long_qty > 0 else 0)
+        if allow_paused_short_probe and effective_long_qty <= 0:
             entry_sell_max_level = 1
         for level in range(1, entry_sell_max_level + 1):
             price = _entry_sell_price(level)
-            if current_long_qty > 0 and f"SELL:{price:.10f}" in take_profit_long_price_keys:
+            if effective_long_qty > 0 and f"SELL:{price:.10f}" in take_profit_long_price_keys:
                 continue
             if short_entry_cost_guard_active:
                 if (
@@ -995,7 +1009,7 @@ def build_hedge_micro_grid_plan(
                     continue
                 if latest_long_lot_price is None and current_long_avg_price > 0 and price <= current_long_avg_price:
                     continue
-            entry_notional = _entry_notional(level=level, current_qty=current_short_qty)
+            entry_notional = _entry_notional(level=level, current_qty=effective_short_qty)
             if allow_paused_short_probe:
                 entry_notional *= paused_entry_short_scale
             qty = _round_order_qty(entry_notional / price, step_size)
@@ -1018,13 +1032,13 @@ def build_hedge_micro_grid_plan(
                     position_side="SHORT",
                 )
             )
-            if allow_paused_short_probe or current_long_qty > 0:
+            if allow_paused_short_probe or effective_long_qty > 0:
                 break
 
     target_long_base_qty = _round_order_qty(base_position_notional / center_price, step_size)
     target_short_base_qty = _round_order_qty(base_position_notional / center_price, step_size)
-    bootstrap_long_qty = max(target_long_base_qty - current_long_qty, 0.0)
-    bootstrap_short_qty = max(target_short_base_qty - current_short_qty, 0.0)
+    bootstrap_long_qty = max(target_long_base_qty - effective_long_qty, 0.0)
+    bootstrap_short_qty = max(target_short_base_qty - effective_short_qty, 0.0)
 
     bootstrap_orders: list[PlanOrder] = []
     if bootstrap_long_qty > 0:
