@@ -860,7 +860,7 @@ def build_hedge_micro_grid_plan(
     take_profit_short_price_keys = {
         f"{order.side}:{order.price:.10f}" for order in buy_orders if order.role == "take_profit_short"
     }
-    if not bool(entry_long_paused):
+    if not bool(entry_long_paused) and current_short_qty <= 0:
         entry_buy_max_level = buy_levels + (1 if current_short_qty > 0 else 0)
         for level in range(1, entry_buy_max_level + 1):
             price = _entry_buy_price(level)
@@ -942,7 +942,7 @@ def build_hedge_micro_grid_plan(
         f"{order.side}:{order.price:.10f}" for order in sell_orders if order.role == "take_profit_long"
     }
     allow_paused_short_probe = bool(entry_short_paused and paused_entry_short_scale > 0)
-    if not bool(entry_short_paused) or allow_paused_short_probe:
+    if (not bool(entry_short_paused) or allow_paused_short_probe) and current_long_qty <= 0:
         entry_sell_max_level = sell_levels + (1 if current_long_qty > 0 else 0)
         if allow_paused_short_probe and current_long_qty <= 0:
             entry_sell_max_level = 1
