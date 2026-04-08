@@ -797,19 +797,31 @@ def build_hedge_micro_grid_plan(
         return _round_order_price(price_raw, tick_size, "SELL")
 
     def _entry_buy_price(level: int) -> float:
-        if flat_inventory or held_long_same_side_entry:
+        if flat_inventory:
             distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
+            price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        elif held_long_same_side_entry and latest_long_lot_price is not None:
+            distance_steps = max(float(level) + buy_offset_steps, 1.0)
+            price_raw = float(
+                Decimal(str(latest_long_lot_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price)))
+            )
         else:
             distance_steps = max(float(level) + buy_offset_steps, 1.0)
-        price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+            price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "BUY")
 
     def _entry_sell_price(level: int) -> float:
-        if flat_inventory or held_short_same_side_entry:
+        if flat_inventory:
             distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
+            price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        elif held_short_same_side_entry and latest_short_lot_price is not None:
+            distance_steps = max(float(level) + sell_offset_steps, 1.0)
+            price_raw = float(
+                Decimal(str(latest_short_lot_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price)))
+            )
         else:
             distance_steps = max(float(level) + sell_offset_steps, 1.0)
-        price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+            price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "SELL")
 
     remaining_short_exit_qty = _round_order_qty(current_short_qty, step_size)

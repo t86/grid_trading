@@ -536,7 +536,7 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         entry_long_prices = {item["price"] for item in plan["buy_orders"] if item["role"] == "entry_long"}
 
-        self.assertEqual(entry_long_prices, {1.009})
+        self.assertEqual(entry_long_prices, {1.005, 0.995})
 
     def test_build_hedge_micro_grid_plan_light_long_skips_loss_making_sell_orders(self) -> None:
         plan = build_hedge_micro_grid_plan(
@@ -613,7 +613,7 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         entry_short_prices = {item["price"] for item in plan["sell_orders"] if item["role"] == "entry_short"}
 
-        self.assertEqual(entry_short_prices, {0.991})
+        self.assertEqual(entry_short_prices, {0.995, 1.005})
 
     def test_build_hedge_micro_grid_plan_light_short_skips_loss_making_buy_orders(self) -> None:
         plan = build_hedge_micro_grid_plan(
@@ -666,7 +666,7 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertIn(0.99, entry_long_prices)
         self.assertIn(1.03, entry_short_prices)
 
-    def test_build_hedge_micro_grid_plan_held_long_inventory_keeps_same_side_entry_at_best_bid(self) -> None:
+    def test_build_hedge_micro_grid_plan_held_long_inventory_anchors_same_side_entries_to_latest_lot(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=1.01,
             step_price=0.01,
@@ -689,22 +689,25 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         entry_long_prices = {item["price"] for item in plan["buy_orders"] if item["role"] == "entry_long"}
         entry_short_prices = {item["price"] for item in plan["sell_orders"] if item["role"] == "entry_short"}
+        take_profit_long_prices = {item["price"] for item in plan["sell_orders"] if item["role"] == "take_profit_long"}
 
-        self.assertIn(1.0, entry_long_prices)
+        self.assertIn(1.01, entry_long_prices)
+        self.assertIn(1.00, entry_long_prices)
+        self.assertNotIn(1.02, entry_long_prices)
         self.assertNotIn(1.02, entry_short_prices)
-        self.assertIn(0.99, entry_long_prices)
+        self.assertIn(1.03, take_profit_long_prices)
         self.assertIn(1.04, entry_short_prices)
 
-    def test_build_hedge_micro_grid_plan_held_short_inventory_keeps_same_side_entry_at_best_ask(self) -> None:
+    def test_build_hedge_micro_grid_plan_held_short_inventory_anchors_same_side_entries_to_latest_lot(self) -> None:
         plan = build_hedge_micro_grid_plan(
-            center_price=1.01,
+            center_price=0.97,
             step_price=0.01,
             buy_levels=2,
             sell_levels=2,
             per_order_notional=25.0,
             base_position_notional=0.0,
-            bid_price=1.000,
-            ask_price=1.020,
+            bid_price=0.960,
+            ask_price=0.980,
             tick_size=0.001,
             step_size=1.0,
             min_qty=1.0,
@@ -718,11 +721,13 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         entry_long_prices = {item["price"] for item in plan["buy_orders"] if item["role"] == "entry_long"}
         entry_short_prices = {item["price"] for item in plan["sell_orders"] if item["role"] == "entry_short"}
+        take_profit_short_prices = {item["price"] for item in plan["buy_orders"] if item["role"] == "take_profit_short"}
 
-        self.assertNotIn(1.0, entry_long_prices)
-        self.assertIn(1.02, entry_short_prices)
-        self.assertIn(0.97, entry_long_prices)
-        self.assertIn(1.03, entry_short_prices)
+        self.assertIn(0.96, take_profit_short_prices)
+        self.assertIn(0.99, entry_short_prices)
+        self.assertIn(1.00, entry_short_prices)
+        self.assertNotIn(0.98, entry_short_prices)
+        self.assertIn(0.95, entry_long_prices)
 
     def test_build_hedge_micro_grid_plan_reverse_entry_orders_avoid_take_profit_levels(self) -> None:
         plan = build_hedge_micro_grid_plan(
