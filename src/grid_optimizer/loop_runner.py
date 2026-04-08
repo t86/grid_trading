@@ -1187,8 +1187,10 @@ def _load_synthetic_ledger(
                 {
                     "virtual_long_qty": net_qty,
                     "virtual_long_avg_price": max(float(entry_price), 0.0),
+                    "virtual_long_lots": [{"qty": net_qty, "price": max(float(entry_price), 0.0)}],
                     "virtual_short_qty": 0.0,
                     "virtual_short_avg_price": 0.0,
+                    "virtual_short_lots": [],
                 }
             )
         elif net_qty < 0:
@@ -1196,8 +1198,10 @@ def _load_synthetic_ledger(
                 {
                     "virtual_long_qty": 0.0,
                     "virtual_long_avg_price": 0.0,
+                    "virtual_long_lots": [],
                     "virtual_short_qty": abs(net_qty),
                     "virtual_short_avg_price": max(float(entry_price), 0.0),
+                    "virtual_short_lots": [{"qty": abs(net_qty), "price": max(float(entry_price), 0.0)}],
                 }
             )
         else:
@@ -1205,14 +1209,37 @@ def _load_synthetic_ledger(
                 {
                     "virtual_long_qty": 0.0,
                     "virtual_long_avg_price": 0.0,
+                    "virtual_long_lots": [],
                     "virtual_short_qty": 0.0,
                     "virtual_short_avg_price": 0.0,
+                    "virtual_short_lots": [],
                 }
             )
         ledger["initialized"] = True
         ledger["last_trade_time_ms"] = int(ledger.get("last_trade_time_ms") or 0)
         ledger["last_trade_keys_at_time"] = list(ledger.get("last_trade_keys_at_time") or [])
         ledger["unmatched_trade_count"] = int(ledger.get("unmatched_trade_count") or 0)
+    else:
+        long_qty = max(_safe_float(ledger.get("virtual_long_qty")), 0.0)
+        long_avg = max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0)
+        short_qty = max(_safe_float(ledger.get("virtual_short_qty")), 0.0)
+        short_avg = max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0)
+        ledger["virtual_long_lots"] = _normalize_synthetic_lots(
+            ledger.get("virtual_long_lots"),
+            fallback_qty=long_qty,
+            fallback_price=long_avg,
+        )
+        ledger["virtual_short_lots"] = _normalize_synthetic_lots(
+            ledger.get("virtual_short_lots"),
+            fallback_qty=short_qty,
+            fallback_price=short_avg,
+        )
+        ledger["virtual_long_qty"], ledger["virtual_long_avg_price"] = _synthetic_book_from_lots(
+            ledger["virtual_long_lots"]
+        )
+        ledger["virtual_short_qty"], ledger["virtual_short_avg_price"] = _synthetic_book_from_lots(
+            ledger["virtual_short_lots"]
+        )
     state["synthetic_ledger"] = ledger
     return ledger
 
@@ -1231,8 +1258,10 @@ def _reset_synthetic_ledger_to_actual(
         "initialized": True,
         "virtual_long_qty": max(net_qty, 0.0),
         "virtual_long_avg_price": max(float(entry_price), 0.0) if net_qty > 0 else 0.0,
+        "virtual_long_lots": [{"qty": max(net_qty, 0.0), "price": max(float(entry_price), 0.0)}] if net_qty > 0 else [],
         "virtual_short_qty": max(-net_qty, 0.0),
         "virtual_short_avg_price": max(float(entry_price), 0.0) if net_qty < 0 else 0.0,
+        "virtual_short_lots": [{"qty": max(-net_qty, 0.0), "price": max(float(entry_price), 0.0)}] if net_qty < 0 else [],
         "last_trade_time_ms": int(current_time.timestamp() * 1000),
         "last_trade_keys_at_time": [],
         "unmatched_trade_count": 0,
@@ -1253,6 +1282,52 @@ def _synthetic_order_ref_from_state(state: dict[str, Any], order_id: int | None)
     return dict(item) if isinstance(item, dict) else None
 
 
+def _normalize_synthetic_lots(
+    raw_lots: Any,
+    *,
+    fallback_qty: float = 0.0,
+    fallback_price: float = 0.0,
+) -> list[dict[str, float]]:
+    lots: list[dict[str, float]] = []
+    if isinstance(raw_lots, list):
+        for item in raw_lots:
+            if not isinstance(item, dict):
+                continue
+            qty = max(_safe_float(item.get("qty")), 0.0)
+            price = max(_safe_float(item.get("price")), 0.0)
+            if qty <= 1e-12 or price <= 0:
+                continue
+            lots.append({"qty": qty, "price": price})
+    if lots:
+        return lots
+    if fallback_qty > 1e-12 and fallback_price > 0:
+        return [{"qty": float(fallback_qty), "price": float(fallback_price)}]
+    return []
+
+
+def _synthetic_book_from_lots(lots: list[dict[str, float]]) -> tuple[float, float]:
+    total_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in lots)
+    if total_qty <= 1e-12:
+        return 0.0, 0.0
+    total_cost = sum(max(_safe_float(item.get("qty")), 0.0) * max(_safe_float(item.get("price")), 0.0) for item in lots)
+    return total_qty, (total_cost / total_qty if total_qty > 0 else 0.0)
+
+
+def _consume_synthetic_lots_lifo(lots: list[dict[str, float]], qty: float) -> list[dict[str, float]]:
+    remaining = max(float(qty), 0.0)
+    updated = [{"qty": float(item["qty"]), "price": float(item["price"])} for item in lots]
+    while updated and remaining > 1e-12:
+        tail = updated[-1]
+        tail_qty = max(_safe_float(tail.get("qty")), 0.0)
+        if tail_qty <= remaining + 1e-12:
+            remaining = max(remaining - tail_qty, 0.0)
+            updated.pop()
+            continue
+        tail["qty"] = tail_qty - remaining
+        remaining = 0.0
+    return updated
+
+
 def _apply_synthetic_trade_fill(
     *,
     ledger: dict[str, Any],
@@ -1267,36 +1342,36 @@ def _apply_synthetic_trade_fill(
     if qty <= 0 or price <= 0:
         return False
 
-    long_qty = max(_safe_float(ledger.get("virtual_long_qty")), 0.0)
-    long_avg = max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0)
-    short_qty = max(_safe_float(ledger.get("virtual_short_qty")), 0.0)
-    short_avg = max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0)
+    long_lots = _normalize_synthetic_lots(
+        ledger.get("virtual_long_lots"),
+        fallback_qty=max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
+        fallback_price=max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
+    )
+    short_lots = _normalize_synthetic_lots(
+        ledger.get("virtual_short_lots"),
+        fallback_qty=max(_safe_float(ledger.get("virtual_short_qty")), 0.0),
+        fallback_price=max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0),
+    )
 
     if role in {"bootstrap_long", "entry_long"}:
-        total_cost = long_avg * long_qty + price * qty
-        long_qty += qty
-        long_avg = total_cost / long_qty if long_qty > 0 else 0.0
+        long_lots.append({"qty": qty, "price": price})
     elif role == "take_profit_long":
-        long_qty = max(long_qty - qty, 0.0)
-        if long_qty <= 1e-12:
-            long_qty = 0.0
-            long_avg = 0.0
+        long_lots = _consume_synthetic_lots_lifo(long_lots, qty)
     elif role in {"bootstrap_short", "entry_short"}:
-        total_proceeds = short_avg * short_qty + price * qty
-        short_qty += qty
-        short_avg = total_proceeds / short_qty if short_qty > 0 else 0.0
+        short_lots.append({"qty": qty, "price": price})
     elif role == "take_profit_short":
-        short_qty = max(short_qty - qty, 0.0)
-        if short_qty <= 1e-12:
-            short_qty = 0.0
-            short_avg = 0.0
+        short_lots = _consume_synthetic_lots_lifo(short_lots, qty)
     else:
         return False
 
+    long_qty, long_avg = _synthetic_book_from_lots(long_lots)
+    short_qty, short_avg = _synthetic_book_from_lots(short_lots)
     ledger["virtual_long_qty"] = long_qty
     ledger["virtual_long_avg_price"] = long_avg
+    ledger["virtual_long_lots"] = long_lots
     ledger["virtual_short_qty"] = short_qty
     ledger["virtual_short_avg_price"] = short_avg
+    ledger["virtual_short_lots"] = short_lots
     return True
 
 
@@ -1350,8 +1425,10 @@ def sync_synthetic_ledger(
     return {
         "virtual_long_qty": max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
         "virtual_long_avg_price": max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
+        "virtual_long_lots": list(ledger.get("virtual_long_lots") or []),
         "virtual_short_qty": max(_safe_float(ledger.get("virtual_short_qty")), 0.0),
         "virtual_short_avg_price": max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0),
+        "virtual_short_lots": list(ledger.get("virtual_short_lots") or []),
         "applied_trade_count": applied,
         "unmatched_trade_count": unmatched,
     }
@@ -4345,6 +4422,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_qty=current_short_qty,
             current_long_avg_price=max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_avg_price")), 0.0),
             current_short_avg_price=max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0),
+            current_long_lots=list(synthetic_ledger_snapshot.get("virtual_long_lots") or []),
+            current_short_lots=list(synthetic_ledger_snapshot.get("virtual_short_lots") or []),
             startup_entry_multiplier=getattr(effective_args, "startup_entry_multiplier", 1.0),
             startup_large_entry_active=(startup_pending or (current_long_qty <= 1e-12 and current_short_qty <= 1e-12)),
             buy_offset_steps=(

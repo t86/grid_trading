@@ -193,6 +193,19 @@ def _build_order(
     )
 
 
+def _normalize_lots(lots: list[dict[str, Any]] | None) -> list[dict[str, float]]:
+    normalized: list[dict[str, float]] = []
+    for item in lots or []:
+        if not isinstance(item, dict):
+            continue
+        qty = max(_safe_float(item.get("qty")), 0.0)
+        price = max(_safe_float(item.get("price")), 0.0)
+        if qty <= 1e-12 or price <= 0:
+            continue
+        normalized.append({"qty": qty, "price": price})
+    return normalized
+
+
 def build_static_binance_grid_plan(
     *,
     strategy_direction: str,
@@ -692,6 +705,8 @@ def build_hedge_micro_grid_plan(
     current_short_qty: float,
     current_long_avg_price: float = 0.0,
     current_short_avg_price: float = 0.0,
+    current_long_lots: list[dict[str, Any]] | None = None,
+    current_short_lots: list[dict[str, Any]] | None = None,
     startup_entry_multiplier: float = 1.0,
     startup_large_entry_active: bool = False,
     buy_offset_steps: float = 0.0,
@@ -713,6 +728,10 @@ def build_hedge_micro_grid_plan(
     sell_orders: list[PlanOrder] = []
     current_long_qty = max(float(current_long_qty), 0.0)
     current_short_qty = max(float(current_short_qty), 0.0)
+    current_long_avg_price = max(float(current_long_avg_price), 0.0)
+    current_short_avg_price = max(float(current_short_avg_price), 0.0)
+    current_long_lots = _normalize_lots(current_long_lots)
+    current_short_lots = _normalize_lots(current_short_lots)
     startup_multiplier = max(float(startup_entry_multiplier), 1.0)
     buy_offset_steps = float(buy_offset_steps)
     sell_offset_steps = float(sell_offset_steps)
@@ -732,8 +751,8 @@ def build_hedge_micro_grid_plan(
         and current_long_qty <= 0
         and current_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
-    current_long_avg_price = max(float(current_long_avg_price), 0.0)
-    current_short_avg_price = max(float(current_short_avg_price), 0.0)
+    latest_long_lot_price = current_long_lots[-1]["price"] if current_long_lots else None
+    latest_short_lot_price = current_short_lots[-1]["price"] if current_short_lots else None
     light_long_entry_max_price = (
         _round_order_price(max(float(bid_price) - float(step_price), 0.0), tick_size, "BUY")
         if long_entry_cost_guard_active and bid_price is not None and bid_price > 0
@@ -794,7 +813,9 @@ def build_hedge_micro_grid_plan(
             if long_entry_cost_guard_active:
                 if light_long_entry_max_price is not None and price > light_long_entry_max_price:
                     continue
-                if current_long_avg_price > 0 and price > current_long_avg_price:
+                if latest_long_lot_price is not None and price > latest_long_lot_price:
+                    continue
+                if latest_long_lot_price is None and current_long_avg_price > 0 and price > current_long_avg_price:
                     continue
             qty = _round_order_qty(_entry_notional(level=level, current_qty=current_long_qty) / price, step_size)
             notional = price * qty
@@ -853,7 +874,9 @@ def build_hedge_micro_grid_plan(
             if short_entry_cost_guard_active:
                 if light_short_entry_min_price is not None and price < light_short_entry_min_price:
                     continue
-                if current_short_avg_price > 0 and price < current_short_avg_price:
+                if latest_short_lot_price is not None and price < latest_short_lot_price:
+                    continue
+                if latest_short_lot_price is None and current_short_avg_price > 0 and price < current_short_avg_price:
                     continue
             entry_notional = _entry_notional(level=level, current_qty=current_short_qty)
             if allow_paused_short_probe:

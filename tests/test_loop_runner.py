@@ -13,6 +13,7 @@ from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _should_sync_account_audit,
     _apply_synthetic_trade_fill,
+    _load_synthetic_ledger,
     _build_parser,
     _current_check_bucket,
     _custom_grid_levels_above_current,
@@ -701,6 +702,78 @@ class LoopRunnerTests(unittest.TestCase):
             )
         )
         self.assertAlmostEqual(ledger["virtual_short_qty"], 30.0)
+
+    def test_apply_synthetic_trade_fill_tracks_lifo_lots(self) -> None:
+        ledger = {
+            "virtual_long_qty": 15.0,
+            "virtual_long_avg_price": (10.0 * 1.0 + 5.0 * 1.1) / 15.0,
+            "virtual_short_qty": 0.0,
+            "virtual_short_avg_price": 0.0,
+            "virtual_long_lots": [
+                {"qty": 10.0, "price": 1.0},
+                {"qty": 5.0, "price": 1.1},
+            ],
+            "virtual_short_lots": [],
+        }
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "3", "price": "1.12"},
+                order_ref={"role": "take_profit_long"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_long_qty"], 12.0)
+        self.assertAlmostEqual(ledger["virtual_long_avg_price"], (10.0 * 1.0 + 2.0 * 1.1) / 12.0)
+        self.assertEqual(
+            ledger["virtual_long_lots"],
+            [
+                {"qty": 10.0, "price": 1.0},
+                {"qty": 2.0, "price": 1.1},
+            ],
+        )
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "4", "price": "1.20"},
+                order_ref={"role": "entry_long"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_long_qty"], 16.0)
+        self.assertAlmostEqual(ledger["virtual_long_avg_price"], (10.0 * 1.0 + 2.0 * 1.1 + 4.0 * 1.2) / 16.0)
+        self.assertEqual(
+            ledger["virtual_long_lots"],
+            [
+                {"qty": 10.0, "price": 1.0},
+                {"qty": 2.0, "price": 1.1},
+                {"qty": 4.0, "price": 1.2},
+            ],
+        )
+
+    def test_load_synthetic_ledger_backfills_missing_lots_from_aggregate_state(self) -> None:
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 12.0,
+                "virtual_long_avg_price": 1.15,
+                "virtual_short_qty": 7.0,
+                "virtual_short_avg_price": 0.95,
+            }
+        }
+
+        ledger = _load_synthetic_ledger(
+            state=state,
+            actual_position_qty=0.0,
+            entry_price=0.0,
+        )
+
+        self.assertEqual(ledger["virtual_long_lots"], [{"qty": 12.0, "price": 1.15}])
+        self.assertEqual(ledger["virtual_short_lots"], [{"qty": 7.0, "price": 0.95}])
+        self.assertAlmostEqual(ledger["virtual_long_qty"], 12.0)
+        self.assertAlmostEqual(ledger["virtual_long_avg_price"], 1.15)
+        self.assertAlmostEqual(ledger["virtual_short_qty"], 7.0)
+        self.assertAlmostEqual(ledger["virtual_short_avg_price"], 0.95)
 
     def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:

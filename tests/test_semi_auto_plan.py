@@ -446,6 +446,34 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual(entry_long_orders, [])
 
+    def test_build_hedge_micro_grid_plan_light_long_uses_latest_lot_over_average_cost(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.02,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=1.019,
+            ask_price=1.021,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=40.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.995,
+            current_long_lots=[
+                {"qty": 20.0, "price": 0.98},
+                {"qty": 20.0, "price": 1.015},
+            ],
+            entry_long_cost_guard_release_notional=100.0,
+        )
+
+        entry_long_prices = {item["price"] for item in plan["buy_orders"] if item["role"] == "entry_long"}
+
+        self.assertEqual(entry_long_prices, {1.009})
+
     def test_build_hedge_micro_grid_plan_light_short_blocks_worse_avg_cost_same_side_reentries(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=0.98,
@@ -469,6 +497,34 @@ class SemiAutoPlanTests(unittest.TestCase):
         entry_short_orders = [item for item in plan["sell_orders"] if item["role"] == "entry_short"]
 
         self.assertEqual(entry_short_orders, [])
+
+    def test_build_hedge_micro_grid_plan_light_short_uses_latest_lot_over_average_cost(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=0.98,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=0.979,
+            ask_price=0.981,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=40.0,
+            current_short_avg_price=1.005,
+            current_short_lots=[
+                {"qty": 20.0, "price": 1.02},
+                {"qty": 20.0, "price": 0.985},
+            ],
+            entry_short_cost_guard_release_notional=100.0,
+        )
+
+        entry_short_prices = {item["price"] for item in plan["sell_orders"] if item["role"] == "entry_short"}
+
+        self.assertEqual(entry_short_prices, {0.991})
 
     def test_build_hedge_micro_grid_plan_light_inventory_skips_top_of_book_entries(self) -> None:
         plan = build_hedge_micro_grid_plan(
