@@ -357,6 +357,85 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(risk["xaut_adaptive_candidate_state"], "reduce_only")
         self.assertEqual(risk["xaut_adaptive_reason"], "15m amp=1.00% ret=-0.80%")
 
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [
+                {
+                    "symbol": "BARDUSDT",
+                    "positionAmt": "0",
+                    "entryPrice": "0",
+                    "breakEvenPrice": "0",
+                    "unRealizedProfit": "0",
+                    "isolated": False,
+                    "leverage": "2",
+                }
+            ],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "0.3268"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "0.3268", "ask_price": "0.3269"}])
+    def test_build_monitor_snapshot_uses_live_flat_position_when_synthetic_runner_stopped(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_competition,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "bard_events.jsonl"
+            plan_path = root / "bard_plan.json"
+            submit_path = root / "bard_submit.json"
+            events_path.write_text("", encoding="utf-8")
+            plan_path.write_text(
+                '{"strategy_mode":"synthetic_neutral","current_long_qty":4478,"current_short_qty":0,"synthetic_net_qty":4478,"current_long_notional":1463.6343,"current_short_notional":0}',
+                encoding="utf-8",
+            )
+            submit_path.write_text(
+                '{"plan_snapshot":{"current_long_qty":4478,"current_short_qty":0,"synthetic_net_qty":4478,"current_long_notional":1463.6343,"current_short_notional":0}}',
+                encoding="utf-8",
+            )
+
+            snapshot = build_monitor_snapshot(
+                symbol="BARDUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": False,
+                    "config": {
+                        "symbol": "BARDUSDT",
+                        "strategy_mode": "synthetic_neutral",
+                    },
+                },
+            )
+
+        position = snapshot["position"]
+        self.assertEqual(position["position_amt"], 0.0)
+        self.assertEqual(position["virtual_long_qty"], 0.0)
+        self.assertEqual(position["virtual_short_qty"], 0.0)
+        self.assertEqual(str(position["virtual_short_qty"]), "0.0")
+        self.assertEqual(position["virtual_net_qty"], 0.0)
+        self.assertEqual(snapshot["risk_controls"]["current_long_notional"], 0.0)
+
     def test_filter_rows_since_discards_older_trade_rows(self) -> None:
         floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)
         rows = [

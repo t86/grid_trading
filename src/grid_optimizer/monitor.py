@@ -1340,6 +1340,8 @@ def _build_monitor_snapshot_uncached(
     ).strip() or "one_way_long"
     synthetic_mode = strategy_mode == "synthetic_neutral"
     target_neutral_mode = strategy_mode == "inventory_target_neutral"
+    runner_is_running = bool(runner.get("is_running")) if isinstance(runner, dict) else False
+    use_live_synthetic_position = synthetic_mode and not runner_is_running and isinstance(position, dict)
 
     synthetic_long_qty = _safe_float((plan_report or {}).get("current_long_qty"))
     if synthetic_long_qty <= 0:
@@ -1366,10 +1368,22 @@ def _build_monitor_snapshot_uncached(
         synthetic_drift_qty = _safe_float(plan_snapshot.get("synthetic_drift_qty"))
     if abs(synthetic_drift_qty) <= 0:
         synthetic_drift_qty = _safe_float(latest_loop.get("synthetic_drift_qty"))
+    if use_live_synthetic_position:
+        live_net_qty = _safe_float(position.get("position_amt"))
+        if abs(live_net_qty) <= 1e-12:
+            live_net_qty = 0.0
+        synthetic_long_qty = live_net_qty if live_net_qty > 0 else 0.0
+        synthetic_short_qty = -live_net_qty if live_net_qty < 0 else 0.0
+        synthetic_net_qty = live_net_qty
+        synthetic_drift_qty = 0.0
 
     current_long_notional = 0.0
     current_short_notional = 0.0
-    if synthetic_mode or target_neutral_mode:
+    if use_live_synthetic_position:
+        mid_price = max(_safe_float(market.get("mid_price")), 0.0)
+        current_long_notional = synthetic_long_qty * mid_price
+        current_short_notional = synthetic_short_qty * mid_price
+    elif synthetic_mode or target_neutral_mode:
         current_long_notional = _safe_float((plan_report or {}).get("current_long_notional"))
         if current_long_notional <= 0:
             current_long_notional = _safe_float(plan_snapshot.get("current_long_notional"))
@@ -1389,13 +1403,13 @@ def _build_monitor_snapshot_uncached(
             max(_safe_float(position.get("short_qty")), 0.0)
             * max(_safe_float(market.get("mid_price")), 0.0)
         )
-    if current_long_notional <= 0:
+    if current_long_notional <= 0 and not use_live_synthetic_position:
         current_long_notional = _safe_float(plan_report.get("current_long_notional")) if plan_report else 0.0
-    if current_long_notional <= 0:
+    if current_long_notional <= 0 and not use_live_synthetic_position:
         current_long_notional = _safe_float(latest_loop.get("current_long_notional"))
-    if current_short_notional <= 0:
+    if current_short_notional <= 0 and not use_live_synthetic_position:
         current_short_notional = _safe_float(plan_report.get("current_short_notional")) if plan_report else 0.0
-    if current_short_notional <= 0:
+    if current_short_notional <= 0 and not use_live_synthetic_position:
         current_short_notional = _safe_float(latest_loop.get("current_short_notional"))
 
     pause_buy_position_notional = _safe_float(runner_config.get("pause_buy_position_notional"))
