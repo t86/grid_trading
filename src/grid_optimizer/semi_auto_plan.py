@@ -780,6 +780,33 @@ def build_hedge_micro_grid_plan(
         if short_entry_cost_guard_active and ask_price is not None and ask_price > 0
         else None
     )
+    long_exit_reference_price = (
+        latest_long_lot_price
+        if latest_long_lot_price is not None
+        else (current_long_avg_price if current_long_avg_price > 0 else None)
+    )
+    short_exit_reference_price = (
+        latest_short_lot_price
+        if latest_short_lot_price is not None
+        else (current_short_avg_price if current_short_avg_price > 0 else None)
+    )
+    price_tick = float(tick_size) if tick_size is not None and tick_size > 0 else 1e-12
+    long_exit_anchor_price = (
+        max(
+            _round_order_price(ask_price, tick_size, "SELL"),
+            _round_order_price(float(long_exit_reference_price) + price_tick, tick_size, "SELL"),
+        )
+        if long_exit_profit_guard_active and long_exit_reference_price is not None
+        else None
+    )
+    short_exit_anchor_price = (
+        min(
+            _round_order_price(bid_price, tick_size, "BUY"),
+            _round_order_price(max(float(short_exit_reference_price) - price_tick, 0.0), tick_size, "BUY"),
+        )
+        if short_exit_profit_guard_active and short_exit_reference_price is not None
+        else None
+    )
 
     def _entry_notional(*, level: int, current_qty: float) -> float:
         if startup_large_entry_active and level == 1 and current_qty <= 1e-12:
@@ -788,12 +815,14 @@ def build_hedge_micro_grid_plan(
 
     def _buy_price(level: int) -> float:
         distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
-        price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        anchor_price = short_exit_anchor_price if short_exit_anchor_price is not None else float(bid_price)
+        price_raw = float(Decimal(str(anchor_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "BUY")
 
     def _sell_price(level: int) -> float:
         distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
-        price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        anchor_price = long_exit_anchor_price if long_exit_anchor_price is not None else float(ask_price)
+        price_raw = float(Decimal(str(anchor_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "SELL")
 
     def _entry_buy_price(level: int) -> float:

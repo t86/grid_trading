@@ -538,7 +538,7 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual(entry_long_prices, {1.005, 0.995})
 
-    def test_build_hedge_micro_grid_plan_light_long_skips_loss_making_sell_orders(self) -> None:
+    def test_build_hedge_micro_grid_plan_light_long_anchors_first_profitable_sell_order(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=1.0,
             step_price=0.01,
@@ -559,7 +559,10 @@ class SemiAutoPlanTests(unittest.TestCase):
             entry_long_cost_guard_release_notional=100.0,
         )
 
-        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(
+            [item["price"] for item in plan["sell_orders"] if item["role"] == "take_profit_long"],
+            [1.021],
+        )
 
     def test_build_hedge_micro_grid_plan_light_short_blocks_worse_avg_cost_same_side_reentries(self) -> None:
         plan = build_hedge_micro_grid_plan(
@@ -613,7 +616,7 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual(entry_short_prices, {0.995, 1.005})
 
-    def test_build_hedge_micro_grid_plan_light_short_skips_loss_making_buy_orders(self) -> None:
+    def test_build_hedge_micro_grid_plan_light_short_anchors_first_profitable_buy_order(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=1.0,
             step_price=0.01,
@@ -634,7 +637,62 @@ class SemiAutoPlanTests(unittest.TestCase):
             entry_short_cost_guard_release_notional=100.0,
         )
 
-        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(
+            [item["price"] for item in plan["buy_orders"] if item["role"] == "take_profit_short"],
+            [0.979],
+        )
+
+    def test_build_hedge_micro_grid_plan_light_short_anchors_first_profitable_buy_order_to_latest_lot(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=4,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=1.001,
+            ask_price=1.002,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=20.0,
+            current_short_avg_price=0.985,
+            current_short_lots=[{"qty": 20.0, "price": 0.985}],
+            entry_short_cost_guard_release_notional=100.0,
+        )
+
+        self.assertEqual(
+            [item["price"] for item in plan["buy_orders"] if item["role"] == "take_profit_short"],
+            [0.984],
+        )
+
+    def test_build_hedge_micro_grid_plan_light_long_anchors_first_profitable_sell_order_to_latest_lot(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=4,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=0.999,
+            ask_price=1.0,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=20.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.015,
+            current_long_lots=[{"qty": 20.0, "price": 1.015}],
+            entry_long_cost_guard_release_notional=100.0,
+        )
+
+        self.assertEqual(
+            [item["price"] for item in plan["sell_orders"] if item["role"] == "take_profit_long"],
+            [1.016],
+        )
 
     def test_build_hedge_micro_grid_plan_flat_entries_can_start_at_best_quote(self) -> None:
         plan = build_hedge_micro_grid_plan(
@@ -691,7 +749,7 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertIn(1.00, entry_long_prices)
         self.assertNotIn(1.02, entry_long_prices)
         self.assertEqual(entry_short_prices, set())
-        self.assertIn(1.03, take_profit_long_prices)
+        self.assertIn(1.021, take_profit_long_prices)
 
     def test_build_hedge_micro_grid_plan_held_short_inventory_anchors_same_side_entries_to_latest_lot(self) -> None:
         plan = build_hedge_micro_grid_plan(
