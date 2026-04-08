@@ -345,9 +345,10 @@
 
 ### `bard_12h_push_neutral_v2`
 
-- 核心：BARDUSDT 的旧版双向冲量模板。
-- 固定 `step_price=0.0001`、双边 `8x8`、零底仓、`1` 格追中心，优先把高成交窗口里的双边回转密度堆高。
-- 关闭 `autotune_symbol_enabled` 和 `excess_inventory_reduce_only_enabled`，更适合短时冲量，不建议长期常开。
+- 核心：BARDUSDT 的固定节奏双向冲量模板。
+- 固定 `step_price=0.0007`、`8` 买 `4` 卖、零底仓、`1` 格追中心，`per_order_notional=45`，长侧上限 `2000/2400`、短侧回补护栏 `220/320`。
+- 默认关闭 `autotune_symbol_enabled`、`excess_inventory_reduce_only_enabled` 和 `volatility_trigger_enabled`，更适合高成交窗口短时冲量。
+- 默认开启最近 `15m` 市场成交额自动启停：`start_threshold=1,000,000`、`stop_threshold=700,000`。低量停机时会先撤策略单，但不会自动平仓。
 - 后续如果要把这套骨架复用到其他币种，优先改用 `synthetic_neutral_bard_style_v1`。
 
 ### `synthetic_neutral_bard_style_v1`
