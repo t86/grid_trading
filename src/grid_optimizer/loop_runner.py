@@ -79,7 +79,7 @@ from .submit_plan import (
     prepare_post_only_order_request,
     validate_plan_report,
 )
-from .dry_run import _round_order_qty
+from .dry_run import _round_order_price, _round_order_qty
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
 AUTO_REGIME_DEFENSIVE_PROFILE = "volatility_defensive_v1"
@@ -1651,6 +1651,7 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         synthetic_trend_follow_3m_amplitude_ratio=getattr(args, "synthetic_trend_follow_3m_amplitude_ratio", 0.0),
         synthetic_trend_follow_min_efficiency_ratio=getattr(args, "synthetic_trend_follow_min_efficiency_ratio", 0.0),
         synthetic_trend_follow_reverse_delay_seconds=getattr(args, "synthetic_trend_follow_reverse_delay_seconds", 0.0),
+        take_profit_min_profit_ratio=getattr(args, "take_profit_min_profit_ratio", None),
     )
 
 
@@ -2331,6 +2332,110 @@ def apply_short_cover_pause(
         "short_cover_paused": bool(active),
         "short_cover_pause_reasons": reasons,
     }
+
+
+def apply_take_profit_profit_guard(
+    *,
+    plan: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    current_long_notional: float,
+    current_short_notional: float,
+    pause_long_position_notional: float | None,
+    pause_short_position_notional: float | None,
+    min_profit_ratio: float | None,
+    tick_size: float | None,
+    bid_price: float,
+    ask_price: float,
+) -> dict[str, Any]:
+    report = {
+        "enabled": min_profit_ratio is not None,
+        "min_profit_ratio": min_profit_ratio,
+        "long_active": False,
+        "short_active": False,
+        "long_floor_price": None,
+        "short_ceiling_price": None,
+        "long_relax_threshold_notional": pause_long_position_notional,
+        "short_relax_threshold_notional": pause_short_position_notional,
+        "adjusted_sell_orders": 0,
+        "adjusted_buy_orders": 0,
+        "dropped_sell_orders": 0,
+        "dropped_buy_orders": 0,
+    }
+    if min_profit_ratio is None:
+        return report
+
+    safe_ratio = max(float(min_profit_ratio), 0.0)
+    long_threshold = pause_long_position_notional if pause_long_position_notional is not None and pause_long_position_notional > 0 else None
+    short_threshold = pause_short_position_notional if pause_short_position_notional is not None and pause_short_position_notional > 0 else None
+    long_active = (
+        current_long_qty > 1e-12
+        and current_long_avg_price > 0
+        and (long_threshold is None or current_long_notional < long_threshold)
+    )
+    short_active = (
+        current_short_qty > 1e-12
+        and current_short_avg_price > 0
+        and (short_threshold is None or current_short_notional < short_threshold)
+    )
+    report["long_active"] = long_active
+    report["short_active"] = short_active
+
+    long_floor_price = None
+    if long_active:
+        long_floor_price = _round_order_price(current_long_avg_price * (1.0 + safe_ratio), tick_size, "SELL")
+        if long_floor_price > 0:
+            report["long_floor_price"] = long_floor_price
+
+    short_ceiling_price = None
+    if short_active:
+        short_ceiling_price = _round_order_price(current_short_avg_price * (1.0 - safe_ratio), tick_size, "BUY")
+        if short_ceiling_price > 0:
+            report["short_ceiling_price"] = short_ceiling_price
+
+    if long_floor_price and long_floor_price > 0:
+        updated_sell_orders: list[dict[str, Any]] = []
+        for item in plan.get("sell_orders", []):
+            if not isinstance(item, dict):
+                continue
+            order = dict(item)
+            if _order_role(order) not in {"take_profit", "take_profit_long"}:
+                updated_sell_orders.append(order)
+                continue
+            adjusted_price = max(_safe_float(order.get("price")), long_floor_price)
+            if adjusted_price <= bid_price:
+                report["dropped_sell_orders"] += 1
+                continue
+            if abs(adjusted_price - _safe_float(order.get("price"))) > 1e-12:
+                order["price"] = adjusted_price
+                order["notional"] = adjusted_price * _safe_float(order.get("qty"))
+                report["adjusted_sell_orders"] += 1
+            updated_sell_orders.append(order)
+        plan["sell_orders"] = updated_sell_orders
+
+    if short_ceiling_price and short_ceiling_price > 0:
+        updated_buy_orders: list[dict[str, Any]] = []
+        for item in plan.get("buy_orders", []):
+            if not isinstance(item, dict):
+                continue
+            order = dict(item)
+            if _order_role(order) != "take_profit_short":
+                updated_buy_orders.append(order)
+                continue
+            adjusted_price = min(_safe_float(order.get("price")), short_ceiling_price)
+            if adjusted_price <= 0 or adjusted_price >= ask_price:
+                report["dropped_buy_orders"] += 1
+                continue
+            if abs(adjusted_price - _safe_float(order.get("price"))) > 1e-12:
+                order["price"] = adjusted_price
+                order["notional"] = adjusted_price * _safe_float(order.get("qty"))
+                report["adjusted_buy_orders"] += 1
+            updated_buy_orders.append(order)
+        plan["buy_orders"] = updated_buy_orders
+
+    return report
 
 
 def assess_market_guard(
@@ -4094,6 +4199,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    current_long_avg_price = 0.0
+    current_short_avg_price = 0.0
+    if requested_strategy_mode == "hedge_neutral":
+        current_long_avg_price = max(_safe_float(long_position.get("entryPrice")), 0.0) if current_long_qty > 1e-12 else 0.0
+        current_short_avg_price = max(_safe_float(short_position.get("entryPrice")), 0.0) if current_short_qty > 1e-12 else 0.0
+    else:
+        if actual_net_qty > 1e-12:
+            current_long_avg_price = max(actual_entry_price, 0.0)
+        elif actual_net_qty < -1e-12:
+            current_short_avg_price = max(actual_entry_price, 0.0)
     synthetic_ledger_snapshot: dict[str, Any] | None = None
     excess_inventory_gate = {
         "enabled": bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
@@ -4106,6 +4221,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     short_cover_controls = {
         "short_cover_paused": False,
         "short_cover_pause_reasons": [],
+    }
+    take_profit_guard = {
+        "enabled": bool(getattr(args, "take_profit_min_profit_ratio", None) is not None),
+        "min_profit_ratio": getattr(args, "take_profit_min_profit_ratio", None),
+        "long_active": False,
+        "short_active": False,
+        "long_floor_price": None,
+        "short_ceiling_price": None,
+        "long_relax_threshold_notional": getattr(args, "pause_buy_position_notional", None),
+        "short_relax_threshold_notional": getattr(args, "pause_short_position_notional", None),
+        "adjusted_sell_orders": 0,
+        "adjusted_buy_orders": 0,
+        "dropped_sell_orders": 0,
+        "dropped_buy_orders": 0,
     }
     flat_start_guard = {
         "enabled": bool(getattr(args, "flat_start_enabled", True)),
@@ -4507,6 +4636,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
         current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)
+        current_long_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_avg_price")), 0.0)
+        current_short_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0)
         current_long_notional = current_long_qty * max(mid_price, 0.0)
         current_short_notional = current_short_qty * max(mid_price, 0.0)
         inventory_tier = {
@@ -4576,6 +4707,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 trend_follow=synthetic_trend_follow,
             )
         )
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
         controls = apply_hedge_position_controls(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -4640,6 +4786,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
             current_net_qty=actual_net_qty,
+        )
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
         )
         controls = apply_hedge_position_controls(
             plan=plan,
@@ -4729,6 +4890,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         if xaut_reduce_only_active:
             apply_xaut_reduce_only_pruning(plan=plan, strategy_mode=strategy_mode)
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=0.0,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=0.0,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=None,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
         controls = apply_hedge_position_controls(
             plan=plan,
             current_long_qty=0.0,
@@ -4800,6 +4976,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         if xaut_reduce_only_active:
             apply_xaut_reduce_only_pruning(plan=plan, strategy_mode=strategy_mode)
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=0.0,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=0.0,
+            current_long_notional=current_long_notional,
+            current_short_notional=0.0,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=None,
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
         controls = apply_position_controls(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -4893,12 +5084,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
         "synthetic_trend_follow": synthetic_trend_follow,
+        "take_profit_guard": take_profit_guard,
         "auto_regime": auto_regime,
         "xaut_adaptive": xaut_adaptive,
         "current_long_qty": current_long_qty,
         "current_long_notional": controls["current_long_notional"],
+        "current_long_avg_price": current_long_avg_price,
         "current_short_qty": current_short_qty,
         "current_short_notional": controls.get("current_short_notional", current_short_notional),
+        "current_short_avg_price": current_short_avg_price,
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_qty * max(mid_price, 0.0),
         "synthetic_ledger": synthetic_ledger_snapshot,
@@ -5337,6 +5531,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buy-pause-down-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--short-cover-pause-amp-trigger-ratio", type=float, default=None)
     parser.add_argument("--short-cover-pause-down-return-trigger-ratio", type=float, default=None)
+    parser.add_argument("--take-profit-min-profit-ratio", type=float, default=None)
     parser.add_argument("--freeze-shift-abs-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--adaptive-step-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--adaptive-step-30s-abs-return-ratio", type=float, default=0.0)
@@ -5472,6 +5667,21 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"budget={_float(summary.get('short_budget_notional', 0.0))} "
             f"planned={_float(summary.get('planned_short_notional', 0.0))} "
             f"(max_short={_float(summary.get('max_short_position_notional', 0.0))})"
+        )
+    take_profit_guard = summary.get("take_profit_guard") if isinstance(summary.get("take_profit_guard"), dict) else {}
+    if take_profit_guard.get("enabled") and (
+        take_profit_guard.get("long_active")
+        or take_profit_guard.get("short_active")
+        or take_profit_guard.get("adjusted_sell_orders")
+        or take_profit_guard.get("adjusted_buy_orders")
+    ):
+        print(
+            "  tp_guard: "
+            f"ratio={_float(take_profit_guard.get('min_profit_ratio', 0.0))} "
+            f"long_active={'yes' if take_profit_guard.get('long_active') else 'no'} "
+            f"short_active={'yes' if take_profit_guard.get('short_active') else 'no'} "
+            f"sell_adj={int(take_profit_guard.get('adjusted_sell_orders', 0) or 0)} "
+            f"buy_adj={int(take_profit_guard.get('adjusted_buy_orders', 0) or 0)}"
         )
     if summary.get("strategy_mode") == "synthetic_neutral":
         print(
@@ -5641,6 +5851,8 @@ def main() -> None:
         raise SystemExit("--short-cover-pause-amp-trigger-ratio must be > 0")
     if args.short_cover_pause_down_return_trigger_ratio is not None and args.short_cover_pause_down_return_trigger_ratio >= 0:
         raise SystemExit("--short-cover-pause-down-return-trigger-ratio must be < 0")
+    if args.take_profit_min_profit_ratio is not None and args.take_profit_min_profit_ratio < 0:
+        raise SystemExit("--take-profit-min-profit-ratio must be >= 0")
     if args.freeze_shift_abs_return_trigger_ratio is not None and args.freeze_shift_abs_return_trigger_ratio <= 0:
         raise SystemExit("--freeze-shift-abs-return-trigger-ratio must be > 0")
     if args.adaptive_step_30s_abs_return_ratio < 0 or args.adaptive_step_30s_amplitude_ratio < 0:

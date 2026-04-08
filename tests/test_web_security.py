@@ -340,6 +340,17 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["synthetic_trend_follow_min_efficiency_ratio"], 0.58)
         self.assertEqual(payload["synthetic_trend_follow_reverse_delay_seconds"], 18.0)
 
+    def test_normalize_runner_control_payload_supports_take_profit_min_profit_ratio(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "BASEDUSDT",
+                "strategy_profile": "based_volume_guarded_bard_v2",
+                "take_profit_min_profit_ratio": 0.0005,
+            }
+        )
+
+        self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0005)
+
     def test_resolve_runner_volume_trigger_action_starts_when_volume_above_threshold(self) -> None:
         decision = _resolve_runner_volume_trigger_action(
             {
@@ -1441,8 +1452,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("synthetic_neutral_bard_style_v1", based_keys)
         self.assertIn("synthetic_neutral_bard_style_v1", opn_keys)
         self.assertIn("based_volume_long_trigger_v1", based_keys)
+        self.assertIn("based_volume_guarded_bard_v2", based_keys)
         self.assertIn("based_volume_push_bard_v1", based_keys)
         self.assertNotIn("based_volume_long_trigger_v1", opn_keys)
+        self.assertNotIn("based_volume_guarded_bard_v2", opn_keys)
         self.assertIn("based_volume_push_bard_v1", opn_keys)
         self.assertIn("xaut_volume_short_v1", xaut_keys)
         self.assertIn("xaut_guarded_ping_pong_v1", xaut_keys)
@@ -1517,6 +1530,32 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_window"], "1h")
         self.assertEqual(payload["volatility_trigger_amplitude_ratio"], 0.04)
         self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
+
+    def test_runner_preset_payload_for_based_volume_guarded_bard_v2(self) -> None:
+        payload = _runner_preset_payload("based_volume_guarded_bard_v2", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["symbol"], "BASEDUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 0.0002)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 5)
+        self.assertEqual(payload["per_order_notional"], 45.0)
+        self.assertEqual(payload["pause_buy_position_notional"], 1200.0)
+        self.assertEqual(payload["pause_short_position_notional"], 320.0)
+        self.assertEqual(payload["max_position_notional"], 1600.0)
+        self.assertEqual(payload["max_short_position_notional"], 480.0)
+        self.assertEqual(payload["max_total_notional"], 2200.0)
+        self.assertEqual(payload["short_cover_pause_amp_trigger_ratio"], 0.005)
+        self.assertEqual(payload["short_cover_pause_down_return_trigger_ratio"], -0.0022)
+        self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0)
+        self.assertFalse(payload["adaptive_step_enabled"])
+        self.assertFalse(payload["volatility_trigger_enabled"])
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertEqual(payload["rolling_hourly_loss_limit"], 6.0)
+        self.assertTrue(payload["volume_trigger_enabled"])
+        self.assertEqual(payload["volume_trigger_start_threshold"], 260000.0)
+        self.assertEqual(payload["volume_trigger_stop_threshold"], 180000.0)
+        self.assertTrue(payload["volume_trigger_stop_cancel_open_orders"])
+        self.assertTrue(payload["volume_trigger_stop_close_all_positions"])
 
     def test_runner_preset_payload_for_based_volume_push_bard_is_generic(self) -> None:
         payload = _runner_preset_payload("based_volume_push_bard_v1", {"symbol": "OPNUSDT"})

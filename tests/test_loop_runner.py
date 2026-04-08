@@ -29,6 +29,7 @@ from grid_optimizer.loop_runner import (
     apply_inventory_tiering,
     apply_max_position_notional_cap,
     apply_position_controls,
+    apply_take_profit_profit_guard,
     apply_short_cover_pause,
     apply_warm_start_bootstrap_guard,
     assess_flat_start_guard,
@@ -1245,6 +1246,65 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 1)
         self.assertEqual(result["short_cover_pause_reasons"], ["1m_short_cover_pause amp=0.80% ret=-0.40%"])
 
+    def test_apply_take_profit_profit_guard_clamps_short_cover_to_cost_for_light_inventory(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 0.0596, "qty": 755, "notional": 44.998, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.0588, "qty": 760, "notional": 44.688, "role": "entry_long"},
+            ],
+            "sell_orders": [{"side": "SELL", "price": 0.0597, "qty": 753, "notional": 44.9541, "role": "entry_short"}],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=2270.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.0590990308370044,
+            current_long_notional=0.0,
+            current_short_notional=135.1785,
+            pause_long_position_notional=None,
+            pause_short_position_notional=320.0,
+            min_profit_ratio=0.0,
+            tick_size=0.0001,
+            bid_price=0.0592,
+            ask_price=0.0593,
+        )
+
+        self.assertTrue(result["short_active"])
+        self.assertEqual(result["adjusted_buy_orders"], 1)
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.0590, places=8)
+        self.assertAlmostEqual(plan["buy_orders"][0]["notional"], 0.0590 * 755, places=8)
+        self.assertEqual(plan["buy_orders"][1]["price"], 0.0588)
+
+    def test_apply_take_profit_profit_guard_relaxes_when_short_inventory_reaches_pause_threshold(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 0.0596, "qty": 755, "notional": 44.998, "role": "take_profit_short"}],
+            "sell_orders": [],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=6000.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.0590990308370044,
+            current_long_notional=0.0,
+            current_short_notional=357.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=320.0,
+            min_profit_ratio=0.0,
+            tick_size=0.0001,
+            bid_price=0.0592,
+            ask_price=0.0593,
+        )
+
+        self.assertFalse(result["short_active"])
+        self.assertEqual(result["adjusted_buy_orders"], 0)
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.0596, places=8)
+
     @patch("grid_optimizer.loop_runner.assess_auto_regime")
     def test_resolve_neutral_hourly_scale_caches_per_hour_bucket(self, mock_assess_auto_regime) -> None:
         now = datetime(2026, 3, 19, 10, 25, tzinfo=timezone.utc)
@@ -1804,6 +1864,11 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.static_buy_offset_steps, 0.5)
         self.assertEqual(args.static_sell_offset_steps, 1.0)
+
+    def test_build_parser_accepts_take_profit_min_profit_ratio(self) -> None:
+        args = _build_parser().parse_args(["--take-profit-min-profit-ratio", "0.0005"])
+
+        self.assertEqual(args.take_profit_min_profit_ratio, 0.0005)
 
     def test_build_hedge_micro_grid_plan_respects_near_price_offsets(self) -> None:
         plan = build_hedge_micro_grid_plan(
