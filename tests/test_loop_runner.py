@@ -1711,8 +1711,8 @@ class LoopRunnerTests(unittest.TestCase):
             sell_offset_steps=0.5,
         )
 
-        self.assertEqual(plan["buy_orders"][0]["price"], 99.99)
-        self.assertEqual(plan["sell_orders"][0]["price"], 100.02)
+        self.assertEqual(plan["buy_orders"][0]["price"], 99.97)
+        self.assertEqual(plan["sell_orders"][0]["price"], 100.04)
 
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     def test_assess_auto_regime_prefers_defensive_when_recent_drop_and_amp_expand(self, mock_fetch_futures_klines) -> None:
