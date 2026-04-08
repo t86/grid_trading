@@ -793,7 +793,7 @@ def build_hedge_micro_grid_plan(
     price_tick = float(tick_size) if tick_size is not None and tick_size > 0 else 1e-12
     long_exit_anchor_price = (
         max(
-            _round_order_price(ask_price, tick_size, "SELL"),
+            _round_order_price(float(ask_price) + price_tick, tick_size, "SELL"),
             _round_order_price(float(long_exit_reference_price) + price_tick, tick_size, "SELL"),
         )
         if long_exit_profit_guard_active and long_exit_reference_price is not None
@@ -801,7 +801,7 @@ def build_hedge_micro_grid_plan(
     )
     short_exit_anchor_price = (
         min(
-            _round_order_price(bid_price, tick_size, "BUY"),
+            _round_order_price(max(float(bid_price) - price_tick, 0.0), tick_size, "BUY"),
             _round_order_price(max(float(short_exit_reference_price) - price_tick, 0.0), tick_size, "BUY"),
         )
         if short_exit_profit_guard_active and short_exit_reference_price is not None
