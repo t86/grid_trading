@@ -1412,6 +1412,69 @@ def _apply_synthetic_trade_fill(
     return True
 
 
+def _synthetic_net_qty_from_snapshot(snapshot: dict[str, Any]) -> float:
+    return max(_safe_float(snapshot.get("virtual_long_qty")), 0.0) - max(_safe_float(snapshot.get("virtual_short_qty")), 0.0)
+
+
+def _resolve_synthetic_resync_price(
+    *,
+    actual_position_qty: float,
+    entry_price: float,
+    fallback_price: float,
+    snapshot: dict[str, Any],
+) -> float:
+    candidates = [max(float(entry_price), 0.0)]
+    if actual_position_qty > 0:
+        candidates.append(max(_safe_float(snapshot.get("virtual_long_avg_price")), 0.0))
+    elif actual_position_qty < 0:
+        candidates.append(max(_safe_float(snapshot.get("virtual_short_avg_price")), 0.0))
+    candidates.append(max(float(fallback_price), 0.0))
+    for candidate in candidates:
+        if candidate > 0:
+            return candidate
+    return 0.0
+
+
+def _maybe_resync_synthetic_ledger_to_actual(
+    *,
+    state: dict[str, Any],
+    snapshot: dict[str, Any],
+    actual_position_qty: float,
+    entry_price: float,
+    fallback_price: float,
+    qty_tolerance: float | None,
+) -> dict[str, Any]:
+    tolerance = max(_safe_float(qty_tolerance), 0.0)
+    drift_qty = float(actual_position_qty) - _synthetic_net_qty_from_snapshot(snapshot)
+    if tolerance <= 0 or abs(drift_qty) <= tolerance:
+        snapshot["resynced_to_actual"] = False
+        return snapshot
+
+    resolved_price = _resolve_synthetic_resync_price(
+        actual_position_qty=actual_position_qty,
+        entry_price=entry_price,
+        fallback_price=fallback_price,
+        snapshot=snapshot,
+    )
+    ledger = _reset_synthetic_ledger_to_actual(
+        state=state,
+        actual_position_qty=actual_position_qty,
+        entry_price=resolved_price,
+        reason="actual_position_drift",
+    )
+    return {
+        "virtual_long_qty": max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
+        "virtual_long_avg_price": max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
+        "virtual_long_lots": list(ledger.get("virtual_long_lots") or []),
+        "virtual_short_qty": max(_safe_float(ledger.get("virtual_short_qty")), 0.0),
+        "virtual_short_avg_price": max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0),
+        "virtual_short_lots": list(ledger.get("virtual_short_lots") or []),
+        "applied_trade_count": int(snapshot.get("applied_trade_count") or 0),
+        "unmatched_trade_count": int(snapshot.get("unmatched_trade_count") or 0),
+        "resynced_to_actual": True,
+    }
+
+
 def sync_synthetic_ledger(
     *,
     state: dict[str, Any],
@@ -1421,6 +1484,8 @@ def sync_synthetic_ledger(
     recv_window: int,
     actual_position_qty: float,
     entry_price: float,
+    qty_tolerance: float | None = None,
+    fallback_price: float = 0.0,
 ) -> dict[str, Any]:
     ledger = _load_synthetic_ledger(
         state=state,
@@ -1459,7 +1524,7 @@ def sync_synthetic_ledger(
     ledger["last_trade_keys_at_time"] = list(keys_at_time)
     ledger["unmatched_trade_count"] = int(ledger.get("unmatched_trade_count") or 0) + unmatched
     state["synthetic_ledger"] = ledger
-    return {
+    snapshot = {
         "virtual_long_qty": max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
         "virtual_long_avg_price": max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
         "virtual_long_lots": list(ledger.get("virtual_long_lots") or []),
@@ -1469,6 +1534,14 @@ def sync_synthetic_ledger(
         "applied_trade_count": applied,
         "unmatched_trade_count": unmatched,
     }
+    return _maybe_resync_synthetic_ledger_to_actual(
+        state=state,
+        snapshot=snapshot,
+        actual_position_qty=actual_position_qty,
+        entry_price=entry_price,
+        fallback_price=fallback_price,
+        qty_tolerance=qty_tolerance,
+    )
 
 
 def update_synthetic_order_refs(
@@ -4214,6 +4287,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 recv_window=args.recv_window,
                 actual_position_qty=actual_net_qty,
                 entry_price=actual_entry_price,
+                qty_tolerance=max(_safe_float(symbol_info.get("step_size")), 1e-9),
+                fallback_price=mid_price,
             )
             current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
             current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)
@@ -4426,6 +4501,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             recv_window=args.recv_window,
             actual_position_qty=actual_net_qty,
             entry_price=actual_entry_price,
+            qty_tolerance=max(_safe_float(symbol_info.get("step_size")), 1e-9),
+            fallback_price=mid_price,
         )
         current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
         current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)

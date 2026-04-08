@@ -48,6 +48,7 @@ from grid_optimizer.loop_runner import (
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
     apply_synthetic_trend_follow_guard,
+    sync_synthetic_ledger,
     update_synthetic_order_refs,
 )
 from grid_optimizer.semi_auto_plan import build_hedge_micro_grid_plan, build_static_binance_grid_plan
@@ -775,6 +776,89 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(ledger["virtual_long_avg_price"], 1.15)
         self.assertAlmostEqual(ledger["virtual_short_qty"], 7.0)
         self.assertAlmostEqual(ledger["virtual_short_avg_price"], 0.95)
+
+    def test_sync_synthetic_ledger_resyncs_flat_book_to_actual_inventory_when_trade_feed_lags(self) -> None:
+        now = datetime(2026, 4, 8, 5, 0, tzinfo=timezone.utc)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 0.0,
+                "virtual_long_avg_price": 0.0,
+                "virtual_long_lots": [],
+                "virtual_short_qty": 0.0,
+                "virtual_short_avg_price": 0.0,
+                "virtual_short_lots": [],
+                "last_trade_time_ms": int((now - timedelta(seconds=2)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            },
+            "synthetic_order_refs": {
+                "123": {
+                    "role": "entry_short",
+                    "client_order_id": "gx-old",
+                }
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="BARDUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=-140.0,
+                entry_price=0.3198,
+                qty_tolerance=1.0,
+                fallback_price=0.3198,
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_long_qty"], 0.0)
+        self.assertAlmostEqual(snapshot["virtual_short_qty"], 140.0)
+        self.assertEqual(snapshot["virtual_short_lots"], [{"qty": 140.0, "price": 0.3198}])
+        self.assertTrue(snapshot["resynced_to_actual"])
+        self.assertEqual(state["synthetic_order_refs"], {})
+        self.assertEqual(state["synthetic_ledger"]["resync_reason"], "actual_position_drift")
+
+    def test_sync_synthetic_ledger_keeps_existing_book_when_drift_is_within_tolerance(self) -> None:
+        now = datetime(2026, 4, 8, 5, 0, tzinfo=timezone.utc)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 0.0,
+                "virtual_long_avg_price": 0.0,
+                "virtual_long_lots": [],
+                "virtual_short_qty": 140.0,
+                "virtual_short_avg_price": 0.3198,
+                "virtual_short_lots": [{"qty": 140.0, "price": 0.3198}],
+                "last_trade_time_ms": int((now - timedelta(seconds=2)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            }
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="BARDUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=-140.5,
+                entry_price=0.3197,
+                qty_tolerance=1.0,
+                fallback_price=0.3197,
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_short_qty"], 140.0)
+        self.assertEqual(snapshot["virtual_short_lots"], [{"qty": 140.0, "price": 0.3198}])
+        self.assertFalse(snapshot.get("resynced_to_actual"))
 
     def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:
