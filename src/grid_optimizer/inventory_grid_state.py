@@ -129,6 +129,16 @@ def _accumulate_pair_credit_steps(*, matched: list[dict[str, Any]], exit_price: 
     return total
 
 
+def _forced_reduce_cost_steps(*, entry_price: float, reduce_price: float, step_price: float, direction_state: str) -> int:
+    if step_price <= 0:
+        return 0
+    if direction_state == "long_active":
+        return int(max(0.0, (float(entry_price) - float(reduce_price)) / float(step_price)))
+    if direction_state == "short_active":
+        return int(max(0.0, (float(reduce_price) - float(entry_price)) / float(step_price)))
+    raise ValueError(f"unsupported direction_state for forced reduce cost: {direction_state}")
+
+
 def apply_inventory_grid_fill(
     *,
     runtime: dict[str, Any],
@@ -203,10 +213,14 @@ def apply_inventory_grid_fill(
                     direction_state=current_state,
                     reduce_qty=fill_qty,
                 )
-                forced_reduce_cost_steps = _accumulate_pair_credit_steps(
-                    matched=matched,
-                    exit_price=fill_price,
-                    step_price=step_price,
+                forced_reduce_cost_steps = sum(
+                    _forced_reduce_cost_steps(
+                        entry_price=max(float(item.get("entry_price", 0.0) or 0.0), 0.0),
+                        reduce_price=fill_price,
+                        step_price=step_price,
+                        direction_state=current_state,
+                    )
+                    for item in matched
                 )
                 runtime["pair_credit_steps"] = max(
                     0,
@@ -292,10 +306,8 @@ def build_forced_reduce_lot_plan(
     lots = list(runtime.get("position_lots") or [])
     if direction_state == "long_active":
         ordered = sorted(lots, key=lambda item: float(item.get("entry_price", 0.0) or 0.0), reverse=True)
-        step_value = lambda lot: max(0.0, (float(lot.get("entry_price", 0.0) or 0.0) - reduce_price) / step_price)
     else:
         ordered = sorted(lots, key=lambda item: float(item.get("entry_price", 0.0) or 0.0))
-        step_value = lambda lot: max(0.0, (reduce_price - float(lot.get("entry_price", 0.0) or 0.0)) / step_price)
 
     remaining = max(float(reduce_qty), 0.0)
     selected: list[dict[str, Any]] = []
@@ -308,6 +320,11 @@ def build_forced_reduce_lot_plan(
         if take_qty <= EPSILON:
             continue
         selected.append({"lot_id": str(lot.get("lot_id") or ""), "qty": take_qty})
-        forced_reduce_cost_steps += int(step_value(lot))
+        forced_reduce_cost_steps += _forced_reduce_cost_steps(
+            entry_price=float(lot.get("entry_price", 0.0) or 0.0),
+            reduce_price=reduce_price,
+            step_price=step_price,
+            direction_state=direction_state,
+        )
         remaining -= take_qty
     return {"lots": selected, "forced_reduce_cost_steps": forced_reduce_cost_steps}
