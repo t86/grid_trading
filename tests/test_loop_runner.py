@@ -660,6 +660,102 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(active_prices, [1.001, 1.011, 1.021])
         self.assertTrue(all(price >= 1.031 for price in take_profit_prices))
 
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_synthetic_neutral_adds_three_active_delever_buys_when_buffer_covers_cost(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_sync_synthetic_ledger,
+        mock_load_state,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 1.0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "synthetic_ledger": {},
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.999", "ask_price": "1.001"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "TESTUSDT", "positionAmt": "-300", "entryPrice": "0.965"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "shift_freeze_reasons": [],
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+        mock_sync_synthetic_ledger.return_value = {
+            "virtual_long_qty": 0.0,
+            "virtual_long_avg_price": 0.0,
+            "virtual_long_lots": [],
+            "virtual_short_qty": 300.0,
+            "virtual_short_avg_price": 0.965,
+            "virtual_short_lots": [{"qty": 300.0, "price": 0.965}],
+            "applied_trade_count": 0,
+            "unmatched_trade_count": 0,
+            "resynced_to_actual": False,
+            "grid_buffer_realized_notional": 20.0,
+            "grid_buffer_spent_notional": 0.0,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_mode = "synthetic_neutral"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 4
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.pause_buy_position_notional = 250.0
+            args.pause_short_position_notional = 250.0
+            args.take_profit_min_profit_ratio = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        active_buys = [item for item in report["buy_orders"] if item["role"] == "active_delever_short"]
+        active_prices = [item["price"] for item in active_buys]
+        take_profit_prices = [item["price"] for item in report["buy_orders"] if item["role"] == "take_profit_short"]
+
+        self.assertEqual(report["active_delever"]["active_buy_order_count"], 3)
+        self.assertEqual(active_prices, [0.999, 0.989, 0.979])
+        self.assertTrue(all(price <= 0.969 for price in take_profit_prices))
+
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
@@ -978,6 +1074,42 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(ledger["grid_buffer_realized_notional"], 0.06, places=8)
         self.assertAlmostEqual(ledger["grid_buffer_spent_notional"], 0.40, places=8)
         self.assertAlmostEqual(ledger["virtual_long_qty"], 8.0, places=8)
+
+    def test_apply_synthetic_trade_fill_tracks_grid_buffer_for_short_realized_and_spent(self) -> None:
+        ledger = {
+            "virtual_long_qty": 0.0,
+            "virtual_long_avg_price": 0.0,
+            "virtual_short_qty": 15.0,
+            "virtual_short_avg_price": (10.0 * 1.0 + 5.0 * 0.9) / 15.0,
+            "virtual_long_lots": [],
+            "virtual_short_lots": [
+                {"qty": 10.0, "price": 1.0},
+                {"qty": 5.0, "price": 0.9},
+            ],
+            "grid_buffer_realized_notional": 0.0,
+            "grid_buffer_spent_notional": 0.0,
+        }
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "3", "price": "0.88"},
+                order_ref={"role": "take_profit_short"},
+            )
+        )
+        self.assertAlmostEqual(ledger["grid_buffer_realized_notional"], 0.06, places=8)
+        self.assertAlmostEqual(ledger["grid_buffer_spent_notional"], 0.0, places=8)
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "4", "price": "1.05"},
+                order_ref={"role": "active_delever_short"},
+            )
+        )
+        self.assertAlmostEqual(ledger["grid_buffer_realized_notional"], 0.06, places=8)
+        self.assertAlmostEqual(ledger["grid_buffer_spent_notional"], 0.40, places=8)
+        self.assertAlmostEqual(ledger["virtual_short_qty"], 8.0, places=8)
 
     def test_load_synthetic_ledger_backfills_missing_lots_from_aggregate_state(self) -> None:
         state = {

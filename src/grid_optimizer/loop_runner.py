@@ -988,7 +988,7 @@ def _is_long_exit_order(order: dict[str, Any]) -> bool:
 
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
-    return _order_role(order) == "take_profit_short"
+    return _order_role(order) in {"take_profit_short", "active_delever_short"}
 
 
 def _direction_from_return_ratio(return_ratio: float, *, tolerance: float = 1e-12) -> str | None:
@@ -1433,7 +1433,11 @@ def _apply_synthetic_trade_fill(
     elif role in {"bootstrap_short", "entry_short"}:
         short_lots.append({"qty": qty, "price": price})
     elif role == "take_profit_short":
-        short_lots = _consume_synthetic_lots_lifo(short_lots, qty)
+        short_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(short_lots, qty)
+        ledger["grid_buffer_realized_notional"] += max(realized_cost - (qty * price), 0.0)
+    elif role == "active_delever_short":
+        short_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(short_lots, qty)
+        ledger["grid_buffer_spent_notional"] += max((qty * price) - realized_cost, 0.0)
     else:
         return False
 
@@ -2500,6 +2504,29 @@ def _estimate_long_delever_cost(
     return total_cost
 
 
+def _estimate_short_delever_cost(
+    *,
+    current_short_lots: list[dict[str, Any]],
+    current_short_qty: float,
+    current_short_avg_price: float,
+    buy_orders: list[dict[str, Any]],
+) -> float:
+    lots = _normalize_synthetic_lots(
+        current_short_lots,
+        fallback_qty=max(float(current_short_qty), 0.0),
+        fallback_price=max(float(current_short_avg_price), 0.0),
+    )
+    total_cost = 0.0
+    for order in buy_orders:
+        qty = max(_safe_float(order.get("qty")), 0.0)
+        price = max(_safe_float(order.get("price")), 0.0)
+        if qty <= 0 or price <= 0:
+            continue
+        lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(lots, qty)
+        total_cost += max((qty * price) - realized_cost, 0.0)
+    return total_cost
+
+
 def apply_active_delever_long(
     *,
     plan: dict[str, Any],
@@ -2524,7 +2551,9 @@ def apply_active_delever_long(
         "available_buffer_notional": available_buffer,
         "estimated_cost_notional": 0.0,
         "active_sell_order_count": 0,
+        "active_buy_order_count": 0,
         "pause_long_position_notional": pause_long_position_notional,
+        "pause_short_position_notional": None,
     }
     if (
         max_active_levels <= 0
@@ -2610,6 +2639,108 @@ def apply_active_delever_long(
             "trigger_mode": trigger_mode,
             "estimated_cost_notional": estimated_cost,
             "active_sell_order_count": active_count,
+        }
+    )
+    return report
+
+
+def apply_active_delever_short(
+    *,
+    plan: dict[str, Any],
+    current_short_qty: float,
+    current_short_notional: float,
+    current_short_avg_price: float,
+    current_short_lots: list[dict[str, Any]],
+    pause_short_position_notional: float | None,
+    step_price: float,
+    tick_size: float | None,
+    grid_buffer_realized_notional: float,
+    grid_buffer_spent_notional: float,
+    max_active_levels: int = 3,
+) -> dict[str, Any]:
+    available_buffer = max(float(grid_buffer_realized_notional) - float(grid_buffer_spent_notional), 0.0)
+    report = {
+        "enabled": max_active_levels > 0,
+        "active": False,
+        "trigger_mode": None,
+        "available_buffer_notional": available_buffer,
+        "estimated_cost_notional": 0.0,
+        "active_sell_order_count": 0,
+        "active_buy_order_count": 0,
+        "pause_long_position_notional": None,
+        "pause_short_position_notional": pause_short_position_notional,
+    }
+    if (
+        max_active_levels <= 0
+        or pause_short_position_notional is None
+        or pause_short_position_notional <= 0
+        or current_short_qty <= 1e-12
+        or current_short_notional < pause_short_position_notional
+        or step_price <= 0
+    ):
+        return report
+
+    take_profit_orders = [
+        dict(item)
+        for item in plan.get("buy_orders", [])
+        if isinstance(item, dict) and _order_role(item) == "take_profit_short"
+    ]
+    if not take_profit_orders:
+        return report
+    take_profit_orders.sort(key=lambda item: _safe_float(item.get("price")), reverse=True)
+    other_buy_orders = [
+        dict(item)
+        for item in plan.get("buy_orders", [])
+        if isinstance(item, dict) and _order_role(item) != "take_profit_short"
+    ]
+
+    requested_levels = min(max_active_levels, len(take_profit_orders))
+    if requested_levels <= 0:
+        return report
+
+    active_count = 0
+    estimated_cost = 0.0
+    for level_count in range(1, requested_levels + 1):
+        level_cost = _estimate_short_delever_cost(
+            current_short_lots=current_short_lots,
+            current_short_qty=current_short_qty,
+            current_short_avg_price=current_short_avg_price,
+            buy_orders=take_profit_orders[:level_count],
+        )
+        if available_buffer + 1e-12 >= level_cost:
+            active_count = level_count
+            estimated_cost = level_cost
+
+    if active_count <= 0:
+        return report
+
+    shift_distance = float(step_price) * float(active_count)
+    shifted_take_profit_orders: list[dict[str, Any]] = []
+    for index, order in enumerate(take_profit_orders, start=1):
+        shifted = dict(order)
+        shifted_price = _round_order_price(_safe_float(order.get("price")) - shift_distance, tick_size, "BUY")
+        shifted["price"] = shifted_price
+        shifted["notional"] = shifted_price * _safe_float(shifted.get("qty"))
+        shifted["level"] = int(order.get("level", index) or index) + active_count
+        shifted_take_profit_orders.append(shifted)
+
+    active_orders: list[dict[str, Any]] = []
+    for index, order in enumerate(take_profit_orders[:active_count], start=1):
+        active = dict(order)
+        active["role"] = "active_delever_short"
+        active["level"] = index
+        active_orders.append(active)
+
+    plan["buy_orders"] = sorted(
+        [*active_orders, *shifted_take_profit_orders, *other_buy_orders],
+        key=lambda item: (-_safe_float(item.get("price")), str(item.get("side", "")).upper().strip()),
+    )
+    report.update(
+        {
+            "active": True,
+            "trigger_mode": "buffer",
+            "estimated_cost_notional": estimated_cost,
+            "active_buy_order_count": active_count,
         }
     )
     return report
@@ -4420,7 +4551,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "available_buffer_notional": 0.0,
         "estimated_cost_notional": 0.0,
         "active_sell_order_count": 0,
+        "active_buy_order_count": 0,
         "pause_long_position_notional": getattr(args, "pause_buy_position_notional", None),
+        "pause_short_position_notional": getattr(args, "pause_short_position_notional", None),
     }
     flat_start_guard = {
         "enabled": bool(getattr(args, "flat_start_enabled", True)),
@@ -4935,7 +5068,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
         )
-        active_delever = apply_active_delever_long(
+        long_active_delever = apply_active_delever_long(
             plan=plan,
             current_long_qty=current_long_qty,
             current_long_notional=controls["current_long_notional"],
@@ -4949,6 +5082,34 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
         )
+        short_active_delever = apply_active_delever_short(
+            plan=plan,
+            current_short_qty=current_short_qty,
+            current_short_notional=controls["current_short_notional"],
+            current_short_avg_price=max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0),
+            current_short_lots=list(synthetic_ledger_snapshot.get("virtual_short_lots") or []),
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
+            grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
+        )
+        active_delever = {
+            "enabled": bool(long_active_delever.get("enabled")) or bool(short_active_delever.get("enabled")),
+            "active": bool(long_active_delever.get("active")) or bool(short_active_delever.get("active")),
+            "trigger_mode": long_active_delever.get("trigger_mode") or short_active_delever.get("trigger_mode"),
+            "available_buffer_notional": max(
+                _safe_float(long_active_delever.get("available_buffer_notional")),
+                _safe_float(short_active_delever.get("available_buffer_notional")),
+            ),
+            "estimated_cost_notional": _safe_float(long_active_delever.get("estimated_cost_notional")) + _safe_float(
+                short_active_delever.get("estimated_cost_notional")
+            ),
+            "active_sell_order_count": int(long_active_delever.get("active_sell_order_count") or 0),
+            "active_buy_order_count": int(short_active_delever.get("active_buy_order_count") or 0),
+            "pause_long_position_notional": long_active_delever.get("pause_long_position_notional"),
+            "pause_short_position_notional": short_active_delever.get("pause_short_position_notional"),
+        }
         target_base_qty = hedge_plan["target_long_base_qty"]
         bootstrap_qty = hedge_plan["bootstrap_long_qty"]
     elif _is_inventory_target_neutral_mode(strategy_mode):
