@@ -498,6 +498,131 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["bootstrap_orders"], [])
         self.assertGreater(len(report["buy_orders"]), 0)
 
+    @patch("grid_optimizer.loop_runner._fetch_trade_rows_since")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_competition_inventory_grid_handles_none_max_position_and_counts_bootstrap_notional(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_fetch_trade_rows_since,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 0.1,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.0999", "ask_price": "0.1001"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        mock_fetch_trade_rows_since.return_value = []
+
+        with TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                symbol="KATUSDT",
+                strategy_mode="competition_inventory_grid",
+                strategy_profile="volume_long_v4",
+                step_price=0.01,
+                buy_levels=8,
+                sell_levels=8,
+                per_order_notional=10.0,
+                base_position_notional=30.0,
+                first_order_multiplier=4.0,
+                threshold_position_notional=50.0,
+                max_order_position_notional=80.0,
+                center_price=0.10,
+                fixed_center_enabled=False,
+                fixed_center_roll_enabled=False,
+                fixed_center_roll_trigger_steps=1.0,
+                fixed_center_roll_confirm_cycles=3,
+                fixed_center_roll_shift_steps=1,
+                custom_grid_enabled=False,
+                custom_grid_direction=None,
+                custom_grid_level_mode="arithmetic",
+                custom_grid_min_price=None,
+                custom_grid_max_price=None,
+                custom_grid_n=None,
+                custom_grid_total_notional=None,
+                custom_grid_neutral_anchor_price=None,
+                custom_grid_roll_enabled=False,
+                custom_grid_roll_interval_minutes=5,
+                custom_grid_roll_trade_threshold=100,
+                custom_grid_roll_upper_distance_ratio=0.30,
+                custom_grid_roll_shift_levels=1,
+                down_trigger_steps=1,
+                up_trigger_steps=1,
+                shift_steps=1,
+                neutral_center_interval_minutes=3,
+                neutral_band1_offset_ratio=0.005,
+                neutral_band2_offset_ratio=0.01,
+                neutral_band3_offset_ratio=0.02,
+                neutral_band1_target_ratio=0.20,
+                neutral_band2_target_ratio=0.50,
+                neutral_band3_target_ratio=1.00,
+                neutral_hourly_scale_enabled=False,
+                neutral_hourly_scale_stable=1.0,
+                neutral_hourly_scale_transition=0.85,
+                neutral_hourly_scale_defensive=0.65,
+                max_position_notional=None,
+                max_short_position_notional=None,
+                pause_buy_position_notional=None,
+                pause_short_position_notional=None,
+                min_mid_price_for_buys=None,
+                excess_inventory_reduce_only_enabled=False,
+                auto_regime_enabled=False,
+                auto_regime_confirm_cycles=2,
+                auto_regime_stable_15m_max_amplitude_ratio=0.02,
+                auto_regime_stable_60m_max_amplitude_ratio=0.05,
+                auto_regime_stable_60m_return_floor_ratio=-0.01,
+                auto_regime_defensive_15m_amplitude_ratio=0.035,
+                auto_regime_defensive_60m_amplitude_ratio=0.08,
+                auto_regime_defensive_15m_return_ratio=-0.015,
+                auto_regime_defensive_60m_return_ratio=-0.03,
+                buy_pause_amp_trigger_ratio=None,
+                buy_pause_down_return_trigger_ratio=None,
+                freeze_shift_abs_return_trigger_ratio=None,
+                recv_window=5000,
+                reset_state=True,
+                state_path=str(Path(tmpdir) / "katusdt_state.json"),
+                summary_jsonl=str(Path(tmpdir) / "katusdt_events.jsonl"),
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["strategy_mode"], "competition_inventory_grid")
+        self.assertIsNone(report["max_position_notional"])
+        self.assertEqual(len(report["bootstrap_orders"]), 2)
+        bootstrap_buy_notional = sum(item["notional"] for item in report["bootstrap_orders"] if item["side"] == "BUY")
+        bootstrap_sell_notional = sum(item["notional"] for item in report["bootstrap_orders"] if item["side"] == "SELL")
+        self.assertAlmostEqual(report["planned_buy_notional"], bootstrap_buy_notional)
+        self.assertAlmostEqual(report["planned_short_notional"], bootstrap_sell_notional)
+
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
@@ -1988,6 +2113,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["plan_snapshot"]["synthetic_ledger"], {})
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
     @patch("grid_optimizer.loop_runner.post_futures_order")
     @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -2006,6 +2132,7 @@ class LoopRunnerTests(unittest.TestCase):
         mock_open_orders,
         mock_change_leverage,
         mock_post_order,
+        mock_update_inventory_grid_refs,
         mock_update_refs,
     ) -> None:
         mock_validate_plan_report.return_value = {
@@ -2069,6 +2196,101 @@ class LoopRunnerTests(unittest.TestCase):
             "submitted_notional_below_min_notional",
         )
         mock_post_order.assert_not_called()
+        mock_update_refs.assert_called_once()
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_competition_inventory_grid_sets_reduce_only_by_role(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        mock_update_inventory_grid_refs,
+        mock_update_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 5,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "bootstrap_entry", "side": "BUY", "qty": 10.0, "price": 0.10},
+                    {"role": "grid_entry", "side": "BUY", "qty": 10.0, "price": 0.09},
+                    {"role": "grid_exit", "side": "SELL", "qty": 10.0, "price": 0.11},
+                    {"role": "forced_reduce", "side": "SELL", "qty": 10.0, "price": 0.08},
+                    {"role": "tail_cleanup", "side": "SELL", "qty": 10.0, "price": 0.10},
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.09", "ask_price": "0.10"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 2}
+        mock_post_order.side_effect = [
+            {"orderId": 1, "clientOrderId": "a"},
+            {"orderId": 2, "clientOrderId": "b"},
+            {"orderId": 3, "clientOrderId": "c"},
+            {"orderId": 4, "clientOrderId": "d"},
+            {"orderId": 5, "clientOrderId": "e"},
+        ]
+
+        args = Namespace(
+            symbol="KATUSDT",
+            strategy_mode="competition_inventory_grid",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/katusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=2,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/katusdt_loop_state.json",
+        )
+        plan_report = {
+            "symbol": "KATUSDT",
+            "strategy_mode": "competition_inventory_grid",
+            "mid_price": 0.095,
+            "step_price": 0.01,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 0.0,
+            "actual_net_qty": 0.0,
+            "symbol_info": {
+                "tick_size": 0.01,
+                "min_qty": 0.1,
+                "min_notional": 0.1,
+            },
+        }
+
+        execute_plan_report(args, plan_report)
+
+        reduce_only_values = [call.kwargs["reduce_only"] for call in mock_post_order.call_args_list]
+        self.assertEqual(reduce_only_values, [None, None, True, True, True])
+        mock_update_inventory_grid_refs.assert_called_once()
         mock_update_refs.assert_called_once()
 
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")

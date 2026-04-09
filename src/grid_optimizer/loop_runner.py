@@ -80,7 +80,6 @@ from .submit_plan import (
     prepare_post_only_order_request,
     validate_plan_report,
 )
-<<<<<<< HEAD
 from .dry_run import _round_order_price, _round_order_qty
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
@@ -5333,6 +5332,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     elif _is_competition_inventory_grid_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("competition inventory grid 策略要求账户处于单向持仓模式")
+        max_position_notional_arg = getattr(args, "max_position_notional", None)
         inventory_tier = {
             "enabled": False,
             "active": False,
@@ -5362,7 +5362,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             per_order_notional=effective_args.per_order_notional,
             threshold_position_notional=float(getattr(args, "threshold_position_notional", 0.0)),
             max_order_position_notional=float(getattr(args, "max_order_position_notional", 0.0)),
-            max_position_notional=float(getattr(args, "max_position_notional", 0.0)),
+            max_position_notional=_safe_float(max_position_notional_arg),
             tick_size=symbol_info.get("tick_size"),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
@@ -5381,11 +5381,19 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         cap_controls = {
             "cap_applied": False,
             "buy_budget_notional": None,
-            "planned_buy_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("buy_orders", []))),
-            "max_position_notional": float(getattr(args, "max_position_notional", 0.0)) or None,
+            "planned_buy_notional": sum(
+                _safe_float(item.get("notional"))
+                for item in [*list(plan.get("bootstrap_orders", [])), *list(plan.get("buy_orders", []))]
+                if str(item.get("side", "")).upper() == "BUY"
+            ),
+            "max_position_notional": max_position_notional_arg,
             "short_cap_applied": False,
             "short_budget_notional": None,
-            "planned_short_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("sell_orders", []))),
+            "planned_short_notional": sum(
+                _safe_float(item.get("notional"))
+                for item in [*list(plan.get("bootstrap_orders", [])), *list(plan.get("sell_orders", []))]
+                if str(item.get("side", "")).upper() == "SELL"
+            ),
             "max_short_position_notional": None,
         }
         target_base_qty = abs(actual_net_qty)
