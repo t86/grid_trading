@@ -35,6 +35,21 @@ def _build_order(
     return order
 
 
+def _normalized_recovery_mode(*, runtime: dict[str, Any]) -> str:
+    return str(runtime.get("recovery_mode", "live")).strip().lower()
+
+
+def _normalized_risk_state(*, runtime: dict[str, Any], recovery_mode: str) -> str:
+    risk_state = str(runtime.get("risk_state", "normal")).strip().lower()
+    if recovery_mode != "live":
+        if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
+            return risk_state
+        return "hard_reduce_only"
+    if risk_state in {"normal", "threshold_reduce_only", "hard_reduce_only"}:
+        return risk_state
+    return "normal"
+
+
 def _position_notional(*, runtime: dict[str, Any], mid_price: float) -> float:
     total_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in list(runtime.get("position_lots") or []))
     return total_qty * max(mid_price, 0.0)
@@ -61,30 +76,14 @@ def _bootstrap_orders(
     buy_qty = _round_order_qty(bootstrap_notional / max(buy_price, EPSILON), step_size)
     buy_notional = buy_price * buy_qty
     if buy_qty > 0 and (min_qty is None or buy_qty >= min_qty) and (min_notional is None or buy_notional >= min_notional):
-        orders.append(
-            _build_order(
-                side="BUY",
-                price=buy_price,
-                qty=buy_qty,
-                role="bootstrap_entry",
-                position_side="LONG" if market_type == "futures" else None,
-            )
-        )
+        orders.append(_build_order(side="BUY", price=buy_price, qty=buy_qty, role="bootstrap_entry"))
 
     if market_type == "futures":
         sell_price = _round_order_price(ask_price, tick_size, "SELL")
         sell_qty = _round_order_qty(bootstrap_notional / max(sell_price, EPSILON), step_size)
         sell_notional = sell_price * sell_qty
         if sell_qty > 0 and (min_qty is None or sell_qty >= min_qty) and (min_notional is None or sell_notional >= min_notional):
-            orders.append(
-                _build_order(
-                    side="SELL",
-                    price=sell_price,
-                    qty=sell_qty,
-                    role="bootstrap_entry",
-                    position_side="SHORT",
-                )
-            )
+            orders.append(_build_order(side="SELL", price=sell_price, qty=sell_qty, role="bootstrap_entry"))
 
     return orders
 
@@ -107,6 +106,8 @@ def build_inventory_grid_orders(
 ) -> dict[str, Any]:
     market_type = str(runtime.get("market_type", "futures")).strip().lower()
     direction_state = str(runtime.get("direction_state", "flat")).strip().lower()
+    recovery_mode = _normalized_recovery_mode(runtime=runtime)
+    runtime_risk_state = _normalized_risk_state(runtime=runtime, recovery_mode=recovery_mode)
     anchor_price = max(_safe_float(runtime.get("grid_anchor_price")), 0.0)
     bootstrap_notional = max(_safe_float(per_order_notional), 0.0) * max(_safe_float(first_order_multiplier), 0.0)
     mid_price = (max(_safe_float(bid_price), 0.0) + max(_safe_float(ask_price), 0.0)) / 2.0
@@ -117,6 +118,15 @@ def build_inventory_grid_orders(
     forced_reduce_orders: list[dict[str, Any]] = []
 
     if direction_state == "flat":
+        if recovery_mode != "live":
+            return {
+                "risk_state": runtime_risk_state,
+                "bootstrap_orders": bootstrap_orders,
+                "buy_orders": buy_orders,
+                "sell_orders": sell_orders,
+                "forced_reduce_orders": forced_reduce_orders,
+                "tail_cleanup_active": False,
+            }
         bootstrap_orders = _bootstrap_orders(
             market_type=market_type,
             bid_price=bid_price,
@@ -139,12 +149,15 @@ def build_inventory_grid_orders(
     inventory_notional = _position_notional(runtime=runtime, mid_price=mid_price)
     held_qty = _held_qty(runtime=runtime)
     one_order_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(mid_price, EPSILON), step_size)
-    if max_position_notional > 0 and inventory_notional >= max_position_notional:
-        risk_state = "hard_reduce_only"
-    elif threshold_position_notional > 0 and inventory_notional >= threshold_position_notional:
-        risk_state = "threshold_reduce_only"
+    if recovery_mode != "live":
+        risk_state = runtime_risk_state
     else:
-        risk_state = "normal"
+        if max_position_notional > 0 and inventory_notional >= max_position_notional:
+            risk_state = "hard_reduce_only"
+        elif threshold_position_notional > 0 and inventory_notional >= threshold_position_notional:
+            risk_state = "threshold_reduce_only"
+        else:
+            risk_state = "normal"
 
     tail_cleanup_active = 0.0 < held_qty < max(one_order_qty, EPSILON)
 
@@ -152,7 +165,10 @@ def build_inventory_grid_orders(
         if tail_cleanup_active:
             cleanup_qty = _round_order_qty(held_qty, step_size)
             cleanup_price = _round_order_price(ask_price, tick_size, "SELL")
-            if cleanup_qty > 0:
+            cleanup_notional = cleanup_qty * cleanup_price
+            if cleanup_qty > 0 and (min_qty is None or cleanup_qty >= min_qty) and (
+                min_notional is None or cleanup_notional >= min_notional
+            ):
                 sell_orders.append(
                     _build_order(
                         side="SELL",
@@ -208,7 +224,10 @@ def build_inventory_grid_orders(
         if tail_cleanup_active:
             cleanup_qty = _round_order_qty(held_qty, step_size)
             cleanup_price = _round_order_price(bid_price, tick_size, "BUY")
-            if cleanup_qty > 0:
+            cleanup_notional = cleanup_qty * cleanup_price
+            if cleanup_qty > 0 and (min_qty is None or cleanup_qty >= min_qty) and (
+                min_notional is None or cleanup_notional >= min_notional
+            ):
                 buy_orders.append(
                     _build_order(
                         side="BUY",

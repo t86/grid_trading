@@ -18,10 +18,11 @@ def test_futures_flat_starts_with_two_bootstrap_orders() -> None:
         tick_size=0.0001,
         step_size=1.0,
         min_qty=1.0,
-        min_notional=5.0,
+        min_notional=0.1,
     )
 
     assert {item["side"] for item in plan["bootstrap_orders"]} == {"BUY", "SELL"}
+    assert {item.get("position_side", "BOTH") for item in plan["bootstrap_orders"]} == {"BOTH"}
     assert plan["buy_orders"] == []
     assert plan["sell_orders"] == []
     assert plan["forced_reduce_orders"] == []
@@ -44,13 +45,78 @@ def test_spot_flat_starts_with_single_bootstrap_buy() -> None:
         tick_size=0.0001,
         step_size=1.0,
         min_qty=1.0,
-        min_notional=5.0,
+        min_notional=0.1,
     )
 
     assert len(plan["bootstrap_orders"]) == 1
     assert plan["bootstrap_orders"][0]["side"] == "BUY"
     assert plan["bootstrap_orders"][0]["role"] == "bootstrap_entry"
     assert plan["sell_orders"] == []
+
+
+def test_conservative_flat_runtime_does_not_bootstrap() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["recovery_mode"] = "conservative_reduce_only"
+    runtime["risk_state"] = "hard_reduce_only"
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0999,
+        ask_price=0.1001,
+        step_price=0.01,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=50.0,
+        max_order_position_notional=80.0,
+        max_position_notional=120.0,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=0.1,
+    )
+
+    assert plan["risk_state"] == "hard_reduce_only"
+    assert plan["bootstrap_orders"] == []
+    assert plan["buy_orders"] == []
+    assert plan["sell_orders"] == []
+    assert plan["forced_reduce_orders"] == []
+
+
+def test_conservative_active_runtime_preserves_risk_state_and_blocks_entries() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["recovery_mode"] = "conservative_reduce_only"
+    runtime["risk_state"] = "hard_reduce_only"
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 200.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0999,
+        ask_price=0.1001,
+        step_price=0.01,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=1000.0,
+        max_order_position_notional=80.0,
+        max_position_notional=120.0,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=0.1,
+    )
+
+    assert plan["risk_state"] == "hard_reduce_only"
+    assert plan["buy_orders"] == []
 
 
 def test_threshold_reduce_only_blocks_same_side_entries_until_pair_credit_covers_cost() -> None:
@@ -198,11 +264,47 @@ def test_tail_cleanup_emits_single_cleanup_order() -> None:
         tick_size=0.0001,
         step_size=1.0,
         min_qty=1.0,
-        min_notional=5.0,
+        min_notional=0.1,
     )
 
     assert plan["tail_cleanup_active"] is True
     assert [item["role"] for item in plan["sell_orders"]] == ["tail_cleanup"]
+    assert plan["buy_orders"] == []
+
+
+def test_tail_cleanup_below_exchange_mins_is_skipped() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["position_lots"] = [
+        {
+            "lot_id": "tail",
+            "side": "long",
+            "qty": 5.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0999,
+        ask_price=0.1001,
+        step_price=0.01,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=50.0,
+        max_order_position_notional=80.0,
+        max_position_notional=120.0,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=1.0,
+    )
+
+    assert plan["tail_cleanup_active"] is True
+    assert plan["sell_orders"] == []
     assert plan["buy_orders"] == []
 
 
@@ -234,7 +336,7 @@ def test_tail_cleanup_overrides_threshold_reduce_only() -> None:
         tick_size=0.0001,
         step_size=1.0,
         min_qty=1.0,
-        min_notional=5.0,
+        min_notional=0.1,
     )
 
     assert plan["risk_state"] == "threshold_reduce_only"
