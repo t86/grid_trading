@@ -198,6 +198,55 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(desired_orders[0]["role"], "bootstrap_entry")
         self.assertEqual(controls["direction_state"], "flat")
 
+    def test_load_state_resets_competition_state_when_symbol_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "BTCUSDT",
+                        "strategy_mode": "spot_competition_inventory_grid",
+                        "known_orders": {
+                            "123": {
+                                "side": "BUY",
+                                "role": "bootstrap_entry",
+                                "created_at_ms": 1,
+                            }
+                        },
+                        "inventory_lots": [
+                            {
+                                "qty": 1.5,
+                                "cost_quote": 150.0,
+                                "buy_time_ms": 1234567890,
+                                "tag": "stale",
+                            }
+                        ],
+                        "seen_trade_ids": [1],
+                        "last_trade_time_ms": 1234567890,
+                        "metrics": {"realized_pnl": 1.0},
+                        "spot_competition_inventory_grid_runtime_cache": {
+                            "strategy_mode": "spot_competition_inventory_grid",
+                            "market_type": "spot",
+                            "runtime": {"direction_state": "long_active"},
+                            "applied_trade_keys": ["old-trade"],
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = _load_state(
+                state_path,
+                symbol="ETHUSDT",
+                strategy_mode="spot_competition_inventory_grid",
+                cell_count=0,
+            )
+
+        self.assertEqual(state["symbol"], "ETHUSDT")
+        self.assertEqual(state["known_orders"], {})
+        self.assertEqual(state["inventory_lots"], [])
+        self.assertNotIn("spot_competition_inventory_grid_runtime_cache", state)
+
     def test_build_spot_competition_inventory_grid_orders_uses_cached_runtime_for_older_inventory(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="spot")
         apply_inventory_grid_fill(

@@ -270,6 +270,10 @@
   - `flat` 时会在买一 / 卖一各挂一笔 `bootstrap_entry` maker 单。
   - futures 里哪一边先成交，就把方向切到 `long_active` 或 `short_active`，后续网格围绕这次有效成交继续展开。
   - `grid_entry` / `grid_exit` 成交会继续更新 `grid_anchor_price`。
+- 重启 / 恢复：
+  - 优先读取本地 state 里的 competition runtime cache，再把交易所最近能映射到策略订单引用的成交增量应用进去。
+  - 只有缓存缺失、缓存和当前实仓对不上，或者增量应用失败时，才退回到“按近端策略成交回放重建 runtime”。
+  - 外部成交不会拿来更新这套 runtime；`pair_credit_steps` 只保留在内存里，重启后恢复为 0。
 - 锚点写回规则：
   - 会更新锚点的成交：`bootstrap_entry`、`grid_entry`、`grid_exit`
   - 不会更新锚点的成交：`forced_reduce`、`tail_cleanup`
@@ -290,9 +294,9 @@
   - `flat` 时只挂一笔 `bootstrap_entry` BUY，不会反向开空。
   - 后续只围绕已持有现货库存做买入补仓、卖出减仓和尾部清理。
 - 重启 / 恢复：
-  - 启动时会用策略标签过的成交和 `known_orders` 重建 lots、方向状态和锚点。
-  - 只有能映射到策略订单引用的成交才会被回放，外部成交不会拿来重建这套 runtime。
-  - `pair_credit_steps` 来自 recovery 重建出来的 runtime；当前实现里这条路径会在重建结束时把它重置为 0，所以重启后不会沿用上一次会话里缓存的 pair-credit。
+  - 优先读取本地 state 里的 spot competition runtime cache，再把交易所最近能映射到 `known_orders` 的策略成交增量应用进去。
+  - 只有缓存缺失、缓存和当前 spot 库存数量对不上，或者增量应用失败时，才退回到“按近端策略成交回放重建 runtime”。
+  - 外部成交不会拿来重建这套 runtime；`pair_credit_steps` 不持久化，重启后从 0 开始。
 
 ## 预设策略说明
 

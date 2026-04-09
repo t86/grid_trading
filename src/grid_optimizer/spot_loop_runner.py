@@ -103,7 +103,12 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
     else:
         state = {}
     loaded_strategy_mode = str(state.get("strategy_mode") or "").strip()
-    if strategy_mode == "spot_competition_inventory_grid" and loaded_strategy_mode and loaded_strategy_mode != strategy_mode:
+    loaded_symbol = str(state.get("symbol") or "").upper().strip()
+    requested_symbol = str(symbol or "").upper().strip()
+    if strategy_mode == "spot_competition_inventory_grid" and (
+        (loaded_strategy_mode and loaded_strategy_mode != strategy_mode)
+        or (loaded_symbol and loaded_symbol != requested_symbol)
+    ):
         state["known_orders"] = {}
         state["inventory_lots"] = []
         state["seen_trade_ids"] = []
