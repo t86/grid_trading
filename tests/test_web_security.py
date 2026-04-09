@@ -150,6 +150,22 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["max_position_notional"], 600.0)
         self.assertAlmostEqual(payload["sleep_seconds"], 5.0)
 
+    def test_monitor_page_exposes_competition_inventory_grid_preset(self) -> None:
+        self.assertIn("合约竞赛库存网格", MONITOR_PAGE)
+        self.assertIn("competition_inventory_grid", MONITOR_PAGE)
+
+    def test_runner_preset_payload_applies_competition_inventory_grid_profile(self) -> None:
+        payload = _runner_preset_payload("competition_inventory_grid_v1", {"symbol": "BARDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "competition_inventory_grid_v1")
+        self.assertEqual(payload["strategy_mode"], "competition_inventory_grid")
+        self.assertEqual(payload["first_order_multiplier"], 4.0)
+        self.assertEqual(payload["threshold_position_notional"], 50.0)
+        self.assertEqual(payload["max_order_position_notional"], 80.0)
+
+    def test_runner_preset_summaries_include_competition_inventory_grid_profile(self) -> None:
+        keys = {item["key"] for item in _runner_preset_summaries("BARDUSDT")}
+        self.assertIn("competition_inventory_grid_v1", keys)
+
     def test_runner_preset_payload_applies_volatility_defensive_profile(self) -> None:
         payload = _runner_preset_payload("volatility_defensive_v1", {"symbol": "OPNUSDT"})
         self.assertEqual(payload["strategy_profile"], "volatility_defensive_v1")

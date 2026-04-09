@@ -23,6 +23,8 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn('id="stop_btn"', SPOT_RUNNER_PAGE)
         self.assertIn('id="strategy_mode"', SPOT_RUNNER_PAGE)
         self.assertIn("Spot V1 单向做多静态网格", SPOT_RUNNER_PAGE)
+        self.assertIn("现货竞赛库存网格", SPOT_RUNNER_PAGE)
+        self.assertIn('id="competition_fields"', SPOT_RUNNER_PAGE)
         self.assertIn("/spot_strategies", SPOT_RUNNER_PAGE)
 
     def test_spot_strategies_page_contains_overview(self) -> None:
@@ -105,6 +107,56 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--run-end-time", command)
         self.assertIn("--rolling-hourly-loss-limit", command)
         self.assertIn("--max-cumulative-notional", command)
+
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_normalize_spot_runner_payload_accepts_competition_inventory_grid(self, _mock_validate_symbol) -> None:
+        payload = _normalize_spot_runner_payload(
+            {
+                "symbol": "btcusdt",
+                "strategy_mode": "spot_competition_inventory_grid",
+                "total_quote_budget": 1800,
+                "step_price": 12.5,
+                "per_order_notional": 45,
+                "first_order_multiplier": 3,
+                "threshold_position_notional": 320,
+                "max_order_position_notional": 420,
+                "max_position_notional": 520,
+            }
+        )
+
+        self.assertEqual(payload["strategy_mode"], "spot_competition_inventory_grid")
+        self.assertEqual(payload["symbol"], "BTCUSDT")
+        self.assertEqual(payload["step_price"], 12.5)
+        self.assertEqual(payload["per_order_notional"], 45.0)
+        self.assertEqual(payload["first_order_multiplier"], 3.0)
+        self.assertEqual(payload["threshold_position_notional"], 320.0)
+        self.assertEqual(payload["max_order_position_notional"], 420.0)
+        self.assertEqual(payload["max_position_notional"], 520.0)
+
+    def test_build_spot_runner_command_includes_competition_inventory_grid_arguments(self) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "BTCUSDT",
+                "strategy_mode": "spot_competition_inventory_grid",
+                "total_quote_budget": 1800.0,
+                "step_price": 12.5,
+                "per_order_notional": 45.0,
+                "first_order_multiplier": 3.0,
+                "threshold_position_notional": 320.0,
+                "max_order_position_notional": 420.0,
+                "max_position_notional": 520.0,
+            }
+        )
+
+        command = _build_spot_runner_command(config)
+
+        self.assertIn("--step-price", command)
+        self.assertIn("--per-order-notional", command)
+        self.assertIn("--first-order-multiplier", command)
+        self.assertIn("--threshold-position-notional", command)
+        self.assertIn("--max-order-position-notional", command)
+        self.assertIn("--max-position-notional", command)
 
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")

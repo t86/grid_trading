@@ -1170,6 +1170,26 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "sleep_seconds": 5.0,
         },
     },
+    "competition_inventory_grid_v1": {
+        "label": "合约竞赛库存网格",
+        "description": "围绕策略自身最近一次有效成交锚点运行的 Competition Inventory Grid。flat 时双向贴盘口等首单，后续按固定步长滚动；达到阈值仓位后优先转入减仓状态机。",
+        "startable": True,
+        "kind": "one_way",
+        "config": {
+            "strategy_mode": "competition_inventory_grid",
+            "step_price": 0.0002,
+            "per_order_notional": 35.0,
+            "first_order_multiplier": 4.0,
+            "threshold_position_notional": 50.0,
+            "max_order_position_notional": 80.0,
+            "max_position_notional": 120.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "autotune_symbol_enabled": True,
+            "max_new_orders": 16,
+            "sleep_seconds": 5.0,
+        },
+    },
 }
 RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "strategy_profile": "volume_long_v4",
@@ -1304,6 +1324,7 @@ RUNNER_AUTOTUNE_STEP_HINTS: dict[str, tuple[float, int]] = {
     "volume_neutral_target_v1": (0.0006, 3),
     "neutral_hedge_v1": (0.0005, 3),
     "synthetic_neutral_v1": (0.0005, 3),
+    "competition_inventory_grid_v1": (0.0004, 2),
     "based_volume_push_bard_v1": (0.00028, 1),
     "volume_neutral_push_v1": (0.00032, 2),
     "volume_neutral_push_guarded_v1": (0.00032, 2),
@@ -2152,6 +2173,12 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "max_price": 130000.0,
     "n": 20,
     "total_quote_budget": 1000.0,
+    "step_price": 0.0,
+    "per_order_notional": 0.0,
+    "first_order_multiplier": 4.0,
+    "threshold_position_notional": 0.0,
+    "max_order_position_notional": 0.0,
+    "max_position_notional": 0.0,
     "sleep_seconds": 10.0,
     "cancel_stale": True,
     "apply": True,
@@ -2841,9 +2868,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "center_price",
         "step_price",
         "per_order_notional",
+        "first_order_multiplier",
         "startup_entry_multiplier",
         "base_position_notional",
         "synthetic_residual_short_flat_notional",
+        "threshold_position_notional",
+        "max_order_position_notional",
         "market_bias_max_shift_steps",
         "market_bias_signal_steps",
         "market_bias_drift_weight",
@@ -3246,6 +3276,13 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--static-sell-offset-steps", str(config["static_sell_offset_steps"])])
     if config.get("center_price") is not None:
         command.extend(["--center-price", str(config["center_price"])])
+    if str(config.get("strategy_mode", "")).strip() == "competition_inventory_grid":
+        if config.get("first_order_multiplier") is not None:
+            command.extend(["--first-order-multiplier", str(config["first_order_multiplier"])])
+        if config.get("threshold_position_notional") is not None:
+            command.extend(["--threshold-position-notional", str(config["threshold_position_notional"])])
+        if config.get("max_order_position_notional") is not None:
+            command.extend(["--max-order-position-notional", str(config["max_order_position_notional"])])
     command.append("--market-bias-enabled" if config.get("market_bias_enabled", False) else "--no-market-bias-enabled")
     if config.get("market_bias_max_shift_steps") is not None:
         command.extend(["--market-bias-max-shift-steps", str(config["market_bias_max_shift_steps"])])
@@ -4264,6 +4301,27 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("total_quote_budget", SPOT_RUNNER_DEFAULT_CONFIG["total_quote_budget"]),
         "total_quote_budget",
     )
+    step_price = _safe_float(payload.get("step_price", SPOT_RUNNER_DEFAULT_CONFIG["step_price"]), "step_price")
+    per_order_notional = _safe_float(
+        payload.get("per_order_notional", SPOT_RUNNER_DEFAULT_CONFIG["per_order_notional"]),
+        "per_order_notional",
+    )
+    first_order_multiplier = _safe_float(
+        payload.get("first_order_multiplier", SPOT_RUNNER_DEFAULT_CONFIG["first_order_multiplier"]),
+        "first_order_multiplier",
+    )
+    threshold_position_notional = _safe_float(
+        payload.get("threshold_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["threshold_position_notional"]),
+        "threshold_position_notional",
+    )
+    max_order_position_notional = _safe_float(
+        payload.get("max_order_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_order_position_notional"]),
+        "max_order_position_notional",
+    )
+    max_position_notional = _safe_float(
+        payload.get("max_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_position_notional"]),
+        "max_position_notional",
+    )
     sleep_seconds = _safe_float(payload.get("sleep_seconds", SPOT_RUNNER_DEFAULT_CONFIG["sleep_seconds"]), "sleep_seconds")
     cancel_stale = _safe_bool(payload.get("cancel_stale", True), "cancel_stale")
     apply = _safe_bool(payload.get("apply", True), "apply")
@@ -4352,13 +4410,26 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             f"unsupported grid_level_mode: {grid_level_mode}; "
             f"supported: {','.join(supported_grid_level_modes())}"
         )
-    if strategy_mode not in {"spot_one_way_long", "spot_volume_shift_long"}:
+    if strategy_mode not in {"spot_one_way_long", "spot_volume_shift_long", "spot_competition_inventory_grid"}:
         raise ValueError("unsupported strategy_mode")
     if strategy_mode == "spot_one_way_long":
         if min_price <= 0 or max_price <= 0 or min_price >= max_price:
             raise ValueError("invalid min_price/max_price")
         if n <= 0:
             raise ValueError("n must be > 0")
+    elif strategy_mode == "spot_competition_inventory_grid":
+        if step_price <= 0:
+            raise ValueError("step_price must be > 0")
+        if per_order_notional <= 0:
+            raise ValueError("per_order_notional must be > 0")
+        if first_order_multiplier <= 0:
+            raise ValueError("first_order_multiplier must be > 0")
+        if threshold_position_notional < 0:
+            raise ValueError("threshold_position_notional must be >= 0")
+        if max_order_position_notional < 0:
+            raise ValueError("max_order_position_notional must be >= 0")
+        if max_position_notional <= 0:
+            raise ValueError("max_position_notional must be > 0")
     if total_quote_budget <= 0:
         raise ValueError("total_quote_budget must be > 0")
     if sleep_seconds <= 0:
@@ -4390,6 +4461,12 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "max_price": max_price,
             "n": n,
             "total_quote_budget": total_quote_budget,
+            "step_price": step_price,
+            "per_order_notional": per_order_notional,
+            "first_order_multiplier": first_order_multiplier,
+            "threshold_position_notional": threshold_position_notional,
+            "max_order_position_notional": max_order_position_notional,
+            "max_position_notional": max_position_notional,
             "sleep_seconds": sleep_seconds,
             "cancel_stale": cancel_stale,
             "apply": apply,
@@ -4441,6 +4518,18 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         str(config["n"]),
         "--total-quote-budget",
         str(config["total_quote_budget"]),
+        "--step-price",
+        str(config.get("step_price", 0.0)),
+        "--per-order-notional",
+        str(config.get("per_order_notional", 0.0)),
+        "--first-order-multiplier",
+        str(config.get("first_order_multiplier", 4.0)),
+        "--threshold-position-notional",
+        str(config.get("threshold_position_notional", 0.0)),
+        "--max-order-position-notional",
+        str(config.get("max_order_position_notional", 0.0)),
+        "--max-position-notional",
+        str(config.get("max_position_notional", 0.0)),
         "--grid-level-mode",
         str(config.get("grid_level_mode", "arithmetic")),
         "--sleep-seconds",
@@ -11884,6 +11973,27 @@ MONITOR_PAGE = """<!doctype html>
           sleep_seconds: 5,
         },
       },
+      {
+        key: "competition_inventory_grid_v1",
+        label: "合约竞赛库存网格",
+        description: "围绕策略自身最近一次有效成交锚点运行的 Competition Inventory Grid。flat 时双向贴盘口等首单，后续按固定步长滚动；达到阈值仓位后优先转入减仓状态机。",
+        startable: true,
+        kind: "one_way",
+        config: {
+          strategy_mode: "competition_inventory_grid",
+          step_price: 0.0002,
+          per_order_notional: 35,
+          first_order_multiplier: 4,
+          threshold_position_notional: 50,
+          max_order_position_notional: 80,
+          max_position_notional: 120,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          autotune_symbol_enabled: true,
+          max_new_orders: 16,
+          sleep_seconds: 5,
+        },
+      },
     ];
 
     let timer = null;
@@ -11898,16 +12008,19 @@ MONITOR_PAGE = """<!doctype html>
     let latestRunnerEditorConfig = null;
     const RUNNER_PARAM_EXPLAIN = {
       strategy_profile: "策略模板标识。用于区分量优先做空、做多、防守或自定义策略。",
-      strategy_mode: "策略方向/模式。one_way_long 做多，one_way_short 做空，neutral/synthetic 是中性或合成中性。",
+      strategy_mode: "策略方向/模式。one_way_long 做多，one_way_short 做空，neutral/synthetic 是中性或合成中性，competition_inventory_grid 是成交驱动的竞赛库存网格。",
       symbol: "当前交易对。",
       step_price: "相邻网格之间的固定价差。越小越贴近盘口、成交更密，但更容易因为手续费和反复换手产生磨损。",
       buy_levels: "买单层数。层数越多，向下承接更深，但资金占用也更高。",
       sell_levels: "卖单层数。层数越多，向上卸仓或开空覆盖更广。",
       per_order_notional: "每笔挂单的目标名义金额（U）。直接决定单笔成交额大小。",
+      first_order_multiplier: "竞赛库存网格首单放大倍数。flat 时最近一档 maker 首单会按 per_order_notional × 这个倍数挂出。",
       startup_entry_multiplier: "启动首轮放大倍数。仅在首轮零持仓时把买一/卖一放大成常规单的倍数，后续恢复普通单量。",
       base_position_notional: "基础持仓目标名义。做多会优先建立底仓，做空则对应基础空仓。",
       sticky_entry_levels: "近端保留旧单的最大档数。仅对 synthetic neutral 的贴盘口单保队列；设为 2 表示前两档尽量沿用更接近盘口的旧价位。",
       synthetic_residual_short_flat_notional: "synthetic neutral 的残余空仓忽略阈值（U）。空侧名义低于它时，计划里会把这点残仓视作已平，立刻恢复双边挂单。",
+      threshold_position_notional: "竞赛库存网格软阈值。达到后优先停掉同侧新增，并按 pair-credit 决定是否直接 forced_reduce。",
+      max_order_position_notional: "竞赛库存网格运行时上限。当前持仓加上同侧未成交挂单潜在新增不能超过这个值。",
       center_price: "固定中心价；为空时由运行时根据中价和偏移逻辑动态计算。",
       fixed_center_enabled: "是否启用固定中心价。开启后不会按常规触发逻辑自动迁移中心。",
       fixed_center_roll_enabled: "固定中心启用时，是否允许中心按规则缓慢滚动。",
@@ -12653,6 +12766,13 @@ MONITOR_PAGE = """<!doctype html>
           "如果把 `startup_entry_multiplier` 设成 4，就相当于首轮大单成交后，用约四笔常规小单去拆回；再叠加 bias 三态换挡，就能少扛单边库存。",
         ],
       },
+      competition_inventory_grid_v1: {
+        summary: "成交驱动的竞赛库存网格。不是围绕市场 last trade，也不是按中心整体平移，而是围绕策略自己最近一次有效成交锚点滚动。",
+        focus: [
+          "flat 时会在买一/卖一各挂一笔 maker 首单；哪边先成交，就进入对应方向，并围绕那次成交继续展开网格。",
+          "达到 threshold_position_notional 后，会优先停掉同侧新增；pair-credit 足够时才挂 forced_reduce，不够就先靠反向网格慢慢减仓。",
+        ],
+      },
     };
     const AUTOTUNE_STEP_HINTS = {
       volume_long_v4: { stepRatio: 0.0004, minTicks: 2 },
@@ -12661,6 +12781,7 @@ MONITOR_PAGE = """<!doctype html>
       volume_neutral_target_v1: { stepRatio: 0.0006, minTicks: 3 },
       neutral_hedge_v1: { stepRatio: 0.0005, minTicks: 3 },
       synthetic_neutral_v1: { stepRatio: 0.0005, minTicks: 3 },
+      competition_inventory_grid_v1: { stepRatio: 0.0004, minTicks: 2 },
       based_volume_push_bard_v1: { stepRatio: 0.00028, minTicks: 1 },
       volume_neutral_push_v1: { stepRatio: 0.00032, minTicks: 2 },
       volume_neutral_push_guarded_v1: { stepRatio: 0.00032, minTicks: 2 },
@@ -12750,6 +12871,14 @@ MONITOR_PAGE = """<!doctype html>
       const sellLevels = Math.max(Number(config.sell_levels) || 0, 0);
       const perOrderNotional = asGuideNumber(config.per_order_notional);
       const basePositionNotional = Math.max(asGuideNumber(config.base_position_notional) || 0, 0);
+      if (mode === "competition_inventory_grid") {
+        const firstOrderMultiplier = asGuideNumber(config.first_order_multiplier);
+        return [
+          `flat 时会在买一 / 卖一各挂一笔 maker 首单，单笔目标名义 ${fmtGuideNotional(perOrderNotional)}，首单放大倍数 ${fmtGuideNumber(firstOrderMultiplier, 2)}。`,
+          `哪一边先成交，就进入对应方向；后续只强制保证最近一次有效成交价上下各一档仍然存在，价差固定为 ${fmtGuidePrice(stepPrice)}。`,
+          "forced_reduce 和 tail_cleanup 成交不会改锚点；只有 bootstrap_entry、grid_entry、grid_exit 会推进 grid_anchor_price。",
+        ];
+      }
       if (mode === "one_way_short") {
         return [
           `以上下方运行时中心价为轴，向上每隔 ${fmtGuidePrice(stepPrice)} 挂 ${sellLevels} 层卖单开空，向下每隔 ${fmtGuidePrice(stepPrice)} 挂 ${buyLevels} 层买单回补空仓。`,
@@ -12788,6 +12917,13 @@ MONITOR_PAGE = """<!doctype html>
     function buildCenterBehaviorLines(config, mode) {
       const centerPrice = asGuideNumber(config.center_price);
       const stepPrice = asGuideNumber(config.step_price);
+      if (mode === "competition_inventory_grid") {
+        return [
+          "这套不按 up/down trigger / shift_steps 迁移中心，也不围绕市场最近一笔成交整体平移。",
+          `真正驱动挂单的是策略自己最近一次有效成交锚点；锚点上下最近一档固定相差 ${fmtGuidePrice(stepPrice)}。`,
+          "forced_reduce、tail_cleanup 只负责去库存，不会推进锚点；所以下一轮网格仍然围绕上一次有效成交继续展开。",
+        ];
+      }
       if (config.custom_grid_enabled) {
         return [
           "当前 JSON 已启用 custom_grid_enabled，中心价来自你定义的固定网格区间中点，不再按普通微网格触发规则移动。",
@@ -12848,11 +12984,23 @@ MONITOR_PAGE = """<!doctype html>
 
     function buildPauseAndCapLines(config, mode) {
       const lines = [];
+      const thresholdPositionNotional = asGuideNumber(config.threshold_position_notional);
+      const maxOrderPositionNotional = asGuideNumber(config.max_order_position_notional);
       const buyPause = asGuideNumber(config.pause_buy_position_notional);
       const shortPause = asGuideNumber(config.pause_short_position_notional);
       const maxLong = asGuideNumber(config.max_position_notional);
       const maxShort = asGuideNumber(config.max_short_position_notional);
-      if (mode === "one_way_short") {
+      if (mode === "competition_inventory_grid") {
+        if (thresholdPositionNotional >= 0) {
+          lines.push(`持仓名义达到 ${fmtGuideNotional(thresholdPositionNotional)} 后进入 threshold_reduce_only：会优先停掉同侧新增，并先看 pair-credit 是否足够覆盖 forced_reduce 成本。`);
+        }
+        if (maxOrderPositionNotional >= 0) {
+          lines.push(`运行时“当前持仓 + 同侧未成交挂单潜在新增”不能超过 ${fmtGuideNotional(maxOrderPositionNotional)}；超过时不再补新的同侧开仓单。`);
+        }
+        if (maxLong > 0) {
+          lines.push(`实际持仓达到 ${fmtGuideNotional(maxLong)} 后进入 hard_reduce_only，只保留减仓逻辑，forced_reduce 不再受 pair-credit 余额限制。`);
+        }
+      } else if (mode === "one_way_short") {
         if (shortPause > 0) {
           lines.push(`当空仓名义达到 ${fmtGuideNotional(shortPause)} 时，会清掉 bootstrap_short 和新的卖单，只保留买回补空单。`);
         }
@@ -13001,6 +13149,10 @@ MONITOR_PAGE = """<!doctype html>
       if (mode === "inventory_target_neutral") {
         lines.push("注意：inventory_target_neutral 当前真正生效的是 neutral_center_interval_minutes、三档 band offset / target ratio、max_position_notional / max_short_position_notional 和 neutral_hourly_scale。");
         lines.push("buy_levels、sell_levels、per_order_notional、base_position_notional、up_trigger_steps、down_trigger_steps、shift_steps 在这个模式里不会决定实际挂单位置。");
+      }
+      if (mode === "competition_inventory_grid") {
+        lines.push("注意：competition_inventory_grid 主要依赖 step_price、per_order_notional、first_order_multiplier、threshold_position_notional、max_order_position_notional、max_position_notional。");
+        lines.push("buy_levels、sell_levels、base_position_notional、up_trigger_steps、down_trigger_steps、shift_steps 在这个模式里不是决定性参数。");
       }
 
       return lines;
@@ -14336,7 +14488,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
   <div class="wrap">
     <section class="card header">
       <h1>现货比赛执行台</h1>
-      <p>隔离于现有合约 runner。支持 `Spot V1 单向做多静态网格` 与 `现货量优先移中心` 两种模式，页面直接展示累计成交额、已实现收益、回收损耗、库存与停买状态。</p>
+      <p>隔离于现有合约 runner。支持 `Spot V1 单向做多静态网格`、`现货量优先移中心` 与 `现货竞赛库存网格` 三种模式，页面直接展示累计成交额、已实现收益、回收损耗、库存与停买状态。</p>
       <div class="header-links">
         <a href="/">返回测算页</a>
         <a href="/monitor">打开合约实盘监控</a>
@@ -14354,6 +14506,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         <label>策略模式
           <select id="strategy_mode">
             <option value="spot_volume_shift_long">现货量优先移中心</option>
+            <option value="spot_competition_inventory_grid">现货竞赛库存网格</option>
             <option value="spot_one_way_long">Spot V1 单向做多静态网格</option>
           </select>
         </label>
@@ -14421,6 +14574,29 @@ SPOT_RUNNER_PAGE = """<!doctype html>
           <input id="recycle_settings" type="text" />
         </label>
       </div>
+      <div class="fields hidden" id="competition_fields">
+        <label>总预算（quote）
+          <input id="competition_total_quote_budget" type="number" min="0" step="0.01" />
+        </label>
+        <label>固定步长
+          <input id="competition_step_price" type="number" min="0" step="0.0000001" />
+        </label>
+        <label>单笔金额
+          <input id="competition_per_order_notional" type="number" min="0" step="0.01" />
+        </label>
+        <label>首单倍数
+          <input id="competition_first_order_multiplier" type="number" min="0" step="0.1" />
+        </label>
+        <label>阈值持仓
+          <input id="competition_threshold_position_notional" type="number" min="0" step="0.01" />
+        </label>
+        <label>最大下单持仓
+          <input id="competition_max_order_position_notional" type="number" min="0" step="0.01" />
+        </label>
+        <label>最大可持仓
+          <input id="competition_max_position_notional" type="number" min="0" step="0.01" />
+        </label>
+      </div>
       <div class="fields" id="runtime_guard_fields">
         <label>起始时间
           <input id="run_start_time" type="datetime-local" />
@@ -14438,7 +14614,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       <div class="actions">
         <span id="status" class="meta">等待状态加载...</span>
       </div>
-      <p class="hint">说明：现货量优先移中心模式会根据成交和库存动态调整买卖；停止时只撤掉这个 spot runner 自己挂出的单，不会碰你账户里的其他现货委托。</p>
+      <p class="hint">说明：现货量优先移中心模式会根据成交和库存动态调整买卖；现货竞赛库存网格会围绕自身最近一次有效成交锚点滚动。停止时只撤掉这个 spot runner 自己挂出的单，不会碰你账户里的其他现货委托。</p>
     </section>
 
     <section class="card">
@@ -14543,6 +14719,13 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const nEl = document.getElementById("n");
     const totalQuoteBudgetEl = document.getElementById("total_quote_budget");
     const shiftTotalQuoteBudgetEl = document.getElementById("shift_total_quote_budget");
+    const competitionTotalQuoteBudgetEl = document.getElementById("competition_total_quote_budget");
+    const competitionStepPriceEl = document.getElementById("competition_step_price");
+    const competitionPerOrderNotionalEl = document.getElementById("competition_per_order_notional");
+    const competitionFirstOrderMultiplierEl = document.getElementById("competition_first_order_multiplier");
+    const competitionThresholdPositionNotionalEl = document.getElementById("competition_threshold_position_notional");
+    const competitionMaxOrderPositionNotionalEl = document.getElementById("competition_max_order_position_notional");
+    const competitionMaxPositionNotionalEl = document.getElementById("competition_max_position_notional");
     const gridBandRatioEl = document.getElementById("grid_band_ratio");
     const attackLevelsEl = document.getElementById("attack_levels");
     const attackPerOrderNotionalEl = document.getElementById("attack_per_order_notional");
@@ -14560,6 +14743,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const refreshSecondsEl = document.getElementById("refresh_seconds");
     const staticFieldsEl = document.getElementById("static_fields");
     const shiftFieldsEl = document.getElementById("shift_fields");
+    const competitionFieldsEl = document.getElementById("competition_fields");
     const previewCardEl = document.getElementById("preview_card");
     const previewBtn = document.getElementById("preview_btn");
     const refreshBtn = document.getElementById("refresh_btn");
@@ -14681,7 +14865,19 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         min_price: Number(minPriceEl.value || 0),
         max_price: Number(maxPriceEl.value || 0),
         n: Number(nEl.value || 0),
-        total_quote_budget: Number(strategyMode === "spot_one_way_long" ? totalQuoteBudgetEl.value : shiftTotalQuoteBudgetEl.value || 0),
+        total_quote_budget: Number(
+          strategyMode === "spot_one_way_long"
+            ? (totalQuoteBudgetEl.value || 0)
+            : strategyMode === "spot_competition_inventory_grid"
+              ? (competitionTotalQuoteBudgetEl.value || 0)
+              : (shiftTotalQuoteBudgetEl.value || 0)
+        ),
+        step_price: Number(competitionStepPriceEl.value || 0),
+        per_order_notional: Number(competitionPerOrderNotionalEl.value || 0),
+        first_order_multiplier: Number(competitionFirstOrderMultiplierEl.value || 0),
+        threshold_position_notional: Number(competitionThresholdPositionNotionalEl.value || 0),
+        max_order_position_notional: Number(competitionMaxOrderPositionNotionalEl.value || 0),
+        max_position_notional: Number(competitionMaxPositionNotionalEl.value || 0),
         sleep_seconds: Number(sleepSecondsEl.value || 10),
         cancel_stale: true,
         apply: true,
@@ -14753,9 +14949,12 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     }
 
     function toggleModeFields() {
-      const isStatic = String(strategyModeEl.value || "") === "spot_one_way_long";
+      const mode = String(strategyModeEl.value || "");
+      const isStatic = mode === "spot_one_way_long";
+      const isCompetition = mode === "spot_competition_inventory_grid";
       staticFieldsEl.classList.toggle("hidden", !isStatic);
-      shiftFieldsEl.classList.toggle("hidden", isStatic);
+      shiftFieldsEl.classList.toggle("hidden", isStatic || isCompetition);
+      competitionFieldsEl.classList.toggle("hidden", !isCompetition);
       previewCardEl.classList.toggle("hidden", !isStatic);
       previewBtn.disabled = !isStatic;
     }
@@ -14901,7 +15100,14 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       if (config.total_quote_budget !== undefined) {
         totalQuoteBudgetEl.value = String(config.total_quote_budget);
         shiftTotalQuoteBudgetEl.value = String(config.total_quote_budget);
+        competitionTotalQuoteBudgetEl.value = String(config.total_quote_budget);
       }
+      competitionStepPriceEl.value = String(config.step_price ?? 0);
+      competitionPerOrderNotionalEl.value = String(config.per_order_notional ?? 0);
+      competitionFirstOrderMultiplierEl.value = String(config.first_order_multiplier ?? 4);
+      competitionThresholdPositionNotionalEl.value = String(config.threshold_position_notional ?? 0);
+      competitionMaxOrderPositionNotionalEl.value = String(config.max_order_position_notional ?? 0);
+      competitionMaxPositionNotionalEl.value = String(config.max_position_notional ?? 0);
       if (config.sleep_seconds !== undefined) sleepSecondsEl.value = String(config.sleep_seconds);
       gridBandRatioEl.value = String(config.grid_band_ratio ?? 0.045);
       attackLevelsEl.value = `${config.attack_buy_levels ?? 14},${config.attack_sell_levels ?? 22}`;
