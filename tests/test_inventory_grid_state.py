@@ -315,6 +315,43 @@ def test_forced_reduce_fill_matches_planner_cost_for_adverse_price() -> None:
     assert runtime["position_lots"] == []
 
 
+def test_forced_reduce_fill_matches_planner_cost_for_adverse_short_price() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "short_active"
+    runtime["pair_credit_steps"] = 5
+    runtime["position_lots"] = [
+        {
+            "lot_id": "s1",
+            "side": "short",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    lot_plan = build_forced_reduce_lot_plan(
+        runtime=runtime,
+        reduce_price=0.1299,
+        reduce_qty=100.0,
+        step_price=0.01,
+    )
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="forced_reduce",
+        side="BUY",
+        price=0.1299,
+        qty=100.0,
+        fill_time_ms=2,
+        step_price=0.01,
+    )
+
+    assert runtime["pair_credit_steps"] == 5 - lot_plan["forced_reduce_cost_steps"]
+    assert lot_plan["forced_reduce_cost_steps"] == 2
+    assert runtime["position_lots"] == []
+
+
 def test_forced_reduce_fill_consumes_same_most_adverse_lots_as_plan() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "long_active"
