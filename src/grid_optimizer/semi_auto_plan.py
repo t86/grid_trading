@@ -756,34 +756,52 @@ def build_hedge_micro_grid_plan(
     effective_long_qty = 0.0 if long_inventory_dust else current_long_qty
     effective_short_qty = 0.0 if short_inventory_dust else current_short_qty
     flat_inventory = effective_long_qty <= 1e-12 and effective_short_qty <= 1e-12
+    effective_long_notional = effective_long_qty * mid_price
+    effective_short_notional = effective_short_qty * mid_price
+    dominant_long_with_tiny_short_residual = (
+        effective_long_qty > 0
+        and effective_short_qty > 0
+        and effective_long_notional > effective_short_notional
+        and effective_short_notional <= per_order_notional
+    )
+    dominant_short_with_tiny_long_residual = (
+        effective_short_qty > 0
+        and effective_long_qty > 0
+        and effective_short_notional > effective_long_notional
+        and effective_long_notional <= per_order_notional
+    )
     long_entry_cost_guard_active = (
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
         and effective_long_qty > 0
-        and effective_short_qty <= 0
+        and (effective_short_qty <= 0 or dominant_long_with_tiny_short_residual)
         and effective_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
     )
     short_entry_cost_guard_active = (
         max(float(entry_short_cost_guard_release_notional), 0.0) > 0
         and effective_short_qty > 0
-        and effective_long_qty <= 0
+        and (effective_long_qty <= 0 or dominant_short_with_tiny_long_residual)
         and effective_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
     long_exit_profit_guard_active = (
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
         and effective_long_qty > 0
-        and effective_short_qty <= 0
+        and (effective_short_qty <= 0 or dominant_long_with_tiny_short_residual)
         and effective_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
     )
     short_exit_profit_guard_active = (
         max(float(entry_short_cost_guard_release_notional), 0.0) > 0
         and effective_short_qty > 0
-        and effective_long_qty <= 0
+        and (effective_long_qty <= 0 or dominant_short_with_tiny_long_residual)
         and effective_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
     latest_long_lot_price = current_long_lots[-1]["price"] if current_long_lots else None
     latest_short_lot_price = current_short_lots[-1]["price"] if current_short_lots else None
-    held_long_same_side_entry = effective_long_qty > 0 and effective_short_qty <= 0
-    held_short_same_side_entry = effective_short_qty > 0 and effective_long_qty <= 0
+    held_long_same_side_entry = effective_long_qty > 0 and (
+        effective_short_qty <= 0 or dominant_long_with_tiny_short_residual
+    )
+    held_short_same_side_entry = effective_short_qty > 0 and (
+        effective_long_qty <= 0 or dominant_short_with_tiny_long_residual
+    )
     light_long_entry_max_price = (
         _round_order_price(max(float(bid_price) - float(step_price), 0.0), tick_size, "BUY")
         if long_entry_cost_guard_active and bid_price is not None and bid_price > 0
@@ -903,7 +921,7 @@ def build_hedge_micro_grid_plan(
     take_profit_short_price_keys = {
         f"{order.side}:{order.price:.10f}" for order in buy_orders if order.role == "take_profit_short"
     }
-    if not bool(entry_long_paused) and effective_short_qty <= 0:
+    if not bool(entry_long_paused) and (effective_short_qty <= 0 or dominant_long_with_tiny_short_residual):
         entry_buy_max_level = buy_levels + (1 if effective_short_qty > 0 else 0)
         for level in range(1, entry_buy_max_level + 1):
             price = _entry_buy_price(level)
@@ -985,7 +1003,9 @@ def build_hedge_micro_grid_plan(
         f"{order.side}:{order.price:.10f}" for order in sell_orders if order.role == "take_profit_long"
     }
     allow_paused_short_probe = bool(entry_short_paused and paused_entry_short_scale > 0)
-    if (not bool(entry_short_paused) or allow_paused_short_probe) and effective_long_qty <= 0:
+    if (not bool(entry_short_paused) or allow_paused_short_probe) and (
+        effective_long_qty <= 0 or dominant_short_with_tiny_long_residual
+    ):
         entry_sell_max_level = sell_levels + (1 if effective_long_qty > 0 else 0)
         if allow_paused_short_probe and effective_long_qty <= 0:
             entry_sell_max_level = 1
