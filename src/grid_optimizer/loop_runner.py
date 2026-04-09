@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import bisect
+import copy
 import json
 import math
 import os
@@ -83,6 +84,7 @@ from .submit_plan import (
 from .dry_run import _round_order_price, _round_order_qty
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
+from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
 AUTO_REGIME_DEFENSIVE_PROFILE = "volatility_defensive_v1"
@@ -152,6 +154,8 @@ AUTO_REGIME_PROFILE_STEP_HINTS: dict[str, tuple[float, int]] = {
     AUTO_REGIME_DEFENSIVE_PROFILE: (0.0008, 4),
 }
 BEST_QUOTE_SHORT_PROFILE = "robo_best_quote_short_v1"
+COMPETITION_RUNTIME_CACHE_KEY = "competition_inventory_grid_runtime_cache"
+COMPETITION_POSITION_QTY_EPSILON = 1e-9
 XAUT_ADAPTIVE_TRANSITION_CONFIRMATIONS = {
     (XAUT_ADAPTIVE_STATE_NORMAL, XAUT_ADAPTIVE_STATE_DEFENSIVE): 2,
     (XAUT_ADAPTIVE_STATE_DEFENSIVE, XAUT_ADAPTIVE_STATE_NORMAL): 2,
@@ -1672,15 +1676,177 @@ def _update_inventory_grid_order_refs(
             "updated_at": _isoformat(_utc_now()),
         }
 
-    if len(refs) > 5000:
-        recent_items = list(refs.items())[-5000:]
-        refs = {key: value for key, value in recent_items}
-
     state["inventory_grid_order_refs"] = refs
     try:
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
         return
+
+
+def _competition_runtime_position_qty(runtime: dict[str, Any]) -> float:
+    lots = runtime.get("position_lots")
+    if not isinstance(lots, list):
+        return 0.0
+    return sum(max(_safe_float((lot or {}).get("qty")), 0.0) for lot in lots if isinstance(lot, dict))
+
+
+def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
+    return ":".join(
+        (
+            str(int(trade.get("time", 0) or 0)),
+            str(int(trade.get("id", 0) or 0)),
+            str(int(trade.get("orderId", 0) or 0)),
+        )
+    )
+
+
+def _load_cached_competition_runtime(state: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+    payload = state.get(COMPETITION_RUNTIME_CACHE_KEY)
+    if not isinstance(payload, dict):
+        return None, []
+    if str(payload.get("strategy_mode", "")).strip() != "competition_inventory_grid":
+        state.pop(COMPETITION_RUNTIME_CACHE_KEY, None)
+        return None, []
+    if str(payload.get("market_type", "")).strip().lower() != "futures":
+        state.pop(COMPETITION_RUNTIME_CACHE_KEY, None)
+        return None, []
+
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict) or str(runtime.get("market_type", "")).strip().lower() != "futures":
+        state.pop(COMPETITION_RUNTIME_CACHE_KEY, None)
+        return None, []
+
+    applied_trade_keys = [str(item).strip() for item in list(payload.get("applied_trade_keys") or []) if str(item).strip()]
+    return copy.deepcopy(runtime), applied_trade_keys
+
+
+def _store_cached_competition_runtime(
+    *,
+    state: dict[str, Any],
+    runtime: dict[str, Any],
+    applied_trade_keys: list[str],
+) -> None:
+    cached_runtime = copy.deepcopy(runtime)
+    cached_runtime["pair_credit_steps"] = 0
+    cached_runtime["recovery_mode"] = "live"
+    cached_runtime["recovery_errors"] = []
+    state[COMPETITION_RUNTIME_CACHE_KEY] = {
+        "strategy_mode": "competition_inventory_grid",
+        "market_type": "futures",
+        "runtime": cached_runtime,
+        "applied_trade_keys": list(applied_trade_keys),
+    }
+
+
+def _apply_competition_runtime_trade_delta(
+    *,
+    runtime: dict[str, Any],
+    trade: dict[str, Any],
+    order_refs: dict[str, dict[str, Any]],
+    step_price: float,
+) -> bool:
+    order_id = str(int(trade.get("orderId", 0) or 0))
+    order_ref = order_refs.get(order_id)
+    if not isinstance(order_ref, dict):
+        return False
+
+    role = str(order_ref.get("role", "") or "").strip()
+    side = str(order_ref.get("side", "") or "").upper().strip()
+    if not role or not side:
+        return False
+
+    current_state = str(runtime.get("direction_state", "flat")).strip().lower()
+    if role == "bootstrap_entry" and current_state in {"long_active", "short_active"}:
+        if (current_state == "long_active" and side == "SELL") or (current_state == "short_active" and side == "BUY"):
+            return False
+
+    try:
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role=role,
+            side=side,
+            price=_safe_float(trade.get("price")),
+            qty=abs(_safe_float(trade.get("qty"))),
+            fill_time_ms=int(trade.get("time", 0) or 0),
+            step_price=step_price,
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_competition_inventory_grid_runtime(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    order_refs: dict[str, dict[str, Any]],
+    step_price: float,
+    current_position_qty: float,
+) -> dict[str, Any]:
+    expected_position_qty = max(float(current_position_qty), 0.0)
+    strategy_trades = sorted(
+        [
+            trade
+            for trade in list(trades or [])
+            if isinstance(trade, dict) and str(int(trade.get("orderId", 0) or 0)) in order_refs
+        ],
+        key=lambda row: (
+            int(row.get("time", 0) or 0),
+            int(row.get("id", 0) or 0),
+        ),
+    )
+
+    cached_runtime, applied_trade_keys = _load_cached_competition_runtime(state)
+    if cached_runtime is not None:
+        applied_trade_key_set = set(applied_trade_keys)
+        cache_valid = True
+        for trade in strategy_trades:
+            trade_key = _competition_runtime_trade_key(trade)
+            if trade_key in applied_trade_key_set:
+                continue
+            if not _apply_competition_runtime_trade_delta(
+                runtime=cached_runtime,
+                trade=trade,
+                order_refs=order_refs,
+                step_price=step_price,
+            ):
+                cache_valid = False
+                break
+            applied_trade_keys.append(trade_key)
+            applied_trade_key_set.add(trade_key)
+
+        cached_runtime["pair_credit_steps"] = 0
+        cached_runtime["recovery_mode"] = "live"
+        cached_runtime["recovery_errors"] = []
+        if cache_valid and abs(_competition_runtime_position_qty(cached_runtime) - expected_position_qty) <= COMPETITION_POSITION_QTY_EPSILON:
+            _store_cached_competition_runtime(
+                state=state,
+                runtime=cached_runtime,
+                applied_trade_keys=applied_trade_keys,
+            )
+            return cached_runtime
+
+    runtime = rebuild_inventory_grid_runtime(
+        market_type="futures",
+        trades=strategy_trades,
+        order_refs=order_refs,
+        step_price=step_price,
+        current_position_qty=expected_position_qty,
+    )
+    if str(runtime.get("recovery_mode", "live") or "live") == "live":
+        _store_cached_competition_runtime(
+            state=state,
+            runtime=runtime,
+            applied_trade_keys=[_competition_runtime_trade_key(trade) for trade in strategy_trades],
+        )
+    elif expected_position_qty <= COMPETITION_POSITION_QTY_EPSILON:
+        flat_runtime = new_inventory_grid_runtime(market_type="futures")
+        _store_cached_competition_runtime(
+            state=state,
+            runtime=flat_runtime,
+            applied_trade_keys=[],
+        )
+    return runtime
 
 
 def _generate_competition_inventory_grid_plan(
@@ -1702,8 +1868,8 @@ def _generate_competition_inventory_grid_plan(
     min_notional: float | None,
 ) -> dict[str, Any]:
     order_refs = state.get("inventory_grid_order_refs")
-    runtime = rebuild_inventory_grid_runtime(
-        market_type="futures",
+    runtime = _resolve_competition_inventory_grid_runtime(
+        state=state,
         trades=trades,
         order_refs=order_refs if isinstance(order_refs, dict) else {},
         step_price=step_price,

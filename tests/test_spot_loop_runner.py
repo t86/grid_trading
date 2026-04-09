@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from grid_optimizer.inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from grid_optimizer.spot_loop_runner import (
     _build_parser,
     _build_spot_competition_inventory_grid_orders,
@@ -157,6 +158,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
                         ],
                         "seen_trade_ids": [1],
                         "last_trade_time_ms": 1234567890,
+                        "spot_competition_inventory_grid_runtime_cache": {
+                            "strategy_mode": "spot_competition_inventory_grid",
+                            "market_type": "spot",
+                            "runtime": {"direction_state": "long_active"},
+                            "applied_trade_keys": ["old-trade"],
+                        },
                     }
                 ),
                 encoding="utf-8",
@@ -169,6 +176,7 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 cell_count=0,
             )
 
+        self.assertNotIn("spot_competition_inventory_grid_runtime_cache", state)
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state=state,
             trades=[],
@@ -189,6 +197,72 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual([order["side"] for order in desired_orders], ["BUY"])
         self.assertEqual(desired_orders[0]["role"], "bootstrap_entry")
         self.assertEqual(controls["direction_state"], "flat")
+
+    def test_build_spot_competition_inventory_grid_orders_uses_cached_runtime_for_older_inventory(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="spot")
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role="bootstrap_entry",
+            side="BUY",
+            price=100.0,
+            qty=2.0,
+            fill_time_ms=1000,
+            step_price=5.0,
+        )
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "strategy_mode": "spot_competition_inventory_grid",
+                "known_orders": {
+                    "200": {
+                        "side": "BUY",
+                        "role": "grid_entry",
+                        "created_at_ms": 2000,
+                    }
+                },
+                "inventory_lots": [
+                    {
+                        "qty": 2.5,
+                        "cost_quote": 250.0,
+                        "buy_time_ms": 1000,
+                        "tag": "older",
+                    }
+                ],
+                "spot_competition_inventory_grid_runtime_cache": {
+                    "strategy_mode": "spot_competition_inventory_grid",
+                    "market_type": "spot",
+                    "runtime": runtime,
+                    "applied_trade_keys": [],
+                },
+            },
+            trades=[
+                {
+                    "id": 1,
+                    "orderId": 200,
+                    "price": "100.0",
+                    "qty": "0.5",
+                    "time": 2000,
+                }
+            ],
+            bid_price=109.0,
+            ask_price=111.0,
+            step_price=5.0,
+            first_order_multiplier=1.0,
+            per_order_notional=110.0,
+            threshold_position_notional=500.0,
+            max_order_position_notional=700.0,
+            max_position_notional=900.0,
+            tick_size=0.1,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        sell_orders = [order for order in desired_orders if str(order.get("side", "")).upper() == "SELL"]
+        self.assertEqual(controls["direction_state"], "long_active")
+        self.assertEqual(controls["risk_state"], "normal")
+        self.assertEqual(len(sell_orders), 1)
+        self.assertAlmostEqual(sell_orders[0]["qty"], 1.0, places=8)
 
     def test_normalize_commission_quote_handles_quote_asset(self) -> None:
         fee = _normalize_commission_quote(

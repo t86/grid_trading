@@ -9,6 +9,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from grid_optimizer.audit import build_audit_paths
+from grid_optimizer.inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from grid_optimizer.loop_runner import (
     AUTO_REGIME_PROFILE_LABELS,
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
@@ -1446,6 +1447,48 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["recovery_mode"], "live")
         self.assertGreater(plan["grid_anchor_price"], 0.0)
 
+    def test_generate_competition_inventory_grid_plan_uses_cached_runtime_beyond_trade_horizon(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role="bootstrap_entry",
+            side="BUY",
+            price=100.0,
+            qty=2.0,
+            fill_time_ms=1000,
+            step_price=5.0,
+        )
+
+        plan = _generate_competition_inventory_grid_plan(
+            state={
+                "competition_inventory_grid_runtime_cache": {
+                    "strategy_mode": "competition_inventory_grid",
+                    "market_type": "futures",
+                    "runtime": runtime,
+                    "applied_trade_keys": [],
+                }
+            },
+            trades=[],
+            current_position_qty=2.0,
+            bid_price=109.0,
+            ask_price=111.0,
+            step_price=5.0,
+            first_order_multiplier=1.0,
+            per_order_notional=110.0,
+            threshold_position_notional=500.0,
+            max_order_position_notional=700.0,
+            max_position_notional=900.0,
+            tick_size=0.1,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(plan["recovery_mode"], "live")
+        self.assertEqual(plan["direction_state"], "long_active")
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertAlmostEqual(plan["sell_orders"][0]["qty"], 1.0, places=8)
+
     def test_update_inventory_grid_order_refs_records_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
@@ -1473,6 +1516,46 @@ class LoopRunnerTests(unittest.TestCase):
             payload = state_path.read_text(encoding="utf-8")
             self.assertIn("inventory_grid_order_refs", payload)
             self.assertIn("67890", payload)
+
+    def test_update_inventory_grid_order_refs_keeps_refs_beyond_trim_boundary_for_competition_mode(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            refs = {
+                str(idx): {
+                    "role": "grid_entry",
+                    "side": "BUY",
+                    "updated_at": "2026-04-01T00:00:00+00:00",
+                }
+                for idx in range(1, 5001)
+            }
+            state_path.write_text(
+                json.dumps({"inventory_grid_order_refs": refs}, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+
+            _update_inventory_grid_order_refs(
+                state_path=state_path,
+                strategy_mode="competition_inventory_grid",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "grid_exit",
+                                "side": "SELL",
+                            },
+                            "response": {
+                                "orderId": 5001,
+                                "clientOrderId": "grid-boundary",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            payload = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(len(payload["inventory_grid_order_refs"]), 5001)
+            self.assertIn("1", payload["inventory_grid_order_refs"])
+            self.assertIn("5001", payload["inventory_grid_order_refs"])
 
     def test_apply_hedge_position_controls_can_pause_long_or_short_side_independently(self) -> None:
         plan = {

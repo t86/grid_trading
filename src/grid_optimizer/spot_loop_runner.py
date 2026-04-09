@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import math
 import os
@@ -29,6 +30,7 @@ from .dry_run import _round_order_price, _round_order_qty
 from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
+from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from .semi_auto_plan import diff_open_orders
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
 
@@ -36,6 +38,7 @@ STATE_VERSION = 2
 EPSILON = 1e-12
 PRICE_CACHE_TTL_SECONDS = 30.0
 _LATEST_PRICE_CACHE: dict[str, tuple[float, float]] = {}
+SPOT_COMPETITION_RUNTIME_CACHE_KEY = "spot_competition_inventory_grid_runtime_cache"
 
 
 def _utc_now() -> datetime:
@@ -106,9 +109,12 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
         state["seen_trade_ids"] = []
         state["last_trade_time_ms"] = 0
         state["metrics"] = _new_metrics()
-    state.setdefault("version", STATE_VERSION)
-    state.setdefault("symbol", symbol)
-    state.setdefault("strategy_mode", strategy_mode)
+        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    elif strategy_mode != "spot_competition_inventory_grid":
+        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    state["version"] = STATE_VERSION
+    state["symbol"] = symbol
+    state["strategy_mode"] = strategy_mode
     state.setdefault("last_trade_time_ms", 0)
     state.setdefault("seen_trade_ids", [])
     state.setdefault("known_orders", {})
@@ -203,6 +209,167 @@ def _sum_inventory_qty(lots: list[dict[str, Any]]) -> float:
 
 def _sum_inventory_cost(lots: list[dict[str, Any]]) -> float:
     return sum(max(_safe_float(item.get("cost_quote")), 0.0) for item in lots if isinstance(item, dict))
+
+
+def _competition_runtime_position_qty(runtime: dict[str, Any]) -> float:
+    lots = runtime.get("position_lots")
+    if not isinstance(lots, list):
+        return 0.0
+    return sum(max(_safe_float((lot or {}).get("qty")), 0.0) for lot in lots if isinstance(lot, dict))
+
+
+def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
+    return ":".join(
+        (
+            str(int(trade.get("time", 0) or 0)),
+            str(int(trade.get("id", 0) or 0)),
+            str(int(trade.get("orderId", 0) or 0)),
+        )
+    )
+
+
+def _load_cached_spot_competition_runtime(state: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+    payload = state.get(SPOT_COMPETITION_RUNTIME_CACHE_KEY)
+    if not isinstance(payload, dict):
+        return None, []
+    if str(payload.get("strategy_mode", "")).strip() != "spot_competition_inventory_grid":
+        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+        return None, []
+    if str(payload.get("market_type", "")).strip().lower() != "spot":
+        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+        return None, []
+
+    runtime = payload.get("runtime")
+    if not isinstance(runtime, dict) or str(runtime.get("market_type", "")).strip().lower() != "spot":
+        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+        return None, []
+
+    applied_trade_keys = [str(item).strip() for item in list(payload.get("applied_trade_keys") or []) if str(item).strip()]
+    return copy.deepcopy(runtime), applied_trade_keys
+
+
+def _store_cached_spot_competition_runtime(
+    *,
+    state: dict[str, Any],
+    runtime: dict[str, Any],
+    applied_trade_keys: list[str],
+) -> None:
+    cached_runtime = copy.deepcopy(runtime)
+    cached_runtime["pair_credit_steps"] = 0
+    cached_runtime["recovery_mode"] = "live"
+    cached_runtime["recovery_errors"] = []
+    state[SPOT_COMPETITION_RUNTIME_CACHE_KEY] = {
+        "strategy_mode": "spot_competition_inventory_grid",
+        "market_type": "spot",
+        "runtime": cached_runtime,
+        "applied_trade_keys": list(applied_trade_keys),
+    }
+
+
+def _apply_spot_competition_runtime_trade_delta(
+    *,
+    runtime: dict[str, Any],
+    trade: dict[str, Any],
+    order_refs: dict[str, dict[str, Any]],
+    step_price: float,
+) -> bool:
+    order_id = str(int(trade.get("orderId", 0) or 0))
+    order_ref = order_refs.get(order_id)
+    if not isinstance(order_ref, dict):
+        return False
+
+    role = str(order_ref.get("role", "") or "").strip()
+    side = str(order_ref.get("side", "") or "").upper().strip()
+    if not role or not side:
+        return False
+
+    try:
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role=role,
+            side=side,
+            price=_safe_float(trade.get("price")),
+            qty=abs(_safe_float(trade.get("qty"))),
+            fill_time_ms=int(trade.get("time", 0) or 0),
+            step_price=step_price,
+        )
+    except ValueError:
+        return False
+    return True
+
+
+def _resolve_spot_competition_runtime(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    order_refs: dict[str, dict[str, Any]],
+    step_price: float,
+    current_position_qty: float,
+) -> dict[str, Any]:
+    expected_position_qty = max(float(current_position_qty), 0.0)
+    strategy_trades = sorted(
+        [
+            trade
+            for trade in list(trades or [])
+            if isinstance(trade, dict) and str(int(trade.get("orderId", 0) or 0)) in order_refs
+        ],
+        key=lambda row: (
+            int(row.get("time", 0) or 0),
+            int(row.get("id", 0) or 0),
+        ),
+    )
+
+    cached_runtime, applied_trade_keys = _load_cached_spot_competition_runtime(state)
+    if cached_runtime is not None:
+        applied_trade_key_set = set(applied_trade_keys)
+        cache_valid = True
+        for trade in strategy_trades:
+            trade_key = _competition_runtime_trade_key(trade)
+            if trade_key in applied_trade_key_set:
+                continue
+            if not _apply_spot_competition_runtime_trade_delta(
+                runtime=cached_runtime,
+                trade=trade,
+                order_refs=order_refs,
+                step_price=step_price,
+            ):
+                cache_valid = False
+                break
+            applied_trade_keys.append(trade_key)
+            applied_trade_key_set.add(trade_key)
+
+        cached_runtime["pair_credit_steps"] = 0
+        cached_runtime["recovery_mode"] = "live"
+        cached_runtime["recovery_errors"] = []
+        if cache_valid and abs(_competition_runtime_position_qty(cached_runtime) - expected_position_qty) <= EPSILON:
+            _store_cached_spot_competition_runtime(
+                state=state,
+                runtime=cached_runtime,
+                applied_trade_keys=applied_trade_keys,
+            )
+            return cached_runtime
+
+    runtime = rebuild_inventory_grid_runtime(
+        market_type="spot",
+        trades=strategy_trades,
+        order_refs=order_refs,
+        step_price=step_price,
+        current_position_qty=expected_position_qty,
+    )
+    if str(runtime.get("recovery_mode", "live") or "live") == "live":
+        _store_cached_spot_competition_runtime(
+            state=state,
+            runtime=runtime,
+            applied_trade_keys=[_competition_runtime_trade_key(trade) for trade in strategy_trades],
+        )
+    elif expected_position_qty <= EPSILON:
+        flat_runtime = new_inventory_grid_runtime(market_type="spot")
+        _store_cached_spot_competition_runtime(
+            state=state,
+            runtime=flat_runtime,
+            applied_trade_keys=[],
+        )
+    return runtime
 
 
 def _inventory_avg_cost(lots: list[dict[str, Any]]) -> float:
@@ -1126,16 +1293,11 @@ def _build_spot_competition_inventory_grid_orders(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     known_orders = state.get("known_orders")
     order_refs = known_orders if isinstance(known_orders, dict) else {}
-    strategy_trades = [
-        trade
-        for trade in list(trades or [])
-        if isinstance(trade, dict) and str(int(trade.get("orderId", 0) or 0)) in order_refs
-    ]
     inventory_lots = state.get("inventory_lots")
     current_position_qty = _sum_inventory_qty(inventory_lots if isinstance(inventory_lots, list) else [])
-    runtime = rebuild_inventory_grid_runtime(
-        market_type="spot",
-        trades=strategy_trades,
+    runtime = _resolve_spot_competition_runtime(
+        state=state,
+        trades=trades,
         order_refs=order_refs,
         step_price=step_price,
         current_position_qty=current_position_qty,
