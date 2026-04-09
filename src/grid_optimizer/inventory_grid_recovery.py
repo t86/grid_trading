@@ -15,6 +15,46 @@ def _mark_conservative(runtime: dict[str, Any], *, error: str) -> dict[str, Any]
     return runtime
 
 
+def _total_position_qty(*, runtime: dict[str, Any]) -> float:
+    return sum(max(float(lot.get("qty", 0.0) or 0.0), 0.0) for lot in list(runtime.get("position_lots") or []))
+
+
+def _apply_conflicting_bootstrap_fill(
+    *,
+    runtime: dict[str, Any],
+    side: str,
+    price: float,
+    qty: float,
+    fill_time_ms: int,
+    step_price: float,
+) -> None:
+    current_state = str(runtime.get("direction_state", "flat")).strip().lower()
+    close_side = "SELL" if current_state == "long_active" else "BUY"
+    available_qty = _total_position_qty(runtime=runtime)
+    close_qty = min(max(float(qty), 0.0), available_qty)
+    if close_qty > POSITION_QTY_EPSILON:
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role="tail_cleanup",
+            side=close_side,
+            price=price,
+            qty=close_qty,
+            fill_time_ms=fill_time_ms,
+            step_price=step_price,
+        )
+    remainder_qty = max(float(qty), 0.0) - close_qty
+    if remainder_qty > POSITION_QTY_EPSILON:
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role="bootstrap_entry",
+            side=side,
+            price=price,
+            qty=remainder_qty,
+            fill_time_ms=fill_time_ms,
+            step_price=step_price,
+        )
+
+
 def rebuild_inventory_grid_runtime(
     *,
     market_type: str,
@@ -45,14 +85,36 @@ def rebuild_inventory_grid_runtime(
         if not role or not side:
             return _mark_conservative(runtime, error="unusable_order_ref")
 
+        fill_price = float(trade.get("price", 0.0) or 0.0)
+        fill_qty = abs(float(trade.get("qty", 0.0) or 0.0))
+        fill_time_ms = int(trade.get("time", 0) or 0)
+
         try:
+            current_state = str(runtime.get("direction_state", "flat")).strip().lower()
+            if (
+                str(runtime.get("market_type", "")).strip().lower() == "futures"
+                and role == "bootstrap_entry"
+                and current_state in {"long_active", "short_active"}
+                and ((current_state == "long_active" and side.upper() == "SELL") or (current_state == "short_active" and side.upper() == "BUY"))
+            ):
+                _apply_conflicting_bootstrap_fill(
+                    runtime=runtime,
+                    side=side,
+                    price=fill_price,
+                    qty=fill_qty,
+                    fill_time_ms=fill_time_ms,
+                    step_price=step_price,
+                )
+                runtime["recovery_errors"] = ["conflicting_bootstrap_fills"]
+                continue
+
             apply_inventory_grid_fill(
                 runtime=runtime,
                 role=role,
                 side=side,
-                price=float(trade.get("price", 0.0) or 0.0),
-                qty=abs(float(trade.get("qty", 0.0) or 0.0)),
-                fill_time_ms=int(trade.get("time", 0) or 0),
+                price=fill_price,
+                qty=fill_qty,
+                fill_time_ms=fill_time_ms,
                 step_price=step_price,
             )
             replayed_any = True
@@ -62,8 +124,11 @@ def rebuild_inventory_grid_runtime(
     runtime["pair_credit_steps"] = 0
 
     position_lots = list(runtime.get("position_lots") or [])
-    recovered_position_qty = sum(max(float(lot.get("qty", 0.0) or 0.0), 0.0) for lot in position_lots)
+    recovered_position_qty = _total_position_qty(runtime=runtime)
     expected_position_qty = max(float(current_position_qty), 0.0)
+    if runtime.get("recovery_errors") == ["conflicting_bootstrap_fills"]:
+        return _mark_conservative(runtime, error="conflicting_bootstrap_fills")
+
     if expected_position_qty > 0 and not replayed_any and not position_lots:
         return _mark_conservative(runtime, error="missing_strategy_trade_history")
 

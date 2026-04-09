@@ -106,7 +106,7 @@ def test_rebuild_runtime_preserves_replayed_state_before_conflicting_bootstrap_f
         market_type="futures",
         trades=[
             {"id": 1, "time": 1000, "price": "0.1000", "qty": "100", "side": "BUY", "orderId": 11},
-            {"id": 2, "time": 2000, "price": "0.1100", "qty": "100", "side": "SELL", "orderId": 12},
+            {"id": 2, "time": 2000, "price": "0.1100", "qty": "50", "side": "SELL", "orderId": 12},
         ],
         order_refs={
             "11": {"role": "bootstrap_entry", "side": "BUY"},
@@ -117,8 +117,9 @@ def test_rebuild_runtime_preserves_replayed_state_before_conflicting_bootstrap_f
 
     assert runtime["recovery_mode"] == "conservative_reduce_only"
     assert runtime["grid_anchor_price"] == 0.1
-    assert runtime["last_strategy_trade_time_ms"] == 1000
-    assert runtime["position_lots"][0]["qty"] == 100.0
+    assert runtime["last_strategy_trade_time_ms"] == 2000
+    assert runtime["direction_state"] == "long_active"
+    assert runtime["position_lots"][0]["qty"] == 50.0
     assert "conflicting_bootstrap_fills" in runtime["recovery_errors"]
 
 
