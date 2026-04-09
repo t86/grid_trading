@@ -107,6 +107,7 @@ def build_inventory_grid_orders(
 ) -> dict[str, Any]:
     market_type = str(runtime.get("market_type", "futures")).strip().lower()
     direction_state = str(runtime.get("direction_state", "flat")).strip().lower()
+    anchor_price = max(_safe_float(runtime.get("grid_anchor_price")), 0.0)
     bootstrap_notional = max(_safe_float(per_order_notional), 0.0) * max(_safe_float(first_order_multiplier), 0.0)
     mid_price = (max(_safe_float(bid_price), 0.0) + max(_safe_float(ask_price), 0.0)) / 2.0
 
@@ -169,7 +170,7 @@ def build_inventory_grid_orders(
                 "tail_cleanup_active": True,
             }
 
-        exit_price = _round_order_price(ask_price, tick_size, "SELL")
+        exit_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
         if exit_qty > 0 and (min_qty is None or exit_qty >= min_qty) and (min_notional is None or exit_qty * exit_price >= min_notional):
             sell_orders.append(_build_order(side="SELL", price=exit_price, qty=exit_qty, role="grid_exit"))
@@ -178,7 +179,7 @@ def build_inventory_grid_orders(
             max_order_position_notional <= 0 or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= max_order_position_notional
         )
         if entry_allowed:
-            entry_price = _round_order_price(max(_safe_float(bid_price) - max(_safe_float(step_price), 0.0), 0.0), tick_size, "BUY")
+            entry_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
             entry_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(entry_price, EPSILON), step_size)
             if entry_qty > 0 and (min_qty is None or entry_qty >= min_qty) and (
                 min_notional is None or entry_qty * entry_price >= min_notional
@@ -188,16 +189,17 @@ def build_inventory_grid_orders(
         if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
             reduce_qty = _round_order_qty(max(inventory_notional - max(_safe_float(threshold_position_notional), 0.0), 0.0) / max(mid_price, EPSILON), step_size)
             if reduce_qty > 0:
+                forced_reduce_price = _round_order_price(ask_price, tick_size, "SELL")
                 lot_plan = build_forced_reduce_lot_plan(
                     runtime=runtime,
-                    reduce_price=exit_price,
+                    reduce_price=forced_reduce_price,
                     reduce_qty=reduce_qty,
                     step_price=step_price,
                 )
                 if risk_state == "hard_reduce_only" or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"]):
                     forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
                     if forced_qty > 0:
-                        order = _build_order(side="SELL", price=exit_price, qty=forced_qty, role="forced_reduce")
+                        order = _build_order(side="SELL", price=forced_reduce_price, qty=forced_qty, role="forced_reduce")
                         sell_orders.append(order)
                         forced_reduce_orders.append(order)
 
@@ -223,7 +225,7 @@ def build_inventory_grid_orders(
                 "tail_cleanup_active": True,
             }
 
-        exit_price = _round_order_price(bid_price, tick_size, "BUY")
+        exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
         if exit_qty > 0 and (min_qty is None or exit_qty >= min_qty) and (min_notional is None or exit_qty * exit_price >= min_notional):
             buy_orders.append(_build_order(side="BUY", price=exit_price, qty=exit_qty, role="grid_exit"))
@@ -232,7 +234,7 @@ def build_inventory_grid_orders(
             max_order_position_notional <= 0 or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= max_order_position_notional
         )
         if entry_allowed:
-            entry_price = _round_order_price(max(_safe_float(ask_price) + max(_safe_float(step_price), 0.0), 0.0), tick_size, "SELL")
+            entry_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
             entry_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(entry_price, EPSILON), step_size)
             if entry_qty > 0 and (min_qty is None or entry_qty >= min_qty) and (
                 min_notional is None or entry_qty * entry_price >= min_notional
@@ -242,16 +244,17 @@ def build_inventory_grid_orders(
         if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
             reduce_qty = _round_order_qty(max(inventory_notional - max(_safe_float(threshold_position_notional), 0.0), 0.0) / max(mid_price, EPSILON), step_size)
             if reduce_qty > 0:
+                forced_reduce_price = _round_order_price(bid_price, tick_size, "BUY")
                 lot_plan = build_forced_reduce_lot_plan(
                     runtime=runtime,
-                    reduce_price=exit_price,
+                    reduce_price=forced_reduce_price,
                     reduce_qty=reduce_qty,
                     step_price=step_price,
                 )
                 if risk_state == "hard_reduce_only" or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"]):
                     forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
                     if forced_qty > 0:
-                        order = _build_order(side="BUY", price=exit_price, qty=forced_qty, role="forced_reduce")
+                        order = _build_order(side="BUY", price=forced_reduce_price, qty=forced_qty, role="forced_reduce")
                         buy_orders.append(order)
                         forced_reduce_orders.append(order)
 

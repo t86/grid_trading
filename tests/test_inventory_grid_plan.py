@@ -203,3 +203,73 @@ def test_max_order_position_notional_blocks_new_same_side_entries() -> None:
     assert plan["risk_state"] == "normal"
     assert plan["buy_orders"] == []
     assert plan["forced_reduce_orders"] == []
+
+
+def test_long_active_grid_orders_are_anchored_to_grid_price() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.1010,
+        ask_price=0.1020,
+        step_price=0.01,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=50.0,
+        max_order_position_notional=80.0,
+        max_position_notional=120.0,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    assert [item["price"] for item in plan["buy_orders"]] == [0.09]
+    assert [item["price"] for item in plan["sell_orders"]] == [0.11]
+
+
+def test_short_active_grid_orders_are_anchored_to_grid_price() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "short_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["position_lots"] = [
+        {
+            "lot_id": "s1",
+            "side": "short",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0990,
+        ask_price=0.1000,
+        step_price=0.01,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=50.0,
+        max_order_position_notional=80.0,
+        max_position_notional=120.0,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    assert [item["price"] for item in plan["buy_orders"]] == [0.09]
+    assert [item["price"] for item in plan["sell_orders"]] == [0.11]
