@@ -27,6 +27,8 @@ from .data import (
 )
 from .dry_run import _round_order_price, _round_order_qty
 from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config
+from .inventory_grid_plan import build_inventory_grid_orders
+from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 from .semi_auto_plan import diff_open_orders
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
 
@@ -1095,6 +1097,75 @@ def _build_volume_shift_desired_orders(
     return desired, controls
 
 
+def _build_spot_competition_inventory_grid_orders(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    bid_price: float,
+    ask_price: float,
+    step_price: float,
+    first_order_multiplier: float,
+    per_order_notional: float,
+    threshold_position_notional: float,
+    max_order_position_notional: float,
+    max_position_notional: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    known_orders = state.get("known_orders")
+    order_refs = known_orders if isinstance(known_orders, dict) else {}
+    inventory_lots = state.get("inventory_lots")
+    current_position_qty = _sum_inventory_qty(inventory_lots if isinstance(inventory_lots, list) else [])
+    runtime = rebuild_inventory_grid_runtime(
+        market_type="spot",
+        trades=trades,
+        order_refs=order_refs,
+        step_price=step_price,
+        current_position_qty=current_position_qty,
+    )
+    if _safe_float(runtime.get("grid_anchor_price")) <= 0:
+        runtime["grid_anchor_price"] = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        step_price=step_price,
+        per_order_notional=per_order_notional,
+        first_order_multiplier=first_order_multiplier,
+        threshold_position_notional=threshold_position_notional,
+        max_order_position_notional=max_order_position_notional,
+        max_position_notional=max_position_notional,
+        tick_size=tick_size,
+        step_size=step_size,
+        min_qty=min_qty,
+        min_notional=min_notional,
+    )
+    desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
+    controls = {
+        "mode": "competition_inventory_grid",
+        "buy_paused": False,
+        "pause_reasons": [],
+        "shift_frozen": False,
+        "market_guard_return_ratio": 0.0,
+        "market_guard_amplitude_ratio": 0.0,
+        "center_price": _safe_float(runtime.get("grid_anchor_price")),
+        "center_shift_count": 0,
+        "inventory_soft_limit_notional": _safe_float(threshold_position_notional),
+        "inventory_hard_limit_notional": _safe_float(max_position_notional),
+        "effective_buy_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "BUY"),
+        "effective_sell_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "SELL"),
+        "effective_per_order_notional": _safe_float(per_order_notional),
+        "direction_state": str(runtime.get("direction_state", "flat") or "flat"),
+        "risk_state": str(plan.get("risk_state", "normal") or "normal"),
+        "grid_anchor_price": _safe_float(runtime.get("grid_anchor_price")),
+        "pair_credit_steps": _safe_int(runtime.get("pair_credit_steps")),
+    }
+    return desired_orders, controls
+
+
 def _strategy_open_orders(open_orders: list[dict[str, Any]], prefix: str) -> list[dict[str, Any]]:
     return [order for order in open_orders if isinstance(order, dict) and _is_strategy_order(order, prefix)]
 
@@ -1292,7 +1363,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             "effective_sell_levels": len(cells),
             "effective_per_order_notional": max(float(args.total_quote_budget), 0.0) / max(int(args.n), 1),
         }
-    else:
+    elif strategy_mode == "spot_volume_shift_long":
         applied_trades = _sync_volume_shift_trades(
             state=state,
             trades=trades,
@@ -1304,6 +1375,14 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             buy_pause_amp_trigger_ratio=args.buy_pause_amp_trigger_ratio,
             buy_pause_down_return_trigger_ratio=args.buy_pause_down_return_trigger_ratio,
             freeze_shift_abs_return_trigger_ratio=args.freeze_shift_abs_return_trigger_ratio,
+        )
+        controls = {}
+    else:
+        applied_trades = _sync_volume_shift_trades(
+            state=state,
+            trades=trades,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
         )
         controls = {}
 
@@ -1361,7 +1440,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             bid_price=bid_price,
             ask_price=ask_price,
         )
-    else:
+    elif strategy_mode == "spot_volume_shift_long":
         desired_orders, controls = _build_volume_shift_desired_orders(
             state=state,
             config=vars(args),
@@ -1370,6 +1449,23 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             ask_price=ask_price,
             mid_price=mid_price,
             market_guard=market_guard,
+        )
+    else:
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=trades,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            step_price=float(args.step_price),
+            first_order_multiplier=float(args.first_order_multiplier),
+            per_order_notional=float(args.per_order_notional),
+            threshold_position_notional=float(args.threshold_position_notional),
+            max_order_position_notional=float(args.max_order_position_notional),
+            max_position_notional=float(args.max_position_notional),
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
         )
     diff = diff_open_orders(existing_orders=strategy_open_orders, desired_orders=desired_orders)
 
@@ -1500,6 +1596,10 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "effective_buy_levels": _safe_int(controls.get("effective_buy_levels")),
         "effective_sell_levels": _safe_int(controls.get("effective_sell_levels")),
         "effective_per_order_notional": _safe_float(controls.get("effective_per_order_notional")),
+        "direction_state": str(controls.get("direction_state", "") or ""),
+        "risk_state": str(controls.get("risk_state", "") or ""),
+        "grid_anchor_price": _safe_float(controls.get("grid_anchor_price")),
+        "pair_credit_steps": _safe_int(controls.get("pair_credit_steps")),
         "shift_moves": controls.get("shift_moves", []),
         "runtime_status": runtime_guard_result.runtime_status,
         "stop_triggered": runtime_guard_result.stop_triggered,
@@ -1522,29 +1622,44 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
     creds = load_binance_api_credentials()
     if not creds:
         raise RuntimeError("Binance API credentials are required for spot runner")
-    if str(args.strategy_mode or "spot_one_way_long").strip() == "spot_one_way_long":
+    strategy_mode = str(args.strategy_mode or "spot_one_way_long").strip()
+    if strategy_mode == "spot_one_way_long":
         if args.min_price <= 0 or args.max_price <= 0 or args.min_price >= args.max_price:
             raise RuntimeError("static spot grid requires valid min/max price")
         if args.n <= 0 or args.total_quote_budget <= 0:
             raise RuntimeError("static spot grid requires n > 0 and total_quote_budget > 0")
-    else:
+    elif strategy_mode == "spot_volume_shift_long":
         if args.total_quote_budget <= 0:
             raise RuntimeError("spot volume-shift runner requires total_quote_budget > 0")
         if args.inventory_hard_limit_notional <= 0:
             raise RuntimeError("inventory_hard_limit_notional must be > 0")
+    else:
+        if args.step_price <= 0:
+            raise RuntimeError("spot competition inventory grid requires step_price > 0")
+        if args.per_order_notional <= 0:
+            raise RuntimeError("spot competition inventory grid requires per_order_notional > 0")
+        if args.max_position_notional <= 0:
+            raise RuntimeError("max_position_notional must be > 0")
     api_key, api_secret = creds
     symbol_info = fetch_spot_symbol_config(args.symbol)
     return _run_cycle(args, symbol_info, api_key, api_secret)
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Spot runner with static and volume-shift long-only modes.")
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Spot runner with static, volume-shift, and competition inventory-grid long-only modes.")
     parser.add_argument("--symbol", type=str, required=True)
-    parser.add_argument("--strategy-mode", type=str, default="spot_one_way_long", choices=("spot_one_way_long", "spot_volume_shift_long"))
+    parser.add_argument(
+        "--strategy-mode",
+        type=str,
+        default="spot_one_way_long",
+        choices=("spot_one_way_long", "spot_volume_shift_long", "spot_competition_inventory_grid"),
+    )
     parser.add_argument("--min-price", type=float, default=0.0)
     parser.add_argument("--max-price", type=float, default=0.0)
     parser.add_argument("--n", type=int, default=0)
     parser.add_argument("--total-quote-budget", type=float, required=True)
+    parser.add_argument("--step-price", type=float, default=0.0)
+    parser.add_argument("--per-order-notional", type=float, default=0.0)
     parser.add_argument("--grid-level-mode", type=str, default="arithmetic", choices=("arithmetic", "geometric"))
     parser.add_argument("--sleep-seconds", type=float, default=10.0)
     parser.add_argument("--client-order-prefix", type=str, required=True)
@@ -1575,11 +1690,20 @@ def main() -> None:
     parser.add_argument("--inventory-recycle-age-minutes", type=float, default=40.0)
     parser.add_argument("--inventory-recycle-loss-tolerance-ratio", type=float, default=0.006)
     parser.add_argument("--inventory-recycle-min-profit-ratio", type=float, default=0.001)
+    parser.add_argument("--first-order-multiplier", type=float, default=1.0)
+    parser.add_argument("--threshold-position-notional", type=float, default=0.0)
+    parser.add_argument("--max-order-position-notional", type=float, default=0.0)
+    parser.add_argument("--max-position-notional", type=float, default=0.0)
     parser.add_argument("--max-single-cycle-new-orders", type=int, default=8)
     parser.add_argument("--run-start-time", type=str, default=None)
     parser.add_argument("--run-end-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
+    return parser
+
+
+def main() -> None:
+    parser = _build_parser()
 
     args = parser.parse_args()
     normalize_runtime_guard_config(vars(args))
