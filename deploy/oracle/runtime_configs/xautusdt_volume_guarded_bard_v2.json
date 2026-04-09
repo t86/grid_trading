@@ -2,7 +2,7 @@
   "strategy_profile": "xaut_volume_guarded_bard_v2",
   "strategy_mode": "synthetic_neutral",
   "symbol": "XAUTUSDT",
-  "step_price": 0.05,
+  "step_price": 1.0,
   "buy_levels": 8,
   "sell_levels": 5,
   "per_order_notional": 45.0,
