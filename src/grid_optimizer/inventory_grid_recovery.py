@@ -4,6 +4,8 @@ from typing import Any
 
 from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 
+POSITION_QTY_EPSILON = 1e-9
+
 
 def rebuild_inventory_grid_runtime(
     *,
@@ -66,9 +68,15 @@ def rebuild_inventory_grid_runtime(
     runtime["pair_credit_steps"] = 0
 
     position_lots = list(runtime.get("position_lots") or [])
-    if max(float(current_position_qty), 0.0) > 0 and not position_lots:
+    recovered_position_qty = sum(max(float(lot.get("qty", 0.0) or 0.0), 0.0) for lot in position_lots)
+    expected_position_qty = max(float(current_position_qty), 0.0)
+    if expected_position_qty > 0 and (
+        not position_lots or abs(recovered_position_qty - expected_position_qty) > POSITION_QTY_EPSILON
+    ):
         runtime["recovery_mode"] = "conservative_reduce_only"
-        runtime["recovery_errors"] = ["missing_strategy_trade_history"]
+        runtime["recovery_errors"] = [
+            "missing_strategy_trade_history" if not position_lots else "position_qty_mismatch"
+        ]
         runtime["risk_state"] = "hard_reduce_only"
         return runtime
 

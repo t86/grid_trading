@@ -50,3 +50,20 @@ def test_rebuild_runtime_marks_conservative_mode_when_both_bootstrap_sides_fill(
 
     assert runtime["recovery_mode"] == "conservative_reduce_only"
     assert "conflicting_bootstrap_fills" in runtime["recovery_errors"]
+
+
+def test_rebuild_runtime_marks_conservative_mode_when_recovered_qty_does_not_match_position() -> None:
+    runtime = rebuild_inventory_grid_runtime(
+        market_type="futures",
+        trades=[
+            {"id": 1, "time": 1000, "price": "0.1000", "qty": "100", "side": "BUY", "orderId": 11},
+        ],
+        order_refs={
+            "11": {"role": "bootstrap_entry", "side": "BUY"},
+        },
+        step_price=0.01,
+        current_position_qty=150.0,
+    )
+
+    assert runtime["recovery_mode"] == "conservative_reduce_only"
+    assert "position_qty_mismatch" in runtime["recovery_errors"]
