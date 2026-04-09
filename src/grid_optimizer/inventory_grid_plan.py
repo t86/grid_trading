@@ -146,7 +146,7 @@ def build_inventory_grid_orders(
     else:
         risk_state = "normal"
 
-    tail_cleanup_active = risk_state == "normal" and 0.0 < held_qty < max(one_order_qty, EPSILON)
+    tail_cleanup_active = 0.0 < held_qty < max(one_order_qty, EPSILON)
 
     if direction_state == "long_active":
         if tail_cleanup_active:
