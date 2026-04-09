@@ -40,7 +40,7 @@
   "sleep_seconds": 4.0,
   "cancel_stale": true,
   "apply": true,
-  "reset_state": true,
+  "reset_state": false,
   "state_path": "output/basedusdt_loop_state.json",
   "plan_json": "output/basedusdt_loop_latest_plan.json",
   "submit_report_json": "output/basedusdt_loop_latest_submit.json",
