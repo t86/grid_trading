@@ -199,6 +199,103 @@ def test_pair_credit_unlocks_forced_reduce_order() -> None:
     assert any(item["role"] == "forced_reduce" for item in plan["forced_reduce_orders"])
 
 
+def test_grid_exit_is_capped_to_held_qty_for_long_side() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.01
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 100.0,
+            "entry_price": 0.01,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0999,
+        ask_price=0.1001,
+        step_price=0.01,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=5.0,
+        max_order_position_notional=30.0,
+        max_position_notional=40.0,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=0.1,
+    )
+
+    assert [item["role"] for item in plan["sell_orders"]] == ["grid_exit"]
+    assert [item["qty"] for item in plan["sell_orders"]] == [100.0]
+
+    replay_runtime = new_inventory_grid_runtime(market_type="futures")
+    replay_runtime["direction_state"] = "long_active"
+    replay_runtime["grid_anchor_price"] = 0.01
+    replay_runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 100.0,
+            "entry_price": 0.01,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    order = plan["sell_orders"][0]
+    apply_inventory_grid_fill(
+        runtime=replay_runtime,
+        role=order["role"],
+        side=order["side"],
+        price=order["price"],
+        qty=order["qty"],
+        fill_time_ms=1,
+    )
+
+    assert replay_runtime["direction_state"] == "flat"
+    assert replay_runtime["position_lots"] == []
+
+
+def test_grid_exit_is_capped_to_held_qty_for_short_side() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "short_active"
+    runtime["grid_anchor_price"] = 0.02
+    runtime["position_lots"] = [
+        {
+            "lot_id": "s1",
+            "side": "short",
+            "qty": 100.0,
+            "entry_price": 0.02,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0999,
+        ask_price=0.1001,
+        step_price=0.01,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=5.0,
+        max_order_position_notional=30.0,
+        max_position_notional=40.0,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=0.1,
+    )
+
+    assert [item["role"] for item in plan["buy_orders"]] == ["grid_exit"]
+    assert [item["qty"] for item in plan["buy_orders"]] == [100.0]
+
+
 def test_threshold_reduce_only_caps_forced_reduce_after_grid_exit() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "long_active"

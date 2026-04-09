@@ -198,8 +198,10 @@ def build_inventory_grid_orders(
 
         exit_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
+        closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
+        exit_qty = min(exit_qty, closeable_qty)
         planned_closing_qty = 0.0
-        if exit_qty > 0 and (min_qty is None or exit_qty >= min_qty) and (min_notional is None or exit_qty * exit_price >= min_notional):
+        if _order_meets_mins(qty=exit_qty, price=exit_price, min_qty=min_qty, min_notional=min_notional):
             sell_orders.append(_build_order(side="SELL", price=exit_price, qty=exit_qty, role="grid_exit"))
             planned_closing_qty = exit_qty
 
@@ -266,8 +268,10 @@ def build_inventory_grid_orders(
 
         exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
+        closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
+        exit_qty = min(exit_qty, closeable_qty)
         planned_closing_qty = 0.0
-        if exit_qty > 0 and (min_qty is None or exit_qty >= min_qty) and (min_notional is None or exit_qty * exit_price >= min_notional):
+        if _order_meets_mins(qty=exit_qty, price=exit_price, min_qty=min_qty, min_notional=min_notional):
             buy_orders.append(_build_order(side="BUY", price=exit_price, qty=exit_qty, role="grid_exit"))
             planned_closing_qty = exit_qty
 
