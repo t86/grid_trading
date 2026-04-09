@@ -552,6 +552,7 @@ class LoopRunnerTests(unittest.TestCase):
             args.base_position_notional = 0.0
             args.pause_buy_position_notional = 700.0
             args.pause_short_position_notional = 700.0
+            args.take_profit_min_profit_ratio = 0.0
             args.reset_state = True
             args.state_path = str(Path(tmpdir) / "testusdt_state.json")
             args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
@@ -1354,7 +1355,7 @@ class LoopRunnerTests(unittest.TestCase):
             current_short_notional=135.1785,
             pause_long_position_notional=None,
             pause_short_position_notional=320.0,
-            min_profit_ratio=0.0,
+            min_profit_ratio=0.001,
             tick_size=0.0001,
             bid_price=0.0592,
             ask_price=0.0593,
@@ -1383,7 +1384,7 @@ class LoopRunnerTests(unittest.TestCase):
             current_short_notional=357.0,
             pause_long_position_notional=None,
             pause_short_position_notional=320.0,
-            min_profit_ratio=0.0,
+            min_profit_ratio=0.001,
             tick_size=0.0001,
             bid_price=0.0592,
             ask_price=0.0593,
@@ -1392,6 +1393,34 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(result["short_active"])
         self.assertEqual(result["adjusted_buy_orders"], 0)
         self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.0596, places=8)
+
+    def test_apply_take_profit_profit_guard_disables_when_ratio_is_zero(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [{"side": "SELL", "price": 0.0597, "qty": 753, "notional": 44.9541, "role": "take_profit_long"}],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=2270.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.060803016737019634,
+            current_short_avg_price=0.0,
+            current_long_notional=135.1785,
+            current_short_notional=0.0,
+            pause_long_position_notional=1200.0,
+            pause_short_position_notional=None,
+            min_profit_ratio=0.0,
+            tick_size=0.0001,
+            bid_price=0.0592,
+            ask_price=0.0593,
+        )
+
+        self.assertFalse(result["enabled"])
+        self.assertFalse(result["long_active"])
+        self.assertEqual(result["adjusted_sell_orders"], 0)
+        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 0.0597, places=8)
 
     @patch("grid_optimizer.loop_runner.assess_auto_regime")
     def test_resolve_neutral_hourly_scale_caches_per_hour_bucket(self, mock_assess_auto_regime) -> None:

@@ -2350,8 +2350,9 @@ def apply_take_profit_profit_guard(
     bid_price: float,
     ask_price: float,
 ) -> dict[str, Any]:
+    safe_ratio = None if min_profit_ratio is None else max(float(min_profit_ratio), 0.0)
     report = {
-        "enabled": min_profit_ratio is not None,
+        "enabled": safe_ratio is not None and safe_ratio > 0,
         "min_profit_ratio": min_profit_ratio,
         "long_active": False,
         "short_active": False,
@@ -2364,10 +2365,9 @@ def apply_take_profit_profit_guard(
         "dropped_sell_orders": 0,
         "dropped_buy_orders": 0,
     }
-    if min_profit_ratio is None:
+    if safe_ratio is None or safe_ratio <= 0:
         return report
 
-    safe_ratio = max(float(min_profit_ratio), 0.0)
     long_threshold = pause_long_position_notional if pause_long_position_notional is not None and pause_long_position_notional > 0 else None
     short_threshold = pause_short_position_notional if pause_short_position_notional is not None and pause_short_position_notional > 0 else None
     long_active = (
