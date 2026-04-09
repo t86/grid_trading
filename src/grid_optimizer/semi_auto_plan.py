@@ -862,10 +862,15 @@ def build_hedge_micro_grid_plan(
             distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
             price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         elif held_long_same_side_entry and latest_long_lot_price is not None:
-            distance_steps = max(float(level) + buy_offset_steps, 1.0)
-            price_raw = float(
-                Decimal(str(latest_long_lot_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price)))
+            lot_distance_steps = max(float(level) + buy_offset_steps, 1.0)
+            market_distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
+            lot_price_raw = float(
+                Decimal(str(latest_long_lot_price)) - (Decimal(str(lot_distance_steps)) * Decimal(str(step_price)))
             )
+            market_price_raw = float(
+                Decimal(str(bid_price)) - (Decimal(str(market_distance_steps)) * Decimal(str(step_price)))
+            )
+            price_raw = market_price_raw if lot_price_raw >= float(ask_price) else lot_price_raw
         else:
             distance_steps = max(float(level) + buy_offset_steps, 1.0)
             price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
@@ -876,10 +881,15 @@ def build_hedge_micro_grid_plan(
             distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
             price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         elif held_short_same_side_entry and latest_short_lot_price is not None:
-            distance_steps = max(float(level) + sell_offset_steps, 1.0)
-            price_raw = float(
-                Decimal(str(latest_short_lot_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price)))
+            lot_distance_steps = max(float(level) + sell_offset_steps, 1.0)
+            market_distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
+            lot_price_raw = float(
+                Decimal(str(latest_short_lot_price)) + (Decimal(str(lot_distance_steps)) * Decimal(str(step_price)))
             )
+            market_price_raw = float(
+                Decimal(str(ask_price)) + (Decimal(str(market_distance_steps)) * Decimal(str(step_price)))
+            )
+            price_raw = market_price_raw if lot_price_raw <= float(bid_price) else lot_price_raw
         else:
             distance_steps = max(float(level) + sell_offset_steps, 1.0)
             price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
