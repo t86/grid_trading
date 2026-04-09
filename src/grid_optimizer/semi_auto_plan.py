@@ -853,6 +853,12 @@ def build_hedge_micro_grid_plan(
         and effective_short_notional > effective_long_notional
         and effective_long_notional <= per_order_notional
     )
+    mixed_inventory_blocks_new_entries = (
+        effective_long_qty > 0
+        and effective_short_qty > 0
+        and not dominant_long_with_tiny_short_residual
+        and not dominant_short_with_tiny_long_residual
+    )
     long_entry_cost_guard_active = (
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
         and effective_long_qty > 0
@@ -1048,7 +1054,7 @@ def build_hedge_micro_grid_plan(
     take_profit_short_price_keys = {
         f"{order.side}:{order.price:.10f}" for order in buy_orders if order.role == "take_profit_short"
     }
-    if not bool(entry_long_paused) and (effective_short_qty <= 0 or dominant_long_with_tiny_short_residual):
+    if not bool(entry_long_paused) and not mixed_inventory_blocks_new_entries:
         entry_buy_max_level = buy_levels + (1 if effective_short_qty > 0 else 0)
         for level in range(1, entry_buy_max_level + 1):
             price = _entry_buy_price(level)
@@ -1086,8 +1092,6 @@ def build_hedge_micro_grid_plan(
                     position_side="LONG",
                 )
             )
-            if effective_short_qty > 0:
-                break
 
     long_lot_exit_orders: list[PlanOrder] = []
     long_lot_exit_qty = 0.0
@@ -1140,9 +1144,7 @@ def build_hedge_micro_grid_plan(
         f"{order.side}:{order.price:.10f}" for order in sell_orders if order.role == "take_profit_long"
     }
     allow_paused_short_probe = bool(entry_short_paused and paused_entry_short_scale > 0)
-    if (not bool(entry_short_paused) or allow_paused_short_probe) and (
-        effective_long_qty <= 0 or dominant_short_with_tiny_long_residual
-    ):
+    if (not bool(entry_short_paused) or allow_paused_short_probe) and not mixed_inventory_blocks_new_entries:
         entry_sell_max_level = sell_levels + (1 if effective_long_qty > 0 else 0)
         if allow_paused_short_probe and effective_long_qty <= 0:
             entry_sell_max_level = 1
@@ -1185,7 +1187,7 @@ def build_hedge_micro_grid_plan(
                     position_side="SHORT",
                 )
             )
-            if allow_paused_short_probe or effective_long_qty > 0:
+            if allow_paused_short_probe:
                 break
 
     target_long_base_qty = _round_order_qty(base_position_notional / center_price, step_size)
