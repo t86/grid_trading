@@ -1,12 +1,17 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.spot_loop_runner import (
     _build_parser,
     _build_spot_competition_inventory_grid_orders,
+    _load_state,
     _normalize_commission_quote,
+    _sync_volume_shift_trades,
 )
 
 
@@ -84,6 +89,89 @@ class SpotLoopRunnerTests(unittest.TestCase):
                     "time": 1234567890,
                 }
             ],
+            bid_price=99.0,
+            ask_price=101.0,
+            step_price=5.0,
+            first_order_multiplier=1.5,
+            per_order_notional=20.0,
+            threshold_position_notional=200.0,
+            max_order_position_notional=300.0,
+            max_position_notional=400.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+        )
+
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY"])
+        self.assertEqual(desired_orders[0]["role"], "bootstrap_entry")
+        self.assertEqual(controls["direction_state"], "flat")
+
+    def test_sync_volume_shift_trades_keeps_old_known_orders_for_competition_mode(self) -> None:
+        state = {
+            "strategy_mode": "spot_competition_inventory_grid",
+            "seen_trade_ids": [],
+            "known_orders": {
+                "123": {
+                    "side": "BUY",
+                    "role": "bootstrap_entry",
+                    "created_at_ms": 1,
+                }
+            },
+            "inventory_lots": [],
+            "metrics": {},
+            "last_trade_time_ms": 0,
+        }
+
+        applied = _sync_volume_shift_trades(
+            state=state,
+            trades=[],
+            base_asset="BTC",
+            quote_asset="USDT",
+        )
+
+        self.assertEqual(applied, 0)
+        self.assertIn("123", state["known_orders"])
+
+    def test_load_state_resets_foreign_spot_mode_state_for_competition_mode_bootstrap(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "strategy_mode": "spot_volume_shift_long",
+                        "known_orders": {
+                            "123": {
+                                "side": "BUY",
+                                "role": "inventory_build",
+                                "created_at_ms": 1,
+                            }
+                        },
+                        "inventory_lots": [
+                            {
+                                "qty": 0.2,
+                                "cost_quote": 20.0,
+                                "buy_time_ms": 1234567890,
+                                "tag": "foreign",
+                            }
+                        ],
+                        "seen_trade_ids": [1],
+                        "last_trade_time_ms": 1234567890,
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            state = _load_state(
+                state_path,
+                symbol="BTCUSDT",
+                strategy_mode="spot_competition_inventory_grid",
+                cell_count=0,
+            )
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
             bid_price=99.0,
             ask_price=101.0,
             step_price=5.0,

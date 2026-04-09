@@ -99,6 +99,13 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
             state = {}
     else:
         state = {}
+    loaded_strategy_mode = str(state.get("strategy_mode") or "").strip()
+    if strategy_mode == "spot_competition_inventory_grid" and loaded_strategy_mode and loaded_strategy_mode != strategy_mode:
+        state["known_orders"] = {}
+        state["inventory_lots"] = []
+        state["seen_trade_ids"] = []
+        state["last_trade_time_ms"] = 0
+        state["metrics"] = _new_metrics()
     state.setdefault("version", STATE_VERSION)
     state.setdefault("symbol", symbol)
     state.setdefault("strategy_mode", strategy_mode)
@@ -685,13 +692,16 @@ def _sync_volume_shift_trades(
     state["inventory_lots"] = lots
     state["seen_trade_ids"] = sorted(seen_ids)[-5000:]
     state["last_trade_time_ms"] = last_trade_time_ms
-    now_ms = int(time.time() * 1000)
-    cutoff_ms = now_ms - 7 * 24 * 3600 * 1000
-    state["known_orders"] = {
-        key: value
-        for key, value in known_orders.items()
-        if int((value or {}).get("created_at_ms", now_ms) or now_ms) >= cutoff_ms
-    }
+    if str(state.get("strategy_mode") or "").strip() == "spot_competition_inventory_grid":
+        state["known_orders"] = known_orders
+    else:
+        now_ms = int(time.time() * 1000)
+        cutoff_ms = now_ms - 7 * 24 * 3600 * 1000
+        state["known_orders"] = {
+            key: value
+            for key, value in known_orders.items()
+            if int((value or {}).get("created_at_ms", now_ms) or now_ms) >= cutoff_ms
+        }
     return applied
 
 
