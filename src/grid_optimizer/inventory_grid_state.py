@@ -261,10 +261,14 @@ def apply_inventory_grid_fill(
                     direction_state=current_state,
                     reduce_qty=fill_qty,
                 )
-                forced_reduce_cost_steps = _accumulate_pair_credit_steps(
-                    matched=matched,
-                    exit_price=fill_price,
-                    step_price=step_price,
+                forced_reduce_cost_steps = sum(
+                    _forced_reduce_cost_steps(
+                        entry_price=max(float(item.get("entry_price", 0.0) or 0.0), 0.0),
+                        reduce_price=fill_price,
+                        step_price=step_price,
+                        direction_state=current_state,
+                    )
+                    for item in matched
                 )
                 runtime["pair_credit_steps"] = max(
                     0,
