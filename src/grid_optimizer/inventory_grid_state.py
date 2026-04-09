@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from decimal import Decimal
 from typing import Any
 
 EPSILON = 1e-12
@@ -64,13 +65,15 @@ def _accumulate_pair_credit_steps(*, matched: list[dict[str, Any]], exit_price: 
     total = 0
     if step_price <= 0:
         return total
+    decimal_step_price = Decimal(str(step_price))
+    decimal_exit_price = Decimal(str(exit_price))
     for item in matched:
         entry_price = max(float(item.get("entry_price", 0.0) or 0.0), 0.0)
         matched_qty = max(float(item.get("matched_qty", 0.0) or 0.0), 0.0)
         if entry_price <= 0 or matched_qty <= EPSILON:
             continue
-        gross_steps = abs(exit_price - entry_price) / step_price
-        total += int(round(gross_steps))
+        gross_steps = abs(decimal_exit_price - Decimal(str(entry_price))) / decimal_step_price
+        total += int(gross_steps)
     return total
 
 
