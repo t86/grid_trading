@@ -123,6 +123,30 @@ def test_rebuild_runtime_preserves_replayed_state_before_conflicting_bootstrap_f
     assert "conflicting_bootstrap_fills" in runtime["recovery_errors"]
 
 
+def test_rebuild_runtime_preserves_flipped_state_when_conflicting_bootstrap_exceeds_inventory() -> None:
+    runtime = rebuild_inventory_grid_runtime(
+        market_type="futures",
+        trades=[
+            {"id": 1, "time": 1000, "price": "0.1000", "qty": "100", "side": "BUY", "orderId": 11},
+            {"id": 2, "time": 2000, "price": "0.1100", "qty": "150", "side": "SELL", "orderId": 12},
+        ],
+        order_refs={
+            "11": {"role": "bootstrap_entry", "side": "BUY"},
+            "12": {"role": "bootstrap_entry", "side": "SELL"},
+        },
+        step_price=0.01,
+        current_position_qty=50.0,
+    )
+
+    assert runtime["recovery_mode"] == "conservative_reduce_only"
+    assert runtime["direction_state"] == "short_active"
+    assert runtime["grid_anchor_price"] == 0.11
+    assert runtime["last_strategy_trade_time_ms"] == 2000
+    assert runtime["position_lots"][0]["side"] == "short"
+    assert runtime["position_lots"][0]["qty"] == 50.0
+    assert "conflicting_bootstrap_fills" in runtime["recovery_errors"]
+
+
 def test_rebuild_runtime_keeps_live_state_for_valid_two_cycle_futures_sequence() -> None:
     runtime = rebuild_inventory_grid_runtime(
         market_type="futures",
