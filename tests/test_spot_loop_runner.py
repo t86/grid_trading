@@ -69,6 +69,39 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["direction_state"], "flat")
         self.assertEqual(controls["risk_state"], "normal")
 
+    def test_build_spot_competition_inventory_grid_orders_ignores_unrelated_trades_when_flat(self) -> None:
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+            },
+            trades=[
+                {
+                    "id": 1,
+                    "orderId": 999999,
+                    "price": "100.0",
+                    "qty": "0.2",
+                    "time": 1234567890,
+                }
+            ],
+            bid_price=99.0,
+            ask_price=101.0,
+            step_price=5.0,
+            first_order_multiplier=1.5,
+            per_order_notional=20.0,
+            threshold_position_notional=200.0,
+            max_order_position_notional=300.0,
+            max_position_notional=400.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+        )
+
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY"])
+        self.assertEqual(desired_orders[0]["role"], "bootstrap_entry")
+        self.assertEqual(controls["direction_state"], "flat")
+
     def test_normalize_commission_quote_handles_quote_asset(self) -> None:
         fee = _normalize_commission_quote(
             commission=0.015,

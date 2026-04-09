@@ -1116,11 +1116,16 @@ def _build_spot_competition_inventory_grid_orders(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     known_orders = state.get("known_orders")
     order_refs = known_orders if isinstance(known_orders, dict) else {}
+    strategy_trades = [
+        trade
+        for trade in list(trades or [])
+        if isinstance(trade, dict) and str(int(trade.get("orderId", 0) or 0)) in order_refs
+    ]
     inventory_lots = state.get("inventory_lots")
     current_position_qty = _sum_inventory_qty(inventory_lots if isinstance(inventory_lots, list) else [])
     runtime = rebuild_inventory_grid_runtime(
         market_type="spot",
-        trades=trades,
+        trades=strategy_trades,
         order_refs=order_refs,
         step_price=step_price,
         current_position_qty=current_position_qty,
