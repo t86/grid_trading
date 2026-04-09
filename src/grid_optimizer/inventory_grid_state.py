@@ -5,6 +5,9 @@ from typing import Any
 
 EPSILON = 1e-12
 ANCHOR_UPDATE_ROLES = frozenset({"bootstrap_entry", "grid_entry", "grid_exit"})
+OPENING_ROLES = frozenset({"bootstrap_entry", "grid_entry"})
+CLOSING_ROLES = frozenset({"grid_exit", "forced_reduce"})
+VALID_DIRECTION_STATES = frozenset({"flat", "long_active", "short_active"})
 
 
 def new_inventory_grid_runtime(*, market_type: str) -> dict[str, Any]:
@@ -61,6 +64,10 @@ def _consume_lots(
     return new_lots, matched
 
 
+def _total_lot_qty(*, lots: list[dict[str, Any]]) -> float:
+    return sum(max(float(lot.get("qty", 0.0) or 0.0), 0.0) for lot in lots)
+
+
 def _accumulate_pair_credit_steps(*, matched: list[dict[str, Any]], exit_price: float, step_price: float) -> int:
     total = 0
     if step_price <= 0:
@@ -94,55 +101,98 @@ def apply_inventory_grid_fill(
     if fill_price <= 0 or fill_qty <= EPSILON:
         return
 
-    runtime["direction_state"] = _next_direction_state(
-        market_type=str(runtime.get("market_type", "futures")),
-        current_state=str(runtime.get("direction_state", "flat")),
-        side=normalized_side,
-    )
+    market_type = str(runtime.get("market_type", "futures")).strip().lower()
+    current_state = str(runtime.get("direction_state", "flat")).strip().lower()
+    if current_state not in VALID_DIRECTION_STATES:
+        raise ValueError(f"unsupported direction_state: {runtime.get('direction_state')}")
+
     lots = list(runtime.get("position_lots") or [])
 
-    if normalized_side == "BUY" and runtime["direction_state"] == "long_active":
-        lots.append(
-            {
-                "lot_id": f"lot_{fill_time_ms}_{len(lots) + 1}",
-                "side": "long",
-                "qty": fill_qty,
-                "entry_price": fill_price,
-                "opened_at_ms": int(fill_time_ms),
-                "source_role": normalized_role,
-            }
-        )
-    elif normalized_side == "SELL" and runtime["direction_state"] == "long_active":
-        lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
-        if normalized_role == "grid_exit":
-            runtime["pair_credit_steps"] = int(runtime.get("pair_credit_steps", 0) or 0) + _accumulate_pair_credit_steps(
-                matched=matched,
-                exit_price=fill_price,
-                step_price=step_price,
+    if current_state == "flat":
+        if normalized_side == "BUY" and normalized_role in OPENING_ROLES:
+            runtime["direction_state"] = "long_active"
+            lots.append(
+                {
+                    "lot_id": f"lot_{fill_time_ms}_{len(lots) + 1}",
+                    "side": "long",
+                    "qty": fill_qty,
+                    "entry_price": fill_price,
+                    "opened_at_ms": int(fill_time_ms),
+                    "source_role": normalized_role,
+                }
             )
-        if not lots:
-            runtime["direction_state"] = "flat"
-    elif normalized_side == "SELL" and runtime["direction_state"] == "short_active":
-        lots.append(
-            {
-                "lot_id": f"lot_{fill_time_ms}_{len(lots) + 1}",
-                "side": "short",
-                "qty": fill_qty,
-                "entry_price": fill_price,
-                "opened_at_ms": int(fill_time_ms),
-                "source_role": normalized_role,
-            }
-        )
-    elif normalized_side == "BUY" and runtime["direction_state"] == "short_active":
-        lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
-        if normalized_role == "grid_exit":
-            runtime["pair_credit_steps"] = int(runtime.get("pair_credit_steps", 0) or 0) + _accumulate_pair_credit_steps(
-                matched=matched,
-                exit_price=fill_price,
-                step_price=step_price,
+        elif market_type == "futures" and normalized_side == "SELL" and normalized_role in OPENING_ROLES:
+            runtime["direction_state"] = "short_active"
+            lots.append(
+                {
+                    "lot_id": f"lot_{fill_time_ms}_{len(lots) + 1}",
+                    "side": "short",
+                    "qty": fill_qty,
+                    "entry_price": fill_price,
+                    "opened_at_ms": int(fill_time_ms),
+                    "source_role": normalized_role,
+                }
             )
-        if not lots:
-            runtime["direction_state"] = "flat"
+        else:
+            raise ValueError(
+                f"cannot apply {normalized_role} {normalized_side} fill while flat in market_type={market_type}"
+            )
+    elif current_state == "long_active":
+        if normalized_side == "BUY" and normalized_role in OPENING_ROLES:
+            lots.append(
+                {
+                    "lot_id": f"lot_{fill_time_ms}_{len(lots) + 1}",
+                    "side": "long",
+                    "qty": fill_qty,
+                    "entry_price": fill_price,
+                    "opened_at_ms": int(fill_time_ms),
+                    "source_role": normalized_role,
+                }
+            )
+        elif normalized_side == "SELL" and normalized_role in CLOSING_ROLES:
+            if _total_lot_qty(lots=lots) + EPSILON < fill_qty:
+                raise ValueError("insufficient long quantity for sell fill")
+            lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
+            if normalized_role == "grid_exit":
+                runtime["pair_credit_steps"] = int(runtime.get("pair_credit_steps", 0) or 0) + _accumulate_pair_credit_steps(
+                    matched=matched,
+                    exit_price=fill_price,
+                    step_price=step_price,
+                )
+            if not lots:
+                runtime["direction_state"] = "flat"
+        else:
+            raise ValueError(
+                f"cannot apply {normalized_role} {normalized_side} fill while long_active"
+            )
+    elif current_state == "short_active":
+        if normalized_side == "SELL" and normalized_role in OPENING_ROLES:
+            lots.append(
+                {
+                    "lot_id": f"lot_{fill_time_ms}_{len(lots) + 1}",
+                    "side": "short",
+                    "qty": fill_qty,
+                    "entry_price": fill_price,
+                    "opened_at_ms": int(fill_time_ms),
+                    "source_role": normalized_role,
+                }
+            )
+        elif normalized_side == "BUY" and normalized_role in CLOSING_ROLES:
+            if _total_lot_qty(lots=lots) + EPSILON < fill_qty:
+                raise ValueError("insufficient short quantity for buy fill")
+            lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
+            if normalized_role == "grid_exit":
+                runtime["pair_credit_steps"] = int(runtime.get("pair_credit_steps", 0) or 0) + _accumulate_pair_credit_steps(
+                    matched=matched,
+                    exit_price=fill_price,
+                    step_price=step_price,
+                )
+            if not lots:
+                runtime["direction_state"] = "flat"
+        else:
+            raise ValueError(
+                f"cannot apply {normalized_role} {normalized_side} fill while short_active"
+            )
 
     runtime["position_lots"] = lots
     runtime["last_strategy_trade_time_ms"] = int(fill_time_ms)
@@ -158,6 +208,10 @@ def build_forced_reduce_lot_plan(
     step_price: float,
 ) -> dict[str, Any]:
     direction_state = str(runtime.get("direction_state", "flat"))
+    if direction_state not in {"long_active", "short_active"}:
+        raise ValueError(f"unsupported direction_state for forced reduce: {runtime.get('direction_state')}")
+    if step_price <= 0:
+        raise ValueError("step_price must be positive")
     lots = list(runtime.get("position_lots") or [])
     if direction_state == "long_active":
         ordered = sorted(lots, key=lambda item: float(item.get("entry_price", 0.0) or 0.0), reverse=True)
