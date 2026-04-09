@@ -7,6 +7,7 @@ from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     build_execution_actions,
     estimate_mid_drift_steps,
+    preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     validate_plan_report,
 )
@@ -30,6 +31,76 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(actions["place_count"], 3)
         self.assertEqual(actions["cancel_count"], 1)
         self.assertAlmostEqual(actions["place_notional"], 202.32531, places=8)
+
+    def test_preserve_queue_priority_drops_replace_when_post_only_projects_back_to_same_bucket(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.05064, "qty": 500.0, "notional": 25.32, "role": "entry"}
+            ],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.05062", "origQty": "500", "positionSide": "BOTH"}
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.05062,
+            live_ask_price=0.05063,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["cancel_count"], 0)
+
+    def test_preserve_queue_priority_only_places_delta_when_post_only_projects_back_to_same_bucket(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.05064, "qty": 650.0, "notional": 32.916, "role": "entry"}
+            ],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.05062", "origQty": "500", "positionSide": "BOTH"}
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.05062,
+            live_ask_price=0.05063,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 0)
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
+
+    def test_preserve_queue_priority_keeps_replace_when_projected_bucket_needs_smaller_qty(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.05064, "qty": 350.0, "notional": 17.724, "role": "entry"}
+            ],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.05062", "origQty": "500", "positionSide": "BOTH"}
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.05062,
+            live_ask_price=0.05063,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 350.0, places=8)
 
     def test_validate_plan_report_rejects_old_plan_and_stale_orders_without_flag(self) -> None:
         now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)

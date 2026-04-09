@@ -244,6 +244,27 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["max_actual_net_notional"], 90.0)
         self.assertFalse(payload["autotune_symbol_enabled"])
 
+    def test_runner_preset_payload_applies_xaut_volume_guarded_bard_v2_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_volume_guarded_bard_v2", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_volume_guarded_bard_v2")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 1.0)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 5)
+        self.assertEqual(payload["per_order_notional"], 20.0)
+        self.assertEqual(payload["pause_buy_position_notional"], 2000.0)
+        self.assertEqual(payload["pause_short_position_notional"], 2000.0)
+        self.assertEqual(payload["max_position_notional"], 2500.0)
+        self.assertEqual(payload["max_short_position_notional"], 2500.0)
+        self.assertEqual(payload["max_total_notional"], 2200.0)
+        self.assertEqual(payload["max_new_orders"], 32)
+        self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0)
+        self.assertFalse(payload["adaptive_step_enabled"])
+        self.assertFalse(payload["synthetic_trend_follow_enabled"])
+        self.assertEqual(payload["leverage"], 10)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+
     def test_normalize_runner_control_payload_supports_volume_trigger_fields(self) -> None:
         payload = _normalize_runner_control_payload(
             {
@@ -512,6 +533,29 @@ class WebSecurityTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             _runner_preset_payload("xaut_volume_short_v1", {"symbol": "OPNUSDT"})
 
+    def test_runner_preset_payload_rejects_xaut_volume_guarded_bard_v2_for_other_symbol(self) -> None:
+        with self.assertRaises(ValueError):
+            _runner_preset_payload("xaut_volume_guarded_bard_v2", {"symbol": "OPNUSDT"})
+
+    def test_runner_preset_payload_applies_xaut_competition_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_competition_push_neutral_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_competition_push_neutral_v1")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 0.1)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 4)
+        self.assertEqual(payload["per_order_notional"], 45.0)
+        self.assertEqual(payload["base_position_notional"], 0.0)
+        self.assertEqual(payload["sticky_entry_levels"], 2)
+        self.assertEqual(payload["synthetic_residual_short_flat_notional"], 30.0)
+        self.assertEqual(payload["max_cumulative_notional"], 660000.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertFalse(payload["volume_trigger_enabled"])
+
+    def test_runner_preset_payload_rejects_xaut_competition_profile_for_other_symbol(self) -> None:
+        with self.assertRaises(ValueError):
+            _runner_preset_payload("xaut_competition_push_neutral_v1", {"symbol": "OPNUSDT"})
+
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
         custom_path = Path("output/test_custom_runner_presets.json")
@@ -655,6 +699,14 @@ class WebSecurityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
             _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_near_price_guarded_v1"})
 
+    def test_resolve_runner_start_config_rejects_xaut_volume_guarded_bard_v2_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_volume_guarded_bard_v2"})
+
+    def test_resolve_runner_start_config_rejects_xaut_competition_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_competition_push_neutral_v1"})
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_starts_xaut_guarded_ping_pong_profile(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -684,6 +736,60 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(config["market_bias_enabled"])
         self.assertTrue(config["synthetic_trend_follow_enabled"])
         self.assertEqual(config["synthetic_trend_follow_reverse_delay_seconds"], 12.0)
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_xaut_volume_guarded_bard_v2_profile(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "4696.0", "ask_price": "4696.2"}]
+        config = _resolve_runner_start_config({"symbol": "XAUTUSDT", "strategy_profile": "xaut_volume_guarded_bard_v2"})
+        self.assertEqual(config["strategy_profile"], "xaut_volume_guarded_bard_v2")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(config["state_path"], "output/xautusdt_loop_state.json")
+        self.assertEqual(config["step_price"], 1.0)
+        self.assertEqual(config["buy_levels"], 8)
+        self.assertEqual(config["sell_levels"], 5)
+        self.assertEqual(config["per_order_notional"], 20.0)
+        self.assertEqual(config["pause_buy_position_notional"], 2000.0)
+        self.assertEqual(config["pause_short_position_notional"], 2000.0)
+        self.assertEqual(config["max_position_notional"], 2500.0)
+        self.assertEqual(config["max_short_position_notional"], 2500.0)
+        self.assertEqual(config["max_total_notional"], 2200.0)
+        self.assertEqual(config["leverage"], 10)
+        self.assertFalse(config["adaptive_step_enabled"])
+        self.assertFalse(config["synthetic_trend_follow_enabled"])
+        self.assertFalse(config["autotune_symbol_enabled"])
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_xaut_competition_profile(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "4669.00", "ask_price": "4669.02"}]
+        config = _resolve_runner_start_config({"symbol": "XAUTUSDT", "strategy_profile": "xaut_competition_push_neutral_v1"})
+        self.assertEqual(config["strategy_profile"], "xaut_competition_push_neutral_v1")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(config["state_path"], "output/xautusdt_loop_state.json")
+        self.assertAlmostEqual(config["step_price"], 0.1)
+        self.assertEqual(config["buy_levels"], 8)
+        self.assertEqual(config["sell_levels"], 4)
+        self.assertEqual(config["sticky_entry_levels"], 2)
+        self.assertEqual(config["synthetic_residual_short_flat_notional"], 30.0)
+        self.assertFalse(config["autotune_symbol_enabled"])
+        self.assertFalse(config["volume_trigger_enabled"])
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
@@ -1153,6 +1259,45 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("0.5", command)
         self.assertIn("--static-sell-offset-steps", command)
 
+    def test_build_runner_command_includes_sticky_entry_levels(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "XAUTUSDT",
+                "strategy_profile": "xaut_competition_push_neutral_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.1,
+                "buy_levels": 8,
+                "sell_levels": 4,
+                "per_order_notional": 45.0,
+                "startup_entry_multiplier": 1.0,
+                "base_position_notional": 0.0,
+                "sticky_entry_levels": 2,
+                "synthetic_residual_short_flat_notional": 30.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 40,
+                "max_total_notional": 3600.0,
+                "sleep_seconds": 3.0,
+                "state_path": "output/xautusdt_loop_state.json",
+                "plan_json": "output/xautusdt_loop_latest_plan.json",
+                "submit_report_json": "output/xautusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/xautusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": False,
+                "reset_state": True,
+            }
+        )
+
+        self.assertIn("--sticky-entry-levels", command)
+        sticky_index = command.index("--sticky-entry-levels")
+        self.assertEqual(command[sticky_index + 1], "2")
+        self.assertIn("--synthetic-residual-short-flat-notional", command)
+        residual_index = command.index("--synthetic-residual-short-flat-notional")
+        self.assertEqual(command[residual_index + 1], "30.0")
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -1457,9 +1602,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertNotIn("based_volume_long_trigger_v1", opn_keys)
         self.assertNotIn("based_volume_guarded_bard_v2", opn_keys)
         self.assertIn("based_volume_push_bard_v1", opn_keys)
+        self.assertIn("xaut_competition_push_neutral_v1", xaut_keys)
+        self.assertIn("xaut_volume_guarded_bard_v2", xaut_keys)
         self.assertIn("xaut_volume_short_v1", xaut_keys)
         self.assertIn("xaut_guarded_ping_pong_v1", xaut_keys)
         self.assertIn("xaut_near_price_guarded_v1", xaut_keys)
+        self.assertNotIn("xaut_competition_push_neutral_v1", opn_keys)
+        self.assertNotIn("xaut_volume_guarded_bard_v2", opn_keys)
         self.assertNotIn("xaut_volume_short_v1", opn_keys)
         self.assertNotIn("xaut_guarded_ping_pong_v1", opn_keys)
         self.assertNotIn("xaut_near_price_guarded_v1", opn_keys)

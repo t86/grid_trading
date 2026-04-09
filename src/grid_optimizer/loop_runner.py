@@ -76,6 +76,7 @@ from .submit_plan import (
     _build_client_order_id,
     _ignore_noop_error,
     estimate_mid_drift_steps,
+    preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     validate_plan_report,
 )
@@ -142,6 +143,7 @@ AUTO_REGIME_PROFILE_LABELS = {
     XAUT_LONG_ADAPTIVE_PROFILE: "XAUT 自适应做多 v1",
     XAUT_SHORT_ADAPTIVE_PROFILE: "XAUT 自适应做空 v1",
     "xaut_near_price_guarded_v1": "XAUT 近价护栏 v1",
+    "xaut_volume_guarded_bard_v2": "XAUT 冲量控损 v2",
 }
 AUTO_REGIME_PROFILE_STEP_HINTS: dict[str, tuple[float, int]] = {
     AUTO_REGIME_STABLE_PROFILE: (0.0004, 2),
@@ -4719,6 +4721,32 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    synthetic_lot_cost_guard_profiles = {
+        "based_volume_guarded_bard_v2",
+        "xaut_competition_push_neutral_v1",
+        "xaut_volume_guarded_bard_v2",
+    }
+    synthetic_residual_short_flat_notional = max(
+        _safe_float(getattr(effective_args, "synthetic_residual_short_flat_notional", None)),
+        0.0,
+    )
+    synthetic_lot_cost_guard_enabled = (
+        requested_strategy_mode in {"hedge_neutral", "synthetic_neutral"}
+        and (
+            str(getattr(effective_args, "strategy_profile", "")).strip() in synthetic_lot_cost_guard_profiles
+            or synthetic_residual_short_flat_notional > 0
+        )
+    )
+    synthetic_entry_long_cost_guard_release_notional = (
+        max(_safe_float(effective_args.pause_buy_position_notional), 0.0) * 0.5
+        if synthetic_lot_cost_guard_enabled
+        else 0.0
+    )
+    synthetic_entry_short_cost_guard_release_notional = (
+        max(_safe_float(effective_args.pause_short_position_notional), 0.0) * 0.5
+        if synthetic_lot_cost_guard_enabled
+        else 0.0
+    )
 
     if _is_custom_grid_mode(args):
         excess_inventory_gate["enabled"] = False
@@ -4900,8 +4928,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 float(getattr(effective_args, "static_sell_offset_steps", 0.0))
                 + float((market_bias or {}).get("sell_offset_steps", 0.0))
             ),
-            entry_long_cost_guard_release_notional=max(_safe_float(effective_args.pause_buy_position_notional), 0.0) * 0.5,
-            entry_short_cost_guard_release_notional=max(_safe_float(effective_args.pause_short_position_notional), 0.0) * 0.5,
+            entry_long_cost_guard_release_notional=synthetic_entry_long_cost_guard_release_notional,
+            entry_short_cost_guard_release_notional=synthetic_entry_short_cost_guard_release_notional,
+            residual_short_flat_notional=synthetic_residual_short_flat_notional,
             entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
             entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
             paused_entry_short_scale=strong_short_probe_scale,
@@ -4999,11 +5028,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 float(getattr(effective_args, "static_sell_offset_steps", 0.0))
                 + float((market_bias or {}).get("sell_offset_steps", 0.0))
             ),
-            # Synthetic neutral should keep quoting near the live book even when
-            # inventory is light; otherwise the nearest exit drifts too far away
-            # from the touch and volume dries up.
-            entry_long_cost_guard_release_notional=0.0,
-            entry_short_cost_guard_release_notional=0.0,
+            entry_long_cost_guard_release_notional=synthetic_entry_long_cost_guard_release_notional,
+            entry_short_cost_guard_release_notional=synthetic_entry_short_cost_guard_release_notional,
+            residual_short_flat_notional=synthetic_residual_short_flat_notional,
             entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
             entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
             paused_entry_short_scale=strong_short_probe_scale,
@@ -5404,6 +5431,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
             price_tolerance=effective_args.step_price,
+            max_levels_per_group=getattr(effective_args, "sticky_entry_levels", None),
         )
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
@@ -5474,6 +5502,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_base_position_notional": inventory_tier["effective_base_position_notional"],
         "effective_pause_buy_position_notional": getattr(effective_args, "pause_buy_position_notional", None),
         "effective_pause_short_position_notional": getattr(effective_args, "pause_short_position_notional", None),
+        "effective_synthetic_residual_short_flat_notional": getattr(
+            effective_args,
+            "synthetic_residual_short_flat_notional",
+            None,
+        ),
         "effective_max_position_notional": getattr(effective_args, "max_position_notional", None),
         "effective_max_short_position_notional": getattr(effective_args, "max_short_position_notional", None),
         "effective_max_total_notional": getattr(effective_args, "max_total_notional", None),
@@ -5502,6 +5535,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "target_short_base_qty": plan.get("target_short_base_qty", 0.0),
         "bootstrap_long_qty": plan.get("bootstrap_long_qty", bootstrap_qty),
         "bootstrap_short_qty": plan.get("bootstrap_short_qty", 0.0),
+        "effective_long_plan_qty": plan.get("effective_long_qty"),
+        "effective_short_plan_qty": plan.get("effective_short_qty"),
+        "residual_short_flat_notional": plan.get("residual_short_flat_notional"),
+        "residual_short_flattened": bool(plan.get("residual_short_flattened")),
+        "residual_short_flattened_qty": plan.get("residual_short_flattened_qty"),
+        "residual_short_flattened_notional": plan.get("residual_short_flattened_notional"),
         "bootstrap_orders": plan["bootstrap_orders"],
         "buy_orders": plan["buy_orders"],
         "sell_orders": plan["sell_orders"],
@@ -5564,6 +5603,14 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             f"live mid drift is {drift_steps:.2f} steps, above max_mid_drift_steps={args.max_mid_drift_steps:.2f}"
         )
         validation["ok"] = False
+    validation["actions"] = preserve_queue_priority_in_execution_actions(
+        actions=validation["actions"],
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+    )
 
     report = {
         "plan_json": str(args.plan_json),
@@ -5847,6 +5894,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per-order-notional", type=float, default=12.6)
     parser.add_argument("--startup-entry-multiplier", type=float, default=1.0)
     parser.add_argument("--base-position-notional", type=float, default=75.6)
+    parser.add_argument("--sticky-entry-levels", type=int, default=None)
+    parser.add_argument("--synthetic-residual-short-flat-notional", type=float, default=None)
     parser.add_argument("--static-buy-offset-steps", type=float, default=0.0)
     parser.add_argument("--static-sell-offset-steps", type=float, default=0.0)
     parser.add_argument("--market-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
@@ -5995,6 +6044,13 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         )
     if summary.get("stop_reason"):
         print(f"  stop_reason: {summary['stop_reason']}")
+    if summary.get("residual_short_flattened"):
+        print(
+            "  residual_short_flattened: "
+            f"qty={_float(summary.get('residual_short_flattened_qty', 0.0))} "
+            f"notional={_float(summary.get('residual_short_flattened_notional', 0.0))} "
+            f"threshold={_float(summary.get('residual_short_flat_notional', 0.0))}"
+        )
     if summary.get("volatility_buy_pause") or summary.get("short_cover_paused") or summary.get("shift_frozen"):
         print(
             "  market_guard: "
@@ -6174,6 +6230,10 @@ def main() -> None:
         raise SystemExit("--buy-levels and --sell-levels must be >= 0")
     if args.per_order_notional <= 0 or args.base_position_notional < 0:
         raise SystemExit("--per-order-notional must be > 0 and --base-position-notional must be >= 0")
+    if args.sticky_entry_levels is not None and args.sticky_entry_levels < 0:
+        raise SystemExit("--sticky-entry-levels must be >= 0")
+    if args.synthetic_residual_short_flat_notional is not None and args.synthetic_residual_short_flat_notional < 0:
+        raise SystemExit("--synthetic-residual-short-flat-notional must be >= 0")
     if args.static_buy_offset_steps < 0 or args.static_sell_offset_steps < 0:
         raise SystemExit("--static-buy-offset-steps and --static-sell-offset-steps must be >= 0")
     if args.market_bias_max_shift_steps < 0:
@@ -6535,6 +6595,11 @@ def main() -> None:
                 "short_budget_notional": _safe_float(plan_report.get("short_budget_notional")),
                 "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
                 "max_short_position_notional": _safe_float(plan_report.get("max_short_position_notional")),
+                "effective_short_plan_qty": _safe_float(plan_report.get("effective_short_plan_qty")),
+                "residual_short_flat_notional": _safe_float(plan_report.get("residual_short_flat_notional")),
+                "residual_short_flattened": bool(plan_report.get("residual_short_flattened")),
+                "residual_short_flattened_qty": _safe_float(plan_report.get("residual_short_flattened_qty")),
+                "residual_short_flattened_notional": _safe_float(plan_report.get("residual_short_flattened_notional")),
                 "inventory_tier_active": bool((plan_report.get("inventory_tier") or {}).get("active")),
                 "inventory_tier_ratio": _safe_float((plan_report.get("inventory_tier") or {}).get("ratio")),
                 "volatility_buy_pause": bool((plan_report.get("market_guard") or {}).get("buy_pause_active")),

@@ -206,6 +206,72 @@ def _normalize_lots(lots: list[dict[str, Any]] | None) -> list[dict[str, float]]
     return normalized
 
 
+def _lot_price_extremes(lots: list[dict[str, float]]) -> tuple[float | None, float | None]:
+    lowest_price: float | None = None
+    highest_price: float | None = None
+    for item in lots:
+        price = max(_safe_float(item.get("price")), 0.0)
+        if price <= 0:
+            continue
+        if lowest_price is None or price < lowest_price:
+            lowest_price = price
+        if highest_price is None or price > highest_price:
+            highest_price = price
+    return lowest_price, highest_price
+
+
+def _build_lot_take_profit_orders(
+    *,
+    lots: list[dict[str, float]],
+    side: str,
+    profit_step: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    role: str,
+    position_side: str,
+) -> tuple[list[PlanOrder], float]:
+    aggregated_qty_by_price: dict[float, float] = {}
+    total_qty = 0.0
+    safe_side = str(side).upper().strip()
+    if safe_side not in {"BUY", "SELL"}:
+        raise ValueError(f"unsupported take-profit side: {side}")
+
+    for lot in lots:
+        lot_price = max(_safe_float(lot.get("price")), 0.0)
+        lot_qty = _round_order_qty(max(_safe_float(lot.get("qty")), 0.0), step_size)
+        if lot_price <= 0 or lot_qty <= 0:
+            continue
+        target_raw = lot_price + profit_step if safe_side == "SELL" else max(lot_price - profit_step, 0.0)
+        target_price = _round_order_price(target_raw, tick_size, safe_side)
+        notional = target_price * lot_qty
+        if min_qty is not None and lot_qty < min_qty:
+            continue
+        if min_notional is not None and notional < min_notional:
+            continue
+        aggregated_qty_by_price[target_price] = aggregated_qty_by_price.get(target_price, 0.0) + lot_qty
+        total_qty += lot_qty
+
+    sorted_prices = sorted(aggregated_qty_by_price, reverse=(safe_side == "BUY"))
+    orders: list[PlanOrder] = []
+    for level, price in enumerate(sorted_prices, start=1):
+        qty = _round_order_qty(aggregated_qty_by_price[price], step_size)
+        if qty <= 0:
+            continue
+        orders.append(
+            _build_order(
+                side=safe_side,
+                price=price,
+                qty=qty,
+                level=level,
+                role=role,
+                position_side=position_side,
+            )
+        )
+    return orders, total_qty
+
+
 def build_static_binance_grid_plan(
     *,
     strategy_direction: str,
@@ -713,6 +779,7 @@ def build_hedge_micro_grid_plan(
     sell_offset_steps: float = 0.0,
     entry_long_cost_guard_release_notional: float = 0.0,
     entry_short_cost_guard_release_notional: float = 0.0,
+    residual_short_flat_notional: float = 0.0,
     entry_long_paused: bool = False,
     entry_short_paused: bool = False,
     paused_entry_short_scale: float = 0.0,
@@ -755,6 +822,22 @@ def build_hedge_micro_grid_plan(
     )
     effective_long_qty = 0.0 if long_inventory_dust else current_long_qty
     effective_short_qty = 0.0 if short_inventory_dust else current_short_qty
+    residual_short_flat_notional = max(float(residual_short_flat_notional), 0.0)
+    residual_short_flattened_qty = 0.0
+    residual_short_flattened_notional = 0.0
+    residual_short_flattened = False
+    if (
+        residual_short_flat_notional > 0
+        and effective_short_qty > 0
+        and effective_long_qty <= 0
+        and (effective_short_qty * mid_price) <= residual_short_flat_notional
+    ):
+        residual_short_flattened = True
+        residual_short_flattened_qty = effective_short_qty
+        residual_short_flattened_notional = effective_short_qty * mid_price
+        effective_short_qty = 0.0
+    effective_long_lots = current_long_lots if effective_long_qty > 1e-12 else []
+    effective_short_lots = current_short_lots if effective_short_qty > 1e-12 else []
     flat_inventory = effective_long_qty <= 1e-12 and effective_short_qty <= 1e-12
     effective_long_notional = effective_long_qty * mid_price
     effective_short_notional = effective_short_qty * mid_price
@@ -794,8 +877,8 @@ def build_hedge_micro_grid_plan(
         and (effective_long_qty <= 0 or dominant_short_with_tiny_long_residual)
         and effective_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
-    latest_long_lot_price = current_long_lots[-1]["price"] if current_long_lots else None
-    latest_short_lot_price = current_short_lots[-1]["price"] if current_short_lots else None
+    lowest_long_lot_price, highest_long_lot_price = _lot_price_extremes(effective_long_lots)
+    lowest_short_lot_price, highest_short_lot_price = _lot_price_extremes(effective_short_lots)
     held_long_same_side_entry = effective_long_qty > 0 and (
         effective_short_qty <= 0 or dominant_long_with_tiny_short_residual
     )
@@ -812,33 +895,53 @@ def build_hedge_micro_grid_plan(
         if short_entry_cost_guard_active and ask_price is not None and ask_price > 0
         else None
     )
+    long_entry_reference_price = (
+        lowest_long_lot_price
+        if lowest_long_lot_price is not None
+        else (current_long_avg_price if current_long_avg_price > 0 else None)
+    )
+    short_entry_reference_price = (
+        highest_short_lot_price
+        if highest_short_lot_price is not None
+        else (current_short_avg_price if current_short_avg_price > 0 else None)
+    )
     long_exit_reference_price = (
-        latest_long_lot_price
-        if latest_long_lot_price is not None
+        highest_long_lot_price
+        if highest_long_lot_price is not None
         else (current_long_avg_price if current_long_avg_price > 0 else None)
     )
     short_exit_reference_price = (
-        latest_short_lot_price
-        if latest_short_lot_price is not None
+        lowest_short_lot_price
+        if lowest_short_lot_price is not None
         else (current_short_avg_price if current_short_avg_price > 0 else None)
     )
     price_tick = float(tick_size) if tick_size is not None and tick_size > 0 else 1e-12
-    long_exit_anchor_price = (
-        max(
-            _round_order_price(float(ask_price) + price_tick, tick_size, "SELL"),
-            _round_order_price(float(long_exit_reference_price) + price_tick, tick_size, "SELL"),
+    profit_step = max(float(step_price), price_tick)
+    long_exit_anchor_price = None
+    if long_exit_profit_guard_active and long_exit_reference_price is not None:
+        market_anchor_price = _round_order_price(float(ask_price) + price_tick, tick_size, "SELL")
+        min_profit_anchor_price = _round_order_price(
+            float(long_exit_reference_price) + profit_step,
+            tick_size,
+            "SELL",
         )
-        if long_exit_profit_guard_active and long_exit_reference_price is not None
-        else None
-    )
-    short_exit_anchor_price = (
-        min(
-            _round_order_price(max(float(bid_price) - price_tick, 0.0), tick_size, "BUY"),
-            _round_order_price(max(float(short_exit_reference_price) - price_tick, 0.0), tick_size, "BUY"),
+        if market_anchor_price <= min_profit_anchor_price + float(step_price) + 1e-12:
+            long_exit_anchor_price = min_profit_anchor_price
+        else:
+            long_exit_anchor_price = max(market_anchor_price, min_profit_anchor_price)
+
+    short_exit_anchor_price = None
+    if short_exit_profit_guard_active and short_exit_reference_price is not None:
+        market_anchor_price = _round_order_price(max(float(bid_price) - price_tick, 0.0), tick_size, "BUY")
+        max_profit_anchor_price = _round_order_price(
+            max(float(short_exit_reference_price) - profit_step, 0.0),
+            tick_size,
+            "BUY",
         )
-        if short_exit_profit_guard_active and short_exit_reference_price is not None
-        else None
-    )
+        if max_profit_anchor_price <= market_anchor_price + float(step_price) + 1e-12:
+            short_exit_anchor_price = max_profit_anchor_price
+        else:
+            short_exit_anchor_price = min(market_anchor_price, max_profit_anchor_price)
 
     def _entry_notional(*, level: int, current_qty: float) -> float:
         if startup_large_entry_active and level == 1 and current_qty <= 1e-12:
@@ -861,11 +964,11 @@ def build_hedge_micro_grid_plan(
         if flat_inventory:
             distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
             price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
-        elif held_long_same_side_entry and latest_long_lot_price is not None:
+        elif held_long_same_side_entry and lowest_long_lot_price is not None:
             lot_distance_steps = max(float(level) + buy_offset_steps, 1.0)
             market_distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
             lot_price_raw = float(
-                Decimal(str(latest_long_lot_price)) - (Decimal(str(lot_distance_steps)) * Decimal(str(step_price)))
+                Decimal(str(lowest_long_lot_price)) - (Decimal(str(lot_distance_steps)) * Decimal(str(step_price)))
             )
             market_price_raw = float(
                 Decimal(str(bid_price)) - (Decimal(str(market_distance_steps)) * Decimal(str(step_price)))
@@ -880,11 +983,11 @@ def build_hedge_micro_grid_plan(
         if flat_inventory:
             distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
             price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
-        elif held_short_same_side_entry and latest_short_lot_price is not None:
+        elif held_short_same_side_entry and highest_short_lot_price is not None:
             lot_distance_steps = max(float(level) + sell_offset_steps, 1.0)
             market_distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
             lot_price_raw = float(
-                Decimal(str(latest_short_lot_price)) + (Decimal(str(lot_distance_steps)) * Decimal(str(step_price)))
+                Decimal(str(highest_short_lot_price)) + (Decimal(str(lot_distance_steps)) * Decimal(str(step_price)))
             )
             market_price_raw = float(
                 Decimal(str(ask_price)) + (Decimal(str(market_distance_steps)) * Decimal(str(step_price)))
@@ -895,21 +998,35 @@ def build_hedge_micro_grid_plan(
             price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "SELL")
 
-    remaining_short_exit_qty = _round_order_qty(effective_short_qty, step_size)
-    for level in range(1, buy_levels + 1):
+    short_lot_exit_orders: list[PlanOrder] = []
+    short_lot_exit_qty = 0.0
+    if short_exit_profit_guard_active:
+        short_lot_exit_orders, short_lot_exit_qty = _build_lot_take_profit_orders(
+            lots=effective_short_lots,
+            side="BUY",
+            profit_step=profit_step,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            role="take_profit_short",
+            position_side="SHORT",
+        )
+        for order in short_lot_exit_orders:
+            buy_orders.append(order)
+
+    remaining_short_exit_qty = _round_order_qty(max(effective_short_qty - short_lot_exit_qty, 0.0), step_size)
+    for level in range(len(short_lot_exit_orders) + 1, len(short_lot_exit_orders) + buy_levels + 1):
         if remaining_short_exit_qty <= 0:
             break
-        price = _buy_price(level)
+        fallback_level = level - len(short_lot_exit_orders)
+        price = _buy_price(fallback_level)
         desired_qty = _round_order_qty(per_order_notional / price, step_size)
         qty = _round_order_qty(min(desired_qty, remaining_short_exit_qty), step_size)
         notional = price * qty
         if short_exit_profit_guard_active:
-            if latest_short_lot_price is not None and price >= latest_short_lot_price:
+            if short_exit_reference_price is not None and price >= short_exit_reference_price:
                 continue
-            if latest_short_lot_price is None and current_short_avg_price > 0 and price >= current_short_avg_price:
-                continue
-        if price >= ask_price:
-            continue
         if min_qty is not None and qty < min_qty:
             continue
         if min_notional is not None and notional < min_notional:
@@ -944,14 +1061,10 @@ def build_hedge_micro_grid_plan(
                     and price > light_long_entry_max_price
                 ):
                     continue
-                if latest_long_lot_price is not None and price > latest_long_lot_price:
-                    continue
-                if latest_long_lot_price is None and current_long_avg_price > 0 and price > current_long_avg_price:
+                if long_entry_reference_price is not None and price > long_entry_reference_price:
                     continue
             if short_exit_profit_guard_active:
-                if latest_short_lot_price is not None and price >= latest_short_lot_price:
-                    continue
-                if latest_short_lot_price is None and current_short_avg_price > 0 and price >= current_short_avg_price:
+                if short_exit_reference_price is not None and price >= short_exit_reference_price:
                     continue
             qty = _round_order_qty(_entry_notional(level=level, current_qty=effective_long_qty) / price, step_size)
             notional = price * qty
@@ -976,21 +1089,35 @@ def build_hedge_micro_grid_plan(
             if effective_short_qty > 0:
                 break
 
-    remaining_long_exit_qty = _round_order_qty(effective_long_qty, step_size)
-    for level in range(1, sell_levels + 1):
+    long_lot_exit_orders: list[PlanOrder] = []
+    long_lot_exit_qty = 0.0
+    if long_exit_profit_guard_active:
+        long_lot_exit_orders, long_lot_exit_qty = _build_lot_take_profit_orders(
+            lots=effective_long_lots,
+            side="SELL",
+            profit_step=profit_step,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            role="take_profit_long",
+            position_side="LONG",
+        )
+        for order in long_lot_exit_orders:
+            sell_orders.append(order)
+
+    remaining_long_exit_qty = _round_order_qty(max(effective_long_qty - long_lot_exit_qty, 0.0), step_size)
+    for level in range(len(long_lot_exit_orders) + 1, len(long_lot_exit_orders) + sell_levels + 1):
         if remaining_long_exit_qty <= 0:
             break
-        price = _sell_price(level)
+        fallback_level = level - len(long_lot_exit_orders)
+        price = _sell_price(fallback_level)
         desired_qty = _round_order_qty(per_order_notional / price, step_size)
         qty = _round_order_qty(min(desired_qty, remaining_long_exit_qty), step_size)
         notional = price * qty
         if long_exit_profit_guard_active:
-            if latest_long_lot_price is not None and price <= latest_long_lot_price:
+            if long_exit_reference_price is not None and price <= long_exit_reference_price:
                 continue
-            if latest_long_lot_price is None and current_long_avg_price > 0 and price <= current_long_avg_price:
-                continue
-        if price <= bid_price:
-            continue
         if min_qty is not None and qty < min_qty:
             continue
         if min_notional is not None and notional < min_notional:
@@ -1030,14 +1157,10 @@ def build_hedge_micro_grid_plan(
                     and price < light_short_entry_min_price
                 ):
                     continue
-                if latest_short_lot_price is not None and price < latest_short_lot_price:
-                    continue
-                if latest_short_lot_price is None and current_short_avg_price > 0 and price < current_short_avg_price:
+                if short_entry_reference_price is not None and price < short_entry_reference_price:
                     continue
             if long_exit_profit_guard_active:
-                if latest_long_lot_price is not None and price <= latest_long_lot_price:
-                    continue
-                if latest_long_lot_price is None and current_long_avg_price > 0 and price <= current_long_avg_price:
+                if long_exit_reference_price is not None and price <= long_exit_reference_price:
                     continue
             entry_notional = _entry_notional(level=level, current_qty=effective_short_qty)
             if allow_paused_short_probe:
@@ -1116,6 +1239,20 @@ def build_hedge_micro_grid_plan(
         "target_short_base_qty": target_short_base_qty,
         "bootstrap_long_qty": bootstrap_long_qty,
         "bootstrap_short_qty": bootstrap_short_qty,
+        "effective_long_qty": effective_long_qty,
+        "effective_short_qty": effective_short_qty,
+        "residual_short_flat_notional": residual_short_flat_notional,
+        "residual_short_flattened": residual_short_flattened,
+        "residual_short_flattened_qty": residual_short_flattened_qty,
+        "residual_short_flattened_notional": residual_short_flattened_notional,
+        "long_entry_reference_price": long_entry_reference_price,
+        "long_exit_reference_price": long_exit_reference_price,
+        "short_entry_reference_price": short_entry_reference_price,
+        "short_exit_reference_price": short_exit_reference_price,
+        "lowest_long_lot_price": lowest_long_lot_price,
+        "highest_long_lot_price": highest_long_lot_price,
+        "lowest_short_lot_price": lowest_short_lot_price,
+        "highest_short_lot_price": highest_short_lot_price,
     }
 
 
@@ -1366,14 +1503,17 @@ def preserve_sticky_entry_orders(
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
     price_tolerance: float,
+    max_levels_per_group: int | None = None,
 ) -> list[dict[str, Any]]:
     tolerance = max(_safe_float(price_tolerance), 0.0)
-    if tolerance <= 0:
+    safe_max_levels = None if max_levels_per_group is None else max(int(max_levels_per_group), 0)
+    if tolerance <= 0 or safe_max_levels == 0:
         return [dict(order) for order in desired_orders]
 
     adjusted_orders = [dict(order) for order in desired_orders]
     entry_roles = {"entry_long", "entry_short"}
     take_profit_roles = {"take_profit_long", "take_profit_short"}
+    sticky_roles = entry_roles | take_profit_roles
 
     def _position_side(order: dict[str, Any]) -> str:
         raw = str(order.get("position_side", order.get("positionSide", "BOTH"))).upper().strip()
@@ -1411,7 +1551,7 @@ def preserve_sticky_entry_orders(
     desired_groups: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
     for index, order in enumerate(adjusted_orders):
         role = str(order.get("role", "")).strip()
-        if role not in entry_roles:
+        if role not in sticky_roles:
             continue
         side = str(order.get("side", "")).upper().strip()
         if side not in {"BUY", "SELL"}:
@@ -1422,7 +1562,7 @@ def preserve_sticky_entry_orders(
     existing_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for order in existing_orders:
         role = str(order.get("role", "")).strip()
-        if role not in entry_roles:
+        if role not in sticky_roles:
             continue
         side = str(order.get("side", "")).upper().strip()
         if side not in {"BUY", "SELL"}:
@@ -1438,12 +1578,16 @@ def preserve_sticky_entry_orders(
             continue
         desired_sorted = sorted(desired_group, key=lambda item: _sort_key(item[1]))
         existing_sorted = sorted(existing_group, key=_sort_key)
+        if safe_max_levels is not None:
+            desired_sorted = desired_sorted[:safe_max_levels]
+            existing_sorted = existing_sorted[:safe_max_levels]
         for (index, desired_order), existing_order in zip(desired_sorted, existing_sorted):
             desired_price = _price(desired_order)
             existing_price = _price(existing_order)
             if desired_price <= 0 or existing_price <= 0:
                 continue
-            if abs(existing_price - desired_price) > tolerance + 1e-12:
+            role = str(desired_order.get("role", "")).strip()
+            if role in entry_roles and abs(existing_price - desired_price) > tolerance + 1e-12:
                 continue
             if not _existing_is_closer(existing_order, desired_order):
                 continue
@@ -1460,6 +1604,7 @@ def preserve_sticky_entry_orders(
             if "notional" in adjusted_order:
                 adjusted_order["notional"] = existing_price * qty
             adjusted_orders[index] = adjusted_order
+            occupied_buckets.add(bucket)
 
     return adjusted_orders
 

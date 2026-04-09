@@ -2246,6 +2246,16 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.static_buy_offset_steps, 0.5)
         self.assertEqual(args.static_sell_offset_steps, 1.0)
 
+    def test_build_parser_accepts_sticky_entry_levels(self) -> None:
+        args = _build_parser().parse_args(["--sticky-entry-levels", "2"])
+
+        self.assertEqual(args.sticky_entry_levels, 2)
+
+    def test_build_parser_accepts_synthetic_residual_short_flat_notional(self) -> None:
+        args = _build_parser().parse_args(["--synthetic-residual-short-flat-notional", "30"])
+
+        self.assertEqual(args.synthetic_residual_short_flat_notional, 30.0)
+
     def test_build_parser_accepts_take_profit_min_profit_ratio(self) -> None:
         args = _build_parser().parse_args(["--take-profit-min-profit-ratio", "0.0005"])
 
