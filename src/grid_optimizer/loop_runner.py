@@ -80,7 +80,10 @@ from .submit_plan import (
     prepare_post_only_order_request,
     validate_plan_report,
 )
+<<<<<<< HEAD
 from .dry_run import _round_order_price, _round_order_qty
+from .inventory_grid_plan import build_inventory_grid_orders
+from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
 AUTO_REGIME_DEFENSIVE_PROFILE = "volatility_defensive_v1"
@@ -1018,6 +1021,10 @@ def _is_inventory_target_neutral_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "inventory_target_neutral"
 
 
+def _is_competition_inventory_grid_mode(strategy_mode: str) -> bool:
+    return str(strategy_mode).strip() == "competition_inventory_grid"
+
+
 def _is_custom_grid_mode(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "custom_grid_enabled", False))
 
@@ -1634,6 +1641,103 @@ def update_synthetic_order_refs(
         return
 
 
+def _update_inventory_grid_order_refs(
+    *,
+    state_path: Path,
+    strategy_mode: str,
+    submit_report: dict[str, Any],
+) -> None:
+    if not _is_competition_inventory_grid_mode(strategy_mode) or not state_path.exists():
+        return
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    refs = state.get("inventory_grid_order_refs")
+    if not isinstance(refs, dict):
+        refs = {}
+
+    for item in submit_report.get("placed_orders", []):
+        if not isinstance(item, dict):
+            continue
+        request = item.get("request", {}) if isinstance(item.get("request"), dict) else {}
+        response = item.get("response", {}) if isinstance(item.get("response"), dict) else {}
+        order_id = epoch_ms(response.get("orderId"))
+        if order_id <= 0:
+            continue
+        refs[str(order_id)] = {
+            "role": str(request.get("role", "")).strip(),
+            "side": str(request.get("side", "")).upper().strip(),
+            "client_order_id": str(response.get("clientOrderId", "")).strip(),
+            "updated_at": _isoformat(_utc_now()),
+        }
+
+    if len(refs) > 5000:
+        recent_items = list(refs.items())[-5000:]
+        refs = {key: value for key, value in recent_items}
+
+    state["inventory_grid_order_refs"] = refs
+    try:
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return
+
+
+def _generate_competition_inventory_grid_plan(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    current_position_qty: float,
+    bid_price: float,
+    ask_price: float,
+    step_price: float,
+    first_order_multiplier: float,
+    per_order_notional: float,
+    threshold_position_notional: float,
+    max_order_position_notional: float,
+    max_position_notional: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    order_refs = state.get("inventory_grid_order_refs")
+    runtime = rebuild_inventory_grid_runtime(
+        market_type="futures",
+        trades=trades,
+        order_refs=order_refs if isinstance(order_refs, dict) else {},
+        step_price=step_price,
+        current_position_qty=max(float(current_position_qty), 0.0),
+    )
+    if _safe_float(runtime.get("grid_anchor_price")) <= 0:
+        runtime["grid_anchor_price"] = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        step_price=step_price,
+        per_order_notional=per_order_notional,
+        first_order_multiplier=first_order_multiplier,
+        threshold_position_notional=threshold_position_notional,
+        max_order_position_notional=max_order_position_notional,
+        max_position_notional=max_position_notional,
+        tick_size=tick_size,
+        step_size=step_size,
+        min_qty=min_qty,
+        min_notional=min_notional,
+    )
+    return {
+        "strategy_mode": "competition_inventory_grid",
+        **plan,
+        "grid_anchor_price": _safe_float(runtime.get("grid_anchor_price")),
+        "direction_state": str(runtime.get("direction_state", "flat") or "flat"),
+        "pair_credit_steps": int(runtime.get("pair_credit_steps", 0) or 0),
+        "recovery_mode": str(runtime.get("recovery_mode", "live") or "live"),
+    }
+
+
 def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         symbol=args.symbol,
@@ -1677,7 +1781,10 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         neutral_hourly_scale_stable=getattr(args, "neutral_hourly_scale_stable", 1.0),
         neutral_hourly_scale_transition=getattr(args, "neutral_hourly_scale_transition", 0.85),
         neutral_hourly_scale_defensive=getattr(args, "neutral_hourly_scale_defensive", 0.65),
+        first_order_multiplier=getattr(args, "first_order_multiplier", None),
+        threshold_position_notional=getattr(args, "threshold_position_notional", None),
         max_position_notional=getattr(args, "max_position_notional", None),
+        max_order_position_notional=getattr(args, "max_order_position_notional", None),
         max_short_position_notional=getattr(args, "max_short_position_notional", None),
         adaptive_step_enabled=getattr(args, "adaptive_step_enabled", False),
         adaptive_step_30s_abs_return_ratio=getattr(args, "adaptive_step_30s_abs_return_ratio", 0.0),
@@ -4234,7 +4341,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     requested_strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     strategy_mode = requested_strategy_mode
     summary_path = Path(args.summary_jsonl)
-    if requested_strategy_mode not in {"one_way_long", "one_way_short", "hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
+    if requested_strategy_mode not in {
+        "one_way_long",
+        "one_way_short",
+        "hedge_neutral",
+        "synthetic_neutral",
+        "inventory_target_neutral",
+        "competition_inventory_grid",
+    }:
         raise RuntimeError(f"Unsupported strategy_mode: {requested_strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
     symbol_info = fetch_futures_symbol_config(symbol)
@@ -4498,7 +4612,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     actual_entry_price = _safe_float(actual_position.get("entryPrice"))
     long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
     short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
-    if _is_inventory_target_neutral_mode(requested_strategy_mode):
+    if _is_inventory_target_neutral_mode(requested_strategy_mode) or _is_competition_inventory_grid_mode(requested_strategy_mode):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
     elif _is_one_way_short_mode(requested_strategy_mode):
@@ -5216,6 +5330,66 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         target_base_qty = 0.0
         bootstrap_qty = 0.0
+    elif _is_competition_inventory_grid_mode(strategy_mode):
+        if dual_side_position:
+            raise RuntimeError("competition inventory grid 策略要求账户处于单向持仓模式")
+        inventory_tier = {
+            "enabled": False,
+            "active": False,
+            "ratio": 0.0,
+            "start_notional": None,
+            "end_notional": None,
+            "effective_buy_levels": 0,
+            "effective_sell_levels": 0,
+            "effective_per_order_notional": effective_args.per_order_notional,
+            "effective_base_position_notional": 0.0,
+        }
+        inventory_grid_trades = _fetch_trade_rows_since(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=max(int((_utc_now().timestamp() * 1000) - 48 * 3600 * 1000), 0),
+            recv_window=args.recv_window,
+        )
+        plan = _generate_competition_inventory_grid_plan(
+            state=state,
+            trades=inventory_grid_trades,
+            current_position_qty=abs(actual_net_qty),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            step_price=effective_args.step_price,
+            first_order_multiplier=float(getattr(args, "first_order_multiplier", 1.0)),
+            per_order_notional=effective_args.per_order_notional,
+            threshold_position_notional=float(getattr(args, "threshold_position_notional", 0.0)),
+            max_order_position_notional=float(getattr(args, "max_order_position_notional", 0.0)),
+            max_position_notional=float(getattr(args, "max_position_notional", 0.0)),
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+        )
+        inventory_tier["effective_buy_levels"] = len(plan.get("buy_orders", []))
+        inventory_tier["effective_sell_levels"] = len(plan.get("sell_orders", []))
+        controls = {
+            "buy_paused": False,
+            "pause_reasons": [],
+            "short_paused": False,
+            "short_pause_reasons": [],
+            "current_long_notional": current_long_notional,
+            "current_short_notional": current_short_notional,
+        }
+        cap_controls = {
+            "cap_applied": False,
+            "buy_budget_notional": None,
+            "planned_buy_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("buy_orders", []))),
+            "max_position_notional": float(getattr(args, "max_position_notional", 0.0)) or None,
+            "short_cap_applied": False,
+            "short_budget_notional": None,
+            "planned_short_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("sell_orders", []))),
+            "max_short_position_notional": None,
+        }
+        target_base_qty = abs(actual_net_qty)
+        bootstrap_qty = sum(_safe_float(item.get("qty")) for item in list(plan.get("bootstrap_orders", [])))
     elif _is_one_way_short_mode(strategy_mode):
         if _is_best_quote_short_profile(effective_strategy_profile):
             plan = build_best_quote_short_flip_plan(
@@ -5544,6 +5718,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "bootstrap_orders": plan["bootstrap_orders"],
         "buy_orders": plan["buy_orders"],
         "sell_orders": plan["sell_orders"],
+        "forced_reduce_orders": plan.get("forced_reduce_orders", []),
+        "grid_anchor_price": plan.get("grid_anchor_price"),
+        "direction_state": plan.get("direction_state"),
+        "pair_credit_steps": plan.get("pair_credit_steps"),
+        "recovery_mode": plan.get("recovery_mode"),
+        "inventory_grid_risk_state": plan.get("risk_state"),
+        "tail_cleanup_active": bool(plan.get("tail_cleanup_active")),
         "open_order_count": len(open_orders),
         "kept_orders": diff["kept_orders"],
         "missing_orders": diff["missing_orders"],
@@ -5691,6 +5872,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     elif _is_inventory_target_neutral_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("单向目标仓位中性策略要求账户处于单向持仓模式")
+    elif _is_competition_inventory_grid_mode(strategy_mode):
+        if dual_side_position:
+            raise RuntimeError("competition inventory grid 策略要求账户处于单向持仓模式")
     elif _is_one_way_short_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("单向固定中心做空策略要求账户处于单向持仓模式")
@@ -5726,6 +5910,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         if _is_synthetic_neutral_mode(strategy_mode):
             current_long_qty = expected_long_qty
             current_short_qty = expected_short_qty
+        elif _is_competition_inventory_grid_mode(strategy_mode):
+            current_long_qty = max(current_actual_net_qty, 0.0)
+            current_short_qty = max(-current_actual_net_qty, 0.0)
         elif _is_inventory_target_neutral_mode(strategy_mode):
             current_long_qty = max(current_actual_net_qty, 0.0)
             current_short_qty = max(-current_actual_net_qty, 0.0)
@@ -5738,6 +5925,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     if len(current_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
     if _is_synthetic_neutral_mode(strategy_mode):
+        if abs(current_actual_net_qty - expected_actual_net_qty) > 1e-9:
+            raise RuntimeError("当前净持仓与计划生成时不一致，请等待下一轮刷新")
+    elif _is_competition_inventory_grid_mode(strategy_mode):
         if abs(current_actual_net_qty - expected_actual_net_qty) > 1e-9:
             raise RuntimeError("当前净持仓与计划生成时不一致，请等待下一轮刷新")
     elif _is_one_way_short_mode(strategy_mode):
@@ -5799,6 +5989,8 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         position_side = _order_position_side(order)
         if strategy_mode in {"hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
             reduce_only = None
+        elif _is_competition_inventory_grid_mode(strategy_mode):
+            reduce_only = True if role in {"grid_exit", "forced_reduce", "tail_cleanup"} else None
         else:
             reduce_only = True if (side == "SELL" and role == "take_profit") or (side == "BUY" and role == "take_profit_short") else None
         last_exc: RuntimeError | None = None
@@ -5877,6 +6069,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         strategy_mode=strategy_mode,
         submit_report=report,
     )
+    _update_inventory_grid_order_refs(
+        state_path=Path(str(plan_report.get("state_path", args.state_path))),
+        strategy_mode=strategy_mode,
+        submit_report=report,
+    )
     report["executed"] = True
     return report
 
@@ -5887,7 +6084,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--symbol", type=str, default="NIGHTUSDT")
     parser.add_argument("--strategy-profile", type=str, default=AUTO_REGIME_STABLE_PROFILE)
-    parser.add_argument("--strategy-mode", type=str, default="one_way_long", choices=("one_way_long", "one_way_short", "hedge_neutral", "synthetic_neutral", "inventory_target_neutral"))
+    parser.add_argument("--strategy-mode", type=str, default="one_way_long", choices=("one_way_long", "one_way_short", "hedge_neutral", "synthetic_neutral", "inventory_target_neutral", "competition_inventory_grid"))
     parser.add_argument("--step-price", type=float, default=0.00002)
     parser.add_argument("--buy-levels", type=int, default=8)
     parser.add_argument("--sell-levels", type=int, default=8)
@@ -5911,6 +6108,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-bias-regime-switch-confirm-cycles", type=int, default=2)
     parser.add_argument("--market-bias-regime-switch-weak-threshold", type=float, default=0.15)
     parser.add_argument("--market-bias-regime-switch-strong-threshold", type=float, default=0.15)
+    parser.add_argument("--first-order-multiplier", type=float, default=4.0)
+    parser.add_argument("--threshold-position-notional", type=float, default=50.0)
+    parser.add_argument("--max-order-position-notional", type=float, default=80.0)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--warm-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -6262,6 +6462,12 @@ def main() -> None:
         raise SystemExit("--market-bias-regime-switch-enabled requires --market-bias-enabled")
     if args.market_bias_regime_switch_enabled and str(args.strategy_mode).strip() != "synthetic_neutral":
         raise SystemExit("--market-bias-regime-switch-enabled currently requires --strategy-mode synthetic_neutral")
+    if args.first_order_multiplier <= 0:
+        raise SystemExit("--first-order-multiplier must be > 0")
+    if args.threshold_position_notional < 0:
+        raise SystemExit("--threshold-position-notional must be >= 0")
+    if args.max_order_position_notional < 0:
+        raise SystemExit("--max-order-position-notional must be >= 0")
     if args.max_position_notional is not None and args.max_position_notional <= 0:
         raise SystemExit("--max-position-notional must be > 0")
     if args.pause_short_position_notional is not None and args.pause_short_position_notional <= 0:

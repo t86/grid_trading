@@ -12,17 +12,19 @@ from grid_optimizer.audit import build_audit_paths
 from grid_optimizer.loop_runner import (
     AUTO_REGIME_PROFILE_LABELS,
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
+    _build_parser,
     _should_sync_account_audit,
     _apply_synthetic_trade_fill,
     _decorate_synthetic_open_orders,
     _load_synthetic_ledger,
-    _build_parser,
     _current_check_bucket,
     _custom_grid_levels_above_current,
+    _generate_competition_inventory_grid_plan,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _shift_custom_grid_bounds,
     StartupProtectionError,
+    _update_inventory_grid_order_refs,
     apply_excess_inventory_reduce_only,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
@@ -60,6 +62,27 @@ from grid_optimizer.types import Candle
 class LoopRunnerTests(unittest.TestCase):
     def test_bard_profile_has_human_readable_label(self) -> None:
         self.assertEqual(AUTO_REGIME_PROFILE_LABELS["bard_12h_push_neutral_v2"], "通用刷量V1")
+
+    def test_build_parser_accepts_competition_inventory_grid_mode(self) -> None:
+        parser = _build_parser()
+
+        args = parser.parse_args(
+            [
+                "--strategy-mode",
+                "competition_inventory_grid",
+                "--first-order-multiplier",
+                "4.0",
+                "--threshold-position-notional",
+                "50.0",
+                "--max-order-position-notional",
+                "80.0",
+            ]
+        )
+
+        self.assertEqual(args.strategy_mode, "competition_inventory_grid")
+        self.assertEqual(args.first_order_multiplier, 4.0)
+        self.assertEqual(args.threshold_position_notional, 50.0)
+        self.assertEqual(args.max_order_position_notional, 80.0)
 
     def test_current_check_bucket_rounds_down_to_interval(self) -> None:
         bucket = _current_check_bucket(
@@ -1269,6 +1292,62 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(decorated[0]["role"], "entry_long")
         self.assertEqual(decorated[0]["positionSide"], "BOTH")
+
+    def test_generate_competition_inventory_grid_plan_bootstraps_two_orders_when_futures_flat(self) -> None:
+        plan = _generate_competition_inventory_grid_plan(
+            state={},
+            trades=[],
+            current_position_qty=0.0,
+            bid_price=0.0999,
+            ask_price=0.1001,
+            step_price=0.01,
+            first_order_multiplier=4.0,
+            per_order_notional=10.0,
+            threshold_position_notional=50.0,
+            max_order_position_notional=80.0,
+            max_position_notional=120.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=0.1,
+        )
+
+        self.assertEqual(plan["strategy_mode"], "competition_inventory_grid")
+        self.assertEqual({item["side"] for item in plan["bootstrap_orders"]}, {"BUY", "SELL"})
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["direction_state"], "flat")
+        self.assertEqual(plan["pair_credit_steps"], 0)
+        self.assertEqual(plan["recovery_mode"], "live")
+        self.assertGreater(plan["grid_anchor_price"], 0.0)
+
+    def test_update_inventory_grid_order_refs_records_placed_orders(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+
+            _update_inventory_grid_order_refs(
+                state_path=state_path,
+                strategy_mode="competition_inventory_grid",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "bootstrap_entry",
+                                "side": "SELL",
+                            },
+                            "response": {
+                                "orderId": 67890,
+                                "clientOrderId": "grid-test",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            payload = state_path.read_text(encoding="utf-8")
+            self.assertIn("inventory_grid_order_refs", payload)
+            self.assertIn("67890", payload)
 
     def test_apply_hedge_position_controls_can_pause_long_or_short_side_independently(self) -> None:
         plan = {
