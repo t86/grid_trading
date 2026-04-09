@@ -4680,8 +4680,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 float(getattr(effective_args, "static_sell_offset_steps", 0.0))
                 + float((market_bias or {}).get("sell_offset_steps", 0.0))
             ),
-            entry_long_cost_guard_release_notional=max(_safe_float(effective_args.pause_buy_position_notional), 0.0) * 0.5,
-            entry_short_cost_guard_release_notional=max(_safe_float(effective_args.pause_short_position_notional), 0.0) * 0.5,
+            # Synthetic neutral should keep quoting near the live book even when
+            # inventory is light; otherwise the nearest exit drifts too far away
+            # from the touch and volume dries up.
+            entry_long_cost_guard_release_notional=0.0,
+            entry_short_cost_guard_release_notional=0.0,
             entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
             entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
             paused_entry_short_scale=strong_short_probe_scale,
