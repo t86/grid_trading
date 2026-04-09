@@ -87,7 +87,14 @@ def _forced_reduce_lots(
         if take_qty <= EPSILON:
             continue
         selection[lot_id] = selection.get(lot_id, 0.0) + take_qty
-        selected.append({"lot_id": lot_id, "qty": take_qty})
+        selected.append(
+            {
+                "lot_id": lot_id,
+                "qty": take_qty,
+                "matched_qty": take_qty,
+                "entry_price": max(float(lot.get("entry_price", 0.0) or 0.0), 0.0),
+            }
+        )
         remaining -= take_qty
 
     new_lots: list[dict[str, Any]] = []
@@ -196,6 +203,15 @@ def apply_inventory_grid_fill(
                     direction_state=current_state,
                     reduce_qty=fill_qty,
                 )
+                forced_reduce_cost_steps = _accumulate_pair_credit_steps(
+                    matched=matched,
+                    exit_price=fill_price,
+                    step_price=step_price,
+                )
+                runtime["pair_credit_steps"] = max(
+                    0,
+                    int(runtime.get("pair_credit_steps", 0) or 0) - forced_reduce_cost_steps,
+                )
             else:
                 lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
             if normalized_role == "grid_exit":
@@ -230,6 +246,15 @@ def apply_inventory_grid_fill(
                     lots=lots,
                     direction_state=current_state,
                     reduce_qty=fill_qty,
+                )
+                forced_reduce_cost_steps = _accumulate_pair_credit_steps(
+                    matched=matched,
+                    exit_price=fill_price,
+                    step_price=step_price,
+                )
+                runtime["pair_credit_steps"] = max(
+                    0,
+                    int(runtime.get("pair_credit_steps", 0) or 0) - forced_reduce_cost_steps,
                 )
             else:
                 lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)

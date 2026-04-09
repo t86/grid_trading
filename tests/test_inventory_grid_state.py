@@ -127,6 +127,64 @@ def test_apply_fill_handles_short_side_entries_and_exits_with_anchor_updates() -
     assert runtime["position_lots"][0]["qty"] == 125.0
 
 
+def test_forced_reduce_fill_debits_pair_credit_steps_for_long_side() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "long_active"
+    runtime["pair_credit_steps"] = 5
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="forced_reduce",
+        side="SELL",
+        price=0.0701,
+        qty=100.0,
+        fill_time_ms=2,
+        step_price=0.01,
+    )
+
+    assert runtime["pair_credit_steps"] == 3
+    assert runtime["position_lots"] == []
+
+
+def test_forced_reduce_fill_floors_pair_credit_steps_at_zero_for_short_side() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "short_active"
+    runtime["pair_credit_steps"] = 1
+    runtime["position_lots"] = [
+        {
+            "lot_id": "s1",
+            "side": "short",
+            "qty": 100.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="forced_reduce",
+        side="BUY",
+        price=0.1299,
+        qty=100.0,
+        fill_time_ms=2,
+        step_price=0.01,
+    )
+
+    assert runtime["pair_credit_steps"] == 0
+    assert runtime["position_lots"] == []
+
+
 def test_build_forced_reduce_lot_plan_prefers_most_adverse_longs() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "long_active"
