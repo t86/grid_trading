@@ -146,6 +146,81 @@ def test_build_forced_reduce_lot_plan_prefers_most_adverse_longs() -> None:
     assert lot_plan["forced_reduce_cost_steps"] == 0
 
 
+def test_forced_reduce_fill_consumes_same_most_adverse_lots_as_plan() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "long_active"
+    runtime["position_lots"] = [
+        {"lot_id": "cheap", "side": "long", "qty": 100.0, "entry_price": 0.09, "opened_at_ms": 1, "source_role": "grid_entry"},
+        {"lot_id": "expensive", "side": "long", "qty": 100.0, "entry_price": 0.10, "opened_at_ms": 2, "source_role": "grid_entry"},
+    ]
+
+    plan = build_forced_reduce_lot_plan(
+        runtime=runtime,
+        reduce_price=0.095,
+        reduce_qty=100.0,
+        step_price=0.01,
+    )
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="forced_reduce",
+        side="SELL",
+        price=0.095,
+        qty=100.0,
+        fill_time_ms=3,
+    )
+
+    assert [item["lot_id"] for item in plan["lots"]] == ["expensive"]
+    assert runtime["position_lots"][0]["lot_id"] == "cheap"
+    assert runtime["position_lots"][0]["qty"] == 100.0
+
+
+def test_tail_cleanup_closes_long_and_short_inventory_without_anchor_updates() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="bootstrap_entry",
+        side="BUY",
+        price=0.10,
+        qty=100.0,
+        fill_time_ms=1,
+    )
+    runtime["grid_anchor_price"] = 0.10
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="tail_cleanup",
+        side="SELL",
+        price=0.09,
+        qty=100.0,
+        fill_time_ms=2,
+    )
+    assert runtime["direction_state"] == "flat"
+    assert runtime["position_lots"] == []
+    assert runtime["grid_anchor_price"] == 0.10
+
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="grid_entry",
+        side="SELL",
+        price=0.12,
+        qty=50.0,
+        fill_time_ms=3,
+    )
+    runtime["grid_anchor_price"] = 0.12
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="tail_cleanup",
+        side="BUY",
+        price=0.11,
+        qty=50.0,
+        fill_time_ms=4,
+    )
+    assert runtime["direction_state"] == "flat"
+    assert runtime["position_lots"] == []
+    assert runtime["grid_anchor_price"] == 0.12
+
+
 def test_build_forced_reduce_lot_plan_rejects_invalid_inputs() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "bogus"

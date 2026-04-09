@@ -6,7 +6,7 @@ from typing import Any
 EPSILON = 1e-12
 ANCHOR_UPDATE_ROLES = frozenset({"bootstrap_entry", "grid_entry", "grid_exit"})
 OPENING_ROLES = frozenset({"bootstrap_entry", "grid_entry"})
-CLOSING_ROLES = frozenset({"grid_exit", "forced_reduce"})
+CLOSING_ROLES = frozenset({"grid_exit", "forced_reduce", "tail_cleanup"})
 VALID_DIRECTION_STATES = frozenset({"flat", "long_active", "short_active"})
 
 
@@ -25,17 +25,6 @@ def new_inventory_grid_runtime(*, market_type: str) -> dict[str, Any]:
         "recovery_mode": "live",
         "recovery_errors": [],
     }
-
-
-def _next_direction_state(*, market_type: str, current_state: str, side: str) -> str:
-    normalized_side = str(side or "").upper().strip()
-    if current_state != "flat":
-        return current_state
-    if normalized_side == "BUY":
-        return "long_active"
-    if market_type == "futures" and normalized_side == "SELL":
-        return "short_active"
-    return current_state
 
 
 def _consume_lots(
@@ -66,6 +55,55 @@ def _consume_lots(
 
 def _total_lot_qty(*, lots: list[dict[str, Any]]) -> float:
     return sum(max(float(lot.get("qty", 0.0) or 0.0), 0.0) for lot in lots)
+
+
+def _forced_reduce_lots(
+    *,
+    lots: list[dict[str, Any]],
+    direction_state: str,
+    reduce_qty: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if direction_state == "long_active":
+        ordered = sorted(
+            enumerate(lots),
+            key=lambda item: (float(item[1].get("entry_price", 0.0) or 0.0), item[0]),
+            reverse=True,
+        )
+    else:
+        ordered = sorted(
+            enumerate(lots),
+            key=lambda item: (float(item[1].get("entry_price", 0.0) or 0.0), item[0]),
+        )
+
+    remaining = max(float(reduce_qty), 0.0)
+    selection: dict[str, float] = {}
+    selected: list[dict[str, Any]] = []
+    for _, lot in ordered:
+        if remaining <= EPSILON:
+            break
+        lot_id = str(lot.get("lot_id") or "")
+        lot_qty = max(float(lot.get("qty", 0.0) or 0.0), 0.0)
+        take_qty = min(lot_qty, remaining)
+        if take_qty <= EPSILON:
+            continue
+        selection[lot_id] = selection.get(lot_id, 0.0) + take_qty
+        selected.append({"lot_id": lot_id, "qty": take_qty})
+        remaining -= take_qty
+
+    new_lots: list[dict[str, Any]] = []
+    for lot in lots:
+        lot_id = str(lot.get("lot_id") or "")
+        take_qty = selection.get(lot_id, 0.0)
+        if take_qty <= EPSILON:
+            new_lots.append(dict(lot))
+            continue
+        lot_qty = max(float(lot.get("qty", 0.0) or 0.0), 0.0)
+        left_qty = lot_qty - take_qty
+        if left_qty > EPSILON:
+            kept = dict(lot)
+            kept["qty"] = left_qty
+            new_lots.append(kept)
+    return new_lots, selected
 
 
 def _accumulate_pair_credit_steps(*, matched: list[dict[str, Any]], exit_price: float, step_price: float) -> int:
@@ -152,7 +190,14 @@ def apply_inventory_grid_fill(
         elif normalized_side == "SELL" and normalized_role in CLOSING_ROLES:
             if _total_lot_qty(lots=lots) + EPSILON < fill_qty:
                 raise ValueError("insufficient long quantity for sell fill")
-            lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
+            if normalized_role == "forced_reduce":
+                lots, matched = _forced_reduce_lots(
+                    lots=lots,
+                    direction_state=current_state,
+                    reduce_qty=fill_qty,
+                )
+            else:
+                lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
             if normalized_role == "grid_exit":
                 runtime["pair_credit_steps"] = int(runtime.get("pair_credit_steps", 0) or 0) + _accumulate_pair_credit_steps(
                     matched=matched,
@@ -180,7 +225,14 @@ def apply_inventory_grid_fill(
         elif normalized_side == "BUY" and normalized_role in CLOSING_ROLES:
             if _total_lot_qty(lots=lots) + EPSILON < fill_qty:
                 raise ValueError("insufficient short quantity for buy fill")
-            lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
+            if normalized_role == "forced_reduce":
+                lots, matched = _forced_reduce_lots(
+                    lots=lots,
+                    direction_state=current_state,
+                    reduce_qty=fill_qty,
+                )
+            else:
+                lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
             if normalized_role == "grid_exit":
                 runtime["pair_credit_steps"] = int(runtime.get("pair_credit_steps", 0) or 0) + _accumulate_pair_credit_steps(
                     matched=matched,
