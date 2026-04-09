@@ -263,6 +263,37 @@
 
 也就是说，这些字段虽然仍然出现在 JSON 里，但在这个模式下不是决定性参数。
 
+### 6. `competition_inventory_grid`
+
+- 核心：围绕这条策略自己最近一次有效成交的锚点滚动，不是围绕市场 last trade，也不是按通用中心迁移逻辑整体平移。
+- 执行方式：
+  - `flat` 时会在买一 / 卖一各挂一笔 `bootstrap_entry` maker 单。
+  - futures 里哪一边先成交，就把方向切到 `long_active` 或 `short_active`，后续网格围绕这次有效成交继续展开。
+  - `grid_entry` / `grid_exit` 成交会继续更新 `grid_anchor_price`。
+- 锚点写回规则：
+  - 会更新锚点的成交：`bootstrap_entry`、`grid_entry`、`grid_exit`
+  - 不会更新锚点的成交：`forced_reduce`、`tail_cleanup`
+- 风险控制：
+  - `threshold_position_notional`
+    - 达到阈值后进入 `threshold_reduce_only`。
+    - 先看 pair-credit 是否足够覆盖本轮 `forced_reduce` 的成本；不够时，本轮不挂 `forced_reduce`，同侧新增仓位也会暂停。
+  - `max_position_notional`
+    - 到达硬上限后进入 `hard_reduce_only`。
+    - 这时只保留减仓逻辑，不再允许新增同向开仓；`forced_reduce` 不再受 pair-credit 余额限制。
+- 适用前提：
+  - 这是单向持仓模式的 futures 竞赛库存网格，不能在双向持仓账户里跑。
+
+### 7. `spot_competition_inventory_grid`
+
+- 核心：和上面的竞赛库存网格是同一套引擎，但适配成 spot 的 long-only 库存滚动。
+- 执行方式：
+  - `flat` 时只挂一笔 `bootstrap_entry` BUY，不会反向开空。
+  - 后续只围绕已持有现货库存做买入补仓、卖出减仓和尾部清理。
+- 重启 / 恢复：
+  - 启动时会用策略标签过的成交和 `known_orders` 重建 lots、方向状态和锚点。
+  - 只有能映射到策略订单引用的成交才会被回放，外部成交不会拿来重建这套 runtime。
+  - `pair_credit_steps` 来自 recovery 重建出来的 runtime；当前实现里这条路径会在重建结束时把它重置为 0，所以重启后不会沿用上一次会话里缓存的 pair-credit。
+
 ## 预设策略说明
 
 ### `volume_long_v4`
