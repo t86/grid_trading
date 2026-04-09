@@ -133,6 +133,43 @@ def test_pair_credit_unlocks_forced_reduce_order() -> None:
     assert any(item["role"] == "forced_reduce" for item in plan["forced_reduce_orders"])
 
 
+def test_threshold_reduce_only_uses_raw_best_price_for_forced_reduce_credit() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.10
+    runtime["pair_credit_steps"] = 0
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 200.0,
+            "entry_price": 0.10,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.0748,
+        ask_price=0.0749,
+        step_price=0.025,
+        per_order_notional=10.0,
+        first_order_multiplier=4.0,
+        threshold_position_notional=5.0,
+        max_order_position_notional=30.0,
+        max_position_notional=40.0,
+        tick_size=0.01,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    assert plan["risk_state"] == "threshold_reduce_only"
+    assert all(item["role"] != "forced_reduce" for item in plan["sell_orders"])
+    assert plan["forced_reduce_orders"] == []
+
+
 def test_tail_cleanup_emits_single_cleanup_order() -> None:
     runtime = new_inventory_grid_runtime(market_type="spot")
     runtime["direction_state"] = "long_active"

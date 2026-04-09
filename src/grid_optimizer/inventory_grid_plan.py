@@ -189,7 +189,8 @@ def build_inventory_grid_orders(
         if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
             reduce_qty = _round_order_qty(max(inventory_notional - max(_safe_float(threshold_position_notional), 0.0), 0.0) / max(mid_price, EPSILON), step_size)
             if reduce_qty > 0:
-                forced_reduce_price = _round_order_price(ask_price, tick_size, "SELL")
+                forced_reduce_price = _safe_float(ask_price)
+                forced_reduce_order_price = _round_order_price(ask_price, tick_size, "SELL")
                 lot_plan = build_forced_reduce_lot_plan(
                     runtime=runtime,
                     reduce_price=forced_reduce_price,
@@ -199,7 +200,7 @@ def build_inventory_grid_orders(
                 if risk_state == "hard_reduce_only" or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"]):
                     forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
                     if forced_qty > 0:
-                        order = _build_order(side="SELL", price=forced_reduce_price, qty=forced_qty, role="forced_reduce")
+                        order = _build_order(side="SELL", price=forced_reduce_order_price, qty=forced_qty, role="forced_reduce")
                         sell_orders.append(order)
                         forced_reduce_orders.append(order)
 
@@ -244,7 +245,8 @@ def build_inventory_grid_orders(
         if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
             reduce_qty = _round_order_qty(max(inventory_notional - max(_safe_float(threshold_position_notional), 0.0), 0.0) / max(mid_price, EPSILON), step_size)
             if reduce_qty > 0:
-                forced_reduce_price = _round_order_price(bid_price, tick_size, "BUY")
+                forced_reduce_price = _safe_float(bid_price)
+                forced_reduce_order_price = _round_order_price(bid_price, tick_size, "BUY")
                 lot_plan = build_forced_reduce_lot_plan(
                     runtime=runtime,
                     reduce_price=forced_reduce_price,
@@ -254,7 +256,7 @@ def build_inventory_grid_orders(
                 if risk_state == "hard_reduce_only" or int(runtime.get("pair_credit_steps", 0) or 0) >= int(lot_plan["forced_reduce_cost_steps"]):
                     forced_qty = _round_order_qty(sum(max(_safe_float(item.get("qty")), 0.0) for item in lot_plan["lots"]), step_size)
                     if forced_qty > 0:
-                        order = _build_order(side="BUY", price=forced_reduce_price, qty=forced_qty, role="forced_reduce")
+                        order = _build_order(side="BUY", price=forced_reduce_order_price, qty=forced_qty, role="forced_reduce")
                         buy_orders.append(order)
                         forced_reduce_orders.append(order)
 
