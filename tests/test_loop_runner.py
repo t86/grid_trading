@@ -35,6 +35,7 @@ from grid_optimizer.loop_runner import (
     apply_take_profit_profit_guard,
     apply_short_cover_pause,
     apply_warm_start_bootstrap_guard,
+    assess_synthetic_tp_only_watchdog,
     assess_flat_start_guard,
     apply_xaut_reduce_only_pruning,
     assess_auto_regime,
@@ -712,6 +713,98 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertIn(1.001, sell_prices)
         self.assertEqual(min(sell_prices), 1.001)
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_synthetic_neutral_keeps_light_short_front_exit_at_nearest_profitable_tick(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_sync_synthetic_ledger,
+        mock_load_state,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 1.0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "synthetic_ledger": {},
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "1.001", "ask_price": "1.002"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "TESTUSDT", "positionAmt": "-20", "entryPrice": "1.0025"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "shift_freeze_reasons": [],
+        }
+        mock_sync_synthetic_ledger.return_value = {
+            "virtual_long_qty": 0.0,
+            "virtual_long_avg_price": 0.0,
+            "virtual_long_lots": [],
+            "virtual_short_qty": 20.0,
+            "virtual_short_avg_price": 1.0025,
+            "virtual_short_lots": [
+                {"qty": 10.0, "price": 1.02},
+                {"qty": 10.0, "price": 0.985},
+            ],
+            "applied_trade_count": 0,
+            "unmatched_trade_count": 0,
+            "resynced_to_actual": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_mode = "synthetic_neutral"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 2
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.pause_buy_position_notional = 250.0
+            args.pause_short_position_notional = 250.0
+            args.synthetic_residual_short_flat_notional = 0.0
+            args.take_profit_min_profit_ratio = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        take_profit_prices = [item["price"] for item in report["buy_orders"] if item["role"] == "take_profit_short"]
+
+        self.assertEqual(take_profit_prices, [1.001])
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
@@ -2640,10 +2733,63 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.synthetic_residual_short_flat_notional, 30.0)
 
+    def test_build_parser_accepts_synthetic_tiny_residual_notional_thresholds(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--synthetic-tiny-long-residual-notional",
+                "45",
+                "--synthetic-tiny-short-residual-notional",
+                "55",
+            ]
+        )
+
+        self.assertEqual(args.synthetic_tiny_long_residual_notional, 45.0)
+        self.assertEqual(args.synthetic_tiny_short_residual_notional, 55.0)
+
     def test_build_parser_accepts_take_profit_min_profit_ratio(self) -> None:
         args = _build_parser().parse_args(["--take-profit-min-profit-ratio", "0.0005"])
 
         self.assertEqual(args.take_profit_min_profit_ratio, 0.0005)
+
+    def test_assess_synthetic_tp_only_watchdog_activates_after_persistent_tp_only_gap(self) -> None:
+        state: dict[str, object] = {}
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"role": "take_profit_short", "side": "BUY", "price": 90.0}],
+            "sell_orders": [{"role": "take_profit_long", "side": "SELL", "price": 110.0}],
+        }
+        started_at = datetime(2026, 4, 10, 0, 6, 33, tzinfo=timezone.utc)
+
+        first = assess_synthetic_tp_only_watchdog(
+            state=state,
+            strategy_mode="synthetic_neutral",
+            plan=plan,
+            current_long_qty=0.008,
+            current_short_qty=0.219,
+            mid_price=100.0,
+            step_price=1.0,
+            now=started_at,
+        )
+        second = assess_synthetic_tp_only_watchdog(
+            state=state,
+            strategy_mode="synthetic_neutral",
+            plan=plan,
+            current_long_qty=0.008,
+            current_short_qty=0.219,
+            mid_price=100.0,
+            step_price=1.0,
+            now=started_at + timedelta(seconds=181),
+        )
+
+        self.assertTrue(first["tp_only_mode"])
+        self.assertTrue(first["candidate"])
+        self.assertFalse(first["active"])
+        self.assertAlmostEqual(first["buy_gap_steps"], 10.0)
+        self.assertAlmostEqual(first["sell_gap_steps"], 10.0)
+        self.assertTrue(second["candidate"])
+        self.assertTrue(second["active"])
+        self.assertAlmostEqual(second["duration_seconds"], 181.0)
+        self.assertIn("buy_gap=10.0 step", second["reason"])
 
     def test_build_hedge_micro_grid_plan_respects_near_price_offsets(self) -> None:
         plan = build_hedge_micro_grid_plan(

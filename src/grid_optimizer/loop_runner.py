@@ -175,6 +175,8 @@ XAUT_ADAPTIVE_MIN_STEP_TICKS = 20
 XAUT_ADAPTIVE_MIN_STEP_SPREADS = 20.0
 ADAPTIVE_STEP_HISTORY_RETENTION_SECONDS = 10 * 60
 ADAPTIVE_STEP_MIN_COVERAGE_RATIO = 0.5
+SYNTHETIC_TP_ONLY_WATCHDOG_MIN_GAP_STEPS = 8.0
+SYNTHETIC_TP_ONLY_WATCHDOG_MIN_DURATION_SECONDS = 180.0
 
 
 class StartupProtectionError(RuntimeError):
@@ -997,6 +999,117 @@ def _is_long_exit_order(order: dict[str, Any]) -> bool:
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
     return _order_role(order) in {"take_profit_short", "active_delever_short"}
+
+
+def assess_synthetic_tp_only_watchdog(
+    *,
+    state: dict[str, Any],
+    strategy_mode: str,
+    plan: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    mid_price: float,
+    step_price: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = now or _utc_now()
+    report = {
+        "enabled": _is_synthetic_neutral_mode(strategy_mode),
+        "tp_only_mode": False,
+        "candidate": False,
+        "active": False,
+        "started_at": None,
+        "last_seen_at": None,
+        "duration_seconds": 0.0,
+        "min_gap_steps": SYNTHETIC_TP_ONLY_WATCHDOG_MIN_GAP_STEPS,
+        "min_duration_seconds": SYNTHETIC_TP_ONLY_WATCHDOG_MIN_DURATION_SECONDS,
+        "buy_gap_steps": None,
+        "sell_gap_steps": None,
+        "nearest_buy_price": None,
+        "nearest_sell_price": None,
+        "buy_roles": [],
+        "sell_roles": [],
+        "reason": None,
+    }
+    if not report["enabled"]:
+        state["synthetic_tp_only_watchdog_state"] = report
+        return report
+
+    buy_orders = [item for item in plan.get("buy_orders", []) if isinstance(item, dict)]
+    sell_orders = [item for item in plan.get("sell_orders", []) if isinstance(item, dict)]
+    bootstrap_orders = [item for item in plan.get("bootstrap_orders", []) if isinstance(item, dict)]
+    buy_roles = sorted({_order_role(item) for item in buy_orders if _order_role(item)})
+    sell_roles = sorted({_order_role(item) for item in sell_orders if _order_role(item)})
+    nearest_buy_price = max((_safe_float(item.get("price")) for item in buy_orders), default=None)
+    nearest_sell_price = min((_safe_float(item.get("price")) for item in sell_orders), default=None)
+    safe_step_price = max(_safe_float(step_price), 0.0)
+    safe_mid_price = max(_safe_float(mid_price), 0.0)
+    buy_gap_steps = None
+    sell_gap_steps = None
+    if nearest_buy_price is not None and safe_step_price > 0 and safe_mid_price > 0:
+        buy_gap_steps = max((safe_mid_price - nearest_buy_price) / safe_step_price, 0.0)
+    if nearest_sell_price is not None and safe_step_price > 0 and safe_mid_price > 0:
+        sell_gap_steps = max((nearest_sell_price - safe_mid_price) / safe_step_price, 0.0)
+
+    report["buy_roles"] = buy_roles
+    report["sell_roles"] = sell_roles
+    report["nearest_buy_price"] = nearest_buy_price
+    report["nearest_sell_price"] = nearest_sell_price
+    report["buy_gap_steps"] = buy_gap_steps
+    report["sell_gap_steps"] = sell_gap_steps
+
+    tp_only_mode = (
+        current_long_qty > 1e-12
+        and current_short_qty > 1e-12
+        and not bootstrap_orders
+        and bool(buy_orders)
+        and bool(sell_orders)
+        and set(buy_roles).issubset({"take_profit_short", "active_delever_short"})
+        and set(sell_roles).issubset({"take_profit_long", "active_delever_long"})
+        and not any(_is_long_entry_order(item) or _is_short_entry_order(item) for item in [*buy_orders, *sell_orders])
+    )
+    report["tp_only_mode"] = tp_only_mode
+
+    candidate = (
+        tp_only_mode
+        and buy_gap_steps is not None
+        and sell_gap_steps is not None
+        and buy_gap_steps >= SYNTHETIC_TP_ONLY_WATCHDOG_MIN_GAP_STEPS
+        and sell_gap_steps >= SYNTHETIC_TP_ONLY_WATCHDOG_MIN_GAP_STEPS
+    )
+    report["candidate"] = candidate
+
+    previous = dict(state.get("synthetic_tp_only_watchdog_state") or {})
+    started_at = None
+    duration_seconds = 0.0
+    if candidate:
+        previous_started_at = str(previous.get("started_at") or "").strip()
+        if bool(previous.get("candidate")) and previous_started_at:
+            started_at = previous_started_at
+            try:
+                duration_seconds = max(
+                    (current_time - datetime.fromisoformat(previous_started_at)).total_seconds(),
+                    0.0,
+                )
+            except ValueError:
+                started_at = None
+                duration_seconds = 0.0
+        if started_at is None:
+            started_at = current_time.isoformat()
+            duration_seconds = 0.0
+
+    report["started_at"] = started_at
+    report["last_seen_at"] = current_time.isoformat() if candidate else None
+    report["duration_seconds"] = duration_seconds
+    report["active"] = candidate and duration_seconds >= SYNTHETIC_TP_ONLY_WATCHDOG_MIN_DURATION_SECONDS
+    if candidate:
+        report["reason"] = (
+            f"buy_gap={buy_gap_steps:.1f} step sell_gap={sell_gap_steps:.1f} step "
+            f"long={current_long_qty * safe_mid_price:.2f} short={current_short_qty * safe_mid_price:.2f}"
+        )
+
+    state["synthetic_tp_only_watchdog_state"] = report
+    return report
 
 
 def _direction_from_return_ratio(return_ratio: float, *, tolerance: float = 1e-12) -> str | None:
@@ -2280,6 +2393,7 @@ def _build_runtime_guard_stop_summary(
     args: argparse.Namespace,
     cycle: int,
     cycle_started_at: datetime,
+    stats_start_time: datetime | None,
     runtime_guard_config: Any,
     runtime_guard_result: Any,
     canceled_count: int,
@@ -2478,6 +2592,7 @@ def _maybe_handle_runtime_guard(
         args=args,
         cycle=cycle,
         cycle_started_at=cycle_started_at,
+        stats_start_time=stats_start_time,
         runtime_guard_config=runtime_guard_config,
         runtime_guard_result=runtime_guard_result,
         canceled_count=canceled_count,
@@ -4541,6 +4656,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     startup_pending = _startup_pending(state)
     auto_regime: dict[str, Any] | None = None
     xaut_adaptive: dict[str, Any] | None = None
+    synthetic_tp_only_watchdog: dict[str, Any] | None = None
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
@@ -5005,14 +5121,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "xaut_competition_push_neutral_v1",
         "xaut_volume_guarded_bard_v2",
     }
+    synthetic_residual_long_flat_notional = max(
+        _safe_float(getattr(effective_args, "synthetic_residual_long_flat_notional", None)),
+        0.0,
+    )
     synthetic_residual_short_flat_notional = max(
         _safe_float(getattr(effective_args, "synthetic_residual_short_flat_notional", None)),
         0.0,
     )
+    synthetic_tiny_long_residual_notional = getattr(effective_args, "synthetic_tiny_long_residual_notional", None)
+    synthetic_tiny_short_residual_notional = getattr(effective_args, "synthetic_tiny_short_residual_notional", None)
     synthetic_lot_cost_guard_enabled = (
         requested_strategy_mode in {"hedge_neutral", "synthetic_neutral"}
         and (
             str(getattr(effective_args, "strategy_profile", "")).strip() in synthetic_lot_cost_guard_profiles
+            or synthetic_residual_long_flat_notional > 0
             or synthetic_residual_short_flat_notional > 0
         )
     )
@@ -5209,7 +5332,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             entry_long_cost_guard_release_notional=synthetic_entry_long_cost_guard_release_notional,
             entry_short_cost_guard_release_notional=synthetic_entry_short_cost_guard_release_notional,
+            residual_long_flat_notional=synthetic_residual_long_flat_notional,
+            take_profit_min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             residual_short_flat_notional=synthetic_residual_short_flat_notional,
+            synthetic_tiny_long_residual_notional=synthetic_tiny_long_residual_notional,
+            synthetic_tiny_short_residual_notional=synthetic_tiny_short_residual_notional,
             entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
             entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
             paused_entry_short_scale=strong_short_probe_scale,
@@ -5309,7 +5436,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             entry_long_cost_guard_release_notional=synthetic_entry_long_cost_guard_release_notional,
             entry_short_cost_guard_release_notional=synthetic_entry_short_cost_guard_release_notional,
+            residual_long_flat_notional=synthetic_residual_long_flat_notional,
+            take_profit_min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             residual_short_flat_notional=synthetic_residual_short_flat_notional,
+            synthetic_tiny_long_residual_notional=synthetic_tiny_long_residual_notional,
+            synthetic_tiny_short_residual_notional=synthetic_tiny_short_residual_notional,
             entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
             entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
             paused_entry_short_scale=strong_short_probe_scale,
@@ -5781,6 +5912,30 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             price_tolerance=effective_args.step_price,
             max_levels_per_group=getattr(effective_args, "sticky_entry_levels", None),
         )
+        synthetic_tp_only_watchdog = assess_synthetic_tp_only_watchdog(
+            state=state,
+            strategy_mode=strategy_mode,
+            plan={
+                "bootstrap_orders": list(plan.get("bootstrap_orders") or []),
+                "buy_orders": [
+                    dict(item)
+                    for item in desired_orders
+                    if str(item.get("side", "")).upper().strip() == "BUY"
+                ],
+                "sell_orders": [
+                    dict(item)
+                    for item in desired_orders
+                    if str(item.get("side", "")).upper().strip() == "SELL"
+                ],
+            },
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            mid_price=mid_price,
+            step_price=effective_args.step_price,
+            now=plan_now,
+        )
+    else:
+        state.pop("synthetic_tp_only_watchdog_state", None)
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
     state_now = _isoformat(_utc_now())
@@ -5850,9 +6005,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_base_position_notional": inventory_tier["effective_base_position_notional"],
         "effective_pause_buy_position_notional": getattr(effective_args, "pause_buy_position_notional", None),
         "effective_pause_short_position_notional": getattr(effective_args, "pause_short_position_notional", None),
+        "effective_synthetic_residual_long_flat_notional": getattr(
+            effective_args,
+            "synthetic_residual_long_flat_notional",
+            None,
+        ),
         "effective_synthetic_residual_short_flat_notional": getattr(
             effective_args,
             "synthetic_residual_short_flat_notional",
+            None,
+        ),
+        "effective_synthetic_tiny_long_residual_notional": getattr(
+            effective_args,
+            "synthetic_tiny_long_residual_notional",
+            None,
+        ),
+        "effective_synthetic_tiny_short_residual_notional": getattr(
+            effective_args,
+            "synthetic_tiny_short_residual_notional",
             None,
         ),
         "effective_max_position_notional": getattr(effective_args, "max_position_notional", None),
@@ -5885,10 +6055,19 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "bootstrap_short_qty": plan.get("bootstrap_short_qty", 0.0),
         "effective_long_plan_qty": plan.get("effective_long_qty"),
         "effective_short_plan_qty": plan.get("effective_short_qty"),
+        "residual_long_flat_notional": plan.get("residual_long_flat_notional"),
+        "residual_long_flattened": bool(plan.get("residual_long_flattened")),
+        "residual_long_flattened_qty": plan.get("residual_long_flattened_qty"),
+        "residual_long_flattened_notional": plan.get("residual_long_flattened_notional"),
         "residual_short_flat_notional": plan.get("residual_short_flat_notional"),
         "residual_short_flattened": bool(plan.get("residual_short_flattened")),
         "residual_short_flattened_qty": plan.get("residual_short_flattened_qty"),
         "residual_short_flattened_notional": plan.get("residual_short_flattened_notional"),
+        "synthetic_tiny_long_residual_notional": plan.get("synthetic_tiny_long_residual_notional"),
+        "synthetic_tiny_short_residual_notional": plan.get("synthetic_tiny_short_residual_notional"),
+        "dominant_long_with_tiny_short_residual": bool(plan.get("dominant_long_with_tiny_short_residual")),
+        "dominant_short_with_tiny_long_residual": bool(plan.get("dominant_short_with_tiny_long_residual")),
+        "synthetic_tp_only_watchdog": synthetic_tp_only_watchdog,
         "bootstrap_orders": plan["bootstrap_orders"],
         "buy_orders": plan["buy_orders"],
         "sell_orders": plan["sell_orders"],
@@ -6266,7 +6445,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--startup-entry-multiplier", type=float, default=1.0)
     parser.add_argument("--base-position-notional", type=float, default=75.6)
     parser.add_argument("--sticky-entry-levels", type=int, default=None)
+    parser.add_argument("--synthetic-residual-long-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-residual-short-flat-notional", type=float, default=None)
+    parser.add_argument("--synthetic-tiny-long-residual-notional", type=float, default=None)
+    parser.add_argument("--synthetic-tiny-short-residual-notional", type=float, default=None)
     parser.add_argument("--static-buy-offset-steps", type=float, default=0.0)
     parser.add_argument("--static-sell-offset-steps", type=float, default=0.0)
     parser.add_argument("--market-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
@@ -6425,6 +6607,13 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"notional={_float(summary.get('residual_short_flattened_notional', 0.0))} "
             f"threshold={_float(summary.get('residual_short_flat_notional', 0.0))}"
         )
+    if summary.get("residual_long_flattened"):
+        print(
+            "  residual_long_flattened: "
+            f"qty={_float(summary.get('residual_long_flattened_qty', 0.0))} "
+            f"notional={_float(summary.get('residual_long_flattened_notional', 0.0))} "
+            f"threshold={_float(summary.get('residual_long_flat_notional', 0.0))}"
+        )
     if summary.get("volatility_buy_pause") or summary.get("short_cover_paused") or summary.get("shift_frozen"):
         print(
             "  market_guard: "
@@ -6486,6 +6675,27 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"drift={_float(summary.get('synthetic_drift_qty', 0.0))} "
             f"unmatched_trades={int(summary.get('synthetic_unmatched_trade_count', 0) or 0)}"
         )
+        if summary.get("effective_synthetic_tiny_long_residual_notional") or summary.get(
+            "effective_synthetic_tiny_short_residual_notional"
+        ):
+            print(
+                "  synthetic_residual: "
+                f"tiny_long<={_float(summary.get('effective_synthetic_tiny_long_residual_notional', 0.0))} "
+                f"tiny_short<={_float(summary.get('effective_synthetic_tiny_short_residual_notional', 0.0))} "
+                f"dominant_short_tiny_long={'yes' if summary.get('dominant_short_with_tiny_long_residual') else 'no'} "
+                f"dominant_long_tiny_short={'yes' if summary.get('dominant_long_with_tiny_short_residual') else 'no'}"
+            )
+        if summary.get("synthetic_tp_only_watchdog_candidate") or summary.get("synthetic_tp_only_watchdog_active"):
+            print(
+                "  synthetic_watchdog: "
+                f"candidate={'yes' if summary.get('synthetic_tp_only_watchdog_candidate') else 'no'} "
+                f"active={'yes' if summary.get('synthetic_tp_only_watchdog_active') else 'no'} "
+                f"duration={_float(summary.get('synthetic_tp_only_watchdog_duration_seconds', 0.0))}s "
+                f"buy_gap={_float(summary.get('synthetic_tp_only_watchdog_buy_gap_steps', 0.0))} "
+                f"sell_gap={_float(summary.get('synthetic_tp_only_watchdog_sell_gap_steps', 0.0))}"
+            )
+            if summary.get("synthetic_tp_only_watchdog_reason"):
+                print(f"  synthetic_watchdog_reason: {summary['synthetic_tp_only_watchdog_reason']}")
     if summary.get("market_bias_enabled"):
         print(
             "  market_bias: "
@@ -6606,8 +6816,14 @@ def main() -> None:
         raise SystemExit("--per-order-notional must be > 0 and --base-position-notional must be >= 0")
     if args.sticky_entry_levels is not None and args.sticky_entry_levels < 0:
         raise SystemExit("--sticky-entry-levels must be >= 0")
+    if args.synthetic_residual_long_flat_notional is not None and args.synthetic_residual_long_flat_notional < 0:
+        raise SystemExit("--synthetic-residual-long-flat-notional must be >= 0")
     if args.synthetic_residual_short_flat_notional is not None and args.synthetic_residual_short_flat_notional < 0:
         raise SystemExit("--synthetic-residual-short-flat-notional must be >= 0")
+    if args.synthetic_tiny_long_residual_notional is not None and args.synthetic_tiny_long_residual_notional < 0:
+        raise SystemExit("--synthetic-tiny-long-residual-notional must be >= 0")
+    if args.synthetic_tiny_short_residual_notional is not None and args.synthetic_tiny_short_residual_notional < 0:
+        raise SystemExit("--synthetic-tiny-short-residual-notional must be >= 0")
     if args.static_buy_offset_steps < 0 or args.static_sell_offset_steps < 0:
         raise SystemExit("--static-buy-offset-steps and --static-sell-offset-steps must be >= 0")
     if args.market_bias_max_shift_steps < 0:
@@ -6976,10 +7192,40 @@ def main() -> None:
                 "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
                 "max_short_position_notional": _safe_float(plan_report.get("max_short_position_notional")),
                 "effective_short_plan_qty": _safe_float(plan_report.get("effective_short_plan_qty")),
+                "residual_long_flat_notional": _safe_float(plan_report.get("residual_long_flat_notional")),
+                "residual_long_flattened": bool(plan_report.get("residual_long_flattened")),
+                "residual_long_flattened_qty": _safe_float(plan_report.get("residual_long_flattened_qty")),
+                "residual_long_flattened_notional": _safe_float(plan_report.get("residual_long_flattened_notional")),
                 "residual_short_flat_notional": _safe_float(plan_report.get("residual_short_flat_notional")),
                 "residual_short_flattened": bool(plan_report.get("residual_short_flattened")),
                 "residual_short_flattened_qty": _safe_float(plan_report.get("residual_short_flattened_qty")),
                 "residual_short_flattened_notional": _safe_float(plan_report.get("residual_short_flattened_notional")),
+                "effective_synthetic_tiny_long_residual_notional": _safe_float(
+                    plan_report.get("effective_synthetic_tiny_long_residual_notional")
+                ),
+                "effective_synthetic_tiny_short_residual_notional": _safe_float(
+                    plan_report.get("effective_synthetic_tiny_short_residual_notional")
+                ),
+                "synthetic_tiny_long_residual_notional": _safe_float(plan_report.get("synthetic_tiny_long_residual_notional")),
+                "synthetic_tiny_short_residual_notional": _safe_float(plan_report.get("synthetic_tiny_short_residual_notional")),
+                "dominant_long_with_tiny_short_residual": bool(plan_report.get("dominant_long_with_tiny_short_residual")),
+                "dominant_short_with_tiny_long_residual": bool(plan_report.get("dominant_short_with_tiny_long_residual")),
+                "synthetic_tp_only_watchdog_candidate": bool(
+                    ((plan_report.get("synthetic_tp_only_watchdog") or {}).get("candidate"))
+                ),
+                "synthetic_tp_only_watchdog_active": bool(
+                    ((plan_report.get("synthetic_tp_only_watchdog") or {}).get("active"))
+                ),
+                "synthetic_tp_only_watchdog_duration_seconds": _safe_float(
+                    (plan_report.get("synthetic_tp_only_watchdog") or {}).get("duration_seconds")
+                ),
+                "synthetic_tp_only_watchdog_buy_gap_steps": _safe_float(
+                    (plan_report.get("synthetic_tp_only_watchdog") or {}).get("buy_gap_steps")
+                ),
+                "synthetic_tp_only_watchdog_sell_gap_steps": _safe_float(
+                    (plan_report.get("synthetic_tp_only_watchdog") or {}).get("sell_gap_steps")
+                ),
+                "synthetic_tp_only_watchdog_reason": (plan_report.get("synthetic_tp_only_watchdog") or {}).get("reason"),
                 "inventory_tier_active": bool((plan_report.get("inventory_tier") or {}).get("active")),
                 "inventory_tier_ratio": _safe_float((plan_report.get("inventory_tier") or {}).get("ratio")),
                 "volatility_buy_pause": bool((plan_report.get("market_guard") or {}).get("buy_pause_active")),

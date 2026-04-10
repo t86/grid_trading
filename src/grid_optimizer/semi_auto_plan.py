@@ -272,6 +272,44 @@ def _build_lot_take_profit_orders(
     return orders, total_qty
 
 
+def _nearest_profitable_exit_price(
+    *,
+    reference_price: float,
+    side: str,
+    min_profit_ratio: float | None,
+    tick_size: float | None,
+) -> float | None:
+    safe_reference = max(float(reference_price), 0.0)
+    if safe_reference <= 0:
+        return None
+    safe_side = str(side).upper().strip()
+    if safe_side not in {"BUY", "SELL"}:
+        raise ValueError(f"unsupported take-profit side: {side}")
+
+    safe_ratio = 0.0 if min_profit_ratio is None else max(float(min_profit_ratio), 0.0)
+    if tick_size is not None and tick_size > 0:
+        tick_dec = Decimal(str(tick_size))
+        reference_dec = Decimal(str(safe_reference))
+        if safe_side == "BUY":
+            target_dec = reference_dec * (Decimal("1") - Decimal(str(safe_ratio)))
+            units = (target_dec / tick_dec).to_integral_value(rounding=ROUND_DOWN)
+            candidate = units * tick_dec
+            if candidate >= reference_dec:
+                candidate = max(units - 1, Decimal("0")) * tick_dec
+        else:
+            target_dec = reference_dec * (Decimal("1") + Decimal(str(safe_ratio)))
+            units = (target_dec / tick_dec).to_integral_value(rounding=ROUND_UP)
+            candidate = units * tick_dec
+            if candidate <= reference_dec:
+                candidate = (units + 1) * tick_dec
+        return max(float(candidate), 0.0)
+
+    epsilon = max(safe_reference * 1e-9, 1e-12)
+    if safe_side == "BUY":
+        return max((safe_reference * (1.0 - safe_ratio)) - epsilon, 0.0)
+    return safe_reference * (1.0 + safe_ratio) + epsilon
+
+
 def build_static_binance_grid_plan(
     *,
     strategy_direction: str,
@@ -779,7 +817,11 @@ def build_hedge_micro_grid_plan(
     sell_offset_steps: float = 0.0,
     entry_long_cost_guard_release_notional: float = 0.0,
     entry_short_cost_guard_release_notional: float = 0.0,
+    take_profit_min_profit_ratio: float | None = None,
+    residual_long_flat_notional: float = 0.0,
     residual_short_flat_notional: float = 0.0,
+    synthetic_tiny_long_residual_notional: float | None = None,
+    synthetic_tiny_short_residual_notional: float | None = None,
     entry_long_paused: bool = False,
     entry_short_paused: bool = False,
     paused_entry_short_scale: float = 0.0,
@@ -822,7 +864,31 @@ def build_hedge_micro_grid_plan(
     )
     effective_long_qty = 0.0 if long_inventory_dust else current_long_qty
     effective_short_qty = 0.0 if short_inventory_dust else current_short_qty
+    residual_long_flat_notional = max(float(residual_long_flat_notional), 0.0)
     residual_short_flat_notional = max(float(residual_short_flat_notional), 0.0)
+    tiny_long_residual_threshold_notional = (
+        max(float(synthetic_tiny_long_residual_notional), 0.0)
+        if synthetic_tiny_long_residual_notional is not None
+        else max(float(per_order_notional), 0.0)
+    )
+    tiny_short_residual_threshold_notional = (
+        max(float(synthetic_tiny_short_residual_notional), 0.0)
+        if synthetic_tiny_short_residual_notional is not None
+        else max(float(per_order_notional), 0.0)
+    )
+    residual_long_flattened_qty = 0.0
+    residual_long_flattened_notional = 0.0
+    residual_long_flattened = False
+    if (
+        residual_long_flat_notional > 0
+        and effective_long_qty > 0
+        and effective_short_qty <= 0
+        and (effective_long_qty * mid_price) <= residual_long_flat_notional
+    ):
+        residual_long_flattened = True
+        residual_long_flattened_qty = effective_long_qty
+        residual_long_flattened_notional = effective_long_qty * mid_price
+        effective_long_qty = 0.0
     residual_short_flattened_qty = 0.0
     residual_short_flattened_notional = 0.0
     residual_short_flattened = False
@@ -845,13 +911,13 @@ def build_hedge_micro_grid_plan(
         effective_long_qty > 0
         and effective_short_qty > 0
         and effective_long_notional > effective_short_notional
-        and effective_short_notional <= per_order_notional
+        and effective_short_notional <= tiny_short_residual_threshold_notional
     )
     dominant_short_with_tiny_long_residual = (
         effective_short_qty > 0
         and effective_long_qty > 0
         and effective_short_notional > effective_long_notional
-        and effective_long_notional <= per_order_notional
+        and effective_long_notional <= tiny_long_residual_threshold_notional
     )
     long_entry_cost_guard_active = (
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
@@ -915,6 +981,18 @@ def build_hedge_micro_grid_plan(
         if lowest_short_lot_price is not None
         else (current_short_avg_price if current_short_avg_price > 0 else None)
     )
+    light_short_front_exit_price = None
+    if short_exit_profit_guard_active and take_profit_min_profit_ratio is not None:
+        light_short_front_exit_price = _nearest_profitable_exit_price(
+            reference_price=(
+                current_short_avg_price
+                if current_short_avg_price > 0
+                else (short_exit_reference_price or 0.0)
+            ),
+            side="BUY",
+            min_profit_ratio=take_profit_min_profit_ratio,
+            tick_size=tick_size,
+        )
     price_tick = float(tick_size) if tick_size is not None and tick_size > 0 else 1e-12
     profit_step = max(float(step_price), price_tick)
     long_exit_anchor_price = None
@@ -1012,6 +1090,24 @@ def build_hedge_micro_grid_plan(
             role="take_profit_short",
             position_side="SHORT",
         )
+        if short_lot_exit_orders and light_short_front_exit_price is not None:
+            front_order = short_lot_exit_orders[0]
+            target_front_exit_price = light_short_front_exit_price
+            if target_front_exit_price >= float(ask_price):
+                target_front_exit_price = _round_order_price(
+                    max(float(ask_price) - price_tick, 0.0),
+                    tick_size,
+                    "BUY",
+                )
+            if 0 < target_front_exit_price < float(ask_price):
+                short_lot_exit_orders[0] = _build_order(
+                    side=front_order.side,
+                    price=target_front_exit_price,
+                    qty=front_order.qty,
+                    level=front_order.level,
+                    role=front_order.role,
+                    position_side=front_order.position_side,
+                )
         for order in short_lot_exit_orders:
             buy_orders.append(order)
 
@@ -1044,6 +1140,29 @@ def build_hedge_micro_grid_plan(
             )
         )
         remaining_short_exit_qty = max(remaining_short_exit_qty - qty, 0.0)
+
+    if not short_lot_exit_orders and light_short_front_exit_price is not None:
+        for index, order in enumerate(buy_orders):
+            if order.role != "take_profit_short":
+                continue
+            target_front_exit_price = light_short_front_exit_price
+            if target_front_exit_price >= float(ask_price):
+                target_front_exit_price = _round_order_price(
+                    max(float(ask_price) - price_tick, 0.0),
+                    tick_size,
+                    "BUY",
+                )
+            if not (0 < target_front_exit_price < float(ask_price)):
+                break
+            buy_orders[index] = _build_order(
+                side=order.side,
+                price=target_front_exit_price,
+                qty=order.qty,
+                level=order.level,
+                role=order.role,
+                position_side=order.position_side,
+            )
+            break
 
     take_profit_short_price_keys = {
         f"{order.side}:{order.price:.10f}" for order in buy_orders if order.role == "take_profit_short"
@@ -1241,10 +1360,18 @@ def build_hedge_micro_grid_plan(
         "bootstrap_short_qty": bootstrap_short_qty,
         "effective_long_qty": effective_long_qty,
         "effective_short_qty": effective_short_qty,
+        "residual_long_flat_notional": residual_long_flat_notional,
+        "residual_long_flattened": residual_long_flattened,
+        "residual_long_flattened_qty": residual_long_flattened_qty,
+        "residual_long_flattened_notional": residual_long_flattened_notional,
         "residual_short_flat_notional": residual_short_flat_notional,
         "residual_short_flattened": residual_short_flattened,
         "residual_short_flattened_qty": residual_short_flattened_qty,
         "residual_short_flattened_notional": residual_short_flattened_notional,
+        "synthetic_tiny_long_residual_notional": tiny_long_residual_threshold_notional,
+        "synthetic_tiny_short_residual_notional": tiny_short_residual_threshold_notional,
+        "dominant_long_with_tiny_short_residual": dominant_long_with_tiny_short_residual,
+        "dominant_short_with_tiny_long_residual": dominant_short_with_tiny_long_residual,
         "long_entry_reference_price": long_entry_reference_price,
         "long_exit_reference_price": long_exit_reference_price,
         "short_entry_reference_price": short_entry_reference_price,

@@ -102,6 +102,55 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
         self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 350.0, places=8)
 
+    def test_preserve_queue_priority_keeps_exact_same_bucket_subset_when_qty_shrinks(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.0564, "qty": 886.0, "notional": 49.9704, "role": "take_profit_short"}
+            ],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.0564", "origQty": "884", "positionSide": "BOTH"},
+                {"orderId": 2, "side": "BUY", "price": "0.0564", "origQty": "886", "positionSide": "BOTH"},
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.0564,
+            live_ask_price=0.0565,
+            tick_size=0.0001,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["cancel_orders"][0]["orderId"], 1)
+
+    def test_preserve_queue_priority_keeps_subset_and_places_delta_when_qty_shrinks(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.05064, "qty": 650.0, "notional": 32.916, "role": "entry"}
+            ],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.05062", "origQty": "500", "positionSide": "BOTH"},
+                {"orderId": 2, "side": "BUY", "price": "0.05062", "origQty": "500", "positionSide": "BOTH"},
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.05062,
+            live_ask_price=0.05063,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
+
     def test_validate_plan_report_rejects_old_plan_and_stale_orders_without_flag(self) -> None:
         now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
         report = {

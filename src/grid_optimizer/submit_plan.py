@@ -85,6 +85,44 @@ def _clone_order_with_qty(order: dict[str, Any], qty: Decimal) -> dict[str, Any]
     return cloned
 
 
+def _choose_preserved_cancel_indices(
+    quantities: list[Decimal],
+    target_qty: Decimal,
+) -> tuple[set[int], Decimal]:
+    safe_target = max(Decimal("0"), target_qty)
+    if safe_target <= Decimal("0") or not quantities:
+        return set(), Decimal("0")
+
+    best_indices: set[int] = set()
+    best_total = Decimal("0")
+
+    def _search(index: int, running_total: Decimal, chosen: list[int]) -> None:
+        nonlocal best_indices, best_total
+        if running_total > safe_target:
+            return
+        chosen_set = set(chosen)
+        if (
+            running_total > best_total
+            or (running_total == best_total and len(chosen_set) > len(best_indices))
+        ):
+            best_total = running_total
+            best_indices = chosen_set
+            if best_total == safe_target and len(best_indices) == len(quantities):
+                return
+        if index >= len(quantities):
+            return
+        remaining_total = sum(quantities[index:], Decimal("0"))
+        if running_total + remaining_total < best_total:
+            return
+        _search(index + 1, running_total + quantities[index], [*chosen, index])
+        if best_total == safe_target:
+            return
+        _search(index + 1, running_total, chosen)
+
+    _search(0, Decimal("0"), [])
+    return best_indices, best_total
+
+
 def _build_client_order_id(*, symbol: str, role: str, index: int) -> str:
     compact_symbol = symbol.lower().replace("usdt", "u")
     compact_role = role.lower().replace("_", "")[:8]
@@ -265,11 +303,23 @@ def preserve_queue_priority_in_execution_actions(
         existing_total = cancel_totals_by_bucket.get(key, Decimal("0"))
         if existing_total <= Decimal("0"):
             continue
-        if desired_total < existing_total:
+        bucket_indices = cancel_indices_by_bucket.get(key, [])
+        bucket_quantities = [
+            _quantity_decimal(cancel_orders[index].get("origQty", cancel_orders[index].get("qty")))
+            for index in bucket_indices
+        ]
+        if desired_total >= existing_total:
+            for cancel_index in bucket_indices:
+                preserved_cancel_indices.add(cancel_index)
+            reduced_place_totals[key] = max(desired_total - existing_total, Decimal("0"))
             continue
-        for cancel_index in cancel_indices_by_bucket.get(key, []):
-            preserved_cancel_indices.add(cancel_index)
-        reduced_place_totals[key] = max(desired_total - existing_total, Decimal("0"))
+
+        chosen_local_indices, preserved_qty = _choose_preserved_cancel_indices(bucket_quantities, desired_total)
+        if preserved_qty <= Decimal("0"):
+            continue
+        for local_index in chosen_local_indices:
+            preserved_cancel_indices.add(bucket_indices[local_index])
+        reduced_place_totals[key] = max(desired_total - preserved_qty, Decimal("0"))
 
     adjusted_place_orders: list[dict[str, Any]] = []
     consumed_projected_buckets: set[str] = set()

@@ -269,6 +269,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["buy_levels"], 8)
         self.assertEqual(payload["sell_levels"], 5)
         self.assertEqual(payload["per_order_notional"], 20.0)
+        self.assertEqual(payload["synthetic_tiny_long_residual_notional"], 45.0)
+        self.assertEqual(payload["synthetic_tiny_short_residual_notional"], 45.0)
         self.assertEqual(payload["pause_buy_position_notional"], 2000.0)
         self.assertEqual(payload["pause_short_position_notional"], 2000.0)
         self.assertEqual(payload["max_position_notional"], 2500.0)
@@ -775,6 +777,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["buy_levels"], 8)
         self.assertEqual(config["sell_levels"], 5)
         self.assertEqual(config["per_order_notional"], 20.0)
+        self.assertEqual(config["synthetic_tiny_long_residual_notional"], 45.0)
+        self.assertEqual(config["synthetic_tiny_short_residual_notional"], 45.0)
         self.assertEqual(config["pause_buy_position_notional"], 2000.0)
         self.assertEqual(config["pause_short_position_notional"], 2000.0)
         self.assertEqual(config["max_position_notional"], 2500.0)
@@ -1311,8 +1315,45 @@ class WebSecurityTests(unittest.TestCase):
         sticky_index = command.index("--sticky-entry-levels")
         self.assertEqual(command[sticky_index + 1], "2")
         self.assertIn("--synthetic-residual-short-flat-notional", command)
-        residual_index = command.index("--synthetic-residual-short-flat-notional")
-        self.assertEqual(command[residual_index + 1], "30.0")
+
+    def test_build_runner_command_includes_synthetic_tiny_residual_thresholds(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "XAUTUSDT",
+                "strategy_profile": "xaut_volume_guarded_bard_v2",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 1.0,
+                "buy_levels": 8,
+                "sell_levels": 5,
+                "per_order_notional": 20.0,
+                "synthetic_tiny_long_residual_notional": 45.0,
+                "synthetic_tiny_short_residual_notional": 45.0,
+                "startup_entry_multiplier": 1.0,
+                "base_position_notional": 0.0,
+                "margin_type": "KEEP",
+                "leverage": 10,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 32,
+                "max_total_notional": 2200.0,
+                "sleep_seconds": 4.0,
+                "state_path": "output/xautusdt_loop_state.json",
+                "plan_json": "output/xautusdt_loop_latest_plan.json",
+                "submit_report_json": "output/xautusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/xautusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": False,
+                "reset_state": False,
+            }
+        )
+
+        self.assertIn("--synthetic-tiny-long-residual-notional", command)
+        long_index = command.index("--synthetic-tiny-long-residual-notional")
+        self.assertEqual(command[long_index + 1], "45.0")
+        self.assertIn("--synthetic-tiny-short-residual-notional", command)
+        short_index = command.index("--synthetic-tiny-short-residual-notional")
+        self.assertEqual(command[short_index + 1], "45.0")
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
@@ -1614,9 +1655,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("synthetic_neutral_bard_style_v1", opn_keys)
         self.assertIn("based_volume_long_trigger_v1", based_keys)
         self.assertIn("based_volume_guarded_bard_v2", based_keys)
+        self.assertIn("based_overnight_volume_v1", based_keys)
         self.assertIn("based_volume_push_bard_v1", based_keys)
         self.assertNotIn("based_volume_long_trigger_v1", opn_keys)
         self.assertNotIn("based_volume_guarded_bard_v2", opn_keys)
+        self.assertNotIn("based_overnight_volume_v1", opn_keys)
         self.assertIn("based_volume_push_bard_v1", opn_keys)
         self.assertIn("xaut_competition_push_neutral_v1", xaut_keys)
         self.assertIn("xaut_volume_guarded_bard_v2", xaut_keys)
@@ -1721,6 +1764,34 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volume_trigger_stop_threshold"], 180000.0)
         self.assertTrue(payload["volume_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volume_trigger_stop_close_all_positions"])
+
+    def test_runner_preset_payload_for_based_overnight_volume_v1(self) -> None:
+        payload = _runner_preset_payload("based_overnight_volume_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["symbol"], "BASEDUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["step_price"], 0.0001)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 5)
+        self.assertEqual(payload["per_order_notional"], 50.0)
+        self.assertEqual(payload["sticky_entry_levels"], 1)
+        self.assertEqual(payload["synthetic_residual_long_flat_notional"], 400.0)
+        self.assertEqual(payload["synthetic_residual_short_flat_notional"], 300.0)
+        self.assertEqual(payload["pause_buy_position_notional"], 800.0)
+        self.assertEqual(payload["pause_short_position_notional"], 260.0)
+        self.assertEqual(payload["max_position_notional"], 1000.0)
+        self.assertEqual(payload["max_short_position_notional"], 320.0)
+        self.assertEqual(payload["max_total_notional"], 1500.0)
+        self.assertEqual(payload["max_new_orders"], 24)
+        self.assertEqual(payload["leverage"], 10)
+        self.assertEqual(payload["max_cumulative_notional"], 250000.0)
+        self.assertEqual(payload["rolling_hourly_loss_limit"], 8.0)
+        self.assertFalse(payload["adaptive_step_enabled"])
+        self.assertFalse(payload["volatility_trigger_enabled"])
+        self.assertFalse(payload["volume_trigger_enabled"])
+        self.assertIsNone(payload["volume_trigger_start_threshold"])
+        self.assertIsNone(payload["volume_trigger_stop_threshold"])
+        self.assertTrue(payload["volume_trigger_stop_cancel_open_orders"])
+        self.assertFalse(payload["volume_trigger_stop_close_all_positions"])
 
     def test_runner_preset_payload_for_based_volume_push_bard_is_generic(self) -> None:
         payload = _runner_preset_payload("based_volume_push_bard_v1", {"symbol": "OPNUSDT"})
