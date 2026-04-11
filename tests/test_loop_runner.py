@@ -998,6 +998,198 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(active_prices, [0.999, 0.989, 0.979])
         self.assertTrue(all(price <= 0.969 for price in take_profit_prices))
 
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_synthetic_neutral_uses_threshold_position_notional_for_active_delever_long(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_sync_synthetic_ledger,
+        mock_load_state,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 1.0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "synthetic_ledger": {},
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.999", "ask_price": "1.001"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "TESTUSDT", "positionAmt": "300", "entryPrice": "1.035"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "shift_freeze_reasons": [],
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+        mock_sync_synthetic_ledger.return_value = {
+            "virtual_long_qty": 300.0,
+            "virtual_long_avg_price": 1.035,
+            "virtual_long_lots": [{"qty": 300.0, "price": 1.035}],
+            "virtual_short_qty": 0.0,
+            "virtual_short_avg_price": 0.0,
+            "virtual_short_lots": [],
+            "applied_trade_count": 0,
+            "unmatched_trade_count": 0,
+            "resynced_to_actual": False,
+            "grid_buffer_realized_notional": 0.0,
+            "grid_buffer_spent_notional": 0.0,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_mode = "synthetic_neutral"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 4
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.pause_buy_position_notional = 200.0
+            args.pause_short_position_notional = 700.0
+            args.threshold_position_notional = 250.0
+            args.take_profit_min_profit_ratio = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        active_sells = [item for item in report["sell_orders"] if item["role"] == "active_delever_long"]
+        active_prices = [item["price"] for item in active_sells]
+
+        self.assertEqual(report["active_delever"]["trigger_mode"], "threshold")
+        self.assertEqual(report["active_delever"]["active_sell_order_count"], 2)
+        self.assertEqual(active_prices, [1.001, 1.011])
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_synthetic_neutral_uses_threshold_position_notional_for_active_delever_short(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_sync_synthetic_ledger,
+        mock_load_state,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 1.0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "synthetic_ledger": {},
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.999", "ask_price": "1.001"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "TESTUSDT", "positionAmt": "-300", "entryPrice": "0.965"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "shift_freeze_reasons": [],
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+        mock_sync_synthetic_ledger.return_value = {
+            "virtual_long_qty": 0.0,
+            "virtual_long_avg_price": 0.0,
+            "virtual_long_lots": [],
+            "virtual_short_qty": 300.0,
+            "virtual_short_avg_price": 0.965,
+            "virtual_short_lots": [{"qty": 300.0, "price": 0.965}],
+            "applied_trade_count": 0,
+            "unmatched_trade_count": 0,
+            "resynced_to_actual": False,
+            "grid_buffer_realized_notional": 0.0,
+            "grid_buffer_spent_notional": 0.0,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_mode = "synthetic_neutral"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 4
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.pause_buy_position_notional = 700.0
+            args.pause_short_position_notional = 200.0
+            args.threshold_position_notional = 250.0
+            args.take_profit_min_profit_ratio = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        active_buys = [item for item in report["buy_orders"] if item["role"] == "active_delever_short"]
+        active_prices = [item["price"] for item in active_buys]
+
+        self.assertEqual(report["active_delever"]["trigger_mode"], "threshold")
+        self.assertEqual(report["active_delever"]["active_buy_order_count"], 2)
+        self.assertEqual(active_prices, [0.999, 0.989])
+
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")

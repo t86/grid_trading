@@ -456,14 +456,14 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     },
     "based_volume_guarded_bard_v2": {
         "label": "BASED 冲量控损 v2",
-        "description": "BASEDUSDT 专用固定节奏 synthetic_neutral。沿用 BARD 风格双向骨架，但把步长固定在 0.0002、压低空侧与总仓位，并叠加轻仓保本回补护栏、15m 成交额启停和 60m 滚动亏损熔断，优先在高成交窗口冲量、低量和单边时快速收缩风险。",
+        "description": "BASEDUSDT 专用固定节奏 synthetic_neutral。沿用 BARD 风格双向骨架，但把步长放宽到 0.0005、提前停买，并在仓位超过减仓阈值后主动把前排减仓单贴回盘口，优先把库存压回安全区后再继续刷量。",
         "startable": True,
         "kind": "synthetic",
         "symbol": "BASEDUSDT",
         "config": {
             "symbol": "BASEDUSDT",
             "strategy_mode": "synthetic_neutral",
-            "step_price": 0.0002,
+            "step_price": 0.0005,
             "buy_levels": 8,
             "sell_levels": 5,
             "per_order_notional": 45.0,
@@ -473,10 +473,11 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "up_trigger_steps": 1,
             "down_trigger_steps": 1,
             "shift_steps": 1,
-            "pause_buy_position_notional": 1200.0,
-            "pause_short_position_notional": 320.0,
-            "max_position_notional": 1600.0,
-            "max_short_position_notional": 480.0,
+            "pause_buy_position_notional": 420.0,
+            "pause_short_position_notional": 260.0,
+            "threshold_position_notional": 520.0,
+            "max_position_notional": 650.0,
+            "max_short_position_notional": 420.0,
             "max_total_notional": 2200.0,
             "max_new_orders": 32,
             "buy_pause_amp_trigger_ratio": 0.009,
@@ -488,15 +489,15 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "adaptive_step_enabled": False,
             "volatility_trigger_enabled": False,
             "sleep_seconds": 4.0,
-            "rolling_hourly_loss_limit": 6.0,
+            "rolling_hourly_loss_limit": None,
             "excess_inventory_reduce_only_enabled": False,
             "autotune_symbol_enabled": False,
-            "volume_trigger_enabled": True,
+            "volume_trigger_enabled": False,
             "volume_trigger_window": "15m",
-            "volume_trigger_start_threshold": 260000.0,
-            "volume_trigger_stop_threshold": 180000.0,
+            "volume_trigger_start_threshold": None,
+            "volume_trigger_stop_threshold": None,
             "volume_trigger_stop_cancel_open_orders": True,
-            "volume_trigger_stop_close_all_positions": True,
+            "volume_trigger_stop_close_all_positions": False,
             "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
         },
     },
@@ -10618,7 +10619,7 @@ MONITOR_PAGE = """<!doctype html>
           <select id="symbol"></select>
         </label>
         <label>刷新秒数
-          <input id="refresh_sec" type="number" min="2" step="1" value="5" />
+          <input id="refresh_sec" type="number" min="10" step="1" value="15" />
         </label>
         <label>策略预设
           <select id="strategy_preset"></select>
@@ -11340,14 +11341,14 @@ MONITOR_PAGE = """<!doctype html>
       {
         key: "based_volume_guarded_bard_v2",
         label: "BASED 冲量控损 v2",
-        description: "BASEDUSDT 专用固定节奏 synthetic_neutral。沿用 BARD 风格双向骨架，但把步长固定在 0.0002、压低空侧与总仓位，并叠加轻仓保本回补护栏、15m 成交额启停和 60m 滚动亏损熔断，优先在高成交窗口冲量、低量和单边时快速收缩风险。",
+        description: "BASEDUSDT 专用固定节奏 synthetic_neutral。沿用 BARD 风格双向骨架，但把步长放宽到 0.0005、提前停买，并在仓位超过减仓阈值后主动把前排减仓单贴回盘口，优先把库存压回安全区后再继续刷量。",
         startable: true,
         kind: "synthetic",
         symbol: "BASEDUSDT",
         config: {
           symbol: "BASEDUSDT",
           strategy_mode: "synthetic_neutral",
-          step_price: 0.0002,
+          step_price: 0.0005,
           buy_levels: 8,
           sell_levels: 5,
           per_order_notional: 45.0,
@@ -11357,10 +11358,11 @@ MONITOR_PAGE = """<!doctype html>
           up_trigger_steps: 1,
           down_trigger_steps: 1,
           shift_steps: 1,
-          pause_buy_position_notional: 1200.0,
-          pause_short_position_notional: 320.0,
-          max_position_notional: 1600.0,
-          max_short_position_notional: 480.0,
+          pause_buy_position_notional: 420.0,
+          pause_short_position_notional: 260.0,
+          threshold_position_notional: 520.0,
+          max_position_notional: 650.0,
+          max_short_position_notional: 420.0,
           max_total_notional: 2200.0,
           max_new_orders: 32,
           buy_pause_amp_trigger_ratio: 0.009,
@@ -11372,15 +11374,15 @@ MONITOR_PAGE = """<!doctype html>
           adaptive_step_enabled: false,
           volatility_trigger_enabled: false,
           sleep_seconds: 4.0,
-          rolling_hourly_loss_limit: 6.0,
+          rolling_hourly_loss_limit: null,
           excess_inventory_reduce_only_enabled: false,
           autotune_symbol_enabled: false,
-          volume_trigger_enabled: true,
+          volume_trigger_enabled: false,
           volume_trigger_window: "15m",
-          volume_trigger_start_threshold: 260000.0,
-          volume_trigger_stop_threshold: 180000.0,
+          volume_trigger_start_threshold: null,
+          volume_trigger_stop_threshold: null,
           volume_trigger_stop_cancel_open_orders: true,
-          volume_trigger_stop_close_all_positions: true,
+          volume_trigger_stop_close_all_positions: false,
           runtime_guard_stats_start_time: "2026-03-31T18:00:00+08:00",
         },
       },
@@ -14410,7 +14412,7 @@ MONITOR_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(2, Number(refreshSecEl.value || 5));
+      const sec = Math.max(10, Number(refreshSecEl.value || 15));
       timer = setInterval(loadMonitor, sec * 1000);
     }
 
@@ -14651,7 +14653,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
           <select id="symbol"></select>
         </label>
         <label>手动筛选 / 直接输入
-          <input id="symbol_search" type="text" placeholder="输入币种，如 BARDUSDT" spellcheck="false" />
+          <input id="symbol_search" type="text" placeholder="输入币种，如 XAUTUSDT" spellcheck="false" />
         </label>
         <label>策略模式
           <select id="strategy_mode">
@@ -14661,7 +14663,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
           </select>
         </label>
         <label>自动刷新秒数
-          <input id="refresh_seconds" type="number" min="2" step="1" value="5" />
+          <input id="refresh_seconds" type="number" min="10" step="1" value="15" />
         </label>
         <label>循环秒数
           <input id="sleep_seconds" type="number" min="2" step="1" value="10" />
@@ -14997,7 +14999,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     }
 
     function getSelectedSymbol() {
-      return getExactSymbolMatch(symbolSearchEl.value) || normalizeSymbol(symbolEl.value) || "BARDUSDT";
+      return getExactSymbolMatch(symbolSearchEl.value) || normalizeSymbol(symbolEl.value) || "XAUTUSDT";
     }
 
     function readForm() {
@@ -15066,7 +15068,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const filteredSymbols = manual
         ? normalizedSymbols.filter((symbol) => symbol.includes(manual))
         : normalizedSymbols;
-      const target = getExactSymbolMatch(preferred) || getExactSymbolMatch(manual) || prev || "BARDUSDT";
+      const target = getExactSymbolMatch(preferred) || getExactSymbolMatch(manual) || prev || "XAUTUSDT";
       if (!filteredSymbols.length) {
         symbolEl.innerHTML = '<option value="">没有匹配币种</option>';
         symbolEl.value = "";
@@ -15075,6 +15077,8 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       symbolEl.innerHTML = filteredSymbols.map((symbol) => `<option value="${symbol}">${symbol}</option>`).join("");
       if (filteredSymbols.includes(target)) {
         symbolEl.value = target;
+      } else if (filteredSymbols.includes("XAUTUSDT")) {
+        symbolEl.value = "XAUTUSDT";
       } else if (filteredSymbols.includes("BARDUSDT")) {
         symbolEl.value = "BARDUSDT";
       } else if (filteredSymbols.includes("BTCUSDT")) {
@@ -15091,9 +15095,12 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         if (!resp.ok || !data.ok || !Array.isArray(data.symbols)) {
           throw new Error(data.error || `HTTP ${resp.status}`);
         }
-        populateSymbols(data.symbols, getSelectedSymbol() || (latestSnapshot && latestSnapshot.symbol) || "BARDUSDT");
+        populateSymbols(data.symbols, getSelectedSymbol() || (latestSnapshot && latestSnapshot.symbol) || "XAUTUSDT");
       } catch (err) {
-        populateSymbols(["BARDUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"], getSelectedSymbol() || (latestSnapshot && latestSnapshot.symbol) || "BARDUSDT");
+        populateSymbols(
+          ["XAUTUSDT", "BARDUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"],
+          getSelectedSymbol() || (latestSnapshot && latestSnapshot.symbol) || "XAUTUSDT",
+        );
         setStatus(`现货交易对加载失败，已使用默认列表：${err}`, true);
       }
     }
@@ -15373,7 +15380,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(2, Number(refreshSecondsEl.value || 5));
+      const sec = Math.max(10, Number(refreshSecondsEl.value || 15));
       timer = setInterval(() => loadStatus(true), sec * 1000);
     }
 
@@ -15397,7 +15404,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const normalized = normalizeSymbol(symbolSearchEl.value);
       symbolSearchEl.value = normalized;
       if (cursor !== null) symbolSearchEl.setSelectionRange(cursor, cursor);
-      populateSymbols(availableSpotSymbols, normalized || symbolEl.value || "BARDUSDT");
+      populateSymbols(availableSpotSymbols, normalized || symbolEl.value || "XAUTUSDT");
       const exactMatch = getExactSymbolMatch(normalized);
       if (exactMatch) {
         symbolEl.value = exactMatch;
@@ -15687,10 +15694,10 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       </div>
       <div class="toolbar">
         <label>币种列表
-          <input id="symbols_input" type="text" value="SAHARAUSDT,NIGHTUSDT,CFGUSDT" />
+          <input id="symbols_input" type="text" value="XAUTUSDT,SAHARAUSDT,NIGHTUSDT,CFGUSDT" />
         </label>
         <label>自动刷新（秒）
-          <input id="refresh_sec" type="number" min="3" step="1" value="8" />
+          <input id="refresh_sec" type="number" min="15" step="1" value="20" />
         </label>
         <button id="refresh_btn" class="primary">立即刷新</button>
         <button id="toggle_btn">暂停自动刷新</button>
@@ -15877,7 +15884,7 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(3, Number(refreshSecEl.value || 8));
+      const sec = Math.max(15, Number(refreshSecEl.value || 20));
       timer = setInterval(loadSpotStrategies, sec * 1000);
     }
 
@@ -16124,7 +16131,7 @@ STRATEGIES_PAGE = """<!doctype html>
       </div>
       <div class="toolbar">
         <label>自动刷新（秒）
-          <input id="refresh_sec" type="number" min="3" step="1" value="8" />
+          <input id="refresh_sec" type="number" min="15" step="1" value="20" />
         </label>
         <button id="refresh_btn" class="primary">立即刷新</button>
         <button id="toggle_btn">暂停自动刷新</button>
@@ -16505,7 +16512,7 @@ STRATEGIES_PAGE = """<!doctype html>
       `;
     }
 
-    async function fetchStrategySnapshots(symbols, concurrency = 2) {
+    async function fetchStrategySnapshots(symbols, concurrency = 1) {
       const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
       const results = new Array(symbols.length);
       let nextIndex = 0;
@@ -16545,7 +16552,7 @@ STRATEGIES_PAGE = """<!doctype html>
             metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
             return;
           }
-          const results = await fetchStrategySnapshots(symbols, 2);
+          const results = await fetchStrategySnapshots(symbols, 1);
           const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
           const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
           summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
@@ -16567,7 +16574,7 @@ STRATEGIES_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(3, Number(refreshSecEl.value || 8));
+      const sec = Math.max(15, Number(refreshSecEl.value || 20));
       timer = setInterval(loadStrategies, sec * 1000);
     }
 
@@ -20134,7 +20141,7 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             except Exception as exc:
                 if market_type == "spot":
-                    fallback_symbols = ["BTCUSDT", "ETHUSDT"]
+                    fallback_symbols = ["XAUTUSDT", "BTCUSDT", "ETHUSDT"]
                 else:
                     fallback_symbols = (
                         ["BTCUSD_PERP", "ETHUSD_PERP"]

@@ -59,6 +59,8 @@ class SpotLoopRunnerTests(unittest.TestCase):
             bid_price=99.0,
             ask_price=101.0,
             step_price=5.0,
+            buy_levels=1,
+            sell_levels=1,
             first_order_multiplier=1.5,
             per_order_notional=20.0,
             threshold_position_notional=200.0,
@@ -93,6 +95,8 @@ class SpotLoopRunnerTests(unittest.TestCase):
             bid_price=99.0,
             ask_price=101.0,
             step_price=5.0,
+            buy_levels=1,
+            sell_levels=1,
             first_order_multiplier=1.5,
             per_order_notional=20.0,
             threshold_position_notional=200.0,
@@ -183,6 +187,8 @@ class SpotLoopRunnerTests(unittest.TestCase):
             bid_price=99.0,
             ask_price=101.0,
             step_price=5.0,
+            buy_levels=1,
+            sell_levels=1,
             first_order_multiplier=1.5,
             per_order_notional=20.0,
             threshold_position_notional=200.0,
@@ -296,6 +302,8 @@ class SpotLoopRunnerTests(unittest.TestCase):
             bid_price=109.0,
             ask_price=111.0,
             step_price=5.0,
+            buy_levels=1,
+            sell_levels=1,
             first_order_multiplier=1.0,
             per_order_notional=110.0,
             threshold_position_notional=500.0,
@@ -311,7 +319,88 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["direction_state"], "long_active")
         self.assertEqual(controls["risk_state"], "normal")
         self.assertEqual(len(sell_orders), 1)
-        self.assertAlmostEqual(sell_orders[0]["qty"], 1.0, places=8)
+        self.assertAlmostEqual(sell_orders[0]["price"], 111.0, places=8)
+        self.assertAlmostEqual(sell_orders[0]["qty"], 0.9, places=8)
+
+    def test_build_spot_competition_inventory_grid_orders_supports_multiple_buy_levels(self) -> None:
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "known_orders": {},
+                "inventory_lots": [],
+            },
+            trades=[],
+            bid_price=100.0,
+            ask_price=100.2,
+            step_price=0.7,
+            buy_levels=3,
+            sell_levels=1,
+            first_order_multiplier=1.0,
+            per_order_notional=20.0,
+            threshold_position_notional=200.0,
+            max_order_position_notional=300.0,
+            max_position_notional=400.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+        )
+
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "BUY"])
+        self.assertEqual([order["role"] for order in desired_orders], ["bootstrap_entry", "grid_entry", "grid_entry"])
+        self.assertEqual([order["price"] for order in desired_orders], [100.0, 99.3, 98.6])
+        self.assertEqual(controls["effective_buy_levels"], 3)
+
+    def test_build_spot_competition_inventory_grid_orders_supports_multiple_sell_levels(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="spot")
+        apply_inventory_grid_fill(
+            runtime=runtime,
+            role="bootstrap_entry",
+            side="BUY",
+            price=100.0,
+            qty=1.0,
+            fill_time_ms=1000,
+            step_price=0.7,
+        )
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state={
+                "strategy_mode": "spot_competition_inventory_grid",
+                "known_orders": {},
+                "inventory_lots": [
+                    {
+                        "qty": 1.0,
+                        "cost_quote": 100.0,
+                        "buy_time_ms": 1000,
+                        "tag": "held",
+                    }
+                ],
+                "spot_competition_inventory_grid_runtime_cache": {
+                    "strategy_mode": "spot_competition_inventory_grid",
+                    "market_type": "spot",
+                    "runtime": runtime,
+                    "applied_trade_keys": [],
+                },
+            },
+            trades=[],
+            bid_price=99.9,
+            ask_price=100.1,
+            step_price=0.7,
+            buy_levels=3,
+            sell_levels=3,
+            first_order_multiplier=1.0,
+            per_order_notional=20.0,
+            threshold_position_notional=200.0,
+            max_order_position_notional=300.0,
+            max_position_notional=400.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+        )
+
+        sell_orders = [order for order in desired_orders if str(order.get("side", "")).upper() == "SELL"]
+        self.assertEqual([order["price"] for order in sell_orders], [100.7, 101.4, 102.1])
+        self.assertEqual(controls["effective_sell_levels"], 3)
 
     def test_normalize_commission_quote_handles_quote_asset(self) -> None:
         fee = _normalize_commission_quote(

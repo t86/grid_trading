@@ -31,6 +31,9 @@ ssh srv-43-155-136-111 '/usr/local/bin/grid-web-update'
 ssh srv-43-155-163-114 '/usr/local/bin/grid-web-update'
 ```
 
+For additional web instances on the same host, install a dedicated systemd unit and a matching
+wrapper such as `/usr/local/bin/grid-web-api2-update`, then use that wrapper for routine updates.
+
 The server-local `/usr/local/bin/grid-web-update` should match the tracked script at
 `deploy/oracle/grid-web-update.sh`.
 
@@ -43,6 +46,44 @@ The server-local `/usr/local/bin/grid-web-update` should match the tracked scrip
 - checking the local `/api/health` endpoint
 
 Do not use GitHub Actions, `rsync`, or ad hoc copy commands for routine deployment.
+
+## 2.1) Installing A Second Web Instance
+
+Use the same tracked installer, but pass a different service name, port, app directory, and env file:
+
+```bash
+APP_DIR=/home/ubuntu/wangge_api2 \
+SERVICE_WORKING_DIR=/home/ubuntu/wangge_api2 \
+SERVICE_NAME=grid-web-api2 \
+SERVICE_DESCRIPTION="Grid Optimizer Web Service (API2)" \
+GRID_WEB_PORT=8788 \
+SYSTEMD_ENV_FILE=/home/ubuntu/.config/wangge/grid_web_api2.env \
+PYTHONPATH_VALUE=/home/ubuntu/wangge_api2/src \
+UPDATE_WRAPPER_NAME=grid-web-api2-update \
+deploy/oracle/install_or_update.sh
+```
+
+If the code checkout and the runtime/output directory are different, also pass:
+
+```bash
+APP_DIR=/home/ubuntu/releases/wangge-118edc7-api2 \
+SERVICE_WORKING_DIR=/home/ubuntu/wangge_api2 \
+EXEC_PYTHON_BIN=/home/ubuntu/releases/wangge-118edc7-api2/.venv/bin/python \
+PYTHONPATH_VALUE=/home/ubuntu/releases/wangge-118edc7-api2/src \
+deploy/oracle/install_or_update.sh
+```
+
+Recommended contents for the instance env file:
+
+- `BINANCE_API_KEY` / `BINANCE_API_SECRET`
+- `GRID_WEB_USERNAME` / `GRID_WEB_PASSWORD` when the instance should require auth
+- any host-local extras such as `BINANCE_BORROW_LOOKUP_MODE=safe`
+
+After install, the routine update entrypoint becomes:
+
+```bash
+ssh <host> '/usr/local/bin/grid-web-api2-update'
+```
 
 ## 3) Runner Ownership Rule
 
@@ -87,6 +128,29 @@ After each deployment, check on the target server:
 sudo systemctl status grid-web --no-pager
 sudo journalctl -u grid-web -n 100 --no-pager
 ```
+
+## 4.1) Saved Runner Restart Helper
+
+For hosts that run multiple Binance accounts, do not hand-type `nohup env BINANCE_API_KEY=...`.
+Use the tracked helper script instead:
+
+```bash
+chmod +x deploy/oracle/manage_saved_runner.sh
+APP_DIR=/home/ubuntu/wangge_api2 \
+PYTHON_BIN=/home/ubuntu/wangge_api2/.venv/bin/python \
+PYTHONPATH_VALUE=/home/ubuntu/wangge_api2/src \
+GRID_API_ENV_FILE=/home/ubuntu/.config/wangge/binance_api_env_api2.env \
+deploy/oracle/manage_saved_runner.sh restart BASEDUSDT
+```
+
+Recommended pattern:
+
+- keep each account in its own env file, for example `binance_api_env.env` and `binance_api_env_api2.env`
+- keep each web instance in its own env file, for example `grid_web.env` and `grid_web_api2.env`
+- keep the env file out of Git and set permissions to `0600`
+- always restart saved runners through `manage_saved_runner.sh`, not ad hoc inline env commands
+- always update extra web instances through their dedicated wrapper, for example `grid-web-api2-update`
+- when the code lives in a release directory, point `PYTHON_BIN` and `PYTHONPATH_VALUE` at that release explicitly
 
 ## 5) Access
 

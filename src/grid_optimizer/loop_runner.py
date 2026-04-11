@@ -2924,6 +2924,7 @@ def apply_active_delever_long(
     current_long_avg_price: float,
     current_long_lots: list[dict[str, Any]],
     pause_long_position_notional: float | None,
+    threshold_position_notional: float | None,
     per_order_notional: float,
     step_price: float,
     tick_size: float | None,
@@ -2944,14 +2945,18 @@ def apply_active_delever_long(
         "pause_long_position_notional": pause_long_position_notional,
         "pause_short_position_notional": None,
     }
+    threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
+    pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
+    threshold_enabled = threshold_notional > max(pause_notional, 0.0)
     if (
         max_active_levels <= 0
-        or pause_long_position_notional is None
-        or pause_long_position_notional <= 0
         or current_long_qty <= 1e-12
-        or current_long_notional < pause_long_position_notional
         or step_price <= 0
     ):
+        return report
+    if not threshold_enabled and pause_notional <= 0:
+        return report
+    if current_long_notional < threshold_notional and current_long_notional < pause_notional:
         return report
 
     take_profit_orders = [
@@ -2975,7 +2980,18 @@ def apply_active_delever_long(
     active_count = 0
     estimated_cost = 0.0
     trigger_mode: str | None = None
-    if market_guard_buy_pause_active:
+    if threshold_enabled and current_long_notional >= threshold_notional:
+        safe_per_order_notional = max(float(per_order_notional), 1e-12)
+        excess_notional = max(current_long_notional - threshold_notional, 0.0)
+        active_count = min(len(take_profit_orders), max(1, int(math.ceil(excess_notional / safe_per_order_notional))))
+        estimated_cost = _estimate_long_delever_cost(
+            current_long_lots=current_long_lots,
+            current_long_qty=current_long_qty,
+            current_long_avg_price=current_long_avg_price,
+            sell_orders=take_profit_orders[:active_count],
+        )
+        trigger_mode = "threshold"
+    elif market_guard_buy_pause_active:
         active_count = requested_levels
         estimated_cost = _estimate_long_delever_cost(
             current_long_lots=current_long_lots,
@@ -3041,6 +3057,8 @@ def apply_active_delever_short(
     current_short_avg_price: float,
     current_short_lots: list[dict[str, Any]],
     pause_short_position_notional: float | None,
+    threshold_position_notional: float | None,
+    per_order_notional: float,
     step_price: float,
     tick_size: float | None,
     grid_buffer_realized_notional: float,
@@ -3059,14 +3077,18 @@ def apply_active_delever_short(
         "pause_long_position_notional": None,
         "pause_short_position_notional": pause_short_position_notional,
     }
+    threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
+    pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
+    threshold_enabled = threshold_notional > max(pause_notional, 0.0)
     if (
         max_active_levels <= 0
-        or pause_short_position_notional is None
-        or pause_short_position_notional <= 0
         or current_short_qty <= 1e-12
-        or current_short_notional < pause_short_position_notional
         or step_price <= 0
     ):
+        return report
+    if not threshold_enabled and pause_notional <= 0:
+        return report
+    if current_short_notional < threshold_notional and current_short_notional < pause_notional:
         return report
 
     take_profit_orders = [
@@ -3089,16 +3111,31 @@ def apply_active_delever_short(
 
     active_count = 0
     estimated_cost = 0.0
-    for level_count in range(1, requested_levels + 1):
-        level_cost = _estimate_short_delever_cost(
+    trigger_mode: str | None = None
+    if threshold_enabled and current_short_notional >= threshold_notional:
+        safe_per_order_notional = max(float(per_order_notional), 1e-12)
+        excess_notional = max(current_short_notional - threshold_notional, 0.0)
+        active_count = min(len(take_profit_orders), max(1, int(math.ceil(excess_notional / safe_per_order_notional))))
+        estimated_cost = _estimate_short_delever_cost(
             current_short_lots=current_short_lots,
             current_short_qty=current_short_qty,
             current_short_avg_price=current_short_avg_price,
-            buy_orders=take_profit_orders[:level_count],
+            buy_orders=take_profit_orders[:active_count],
         )
-        if available_buffer + 1e-12 >= level_cost:
-            active_count = level_count
-            estimated_cost = level_cost
+        trigger_mode = "threshold"
+    else:
+        for level_count in range(1, requested_levels + 1):
+            level_cost = _estimate_short_delever_cost(
+                current_short_lots=current_short_lots,
+                current_short_qty=current_short_qty,
+                current_short_avg_price=current_short_avg_price,
+                buy_orders=take_profit_orders[:level_count],
+            )
+            if available_buffer + 1e-12 >= level_cost:
+                active_count = level_count
+                estimated_cost = level_cost
+        if active_count > 0:
+            trigger_mode = "buffer"
 
     if active_count <= 0:
         return report
@@ -3127,7 +3164,7 @@ def apply_active_delever_short(
     report.update(
         {
             "active": True,
-            "trigger_mode": "buffer",
+            "trigger_mode": trigger_mode,
             "estimated_cost_notional": estimated_cost,
             "active_buy_order_count": active_count,
         }
@@ -5512,6 +5549,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_avg_price=max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_avg_price")), 0.0),
             current_long_lots=list(synthetic_ledger_snapshot.get("virtual_long_lots") or []),
             pause_long_position_notional=effective_args.pause_buy_position_notional,
+            threshold_position_notional=getattr(args, "threshold_position_notional", None),
             per_order_notional=inventory_tier["effective_per_order_notional"],
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
@@ -5526,6 +5564,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price=max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0),
             current_short_lots=list(synthetic_ledger_snapshot.get("virtual_short_lots") or []),
             pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_position_notional=getattr(args, "threshold_position_notional", None),
+            per_order_notional=inventory_tier["effective_per_order_notional"],
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),

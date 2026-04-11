@@ -26,11 +26,14 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("现货竞赛库存网格", SPOT_RUNNER_PAGE)
         self.assertIn('id="competition_fields"', SPOT_RUNNER_PAGE)
         self.assertIn("/spot_strategies", SPOT_RUNNER_PAGE)
+        self.assertIn('placeholder="输入币种，如 XAUTUSDT"', SPOT_RUNNER_PAGE)
+        self.assertIn('["XAUTUSDT", "BARDUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"]', SPOT_RUNNER_PAGE)
 
     def test_spot_strategies_page_contains_overview(self) -> None:
         self.assertIn("现货策略总览", SPOT_STRATEGIES_PAGE)
         self.assertIn('id="symbols_input"', SPOT_STRATEGIES_PAGE)
         self.assertIn("/api/spot_runner/status", SPOT_STRATEGIES_PAGE)
+        self.assertIn('value="XAUTUSDT,SAHARAUSDT,NIGHTUSDT,CFGUSDT"', SPOT_STRATEGIES_PAGE)
 
     @patch("grid_optimizer.web._validate_market_symbol")
     def test_normalize_spot_runner_payload_sets_defaults(self, _mock_validate_symbol) -> None:

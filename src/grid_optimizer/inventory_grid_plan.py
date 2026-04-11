@@ -15,6 +15,14 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _safe_positive_int(value: Any, default: int = 1) -> int:
+    try:
+        number = int(value)
+    except (TypeError, ValueError):
+        return default
+    return number if number > 0 else default
+
+
 def _build_order(
     *,
     side: str,
@@ -98,6 +106,112 @@ def _bootstrap_orders(
     return orders
 
 
+def _build_buy_ladder_orders(
+    *,
+    reference_price: float,
+    step_price: float,
+    levels: int,
+    first_order_notional: float,
+    per_order_notional: float,
+    first_role: str,
+    next_role: str,
+    start_level: int,
+    max_total_notional: float | None,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> list[dict[str, Any]]:
+    if max_total_notional is not None and max_total_notional <= EPSILON:
+        return []
+
+    orders: list[dict[str, Any]] = []
+    used_prices: set[float] = set()
+    planned_notional = 0.0
+
+    safe_levels = _safe_positive_int(levels, default=1)
+    for offset in range(safe_levels):
+        level = start_level + offset
+        raw_price = max(float(reference_price) - float(step_price) * float(level), 0.0)
+        if raw_price <= 0:
+            break
+        price = _round_order_price(raw_price, tick_size, "BUY")
+        if price <= 0 or price in used_prices:
+            continue
+        target_notional = max(float(first_order_notional if offset == 0 else per_order_notional), 0.0)
+        if target_notional <= 0:
+            continue
+        qty = _round_order_qty(target_notional / max(price, EPSILON), step_size)
+        actual_notional = qty * price
+        if not _order_meets_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+            continue
+        if max_total_notional is not None and max_total_notional > 0 and planned_notional + actual_notional > max_total_notional + EPSILON:
+            break
+        orders.append(
+            _build_order(
+                side="BUY",
+                price=price,
+                qty=qty,
+                role=first_role if offset == 0 else next_role,
+            )
+        )
+        used_prices.add(price)
+        planned_notional += actual_notional
+
+    return orders
+
+
+def _build_sell_ladder_orders(
+    *,
+    reference_price: float,
+    step_price: float,
+    levels: int,
+    per_order_notional: float,
+    role: str,
+    start_level: int,
+    max_total_qty: float | None,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> list[dict[str, Any]]:
+    if max_total_qty is not None and max_total_qty <= EPSILON:
+        return []
+
+    orders: list[dict[str, Any]] = []
+    used_prices: set[float] = set()
+    remaining_qty = None if max_total_qty is None else max(float(max_total_qty), 0.0)
+
+    safe_levels = _safe_positive_int(levels, default=1)
+    for offset in range(safe_levels):
+        level = start_level + offset
+        raw_price = max(float(reference_price) + float(step_price) * float(level), 0.0)
+        if raw_price <= 0:
+            continue
+        price = _round_order_price(raw_price, tick_size, "SELL")
+        if price <= 0 or price in used_prices:
+            continue
+        target_notional = max(float(per_order_notional), 0.0)
+        if target_notional <= 0:
+            continue
+        qty = _round_order_qty(target_notional / max(price, EPSILON), step_size)
+        if remaining_qty is not None:
+            remaining_qty_rounded = _round_order_qty(max(remaining_qty, 0.0), step_size)
+            if remaining_qty_rounded <= 0:
+                break
+            qty = min(qty, remaining_qty_rounded)
+        if not _order_meets_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+            continue
+        orders.append(_build_order(side="SELL", price=price, qty=qty, role=role))
+        used_prices.add(price)
+        if remaining_qty is not None:
+            remaining_qty = max(remaining_qty - qty, 0.0)
+            if remaining_qty <= EPSILON:
+                break
+
+    return orders
+
+
 def build_inventory_grid_orders(
     *,
     runtime: dict[str, Any],
@@ -109,10 +223,12 @@ def build_inventory_grid_orders(
     threshold_position_notional: float,
     max_order_position_notional: float,
     max_position_notional: float,
+    buy_levels: int = 1,
     tick_size: float | None,
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    sell_levels: int = 1,
 ) -> dict[str, Any]:
     market_type = str(runtime.get("market_type", "futures")).strip().lower()
     direction_state = str(runtime.get("direction_state", "flat")).strip().lower()
@@ -137,16 +253,33 @@ def build_inventory_grid_orders(
                 "forced_reduce_orders": forced_reduce_orders,
                 "tail_cleanup_active": False,
             }
-        bootstrap_orders = _bootstrap_orders(
-            market_type=market_type,
-            bid_price=bid_price,
-            ask_price=ask_price,
-            bootstrap_notional=bootstrap_notional,
-            tick_size=tick_size,
-            step_size=step_size,
-            min_qty=min_qty,
-            min_notional=min_notional,
-        )
+        if market_type == "spot":
+            bootstrap_orders = _build_buy_ladder_orders(
+                reference_price=bid_price,
+                step_price=step_price,
+                levels=buy_levels,
+                first_order_notional=bootstrap_notional,
+                per_order_notional=per_order_notional,
+                first_role="bootstrap_entry",
+                next_role="grid_entry",
+                start_level=0,
+                max_total_notional=max_order_position_notional if max_order_position_notional > 0 else None,
+                tick_size=tick_size,
+                step_size=step_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
+        else:
+            bootstrap_orders = _bootstrap_orders(
+                market_type=market_type,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                bootstrap_notional=bootstrap_notional,
+                tick_size=tick_size,
+                step_size=step_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
         return {
             "risk_state": "normal",
             "bootstrap_orders": bootstrap_orders,
@@ -196,25 +329,49 @@ def build_inventory_grid_orders(
                 "tail_cleanup_active": True,
             }
 
-        exit_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
-        exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
-        exit_qty = min(exit_qty, closeable_qty)
         planned_closing_qty = 0.0
-        if _order_meets_mins(qty=exit_qty, price=exit_price, min_qty=min_qty, min_notional=min_notional):
-            sell_orders.append(_build_order(side="SELL", price=exit_price, qty=exit_qty, role="grid_exit"))
-            planned_closing_qty = exit_qty
-
-        entry_allowed = risk_state == "normal" and (
-            max_order_position_notional <= 0 or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= max_order_position_notional
+        sell_reference_price = anchor_price
+        if market_type == "spot":
+            sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
+        sell_orders.extend(
+            _build_sell_ladder_orders(
+                reference_price=sell_reference_price,
+                step_price=step_price,
+                levels=sell_levels if risk_state == "normal" else 1,
+                per_order_notional=per_order_notional,
+                role="grid_exit",
+                start_level=1,
+                max_total_qty=closeable_qty,
+                tick_size=tick_size,
+                step_size=step_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
         )
-        if entry_allowed:
-            entry_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
-            entry_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(entry_price, EPSILON), step_size)
-            if entry_qty > 0 and (min_qty is None or entry_qty >= min_qty) and (
-                min_notional is None or entry_qty * entry_price >= min_notional
-            ):
-                buy_orders.append(_build_order(side="BUY", price=entry_price, qty=entry_qty, role="grid_entry"))
+        planned_closing_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in sell_orders if item.get("role") == "grid_exit")
+
+        if risk_state == "normal":
+            remaining_entry_notional_cap = None
+            if max_order_position_notional > 0:
+                remaining_entry_notional_cap = max(max_order_position_notional - inventory_notional, 0.0)
+            buy_orders.extend(
+                _build_buy_ladder_orders(
+                    reference_price=anchor_price,
+                    step_price=step_price,
+                    levels=buy_levels,
+                    first_order_notional=per_order_notional,
+                    per_order_notional=per_order_notional,
+                    first_role="grid_entry",
+                    next_role="grid_entry",
+                    start_level=1,
+                    max_total_notional=remaining_entry_notional_cap,
+                    tick_size=tick_size,
+                    step_size=step_size,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
+            )
 
         if risk_state in {"threshold_reduce_only", "hard_reduce_only"}:
             raw_reduce_qty = max(inventory_notional - max(_safe_float(threshold_position_notional), 0.0), 0.0) / max(mid_price, EPSILON)
