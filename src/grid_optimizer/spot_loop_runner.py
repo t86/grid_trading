@@ -1291,6 +1291,9 @@ def _build_spot_competition_inventory_grid_orders(
     first_order_multiplier: float,
     per_order_notional: float,
     threshold_position_notional: float,
+    threshold_reduce_target_notional: float = 0.0,
+    warmup_position_notional: float = 0.0,
+    require_non_loss_exit: bool = False,
     max_order_position_notional: float,
     max_position_notional: float,
     tick_size: float | None,
@@ -1320,6 +1323,9 @@ def _build_spot_competition_inventory_grid_orders(
         per_order_notional=per_order_notional,
         first_order_multiplier=first_order_multiplier,
         threshold_position_notional=threshold_position_notional,
+        threshold_reduce_target_notional=threshold_reduce_target_notional,
+        warmup_position_notional=warmup_position_notional,
+        require_non_loss_exit=require_non_loss_exit,
         max_order_position_notional=max_order_position_notional,
         max_position_notional=max_position_notional,
         buy_levels=buy_levels,
@@ -1330,6 +1336,8 @@ def _build_spot_competition_inventory_grid_orders(
         min_notional=min_notional,
     )
     desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
+    reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
+    display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
     controls = {
         "mode": "competition_inventory_grid",
         "buy_paused": False,
@@ -1339,7 +1347,7 @@ def _build_spot_competition_inventory_grid_orders(
         "market_guard_amplitude_ratio": 0.0,
         "center_price": _safe_float(runtime.get("grid_anchor_price")),
         "center_shift_count": 0,
-        "inventory_soft_limit_notional": _safe_float(threshold_position_notional),
+        "inventory_soft_limit_notional": display_soft_limit,
         "inventory_hard_limit_notional": _safe_float(max_position_notional),
         "effective_buy_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "BUY"),
         "effective_sell_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "SELL"),
@@ -1348,6 +1356,10 @@ def _build_spot_competition_inventory_grid_orders(
         "risk_state": str(plan.get("risk_state", "normal") or "normal"),
         "grid_anchor_price": _safe_float(runtime.get("grid_anchor_price")),
         "pair_credit_steps": _safe_int(runtime.get("pair_credit_steps")),
+        "threshold_position_notional": _safe_float(threshold_position_notional),
+        "threshold_reduce_target_notional": reduce_target_notional,
+        "warmup_position_notional": max(_safe_float(warmup_position_notional), 0.0),
+        "require_non_loss_exit": bool(require_non_loss_exit),
     }
     return desired_orders, controls
 
@@ -1648,6 +1660,9 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             first_order_multiplier=float(args.first_order_multiplier),
             per_order_notional=float(args.per_order_notional),
             threshold_position_notional=float(args.threshold_position_notional),
+            threshold_reduce_target_notional=float(getattr(args, "threshold_reduce_target_notional", 0.0)),
+            warmup_position_notional=float(getattr(args, "warmup_position_notional", 0.0)),
+            require_non_loss_exit=bool(getattr(args, "require_non_loss_exit", False)),
             max_order_position_notional=float(args.max_order_position_notional),
             max_position_notional=float(args.max_position_notional),
             tick_size=symbol_info.get("tick_size"),
@@ -1788,6 +1803,10 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "risk_state": str(controls.get("risk_state", "") or ""),
         "grid_anchor_price": _safe_float(controls.get("grid_anchor_price")),
         "pair_credit_steps": _safe_int(controls.get("pair_credit_steps")),
+        "threshold_position_notional": _safe_float(controls.get("threshold_position_notional")),
+        "threshold_reduce_target_notional": _safe_float(controls.get("threshold_reduce_target_notional")),
+        "warmup_position_notional": _safe_float(controls.get("warmup_position_notional")),
+        "require_non_loss_exit": bool(controls.get("require_non_loss_exit")),
         "shift_moves": controls.get("shift_moves", []),
         "runtime_status": runtime_guard_result.runtime_status,
         "stop_triggered": runtime_guard_result.stop_triggered,
@@ -1880,11 +1899,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inventory-recycle-min-profit-ratio", type=float, default=0.001)
     parser.add_argument("--first-order-multiplier", type=float, default=1.0)
     parser.add_argument("--threshold-position-notional", type=float, default=0.0)
+    parser.add_argument("--threshold-reduce-target-notional", type=float, default=0.0)
+    parser.add_argument("--warmup-position-notional", type=float, default=0.0)
+    parser.add_argument("--require-non-loss-exit", action="store_true")
     parser.add_argument("--max-order-position-notional", type=float, default=0.0)
     parser.add_argument("--max-position-notional", type=float, default=0.0)
     parser.add_argument("--max-single-cycle-new-orders", type=int, default=8)
     parser.add_argument("--run-start-time", type=str, default=None)
     parser.add_argument("--run-end-time", type=str, default=None)
+    parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     return parser

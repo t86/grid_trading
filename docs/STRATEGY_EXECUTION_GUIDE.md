@@ -98,6 +98,9 @@
 - 生产机器上的策略 runner、flatten runner、`output/*_loop_runner.pid`、`output/*_loop_runner_control.json` 必须由 `ubuntu` 用户持有和启动。
 - 日常启动、停止、重启，优先走监控台页面，或由 `ubuntu` 用户调用本机 `grid-web` / `wangge-web` 提供的 `/api/runner/start`、`/api/runner/stop`。
 - 不要用 `root` 直接执行 `python -m grid_optimizer.loop_runner`、`python -m grid_optimizer.maker_flatten_runner`，也不要让 `root` 写入 runner 的 pid / control / state 文件。
+- 手工热更前先确认“真实运行目录”，不要只看端口或 release 名字猜路径。`state-path`、`plan-json`、`summary-jsonl`、日志默认都是相对路径，runner 从哪个 cwd 启动，就会把 `output/*` 写到哪个目录。
+- 同一台机器可以同时存在多个代码树，例如老 release 和常驻工作目录；重启前先用 `ps` / `/proc/<pid>/cwd` 确认当前进程到底跑在哪个目录，再去覆盖对应代码。
+- 如果不是通过 web 端拉起，而是手工 `nohup` runner，先在同一 shell 里加载匹配账号的 `binance_api*.env`。否则很容易出现“进程已启动但立即因缺少 API key 退出”的假成功。
 - 如果需要跨电脑查看 `KAT` 巡检结果，使用 [`docs/KAT_GUARD_AUTOMATION.md`](./KAT_GUARD_AUTOMATION.md) 里约定的远端落盘路径，不要依赖本机 automation 列表。
 
 原因：
@@ -216,6 +219,11 @@
 - 系统会持续同步一份“虚拟 long/short 账本”，用来判断当前应该补哪边。
 - 如果启用了 `startup_entry_multiplier`，首轮 `startup_pending` 时会把买一 / 卖一放大；
   首轮之后恢复为普通 `per_order_notional`。
+- `take_profit_min_profit_ratio > 0` 时，轻仓阶段的 `take_profit_long / take_profit_short` 会先守住非亏损线，不再为了贴盘口而主动亏损平仓。
+- 当单边名义仓位超过 `threshold_position_notional` 时，会把最前排的 `take_profit` 提升成 `active_delever_*`：
+  - `threshold` 分支会优先按虚拟账本里最早、最远端的 lot 做 FIFO 减仓，目的是先吃掉最难回本的库存，而不是继续把最新成交的低成本 lot 先卖掉。
+  - 如果“只减到阈值线”后最近一笔非亏损回补单仍然离盘口太远，系统会继续多提一两档前排减仓单，但前提是这一步确实能把最近保本单重新压回大约 `1 step_price` 的距离内。
+  - `buffer` / `market_guard` 触发的 `active_delever` 仍按原有逻辑工作；这次 FIFO 只针对阈值减仓分支。
 
 适用场景：
 
@@ -293,6 +301,16 @@
 - 执行方式：
   - `flat` 时只挂一笔 `bootstrap_entry` BUY，不会反向开空。
   - 后续只围绕已持有现货库存做买入补仓、卖出减仓和尾部清理。
+- 可选控制：
+  - `warmup_position_notional`
+    - 大于 `0` 时，现货冷启动先只挂买一附近的首笔暖仓单，不会一上来把整排买梯全部铺开。
+    - 更适合像 `XAUT spot` 这种希望先拿到一小段轻仓、再逐步把网格跑起来的场景。
+  - `require_non_loss_exit`
+    - 仅在 `normal` 风险态生效。
+    - 卖单会按已匹配 lot 的 break-even floor 往上抬，默认不允许正常网格为了成交去亏损卖出。
+  - `threshold_reduce_target_notional`
+    - 达到阈值后，不是只减回阈值线，而是继续减到这个 target。
+    - 适合单边下跌后主动把库存多削一点，让后续买单更快恢复、网格重新转起来。
 - 重启 / 恢复：
   - 优先读取本地 state 里的 spot competition runtime cache，再把交易所最近能映射到 `known_orders` 的策略成交增量应用进去。
   - 只有缓存缺失、缓存和当前 spot 库存数量对不上，或者增量应用失败时，才退回到“按近端策略成交回放重建 runtime”。

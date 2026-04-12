@@ -1516,6 +1516,75 @@ def _consume_synthetic_lots_lifo_with_cost(
     return updated, realized_cost
 
 
+def _consume_synthetic_lots_fifo_with_cost(
+    lots: list[dict[str, float]],
+    qty: float,
+) -> tuple[list[dict[str, float]], float]:
+    remaining = max(float(qty), 0.0)
+    realized_cost = 0.0
+    updated = [{"qty": float(item["qty"]), "price": float(item["price"])} for item in lots]
+    while updated and remaining > 1e-12:
+        head = updated[0]
+        head_qty = max(_safe_float(head.get("qty")), 0.0)
+        head_price = max(_safe_float(head.get("price")), 0.0)
+        consumed_qty = min(head_qty, remaining)
+        realized_cost += consumed_qty * head_price
+        if head_qty <= remaining + 1e-12:
+            remaining = max(remaining - head_qty, 0.0)
+            updated.pop(0)
+            continue
+        head["qty"] = head_qty - remaining
+        remaining = 0.0
+    return updated, realized_cost
+
+
+def _consume_synthetic_lots_with_cost(
+    lots: list[dict[str, float]],
+    qty: float,
+    *,
+    consume_mode: str = "lifo",
+) -> tuple[list[dict[str, float]], float]:
+    normalized_mode = str(consume_mode or "lifo").strip().lower()
+    if normalized_mode == "fifo":
+        return _consume_synthetic_lots_fifo_with_cost(lots, qty)
+    return _consume_synthetic_lots_lifo_with_cost(lots, qty)
+
+
+def _project_remaining_synthetic_book(
+    *,
+    raw_lots: list[dict[str, Any]],
+    fallback_qty: float,
+    fallback_price: float,
+    consume_qty: float,
+    consume_mode: str = "lifo",
+) -> dict[str, Any]:
+    lots = _normalize_synthetic_lots(
+        raw_lots,
+        fallback_qty=max(float(fallback_qty), 0.0),
+        fallback_price=max(float(fallback_price), 0.0),
+    )
+    if consume_qty <= 1e-12:
+        remaining_qty, remaining_avg = _synthetic_book_from_lots(lots)
+        return {
+            "remaining_lots": lots,
+            "remaining_qty": remaining_qty,
+            "remaining_avg_price": remaining_avg,
+            "realized_cost": 0.0,
+        }
+    remaining_lots, realized_cost = _consume_synthetic_lots_with_cost(
+        lots,
+        consume_qty,
+        consume_mode=consume_mode,
+    )
+    remaining_qty, remaining_avg = _synthetic_book_from_lots(remaining_lots)
+    return {
+        "remaining_lots": remaining_lots,
+        "remaining_qty": remaining_qty,
+        "remaining_avg_price": remaining_avg,
+        "realized_cost": realized_cost,
+    }
+
+
 def _ensure_synthetic_buffer_fields(ledger: dict[str, Any]) -> None:
     ledger["grid_buffer_realized_notional"] = max(_safe_float(ledger.get("grid_buffer_realized_notional")), 0.0)
     ledger["grid_buffer_spent_notional"] = max(_safe_float(ledger.get("grid_buffer_spent_notional")), 0.0)
@@ -1535,6 +1604,7 @@ def _apply_synthetic_trade_fill(
     if qty <= 0 or price <= 0:
         return False
     _ensure_synthetic_buffer_fields(ledger)
+    lot_consume_mode = str(order_ref.get("lot_consume_mode", "lifo") or "lifo").strip().lower()
 
     long_lots = _normalize_synthetic_lots(
         ledger.get("virtual_long_lots"),
@@ -1553,7 +1623,11 @@ def _apply_synthetic_trade_fill(
         long_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(long_lots, qty)
         ledger["grid_buffer_realized_notional"] += max((qty * price) - realized_cost, 0.0)
     elif role == "active_delever_long":
-        long_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(long_lots, qty)
+        long_lots, realized_cost = _consume_synthetic_lots_with_cost(
+            long_lots,
+            qty,
+            consume_mode=lot_consume_mode,
+        )
         ledger["grid_buffer_spent_notional"] += max(realized_cost - (qty * price), 0.0)
     elif role in {"bootstrap_short", "entry_short"}:
         short_lots.append({"qty": qty, "price": price})
@@ -1561,7 +1635,11 @@ def _apply_synthetic_trade_fill(
         short_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(short_lots, qty)
         ledger["grid_buffer_realized_notional"] += max(realized_cost - (qty * price), 0.0)
     elif role == "active_delever_short":
-        short_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(short_lots, qty)
+        short_lots, realized_cost = _consume_synthetic_lots_with_cost(
+            short_lots,
+            qty,
+            consume_mode=lot_consume_mode,
+        )
         ledger["grid_buffer_spent_notional"] += max((qty * price) - realized_cost, 0.0)
     else:
         return False
@@ -1743,6 +1821,7 @@ def update_synthetic_order_refs(
             "side": str(request.get("side", "")).upper().strip(),
             "position_side": str(request.get("position_side", "BOTH")).upper().strip() or "BOTH",
             "client_order_id": str(response.get("clientOrderId", "")).strip(),
+            "lot_consume_mode": str(request.get("lot_consume_mode", "")).strip().lower(),
             "updated_at": _isoformat(_utc_now()),
         }
 
@@ -2777,12 +2856,20 @@ def apply_take_profit_profit_guard(
     current_short_notional: float,
     pause_long_position_notional: float | None,
     pause_short_position_notional: float | None,
+    threshold_long_position_notional: float | None = None,
+    threshold_short_position_notional: float | None = None,
     min_profit_ratio: float | None,
     tick_size: float | None,
     bid_price: float,
     ask_price: float,
 ) -> dict[str, Any]:
     safe_ratio = None if min_profit_ratio is None else max(float(min_profit_ratio), 0.0)
+    long_pause_threshold = max(_safe_float(pause_long_position_notional), 0.0)
+    short_pause_threshold = max(_safe_float(pause_short_position_notional), 0.0)
+    long_threshold_notional = max(_safe_float(threshold_long_position_notional), 0.0)
+    short_threshold_notional = max(_safe_float(threshold_short_position_notional), 0.0)
+    long_relax_threshold = max(long_pause_threshold, long_threshold_notional)
+    short_relax_threshold = max(short_pause_threshold, short_threshold_notional)
     report = {
         "enabled": safe_ratio is not None and safe_ratio > 0,
         "min_profit_ratio": min_profit_ratio,
@@ -2790,8 +2877,8 @@ def apply_take_profit_profit_guard(
         "short_active": False,
         "long_floor_price": None,
         "short_ceiling_price": None,
-        "long_relax_threshold_notional": pause_long_position_notional,
-        "short_relax_threshold_notional": pause_short_position_notional,
+        "long_relax_threshold_notional": long_relax_threshold if long_relax_threshold > 0 else pause_long_position_notional,
+        "short_relax_threshold_notional": short_relax_threshold if short_relax_threshold > 0 else pause_short_position_notional,
         "adjusted_sell_orders": 0,
         "adjusted_buy_orders": 0,
         "dropped_sell_orders": 0,
@@ -2800,18 +2887,8 @@ def apply_take_profit_profit_guard(
     if safe_ratio is None or safe_ratio <= 0:
         return report
 
-    long_threshold = pause_long_position_notional if pause_long_position_notional is not None and pause_long_position_notional > 0 else None
-    short_threshold = pause_short_position_notional if pause_short_position_notional is not None and pause_short_position_notional > 0 else None
-    long_active = (
-        current_long_qty > 1e-12
-        and current_long_avg_price > 0
-        and (long_threshold is None or current_long_notional < long_threshold)
-    )
-    short_active = (
-        current_short_qty > 1e-12
-        and current_short_avg_price > 0
-        and (short_threshold is None or current_short_notional < short_threshold)
-    )
+    long_active = current_long_qty > 1e-12 and current_long_avg_price > 0
+    short_active = current_short_qty > 1e-12 and current_short_avg_price > 0
     report["long_active"] = long_active
     report["short_active"] = short_active
 
@@ -2876,6 +2953,7 @@ def _estimate_long_delever_cost(
     current_long_qty: float,
     current_long_avg_price: float,
     sell_orders: list[dict[str, Any]],
+    consume_mode: str = "lifo",
 ) -> float:
     lots = _normalize_synthetic_lots(
         current_long_lots,
@@ -2888,7 +2966,7 @@ def _estimate_long_delever_cost(
         price = max(_safe_float(order.get("price")), 0.0)
         if qty <= 0 or price <= 0:
             continue
-        lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(lots, qty)
+        lots, realized_cost = _consume_synthetic_lots_with_cost(lots, qty, consume_mode=consume_mode)
         total_cost += max(realized_cost - (qty * price), 0.0)
     return total_cost
 
@@ -2899,6 +2977,7 @@ def _estimate_short_delever_cost(
     current_short_qty: float,
     current_short_avg_price: float,
     buy_orders: list[dict[str, Any]],
+    consume_mode: str = "lifo",
 ) -> float:
     lots = _normalize_synthetic_lots(
         current_short_lots,
@@ -2911,9 +2990,115 @@ def _estimate_short_delever_cost(
         price = max(_safe_float(order.get("price")), 0.0)
         if qty <= 0 or price <= 0:
             continue
-        lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(lots, qty)
+        lots, realized_cost = _consume_synthetic_lots_with_cost(lots, qty, consume_mode=consume_mode)
         total_cost += max((qty * price) - realized_cost, 0.0)
     return total_cost
+
+
+def _project_nearest_long_non_loss_exit_price(
+    *,
+    current_long_lots: list[dict[str, Any]],
+    current_long_qty: float,
+    current_long_avg_price: float,
+    consume_qty: float,
+    consume_mode: str,
+    step_price: float,
+    tick_size: float | None,
+    min_profit_ratio: float | None,
+) -> float | None:
+    projection = _project_remaining_synthetic_book(
+        raw_lots=current_long_lots,
+        fallback_qty=current_long_qty,
+        fallback_price=current_long_avg_price,
+        consume_qty=consume_qty,
+        consume_mode=consume_mode,
+    )
+    remaining_qty = max(_safe_float(projection.get("remaining_qty")), 0.0)
+    if remaining_qty <= 1e-12:
+        return None
+
+    profit_step = max(
+        float(step_price),
+        float(tick_size) if tick_size is not None and tick_size > 0 else 0.0,
+        1e-12,
+    )
+    nearest_exit_price = None
+    for lot in projection.get("remaining_lots", []):
+        if not isinstance(lot, dict):
+            continue
+        lot_price = max(_safe_float(lot.get("price")), 0.0)
+        if lot_price <= 0:
+            continue
+        candidate_price = _round_order_price(lot_price + profit_step, tick_size, "SELL")
+        if candidate_price <= 0:
+            continue
+        if nearest_exit_price is None or candidate_price < nearest_exit_price:
+            nearest_exit_price = candidate_price
+
+    remaining_avg_price = max(_safe_float(projection.get("remaining_avg_price")), 0.0)
+    if nearest_exit_price is None and remaining_avg_price > 0:
+        nearest_exit_price = _round_order_price(remaining_avg_price + profit_step, tick_size, "SELL")
+
+    safe_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    if safe_ratio > 0 and remaining_avg_price > 0:
+        guard_floor = _round_order_price(remaining_avg_price * (1.0 + safe_ratio), tick_size, "SELL")
+        if guard_floor > 0:
+            nearest_exit_price = guard_floor if nearest_exit_price is None else max(nearest_exit_price, guard_floor)
+
+    return nearest_exit_price if nearest_exit_price is not None and nearest_exit_price > 0 else None
+
+
+def _project_nearest_short_non_loss_exit_price(
+    *,
+    current_short_lots: list[dict[str, Any]],
+    current_short_qty: float,
+    current_short_avg_price: float,
+    consume_qty: float,
+    consume_mode: str,
+    step_price: float,
+    tick_size: float | None,
+    min_profit_ratio: float | None,
+) -> float | None:
+    projection = _project_remaining_synthetic_book(
+        raw_lots=current_short_lots,
+        fallback_qty=current_short_qty,
+        fallback_price=current_short_avg_price,
+        consume_qty=consume_qty,
+        consume_mode=consume_mode,
+    )
+    remaining_qty = max(_safe_float(projection.get("remaining_qty")), 0.0)
+    if remaining_qty <= 1e-12:
+        return None
+
+    profit_step = max(
+        float(step_price),
+        float(tick_size) if tick_size is not None and tick_size > 0 else 0.0,
+        1e-12,
+    )
+    nearest_exit_price = None
+    for lot in projection.get("remaining_lots", []):
+        if not isinstance(lot, dict):
+            continue
+        lot_price = max(_safe_float(lot.get("price")), 0.0)
+        if lot_price <= 0:
+            continue
+        candidate_price = _round_order_price(max(lot_price - profit_step, 0.0), tick_size, "BUY")
+        if candidate_price <= 0:
+            continue
+        if nearest_exit_price is None or candidate_price > nearest_exit_price:
+            nearest_exit_price = candidate_price
+
+    remaining_avg_price = max(_safe_float(projection.get("remaining_avg_price")), 0.0)
+    if nearest_exit_price is None and remaining_avg_price > 0:
+        nearest_exit_price = _round_order_price(max(remaining_avg_price - profit_step, 0.0), tick_size, "BUY")
+
+    safe_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    if safe_ratio > 0 and remaining_avg_price > 0:
+        guard_ceiling = _round_order_price(remaining_avg_price * (1.0 - safe_ratio), tick_size, "BUY")
+        if guard_ceiling > 0:
+            nearest_exit_price = guard_ceiling if nearest_exit_price is None else min(nearest_exit_price, guard_ceiling)
+
+    return nearest_exit_price if nearest_exit_price is not None and nearest_exit_price > 0 else None
 
 
 def apply_active_delever_long(
@@ -2928,6 +3113,8 @@ def apply_active_delever_long(
     per_order_notional: float,
     step_price: float,
     tick_size: float | None,
+    ask_price: float,
+    min_profit_ratio: float | None,
     market_guard_buy_pause_active: bool,
     grid_buffer_realized_notional: float,
     grid_buffer_spent_notional: float,
@@ -2981,6 +3168,7 @@ def apply_active_delever_long(
     estimated_cost = 0.0
     trigger_mode: str | None = None
     if threshold_enabled and current_long_notional >= threshold_notional:
+        threshold_consume_mode = "fifo"
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
         excess_notional = max(current_long_notional - threshold_notional, 0.0)
         active_count = min(len(take_profit_orders), max(1, int(math.ceil(excess_notional / safe_per_order_notional))))
@@ -2989,7 +3177,54 @@ def apply_active_delever_long(
             current_long_qty=current_long_qty,
             current_long_avg_price=current_long_avg_price,
             sell_orders=take_profit_orders[:active_count],
+            consume_mode=threshold_consume_mode,
         )
+        target_active_count = max(active_count, requested_levels)
+        projected_exit_price = _project_nearest_long_non_loss_exit_price(
+            current_long_lots=current_long_lots,
+            current_long_qty=current_long_qty,
+            current_long_avg_price=current_long_avg_price,
+            consume_qty=sum(max(_safe_float(item.get("qty")), 0.0) for item in take_profit_orders[:active_count]),
+            consume_mode=threshold_consume_mode,
+            step_price=step_price,
+            tick_size=tick_size,
+            min_profit_ratio=min_profit_ratio,
+        )
+        while active_count < target_active_count:
+            if projected_exit_price is None or projected_exit_price <= float(ask_price) + float(step_price) + 1e-12:
+                break
+            next_active_count = active_count + 1
+            next_projected_exit_price = _project_nearest_long_non_loss_exit_price(
+                current_long_lots=current_long_lots,
+                current_long_qty=current_long_qty,
+                current_long_avg_price=current_long_avg_price,
+                consume_qty=sum(max(_safe_float(item.get("qty")), 0.0) for item in take_profit_orders[:next_active_count]),
+                consume_mode=threshold_consume_mode,
+                step_price=step_price,
+                tick_size=tick_size,
+                min_profit_ratio=min_profit_ratio,
+            )
+            if next_projected_exit_price is None:
+                active_count = next_active_count
+                estimated_cost = _estimate_long_delever_cost(
+                    current_long_lots=current_long_lots,
+                    current_long_qty=current_long_qty,
+                    current_long_avg_price=current_long_avg_price,
+                    sell_orders=take_profit_orders[:active_count],
+                    consume_mode=threshold_consume_mode,
+                )
+                break
+            if projected_exit_price - next_projected_exit_price <= 1e-12:
+                break
+            active_count = next_active_count
+            projected_exit_price = next_projected_exit_price
+            estimated_cost = _estimate_long_delever_cost(
+                current_long_lots=current_long_lots,
+                current_long_qty=current_long_qty,
+                current_long_avg_price=current_long_avg_price,
+                sell_orders=take_profit_orders[:active_count],
+                consume_mode=threshold_consume_mode,
+            )
         trigger_mode = "threshold"
     elif market_guard_buy_pause_active:
         active_count = requested_levels
@@ -3032,6 +3267,8 @@ def apply_active_delever_long(
         active = dict(order)
         active["role"] = "active_delever_long"
         active["level"] = index
+        if trigger_mode == "threshold":
+            active["lot_consume_mode"] = "fifo"
         active_orders.append(active)
 
     plan["sell_orders"] = sorted(
@@ -3061,6 +3298,8 @@ def apply_active_delever_short(
     per_order_notional: float,
     step_price: float,
     tick_size: float | None,
+    bid_price: float,
+    min_profit_ratio: float | None,
     grid_buffer_realized_notional: float,
     grid_buffer_spent_notional: float,
     max_active_levels: int = 3,
@@ -3113,6 +3352,7 @@ def apply_active_delever_short(
     estimated_cost = 0.0
     trigger_mode: str | None = None
     if threshold_enabled and current_short_notional >= threshold_notional:
+        threshold_consume_mode = "fifo"
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
         excess_notional = max(current_short_notional - threshold_notional, 0.0)
         active_count = min(len(take_profit_orders), max(1, int(math.ceil(excess_notional / safe_per_order_notional))))
@@ -3121,7 +3361,54 @@ def apply_active_delever_short(
             current_short_qty=current_short_qty,
             current_short_avg_price=current_short_avg_price,
             buy_orders=take_profit_orders[:active_count],
+            consume_mode=threshold_consume_mode,
         )
+        target_active_count = max(active_count, requested_levels)
+        projected_exit_price = _project_nearest_short_non_loss_exit_price(
+            current_short_lots=current_short_lots,
+            current_short_qty=current_short_qty,
+            current_short_avg_price=current_short_avg_price,
+            consume_qty=sum(max(_safe_float(item.get("qty")), 0.0) for item in take_profit_orders[:active_count]),
+            consume_mode=threshold_consume_mode,
+            step_price=step_price,
+            tick_size=tick_size,
+            min_profit_ratio=min_profit_ratio,
+        )
+        while active_count < target_active_count:
+            if projected_exit_price is None or projected_exit_price >= max(float(bid_price) - float(step_price), 0.0) - 1e-12:
+                break
+            next_active_count = active_count + 1
+            next_projected_exit_price = _project_nearest_short_non_loss_exit_price(
+                current_short_lots=current_short_lots,
+                current_short_qty=current_short_qty,
+                current_short_avg_price=current_short_avg_price,
+                consume_qty=sum(max(_safe_float(item.get("qty")), 0.0) for item in take_profit_orders[:next_active_count]),
+                consume_mode=threshold_consume_mode,
+                step_price=step_price,
+                tick_size=tick_size,
+                min_profit_ratio=min_profit_ratio,
+            )
+            if next_projected_exit_price is None:
+                active_count = next_active_count
+                estimated_cost = _estimate_short_delever_cost(
+                    current_short_lots=current_short_lots,
+                    current_short_qty=current_short_qty,
+                    current_short_avg_price=current_short_avg_price,
+                    buy_orders=take_profit_orders[:active_count],
+                    consume_mode=threshold_consume_mode,
+                )
+                break
+            if next_projected_exit_price - projected_exit_price <= 1e-12:
+                break
+            active_count = next_active_count
+            projected_exit_price = next_projected_exit_price
+            estimated_cost = _estimate_short_delever_cost(
+                current_short_lots=current_short_lots,
+                current_short_qty=current_short_qty,
+                current_short_avg_price=current_short_avg_price,
+                buy_orders=take_profit_orders[:active_count],
+                consume_mode=threshold_consume_mode,
+            )
         trigger_mode = "threshold"
     else:
         for level_count in range(1, requested_levels + 1):
@@ -3155,6 +3442,8 @@ def apply_active_delever_short(
         active = dict(order)
         active["role"] = "active_delever_short"
         active["level"] = index
+        if trigger_mode == "threshold":
+            active["lot_consume_mode"] = "fifo"
         active_orders.append(active)
 
     plan["buy_orders"] = sorted(
@@ -5504,21 +5793,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 trend_follow=synthetic_trend_follow,
             )
         )
-        take_profit_guard = apply_take_profit_profit_guard(
-            plan=plan,
-            current_long_qty=current_long_qty,
-            current_short_qty=current_short_qty,
-            current_long_avg_price=current_long_avg_price,
-            current_short_avg_price=current_short_avg_price,
-            current_long_notional=current_long_notional,
-            current_short_notional=current_short_notional,
-            pause_long_position_notional=effective_args.pause_buy_position_notional,
-            pause_short_position_notional=effective_args.pause_short_position_notional,
-            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
-            tick_size=symbol_info.get("tick_size"),
-            bid_price=bid_price,
-            ask_price=ask_price,
-        )
         controls = apply_hedge_position_controls(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -5554,6 +5828,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             per_order_notional=inventory_tier["effective_per_order_notional"],
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
+            ask_price=ask_price,
+            min_profit_ratio=getattr(args, "take_profit_min_profit_ratio", None),
             market_guard_buy_pause_active=bool(market_guard["buy_pause_active"]),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
@@ -5569,8 +5845,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             per_order_notional=inventory_tier["effective_per_order_notional"],
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            min_profit_ratio=getattr(args, "take_profit_min_profit_ratio", None),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
+        )
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
         )
         active_delever = {
             "enabled": bool(long_active_delever.get("enabled")) or bool(short_active_delever.get("enabled")),
@@ -5639,6 +5934,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=current_short_notional,
             pause_long_position_notional=effective_args.pause_buy_position_notional,
             pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,
@@ -5811,6 +6108,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=current_short_notional,
             pause_long_position_notional=None,
             pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,
@@ -5897,6 +6195,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=0.0,
             pause_long_position_notional=effective_args.pause_buy_position_notional,
             pause_short_position_notional=None,
+            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,

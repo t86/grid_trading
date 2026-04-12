@@ -796,7 +796,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     },
     "xaut_volume_guarded_bard_v2": {
         "label": "XAUT 冲量控损 v2",
-        "description": "仅用于 XAUTUSDT 的固定节奏 synthetic_neutral。沿用 111 线上实盘版本：逐笔 lot 一格配对止盈、8 买 5 卖、单笔 20U、对称 2000/2500 仓位阈值，并把 mixed inventory 的 tiny residual 阈值固定到 45U，避免轻微反向残仓把计划锁成只减仓。",
+        "description": "仅用于 XAUTUSDT 的固定节奏 synthetic_neutral。8 买 5 卖、单笔 20U、轻仓卖单至少保 1 tick，不到减仓阈值不亏损卖；单边库存超过阈值后，用前排 active_delever 把减仓单贴回盘口，同时把 inventory tier 提前到 160U 开始收缩买单。",
         "startable": True,
         "kind": "synthetic",
         "symbol": "XAUTUSDT",
@@ -816,17 +816,18 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "up_trigger_steps": 1,
             "down_trigger_steps": 1,
             "shift_steps": 1,
-            "pause_buy_position_notional": 2000.0,
-            "pause_short_position_notional": 2000.0,
-            "max_position_notional": 2500.0,
-            "max_short_position_notional": 2500.0,
+            "pause_buy_position_notional": 200.0,
+            "pause_short_position_notional": 200.0,
+            "threshold_position_notional": 240.0,
+            "max_position_notional": 320.0,
+            "max_short_position_notional": 320.0,
             "max_total_notional": 2200.0,
-            "max_new_orders": 32,
+            "max_new_orders": 24,
             "buy_pause_amp_trigger_ratio": 0.009,
             "buy_pause_down_return_trigger_ratio": -0.0045,
             "short_cover_pause_amp_trigger_ratio": 0.005,
             "short_cover_pause_down_return_trigger_ratio": -0.0022,
-            "take_profit_min_profit_ratio": 0.0,
+            "take_profit_min_profit_ratio": 0.0001,
             "freeze_shift_abs_return_trigger_ratio": 0.006,
             "adaptive_step_enabled": False,
             "synthetic_trend_follow_enabled": False,
@@ -836,7 +837,13 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "excess_inventory_reduce_only_enabled": False,
             "margin_type": "KEEP",
             "leverage": 10,
-            "sleep_seconds": 4.0,
+            "inventory_tier_start_notional": 160.0,
+            "inventory_tier_end_notional": 220.0,
+            "inventory_tier_buy_levels": 3,
+            "inventory_tier_sell_levels": 12,
+            "inventory_tier_per_order_notional": 20.0,
+            "inventory_tier_base_position_notional": 60.0,
+            "sleep_seconds": 8.0,
         },
     },
     "volume_short_v1": {
@@ -2240,6 +2247,9 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "per_order_notional": 0.0,
     "first_order_multiplier": 4.0,
     "threshold_position_notional": 0.0,
+    "threshold_reduce_target_notional": 0.0,
+    "warmup_position_notional": 0.0,
+    "require_non_loss_exit": False,
     "max_order_position_notional": 0.0,
     "max_position_notional": 0.0,
     "sleep_seconds": 10.0,
@@ -3366,11 +3376,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--static-sell-offset-steps", str(config["static_sell_offset_steps"])])
     if config.get("center_price") is not None:
         command.extend(["--center-price", str(config["center_price"])])
+    if config.get("threshold_position_notional") is not None:
+        command.extend(["--threshold-position-notional", str(config["threshold_position_notional"])])
     if str(config.get("strategy_mode", "")).strip() == "competition_inventory_grid":
         if config.get("first_order_multiplier") is not None:
             command.extend(["--first-order-multiplier", str(config["first_order_multiplier"])])
-        if config.get("threshold_position_notional") is not None:
-            command.extend(["--threshold-position-notional", str(config["threshold_position_notional"])])
         if config.get("max_order_position_notional") is not None:
             command.extend(["--max-order-position-notional", str(config["max_order_position_notional"])])
     command.append("--market-bias-enabled" if config.get("market_bias_enabled", False) else "--no-market-bias-enabled")
@@ -3683,6 +3693,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "shift_steps",
             "pause_buy_position_notional",
             "pause_short_position_notional",
+            "threshold_position_notional",
             "max_position_notional",
             "max_short_position_notional",
             "custom_grid_roll_enabled",
@@ -4407,6 +4418,18 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("threshold_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["threshold_position_notional"]),
         "threshold_position_notional",
     )
+    threshold_reduce_target_notional = _safe_float(
+        payload.get("threshold_reduce_target_notional", SPOT_RUNNER_DEFAULT_CONFIG["threshold_reduce_target_notional"]),
+        "threshold_reduce_target_notional",
+    )
+    warmup_position_notional = _safe_float(
+        payload.get("warmup_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["warmup_position_notional"]),
+        "warmup_position_notional",
+    )
+    require_non_loss_exit = _safe_bool(
+        payload.get("require_non_loss_exit", SPOT_RUNNER_DEFAULT_CONFIG["require_non_loss_exit"]),
+        "require_non_loss_exit",
+    )
     max_order_position_notional = _safe_float(
         payload.get("max_order_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_order_position_notional"]),
         "max_order_position_notional",
@@ -4519,6 +4542,8 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("first_order_multiplier must be > 0")
         if threshold_position_notional < 0:
             raise ValueError("threshold_position_notional must be >= 0")
+        if warmup_position_notional < 0:
+            raise ValueError("warmup_position_notional must be >= 0")
         if max_order_position_notional < 0:
             raise ValueError("max_order_position_notional must be >= 0")
         if max_position_notional <= 0:
@@ -4558,6 +4583,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "per_order_notional": per_order_notional,
             "first_order_multiplier": first_order_multiplier,
             "threshold_position_notional": threshold_position_notional,
+            "threshold_reduce_target_notional": threshold_reduce_target_notional,
+            "warmup_position_notional": warmup_position_notional,
+            "require_non_loss_exit": require_non_loss_exit,
             "max_order_position_notional": max_order_position_notional,
             "max_position_notional": max_position_notional,
             "sleep_seconds": sleep_seconds,
@@ -4619,6 +4647,10 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("first_order_multiplier", 4.0)),
         "--threshold-position-notional",
         str(config.get("threshold_position_notional", 0.0)),
+        "--threshold-reduce-target-notional",
+        str(config.get("threshold_reduce_target_notional", 0.0)),
+        "--warmup-position-notional",
+        str(config.get("warmup_position_notional", 0.0)),
         "--max-order-position-notional",
         str(config.get("max_order_position_notional", 0.0)),
         "--max-position-notional",
@@ -4663,6 +4695,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
     for flag, value in extra_args:
         if value is not None:
             command.extend([flag, str(value)])
+    if _truthy(config.get("require_non_loss_exit", False)):
+        command.append("--require-non-loss-exit")
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")
     command.append("--apply" if config.get("apply", True) else "--no-apply")
     return command
@@ -11696,7 +11730,7 @@ MONITOR_PAGE = """<!doctype html>
       {
         key: "xaut_volume_guarded_bard_v2",
         label: "XAUT 冲量控损 v2",
-        description: "仅用于 XAUTUSDT 的固定节奏 synthetic_neutral。沿用 111 线上实盘版本：逐笔 lot 一格配对止盈、8 买 5 卖、单笔 20U、对称 2000/2500 仓位阈值，并把 mixed inventory 的 tiny residual 阈值固定到 45U，避免轻微反向残仓把计划锁成只减仓。",
+        description: "仅用于 XAUTUSDT 的固定节奏 synthetic_neutral。8 买 5 卖、单笔 20U、轻仓卖单至少保 1 tick，不到减仓阈值不亏损卖；单边库存超过阈值后，用前排 active_delever 把减仓单贴回盘口，同时把 inventory tier 提前到 160U 开始收缩买单。",
         startable: true,
         kind: "synthetic",
         symbol: "XAUTUSDT",
@@ -11716,17 +11750,18 @@ MONITOR_PAGE = """<!doctype html>
           up_trigger_steps: 1,
           down_trigger_steps: 1,
           shift_steps: 1,
-          pause_buy_position_notional: 2000.0,
-          pause_short_position_notional: 2000.0,
-          max_position_notional: 2500.0,
-          max_short_position_notional: 2500.0,
+          pause_buy_position_notional: 200.0,
+          pause_short_position_notional: 200.0,
+          threshold_position_notional: 240.0,
+          max_position_notional: 320.0,
+          max_short_position_notional: 320.0,
           max_total_notional: 2200.0,
-          max_new_orders: 32,
+          max_new_orders: 24,
           buy_pause_amp_trigger_ratio: 0.009,
           buy_pause_down_return_trigger_ratio: -0.0045,
           short_cover_pause_amp_trigger_ratio: 0.005,
           short_cover_pause_down_return_trigger_ratio: -0.0022,
-          take_profit_min_profit_ratio: 0.0,
+          take_profit_min_profit_ratio: 0.0001,
           freeze_shift_abs_return_trigger_ratio: 0.006,
           adaptive_step_enabled: false,
           synthetic_trend_follow_enabled: false,
@@ -11736,7 +11771,13 @@ MONITOR_PAGE = """<!doctype html>
           excess_inventory_reduce_only_enabled: false,
           margin_type: "KEEP",
           leverage: 10,
-          sleep_seconds: 4.0,
+          inventory_tier_start_notional: 160.0,
+          inventory_tier_end_notional: 220.0,
+          inventory_tier_buy_levels: 3,
+          inventory_tier_sell_levels: 12,
+          inventory_tier_per_order_notional: 20.0,
+          inventory_tier_base_position_notional: 60.0,
+          sleep_seconds: 8.0,
         },
       },
       {
@@ -12848,12 +12889,12 @@ MONITOR_PAGE = """<!doctype html>
         ],
       },
       xaut_volume_guarded_bard_v2: {
-        summary: "XAUTUSDT 的固定节奏双向冲量版。沿用 111 线上实盘版本：8 买 5 卖、单笔 20U、10x 杠杆，并把多空软硬阈值对称放到 2000 / 2500，同时把 mixed inventory 的 tiny residual 阈值固定到 45U。",
+        summary: "XAUTUSDT 的固定节奏双向冲量版。8 买 5 卖、单笔 20U、10x 杠杆；轻仓卖单默认守保本线，超过 240U 阈值后再让前排减仓单贴近盘口，同时从 160U 开始提前收缩买单。",
         focus: [
-          "这套的核心不是整仓均价保本，而是 synthetic ledger 里的逐笔 lot 一格配对。每一笔净增仓都会单独挂回相隔 1 个 step_price 的反向单。",
-          "因为阈值已经改成多空对称的 2000 / 2500，所以它比早期 XAUT 非对称版本更接近中性，允许更大的双边库存带宽。",
-          "额外的 45U tiny residual 阈值只作用在多空同时存在时，目的是让 20U 单笔的配置继续保留高挂单数，但不要再因为 30-40U 的反向残仓整轮退化成 tp-only。",
-          "默认关闭 adaptive step 和 trend follow，目的是把线上已经验证过的固定节奏完整保留下来，避免启动时又被自动放大步长。",
+          "这套的核心仍然是 synthetic ledger 里的逐笔 lot 一格配对。阈值以下的 take_profit 单会按最小利润抬底，不为了成交主动亏损卖出。",
+          "当单边库存超过 240U 时，active_delever 会把前排减仓单推回盘口附近，允许用很小的一部分库存先恢复流动性，而不是整排卖单都挂在远离盘口的位置。",
+          "inventory tier 从 160U 开始生效，到 220U 时会把买单收窄到 3 档、卖单扩到 12 档，目的是在接近阈值前就先减慢继续吸仓的速度。",
+          "45U tiny residual 阈值仍然保留，避免轻微反向残仓把计划锁成只减仓。",
         ],
       },
       volume_short_v1: {
@@ -20157,7 +20198,15 @@ class _Handler(BaseHTTPRequestHandler):
                 )
             except Exception as exc:
                 if market_type == "spot":
-                    fallback_symbols = ["XAUTUSDT", "BTCUSDT", "ETHUSDT"]
+                    fallback_symbols = [
+                        "XAUTUSDT",
+                        "BARDUSDT",
+                        "SAHARAUSDT",
+                        "NIGHTUSDT",
+                        "CFGUSDT",
+                        "BTCUSDT",
+                        "ETHUSDT",
+                    ]
                 else:
                     fallback_symbols = (
                         ["BTCUSD_PERP", "ETHUSD_PERP"]

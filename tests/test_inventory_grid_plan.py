@@ -81,6 +81,32 @@ def test_spot_flat_seeds_multiple_buy_levels() -> None:
     assert plan["sell_orders"] == []
 
 
+def test_spot_flat_warmup_mode_places_only_top_of_book_buy() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.33,
+        ask_price=0.331,
+        step_price=0.0005,
+        per_order_notional=30.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=200.0,
+        warmup_position_notional=30.0,
+        max_order_position_notional=300.0,
+        max_position_notional=300.0,
+        buy_levels=5,
+        tick_size=0.0001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    assert [item["side"] for item in plan["bootstrap_orders"]] == ["BUY"]
+    assert plan["bootstrap_orders"][0]["price"] == 0.33
+    assert plan["bootstrap_orders"][0]["role"] == "bootstrap_entry"
+
+
 def test_conservative_flat_runtime_does_not_bootstrap() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["recovery_mode"] = "conservative_reduce_only"
@@ -224,6 +250,158 @@ def test_pair_credit_unlocks_forced_reduce_order() -> None:
 
     assert any(item["role"] == "forced_reduce" for item in plan["sell_orders"])
     assert any(item["role"] == "forced_reduce" for item in plan["forced_reduce_orders"])
+
+
+def test_threshold_reduce_target_unlocks_forced_reduce_without_pair_credit() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 100.0
+    runtime["pair_credit_steps"] = 0
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 4.0,
+            "entry_price": 101.0,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=99.9,
+        ask_price=100.1,
+        step_price=1.0,
+        per_order_notional=100.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        threshold_reduce_target_notional=250.0,
+        max_order_position_notional=500.0,
+        max_position_notional=500.0,
+        tick_size=0.1,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    forced_reduce = [item for item in plan["sell_orders"] if item["role"] == "forced_reduce"]
+    assert plan["risk_state"] == "threshold_reduce_only"
+    assert forced_reduce
+    assert forced_reduce[0]["qty"] == 1.5
+
+
+def test_spot_non_loss_exit_keeps_sell_above_entry_before_threshold() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="bootstrap_entry",
+        side="BUY",
+        price=100.0,
+        qty=1.0,
+        fill_time_ms=1000,
+        step_price=1.0,
+    )
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=98.9,
+        ask_price=99.1,
+        step_price=1.0,
+        per_order_notional=100.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        require_non_loss_exit=True,
+        max_order_position_notional=300.0,
+        max_position_notional=300.0,
+        sell_levels=3,
+        tick_size=0.1,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    sell_orders = [item for item in plan["sell_orders"] if item["role"] == "grid_exit"]
+    assert sell_orders
+    assert sell_orders[0]["price"] >= 100.0
+
+
+def test_spot_warmup_mode_uses_top_of_book_buy_and_non_loss_sell() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    apply_inventory_grid_fill(
+        runtime=runtime,
+        role="bootstrap_entry",
+        side="BUY",
+        price=100.0,
+        qty=0.2,
+        fill_time_ms=1000,
+        step_price=1.0,
+    )
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=99.8,
+        ask_price=99.9,
+        step_price=1.0,
+        per_order_notional=30.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=200.0,
+        warmup_position_notional=30.0,
+        require_non_loss_exit=True,
+        max_order_position_notional=300.0,
+        max_position_notional=300.0,
+        buy_levels=5,
+        sell_levels=5,
+        tick_size=0.1,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    assert [item["side"] for item in plan["buy_orders"]] == ["BUY"]
+    assert [item["price"] for item in plan["buy_orders"]] == [99.8]
+    sell_orders = [item for item in plan["sell_orders"] if item["role"] == "grid_exit"]
+    assert len(sell_orders) == 1
+    assert sell_orders[0]["price"] == 100.0
+
+
+def test_spot_long_active_caps_stale_anchor_buy_back_to_top_of_book() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 110.0
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 1.0,
+            "entry_price": 105.0,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=99.8,
+        ask_price=99.9,
+        step_price=1.0,
+        per_order_notional=30.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=200.0,
+        max_order_position_notional=300.0,
+        max_position_notional=300.0,
+        buy_levels=5,
+        sell_levels=5,
+        tick_size=0.1,
+        step_size=0.1,
+        min_qty=0.1,
+        min_notional=5.0,
+    )
+
+    assert plan["risk_state"] == "normal"
+    assert plan["buy_orders"]
+    assert plan["buy_orders"][0]["price"] == 99.8
+    assert all(item["price"] < 99.9 for item in plan["buy_orders"])
 
 
 def test_grid_exit_is_capped_to_held_qty_for_long_side() -> None:
