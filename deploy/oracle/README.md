@@ -179,3 +179,8 @@ Also note that preserving `output/` keeps runner state and control JSON files. T
 required, but it also means a code deployment does not automatically refresh saved runtime
 configuration. When debugging "server still uses old config" issues, inspect the persisted files
 under `output/` in addition to the code version.
+
+When restarting a saved runner through `/api/runner/start`, prefer sending the full payload copied
+from the live `output/*_control.json` and then editing only the fields you intend to change. Partial
+payloads are easy to start from, but they can silently drop live overrides such as
+`take_profit_min_profit_ratio`, inventory guards, or preset-specific caps.

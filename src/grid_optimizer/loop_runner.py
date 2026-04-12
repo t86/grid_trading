@@ -5154,6 +5154,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
     synthetic_lot_cost_guard_profiles = {
+        "bard_12h_push_neutral_v2",
         "based_volume_guarded_bard_v2",
         "xaut_competition_push_neutral_v1",
         "xaut_volume_guarded_bard_v2",

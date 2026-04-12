@@ -381,16 +381,17 @@
 ### `bard_12h_push_neutral_v2`
 
 - 核心：BARDUSDT 的固定节奏双向冲量模板。
-- 固定 `step_price=0.0007`、`8` 买 `4` 卖、零底仓、`1` 格追中心，`per_order_notional=45`，长侧上限 `2000/2400`、短侧回补护栏 `220/320`。
-- 默认关闭 `autotune_symbol_enabled`、`excess_inventory_reduce_only_enabled` 和 `volatility_trigger_enabled`，更适合高成交窗口短时冲量。
-- 默认开启最近 `15m` 市场成交额自动启停：`start_threshold=1,000,000`、`stop_threshold=700,000`。低量停机时会先撤策略单，但不会自动平仓。
-- 后续如果要把这套骨架复用到其他币种，优先改用 `synthetic_neutral_bard_style_v1`。
+- 固定 `step_price=0.0005`、`8` 买 `4` 卖、零底仓、`1` 格追中心，`per_order_notional=45`，长侧停买/硬上限 `420/650`、短侧回补护栏 `220/320`。
+- 轻仓回补默认带 `take_profit_min_profit_ratio=0.0001`，也就是首档至少保 1 tick 盈利，不再走亏损贴边平仓。
+- 默认关闭 `autotune_symbol_enabled`、`excess_inventory_reduce_only_enabled`、`volatility_trigger_enabled` 和量能自动启停，优先按固定节奏控损刷量。
+- 如果后续要复用“贴盘口先成交、成交优先”的旧风格，改用 `synthetic_neutral_bard_style_v1`；当前这个 preset 已默认偏向微网格盈利。
 
 ### `synthetic_neutral_bard_style_v1`
 
-- 核心：把 `114/150` 上验证过的 BARD 实盘骨架整理成通用模板。
+- 核心：保留一份可复用的 BARD 贴边成交模板。
 - 固定 `step_price=0.0007`、`8` 买 `4` 卖、零底仓、`1` 格追中心，`per_order_notional=45`，长侧上限 `2000/2400`、短侧回补护栏 `220/320`。
-- 默认关闭 `autotune_symbol_enabled` 和 `volatility_trigger_enabled`，先保留验证过的固定节奏；更适合复制给同价位低价币后，再按 tick、点差和库存承受能力细调。
+- 默认 `take_profit_min_profit_ratio=0.0`，保留贴盘口首档回补的旧成交风格，更适合成交量优先、愿意接受更强贴边出清的场景。
+- 如果要降低损耗、让轻仓回补先追求微利，优先从 `bard_12h_push_neutral_v2` 出发，而不是从这个模板出发。
 - 仓库里附了一个可复制模板文件：
   `deploy/oracle/runtime_configs/synthetic_neutral_bard_style_v1.template.json`
 
