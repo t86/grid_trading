@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from .dry_run import _round_order_price, _round_order_qty
-from .inventory_grid_state import build_forced_reduce_lot_plan
+from .inventory_grid_state import build_forced_reduce_lot_plan, select_grid_exit_lots
 
 EPSILON = 1e-12
 
@@ -134,6 +134,7 @@ def _apply_spot_non_loss_floor_to_sell_orders(
     *,
     orders: list[dict[str, Any]],
     position_lots: list[dict[str, Any]],
+    direction_state: str,
     tick_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
@@ -146,7 +147,14 @@ def _apply_spot_non_loss_floor_to_sell_orders(
         price = max(_safe_float(order.get("price")), 0.0)
         if qty <= EPSILON or price <= 0:
             continue
-        remaining_lots, matched = _consume_lots_preview(lots=remaining_lots, qty_to_consume=qty)
+        if direction_state in {"long_active", "short_active"}:
+            remaining_lots, matched = select_grid_exit_lots(
+                lots=remaining_lots,
+                direction_state=direction_state,
+                close_qty=qty,
+            )
+        else:
+            remaining_lots, matched = _consume_lots_preview(lots=remaining_lots, qty_to_consume=qty)
         break_even_price = _matched_break_even_price(matched=matched)
         if break_even_price > 0:
             price = max(price, _round_order_price(break_even_price, tick_size, "SELL"))
@@ -458,7 +466,17 @@ def build_inventory_grid_orders(
             if non_loss_spot_exit_active:
                 cleanup_price = max(
                     cleanup_price,
-                    _round_order_price(_matched_break_even_price(matched=_consume_lots_preview(lots=list(runtime.get("position_lots") or []), qty_to_consume=cleanup_qty)[1]), tick_size, "SELL"),
+                    _round_order_price(
+                        _matched_break_even_price(
+                            matched=select_grid_exit_lots(
+                                lots=list(runtime.get("position_lots") or []),
+                                direction_state=direction_state,
+                                close_qty=cleanup_qty,
+                            )[1]
+                        ),
+                        tick_size,
+                        "SELL",
+                    ),
                 )
             cleanup_notional = cleanup_qty * cleanup_price
             if cleanup_qty > 0 and (min_qty is None or cleanup_qty >= min_qty) and (
@@ -523,6 +541,7 @@ def build_inventory_grid_orders(
                 _apply_spot_non_loss_floor_to_sell_orders(
                     orders=raw_sell_orders,
                     position_lots=list(runtime.get("position_lots") or []),
+                    direction_state=direction_state,
                     tick_size=tick_size,
                     min_qty=min_qty,
                     min_notional=min_notional,

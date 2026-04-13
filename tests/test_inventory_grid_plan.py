@@ -326,6 +326,52 @@ def test_spot_non_loss_exit_keeps_sell_above_entry_before_threshold() -> None:
     assert sell_orders[0]["price"] >= 100.0
 
 
+def test_spot_non_loss_exit_prefers_near_profitable_lots() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 94.0
+    runtime["position_lots"] = [
+        {
+            "lot_id": "expensive",
+            "side": "long",
+            "qty": 1.0,
+            "entry_price": 100.0,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        },
+        {
+            "lot_id": "cheap",
+            "side": "long",
+            "qty": 1.0,
+            "entry_price": 90.0,
+            "opened_at_ms": 2,
+            "source_role": "grid_entry",
+        },
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=94.9,
+        ask_price=95.1,
+        step_price=1.0,
+        per_order_notional=100.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=300.0,
+        require_non_loss_exit=True,
+        max_order_position_notional=300.0,
+        max_position_notional=300.0,
+        sell_levels=1,
+        tick_size=0.1,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    sell_orders = [item for item in plan["sell_orders"] if item["role"] == "grid_exit"]
+    assert sell_orders
+    assert sell_orders[0]["price"] == 95.1
+
+
 def test_spot_warmup_mode_uses_top_of_book_buy_and_non_loss_sell() -> None:
     runtime = new_inventory_grid_runtime(market_type="spot")
     apply_inventory_grid_fill(

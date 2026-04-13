@@ -113,6 +113,64 @@ def _forced_reduce_lots(
     return new_lots, selected
 
 
+def select_grid_exit_lots(
+    *,
+    lots: list[dict[str, Any]],
+    direction_state: str,
+    close_qty: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    if direction_state == "long_active":
+        ordered = sorted(
+            enumerate(lots),
+            key=lambda item: (float(item[1].get("entry_price", 0.0) or 0.0), item[0]),
+        )
+    elif direction_state == "short_active":
+        ordered = sorted(
+            enumerate(lots),
+            key=lambda item: (float(item[1].get("entry_price", 0.0) or 0.0), item[0]),
+            reverse=True,
+        )
+    else:
+        raise ValueError(f"unsupported direction_state for grid exit: {direction_state}")
+
+    remaining = max(float(close_qty), 0.0)
+    selection: dict[str, float] = {}
+    selected: list[dict[str, Any]] = []
+    for _, lot in ordered:
+        if remaining <= EPSILON:
+            break
+        lot_id = str(lot.get("lot_id") or "")
+        lot_qty = max(float(lot.get("qty", 0.0) or 0.0), 0.0)
+        take_qty = min(lot_qty, remaining)
+        if take_qty <= EPSILON:
+            continue
+        selection[lot_id] = selection.get(lot_id, 0.0) + take_qty
+        selected.append(
+            {
+                "lot_id": lot_id,
+                "qty": take_qty,
+                "matched_qty": take_qty,
+                "entry_price": max(float(lot.get("entry_price", 0.0) or 0.0), 0.0),
+            }
+        )
+        remaining -= take_qty
+
+    new_lots: list[dict[str, Any]] = []
+    for lot in lots:
+        lot_id = str(lot.get("lot_id") or "")
+        take_qty = selection.get(lot_id, 0.0)
+        if take_qty <= EPSILON:
+            new_lots.append(dict(lot))
+            continue
+        lot_qty = max(float(lot.get("qty", 0.0) or 0.0), 0.0)
+        left_qty = lot_qty - take_qty
+        if left_qty > EPSILON:
+            kept = dict(lot)
+            kept["qty"] = left_qty
+            new_lots.append(kept)
+    return new_lots, selected
+
+
 def _accumulate_pair_credit_steps(*, matched: list[dict[str, Any]], exit_price: float, step_price: float) -> int:
     total = 0
     if step_price <= 0:
@@ -226,6 +284,12 @@ def apply_inventory_grid_fill(
                     0,
                     int(runtime.get("pair_credit_steps", 0) or 0) - forced_reduce_cost_steps,
                 )
+            elif normalized_role == "grid_exit":
+                lots, matched = select_grid_exit_lots(
+                    lots=lots,
+                    direction_state=current_state,
+                    close_qty=fill_qty,
+                )
             else:
                 lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
             if normalized_role == "grid_exit":
@@ -273,6 +337,12 @@ def apply_inventory_grid_fill(
                 runtime["pair_credit_steps"] = max(
                     0,
                     int(runtime.get("pair_credit_steps", 0) or 0) - forced_reduce_cost_steps,
+                )
+            elif normalized_role == "grid_exit":
+                lots, matched = select_grid_exit_lots(
+                    lots=lots,
+                    direction_state=current_state,
+                    close_qty=fill_qty,
                 )
             else:
                 lots, matched = _consume_lots(lots=lots, qty_to_consume=fill_qty)
