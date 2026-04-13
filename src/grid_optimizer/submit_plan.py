@@ -159,16 +159,23 @@ def prepare_post_only_order_request(
     tick_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    post_only: bool = True,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     qty = _safe_float(order.get("qty"))
     desired_price = _safe_float(order.get("price"))
-    submit_price = adjust_post_only_price(
-        desired_price=desired_price,
-        side=side,
-        live_bid_price=live_bid_price,
-        live_ask_price=live_ask_price,
-        tick_size=tick_size,
-    )
+    normalized_side = side.upper().strip()
+    if post_only:
+        submit_price = adjust_post_only_price(
+            desired_price=desired_price,
+            side=normalized_side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+        )
+    elif tick_size and tick_size > 0:
+        submit_price = _round_order_price(desired_price, tick_size, normalized_side)
+    else:
+        submit_price = desired_price
     submit_notional = qty * submit_price
     if qty <= 0:
         return None, {
@@ -202,6 +209,10 @@ def prepare_post_only_order_request(
         "submitted_price": submit_price,
         "submitted_notional": submit_notional,
     }, None
+
+
+def _order_prefers_post_only(order: dict[str, Any]) -> bool:
+    return str(order.get("execution_type", "post_only")).strip().lower() != "aggressive"
 
 
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
@@ -272,6 +283,7 @@ def preserve_queue_priority_in_execution_actions(
             tick_size=tick_size,
             min_qty=min_qty,
             min_notional=min_notional,
+            post_only=_order_prefers_post_only(order),
         )
         if prepared_order is None:
             continue
@@ -336,6 +348,7 @@ def preserve_queue_priority_in_execution_actions(
             tick_size=tick_size,
             min_qty=min_qty,
             min_notional=min_notional,
+            post_only=_order_prefers_post_only(order),
         )
         if prepared_order is None:
             adjusted_place_orders.append(order)

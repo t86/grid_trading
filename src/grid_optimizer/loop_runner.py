@@ -11,6 +11,7 @@ import sys
 import time
 import traceback
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -2784,6 +2785,7 @@ def apply_hedge_position_controls(
     external_short_pause: bool = False,
     external_short_pause_reasons: list[str] | None = None,
     preserve_short_entry_on_external_pause: bool = False,
+    preserve_short_entry_on_inventory_pause: bool = False,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
     current_short_notional = max(current_short_qty, 0.0) * max(mid_price, 0.0)
@@ -2815,7 +2817,12 @@ def apply_hedge_position_controls(
         plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
     if short_paused:
         plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
-        if inventory_short_paused or not preserve_short_entry_on_external_pause:
+        keep_short_probe = (
+            preserve_short_entry_on_inventory_pause
+            if inventory_short_paused
+            else preserve_short_entry_on_external_pause
+        )
+        if not keep_short_probe:
             plan["sell_orders"] = [item for item in plan.get("sell_orders", []) if not _is_short_entry_order(item)]
 
     return {
@@ -2913,6 +2920,9 @@ def apply_take_profit_profit_guard(
             if _order_role(order) not in {"take_profit", "take_profit_long"}:
                 updated_sell_orders.append(order)
                 continue
+            if _truthy(order.get("lot_tracked")):
+                updated_sell_orders.append(order)
+                continue
             adjusted_price = max(_safe_float(order.get("price")), long_floor_price)
             if adjusted_price <= bid_price:
                 report["dropped_sell_orders"] += 1
@@ -2933,6 +2943,9 @@ def apply_take_profit_profit_guard(
             if _order_role(order) != "take_profit_short":
                 updated_buy_orders.append(order)
                 continue
+            if _truthy(order.get("lot_tracked")):
+                updated_buy_orders.append(order)
+                continue
             adjusted_price = min(_safe_float(order.get("price")), short_ceiling_price)
             if adjusted_price <= 0 or adjusted_price >= ask_price:
                 report["dropped_buy_orders"] += 1
@@ -2944,6 +2957,122 @@ def apply_take_profit_profit_guard(
             updated_buy_orders.append(order)
         plan["buy_orders"] = updated_buy_orders
 
+    return report
+
+
+def resolve_short_threshold_timeout_state(
+    *,
+    state: dict[str, Any],
+    current_short_notional: float,
+    pause_short_position_notional: float | None,
+    threshold_position_notional: float | None,
+    hold_seconds: float | None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = now or _utc_now()
+    current_notional = max(_safe_float(current_short_notional), 0.0)
+    pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
+    threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
+    safe_hold_seconds = max(_safe_float(hold_seconds), 0.0)
+    report = {
+        "enabled": False,
+        "threshold_notional": threshold_position_notional,
+        "target_notional": pause_short_position_notional,
+        "hold_seconds": safe_hold_seconds,
+        "above_threshold": False,
+        "armed": False,
+        "timeout_active": False,
+        "duration_seconds": 0.0,
+        "above_threshold_started_at": None,
+        "timeout_active_since": None,
+    }
+    if threshold_notional <= max(pause_notional, 0.0) or safe_hold_seconds <= 0:
+        state.pop("short_threshold_timeout_state", None)
+        return report
+
+    report["enabled"] = True
+
+    def _parse_state_ts(value: Any) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    timeout_state = dict(state.get("short_threshold_timeout_state") or {})
+    armed_at = _parse_state_ts(timeout_state.get("above_threshold_started_at"))
+    active_since = _parse_state_ts(timeout_state.get("timeout_active_since"))
+    timeout_active = bool(timeout_state.get("timeout_active"))
+
+    if current_notional <= pause_notional + 1e-12:
+        state.pop("short_threshold_timeout_state", None)
+        return report
+
+    if timeout_active and current_notional > pause_notional + 1e-12:
+        if armed_at is None:
+            armed_at = active_since or current_time
+        if active_since is None:
+            active_since = current_time
+        report.update(
+            {
+                "above_threshold": current_notional >= threshold_notional - 1e-12,
+                "armed": True,
+                "timeout_active": True,
+                "duration_seconds": max((current_time - armed_at).total_seconds(), 0.0),
+                "above_threshold_started_at": armed_at.isoformat(),
+                "timeout_active_since": active_since.isoformat(),
+            }
+        )
+        state["short_threshold_timeout_state"] = {
+            "threshold_notional": threshold_notional,
+            "target_notional": pause_notional,
+            "hold_seconds": safe_hold_seconds,
+            "above_threshold_started_at": armed_at.isoformat(),
+            "timeout_active_since": active_since.isoformat(),
+            "timeout_active": True,
+            "updated_at": current_time.isoformat(),
+        }
+        return report
+
+    if current_notional >= threshold_notional - 1e-12:
+        if armed_at is None:
+            armed_at = current_time
+        duration_seconds = max((current_time - armed_at).total_seconds(), 0.0)
+        timeout_active = duration_seconds >= safe_hold_seconds
+        if timeout_active and active_since is None:
+            active_since = current_time
+        report.update(
+            {
+                "above_threshold": True,
+                "armed": True,
+                "timeout_active": timeout_active,
+                "duration_seconds": duration_seconds,
+                "above_threshold_started_at": armed_at.isoformat(),
+                "timeout_active_since": active_since.isoformat() if active_since else None,
+            }
+        )
+        state["short_threshold_timeout_state"] = {
+            "threshold_notional": threshold_notional,
+            "target_notional": pause_notional,
+            "hold_seconds": safe_hold_seconds,
+            "above_threshold_started_at": armed_at.isoformat(),
+            "timeout_active_since": active_since.isoformat() if active_since else None,
+            "timeout_active": timeout_active,
+            "updated_at": current_time.isoformat(),
+        }
+        return report
+
+    state["short_threshold_timeout_state"] = {
+        "threshold_notional": threshold_notional,
+        "target_notional": pause_notional,
+        "hold_seconds": safe_hold_seconds,
+        "above_threshold_started_at": None,
+        "timeout_active_since": None,
+        "timeout_active": False,
+        "updated_at": current_time.isoformat(),
+    }
     return report
 
 
@@ -3299,10 +3428,13 @@ def apply_active_delever_short(
     step_price: float,
     tick_size: float | None,
     bid_price: float,
+    ask_price: float | None,
     min_profit_ratio: float | None,
     grid_buffer_realized_notional: float,
     grid_buffer_spent_notional: float,
     max_active_levels: int = 3,
+    threshold_timeout_active: bool = False,
+    timeout_target_notional: float | None = None,
 ) -> dict[str, Any]:
     available_buffer = max(float(grid_buffer_realized_notional) - float(grid_buffer_spent_notional), 0.0)
     report = {
@@ -3315,9 +3447,13 @@ def apply_active_delever_short(
         "active_buy_order_count": 0,
         "pause_long_position_notional": None,
         "pause_short_position_notional": pause_short_position_notional,
+        "threshold_timeout_active": bool(threshold_timeout_active),
+        "threshold_timeout_target_notional": timeout_target_notional,
+        "threshold_timeout_aggressive": False,
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
+    timeout_target = max(_safe_float(timeout_target_notional), 0.0)
     threshold_enabled = threshold_notional > max(pause_notional, 0.0)
     if (
         max_active_levels <= 0
@@ -3351,7 +3487,19 @@ def apply_active_delever_short(
     active_count = 0
     estimated_cost = 0.0
     trigger_mode: str | None = None
-    if threshold_enabled and current_short_notional >= threshold_notional:
+    if threshold_timeout_active and timeout_target > 0 and current_short_notional > timeout_target:
+        safe_per_order_notional = max(float(per_order_notional), 1e-12)
+        excess_notional = max(current_short_notional - timeout_target, 0.0)
+        active_count = min(len(take_profit_orders), requested_levels, max(1, int(math.ceil(excess_notional / safe_per_order_notional))))
+        estimated_cost = _estimate_short_delever_cost(
+            current_short_lots=current_short_lots,
+            current_short_qty=current_short_qty,
+            current_short_avg_price=current_short_avg_price,
+            buy_orders=take_profit_orders[:active_count],
+            consume_mode="fifo",
+        )
+        trigger_mode = "threshold_timeout"
+    elif threshold_enabled and current_short_notional >= threshold_notional:
         threshold_consume_mode = "fifo"
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
         excess_notional = max(current_short_notional - threshold_notional, 0.0)
@@ -3442,8 +3590,21 @@ def apply_active_delever_short(
         active = dict(order)
         active["role"] = "active_delever_short"
         active["level"] = index
-        if trigger_mode == "threshold":
+        if trigger_mode in {"threshold", "threshold_timeout"}:
             active["lot_consume_mode"] = "fifo"
+        if trigger_mode == "threshold_timeout":
+            safe_ask_price = max(_safe_float(ask_price), 0.0)
+            safe_tick = max(_safe_float(tick_size), 0.0)
+            if safe_ask_price > 0:
+                if safe_tick > 0:
+                    aggressive_price = float(Decimal(str(safe_ask_price)) + (Decimal(str(safe_tick)) * Decimal(index - 1)))
+                else:
+                    aggressive_price = safe_ask_price
+                active["price"] = aggressive_price
+                active["notional"] = _safe_float(active.get("price")) * _safe_float(active.get("qty"))
+            active["execution_type"] = "aggressive"
+            active["time_in_force"] = "GTC"
+            active["force_reduce_only"] = True
         active_orders.append(active)
 
     plan["buy_orders"] = sorted(
@@ -3456,6 +3617,7 @@ def apply_active_delever_short(
             "trigger_mode": trigger_mode,
             "estimated_cost_notional": estimated_cost,
             "active_buy_order_count": active_count,
+            "threshold_timeout_aggressive": trigger_mode == "threshold_timeout",
         }
     )
     return report
@@ -5277,6 +5439,23 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "active_buy_order_count": 0,
         "pause_long_position_notional": getattr(args, "pause_buy_position_notional", None),
         "pause_short_position_notional": getattr(args, "pause_short_position_notional", None),
+        "threshold_timeout_active": False,
+        "threshold_timeout_duration_seconds": 0.0,
+        "threshold_timeout_hold_seconds": _safe_float(getattr(args, "short_threshold_timeout_seconds", None)),
+        "threshold_timeout_target_notional": getattr(args, "pause_short_position_notional", None),
+        "threshold_timeout_aggressive": False,
+    }
+    short_threshold_timeout = {
+        "enabled": False,
+        "threshold_notional": getattr(args, "threshold_position_notional", None),
+        "target_notional": getattr(args, "pause_short_position_notional", None),
+        "hold_seconds": _safe_float(getattr(args, "short_threshold_timeout_seconds", None)),
+        "above_threshold": False,
+        "armed": False,
+        "timeout_active": False,
+        "duration_seconds": 0.0,
+        "above_threshold_started_at": None,
+        "timeout_active_since": None,
     }
     flat_start_guard = {
         "enabled": bool(getattr(args, "flat_start_enabled", True)),
@@ -5621,6 +5800,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             target_base_qty = 0.0
             bootstrap_qty = 0.0
     elif strategy_mode == "hedge_neutral":
+        inventory_short_pause_active = (
+            _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
+            and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
+        )
+        inventory_short_probe_scale = (
+            _clamp_ratio(float(getattr(effective_args, "inventory_pause_short_probe_scale", 0.25)))
+            if inventory_short_pause_active
+            else 0.0
+        )
+        combined_short_probe_scale = max(strong_short_probe_scale, inventory_short_probe_scale)
+        short_threshold_timeout = resolve_short_threshold_timeout_state(
+            state=state,
+            current_short_notional=current_short_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_position_notional=getattr(args, "threshold_position_notional", None),
+            hold_seconds=getattr(effective_args, "short_threshold_timeout_seconds", None),
+            now=plan_now,
+        )
         inventory_tier = {
             "enabled": False,
             "active": False,
@@ -5665,8 +5862,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             synthetic_tiny_long_residual_notional=synthetic_tiny_long_residual_notional,
             synthetic_tiny_short_residual_notional=synthetic_tiny_short_residual_notional,
             entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
-            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
-            paused_entry_short_scale=strong_short_probe_scale,
+            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"] or inventory_short_pause_active),
+            paused_entry_short_scale=combined_short_probe_scale,
         )
         controls = apply_hedge_position_controls(
             plan=plan,
@@ -5681,6 +5878,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
             external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0,
+            preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -5721,6 +5919,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0)
         current_long_notional = current_long_qty * max(mid_price, 0.0)
         current_short_notional = current_short_qty * max(mid_price, 0.0)
+        inventory_short_pause_active = (
+            _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
+            and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
+        )
+        inventory_short_probe_scale = (
+            _clamp_ratio(float(getattr(effective_args, "inventory_pause_short_probe_scale", 0.25)))
+            if inventory_short_pause_active
+            else 0.0
+        )
+        combined_short_probe_scale = max(strong_short_probe_scale, inventory_short_probe_scale)
+        short_threshold_timeout = resolve_short_threshold_timeout_state(
+            state=state,
+            current_short_notional=current_short_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_position_notional=getattr(args, "threshold_position_notional", None),
+            hold_seconds=getattr(effective_args, "short_threshold_timeout_seconds", None),
+            now=plan_now,
+        )
         inventory_tier = {
             "enabled": False,
             "active": False,
@@ -5769,8 +5985,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             synthetic_tiny_long_residual_notional=synthetic_tiny_long_residual_notional,
             synthetic_tiny_short_residual_notional=synthetic_tiny_short_residual_notional,
             entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
-            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"]),
-            paused_entry_short_scale=strong_short_probe_scale,
+            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"] or inventory_short_pause_active),
+            paused_entry_short_scale=combined_short_probe_scale,
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
         synthetic_trend_follow = resolve_synthetic_trend_follow(
@@ -5806,6 +6022,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
             external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0,
+            preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -5846,9 +6063,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,
+            ask_price=ask_price,
             min_profit_ratio=getattr(args, "take_profit_min_profit_ratio", None),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
+            threshold_timeout_active=bool(short_threshold_timeout.get("timeout_active")),
+            timeout_target_notional=effective_args.pause_short_position_notional,
         )
         take_profit_guard = apply_take_profit_profit_guard(
             plan=plan,
@@ -5882,6 +6102,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "active_buy_order_count": int(short_active_delever.get("active_buy_order_count") or 0),
             "pause_long_position_notional": long_active_delever.get("pause_long_position_notional"),
             "pause_short_position_notional": short_active_delever.get("pause_short_position_notional"),
+            "threshold_timeout_active": bool(short_threshold_timeout.get("timeout_active")),
+            "threshold_timeout_duration_seconds": _safe_float(short_threshold_timeout.get("duration_seconds")),
+            "threshold_timeout_hold_seconds": _safe_float(short_threshold_timeout.get("hold_seconds")),
+            "threshold_timeout_target_notional": short_threshold_timeout.get("target_notional"),
+            "threshold_timeout_aggressive": bool(short_active_delever.get("threshold_timeout_aggressive")),
         }
         target_base_qty = hedge_plan["target_long_base_qty"]
         bootstrap_qty = hedge_plan["bootstrap_long_qty"]
@@ -6321,6 +6546,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "synthetic_trend_follow": synthetic_trend_follow,
         "take_profit_guard": take_profit_guard,
         "active_delever": active_delever,
+        "short_threshold_timeout": short_threshold_timeout,
         "auto_regime": auto_regime,
         "xaut_adaptive": xaut_adaptive,
         "current_long_qty": current_long_qty,
@@ -6345,6 +6571,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_base_position_notional": inventory_tier["effective_base_position_notional"],
         "effective_pause_buy_position_notional": getattr(effective_args, "pause_buy_position_notional", None),
         "effective_pause_short_position_notional": getattr(effective_args, "pause_short_position_notional", None),
+        "effective_inventory_pause_short_probe_scale": getattr(effective_args, "inventory_pause_short_probe_scale", None),
+        "effective_short_threshold_timeout_seconds": getattr(effective_args, "short_threshold_timeout_seconds", None),
         "effective_synthetic_residual_long_flat_notional": getattr(
             effective_args,
             "synthetic_residual_long_flat_notional",
@@ -6680,12 +6908,20 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         role = str(order.get("role", "entry"))
         side = str(order.get("side", "")).upper().strip()
         position_side = _order_position_side(order)
+        post_only = str(order.get("execution_type", "post_only")).strip().lower() != "aggressive"
+        time_in_force = (
+            "GTX"
+            if post_only
+            else (str(order.get("time_in_force", "GTC")).upper().strip() or "GTC")
+        )
         if strategy_mode in {"hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
             reduce_only = None
         elif _is_competition_inventory_grid_mode(strategy_mode):
             reduce_only = True if role in {"grid_exit", "forced_reduce", "tail_cleanup"} else None
         else:
             reduce_only = True if (side == "SELL" and role == "take_profit") or (side == "BUY" and role == "take_profit_short") else None
+        if order.get("force_reduce_only") is not None:
+            reduce_only = bool(order.get("force_reduce_only"))
         last_exc: RuntimeError | None = None
         for attempt in range(args.maker_retries + 1):
             current_book = fetch_futures_book_tickers(symbol=symbol)[0]
@@ -6699,6 +6935,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 tick_size=tick_size,
                 min_qty=min_qty,
                 min_notional=min_notional,
+                post_only=post_only,
             )
             if prepared_order is None:
                 report["skipped_orders"].append(
@@ -6710,6 +6947,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "qty": _safe_float(order.get("qty")),
                             "desired_price": _safe_float(order.get("price")),
                             "attempt": attempt + 1,
+                            "time_in_force": time_in_force,
                         },
                         "reason": skip_reason or {},
                     }
@@ -6725,7 +6963,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                     api_key=api_key,
                     api_secret=api_secret,
                     recv_window=args.recv_window,
-                    time_in_force="GTX",
+                    time_in_force=time_in_force,
                     new_client_order_id=_build_client_order_id(symbol=symbol, role=role, index=index),
                     reduce_only=reduce_only,
                     position_side=None if position_side == "BOTH" else position_side,
@@ -6741,6 +6979,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "submitted_price": _safe_float(prepared_order.get("submitted_price")),
                             "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
                             "attempt": attempt + 1,
+                            "time_in_force": time_in_force,
                         },
                         "response": place_response,
                     }
@@ -6806,6 +7045,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-bias-regime-switch-strong-threshold", type=float, default=0.15)
     parser.add_argument("--first-order-multiplier", type=float, default=4.0)
     parser.add_argument("--threshold-position-notional", type=float, default=50.0)
+    parser.add_argument("--short-threshold-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--max-order-position-notional", type=float, default=80.0)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -6834,6 +7074,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shift-steps", type=int, default=4)
     parser.add_argument("--pause-buy-position-notional", type=float, default=180.0)
     parser.add_argument("--pause-short-position-notional", type=float, default=None)
+    parser.add_argument("--inventory-pause-short-probe-scale", type=float, default=0.25)
     parser.add_argument("--max-position-notional", type=float, default=None)
     parser.add_argument("--max-short-position-notional", type=float, default=None)
     parser.add_argument("--min-mid-price-for-buys", type=float, default=None)
@@ -7196,12 +7437,16 @@ def main() -> None:
         raise SystemExit("--first-order-multiplier must be > 0")
     if args.threshold_position_notional < 0:
         raise SystemExit("--threshold-position-notional must be >= 0")
+    if args.short_threshold_timeout_seconds < 0:
+        raise SystemExit("--short-threshold-timeout-seconds must be >= 0")
     if args.max_order_position_notional < 0:
         raise SystemExit("--max-order-position-notional must be >= 0")
     if args.max_position_notional is not None and args.max_position_notional <= 0:
         raise SystemExit("--max-position-notional must be > 0")
     if args.pause_short_position_notional is not None and args.pause_short_position_notional <= 0:
         raise SystemExit("--pause-short-position-notional must be > 0")
+    if args.inventory_pause_short_probe_scale < 0 or args.inventory_pause_short_probe_scale > 1:
+        raise SystemExit("--inventory-pause-short-probe-scale must be within [0, 1]")
     if args.max_short_position_notional is not None and args.max_short_position_notional <= 0:
         raise SystemExit("--max-short-position-notional must be > 0")
     if args.buy_pause_amp_trigger_ratio is not None and args.buy_pause_amp_trigger_ratio <= 0:
@@ -7531,6 +7776,13 @@ def main() -> None:
                 "short_budget_notional": _safe_float(plan_report.get("short_budget_notional")),
                 "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
                 "max_short_position_notional": _safe_float(plan_report.get("max_short_position_notional")),
+                "short_threshold_timeout_active": bool((plan_report.get("short_threshold_timeout") or {}).get("timeout_active")),
+                "short_threshold_timeout_duration_seconds": _safe_float(
+                    (plan_report.get("short_threshold_timeout") or {}).get("duration_seconds")
+                ),
+                "short_threshold_timeout_hold_seconds": _safe_float(
+                    (plan_report.get("short_threshold_timeout") or {}).get("hold_seconds")
+                ),
                 "effective_short_plan_qty": _safe_float(plan_report.get("effective_short_plan_qty")),
                 "residual_long_flat_notional": _safe_float(plan_report.get("residual_long_flat_notional")),
                 "residual_long_flattened": bool(plan_report.get("residual_long_flattened")),

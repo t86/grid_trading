@@ -223,6 +223,8 @@
 - 当单边名义仓位超过 `threshold_position_notional` 时，会把最前排的 `take_profit` 提升成 `active_delever_*`：
   - `threshold` 分支会优先按虚拟账本里最早、最远端的 lot 做 FIFO 减仓，目的是先吃掉最难回本的库存，而不是继续把最新成交的低成本 lot 先卖掉。
   - 如果“只减到阈值线”后最近一笔非亏损回补单仍然离盘口太远，系统会继续多提一两档前排减仓单，但前提是这一步确实能把最近保本单重新压回大约 `1 step_price` 的距离内。
+  - 如果空侧库存先超过 `pause_short_position_notional`，系统不会立刻把 `entry_short` 全清空；只要 `inventory_pause_short_probe_scale > 0`，仍会保留一笔缩量贴盘口的 probe 空单，避免直接掉进“静默等待回本”的状态。
+  - 如果空侧库存在 `threshold_position_notional` 之上持续超过 `short_threshold_timeout_seconds`，会把最近 1 到 3 笔 `take_profit_short` 改成更主动的回补单，优先把仓位压回 `pause_short_position_notional` 下方；这一步允许为了回落库存而放弃严格保本。
   - `buffer` / `market_guard` 触发的 `active_delever` 仍按原有逻辑工作；这次 FIFO 只针对阈值减仓分支。
 
 适用场景：
@@ -431,6 +433,9 @@
 - `step_price`：先确认最小 tick、常态点差和盘口密度，别机械照搬 `0.0007`。
 - `per_order_notional`：至少要覆盖最小下单名义，还要和盘口深度匹配，避免一笔过大把库存抬太快。
 - `pause_buy_position_notional` / `max_position_notional` / `pause_short_position_notional` / `max_short_position_notional`：这四个阈值要按你愿意承受的多空库存重算，不建议直接套用。
+- 跑 synthetic neutral 时，空侧阈值最好满足 `pause_short_position_notional < threshold_position_notional < max_short_position_notional`。
+- `inventory_pause_short_probe_scale` 决定软停空后还保留多少贴盘口 probe 空单；想完全停空就设 `0`，想保留轻量成交可以从 `0.2` 到 `0.3` 起步。
+- `short_threshold_timeout_seconds` 决定“超过 threshold 后还能等多久再强制回落”；默认 60 秒更适合 XAUT 这类希望持续有成交、又不想长时间挂死高位回补单的场景。
 - 如果币种波动更大或盘口更稀，优先先放宽 `step_price`，而不是先把层数和仓位上限抬高。
 
 ## 额外说明

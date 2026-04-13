@@ -875,6 +875,36 @@ class SemiAutoPlanTests(unittest.TestCase):
             [1.01],
         )
 
+    def test_build_hedge_micro_grid_plan_heavy_long_keeps_lot_tracked_take_profit_orders(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.0,
+            step_price=0.01,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=0.999,
+            ask_price=1.001,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=500.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.004,
+            current_long_lots=[
+                {"qty": 200.0, "price": 0.98},
+                {"qty": 300.0, "price": 1.02},
+            ],
+            entry_long_cost_guard_release_notional=100.0,
+        )
+
+        take_profit_long = [item for item in plan["sell_orders"] if item["role"] == "take_profit_long"]
+
+        self.assertEqual([item["price"] for item in take_profit_long], [0.99, 1.03])
+        self.assertEqual([item["qty"] for item in take_profit_long], [200.0, 300.0])
+        self.assertTrue(all(item.get("lot_tracked") for item in take_profit_long))
+
     def test_build_hedge_micro_grid_plan_flat_entries_can_start_at_best_quote(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=1.01,

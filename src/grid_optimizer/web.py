@@ -1271,6 +1271,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "sticky_entry_levels": None,
     "synthetic_residual_long_flat_notional": None,
     "synthetic_residual_short_flat_notional": None,
+    "threshold_position_notional": 0.0,
+    "short_threshold_timeout_seconds": 60.0,
     "synthetic_tiny_long_residual_notional": None,
     "synthetic_tiny_short_residual_notional": None,
     "static_buy_offset_steps": 0.0,
@@ -1304,7 +1306,10 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "down_trigger_steps": 4,
     "shift_steps": 4,
     "pause_buy_position_notional": 750.0,
+    "pause_short_position_notional": None,
+    "inventory_pause_short_probe_scale": 0.25,
     "max_position_notional": 900.0,
+    "max_short_position_notional": None,
     "buy_pause_amp_trigger_ratio": 0.0075,
     "buy_pause_down_return_trigger_ratio": -0.0035,
     "take_profit_min_profit_ratio": None,
@@ -2960,8 +2965,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_strong_threshold",
         "pause_buy_position_notional",
         "pause_short_position_notional",
+        "inventory_pause_short_probe_scale",
         "max_position_notional",
         "max_short_position_notional",
+        "threshold_position_notional",
+        "short_threshold_timeout_seconds",
         "min_mid_price_for_buys",
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
@@ -3378,6 +3386,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--center-price", str(config["center_price"])])
     if config.get("threshold_position_notional") is not None:
         command.extend(["--threshold-position-notional", str(config["threshold_position_notional"])])
+    if config.get("short_threshold_timeout_seconds") is not None:
+        command.extend(["--short-threshold-timeout-seconds", str(config["short_threshold_timeout_seconds"])])
     if str(config.get("strategy_mode", "")).strip() == "competition_inventory_grid":
         if config.get("first_order_multiplier") is not None:
             command.extend(["--first-order-multiplier", str(config["first_order_multiplier"])])
@@ -3470,6 +3480,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--pause-buy-position-notional", str(config["pause_buy_position_notional"])])
     if config.get("pause_short_position_notional") is not None:
         command.extend(["--pause-short-position-notional", str(config["pause_short_position_notional"])])
+    if config.get("inventory_pause_short_probe_scale") is not None:
+        command.extend(["--inventory-pause-short-probe-scale", str(config["inventory_pause_short_probe_scale"])])
     if config.get("max_position_notional") is not None:
         command.extend(["--max-position-notional", str(config["max_position_notional"])])
     if config.get("max_short_position_notional") is not None:
@@ -3694,6 +3706,8 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "pause_buy_position_notional",
             "pause_short_position_notional",
             "threshold_position_notional",
+            "inventory_pause_short_probe_scale",
+            "short_threshold_timeout_seconds",
             "max_position_notional",
             "max_short_position_notional",
             "custom_grid_roll_enabled",
@@ -12217,6 +12231,7 @@ MONITOR_PAGE = """<!doctype html>
       synthetic_residual_long_flat_notional: "synthetic neutral 的残余多仓忽略阈值（U）。多侧名义低于它时，计划里会把这点残仓视作已平，立刻恢复双边挂单。",
       synthetic_residual_short_flat_notional: "synthetic neutral 的残余空仓忽略阈值（U）。空侧名义低于它时，计划里会把这点残仓视作已平，立刻恢复双边挂单。",
       threshold_position_notional: "竞赛库存网格软阈值。达到后优先停掉同侧新增，并按 pair-credit 决定是否直接 forced_reduce。",
+      short_threshold_timeout_seconds: "空侧超过 threshold 后允许静待多久。超过这个秒数仍未回到阈值内，就切到强制回落模式，优先把仓位压回 pause 下方。",
       max_order_position_notional: "竞赛库存网格运行时上限。当前持仓加上同侧未成交挂单潜在新增不能超过这个值。",
       synthetic_tiny_long_residual_notional: "synthetic neutral 的 mixed inventory 微小多残仓阈值（U）。当 short 明显占优、long 名义低于它时，策略仍允许继续挂 entry_short，避免轻微反向残仓把计划锁成只减仓。",
       synthetic_tiny_short_residual_notional: "synthetic neutral 的 mixed inventory 微小空残仓阈值（U）。当 long 明显占优、short 名义低于它时，策略仍允许继续挂 entry_long，避免对侧一点点残仓就切成只减仓。",
@@ -12230,6 +12245,7 @@ MONITOR_PAGE = """<!doctype html>
       shift_steps: "每次触发后中心移动多少格。越大越跟价，越小越稳。",
       pause_buy_position_notional: "做多模式下达到该持仓名义后暂停继续买入。",
       pause_short_position_notional: "做空模式下达到该空仓名义后暂停继续开空。",
+      inventory_pause_short_probe_scale: "空仓达到软停空后保留的 probe 空单缩量系数。设为 0 表示完全停空；0.25 表示只保留约四分之一单量的贴盘口探针单。",
       max_position_notional: "做多模式总持仓上限。",
       max_short_position_notional: "做空模式总空仓上限。",
       static_buy_offset_steps: "静态买单偏移步数。用于在研究版近价策略里给买单离买一保留一点安全距离。",

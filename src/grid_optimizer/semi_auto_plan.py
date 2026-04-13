@@ -34,6 +34,7 @@ class PlanOrder:
     level: int
     role: str
     position_side: str = "BOTH"
+    lot_tracked: bool = False
 
 
 def _utc_now() -> datetime:
@@ -181,6 +182,7 @@ def _build_order(
     level: int,
     role: str,
     position_side: str = "BOTH",
+    lot_tracked: bool = False,
 ) -> PlanOrder:
     return PlanOrder(
         side=side.upper(),
@@ -190,6 +192,7 @@ def _build_order(
         level=level,
         role=role,
         position_side=str(position_side or "BOTH").upper().strip() or "BOTH",
+        lot_tracked=bool(lot_tracked),
     )
 
 
@@ -267,6 +270,7 @@ def _build_lot_take_profit_orders(
                 level=level,
                 role=role,
                 position_side=position_side,
+                lot_tracked=True,
             )
         )
     return orders, total_qty
@@ -935,13 +939,11 @@ def build_hedge_micro_grid_plan(
         max(float(entry_long_cost_guard_release_notional), 0.0) > 0
         and effective_long_qty > 0
         and (effective_short_qty <= 0 or dominant_long_with_tiny_short_residual)
-        and effective_long_qty * mid_price < float(entry_long_cost_guard_release_notional)
     )
     short_exit_profit_guard_active = (
         max(float(entry_short_cost_guard_release_notional), 0.0) > 0
         and effective_short_qty > 0
         and (effective_long_qty <= 0 or dominant_short_with_tiny_long_residual)
-        and effective_short_qty * mid_price < float(entry_short_cost_guard_release_notional)
     )
     lowest_long_lot_price, highest_long_lot_price = _lot_price_extremes(effective_long_lots)
     lowest_short_lot_price, highest_short_lot_price = _lot_price_extremes(effective_short_lots)

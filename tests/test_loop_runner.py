@@ -27,6 +27,7 @@ from grid_optimizer.loop_runner import (
     StartupProtectionError,
     _update_inventory_grid_order_refs,
     apply_excess_inventory_reduce_only,
+    apply_active_delever_short,
     apply_active_delever_long,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
@@ -51,6 +52,7 @@ from grid_optimizer.loop_runner import (
     resolve_market_bias_offsets,
     resolve_market_bias_regime_switch,
     resolve_adaptive_step_price,
+    resolve_short_threshold_timeout_state,
     resolve_synthetic_trend_follow,
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
@@ -1284,6 +1286,47 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["active_delever"]["active_buy_order_count"], 2)
         self.assertEqual(active_prices, [0.999, 0.989])
 
+    def test_apply_active_delever_short_switches_to_aggressive_orders_after_threshold_timeout(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 0.999, "qty": 25.0, "notional": 24.975, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.989, "qty": 25.0, "notional": 24.725, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.979, "qty": 25.0, "notional": 24.475, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.969, "qty": 25.0, "notional": 24.225, "role": "take_profit_short"},
+            ],
+            "sell_orders": [],
+        }
+
+        result = apply_active_delever_short(
+            plan=plan,
+            current_short_qty=300.0,
+            current_short_notional=300.0,
+            current_short_avg_price=0.965,
+            current_short_lots=[{"qty": 300.0, "price": 0.965}],
+            pause_short_position_notional=200.0,
+            threshold_position_notional=250.0,
+            per_order_notional=25.0,
+            step_price=0.01,
+            tick_size=0.001,
+            bid_price=0.999,
+            ask_price=1.001,
+            min_profit_ratio=0.0,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            threshold_timeout_active=True,
+            timeout_target_notional=200.0,
+        )
+
+        active_buys = [item for item in plan["buy_orders"] if item["role"] == "active_delever_short"]
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["trigger_mode"], "threshold_timeout")
+        self.assertEqual(result["active_buy_order_count"], 3)
+        self.assertEqual([item["price"] for item in active_buys], [1.003, 1.002, 1.001])
+        self.assertTrue(all(item["execution_type"] == "aggressive" for item in active_buys))
+        self.assertTrue(all(item["time_in_force"] == "GTC" for item in active_buys))
+        self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_buys))
+
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
@@ -2169,6 +2212,78 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 1)
         self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
 
+    def test_apply_hedge_position_controls_can_keep_probe_short_on_inventory_pause_when_allowed(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.23, "qty": 3, "notional": 3.69, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=150.0,
+            mid_price=1.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=100.0,
+            min_mid_price_for_buys=None,
+            preserve_short_entry_on_inventory_pause=True,
+        )
+
+        self.assertTrue(result["short_paused"])
+        self.assertEqual(len(plan["sell_orders"]), 2)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+        self.assertEqual(plan["sell_orders"][1]["role"], "entry_short")
+
+    def test_resolve_short_threshold_timeout_state_stays_active_until_pause(self) -> None:
+        state: dict[str, object] = {}
+        start = datetime(2026, 4, 14, 2, 0, 0, tzinfo=timezone.utc)
+
+        initial = resolve_short_threshold_timeout_state(
+            state=state,
+            current_short_notional=260.0,
+            pause_short_position_notional=200.0,
+            threshold_position_notional=240.0,
+            hold_seconds=60.0,
+            now=start,
+        )
+        self.assertFalse(initial["timeout_active"])
+        self.assertTrue(initial["armed"])
+
+        active = resolve_short_threshold_timeout_state(
+            state=state,
+            current_short_notional=255.0,
+            pause_short_position_notional=200.0,
+            threshold_position_notional=240.0,
+            hold_seconds=60.0,
+            now=start + timedelta(seconds=61),
+        )
+        self.assertTrue(active["timeout_active"])
+
+        still_active = resolve_short_threshold_timeout_state(
+            state=state,
+            current_short_notional=220.0,
+            pause_short_position_notional=200.0,
+            threshold_position_notional=240.0,
+            hold_seconds=60.0,
+            now=start + timedelta(seconds=90),
+        )
+        self.assertTrue(still_active["timeout_active"])
+
+        reset = resolve_short_threshold_timeout_state(
+            state=state,
+            current_short_notional=199.0,
+            pause_short_position_notional=200.0,
+            threshold_position_notional=240.0,
+            hold_seconds=60.0,
+            now=start + timedelta(seconds=95),
+        )
+        self.assertFalse(reset["timeout_active"])
+        self.assertNotIn("short_threshold_timeout_state", state)
+
     def test_apply_hedge_position_notional_caps_trim_long_and_short_entries(self) -> None:
         plan = {
             "bootstrap_orders": [
@@ -2463,6 +2578,51 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(result["long_relax_threshold_notional"], 320.0, places=8)
         self.assertEqual(result["adjusted_sell_orders"], 1)
         self.assertAlmostEqual(plan["sell_orders"][0]["price"], 4635.47, places=8)
+
+    def test_apply_take_profit_profit_guard_preserves_lot_tracked_long_take_profit_orders(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.99,
+                    "qty": 200.0,
+                    "notional": 198.0,
+                    "role": "take_profit_long",
+                    "lot_tracked": True,
+                },
+                {
+                    "side": "SELL",
+                    "price": 1.0,
+                    "qty": 100.0,
+                    "notional": 100.0,
+                    "role": "take_profit_long",
+                },
+            ],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=300.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.02,
+            current_short_avg_price=0.0,
+            current_long_notional=306.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=220.0,
+            pause_short_position_notional=None,
+            threshold_long_position_notional=320.0,
+            min_profit_ratio=0.001,
+            tick_size=0.001,
+            bid_price=1.005,
+            ask_price=1.006,
+        )
+
+        self.assertTrue(result["long_active"])
+        self.assertEqual(result["adjusted_sell_orders"], 1)
+        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 0.99, places=8)
+        self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.022, places=8)
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
