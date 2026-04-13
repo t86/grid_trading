@@ -983,14 +983,15 @@ def build_hedge_micro_grid_plan(
         if lowest_short_lot_price is not None
         else (current_short_avg_price if current_short_avg_price > 0 else None)
     )
+    front_short_exit_reference_price = (
+        highest_short_lot_price
+        if highest_short_lot_price is not None
+        else short_exit_reference_price
+    )
     light_short_front_exit_price = None
     if short_exit_profit_guard_active and take_profit_min_profit_ratio is not None:
         light_short_front_exit_price = _nearest_profitable_exit_price(
-            reference_price=(
-                current_short_avg_price
-                if current_short_avg_price > 0
-                else (short_exit_reference_price or 0.0)
-            ),
+            reference_price=(front_short_exit_reference_price or 0.0),
             side="BUY",
             min_profit_ratio=take_profit_min_profit_ratio,
             tick_size=tick_size,
@@ -1109,6 +1110,7 @@ def build_hedge_micro_grid_plan(
                     level=front_order.level,
                     role=front_order.role,
                     position_side=front_order.position_side,
+                    lot_tracked=front_order.lot_tracked,
                 )
         for order in short_lot_exit_orders:
             buy_orders.append(order)
@@ -1163,6 +1165,7 @@ def build_hedge_micro_grid_plan(
                 level=order.level,
                 role=order.role,
                 position_side=order.position_side,
+                lot_tracked=order.lot_tracked,
             )
             break
 

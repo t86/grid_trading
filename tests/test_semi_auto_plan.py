@@ -764,7 +764,7 @@ class SemiAutoPlanTests(unittest.TestCase):
             [1.01, 0.975],
         )
 
-    def test_build_hedge_micro_grid_plan_light_short_uses_avg_cost_for_front_exit_when_profit_ratio_is_zero(self) -> None:
+    def test_build_hedge_micro_grid_plan_light_short_uses_highest_short_lot_for_front_exit_when_profit_ratio_is_zero(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=1.0,
             step_price=0.01,
@@ -789,10 +789,10 @@ class SemiAutoPlanTests(unittest.TestCase):
             take_profit_min_profit_ratio=0.0,
         )
 
-        self.assertEqual(
-            [item["price"] for item in plan["buy_orders"] if item["role"] == "take_profit_short"],
-            [1.002, 0.975],
-        )
+        take_profit_short = [item for item in plan["buy_orders"] if item["role"] == "take_profit_short"]
+
+        self.assertEqual([item["price"] for item in take_profit_short], [1.003, 0.975])
+        self.assertTrue(all(item.get("lot_tracked") for item in take_profit_short))
 
     def test_build_hedge_micro_grid_plan_profitable_short_exit_keeps_one_step_pairing(self) -> None:
         plan = build_hedge_micro_grid_plan(
