@@ -1079,6 +1079,11 @@ def build_hedge_micro_grid_plan(
             price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "SELL")
 
+    def _paused_probe_sell_price(level: int) -> float:
+        distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
+        price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        return _round_order_price(price_raw, tick_size, "SELL")
+
     short_lot_exit_orders: list[PlanOrder] = []
     short_lot_exit_qty = 0.0
     if short_exit_profit_guard_active:
@@ -1271,7 +1276,7 @@ def build_hedge_micro_grid_plan(
         if allow_paused_short_probe and effective_long_qty <= 0:
             entry_sell_max_level = 1
         for level in range(1, entry_sell_max_level + 1):
-            price = _entry_sell_price(level)
+            price = _paused_probe_sell_price(level) if allow_paused_short_probe else _entry_sell_price(level)
             if effective_long_qty > 0 and f"SELL:{price:.10f}" in take_profit_long_price_keys:
                 continue
             if short_entry_cost_guard_active:

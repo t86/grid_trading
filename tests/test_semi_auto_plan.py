@@ -573,7 +573,36 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual(len(entry_short_orders), 1)
         self.assertEqual(entry_short_orders[0]["level"], 1)
+        self.assertEqual(entry_short_orders[0]["price"], 1.001)
         self.assertAlmostEqual(entry_short_orders[0]["notional"], 10.0, delta=1.0)
+
+    def test_build_hedge_micro_grid_plan_paused_short_probe_stays_at_ask_even_with_existing_short_inventory(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=4732.8,
+            step_price=1.0,
+            buy_levels=20,
+            sell_levels=20,
+            per_order_notional=50.0,
+            base_position_notional=0.0,
+            bid_price=4732.89,
+            ask_price=4732.9,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.082,
+            current_short_avg_price=4730.0,
+            current_short_lots=[{"qty": 0.082, "price": 4732.27}],
+            entry_short_paused=True,
+            paused_entry_short_scale=0.25,
+        )
+
+        entry_short_orders = [item for item in plan["sell_orders"] if item["role"] == "entry_short"]
+
+        self.assertEqual(len(entry_short_orders), 1)
+        self.assertEqual(entry_short_orders[0]["price"], 4732.9)
+        self.assertLess(entry_short_orders[0]["price"], 4733.27)
 
     def test_build_hedge_micro_grid_plan_light_long_blocks_worse_avg_cost_same_side_reentries(self) -> None:
         plan = build_hedge_micro_grid_plan(
