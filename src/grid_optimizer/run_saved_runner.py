@@ -6,7 +6,10 @@ import os
 import sys
 
 from .monitor import RUNNER_PID_PATH, runner_pid_path_for_symbol
-from .web import _build_runner_command, _load_runner_control_config
+from .web import _build_runner_command, _load_saved_runner_control_config
+
+
+DEFAULT_RUNNER_SYMBOL = "SOONUSDT"
 
 
 def _write_pid(path) -> None:
@@ -29,11 +32,14 @@ def main() -> None:
     parser.add_argument("--symbol", type=str, default="")
     args = parser.parse_args()
 
-    symbol = str(args.symbol or "").upper().strip()
+    symbol = str(args.symbol or os.environ.get("GRID_RUNNER_SYMBOL") or DEFAULT_RUNNER_SYMBOL).upper().strip()
     pid_path = runner_pid_path_for_symbol(symbol) if symbol else RUNNER_PID_PATH
     _write_pid(pid_path)
     atexit.register(_cleanup_pid, pid_path)
-    command = _build_runner_command(_load_runner_control_config(symbol or None))
+    config = _load_saved_runner_control_config(symbol)
+    if not config:
+        raise SystemExit(f"no saved runner control config found for {symbol}")
+    command = _build_runner_command(config)
     os.execvpe(command[0], command, os.environ.copy())
 
 
