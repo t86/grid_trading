@@ -106,14 +106,18 @@ EOF
 
 if [ "${INSTALL_UPDATE_WRAPPER}" != "0" ]; then
   UPDATE_WRAPPER_PATH="/usr/local/bin/${UPDATE_WRAPPER_NAME}"
-  sudo tee "${UPDATE_WRAPPER_PATH}" >/dev/null <<EOF
+  if [ "${UPDATE_WRAPPER_PATH}" = "/usr/local/bin/grid-web-update" ]; then
+    sudo install -m 755 "${APP_DIR}/deploy/oracle/grid-web-update.sh" "${UPDATE_WRAPPER_PATH}"
+  else
+    sudo tee "${UPDATE_WRAPPER_PATH}" >/dev/null <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 export SERVICE_NAME='${SERVICE_NAME}'
 export APP_DIR='${APP_DIR}'
 exec /usr/local/bin/grid-web-update "\$@"
 EOF
-  sudo chmod 755 "${UPDATE_WRAPPER_PATH}"
+    sudo chmod 755 "${UPDATE_WRAPPER_PATH}"
+  fi
 fi
 
 if [ "${INSTALL_RUNNER_WRAPPER}" != "0" ]; then
