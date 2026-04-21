@@ -9,6 +9,7 @@ from grid_optimizer import run_saved_runner
 
 class RunSavedRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
     @patch("grid_optimizer.run_saved_runner.atexit.register")
     @patch("grid_optimizer.run_saved_runner._write_pid")
     @patch("grid_optimizer.run_saved_runner.os.execvpe")
@@ -21,6 +22,7 @@ class RunSavedRunnerTests(unittest.TestCase):
         mock_execvpe,
         mock_write_pid,
         mock_atexit_register,
+        _mock_getcwd,
         mock_chdir,
     ) -> None:
         mock_load_runner_control_config.return_value = {"symbol": "SOONUSDT"}
@@ -41,6 +43,7 @@ class RunSavedRunnerTests(unittest.TestCase):
         self.assertEqual(exec_env["GRID_RUNNER_SERVICE_TEMPLATE"], "grid-loop@{symbol}.service")
 
     @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
     @patch("grid_optimizer.run_saved_runner.atexit.register")
     @patch("grid_optimizer.run_saved_runner._write_pid")
     @patch("grid_optimizer.run_saved_runner.os.execvpe")
@@ -53,6 +56,7 @@ class RunSavedRunnerTests(unittest.TestCase):
         mock_execvpe,
         mock_write_pid,
         mock_atexit_register,
+        _mock_getcwd,
         mock_chdir,
     ) -> None:
         mock_load_runner_control_config.return_value = {"symbol": "SOONUSDT"}
@@ -63,7 +67,9 @@ class RunSavedRunnerTests(unittest.TestCase):
         ):
             run_saved_runner.main()
 
-        mock_chdir.assert_called_once_with("/tmp/runtime")
+        self.assertEqual(len(mock_chdir.call_args_list), 2)
+        self.assertEqual(mock_chdir.call_args_list[0].args, ("/tmp/runtime",))
+        self.assertEqual(mock_chdir.call_args_list[1].args, ("/repo",))
         mock_load_runner_control_config.assert_called_once_with("SOONUSDT")
         mock_execvpe.assert_called_once()
 
