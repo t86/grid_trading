@@ -126,6 +126,7 @@ if [ "${INSTALL_RUNNER_WRAPPER}" != "0" ]; then
 #!/usr/bin/env bash
 set -euo pipefail
 export APP_DIR='${SERVICE_WORKING_DIR}'
+export RUNNER_CODE_DIR='${APP_DIR}'
 export PYTHON_BIN='${EXEC_PYTHON_BIN}'
 export PYTHONPATH_VALUE='${PYTHONPATH_VALUE}'
 export GRID_API_ENV_FILE='${RUNNER_ENV_FILE}'

@@ -23,6 +23,7 @@ fi
 ACTION="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
 SYMBOL="$(printf '%s' "$2" | tr '[:lower:]' '[:upper:]')"
 APP_DIR="${APP_DIR:-$PWD}"
+RUNNER_CODE_DIR="${RUNNER_CODE_DIR:-$APP_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-$APP_DIR/.venv/bin/python}"
 GRID_API_ENV_FILE="${GRID_API_ENV_FILE:-$APP_DIR/.env.runner}"
 PYTHONPATH_VALUE="${PYTHONPATH_VALUE:-$APP_DIR/src}"
@@ -40,6 +41,10 @@ runner_patterns=(
 ensure_paths() {
   if [ ! -d "$APP_DIR" ]; then
     echo "APP_DIR does not exist: $APP_DIR" >&2
+    exit 1
+  fi
+  if [ ! -d "$RUNNER_CODE_DIR" ]; then
+    echo "RUNNER_CODE_DIR does not exist: $RUNNER_CODE_DIR" >&2
     exit 1
   fi
   if [ ! -x "$PYTHON_BIN" ]; then
@@ -111,11 +116,11 @@ print_status() {
 start_runner() {
   ensure_paths
   load_exchange_env
-  cd "$APP_DIR"
+  cd "$RUNNER_CODE_DIR"
   if [ -f "$LOG_PATH" ]; then
     mv "$LOG_PATH" "${LOG_PATH}.$(date +%Y%m%d_%H%M%S)"
   fi
-  nohup env PYTHONPATH="$PYTHONPATH_VALUE" "$PYTHON_BIN" -u -m grid_optimizer.run_saved_runner --symbol "$SYMBOL" >"$LOG_PATH" 2>&1 < /dev/null &
+  nohup env PYTHONPATH="$PYTHONPATH_VALUE" GRID_RUNNER_WORK_DIR="$APP_DIR" "$PYTHON_BIN" -u -m grid_optimizer.run_saved_runner --symbol "$SYMBOL" >"$LOG_PATH" 2>&1 < /dev/null &
   sleep 2
   print_status
 }

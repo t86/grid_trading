@@ -32,6 +32,10 @@ def main() -> None:
     parser.add_argument("--symbol", type=str, default="")
     args = parser.parse_args()
 
+    runner_work_dir = str(os.environ.get("GRID_RUNNER_WORK_DIR") or "").strip()
+    if runner_work_dir:
+        os.chdir(runner_work_dir)
+
     symbol = str(args.symbol or os.environ.get("GRID_RUNNER_SYMBOL") or DEFAULT_RUNNER_SYMBOL).upper().strip()
     if symbol and not os.environ.get("GRID_RUNNER_SERVICE_TEMPLATE"):
         os.environ["GRID_RUNNER_SERVICE_TEMPLATE"] = "grid-loop@{symbol}.service"
