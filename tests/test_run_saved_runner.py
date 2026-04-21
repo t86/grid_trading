@@ -24,7 +24,9 @@ class RunSavedRunnerTests(unittest.TestCase):
         mock_load_runner_control_config.return_value = {"symbol": "SOONUSDT"}
         mock_build_runner_command.return_value = ["python", "-m", "grid_optimizer.loop_runner", "--symbol", "SOONUSDT"]
 
-        with patch.object(sys, "argv", ["run_saved_runner.py", "--symbol", "soonusdt"]):
+        with patch.dict("os.environ", {}, clear=True), patch.object(
+            sys, "argv", ["run_saved_runner.py", "--symbol", "soonusdt"]
+        ):
             run_saved_runner.main()
 
         mock_write_pid.assert_called_once()
@@ -32,6 +34,8 @@ class RunSavedRunnerTests(unittest.TestCase):
         mock_load_runner_control_config.assert_called_once_with("SOONUSDT")
         mock_build_runner_command.assert_called_once_with({"symbol": "SOONUSDT"})
         mock_execvpe.assert_called_once()
+        _, _, exec_env = mock_execvpe.call_args.args
+        self.assertEqual(exec_env["GRID_RUNNER_SERVICE_TEMPLATE"], "grid-loop@{symbol}.service")
 
 
 if __name__ == "__main__":

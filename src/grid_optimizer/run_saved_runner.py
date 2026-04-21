@@ -33,6 +33,8 @@ def main() -> None:
     args = parser.parse_args()
 
     symbol = str(args.symbol or os.environ.get("GRID_RUNNER_SYMBOL") or DEFAULT_RUNNER_SYMBOL).upper().strip()
+    if symbol and not os.environ.get("GRID_RUNNER_SERVICE_TEMPLATE"):
+        os.environ["GRID_RUNNER_SERVICE_TEMPLATE"] = "grid-loop@{symbol}.service"
     pid_path = runner_pid_path_for_symbol(symbol) if symbol else RUNNER_PID_PATH
     _write_pid(pid_path)
     atexit.register(_cleanup_pid, pid_path)
