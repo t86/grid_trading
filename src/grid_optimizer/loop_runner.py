@@ -7342,6 +7342,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
 
     report = {
@@ -7579,6 +7580,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 tick_size=tick_size,
                 min_qty=min_qty,
                 min_notional=min_notional,
+                step_size=symbol_info.get("step_size"),
                 post_only=post_only,
             )
             if prepared_order is None:

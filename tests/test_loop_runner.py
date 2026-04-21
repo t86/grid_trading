@@ -3295,7 +3295,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
-    def test_execute_plan_report_skips_order_below_min_notional_after_post_only_adjustment(
+    def test_execute_plan_report_raises_entry_order_below_min_notional_after_post_only_adjustment(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
@@ -3354,6 +3354,7 @@ class LoopRunnerTests(unittest.TestCase):
             "actual_net_qty": 0.0,
             "symbol_info": {
                 "tick_size": 0.01,
+                "step_size": 0.1,
                 "min_qty": 0.1,
                 "min_notional": 5.0,
             },
@@ -3362,13 +3363,12 @@ class LoopRunnerTests(unittest.TestCase):
         report = execute_plan_report(args, plan_report)
 
         self.assertTrue(report["executed"])
-        self.assertEqual(report["placed_orders"], [])
-        self.assertEqual(len(report["skipped_orders"]), 1)
-        self.assertEqual(
-            report["skipped_orders"][0]["reason"]["reason"],
-            "submitted_notional_below_min_notional",
-        )
-        mock_post_order.assert_not_called()
+        self.assertEqual(report["skipped_orders"], [])
+        self.assertEqual(len(report["placed_orders"]), 1)
+        self.assertAlmostEqual(report["placed_orders"][0]["request"]["qty"], 10.0, places=8)
+        self.assertAlmostEqual(report["placed_orders"][0]["request"]["submitted_notional"], 5.0, places=8)
+        mock_post_order.assert_called_once()
+        self.assertAlmostEqual(mock_post_order.call_args.kwargs["quantity"], 10.0, places=8)
         mock_update_refs.assert_called_once()
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")

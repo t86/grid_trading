@@ -244,6 +244,39 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertAlmostEqual(skipped["submitted_price"], 0.50, places=8)
         self.assertAlmostEqual(skipped["submitted_notional"], 4.95, places=8)
 
+    def test_prepare_post_only_order_request_raises_entry_qty_to_min_notional(self) -> None:
+        prepared, skipped = prepare_post_only_order_request(
+            order={"role": "entry_long", "qty": 24.0, "price": 0.172},
+            side="BUY",
+            live_bid_price=0.1719,
+            live_ask_price=0.1721,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertIsNone(skipped)
+        self.assertEqual(prepared["qty"], 30.0)
+        self.assertAlmostEqual(prepared["submitted_price"], 0.172, places=8)
+        self.assertAlmostEqual(prepared["submitted_notional"], 5.16, places=8)
+        self.assertTrue(prepared["qty_bumped_to_min_order"])
+
+    def test_prepare_post_only_order_request_does_not_raise_take_profit_qty_to_min_notional(self) -> None:
+        prepared, skipped = prepare_post_only_order_request(
+            order={"role": "take_profit_long", "qty": 24.0, "price": 0.172},
+            side="SELL",
+            live_bid_price=0.1719,
+            live_ask_price=0.1721,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertIsNone(prepared)
+        self.assertEqual(skipped["reason"], "submitted_notional_below_min_notional")
+
 
 if __name__ == "__main__":
     unittest.main()

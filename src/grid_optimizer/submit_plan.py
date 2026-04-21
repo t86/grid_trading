@@ -5,7 +5,7 @@ import json
 import time
 import traceback
 from datetime import datetime, timezone
-from decimal import Decimal
+from decimal import Decimal, ROUND_UP
 from pathlib import Path
 from typing import Any
 
@@ -22,6 +22,18 @@ from .data import (
 )
 from .dry_run import _round_order_price
 from .live_check import extract_symbol_position
+
+
+MIN_ORDER_QTY_BUMP_ROLES = {
+    "bootstrap",
+    "bootstrap_entry",
+    "bootstrap_long",
+    "bootstrap_short",
+    "entry",
+    "entry_long",
+    "entry_short",
+    "grid_entry",
+}
 
 
 def _float(value: float) -> str:
@@ -60,6 +72,24 @@ def _quantity_decimal(value: Any) -> Decimal:
         return Decimal(str(value))
     except Exception:
         return Decimal("0")
+
+
+def _round_order_qty_up(qty: float, step_size: float | None) -> float:
+    safe_qty = max(_safe_float(qty), 0.0)
+    safe_step = _safe_float(step_size)
+    if safe_step <= 0:
+        return safe_qty
+    qty_dec = Decimal(str(safe_qty))
+    step_dec = Decimal(str(safe_step))
+    units = (qty_dec / step_dec).to_integral_value(rounding=ROUND_UP)
+    return float(units * step_dec)
+
+
+def _order_allows_min_order_qty_bump(order: dict[str, Any]) -> bool:
+    if order.get("force_reduce_only") is not None and bool(order.get("force_reduce_only")):
+        return False
+    role = str(order.get("role", "entry")).strip().lower() or "entry"
+    return role in MIN_ORDER_QTY_BUMP_ROLES
 
 
 def _order_position_side(order: dict[str, Any]) -> str:
@@ -188,6 +218,7 @@ def prepare_post_only_order_request(
     tick_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    step_size: float | None = None,
     post_only: bool = True,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     qty = _safe_float(order.get("qty"))
@@ -206,6 +237,18 @@ def prepare_post_only_order_request(
     else:
         submit_price = desired_price
     submit_notional = qty * submit_price
+    original_qty = qty
+    qty_bumped = False
+    if _order_allows_min_order_qty_bump(order) and submit_price > 0 and _safe_float(step_size) > 0:
+        required_qty = qty
+        if min_qty is not None and qty < float(min_qty):
+            required_qty = max(required_qty, float(min_qty))
+        if min_notional is not None and submit_notional < float(min_notional):
+            required_qty = max(required_qty, float(min_notional) / submit_price)
+        if required_qty > qty:
+            qty = _round_order_qty_up(required_qty, step_size)
+            submit_notional = qty * submit_price
+            qty_bumped = qty > original_qty
     if qty <= 0:
         return None, {
             "reason": "non_positive_qty",
@@ -237,6 +280,8 @@ def prepare_post_only_order_request(
         "desired_price": desired_price,
         "submitted_price": submit_price,
         "submitted_notional": submit_notional,
+        "qty_bumped_to_min_order": qty_bumped,
+        "original_qty": original_qty,
     }, None
 
 
@@ -387,6 +432,7 @@ def preserve_queue_priority_in_execution_actions(
     tick_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    step_size: float | None = None,
 ) -> dict[str, Any]:
     """Prefer preserving queued orders unless the refreshed plan truly needs less size or a new bucket."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
@@ -426,6 +472,7 @@ def preserve_queue_priority_in_execution_actions(
             tick_size=tick_size,
             min_qty=min_qty,
             min_notional=min_notional,
+            step_size=step_size,
             post_only=_order_prefers_post_only(order),
         )
         if prepared_order is None:
@@ -491,6 +538,7 @@ def preserve_queue_priority_in_execution_actions(
             tick_size=tick_size,
             min_qty=min_qty,
             min_notional=min_notional,
+            step_size=step_size,
             post_only=_order_prefers_post_only(order),
         )
         if prepared_order is None:
@@ -712,6 +760,7 @@ def main() -> None:
         tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
 
     _print_preview(plan_report=plan_report, validation=validation, drift_steps=drift_steps)
@@ -872,6 +921,7 @@ def main() -> None:
                     tick_size=tick_size,
                     min_qty=min_qty,
                     min_notional=min_notional,
+                    step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
                 )
                 if prepared_order is None:
                     report["skipped_orders"].append(
