@@ -1453,6 +1453,62 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertIn(1.009, entry_long_prices)
 
+    def test_build_hedge_micro_grid_plan_blocks_loss_making_long_exits(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=0.1712,
+            step_price=0.00045,
+            buy_levels=12,
+            sell_levels=1,
+            per_order_notional=30.0,
+            base_position_notional=0.0,
+            bid_price=0.1708,
+            ask_price=0.1709,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=175.0,
+            current_short_qty=0.0,
+            current_long_lots=[
+                {"qty": 175.0, "price": 0.1714},
+            ],
+            take_profit_min_profit_ratio=0.0003,
+        )
+
+        take_profit_long_orders = [item for item in plan["sell_orders"] if item["role"] == "take_profit_long"]
+        entry_short_orders = [item for item in plan["sell_orders"] if item["role"] == "entry_short"]
+
+        self.assertEqual(take_profit_long_orders, [])
+        self.assertEqual(entry_short_orders, [])
+
+    def test_build_hedge_micro_grid_plan_blocks_loss_making_short_exits(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=0.1712,
+            step_price=0.00045,
+            buy_levels=1,
+            sell_levels=12,
+            per_order_notional=30.0,
+            base_position_notional=0.0,
+            bid_price=0.1716,
+            ask_price=0.1717,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=175.0,
+            current_short_lots=[
+                {"qty": 175.0, "price": 0.1710},
+            ],
+            take_profit_min_profit_ratio=0.0003,
+        )
+
+        take_profit_short_orders = [item for item in plan["buy_orders"] if item["role"] == "take_profit_short"]
+        entry_long_orders = [item for item in plan["buy_orders"] if item["role"] == "entry_long"]
+
+        self.assertEqual(take_profit_short_orders, [])
+        self.assertEqual(entry_long_orders, [])
+
     def test_build_inventory_target_neutral_plan_builds_band_orders_and_bootstrap(self) -> None:
         plan = build_inventory_target_neutral_plan(
             center_price=1.0,

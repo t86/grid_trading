@@ -4,7 +4,7 @@ import argparse
 import json
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
 from pathlib import Path
 from typing import Any
 
@@ -228,6 +228,7 @@ def _build_lot_take_profit_orders(
     lots: list[dict[str, float]],
     side: str,
     profit_step: float,
+    min_profit_ratio: float | None = None,
     tick_size: float | None,
     step_size: float | None,
     min_qty: float | None,
@@ -248,6 +249,17 @@ def _build_lot_take_profit_orders(
             continue
         target_raw = lot_price + profit_step if safe_side == "SELL" else max(lot_price - profit_step, 0.0)
         target_price = _round_order_price(target_raw, tick_size, safe_side)
+        min_profit_price = _nearest_profitable_exit_price(
+            reference_price=lot_price,
+            side=safe_side,
+            min_profit_ratio=min_profit_ratio,
+            tick_size=tick_size,
+        )
+        if min_profit_price is not None:
+            if safe_side == "SELL":
+                target_price = max(target_price, min_profit_price)
+            else:
+                target_price = min(target_price, min_profit_price)
         notional = target_price * lot_qty
         if min_qty is not None and lot_qty < min_qty:
             continue
@@ -983,6 +995,26 @@ def build_hedge_micro_grid_plan(
         if lowest_short_lot_price is not None
         else (current_short_avg_price if current_short_avg_price > 0 else None)
     )
+    long_non_loss_exit_price = (
+        _nearest_profitable_exit_price(
+            reference_price=long_exit_reference_price,
+            side="SELL",
+            min_profit_ratio=take_profit_min_profit_ratio,
+            tick_size=tick_size,
+        )
+        if take_profit_min_profit_ratio is not None and long_exit_reference_price is not None
+        else None
+    )
+    short_non_loss_exit_price = (
+        _nearest_profitable_exit_price(
+            reference_price=short_exit_reference_price,
+            side="BUY",
+            min_profit_ratio=take_profit_min_profit_ratio,
+            tick_size=tick_size,
+        )
+        if take_profit_min_profit_ratio is not None and short_exit_reference_price is not None
+        else None
+    )
     front_short_exit_reference_price = (
         highest_short_lot_price
         if highest_short_lot_price is not None
@@ -1091,6 +1123,7 @@ def build_hedge_micro_grid_plan(
             lots=effective_short_lots,
             side="BUY",
             profit_step=profit_step,
+            min_profit_ratio=take_profit_min_profit_ratio,
             tick_size=tick_size,
             step_size=step_size,
             min_qty=min_qty,
@@ -1132,6 +1165,8 @@ def build_hedge_micro_grid_plan(
         if short_exit_profit_guard_active:
             if short_exit_reference_price is not None and price >= short_exit_reference_price:
                 continue
+        if short_non_loss_exit_price is not None and price > short_non_loss_exit_price:
+            continue
         if min_qty is not None and qty < min_qty:
             continue
         if min_notional is not None and notional < min_notional:
@@ -1225,6 +1260,7 @@ def build_hedge_micro_grid_plan(
             lots=effective_long_lots,
             side="SELL",
             profit_step=profit_step,
+            min_profit_ratio=take_profit_min_profit_ratio,
             tick_size=tick_size,
             step_size=step_size,
             min_qty=min_qty,
@@ -1247,6 +1283,8 @@ def build_hedge_micro_grid_plan(
         if long_exit_profit_guard_active:
             if long_exit_reference_price is not None and price <= long_exit_reference_price:
                 continue
+        if long_non_loss_exit_price is not None and price < long_non_loss_exit_price:
+            continue
         if min_qty is not None and qty < min_qty:
             continue
         if min_notional is not None and notional < min_notional:
