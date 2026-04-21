@@ -19,7 +19,6 @@ data/
 output/*
 !output/custom_runner_presets.json
 !output/symbol_lists.json
-!output/soonusdt_loop_runner_control.json
 
 # Temp files
 *.log
