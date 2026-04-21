@@ -3389,7 +3389,10 @@ def apply_active_delever_long(
         return report
     if not threshold_enabled and pause_notional <= 0:
         return report
-    if current_long_notional < threshold_notional and current_long_notional < pause_notional:
+    if threshold_enabled:
+        if current_long_notional < threshold_notional and current_long_notional < pause_notional:
+            return report
+    elif current_long_notional < pause_notional:
         return report
 
     take_profit_orders = [
@@ -3580,7 +3583,10 @@ def apply_active_delever_short(
         return report
     if not threshold_enabled and pause_notional <= 0:
         return report
-    if current_short_notional < threshold_notional and current_short_notional < pause_notional:
+    if threshold_enabled:
+        if current_short_notional < threshold_notional and current_short_notional < pause_notional:
+            return report
+    elif current_short_notional < pause_notional:
         return report
 
     take_profit_orders = [

@@ -927,7 +927,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         take_profit_prices = [item["price"] for item in report["buy_orders"] if item["role"] == "take_profit_short"]
 
-        self.assertEqual(take_profit_prices, [0.971])
+        self.assertEqual(take_profit_prices, [0.981])
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
@@ -1020,7 +1020,7 @@ class LoopRunnerTests(unittest.TestCase):
         take_profit_prices = [item["price"] for item in report["buy_orders"] if item["role"] == "take_profit_short"]
         entry_short_prices = [item["price"] for item in report["sell_orders"] if item["role"] == "entry_short"]
 
-        self.assertEqual(take_profit_prices, [0.971])
+        self.assertEqual(take_profit_prices, [0.981])
         self.assertEqual(entry_short_prices, [])
         self.assertTrue(report["synthetic_inventory_exit_priority"]["active"])
         self.assertEqual(report["synthetic_inventory_exit_priority"]["direction"], "short")
@@ -2132,6 +2132,70 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["active_sell_order_count"], 2)
         self.assertEqual(len(active_sells), 2)
         self.assertTrue(all(item.get("lot_consume_mode") == "fifo" for item in active_sells))
+
+    def test_apply_active_delever_long_disabled_threshold_waits_for_pause_notional(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 30.0, "notional": 30.3, "role": "take_profit_long"},
+                {"side": "SELL", "price": 1.02, "qty": 30.0, "notional": 30.6, "role": "take_profit_long"},
+            ],
+        }
+
+        report = apply_active_delever_long(
+            plan=plan,
+            current_long_qty=50.0,
+            current_long_notional=50.0,
+            current_long_avg_price=1.0,
+            current_long_lots=[{"qty": 50.0, "price": 1.0}],
+            pause_long_position_notional=220.0,
+            threshold_position_notional=0.0,
+            per_order_notional=30.0,
+            step_price=0.01,
+            tick_size=0.001,
+            ask_price=1.001,
+            min_profit_ratio=0.0,
+            market_guard_buy_pause_active=False,
+            grid_buffer_realized_notional=100.0,
+            grid_buffer_spent_notional=0.0,
+            max_active_levels=2,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertIsNone(report["trigger_mode"])
+        self.assertFalse(any(item["role"] == "active_delever_long" for item in plan["sell_orders"]))
+
+    def test_apply_active_delever_short_disabled_threshold_waits_for_pause_notional(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 30.0, "notional": 29.7, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.98, "qty": 30.0, "notional": 29.4, "role": "take_profit_short"},
+            ],
+            "sell_orders": [],
+        }
+
+        report = apply_active_delever_short(
+            plan=plan,
+            current_short_qty=50.0,
+            current_short_notional=50.0,
+            current_short_avg_price=1.0,
+            current_short_lots=[{"qty": 50.0, "price": 1.0}],
+            pause_short_position_notional=220.0,
+            threshold_position_notional=0.0,
+            per_order_notional=30.0,
+            step_price=0.01,
+            tick_size=0.001,
+            bid_price=0.999,
+            ask_price=1.001,
+            min_profit_ratio=0.0,
+            grid_buffer_realized_notional=100.0,
+            grid_buffer_spent_notional=0.0,
+            max_active_levels=2,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertIsNone(report["trigger_mode"])
+        self.assertFalse(any(item["role"] == "active_delever_short" for item in plan["buy_orders"]))
 
 
     def test_decorate_synthetic_open_orders_applies_role_metadata(self) -> None:
