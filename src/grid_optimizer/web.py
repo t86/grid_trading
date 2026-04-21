@@ -1240,6 +1240,58 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "sleep_seconds": 5.0,
         },
     },
+    "soon_volume_neutral_ping_pong_v1": {
+        "label": "SOON 专用中性刷量 v1",
+        "description": "仅用于 SOONUSDT 的调教版 synthetic_neutral。12x12、30U、小步长近市场刷量；4.5 格内刷量，4.5-6 格缓冲，6 格外转网格再平衡，并用 adaptive step 在短线波动放大时及时拉宽挂单。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "SOONUSDT",
+        "config": {
+            "symbol": "SOONUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0002,
+            "buy_levels": 12,
+            "sell_levels": 12,
+            "per_order_notional": 30.0,
+            "startup_entry_multiplier": 1.0,
+            "base_position_notional": 0.0,
+            "neutral_center_interval_minutes": 15,
+            "static_buy_offset_steps": 0.75,
+            "static_sell_offset_steps": 0.75,
+            "near_market_entry_max_center_distance_steps": 4.5,
+            "grid_inventory_rebalance_min_center_distance_steps": 6.0,
+            "near_market_reentry_confirm_cycles": 3,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 2,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 220.0,
+            "pause_short_position_notional": 220.0,
+            "threshold_position_notional": 0.0,
+            "max_position_notional": 260.0,
+            "max_short_position_notional": 260.0,
+            "max_total_notional": 520.0,
+            "max_new_orders": 30,
+            "take_profit_min_profit_ratio": 0.0003,
+            "adaptive_step_enabled": True,
+            "adaptive_step_30s_abs_return_ratio": 0.001,
+            "adaptive_step_30s_amplitude_ratio": 0.0016,
+            "adaptive_step_1m_abs_return_ratio": 0.002,
+            "adaptive_step_1m_amplitude_ratio": 0.003,
+            "adaptive_step_3m_abs_return_ratio": 0.003,
+            "adaptive_step_5m_abs_return_ratio": 0.004,
+            "adaptive_step_max_scale": 3.0,
+            "adaptive_step_min_per_order_scale": 0.6,
+            "adaptive_step_min_position_limit_scale": 0.75,
+            "autotune_symbol_enabled": False,
+            "autotune_min_order_notional_only": True,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "1m",
+            "volatility_trigger_amplitude_ratio": 0.015,
+            "volatility_trigger_abs_return_ratio": 0.009,
+            "volatility_trigger_stop_close_all_positions": False,
+            "sleep_seconds": 5.0,
+        },
+    },
     "competition_inventory_grid_v1": {
         "label": "合约竞赛库存网格",
         "description": "围绕策略自身最近一次有效成交锚点运行的 Competition Inventory Grid。flat 时双向贴盘口等首单，后续按固定步长滚动；达到阈值仓位后优先转入减仓状态机。",
@@ -1305,6 +1357,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "custom_grid_roll_upper_distance_ratio": 0.30,
     "custom_grid_roll_shift_levels": 1,
     "autotune_symbol_enabled": True,
+    "autotune_min_order_notional_only": False,
     "up_trigger_steps": 6,
     "down_trigger_steps": 4,
     "shift_steps": 4,
@@ -2407,7 +2460,12 @@ def _round_up_to_step(value: float, step: float | None) -> float:
 
 def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
     tuned = dict(config)
-    if not _safe_bool(tuned.get("autotune_symbol_enabled", True), "autotune_symbol_enabled"):
+    full_autotune_enabled = _safe_bool(tuned.get("autotune_symbol_enabled", True), "autotune_symbol_enabled")
+    min_order_notional_only = _safe_bool(
+        tuned.get("autotune_min_order_notional_only", False),
+        "autotune_min_order_notional_only",
+    )
+    if not full_autotune_enabled and not min_order_notional_only:
         return tuned
     symbol = str(tuned.get("symbol", "")).upper().strip()
     if not symbol:
@@ -2429,22 +2487,33 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
     min_notional = _safe_float(symbol_info.get("min_notional"), "min_notional")
     spread = max(ask_price - bid_price, 0.0)
 
-    profile = str(tuned.get("strategy_profile", "volume_long_v4")).strip() or "volume_long_v4"
-    step_ratio, min_ticks = RUNNER_AUTOTUNE_STEP_HINTS.get(profile, RUNNER_AUTOTUNE_STEP_HINTS["volume_long_v4"])
-    desired_step = max(mid_price * step_ratio, tick_size * min_ticks, spread * 2.0)
-    if desired_step > 0:
-        tuned["step_price"] = _round_up_to_step(desired_step, tick_size if tick_size > 0 else None)
+    if full_autotune_enabled:
+        profile = str(tuned.get("strategy_profile", "volume_long_v4")).strip() or "volume_long_v4"
+        step_ratio, min_ticks = RUNNER_AUTOTUNE_STEP_HINTS.get(profile, RUNNER_AUTOTUNE_STEP_HINTS["volume_long_v4"])
+        desired_step = max(mid_price * step_ratio, tick_size * min_ticks, spread * 2.0)
+        if desired_step > 0:
+            tuned["step_price"] = _round_up_to_step(desired_step, tick_size if tick_size > 0 else None)
 
     minimum_working_notional = 0.0
     if min_notional > 0:
-        minimum_working_notional = max(minimum_working_notional, min_notional * 4.0)
+        minimum_working_notional = max(
+            minimum_working_notional,
+            min_notional if min_order_notional_only and not full_autotune_enabled else min_notional * 4.0,
+        )
     if min_qty > 0 and mid_price > 0:
-        minimum_working_notional = max(minimum_working_notional, min_qty * mid_price * 2.0)
+        minimum_working_notional = max(
+            minimum_working_notional,
+            min_qty * mid_price if min_order_notional_only and not full_autotune_enabled else min_qty * mid_price * 2.0,
+        )
     if minimum_working_notional > 0:
         tuned["per_order_notional"] = max(_safe_float(tuned.get("per_order_notional"), "per_order_notional"), minimum_working_notional)
-        base_position_notional = _safe_float(tuned.get("base_position_notional"), "base_position_notional")
-        if base_position_notional > 0:
-            tuned["base_position_notional"] = max(base_position_notional, tuned["per_order_notional"] * 2.0)
+        if full_autotune_enabled:
+            base_position_notional = _safe_float(tuned.get("base_position_notional"), "base_position_notional")
+            if base_position_notional > 0:
+                tuned["base_position_notional"] = max(base_position_notional, tuned["per_order_notional"] * 2.0)
+
+    if not full_autotune_enabled:
+        return tuned
 
     max_new_orders = max(_safe_int(tuned.get("max_new_orders", 20), "max_new_orders"), 1)
     current_max_total_notional = _safe_float(tuned.get("max_total_notional"), "max_total_notional")
@@ -3019,6 +3088,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "inventory_tier_base_position_notional",
         "max_plan_age_seconds",
         "max_mid_drift_steps",
+        "near_market_entry_max_center_distance_steps",
+        "grid_inventory_rebalance_min_center_distance_steps",
         "max_total_notional",
         "rolling_hourly_loss_limit",
         "max_cumulative_notional",
@@ -3040,6 +3111,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "leverage",
         "maker_retries",
         "max_new_orders",
+        "near_market_reentry_confirm_cycles",
         "auto_regime_confirm_cycles",
         "market_bias_regime_switch_confirm_cycles",
         "neutral_center_interval_minutes",
@@ -3064,6 +3136,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "fixed_center_roll_enabled",
         "excess_inventory_reduce_only_enabled",
         "autotune_symbol_enabled",
+        "autotune_min_order_notional_only",
         "volume_trigger_enabled",
         "volume_trigger_stop_cancel_open_orders",
         "volume_trigger_stop_close_all_positions",
@@ -3379,6 +3452,27 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             [
                 "--synthetic-tiny-short-residual-notional",
                 str(config["synthetic_tiny_short_residual_notional"]),
+            ]
+        )
+    if config.get("near_market_entry_max_center_distance_steps") is not None:
+        command.extend(
+            [
+                "--near-market-entry-max-center-distance-steps",
+                str(config["near_market_entry_max_center_distance_steps"]),
+            ]
+        )
+    if config.get("grid_inventory_rebalance_min_center_distance_steps") is not None:
+        command.extend(
+            [
+                "--grid-inventory-rebalance-min-center-distance-steps",
+                str(config["grid_inventory_rebalance_min_center_distance_steps"]),
+            ]
+        )
+    if config.get("near_market_reentry_confirm_cycles") is not None:
+        command.extend(
+            [
+                "--near-market-reentry-confirm-cycles",
+                str(config["near_market_reentry_confirm_cycles"]),
             ]
         )
     if config.get("static_buy_offset_steps") is not None:
@@ -12190,6 +12284,59 @@ MONITOR_PAGE = """<!doctype html>
         },
       },
       {
+        key: "soon_volume_neutral_ping_pong_v1",
+        label: "SOON 专用中性刷量 v1",
+        description: "仅用于 SOONUSDT 的调教版 synthetic_neutral。12x12、30U、小步长近市场刷量；4.5 格内刷量，4.5-6 格缓冲，6 格外转网格再平衡，并用 adaptive step 在短线波动放大时及时拉宽挂单。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "SOONUSDT",
+        config: {
+          symbol: "SOONUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0002,
+          buy_levels: 12,
+          sell_levels: 12,
+          per_order_notional: 30,
+          startup_entry_multiplier: 1,
+          base_position_notional: 0,
+          neutral_center_interval_minutes: 15,
+          static_buy_offset_steps: 0.75,
+          static_sell_offset_steps: 0.75,
+          near_market_entry_max_center_distance_steps: 4.5,
+          grid_inventory_rebalance_min_center_distance_steps: 6,
+          near_market_reentry_confirm_cycles: 3,
+          up_trigger_steps: 2,
+          down_trigger_steps: 2,
+          shift_steps: 1,
+          pause_buy_position_notional: 220,
+          pause_short_position_notional: 220,
+          threshold_position_notional: 0,
+          max_position_notional: 260,
+          max_short_position_notional: 260,
+          max_total_notional: 520,
+          max_new_orders: 30,
+          take_profit_min_profit_ratio: 0.0003,
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.001,
+          adaptive_step_30s_amplitude_ratio: 0.0016,
+          adaptive_step_1m_abs_return_ratio: 0.002,
+          adaptive_step_1m_amplitude_ratio: 0.003,
+          adaptive_step_3m_abs_return_ratio: 0.003,
+          adaptive_step_5m_abs_return_ratio: 0.004,
+          adaptive_step_max_scale: 3,
+          adaptive_step_min_per_order_scale: 0.6,
+          adaptive_step_min_position_limit_scale: 0.75,
+          autotune_symbol_enabled: false,
+          autotune_min_order_notional_only: true,
+          volatility_trigger_enabled: true,
+          volatility_trigger_window: "1m",
+          volatility_trigger_amplitude_ratio: 0.015,
+          volatility_trigger_abs_return_ratio: 0.009,
+          volatility_trigger_stop_close_all_positions: false,
+          sleep_seconds: 5,
+        },
+      },
+      {
         key: "competition_inventory_grid_v1",
         label: "合约竞赛库存网格",
         description: "围绕策略自身最近一次有效成交锚点运行的 Competition Inventory Grid。flat 时双向贴盘口等首单，后续按固定步长滚动；达到阈值仓位后优先转入减仓状态机。",
@@ -12995,6 +13142,13 @@ MONITOR_PAGE = """<!doctype html>
         summary: "量优先的单向合成中性。不开底仓，启动先挂一对更大的近端买卖单；弱市切到做空、强市切到做多，震荡再回到中性回转。",
         focus: [
           "如果把 `startup_entry_multiplier` 设成 4，就相当于首轮大单成交后，用约四笔常规小单去拆回；再叠加 bias 三态换挡，就能少扛单边库存。",
+        ],
+      },
+      soon_volume_neutral_ping_pong_v1: {
+        summary: "SOON 专用调教版 synthetic neutral。固定 12x12、30U、小步长刷量；只保留最小下单额兜底，避免通用 autotune 改写 step 和仓位阈值。",
+        focus: [
+          "4.5 格内是近市场刷量，4.5-6 格是滞回缓冲，6 格外确认后转网格再平衡；TP 保本线默认 0.03%，正常刷量段不亏损平仓。",
+          "基准 step=0.0002；30s/1m 振幅或 30s/1m/3m/5m 涨跌扩大时，adaptive step 最多放大到 3 倍，并同步轻度缩单笔和仓位上限。",
         ],
       },
       competition_inventory_grid_v1: {

@@ -153,6 +153,38 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["max_position_notional"], 600.0)
         self.assertAlmostEqual(payload["sleep_seconds"], 5.0)
 
+    def test_runner_preset_payload_applies_soon_volume_neutral_ping_pong_profile(self) -> None:
+        payload = _runner_preset_payload("soon_volume_neutral_ping_pong_v1", {"symbol": "SOONUSDT"})
+        self.assertEqual(payload["strategy_profile"], "soon_volume_neutral_ping_pong_v1")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["symbol"], "SOONUSDT")
+        self.assertAlmostEqual(payload["step_price"], 0.0002)
+        self.assertEqual(payload["buy_levels"], 12)
+        self.assertEqual(payload["sell_levels"], 12)
+        self.assertAlmostEqual(payload["per_order_notional"], 30.0)
+        self.assertEqual(payload["neutral_center_interval_minutes"], 15)
+        self.assertEqual(payload["near_market_entry_max_center_distance_steps"], 4.5)
+        self.assertEqual(payload["grid_inventory_rebalance_min_center_distance_steps"], 6.0)
+        self.assertEqual(payload["near_market_reentry_confirm_cycles"], 3)
+        self.assertEqual(payload["threshold_position_notional"], 0.0)
+        self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0003)
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertEqual(payload["adaptive_step_30s_abs_return_ratio"], 0.001)
+        self.assertEqual(payload["adaptive_step_30s_amplitude_ratio"], 0.0016)
+        self.assertEqual(payload["adaptive_step_1m_abs_return_ratio"], 0.002)
+        self.assertEqual(payload["adaptive_step_1m_amplitude_ratio"], 0.003)
+        self.assertEqual(payload["adaptive_step_3m_abs_return_ratio"], 0.003)
+        self.assertEqual(payload["adaptive_step_5m_abs_return_ratio"], 0.004)
+        self.assertEqual(payload["adaptive_step_max_scale"], 3.0)
+        self.assertEqual(payload["adaptive_step_min_per_order_scale"], 0.6)
+        self.assertEqual(payload["adaptive_step_min_position_limit_scale"], 0.75)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertTrue(payload["autotune_min_order_notional_only"])
+
+    def test_runner_preset_payload_rejects_soon_profile_for_other_symbols(self) -> None:
+        with self.assertRaises(ValueError):
+            _runner_preset_payload("soon_volume_neutral_ping_pong_v1", {"symbol": "BASEDUSDT"})
+
     def test_monitor_page_exposes_competition_inventory_grid_preset(self) -> None:
         self.assertIn("合约竞赛库存网格", MONITOR_PAGE)
         self.assertIn("competition_inventory_grid", MONITOR_PAGE)
@@ -692,6 +724,58 @@ class WebSecurityTests(unittest.TestCase):
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_starts_soon_profile_without_step_autotune(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.1725", "ask_price": "0.1726"}]
+        config = _resolve_runner_start_config(
+            {"symbol": "SOONUSDT", "strategy_profile": "soon_volume_neutral_ping_pong_v1"}
+        )
+        self.assertEqual(config["strategy_profile"], "soon_volume_neutral_ping_pong_v1")
+        self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(config["step_price"], 0.0002)
+        self.assertEqual(config["buy_levels"], 12)
+        self.assertEqual(config["sell_levels"], 12)
+        self.assertAlmostEqual(config["per_order_notional"], 30.0)
+        self.assertAlmostEqual(config["pause_buy_position_notional"], 220.0)
+        self.assertAlmostEqual(config["max_position_notional"], 260.0)
+        self.assertEqual(config["state_path"], "output/soonusdt_loop_state.json")
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_soon_profile_only_raises_min_order_notional(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 40.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.1725", "ask_price": "0.1726"}]
+        config = _resolve_runner_start_config(
+            {"symbol": "SOONUSDT", "strategy_profile": "soon_volume_neutral_ping_pong_v1"}
+        )
+        self.assertAlmostEqual(config["step_price"], 0.0002)
+        self.assertEqual(config["buy_levels"], 12)
+        self.assertEqual(config["sell_levels"], 12)
+        self.assertAlmostEqual(config["per_order_notional"], 40.0)
+        self.assertAlmostEqual(config["pause_buy_position_notional"], 220.0)
+        self.assertAlmostEqual(config["max_position_notional"], 260.0)
+        self.assertAlmostEqual(config["max_total_notional"], 520.0)
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_starts_volatility_defensive_profile(self, mock_symbol_config, mock_book_tickers) -> None:
         mock_symbol_config.return_value = self._mock_symbol_config()
         mock_book_tickers.return_value = self._mock_book()
@@ -1095,6 +1179,49 @@ class WebSecurityTests(unittest.TestCase):
         )
         self.assertIn("--startup-entry-multiplier", command)
         self.assertIn("4.0", command)
+
+    def test_build_runner_command_includes_near_market_rebalance_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "SOONUSDT",
+                "strategy_profile": "soon_volume_neutral_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0002,
+                "buy_levels": 12,
+                "sell_levels": 12,
+                "per_order_notional": 30.0,
+                "startup_entry_multiplier": 1.0,
+                "base_position_notional": 0.0,
+                "near_market_entry_max_center_distance_steps": 4.5,
+                "grid_inventory_rebalance_min_center_distance_steps": 6.0,
+                "near_market_reentry_confirm_cycles": 3,
+                "pause_buy_position_notional": 220.0,
+                "pause_short_position_notional": 220.0,
+                "max_position_notional": 260.0,
+                "max_short_position_notional": 260.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 30,
+                "max_total_notional": 520.0,
+                "sleep_seconds": 5,
+                "state_path": "output/soonusdt_loop_state.json",
+                "plan_json": "output/soonusdt_loop_latest_plan.json",
+                "submit_report_json": "output/soonusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/soonusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+        self.assertIn("--near-market-entry-max-center-distance-steps", command)
+        self.assertIn("4.5", command)
+        self.assertIn("--grid-inventory-rebalance-min-center-distance-steps", command)
+        self.assertIn("6.0", command)
+        self.assertIn("--near-market-reentry-confirm-cycles", command)
+        self.assertIn("3", command)
 
     def test_build_runner_command_includes_market_bias_arguments(self) -> None:
         command = _build_runner_command(
