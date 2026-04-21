@@ -1955,6 +1955,20 @@ def _volatility_trigger_status_from_stop(previous_status: dict[str, Any]) -> boo
     }
 
 
+def _volatility_reduce_was_effective(previous_status: dict[str, Any]) -> bool:
+    if bool(previous_status.get("reduce_effective")) or bool(previous_status.get("reduce_flatten_started")):
+        return True
+    result = previous_status.get("result") if isinstance(previous_status.get("result"), dict) else {}
+    post_actions = result.get("post_stop_actions") if isinstance(result.get("post_stop_actions"), dict) else {}
+    try:
+        close_attempted_count = int(post_actions.get("close_attempted_count") or 0)
+    except (TypeError, ValueError):
+        close_attempted_count = 0
+    return close_attempted_count > 0 or bool(
+        post_actions.get("flatten_started") or post_actions.get("flatten_already_running")
+    )
+
+
 def _volatility_reduce_escalation_reason(
     config: dict[str, Any],
     previous_status: dict[str, Any],
@@ -1963,6 +1977,8 @@ def _volatility_reduce_escalation_reason(
     current_return_ratio: float,
 ) -> str | None:
     if str(previous_status.get("phase") or "") != "reduce_to_notional":
+        return None
+    if not _volatility_reduce_was_effective(previous_status):
         return None
     try:
         abs_return_threshold = float(config.get("volatility_trigger_reduce_escalate_abs_return_ratio") or 0.0)
@@ -2216,6 +2232,9 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         "phase": previous_status.get("phase"),
         "reduce_target_notional": previous_status.get("reduce_target_notional"),
         "reduce_started_at": previous_status.get("reduce_started_at"),
+        "reduce_effective": bool(previous_status.get("reduce_effective", False)),
+        "reduce_close_attempted_count": previous_status.get("reduce_close_attempted_count"),
+        "reduce_flatten_started": previous_status.get("reduce_flatten_started"),
         "full_flatten_started_at": previous_status.get("full_flatten_started_at"),
         "escalation_reason": previous_status.get("escalation_reason"),
     }
@@ -2248,6 +2267,9 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             status["phase"] = None
             status["reduce_target_notional"] = None
             status["reduce_started_at"] = None
+            status["reduce_effective"] = False
+            status["reduce_close_attempted_count"] = None
+            status["reduce_flatten_started"] = None
             status["full_flatten_started_at"] = None
             status["escalation_reason"] = None
             print(
@@ -2280,9 +2302,20 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             }
             status["paused_by_trigger"] = True
             if target_notional > 0:
+                post_actions = result.get("post_stop_actions") if isinstance(result.get("post_stop_actions"), dict) else {}
+                try:
+                    close_attempted_count = int(post_actions.get("close_attempted_count") or 0)
+                except (TypeError, ValueError):
+                    close_attempted_count = 0
+                reduce_flatten_started = bool(
+                    post_actions.get("flatten_started") or post_actions.get("flatten_already_running")
+                )
                 status["phase"] = "reduce_to_notional"
                 status["reduce_target_notional"] = target_notional
                 status["reduce_started_at"] = previous_status.get("reduce_started_at") or checked_at
+                status["reduce_effective"] = close_attempted_count > 0 or reduce_flatten_started
+                status["reduce_close_attempted_count"] = close_attempted_count
+                status["reduce_flatten_started"] = reduce_flatten_started
                 status["full_flatten_started_at"] = None
                 status["escalation_reason"] = None
             elif close_positions:
@@ -2300,6 +2333,9 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             status["phase"] = None
             status["reduce_target_notional"] = None
             status["reduce_started_at"] = None
+            status["reduce_effective"] = False
+            status["reduce_close_attempted_count"] = None
+            status["reduce_flatten_started"] = None
             status["full_flatten_started_at"] = None
             status["escalation_reason"] = None
     except Exception as exc:  # pragma: no cover

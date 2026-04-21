@@ -35,6 +35,7 @@ from grid_optimizer.web import (
     _start_runner_process,
     _update_custom_grid_runner_preset,
     _uses_legacy_runner,
+    _volatility_reduce_escalation_reason,
 )
 
 
@@ -521,6 +522,46 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(decision["action"], "start")
         self.assertEqual(decision["reason"], "volatility_back_within_threshold")
+
+    def test_volatility_reduce_does_not_escalate_when_target_already_reached(self) -> None:
+        reason = _volatility_reduce_escalation_reason(
+            {
+                "volatility_trigger_reduce_escalate_after_seconds": 900,
+                "volatility_trigger_reduce_escalate_abs_return_ratio": 0.02,
+            },
+            {
+                "phase": "reduce_to_notional",
+                "reduce_started_at": "2026-04-21T13:53:03+00:00",
+                "reduce_effective": False,
+                "result": {
+                    "post_stop_actions": {
+                        "close_attempted_count": 0,
+                        "flatten_started": False,
+                    }
+                },
+            },
+            checked_at=datetime(2026, 4, 21, 14, 10, 0, tzinfo=timezone.utc),
+            current_return_ratio=-0.025,
+        )
+
+        self.assertIsNone(reason)
+
+    def test_volatility_reduce_escalates_after_effective_reduce(self) -> None:
+        reason = _volatility_reduce_escalation_reason(
+            {
+                "volatility_trigger_reduce_escalate_after_seconds": 900,
+                "volatility_trigger_reduce_escalate_abs_return_ratio": 0.02,
+            },
+            {
+                "phase": "reduce_to_notional",
+                "reduce_started_at": "2026-04-21T13:53:03+00:00",
+                "reduce_effective": True,
+            },
+            checked_at=datetime(2026, 4, 21, 13, 54, 0, tzinfo=timezone.utc),
+            current_return_ratio=-0.025,
+        )
+
+        self.assertEqual(reason, "reduce_escalate_abs_return_ratio")
 
     def test_runner_preset_payload_rejects_xaut_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
