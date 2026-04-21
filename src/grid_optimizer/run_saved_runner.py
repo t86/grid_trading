@@ -11,6 +11,12 @@ from .web import _build_runner_command, _load_runner_control_config
 
 
 DEFAULT_RUNNER_SYMBOL = "SOONUSDT"
+RUNTIME_PATH_FLAGS = {
+    "--plan-json",
+    "--state-path",
+    "--submit-report-json",
+    "--summary-jsonl",
+}
 
 
 def _write_pid(path) -> None:
@@ -26,6 +32,21 @@ def _cleanup_pid(path) -> None:
                 path.unlink()
     except OSError:
         pass
+
+
+def _anchor_relative_runtime_paths(command: list[str], runner_work_dir: str) -> list[str]:
+    if not runner_work_dir:
+        return command
+    anchored = list(command)
+    base = Path(runner_work_dir)
+    for index, token in enumerate(anchored[:-1]):
+        if token not in RUNTIME_PATH_FLAGS:
+            continue
+        path = Path(anchored[index + 1])
+        if path.is_absolute():
+            continue
+        anchored[index + 1] = str(base / path)
+    return anchored
 
 
 def main() -> None:
@@ -49,6 +70,7 @@ def main() -> None:
     if not config:
         raise SystemExit(f"no saved runner control config found for {symbol}")
     command = _build_runner_command(config)
+    command = _anchor_relative_runtime_paths(command, runner_work_dir)
     if runner_work_dir:
         os.chdir(original_cwd)
     os.execvpe(command[0], command, os.environ.copy())

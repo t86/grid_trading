@@ -73,6 +73,49 @@ class RunSavedRunnerTests(unittest.TestCase):
         mock_load_runner_control_config.assert_called_once_with("SOONUSDT")
         mock_execvpe.assert_called_once()
 
+    @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
+    @patch("grid_optimizer.run_saved_runner.atexit.register")
+    @patch("grid_optimizer.run_saved_runner._write_pid")
+    @patch("grid_optimizer.run_saved_runner.os.execvpe")
+    @patch("grid_optimizer.run_saved_runner._build_runner_command")
+    @patch("grid_optimizer.run_saved_runner._load_runner_control_config")
+    def test_main_anchors_relative_runtime_paths_to_runner_work_dir(
+        self,
+        mock_load_runner_control_config,
+        mock_build_runner_command,
+        mock_execvpe,
+        mock_write_pid,
+        mock_atexit_register,
+        _mock_getcwd,
+        mock_chdir,
+    ) -> None:
+        mock_load_runner_control_config.return_value = {"symbol": "SOONUSDT"}
+        mock_build_runner_command.return_value = [
+            "python",
+            "-m",
+            "grid_optimizer.loop_runner",
+            "--state-path",
+            "output/state.json",
+            "--plan-json",
+            "output/plan.json",
+            "--submit-report-json",
+            "/already/absolute/submit.json",
+            "--summary-jsonl",
+            "output/events.jsonl",
+        ]
+
+        with patch.dict("os.environ", {"GRID_RUNNER_WORK_DIR": "/tmp/runtime"}, clear=True), patch.object(
+            sys, "argv", ["run_saved_runner.py", "--symbol", "soonusdt"]
+        ):
+            run_saved_runner.main()
+
+        command = mock_execvpe.call_args.args[1]
+        self.assertEqual(command[command.index("--state-path") + 1], "/tmp/runtime/output/state.json")
+        self.assertEqual(command[command.index("--plan-json") + 1], "/tmp/runtime/output/plan.json")
+        self.assertEqual(command[command.index("--submit-report-json") + 1], "/already/absolute/submit.json")
+        self.assertEqual(command[command.index("--summary-jsonl") + 1], "/tmp/runtime/output/events.jsonl")
+
 
 if __name__ == "__main__":
     unittest.main()
