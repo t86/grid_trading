@@ -27,6 +27,7 @@ RUNNER_CODE_DIR="${RUNNER_CODE_DIR:-$APP_DIR}"
 PYTHON_BIN="${PYTHON_BIN:-$APP_DIR/.venv/bin/python}"
 GRID_API_ENV_FILE="${GRID_API_ENV_FILE:-$APP_DIR/.env.runner}"
 PYTHONPATH_VALUE="${PYTHONPATH_VALUE:-$APP_DIR/src}"
+GRID_RUNNER_SERVICE_TEMPLATE="${GRID_RUNNER_SERVICE_TEMPLATE:-${RUNNER_SERVICE_TEMPLATE:-}}"
 LOG_DIR="${LOG_DIR:-$APP_DIR/output}"
 SYMBOL_SLUG="$(printf '%s' "$SYMBOL" | tr '[:upper:]' '[:lower:]')"
 PID_PATH="$LOG_DIR/${SYMBOL_SLUG}_loop_runner.pid"
@@ -65,6 +66,75 @@ load_exchange_env() {
     echo "BINANCE_API_KEY / BINANCE_API_SECRET are missing. Set them in env or $GRID_API_ENV_FILE" >&2
     exit 1
   fi
+}
+
+runner_service_name() {
+  local template lower service
+  template="$GRID_RUNNER_SERVICE_TEMPLATE"
+  lower="$(printf '%s' "$SYMBOL" | tr '[:upper:]' '[:lower:]')"
+  service="${template//\{symbol\}/${SYMBOL}}"
+  service="${service//\{symbol_upper\}/${SYMBOL}}"
+  service="${service//\{symbol_lower\}/${lower}}"
+  service="${service//\{slug\}/${SYMBOL_SLUG}}"
+  printf '%s\n' "$service"
+}
+
+systemd_runner_available() {
+  local service
+  [ -n "$GRID_RUNNER_SERVICE_TEMPLATE" ] || return 1
+  command -v systemctl >/dev/null 2>&1 || return 1
+  service="$(runner_service_name)"
+  [ -n "$service" ] || return 1
+  systemctl cat "$service" >/dev/null 2>&1
+}
+
+run_systemctl() {
+  if [ "$(id -u)" = "0" ]; then
+    systemctl "$@"
+    return
+  fi
+  if systemctl "$@" 2>/dev/null; then
+    return
+  fi
+  if command -v sudo >/dev/null 2>&1; then
+    sudo -n systemctl "$@"
+    return
+  fi
+  systemctl "$@"
+}
+
+print_systemd_status() {
+  local service
+  service="$(runner_service_name)"
+  if systemctl is-active --quiet "$service"; then
+    echo "runner_status=running"
+  else
+    echo "runner_status=stopped"
+  fi
+  echo "systemd_service=$service"
+  systemctl --no-pager --full status "$service" | sed -n '1,20p' || true
+  if [ -f "$PID_PATH" ]; then
+    echo "pid_file=$(cat "$PID_PATH" 2>/dev/null || true)"
+  fi
+}
+
+systemd_runner_action() {
+  local service
+  service="$(runner_service_name)"
+  case "$ACTION" in
+    start)
+      run_systemctl start "$service"
+      ;;
+    restart)
+      run_systemctl restart "$service"
+      ;;
+    stop)
+      run_systemctl stop "$service"
+      ;;
+    status)
+      ;;
+  esac
+  print_systemd_status
 }
 
 find_matching_pids() {
@@ -128,6 +198,10 @@ start_runner() {
 case "$ACTION" in
   start)
     ensure_paths
+    if systemd_runner_available; then
+      systemd_runner_action
+      exit 0
+    fi
     if [ -n "$(find_matching_pids || true)" ]; then
       echo "runner already running for $SYMBOL"
       print_status
@@ -137,16 +211,28 @@ case "$ACTION" in
     ;;
   restart)
     ensure_paths
+    if systemd_runner_available; then
+      systemd_runner_action
+      exit 0
+    fi
     stop_runner
     start_runner
     ;;
   stop)
     ensure_paths
+    if systemd_runner_available; then
+      systemd_runner_action
+      exit 0
+    fi
     stop_runner
     print_status
     ;;
   status)
     ensure_paths
+    if systemd_runner_available; then
+      systemd_runner_action
+      exit 0
+    fi
     print_status
     ;;
   *)

@@ -175,6 +175,46 @@ ssh <host> '/usr/local/bin/grid-saved-runner-api2 restart SOONUSDT'
 ssh <host> '/usr/local/bin/grid-saved-runner-api2 status SOONUSDT'
 ```
 
+## 4.2) Saved Runner systemd Template
+
+For production runners that should survive process exits and host reboots, install the symbol-level
+systemd template from the checked-out repo. This keeps the same saved runner control JSON, but
+routes web/wrapper start-stop operations through `grid-loop@SYMBOL.service`.
+
+Primary host:
+
+```bash
+APP_DIR=/home/ubuntu/wangge \
+RUNNER_CODE_DIR=/home/ubuntu/wangge \
+PYTHON_BIN=/home/ubuntu/wangge/.venv/bin/python \
+PYTHONPATH_VALUE=/home/ubuntu/wangge/src \
+GRID_API_ENV_FILE=/home/ubuntu/.config/wangge/binance_api_env.env \
+WEB_SERVICE_NAME=grid-web \
+RUNNER_WRAPPER_NAME=grid-saved-runner \
+SYMBOLS=SOONUSDT \
+START_NOW=1 \
+deploy/oracle/install_runner_systemd.sh
+```
+
+API2 host:
+
+```bash
+APP_DIR=/home/ubuntu/wangge_api2 \
+RUNNER_CODE_DIR=/home/ubuntu/wangge_api2_repo \
+PYTHON_BIN=/home/ubuntu/wangge_api2_repo/.venv/bin/python \
+PYTHONPATH_VALUE=/home/ubuntu/wangge_api2_repo/src \
+GRID_API_ENV_FILE=/home/ubuntu/.config/wangge/binance_api_env_api2.env \
+WEB_SERVICE_NAME=grid-web-api2 \
+RUNNER_WRAPPER_NAME=grid-saved-runner-api2 \
+SYMBOLS=SOONUSDT \
+START_NOW=1 \
+deploy/oracle/install_runner_systemd.sh
+```
+
+The installer also enables `grid-loop-watchdog@SYMBOL.timer`. The watchdog only restarts an
+active runner whose `output/<symbol>_loop_events.jsonl` has stopped updating; it does not start a
+manually stopped runner.
+
 Recommended pattern:
 
 - keep each account in its own env file, for example `binance_api_env.env` and `binance_api_env_api2.env`
