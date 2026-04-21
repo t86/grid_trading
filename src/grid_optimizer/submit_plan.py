@@ -72,6 +72,35 @@ def _order_bucket_key(side: str, price: float, position_side: str | None = None)
     return f"{side.upper()}:{normalized_position_side}:{price:.10f}"
 
 
+
+def _resolve_reduce_only_flag(
+    *,
+    strategy_mode: str,
+    side: str,
+    role: str,
+) -> bool | None:
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    normalized_side = str(side or "").upper().strip()
+    normalized_role = str(role or "").lower().strip()
+    if normalized_mode == "hedge_neutral":
+        return None
+    if normalized_role in {"grid_exit", "forced_reduce", "tail_cleanup"}:
+        return True
+    if normalized_side == "SELL" and normalized_role in {
+        "take_profit",
+        "take_profit_long",
+        "active_delever_long",
+    }:
+        return True
+    if normalized_side == "BUY" and normalized_role in {
+        "take_profit_short",
+        "active_delever_short",
+    }:
+        return True
+    return None
+
+
+
 def _clone_order_with_qty(order: dict[str, Any], qty: Decimal) -> dict[str, Any]:
     cloned = dict(order)
     qty_float = float(qty)
@@ -688,10 +717,15 @@ def main() -> None:
         tick_size = _safe_float((plan_report.get("symbol_info") or {}).get("tick_size"))
         min_qty = (plan_report.get("symbol_info") or {}).get("min_qty")
         min_notional = (plan_report.get("symbol_info") or {}).get("min_notional")
+        strategy_mode = str(plan_report.get("strategy_mode", "")).strip() or "one_way_long"
         for index, order in enumerate(validation["actions"]["place_orders"], start=1):
             role = str(order.get("role", "entry"))
             side = str(order.get("side", "")).upper().strip()
-            reduce_only = True if side == "SELL" and role == "take_profit" else None
+            reduce_only = _resolve_reduce_only_flag(
+                strategy_mode=strategy_mode,
+                side=side,
+                role=role,
+            )
             last_exc: RuntimeError | None = None
             for attempt in range(args.maker_retries + 1):
                 live_book = fetch_futures_book_tickers(symbol=symbol)[0]
@@ -753,6 +787,27 @@ def main() -> None:
                 except RuntimeError as exc:
                     last_exc = exc
                     message = str(exc).lower()
+                    if "-4164" in message and "notional must be no smaller than 5" in message:
+                        report["skipped_orders"].append(
+                            {
+                                "request": {
+                                    "role": role,
+                                    "side": side,
+                                    "qty": _safe_float(prepared_order.get("qty")),
+                                    "desired_price": _safe_float(prepared_order.get("desired_price")),
+                                    "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                                    "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
+                                    "attempt": attempt + 1,
+                                    "reduce_only": reduce_only,
+                                },
+                                "reason": {
+                                    "reason": "exchange_min_notional_reject",
+                                    "error": str(exc),
+                                },
+                            }
+                        )
+                        last_exc = None
+                        break
                     if "-5022" not in message and "post only order will be rejected" not in message:
                         raise
                     if attempt >= args.maker_retries:

@@ -1002,6 +1002,35 @@ def _is_short_exit_order(order: dict[str, Any]) -> bool:
     return _order_role(order) in {"take_profit_short", "active_delever_short"}
 
 
+
+def _resolve_reduce_only_flag(
+    *,
+    strategy_mode: str,
+    side: str,
+    role: str,
+) -> bool | None:
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    normalized_side = str(side or "").upper().strip()
+    normalized_role = str(role or "").lower().strip()
+    if normalized_mode == "hedge_neutral":
+        return None
+    if normalized_role in {"grid_exit", "forced_reduce", "tail_cleanup"}:
+        return True
+    if normalized_side == "SELL" and normalized_role in {
+        "take_profit",
+        "take_profit_long",
+        "active_delever_long",
+    }:
+        return True
+    if normalized_side == "BUY" and normalized_role in {
+        "take_profit_short",
+        "active_delever_short",
+    }:
+        return True
+    return None
+
+
+
 def assess_synthetic_tp_only_watchdog(
     *,
     state: dict[str, Any],
@@ -1111,6 +1140,77 @@ def assess_synthetic_tp_only_watchdog(
 
     state["synthetic_tp_only_watchdog_state"] = report
     return report
+
+
+
+def apply_synthetic_inventory_exit_priority(
+    *,
+    plan: dict[str, Any],
+    strategy_mode: str,
+    current_long_qty: float,
+    current_short_qty: float,
+    step_size: float | None,
+) -> dict[str, Any]:
+    qty_tolerance = max(_safe_float(step_size) * 0.5, 1e-9)
+    report = {
+        "enabled": _is_synthetic_neutral_mode(strategy_mode),
+        "active": False,
+        "direction": None,
+        "qty_tolerance": qty_tolerance,
+        "exit_ready": False,
+        "pruned_bootstrap_orders": 0,
+        "pruned_entry_orders": 0,
+        "reason": None,
+    }
+    if not report["enabled"]:
+        return report
+
+    pure_long_inventory = current_long_qty > qty_tolerance and current_short_qty <= qty_tolerance
+    pure_short_inventory = current_short_qty > qty_tolerance and current_long_qty <= qty_tolerance
+    if not pure_long_inventory and not pure_short_inventory:
+        return report
+
+    if pure_long_inventory:
+        exit_ready = any(
+            _is_long_exit_order(item)
+            for item in plan.get("sell_orders", [])
+            if isinstance(item, dict)
+        )
+        report["direction"] = "long"
+        report["exit_ready"] = exit_ready
+        if not exit_ready:
+            return report
+        bootstrap_before = len(plan.get("bootstrap_orders", []))
+        entry_before = len(plan.get("buy_orders", []))
+        plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
+        plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
+        report["pruned_bootstrap_orders"] = bootstrap_before - len(plan.get("bootstrap_orders", []))
+        report["pruned_entry_orders"] = entry_before - len(plan.get("buy_orders", []))
+        report["active"] = report["pruned_bootstrap_orders"] > 0 or report["pruned_entry_orders"] > 0
+        if report["active"]:
+            report["reason"] = "pure_long_inventory_with_exit_ready"
+        return report
+
+    exit_ready = any(
+        _is_short_exit_order(item)
+        for item in plan.get("buy_orders", [])
+        if isinstance(item, dict)
+    )
+    report["direction"] = "short"
+    report["exit_ready"] = exit_ready
+    if not exit_ready:
+        return report
+    bootstrap_before = len(plan.get("bootstrap_orders", []))
+    entry_before = len(plan.get("sell_orders", []))
+    plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
+    plan["sell_orders"] = [item for item in plan.get("sell_orders", []) if not _is_short_entry_order(item)]
+    report["pruned_bootstrap_orders"] = bootstrap_before - len(plan.get("bootstrap_orders", []))
+    report["pruned_entry_orders"] = entry_before - len(plan.get("sell_orders", []))
+    report["active"] = report["pruned_bootstrap_orders"] > 0 or report["pruned_entry_orders"] > 0
+    if report["active"]:
+        report["reason"] = "pure_short_inventory_with_exit_ready"
+    return report
+
 
 
 def _direction_from_return_ratio(return_ratio: float, *, tolerance: float = 1e-12) -> str | None:
@@ -5145,6 +5245,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     auto_regime: dict[str, Any] | None = None
     xaut_adaptive: dict[str, Any] | None = None
     synthetic_tp_only_watchdog: dict[str, Any] | None = None
+    synthetic_inventory_exit_priority: dict[str, Any] | None = None
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
@@ -6108,6 +6209,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "threshold_timeout_target_notional": short_threshold_timeout.get("target_notional"),
             "threshold_timeout_aggressive": bool(short_active_delever.get("threshold_timeout_aggressive")),
         }
+        synthetic_inventory_exit_priority = apply_synthetic_inventory_exit_priority(
+            plan=plan,
+            strategy_mode=strategy_mode,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            step_size=symbol_info.get("step_size"),
+        )
         target_base_qty = hedge_plan["target_long_base_qty"]
         bootstrap_qty = hedge_plan["bootstrap_long_qty"]
     elif _is_inventory_target_neutral_mode(strategy_mode):
@@ -6636,6 +6744,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "dominant_long_with_tiny_short_residual": bool(plan.get("dominant_long_with_tiny_short_residual")),
         "dominant_short_with_tiny_long_residual": bool(plan.get("dominant_short_with_tiny_long_residual")),
         "synthetic_tp_only_watchdog": synthetic_tp_only_watchdog,
+        "synthetic_inventory_exit_priority": synthetic_inventory_exit_priority,
         "bootstrap_orders": plan["bootstrap_orders"],
         "buy_orders": plan["buy_orders"],
         "sell_orders": plan["sell_orders"],
@@ -6914,12 +7023,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             if post_only
             else (str(order.get("time_in_force", "GTC")).upper().strip() or "GTC")
         )
-        if strategy_mode in {"hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
-            reduce_only = None
-        elif _is_competition_inventory_grid_mode(strategy_mode):
-            reduce_only = True if role in {"grid_exit", "forced_reduce", "tail_cleanup"} else None
-        else:
-            reduce_only = True if (side == "SELL" and role == "take_profit") or (side == "BUY" and role == "take_profit_short") else None
+        reduce_only = _resolve_reduce_only_flag(
+            strategy_mode=strategy_mode,
+            side=side,
+            role=role,
+        )
         if order.get("force_reduce_only") is not None:
             reduce_only = bool(order.get("force_reduce_only"))
         last_exc: RuntimeError | None = None
@@ -6989,6 +7097,29 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             except RuntimeError as exc:
                 last_exc = exc
                 message = str(exc).lower()
+                if "-4164" in message and "notional must be no smaller than 5" in message:
+                    report["skipped_orders"].append(
+                        {
+                            "request": {
+                                "role": role,
+                                "side": side,
+                                "position_side": position_side,
+                                "qty": _safe_float(prepared_order.get("qty")),
+                                "desired_price": _safe_float(prepared_order.get("desired_price")),
+                                "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                                "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
+                                "attempt": attempt + 1,
+                                "time_in_force": time_in_force,
+                                "reduce_only": reduce_only,
+                            },
+                            "reason": {
+                                "reason": "exchange_min_notional_reject",
+                                "error": str(exc),
+                            },
+                        }
+                    )
+                    last_exc = None
+                    break
                 if "-5022" not in message and "post only order will be rejected" not in message:
                     raise
                 if attempt >= args.maker_retries:
