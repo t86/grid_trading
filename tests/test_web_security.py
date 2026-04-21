@@ -14,6 +14,7 @@ from grid_optimizer.web import (
     STRATEGIES_PAGE,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
+    _build_flatten_command,
     _delete_custom_grid_runner_preset,
     _build_runner_command,
     _client_ip_allowed,
@@ -83,6 +84,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_volatility_trigger_window"', MONITOR_PAGE)
         self.assertIn('id="monitor_volatility_trigger_amplitude_ratio"', MONITOR_PAGE)
         self.assertIn('id="monitor_volatility_trigger_abs_return_ratio"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volatility_trigger_stop_reduce_to_notional"', MONITOR_PAGE)
         self.assertIn('id="save_params_btn"', MONITOR_PAGE)
 
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
@@ -180,6 +182,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["adaptive_step_min_position_limit_scale"], 0.75)
         self.assertFalse(payload["autotune_symbol_enabled"])
         self.assertTrue(payload["autotune_min_order_notional_only"])
+        self.assertEqual(payload["volatility_trigger_stop_reduce_to_notional"], 150.0)
+        self.assertEqual(payload["volatility_trigger_reduce_escalate_after_seconds"], 900.0)
+        self.assertEqual(payload["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.02)
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
 
     def test_runner_preset_payload_rejects_soon_profile_for_other_symbols(self) -> None:
         with self.assertRaises(ValueError):
@@ -348,6 +354,9 @@ class WebSecurityTests(unittest.TestCase):
                 "volatility_trigger_window": "1h",
                 "volatility_trigger_amplitude_ratio": 0.04,
                 "volatility_trigger_abs_return_ratio": 0.02,
+                "volatility_trigger_stop_reduce_to_notional": 150,
+                "volatility_trigger_reduce_escalate_after_seconds": 900,
+                "volatility_trigger_reduce_escalate_abs_return_ratio": 0.03,
                 "volatility_trigger_stop_cancel_open_orders": False,
                 "volatility_trigger_stop_close_all_positions": True,
             }
@@ -357,10 +366,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_window"], "1h")
         self.assertEqual(payload["volatility_trigger_amplitude_ratio"], 0.04)
         self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
+        self.assertEqual(payload["volatility_trigger_stop_reduce_to_notional"], 150)
+        self.assertEqual(payload["volatility_trigger_reduce_escalate_after_seconds"], 900)
+        self.assertEqual(payload["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.03)
         self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
         self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+
+    def test_build_flatten_command_includes_target_position_notional(self) -> None:
+        command = _build_flatten_command(
+            {
+                "symbol": "SOONUSDT",
+                "client_order_prefix": "mfsoon",
+                "sleep_seconds": 2.0,
+                "recv_window": 5000,
+                "max_consecutive_errors": 20,
+                "events_jsonl": "output/soonusdt_maker_flatten_events.jsonl",
+                "target_position_notional": 150.0,
+            }
+        )
+
+        self.assertIn("--target-position-notional", command)
+        self.assertIn("150.0", command)
 
     def test_normalize_runner_control_payload_supports_adaptive_step_fields(self) -> None:
         payload = _normalize_runner_control_payload(
@@ -747,6 +775,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(config["per_order_notional"], 30.0)
         self.assertAlmostEqual(config["pause_buy_position_notional"], 220.0)
         self.assertAlmostEqual(config["max_position_notional"], 260.0)
+        self.assertEqual(config["volatility_trigger_stop_reduce_to_notional"], 150.0)
+        self.assertEqual(config["volatility_trigger_reduce_escalate_after_seconds"], 900.0)
+        self.assertEqual(config["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.02)
+        self.assertTrue(config["volatility_trigger_stop_close_all_positions"])
         self.assertEqual(config["state_path"], "output/soonusdt_loop_state.json")
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")

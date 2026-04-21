@@ -1288,7 +1288,10 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "volatility_trigger_window": "1m",
             "volatility_trigger_amplitude_ratio": 0.015,
             "volatility_trigger_abs_return_ratio": 0.009,
-            "volatility_trigger_stop_close_all_positions": False,
+            "volatility_trigger_stop_reduce_to_notional": 150.0,
+            "volatility_trigger_reduce_escalate_after_seconds": 900.0,
+            "volatility_trigger_reduce_escalate_abs_return_ratio": 0.02,
+            "volatility_trigger_stop_close_all_positions": True,
             "sleep_seconds": 5.0,
         },
     },
@@ -1439,6 +1442,9 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volatility_trigger_abs_return_ratio": 0.02,
     "volatility_trigger_stop_cancel_open_orders": True,
     "volatility_trigger_stop_close_all_positions": True,
+    "volatility_trigger_stop_reduce_to_notional": None,
+    "volatility_trigger_reduce_escalate_after_seconds": None,
+    "volatility_trigger_reduce_escalate_abs_return_ratio": None,
     "sleep_seconds": 15.0,
     "cancel_stale": True,
     "apply": True,
@@ -1618,12 +1624,23 @@ def _normalize_runner_volatility_trigger_config(config: dict[str, Any]) -> dict[
     normalized["volatility_trigger_window"] = _normalize_volatility_trigger_window(
         normalized.get("volatility_trigger_window")
     )
-    for key in {"volatility_trigger_amplitude_ratio", "volatility_trigger_abs_return_ratio"}:
+    for key in {
+        "volatility_trigger_amplitude_ratio",
+        "volatility_trigger_abs_return_ratio",
+        "volatility_trigger_stop_reduce_to_notional",
+        "volatility_trigger_reduce_escalate_after_seconds",
+        "volatility_trigger_reduce_escalate_abs_return_ratio",
+    }:
         value = normalized.get(key)
         if value in {"", None}:
             normalized[key] = None
             continue
         threshold = float(value)
+        if key == "volatility_trigger_stop_reduce_to_notional":
+            if threshold < 0:
+                raise ValueError(f"{key} must be >= 0")
+            normalized[key] = threshold or None
+            continue
         if threshold <= 0:
             raise ValueError(f"{key} must be > 0")
         normalized[key] = threshold
@@ -1633,7 +1650,7 @@ def _normalize_runner_volatility_trigger_config(config: dict[str, Any]) -> dict[
     normalized["volatility_trigger_stop_close_all_positions"] = bool(
         normalized.get("volatility_trigger_stop_close_all_positions", True)
     )
-    if normalized["volatility_trigger_stop_close_all_positions"]:
+    if normalized["volatility_trigger_stop_close_all_positions"] or normalized.get("volatility_trigger_stop_reduce_to_notional"):
         normalized["volatility_trigger_stop_cancel_open_orders"] = True
     if normalized["volatility_trigger_enabled"]:
         if (
@@ -1910,6 +1927,60 @@ def _evaluate_runner_volatility_trigger_signal(
     }
 
 
+def _parse_utc_datetime(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = f"{text[:-1]}+00:00"
+        return datetime.fromisoformat(text).astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _volatility_reduce_target_notional(config: dict[str, Any]) -> float:
+    try:
+        return max(float(config.get("volatility_trigger_stop_reduce_to_notional") or 0.0), 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _volatility_trigger_status_from_stop(previous_status: dict[str, Any]) -> bool:
+    reason = str(previous_status.get("reason") or "").strip()
+    return bool(previous_status.get("paused_by_trigger")) or reason in {
+        "volatility_above_threshold",
+        "waiting_for_volatility_cooldown",
+        "flatten_running",
+    }
+
+
+def _volatility_reduce_escalation_reason(
+    config: dict[str, Any],
+    previous_status: dict[str, Any],
+    *,
+    checked_at: datetime,
+    current_return_ratio: float,
+) -> str | None:
+    if str(previous_status.get("phase") or "") != "reduce_to_notional":
+        return None
+    try:
+        abs_return_threshold = float(config.get("volatility_trigger_reduce_escalate_abs_return_ratio") or 0.0)
+    except (TypeError, ValueError):
+        abs_return_threshold = 0.0
+    if abs_return_threshold > 0 and abs(float(current_return_ratio)) >= abs_return_threshold:
+        return "reduce_escalate_abs_return_ratio"
+
+    try:
+        after_seconds = float(config.get("volatility_trigger_reduce_escalate_after_seconds") or 0.0)
+    except (TypeError, ValueError):
+        after_seconds = 0.0
+    started_at = _parse_utc_datetime(previous_status.get("reduce_started_at"))
+    if after_seconds > 0 and started_at is not None and (checked_at - started_at).total_seconds() >= after_seconds:
+        return "reduce_escalate_after_seconds"
+    return None
+
+
 def _resolve_runner_volatility_trigger_action(
     config: dict[str, Any],
     *,
@@ -2081,7 +2152,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     if not symbol or not normalized_config.get("volatility_trigger_enabled"):
         return
 
-    checked_at = datetime.now(timezone.utc).isoformat()
+    checked_at_dt = datetime.now(timezone.utc)
+    checked_at = checked_at_dt.isoformat()
     window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
     window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
     price_stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
@@ -2090,6 +2162,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     runner = _read_runner_process_for_symbol(symbol)
     flatten = _read_flatten_process_for_symbol(symbol)
     previous_status = _runner_volatility_trigger_status(symbol) or {}
+    reduce_target_notional = _volatility_reduce_target_notional(normalized_config)
+    signal_hit = False
     decision = _resolve_runner_volatility_trigger_action(
         normalized_config,
         current_amplitude_ratio=current_amplitude_ratio,
@@ -2098,6 +2172,31 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         flatten_running=bool(flatten.get("is_running")),
         paused_by_trigger=bool(previous_status.get("paused_by_trigger", False)),
     )
+    signal_hit = bool(decision.get("hit"))
+    escalation_reason = _volatility_reduce_escalation_reason(
+        normalized_config,
+        previous_status,
+        checked_at=checked_at_dt,
+        current_return_ratio=current_return_ratio,
+    )
+    if (
+        decision.get("action") is None
+        and signal_hit
+        and reduce_target_notional > 0
+        and not bool(runner.get("is_running"))
+        and not bool(flatten.get("is_running"))
+        and str(previous_status.get("phase") or "") not in {"reduce_to_notional", "full_flatten"}
+        and _volatility_trigger_status_from_stop(previous_status)
+    ):
+        decision["action"] = "reduce_to_notional"
+        decision["reason"] = "volatility_above_threshold"
+    if (
+        signal_hit
+        and escalation_reason
+        and bool(normalized_config.get("volatility_trigger_stop_close_all_positions", True))
+    ):
+        decision["action"] = "full_flatten"
+        decision["reason"] = escalation_reason
     status: dict[str, Any] = {
         "checked_at": checked_at,
         "symbol": symbol,
@@ -2114,6 +2213,11 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         "matched_reasons": decision.get("matched_reasons") or [],
         "paused_by_trigger": bool(previous_status.get("paused_by_trigger", False)),
         "last_error": None,
+        "phase": previous_status.get("phase"),
+        "reduce_target_notional": previous_status.get("reduce_target_notional"),
+        "reduce_started_at": previous_status.get("reduce_started_at"),
+        "full_flatten_started_at": previous_status.get("full_flatten_started_at"),
+        "escalation_reason": previous_status.get("escalation_reason"),
     }
     try:
         if decision.get("action") == "start":
@@ -2141,27 +2245,63 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 "restarted": bool(result.get("restarted")),
             }
             status["paused_by_trigger"] = False
+            status["phase"] = None
+            status["reduce_target_notional"] = None
+            status["reduce_started_at"] = None
+            status["full_flatten_started_at"] = None
+            status["escalation_reason"] = None
             print(
                 f"[volatility-trigger] {symbol} resume window={window_key} "
                 f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%}"
             )
-        elif decision.get("action") == "stop":
+        elif decision.get("action") in {"stop", "reduce_to_notional", "full_flatten"}:
+            target_notional = 0.0
+            close_positions = bool(normalized_config.get("volatility_trigger_stop_close_all_positions", True))
+            if decision.get("action") == "reduce_to_notional":
+                target_notional = reduce_target_notional
+                close_positions = True
+            elif decision.get("action") == "stop" and reduce_target_notional > 0:
+                target_notional = reduce_target_notional
+                close_positions = True
+                status["action"] = "reduce_to_notional"
+            elif decision.get("action") == "full_flatten":
+                target_notional = 0.0
+                close_positions = True
             result = _stop_runner_process(
                 symbol,
                 cancel_open_orders=bool(normalized_config.get("volatility_trigger_stop_cancel_open_orders", True)),
-                close_all_positions=bool(normalized_config.get("volatility_trigger_stop_close_all_positions", True)),
+                close_all_positions=close_positions,
+                close_position_target_notional=target_notional,
             )
             status["result"] = {
                 "stopped": bool(result.get("stopped")),
                 "already_stopped": bool(result.get("already_stopped")),
+                "post_stop_actions": result.get("post_stop_actions"),
             }
             status["paused_by_trigger"] = True
+            if target_notional > 0:
+                status["phase"] = "reduce_to_notional"
+                status["reduce_target_notional"] = target_notional
+                status["reduce_started_at"] = previous_status.get("reduce_started_at") or checked_at
+                status["full_flatten_started_at"] = None
+                status["escalation_reason"] = None
+            elif close_positions:
+                status["phase"] = "full_flatten"
+                status["reduce_target_notional"] = 0.0
+                status["full_flatten_started_at"] = previous_status.get("full_flatten_started_at") or checked_at
+                status["escalation_reason"] = escalation_reason
             print(
                 f"[volatility-trigger] {symbol} stop window={window_key} "
-                f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%}"
+                f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%} "
+                f"target={target_notional:.4f}"
             )
         elif bool(runner.get("is_running")):
             status["paused_by_trigger"] = False
+            status["phase"] = None
+            status["reduce_target_notional"] = None
+            status["reduce_started_at"] = None
+            status["full_flatten_started_at"] = None
+            status["escalation_reason"] = None
     except Exception as exc:  # pragma: no cover
         status["last_error"] = f"{type(exc).__name__}: {exc}"
     _update_volatility_trigger_status(symbol, status)
@@ -3099,6 +3239,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_trigger_stop_threshold",
         "volatility_trigger_amplitude_ratio",
         "volatility_trigger_abs_return_ratio",
+        "volatility_trigger_stop_reduce_to_notional",
+        "volatility_trigger_reduce_escalate_after_seconds",
+        "volatility_trigger_reduce_escalate_abs_return_ratio",
         "sleep_seconds",
     }
     int_fields = {
@@ -3211,6 +3354,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_trigger_stop_threshold",
         "volatility_trigger_amplitude_ratio",
         "volatility_trigger_abs_return_ratio",
+        "volatility_trigger_stop_reduce_to_notional",
+        "volatility_trigger_reduce_escalate_after_seconds",
+        "volatility_trigger_reduce_escalate_abs_return_ratio",
     }
 
     for key, value in payload.items():
@@ -3984,7 +4130,7 @@ def _cancel_flatten_orders(*, symbol: str, api_key: str, api_secret: str, prefix
 
 
 def _build_flatten_command(config: dict[str, Any]) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "grid_optimizer.maker_flatten_runner",
@@ -4001,6 +4147,10 @@ def _build_flatten_command(config: dict[str, Any]) -> list[str]:
         "--events-jsonl",
         str(config["events_jsonl"]),
     ]
+    target_notional = max(float(config.get("target_position_notional") or 0.0), 0.0)
+    if target_notional > 0:
+        command.extend(["--target-position-notional", str(target_notional)])
+    return command
 
 
 def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
@@ -4013,10 +4163,19 @@ def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
         "recv_window": int(config.get("recv_window", 5000)),
         "max_consecutive_errors": int(config.get("max_consecutive_errors", 20)),
         "events_jsonl": str(config.get("events_jsonl") or _flatten_events_path(symbol)),
+        "target_position_notional": max(float(config.get("target_position_notional") or 0.0), 0.0),
     }
     if flatten.get("is_running"):
         current_config = dict(flatten.get("config") or {})
-        compare_fields = {"symbol", "client_order_prefix", "sleep_seconds", "recv_window", "max_consecutive_errors", "events_jsonl"}
+        compare_fields = {
+            "symbol",
+            "client_order_prefix",
+            "sleep_seconds",
+            "recv_window",
+            "max_consecutive_errors",
+            "events_jsonl",
+            "target_position_notional",
+        }
         if all(current_config.get(field) == desired.get(field) for field in compare_fields):
             return {"started": False, "already_running": True, "flatten_runner": flatten, "symbol": symbol}
         _stop_flatten_process(symbol, cancel_orders=True)
@@ -4091,6 +4250,7 @@ def _stop_runner_process(
     *,
     cancel_open_orders: bool = False,
     close_all_positions: bool = False,
+    close_position_target_notional: float | None = None,
     clear_volatility_resume_state: bool = False,
 ) -> dict[str, Any]:
     normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
@@ -4120,6 +4280,7 @@ def _stop_runner_process(
                     symbol=normalized_symbol,
                     cancel_open_orders=cancel_open_orders,
                     close_all_positions=close_all_positions,
+                    close_position_target_notional=close_position_target_notional,
                 ),
             }
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(RUNNER_LAUNCH_AGENT_PATH)], check=False)
@@ -4135,6 +4296,7 @@ def _stop_runner_process(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
             close_all_positions=close_all_positions,
+            close_position_target_notional=close_position_target_notional,
         )
         return {
             "stopped": True,
@@ -4165,6 +4327,7 @@ def _stop_runner_process(
                     symbol=normalized_symbol,
                     cancel_open_orders=cancel_open_orders,
                     close_all_positions=close_all_positions,
+                    close_position_target_notional=close_position_target_notional,
                 ),
             }
         _run_systemctl(["stop", service_name], check=True)
@@ -4180,6 +4343,7 @@ def _stop_runner_process(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
             close_all_positions=close_all_positions,
+            close_position_target_notional=close_position_target_notional,
         )
         return {
             "stopped": True,
@@ -4208,6 +4372,7 @@ def _stop_runner_process(
                 symbol=normalized_symbol,
                 cancel_open_orders=cancel_open_orders,
                 close_all_positions=close_all_positions,
+                close_position_target_notional=close_position_target_notional,
             ),
         }
 
@@ -4232,6 +4397,7 @@ def _stop_runner_process(
                     symbol=normalized_symbol,
                     cancel_open_orders=cancel_open_orders,
                     close_all_positions=close_all_positions,
+                    close_position_target_notional=close_position_target_notional,
                 ),
             }
         time.sleep(0.25)
@@ -4249,6 +4415,7 @@ def _stop_runner_process(
         symbol=normalized_symbol,
         cancel_open_orders=cancel_open_orders,
         close_all_positions=close_all_positions,
+        close_position_target_notional=close_position_target_notional,
     )
     return {
         "stopped": True,
@@ -4292,11 +4459,15 @@ def _build_stop_execution_summary(
     symbol: str,
     cancel_open_orders: bool,
     close_all_positions: bool,
+    close_position_target_notional: float | None = None,
 ) -> dict[str, Any]:
+    target_notional = max(float(close_position_target_notional or 0.0), 0.0)
     return {
         "symbol": symbol,
         "cancel_open_orders_requested": bool(cancel_open_orders),
         "close_all_positions_requested": bool(close_all_positions),
+        "close_position_target_notional": target_notional,
+        "close_position_mode": "full_flatten" if target_notional <= 0 else "reduce_to_notional",
         "cancel_open_orders_executed": False,
         "close_all_positions_executed": False,
         "cancel_attempted_count": 0,
@@ -4458,11 +4629,14 @@ def _execute_stop_actions(
     symbol: str,
     cancel_open_orders: bool,
     close_all_positions: bool,
+    close_position_target_notional: float | None = None,
 ) -> dict[str, Any]:
+    target_notional = max(float(close_position_target_notional or 0.0), 0.0)
     summary = _build_stop_execution_summary(
         symbol=symbol,
         cancel_open_orders=cancel_open_orders,
         close_all_positions=close_all_positions,
+        close_position_target_notional=target_notional,
     )
     if not cancel_open_orders and not close_all_positions:
         return summary
@@ -4480,11 +4654,19 @@ def _execute_stop_actions(
         summary["cancel_errors"] = cancel_result["errors"]
     if close_all_positions:
         summary["close_all_positions_executed"] = True
-        live_snapshot = load_live_flatten_snapshot(symbol, api_key, api_secret)
+        live_snapshot = load_live_flatten_snapshot(
+            symbol,
+            api_key,
+            api_secret,
+            target_position_notional=target_notional,
+        )
         summary["close_attempted_count"] = len(live_snapshot.get("orders", []))
         summary["warnings"].extend(live_snapshot.get("warnings", []))
         if not live_snapshot.get("orders"):
-            summary["warnings"].append("当前无可平持仓，未启动跟价平仓进程")
+            if target_notional > 0:
+                summary["warnings"].append(f"当前仓位已不高于 {target_notional:.4f}U，未启动跟价减仓进程")
+            else:
+                summary["warnings"].append("当前无可平持仓，未启动跟价平仓进程")
         else:
             flatten_result = _start_flatten_process(
                 {
@@ -4494,14 +4676,21 @@ def _execute_stop_actions(
                     "recv_window": 5000,
                     "max_consecutive_errors": 20,
                     "events_jsonl": str(_flatten_events_path(symbol)),
+                    "target_position_notional": target_notional,
                 }
             )
             summary["flatten_started"] = bool(flatten_result.get("started"))
             summary["flatten_already_running"] = bool(flatten_result.get("already_running"))
             if flatten_result.get("started"):
-                summary["warnings"].append("已启动买一/卖一 maker 跟价平仓，直到仓位归零")
+                if target_notional > 0:
+                    summary["warnings"].append(f"已启动买一/卖一 maker 跟价减仓，直到仓位名义不高于 {target_notional:.4f}U")
+                else:
+                    summary["warnings"].append("已启动买一/卖一 maker 跟价平仓，直到仓位归零")
             elif flatten_result.get("already_running"):
-                summary["warnings"].append("买一/卖一 maker 跟价平仓已在运行")
+                if target_notional > 0:
+                    summary["warnings"].append(f"买一/卖一 maker 跟价减仓已在运行，目标 {target_notional:.4f}U")
+                else:
+                    summary["warnings"].append("买一/卖一 maker 跟价平仓已在运行")
     return summary
 
 
@@ -10887,6 +11076,9 @@ MONITOR_PAGE = """<!doctype html>
         <label>绝对涨跌阈值
           <input id="monitor_volatility_trigger_abs_return_ratio" type="number" min="0" step="0.0001" />
         </label>
+        <label>先减到
+          <input id="monitor_volatility_trigger_stop_reduce_to_notional" type="number" min="0" step="1" />
+        </label>
         <label class="inline-check" title="高波动自动暂停时，先撤掉当前交易对全部未成交委托">
           <span class="check-row">
             <input id="monitor_volatility_trigger_stop_cancel_orders" type="checkbox" />
@@ -11168,6 +11360,7 @@ MONITOR_PAGE = """<!doctype html>
     const monitorVolatilityTriggerWindowEl = document.getElementById("monitor_volatility_trigger_window");
     const monitorVolatilityTriggerAmplitudeRatioEl = document.getElementById("monitor_volatility_trigger_amplitude_ratio");
     const monitorVolatilityTriggerAbsReturnRatioEl = document.getElementById("monitor_volatility_trigger_abs_return_ratio");
+    const monitorVolatilityTriggerStopReduceToNotionalEl = document.getElementById("monitor_volatility_trigger_stop_reduce_to_notional");
     const monitorVolatilityTriggerStopCancelOrdersEl = document.getElementById("monitor_volatility_trigger_stop_cancel_orders");
     const monitorVolatilityTriggerStopClosePositionsEl = document.getElementById("monitor_volatility_trigger_stop_close_positions");
     const customGridNameEl = document.getElementById("custom_grid_name");
@@ -12332,7 +12525,10 @@ MONITOR_PAGE = """<!doctype html>
           volatility_trigger_window: "1m",
           volatility_trigger_amplitude_ratio: 0.015,
           volatility_trigger_abs_return_ratio: 0.009,
-          volatility_trigger_stop_close_all_positions: false,
+          volatility_trigger_stop_reduce_to_notional: 150,
+          volatility_trigger_reduce_escalate_after_seconds: 900,
+          volatility_trigger_reduce_escalate_abs_return_ratio: 0.02,
+          volatility_trigger_stop_close_all_positions: true,
           sleep_seconds: 5,
         },
       },
@@ -12460,8 +12656,11 @@ MONITOR_PAGE = """<!doctype html>
       volatility_trigger_window: "波动观察窗口。按 Binance 合约 1 分钟 K 线聚合整窗的开高低收后计算振幅和涨跌。",
       volatility_trigger_amplitude_ratio: "最近窗口振幅阈值。整窗最高价 / 最低价 - 1 达到这个值后会自动暂停。",
       volatility_trigger_abs_return_ratio: "最近窗口绝对涨跌阈值。整窗收盘 / 开盘 - 1 的绝对值达到这个值后会自动暂停。",
+      volatility_trigger_stop_reduce_to_notional: "高波动自动暂停时，先用 maker 跟价把单边仓位减到该名义值以内；留空则跳过分段减仓。",
+      volatility_trigger_reduce_escalate_after_seconds: "分段减仓后仍处于高波动状态超过这个秒数时，如启用自动清仓则升级为全平。",
+      volatility_trigger_reduce_escalate_abs_return_ratio: "分段减仓后，最近窗口绝对涨跌继续扩大到这个阈值时，如启用自动清仓则升级为全平。",
       volatility_trigger_stop_cancel_open_orders: "高波动自动暂停时是否先撤销当前交易对全部未成交委托。",
-      volatility_trigger_stop_close_all_positions: "高波动自动暂停时是否继续启动 maker 跟价平仓，直到仓位归零。",
+      volatility_trigger_stop_close_all_positions: "高波动自动暂停时是否启动 maker 跟价清仓；如配置了先减到，则分段减仓后继续单边才升级清仓。",
       cancel_stale: "是否撤掉与当前目标计划不一致的旧单。",
       apply: "是否真实下单。关闭时仅做 dry-run。",
       reset_state: "启动时是否重置本地状态文件。",
@@ -12768,6 +12967,9 @@ MONITOR_PAGE = """<!doctype html>
         volatility_trigger_abs_return_ratio: monitorVolatilityTriggerAbsReturnRatioEl && monitorVolatilityTriggerAbsReturnRatioEl.value
           ? Number(monitorVolatilityTriggerAbsReturnRatioEl.value)
           : null,
+        volatility_trigger_stop_reduce_to_notional: monitorVolatilityTriggerStopReduceToNotionalEl && monitorVolatilityTriggerStopReduceToNotionalEl.value
+          ? Number(monitorVolatilityTriggerStopReduceToNotionalEl.value)
+          : null,
         volatility_trigger_stop_cancel_open_orders: Boolean(
           monitorVolatilityTriggerStopCancelOrdersEl && monitorVolatilityTriggerStopCancelOrdersEl.checked
         ),
@@ -12794,6 +12996,7 @@ MONITOR_PAGE = """<!doctype html>
       monitorVolatilityTriggerWindowEl.value = source.volatility_trigger_window || "1h";
       monitorVolatilityTriggerAmplitudeRatioEl.value = source.volatility_trigger_amplitude_ratio ?? "";
       monitorVolatilityTriggerAbsReturnRatioEl.value = source.volatility_trigger_abs_return_ratio ?? "";
+      monitorVolatilityTriggerStopReduceToNotionalEl.value = source.volatility_trigger_stop_reduce_to_notional ?? "";
       monitorVolatilityTriggerStopCancelOrdersEl.checked = Boolean(source.volatility_trigger_stop_cancel_open_orders);
       monitorVolatilityTriggerStopClosePositionsEl.checked = Boolean(source.volatility_trigger_stop_close_all_positions);
     }
@@ -13479,7 +13682,13 @@ MONITOR_PAGE = """<!doctype html>
         const windowLabel = formatVolumeTriggerWindowLabel(config.volatility_trigger_window);
         const stopActions = [];
         if (config.volatility_trigger_stop_cancel_open_orders) stopActions.push("撤策略单");
-        if (config.volatility_trigger_stop_close_all_positions) stopActions.push("清仓");
+        const reduceTarget = asGuideNumber(config.volatility_trigger_stop_reduce_to_notional);
+        if (reduceTarget > 0) {
+          stopActions.push(`先减到 ${fmtGuideNotional(config.volatility_trigger_stop_reduce_to_notional)}`);
+          if (config.volatility_trigger_stop_close_all_positions) stopActions.push("继续单边再清仓");
+        } else if (config.volatility_trigger_stop_close_all_positions) {
+          stopActions.push("清仓");
+        }
         if (asGuideNumber(config.volatility_trigger_amplitude_ratio) > 0) {
           lines.push(`web 后台会持续观察最近 ${windowLabel} 的整窗振幅；达到 ${fmtGuidePctFromRatio(config.volatility_trigger_amplitude_ratio)} 时，会自动暂停策略${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`);
         }
@@ -20184,6 +20393,10 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
         "window": runner_config.get("volatility_trigger_window"),
         "amplitude_ratio": runner_config.get("volatility_trigger_amplitude_ratio"),
         "abs_return_ratio": runner_config.get("volatility_trigger_abs_return_ratio"),
+        "stop_reduce_to_notional": runner_config.get("volatility_trigger_stop_reduce_to_notional"),
+        "reduce_escalate_after_seconds": runner_config.get("volatility_trigger_reduce_escalate_after_seconds"),
+        "reduce_escalate_abs_return_ratio": runner_config.get("volatility_trigger_reduce_escalate_abs_return_ratio"),
+        "stop_close_all_positions": runner_config.get("volatility_trigger_stop_close_all_positions"),
         **volatility_trigger_status,
     }
     snapshot["runner_presets"] = _runner_preset_summaries(symbol)

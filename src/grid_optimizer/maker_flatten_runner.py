@@ -67,9 +67,11 @@ def build_flatten_orders_from_snapshot(
     dual_side_position: bool,
     account_info: dict[str, Any],
     symbol_info: dict[str, Any],
+    target_position_notional: float = 0.0,
 ) -> dict[str, Any]:
     if bid_price <= 0 or ask_price <= 0:
         raise ValueError("bid_price and ask_price must be > 0")
+    target_notional = max(float(target_position_notional or 0.0), 0.0)
 
     result = {
         "orders": [],
@@ -78,6 +80,8 @@ def build_flatten_orders_from_snapshot(
         "long_qty": 0.0,
         "short_qty": 0.0,
         "net_qty": 0.0,
+        "target_position_notional": target_notional,
+        "target_mode": "full_flatten" if target_notional <= 0 else "reduce_to_notional",
     }
     tick_size = symbol_info.get("tick_size")
     step_size = symbol_info.get("step_size")
@@ -118,6 +122,16 @@ def build_flatten_orders_from_snapshot(
             order["position_side"] = position_side
         result["orders"].append(order)
 
+    def _qty_above_target(qty: float, price: float, position_side: str | None) -> float:
+        if target_notional <= 0:
+            return abs(qty)
+        current_notional = abs(qty) * price
+        result_key = "long_target_reached" if str(position_side or "").upper() != "SHORT" else "short_target_reached"
+        if current_notional <= target_notional:
+            result[result_key] = True
+            return 0.0
+        return max((current_notional - target_notional) / max(price, 1e-12), 0.0)
+
     if dual_side_position:
         long_position = extract_symbol_position(account_info, symbol, "LONG")
         short_position = extract_symbol_position(account_info, symbol, "SHORT")
@@ -127,23 +141,27 @@ def build_flatten_orders_from_snapshot(
         result["short_qty"] = short_qty
         result["net_qty"] = long_qty - short_qty
         if long_qty > 0:
-            _append_order(
-                qty=long_qty,
-                side="SELL",
-                price=ask_price,
-                reduce_only=None,
-                position_side="LONG",
-                tag="closelong",
-            )
+            close_qty = _qty_above_target(long_qty, ask_price, "LONG")
+            if close_qty > 0:
+                _append_order(
+                    qty=close_qty,
+                    side="SELL",
+                    price=ask_price,
+                    reduce_only=None,
+                    position_side="LONG",
+                    tag="closelong",
+                )
         if short_qty > 0:
-            _append_order(
-                qty=short_qty,
-                side="BUY",
-                price=bid_price,
-                reduce_only=None,
-                position_side="SHORT",
-                tag="closeshort",
-            )
+            close_qty = _qty_above_target(short_qty, bid_price, "SHORT")
+            if close_qty > 0:
+                _append_order(
+                    qty=close_qty,
+                    side="BUY",
+                    price=bid_price,
+                    reduce_only=None,
+                    position_side="SHORT",
+                    tag="closeshort",
+                )
     else:
         position = extract_symbol_position(account_info, symbol)
         position_amt = _safe_float(position.get("positionAmt"))
@@ -151,28 +169,41 @@ def build_flatten_orders_from_snapshot(
         result["long_qty"] = max(position_amt, 0.0)
         result["short_qty"] = max(-position_amt, 0.0)
         if position_amt > 0:
-            _append_order(
-                qty=position_amt,
-                side="SELL",
-                price=ask_price,
-                reduce_only=True,
-                position_side=None,
-                tag="closelong",
-            )
+            close_qty = _qty_above_target(position_amt, ask_price, None)
+            if close_qty > 0:
+                _append_order(
+                    qty=close_qty,
+                    side="SELL",
+                    price=ask_price,
+                    reduce_only=True,
+                    position_side=None,
+                    tag="closelong",
+                )
         elif position_amt < 0:
-            _append_order(
-                qty=abs(position_amt),
-                side="BUY",
-                price=bid_price,
-                reduce_only=True,
-                position_side=None,
-                tag="closeshort",
-            )
+            close_qty = _qty_above_target(abs(position_amt), bid_price, "SHORT")
+            if close_qty > 0:
+                _append_order(
+                    qty=close_qty,
+                    side="BUY",
+                    price=bid_price,
+                    reduce_only=True,
+                    position_side=None,
+                    tag="closeshort",
+                )
+
+    if target_notional > 0 and not result["orders"]:
+        result["warnings"].append(f"{symbol} 当前仓位名义已不高于目标 {target_notional:.4f}U，未继续减仓")
 
     return result
 
 
-def load_live_flatten_snapshot(symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+def load_live_flatten_snapshot(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    *,
+    target_position_notional: float = 0.0,
+) -> dict[str, Any]:
     symbol_info = fetch_futures_symbol_config(symbol)
     book = fetch_futures_book_tickers(symbol=symbol)
     if not book:
@@ -191,6 +222,7 @@ def load_live_flatten_snapshot(symbol: str, api_key: str, api_secret: str) -> di
         dual_side_position=dual_side_position,
         account_info=account_info,
         symbol_info=symbol_info,
+        target_position_notional=target_position_notional,
     )
     snapshot["bid_price"] = bid_price
     snapshot["ask_price"] = ask_price
@@ -312,7 +344,12 @@ def _run(args: argparse.Namespace) -> int:
             )
             return 0
         try:
-            snapshot = load_live_flatten_snapshot(args.symbol, api_key, api_secret)
+            snapshot = load_live_flatten_snapshot(
+                args.symbol,
+                api_key,
+                api_secret,
+                target_position_notional=args.target_position_notional,
+            )
             open_orders = fetch_futures_open_orders(args.symbol, api_key, api_secret, recv_window=args.recv_window)
             our_orders = [order for order in open_orders if isinstance(order, dict) and is_flatten_order(order, prefix)]
             orders = list(snapshot.get("orders", []))
@@ -424,6 +461,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recv-window", type=int, default=5000)
     parser.add_argument("--max-consecutive-errors", type=int, default=20)
     parser.add_argument("--events-jsonl", type=str, required=True)
+    parser.add_argument("--target-position-notional", type=float, default=0.0)
     return parser
 
 
@@ -436,6 +474,8 @@ def main() -> None:
         raise SystemExit("--sleep-seconds must be > 0")
     if args.max_consecutive_errors <= 0:
         raise SystemExit("--max-consecutive-errors must be > 0")
+    if args.target_position_notional < 0:
+        raise SystemExit("--target-position-notional must be >= 0")
     raise SystemExit(_run(args))
 
 

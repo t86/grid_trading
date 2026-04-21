@@ -57,6 +57,56 @@ class MakerFlattenRunnerTests(unittest.TestCase):
         self.assertTrue(order["reduce_only"])
         self.assertNotIn("position_side", order)
 
+    def test_one_way_long_reduces_only_above_target_notional(self) -> None:
+        result = build_flatten_orders_from_snapshot(
+            symbol="TESTUSDT",
+            bid_price=1.23,
+            ask_price=1.25,
+            dual_side_position=False,
+            account_info={
+                "positions": [
+                    {
+                        "symbol": "TESTUSDT",
+                        "positionAmt": "200",
+                        "positionSide": "BOTH",
+                    }
+                ]
+            },
+            symbol_info={"tick_size": 0.01, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            target_position_notional=150.0,
+        )
+
+        self.assertEqual(result["target_mode"], "reduce_to_notional")
+        self.assertEqual(len(result["orders"]), 1)
+        order = result["orders"][0]
+        self.assertEqual(order["side"], "SELL")
+        self.assertEqual(order["price"], 1.25)
+        self.assertEqual(order["quantity"], 80.0)
+        self.assertTrue(order["reduce_only"])
+
+    def test_one_way_long_target_reached_places_no_order(self) -> None:
+        result = build_flatten_orders_from_snapshot(
+            symbol="TESTUSDT",
+            bid_price=1.23,
+            ask_price=1.25,
+            dual_side_position=False,
+            account_info={
+                "positions": [
+                    {
+                        "symbol": "TESTUSDT",
+                        "positionAmt": "100",
+                        "positionSide": "BOTH",
+                    }
+                ]
+            },
+            symbol_info={"tick_size": 0.01, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            target_position_notional=150.0,
+        )
+
+        self.assertEqual(result["orders"], [])
+        self.assertTrue(result["long_target_reached"])
+        self.assertIn("目标 150.0000U", result["warnings"][0])
+
     def test_hedge_mode_closes_both_legs_at_top_of_book(self) -> None:
         result = build_flatten_orders_from_snapshot(
             symbol="TESTUSDT",
