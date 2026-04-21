@@ -77,6 +77,7 @@ from .semi_auto_plan import (
 from .submit_plan import (
     _build_client_order_id,
     _ignore_noop_error,
+    cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
@@ -7407,6 +7408,21 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
     if strategy_mode == "hedge_neutral" and abs(current_short_qty - expected_short_qty) > 1e-9:
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
+
+    validation["actions"] = cap_reduce_only_place_orders_to_position(
+        actions=validation["actions"],
+        strategy_mode=strategy_mode,
+        current_actual_net_qty=current_actual_net_qty,
+        current_open_orders=current_open_orders,
+    )
+    report["reduce_only_position_cap"] = validation["actions"].get("reduce_only_position_cap")
+    if validation["actions"]["place_count"] <= 0 and validation["actions"]["cancel_count"] <= 0:
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        validation["ok"] = not validation["errors"]
+        report["idle"] = True
+        return report
 
     if requested_margin_type != "KEEP":
         try:

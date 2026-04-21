@@ -3308,7 +3308,7 @@ class LoopRunnerTests(unittest.TestCase):
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
             "multiAssetsMargin": False,
-            "positions": [{"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"}],
+            "positions": [{"symbol": "KATUSDT", "positionAmt": "30", "entryPrice": "0.10"}],
         }
         mock_open_orders.return_value = []
         mock_change_leverage.return_value = {"leverage": 2}
@@ -3342,9 +3342,9 @@ class LoopRunnerTests(unittest.TestCase):
             "mid_price": 0.095,
             "step_price": 0.01,
             "open_order_count": 0,
-            "current_long_qty": 0.0,
+            "current_long_qty": 30.0,
             "current_short_qty": 0.0,
-            "actual_net_qty": 0.0,
+            "actual_net_qty": 30.0,
             "symbol_info": {
                 "tick_size": 0.01,
                 "min_qty": 0.1,
@@ -3392,8 +3392,6 @@ class LoopRunnerTests(unittest.TestCase):
                 "place_orders": [
                     {"role": "take_profit_short", "side": "BUY", "qty": 100.0, "price": 0.10},
                     {"role": "active_delever_short", "side": "BUY", "qty": 100.0, "price": 0.09},
-                    {"role": "take_profit_long", "side": "SELL", "qty": 100.0, "price": 0.11},
-                    {"role": "active_delever_long", "side": "SELL", "qty": 100.0, "price": 0.12},
                 ],
             },
         }
@@ -3402,15 +3400,13 @@ class LoopRunnerTests(unittest.TestCase):
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
             "multiAssetsMargin": False,
-            "positions": [{"symbol": "SOONUSDT", "positionAmt": "-100", "entryPrice": "0.18"}],
+            "positions": [{"symbol": "SOONUSDT", "positionAmt": "-200", "entryPrice": "0.18"}],
         }
         mock_open_orders.return_value = []
         mock_change_leverage.return_value = {"leverage": 2}
         mock_post_order.side_effect = [
             {"orderId": 1, "clientOrderId": "a"},
             {"orderId": 2, "clientOrderId": "b"},
-            {"orderId": 3, "clientOrderId": "c"},
-            {"orderId": 4, "clientOrderId": "d"},
         ]
 
         args = Namespace(
@@ -3436,8 +3432,8 @@ class LoopRunnerTests(unittest.TestCase):
             "step_price": 0.01,
             "open_order_count": 0,
             "current_long_qty": 0.0,
-            "current_short_qty": 100.0,
-            "actual_net_qty": -100.0,
+            "current_short_qty": 200.0,
+            "actual_net_qty": -200.0,
             "symbol_info": {
                 "tick_size": 0.01,
                 "min_qty": 0.1,
@@ -3448,7 +3444,103 @@ class LoopRunnerTests(unittest.TestCase):
         execute_plan_report(args, plan_report)
 
         reduce_only_values = [call.kwargs["reduce_only"] for call in mock_post_order.call_args_list]
-        self.assertEqual(reduce_only_values, [True, True, True, True])
+        self.assertEqual(reduce_only_values, [True, True])
+        mock_update_synthetic_refs.assert_called_once()
+        mock_update_inventory_grid_refs.assert_called_once()
+
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_caps_one_way_reduce_only_orders_to_net_position(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        mock_update_synthetic_refs,
+        mock_update_inventory_grid_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 4,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "take_profit_short", "side": "BUY", "qty": 80.0, "price": 0.1724},
+                    {"role": "take_profit_short", "side": "BUY", "qty": 173.0, "price": 0.1725},
+                    {"role": "active_delever_short", "side": "BUY", "qty": 173.0, "price": 0.1730},
+                    {"role": "active_delever_short", "side": "BUY", "qty": 80.0, "price": 0.1728},
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.1731", "ask_price": "0.1732"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "SOONUSDT", "positionAmt": "-253", "entryPrice": "0.1735"}],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 2}
+        mock_post_order.side_effect = [
+            {"orderId": 1, "clientOrderId": "a"},
+            {"orderId": 2, "clientOrderId": "b"},
+        ]
+
+        args = Namespace(
+            symbol="SOONUSDT",
+            strategy_mode="synthetic_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/soonusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=2,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/soonusdt_loop_state.json",
+        )
+        plan_report = {
+            "symbol": "SOONUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "mid_price": 0.1730,
+            "step_price": 0.0002,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 253.0,
+            "actual_net_qty": -253.0,
+            "symbol_info": {
+                "tick_size": 0.0001,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        execute_plan_report(args, plan_report)
+
+        posted_quantities = [call.kwargs["quantity"] for call in mock_post_order.call_args_list]
+        posted_roles = [
+            call.kwargs["new_client_order_id"].split("-")[2]
+            for call in mock_post_order.call_args_list
+        ]
+        self.assertEqual(posted_quantities, [80.0, 173.0])
+        self.assertEqual(posted_roles, ["takeprof", "takeprof"])
         mock_update_synthetic_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 

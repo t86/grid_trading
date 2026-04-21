@@ -244,6 +244,120 @@ def _order_prefers_post_only(order: dict[str, Any]) -> bool:
     return str(order.get("execution_type", "post_only")).strip().lower() != "aggressive"
 
 
+def _order_remaining_qty(order: dict[str, Any]) -> Decimal:
+    raw_qty = _quantity_decimal(order.get("origQty", order.get("qty", order.get("quantity"))))
+    executed_qty = _quantity_decimal(order.get("executedQty"))
+    return max(raw_qty - executed_qty, Decimal("0"))
+
+
+def _order_matches_cancel(open_order: dict[str, Any], cancel_order: dict[str, Any]) -> bool:
+    open_order_id = str(open_order.get("orderId", "")).strip()
+    cancel_order_id = str(cancel_order.get("orderId", "")).strip()
+    if open_order_id and cancel_order_id and open_order_id == cancel_order_id:
+        return True
+    open_client_id = str(open_order.get("clientOrderId", "")).strip()
+    cancel_client_id = str(cancel_order.get("clientOrderId", "")).strip()
+    return bool(open_client_id and cancel_client_id and open_client_id == cancel_client_id)
+
+
+def _reduce_only_cap_side(
+    *,
+    order: dict[str, Any],
+    strategy_mode: str,
+) -> str | None:
+    side = str(order.get("side", "")).upper().strip()
+    role = str(order.get("role", "entry"))
+    reduce_only = _resolve_reduce_only_flag(strategy_mode=strategy_mode, side=side, role=role)
+    if order.get("force_reduce_only") is not None:
+        reduce_only = bool(order.get("force_reduce_only"))
+    if reduce_only is not True:
+        return None
+    if side == "BUY":
+        return "BUY"
+    if side == "SELL":
+        return "SELL"
+    return None
+
+
+def cap_reduce_only_place_orders_to_position(
+    *,
+    actions: dict[str, Any],
+    strategy_mode: str,
+    current_actual_net_qty: float,
+    current_open_orders: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Cap one-way reduce-only places so TP and delever orders cannot over-close the live net position."""
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    if normalized_mode == "hedge_neutral" or not place_orders:
+        result = dict(actions)
+        result["place_orders"] = place_orders
+        result["cancel_orders"] = cancel_orders
+        result["place_count"] = len(place_orders)
+        result["cancel_count"] = len(cancel_orders)
+        result["place_notional"] = sum(_safe_float(item.get("notional")) for item in place_orders)
+        return result
+
+    net_qty = Decimal(str(current_actual_net_qty))
+    available_qty_by_side = {
+        "BUY": max(-net_qty, Decimal("0")),
+        "SELL": max(net_qty, Decimal("0")),
+    }
+    remaining_open_orders = [
+        item
+        for item in current_open_orders
+        if isinstance(item, dict)
+        and not any(_order_matches_cancel(item, cancel_order) for cancel_order in cancel_orders)
+    ]
+    for open_order in remaining_open_orders:
+        if not _truthy(open_order.get("reduceOnly")):
+            continue
+        side = str(open_order.get("side", "")).upper().strip()
+        if side in available_qty_by_side:
+            available_qty_by_side[side] = max(
+                available_qty_by_side[side] - _order_remaining_qty(open_order),
+                Decimal("0"),
+            )
+
+    capped_place_orders: list[dict[str, Any]] = []
+    dropped_count = 0
+    resized_count = 0
+    for order in place_orders:
+        cap_side = _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
+        if cap_side is None:
+            capped_place_orders.append(order)
+            continue
+        available_qty = available_qty_by_side.get(cap_side, Decimal("0"))
+        requested_qty = _quantity_decimal(order.get("qty"))
+        if requested_qty <= Decimal("0") or available_qty <= Decimal("0"):
+            dropped_count += 1
+            continue
+        if requested_qty <= available_qty:
+            capped_place_orders.append(order)
+            available_qty_by_side[cap_side] = max(available_qty - requested_qty, Decimal("0"))
+            continue
+        capped_place_orders.append(_clone_order_with_qty(order, available_qty))
+        available_qty_by_side[cap_side] = Decimal("0")
+        resized_count += 1
+
+    result = dict(actions)
+    result["place_orders"] = capped_place_orders
+    result["cancel_orders"] = cancel_orders
+    result["place_count"] = len(capped_place_orders)
+    result["cancel_count"] = len(cancel_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in capped_place_orders)
+    result["reduce_only_position_cap"] = {
+        "enabled": True,
+        "current_actual_net_qty": float(net_qty),
+        "remaining_buy_reduce_qty": float(available_qty_by_side["BUY"]),
+        "remaining_sell_reduce_qty": float(available_qty_by_side["SELL"]),
+        "dropped_order_count": dropped_count,
+        "resized_order_count": resized_count,
+    }
+    return result
+
+
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     bootstrap_orders = [
         item for item in plan_report.get("bootstrap_orders", []) if isinstance(item, dict)
@@ -661,13 +775,32 @@ def main() -> None:
             )
         current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
         current_position = extract_symbol_position(account_info, symbol)
-        current_long_qty = max(_safe_float(current_position.get("positionAmt")), 0.0)
+        current_actual_net_qty = _safe_float(current_position.get("positionAmt"))
+        current_long_qty = max(current_actual_net_qty, 0.0)
         expected_open_order_count = int(plan_report.get("open_order_count", 0) or 0)
         expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
         if len(current_open_orders) != expected_open_order_count:
             raise SystemExit("当前未成交委托数量与计划生成时不一致，请先重新生成计划")
         if abs(current_long_qty - expected_long_qty) > 1e-9:
             raise SystemExit("当前持仓与计划生成时不一致，请先重新生成计划")
+
+        validation["actions"] = cap_reduce_only_place_orders_to_position(
+            actions=validation["actions"],
+            strategy_mode=str(plan_report.get("strategy_mode", "")).strip() or "one_way_long",
+            current_actual_net_qty=current_actual_net_qty,
+            current_open_orders=current_open_orders,
+        )
+        report["reduce_only_position_cap"] = validation["actions"].get("reduce_only_position_cap")
+        if validation["actions"]["place_count"] <= 0 and validation["actions"]["cancel_count"] <= 0:
+            validation["errors"] = [
+                item for item in validation["errors"] if "plan contains no actions to execute" not in item
+            ]
+            validation["ok"] = not validation["errors"]
+            report["idle"] = True
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            print("No executable orders after reduce-only position cap.")
+            print(f"JSON report saved: {report_path}")
+            return
 
         margin_response: dict[str, Any] | None = None
         leverage_response: dict[str, Any] | None = None
