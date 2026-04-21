@@ -52,6 +52,7 @@ from grid_optimizer.loop_runner import (
     resolve_market_bias_offsets,
     resolve_market_bias_regime_switch,
     resolve_adaptive_step_price,
+    resolve_interval_locked_center_price,
     resolve_short_threshold_timeout_state,
     resolve_synthetic_trend_follow,
     resolve_auto_regime_profile,
@@ -88,6 +89,91 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.first_order_multiplier, 4.0)
         self.assertEqual(args.threshold_position_notional, 50.0)
         self.assertEqual(args.max_order_position_notional, 80.0)
+
+    def test_build_parser_accepts_near_market_and_fast_catchup_args(self) -> None:
+        parser = _build_parser()
+
+        args = parser.parse_args(
+            [
+                "--near-market-entry-max-center-distance-steps",
+                "4.5",
+                "--grid-inventory-rebalance-min-center-distance-steps",
+                "6.0",
+                "--near-market-reentry-confirm-cycles",
+                "3",
+                "--neutral-center-interval-minutes",
+                "30",
+                "--synthetic-center-fast-catchup-trigger-steps",
+                "6",
+                "--synthetic-center-fast-catchup-confirm-cycles",
+                "3",
+                "--synthetic-center-fast-catchup-shift-steps",
+                "2",
+            ]
+        )
+
+        self.assertEqual(args.near_market_entry_max_center_distance_steps, 4.5)
+        self.assertEqual(args.grid_inventory_rebalance_min_center_distance_steps, 6.0)
+        self.assertEqual(args.near_market_reentry_confirm_cycles, 3)
+        self.assertEqual(args.neutral_center_interval_minutes, 30)
+        self.assertEqual(args.synthetic_center_fast_catchup_trigger_steps, 6.0)
+        self.assertEqual(args.synthetic_center_fast_catchup_confirm_cycles, 3)
+        self.assertEqual(args.synthetic_center_fast_catchup_shift_steps, 2)
+
+    def test_resolve_interval_locked_center_price_fast_catchup_shifts_after_confirm_cycles(self) -> None:
+        state = {"last_center_update_ts": "2026-04-21T04:00:00+00:00"}
+        now = datetime(2026, 4, 21, 4, 5, 0, tzinfo=timezone.utc)
+
+        center, report = resolve_interval_locked_center_price(
+            state=state,
+            symbol="TESTUSDT",
+            current_center_price=100.0,
+            mid_price=103.5,
+            step_price=0.5,
+            interval_minutes=30,
+            tick_size=0.1,
+            fast_catchup_trigger_steps=6.0,
+            fast_catchup_confirm_cycles=3,
+            fast_catchup_shift_steps=2,
+            now=now,
+        )
+        self.assertEqual(center, 100.0)
+        self.assertEqual(report["reason"], "center_interval_locked")
+        self.assertEqual(report["fast_catchup_pending_count"], 1)
+
+        center, report = resolve_interval_locked_center_price(
+            state=state,
+            symbol="TESTUSDT",
+            current_center_price=center,
+            mid_price=103.5,
+            step_price=0.5,
+            interval_minutes=30,
+            tick_size=0.1,
+            fast_catchup_trigger_steps=6.0,
+            fast_catchup_confirm_cycles=3,
+            fast_catchup_shift_steps=2,
+            now=now + timedelta(seconds=10),
+        )
+        self.assertEqual(center, 100.0)
+        self.assertEqual(report["fast_catchup_pending_count"], 2)
+
+        center, report = resolve_interval_locked_center_price(
+            state=state,
+            symbol="TESTUSDT",
+            current_center_price=center,
+            mid_price=103.5,
+            step_price=0.5,
+            interval_minutes=30,
+            tick_size=0.1,
+            fast_catchup_trigger_steps=6.0,
+            fast_catchup_confirm_cycles=3,
+            fast_catchup_shift_steps=2,
+            now=now + timedelta(seconds=20),
+        )
+
+        self.assertEqual(center, 101.0)
+        self.assertEqual(report["reason"], "center_interval_fast_catchup")
+        self.assertEqual(report["center_shift_steps"], 2)
 
     def test_current_check_bucket_rounds_down_to_interval(self) -> None:
         bucket = _current_check_bucket(
@@ -2676,7 +2762,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(result["adjusted_sell_orders"], 1)
         self.assertAlmostEqual(plan["sell_orders"][0]["price"], 4635.47, places=8)
 
-    def test_apply_take_profit_profit_guard_preserves_lot_tracked_long_take_profit_orders(self) -> None:
+    def test_apply_take_profit_profit_guard_clamps_lot_tracked_and_active_long_orders_to_stricter_cost_floor(self) -> None:
         plan = {
             "bootstrap_orders": [],
             "buy_orders": [],
@@ -2694,7 +2780,7 @@ class LoopRunnerTests(unittest.TestCase):
                     "price": 1.0,
                     "qty": 100.0,
                     "notional": 100.0,
-                    "role": "take_profit_long",
+                    "role": "active_delever_long",
                 },
             ],
         }
@@ -2705,6 +2791,7 @@ class LoopRunnerTests(unittest.TestCase):
             current_short_qty=0.0,
             current_long_avg_price=1.02,
             current_short_avg_price=0.0,
+            synthetic_long_avg_price=1.03,
             current_long_notional=306.0,
             current_short_notional=0.0,
             pause_long_position_notional=220.0,
@@ -2717,9 +2804,9 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertTrue(result["long_active"])
-        self.assertEqual(result["adjusted_sell_orders"], 1)
-        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 0.99, places=8)
-        self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.022, places=8)
+        self.assertEqual(result["adjusted_sell_orders"], 2)
+        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.032, places=8)
+        self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.032, places=8)
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")

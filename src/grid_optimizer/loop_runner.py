@@ -2959,6 +2959,8 @@ def apply_take_profit_profit_guard(
     current_short_qty: float,
     current_long_avg_price: float,
     current_short_avg_price: float,
+    synthetic_long_avg_price: float | None = None,
+    synthetic_short_avg_price: float | None = None,
     current_long_notional: float,
     current_short_notional: float,
     pause_long_position_notional: float | None,
@@ -2994,22 +2996,42 @@ def apply_take_profit_profit_guard(
     if safe_ratio is None or safe_ratio <= 0:
         return report
 
-    long_active = current_long_qty > 1e-12 and current_long_avg_price > 0
-    short_active = current_short_qty > 1e-12 and current_short_avg_price > 0
+    actual_long_avg = max(_safe_float(current_long_avg_price), 0.0)
+    actual_short_avg = max(_safe_float(current_short_avg_price), 0.0)
+    synthetic_long_avg = max(_safe_float(synthetic_long_avg_price), 0.0)
+    synthetic_short_avg = max(_safe_float(synthetic_short_avg_price), 0.0)
+
+    long_floor_candidates: list[float] = []
+    short_ceiling_candidates: list[float] = []
+    if actual_long_avg > 0:
+        actual_long_floor = _round_order_price(actual_long_avg * (1.0 + safe_ratio), tick_size, "SELL")
+        if actual_long_floor > 0:
+            long_floor_candidates.append(actual_long_floor)
+    if synthetic_long_avg > 0:
+        synthetic_long_floor = _round_order_price(synthetic_long_avg * (1.0 + safe_ratio), tick_size, "SELL")
+        if synthetic_long_floor > 0:
+            long_floor_candidates.append(synthetic_long_floor)
+    if actual_short_avg > 0:
+        actual_short_ceiling = _round_order_price(actual_short_avg * (1.0 - safe_ratio), tick_size, "BUY")
+        if actual_short_ceiling > 0:
+            short_ceiling_candidates.append(actual_short_ceiling)
+    if synthetic_short_avg > 0:
+        synthetic_short_ceiling = _round_order_price(synthetic_short_avg * (1.0 - safe_ratio), tick_size, "BUY")
+        if synthetic_short_ceiling > 0:
+            short_ceiling_candidates.append(synthetic_short_ceiling)
+
+    long_active = current_long_qty > 1e-12 and bool(long_floor_candidates)
+    short_active = current_short_qty > 1e-12 and bool(short_ceiling_candidates)
     report["long_active"] = long_active
     report["short_active"] = short_active
 
-    long_floor_price = None
-    if long_active:
-        long_floor_price = _round_order_price(current_long_avg_price * (1.0 + safe_ratio), tick_size, "SELL")
-        if long_floor_price > 0:
-            report["long_floor_price"] = long_floor_price
+    long_floor_price = max(long_floor_candidates) if long_floor_candidates else None
+    if long_floor_price and long_floor_price > 0:
+        report["long_floor_price"] = long_floor_price
 
-    short_ceiling_price = None
-    if short_active:
-        short_ceiling_price = _round_order_price(current_short_avg_price * (1.0 - safe_ratio), tick_size, "BUY")
-        if short_ceiling_price > 0:
-            report["short_ceiling_price"] = short_ceiling_price
+    short_ceiling_price = min(short_ceiling_candidates) if short_ceiling_candidates else None
+    if short_ceiling_price and short_ceiling_price > 0:
+        report["short_ceiling_price"] = short_ceiling_price
 
     if long_floor_price and long_floor_price > 0:
         updated_sell_orders: list[dict[str, Any]] = []
@@ -3017,10 +3039,7 @@ def apply_take_profit_profit_guard(
             if not isinstance(item, dict):
                 continue
             order = dict(item)
-            if _order_role(order) not in {"take_profit", "take_profit_long"}:
-                updated_sell_orders.append(order)
-                continue
-            if _truthy(order.get("lot_tracked")):
+            if _order_role(order) not in {"take_profit", "take_profit_long", "active_delever_long"}:
                 updated_sell_orders.append(order)
                 continue
             adjusted_price = max(_safe_float(order.get("price")), long_floor_price)
@@ -3040,10 +3059,7 @@ def apply_take_profit_profit_guard(
             if not isinstance(item, dict):
                 continue
             order = dict(item)
-            if _order_role(order) != "take_profit_short":
-                updated_buy_orders.append(order)
-                continue
-            if _truthy(order.get("lot_tracked")):
+            if _order_role(order) not in {"take_profit_short", "active_delever_short"}:
                 updated_buy_orders.append(order)
                 continue
             adjusted_price = min(_safe_float(order.get("price")), short_ceiling_price)
@@ -4508,8 +4524,8 @@ def determine_interval_center_price(
     tick_size: float | None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    if interval_minutes not in {3, 5}:
-        raise ValueError("neutral center interval currently supports 3m or 5m")
+    if interval_minutes <= 0:
+        raise ValueError("neutral center interval must be > 0")
     current_time = now or datetime.now(timezone.utc)
     end_ms = int(current_time.timestamp() * 1000)
     start_ms = end_ms - int(timedelta(minutes=interval_minutes * 4).total_seconds() * 1000)
@@ -4553,6 +4569,215 @@ def determine_interval_center_price(
         }
     )
     return report
+
+
+def _parse_state_datetime(value: Any) -> datetime | None:
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+CENTER_INTERVAL_SHIFT_RATIO = 1.0 / 3.0
+
+
+def _proportional_center_shift_steps(drift_steps: float, ratio: float = CENTER_INTERVAL_SHIFT_RATIO) -> int:
+    abs_drift_steps = abs(float(drift_steps))
+    if abs_drift_steps < 1.0:
+        return 0
+    scaled = int(math.floor((abs_drift_steps * float(ratio)) + 0.5))
+    max_without_overshoot = max(int(math.floor(abs_drift_steps)), 1)
+    return min(max(scaled, 1), max_without_overshoot)
+
+
+def resolve_interval_locked_center_price(
+    *,
+    state: dict[str, Any],
+    symbol: str,
+    current_center_price: float,
+    mid_price: float,
+    step_price: float,
+    interval_minutes: int,
+    tick_size: float | None,
+    fast_catchup_trigger_steps: float = 0.0,
+    fast_catchup_confirm_cycles: int = 3,
+    fast_catchup_shift_steps: int = 1,
+    now: datetime | None = None,
+) -> tuple[float, dict[str, Any]]:
+    current_time = now or _utc_now()
+    safe_interval_minutes = max(int(interval_minutes), 1)
+    safe_step_price = max(_safe_float(step_price), 0.0)
+    safe_fast_catchup_trigger_steps = max(_safe_float(fast_catchup_trigger_steps), 0.0)
+    safe_fast_catchup_confirm_cycles = max(int(fast_catchup_confirm_cycles), 1)
+    safe_fast_catchup_shift_steps = max(int(fast_catchup_shift_steps), 1)
+    center_mid_drift_steps = ((float(mid_price) - float(current_center_price)) / safe_step_price) if safe_step_price > 0 else 0.0
+    fast_pending_direction = str(state.get("center_fast_catchup_pending_direction", "") or "")
+    fast_pending_count = int(state.get("center_fast_catchup_pending_count", 0) or 0)
+    fast_direction = ""
+    if safe_fast_catchup_trigger_steps > 0 and safe_step_price > 0:
+        if center_mid_drift_steps >= safe_fast_catchup_trigger_steps:
+            fast_direction = "up"
+        elif center_mid_drift_steps <= -safe_fast_catchup_trigger_steps:
+            fast_direction = "down"
+    if fast_direction:
+        if fast_direction == fast_pending_direction:
+            fast_pending_count += 1
+        else:
+            fast_pending_direction = fast_direction
+            fast_pending_count = 1
+    else:
+        fast_pending_direction = ""
+        fast_pending_count = 0
+
+    last_update = (
+        _parse_state_datetime(state.get("last_center_update_ts"))
+        or _parse_state_datetime(state.get("updated_at"))
+        or _parse_state_datetime(state.get("created_at"))
+    )
+    if last_update is None:
+        state["last_center_update_ts"] = _isoformat(current_time)
+        state["center_fast_catchup_pending_direction"] = fast_pending_direction
+        state["center_fast_catchup_pending_count"] = fast_pending_count
+        return current_center_price, {
+            "available": True,
+            "center_price": current_center_price,
+            "interval": f"{safe_interval_minutes}m",
+            "reason": "center_lock_initialized",
+            "locked": True,
+            "elapsed_seconds": 0.0,
+            "center_drift_steps": center_mid_drift_steps,
+            "fast_catchup_trigger_steps": safe_fast_catchup_trigger_steps,
+            "fast_catchup_confirm_cycles": safe_fast_catchup_confirm_cycles,
+            "fast_catchup_shift_steps": safe_fast_catchup_shift_steps,
+            "fast_catchup_pending_direction": fast_pending_direction,
+            "fast_catchup_pending_count": fast_pending_count,
+            "next_update_after": _isoformat(current_time + timedelta(minutes=safe_interval_minutes)),
+        }
+
+    if not str(state.get("last_center_update_ts") or "").strip():
+        state["last_center_update_ts"] = _isoformat(last_update)
+    elapsed_seconds = max((current_time - last_update).total_seconds(), 0.0)
+    interval_seconds = safe_interval_minutes * 60.0
+    if elapsed_seconds < interval_seconds:
+        if fast_direction and fast_pending_count >= safe_fast_catchup_confirm_cycles and safe_step_price > 0:
+            applied_shift_steps = min(safe_fast_catchup_shift_steps, max(int(math.floor(abs(center_mid_drift_steps))), 1))
+            old_center_price = float(current_center_price)
+            direction = 1.0 if fast_direction == "up" else -1.0
+            new_center_price = _round_to_nearest_step(
+                old_center_price + (direction * applied_shift_steps * safe_step_price),
+                tick_size,
+            )
+            state["center_fast_catchup_pending_direction"] = ""
+            state["center_fast_catchup_pending_count"] = 0
+            if abs(new_center_price - old_center_price) > 1e-12:
+                target_center_price = _round_to_nearest_step(float(mid_price), tick_size)
+                state["last_center_update_ts"] = _isoformat(current_time)
+                state["last_center_old_price"] = old_center_price
+                state["last_center_new_price"] = new_center_price
+                state["last_center_target_price"] = target_center_price
+                state["last_center_shift_steps"] = applied_shift_steps
+                state["last_center_roll_reason"] = "center_interval_fast_catchup"
+                return new_center_price, {
+                    "available": True,
+                    "center_price": new_center_price,
+                    "target_center_price": target_center_price,
+                    "interval": f"{safe_interval_minutes}m",
+                    "reason": "center_interval_fast_catchup",
+                    "locked": False,
+                    "elapsed_seconds": elapsed_seconds,
+                    "old_center_price": old_center_price,
+                    "center_drift_steps": center_mid_drift_steps,
+                    "center_shift_steps": applied_shift_steps,
+                    "center_shift_ratio": None,
+                    "fast_catchup_trigger_steps": safe_fast_catchup_trigger_steps,
+                    "fast_catchup_confirm_cycles": safe_fast_catchup_confirm_cycles,
+                    "fast_catchup_shift_steps": safe_fast_catchup_shift_steps,
+                    "fast_catchup_pending_direction": "",
+                    "fast_catchup_pending_count": 0,
+                    "next_update_after": _isoformat(current_time + timedelta(minutes=safe_interval_minutes)),
+                }
+        state["center_fast_catchup_pending_direction"] = fast_pending_direction
+        state["center_fast_catchup_pending_count"] = fast_pending_count
+        return current_center_price, {
+            "available": True,
+            "center_price": current_center_price,
+            "interval": f"{safe_interval_minutes}m",
+            "reason": "center_interval_locked",
+            "locked": True,
+            "elapsed_seconds": elapsed_seconds,
+            "center_drift_steps": center_mid_drift_steps,
+            "fast_catchup_trigger_steps": safe_fast_catchup_trigger_steps,
+            "fast_catchup_confirm_cycles": safe_fast_catchup_confirm_cycles,
+            "fast_catchup_shift_steps": safe_fast_catchup_shift_steps,
+            "fast_catchup_pending_direction": fast_pending_direction,
+            "fast_catchup_pending_count": fast_pending_count,
+            "next_update_after": _isoformat(last_update + timedelta(minutes=safe_interval_minutes)),
+        }
+
+    center_source = determine_interval_center_price(
+        symbol=symbol,
+        interval_minutes=safe_interval_minutes,
+        tick_size=tick_size,
+        now=current_time,
+    )
+    old_center_price = float(current_center_price)
+    if center_source.get("available") and center_source.get("center_price") is not None:
+        target_center_price = float(center_source["center_price"])
+        reason = "center_interval_roll"
+    else:
+        target_center_price = _round_to_nearest_step(float(mid_price), tick_size)
+        reason = "center_interval_roll_mid_fallback"
+    center_drift_steps = 0.0
+    center_shift_steps = 0
+    if safe_step_price > 0:
+        center_drift_steps = (target_center_price - old_center_price) / safe_step_price
+        center_shift_steps = _proportional_center_shift_steps(center_drift_steps)
+        if center_shift_steps > 0:
+            direction = 1.0 if center_drift_steps > 0 else -1.0
+            new_center_price = _round_to_nearest_step(
+                old_center_price + (direction * center_shift_steps * safe_step_price),
+                tick_size,
+            )
+        else:
+            new_center_price = old_center_price
+    else:
+        new_center_price = target_center_price
+    state["last_center_update_ts"] = _isoformat(current_time)
+    state["last_center_old_price"] = old_center_price
+    state["last_center_new_price"] = new_center_price
+    state["last_center_target_price"] = target_center_price
+    state["last_center_shift_steps"] = center_shift_steps
+    state["last_center_roll_reason"] = reason
+    state["center_fast_catchup_pending_direction"] = ""
+    state["center_fast_catchup_pending_count"] = 0
+    center_source.update(
+        {
+            "available": True,
+            "center_price": new_center_price,
+            "target_center_price": target_center_price,
+            "interval": f"{safe_interval_minutes}m",
+            "reason": reason,
+            "locked": False,
+            "elapsed_seconds": elapsed_seconds,
+            "old_center_price": old_center_price,
+            "center_drift_steps": center_drift_steps,
+            "center_shift_steps": center_shift_steps,
+            "center_shift_ratio": CENTER_INTERVAL_SHIFT_RATIO,
+            "fast_catchup_trigger_steps": safe_fast_catchup_trigger_steps,
+            "fast_catchup_confirm_cycles": safe_fast_catchup_confirm_cycles,
+            "fast_catchup_shift_steps": safe_fast_catchup_shift_steps,
+            "fast_catchup_pending_direction": "",
+            "fast_catchup_pending_count": 0,
+            "next_update_after": _isoformat(current_time + timedelta(minutes=safe_interval_minutes)),
+        }
+    )
+    return new_center_price, center_source
 
 
 def resolve_neutral_hourly_scale(
@@ -4641,6 +4866,73 @@ def resolve_neutral_hourly_scale(
         "reason": report["reason"],
         "metrics": report["metrics"],
     }
+    return report
+
+
+def resolve_near_market_entry_state(
+    *,
+    state: dict[str, Any],
+    center_distance_steps: float,
+    near_market_max_steps: float,
+    grid_rebalance_min_steps: float,
+    confirm_cycles: int,
+) -> dict[str, Any]:
+    distance = abs(_safe_float(center_distance_steps))
+    near_max = max(_safe_float(near_market_max_steps), 0.0)
+    grid_min = max(_safe_float(grid_rebalance_min_steps), near_max)
+    safe_confirm_cycles = max(int(confirm_cycles or 1), 1)
+    previous = state.get("near_market_entry_state")
+    previous_mode = (
+        str((previous or {}).get("mode") or "").strip()
+        if isinstance(previous, dict)
+        else ""
+    )
+    if previous_mode not in {"near_market", "grid_rebalance"}:
+        previous_mode = "near_market" if distance <= near_max + 1e-12 else "grid_rebalance"
+
+    candidate_mode = previous_mode
+    reason = "hysteresis_hold"
+    if distance <= near_max + 1e-12:
+        candidate_mode = "near_market"
+        reason = "within_near_market_band"
+    elif distance >= grid_min - 1e-12:
+        candidate_mode = "grid_rebalance"
+        reason = "outside_grid_rebalance_band"
+
+    previous_pending_mode = (
+        str((previous or {}).get("pending_mode") or "").strip()
+        if isinstance(previous, dict)
+        else ""
+    )
+    previous_pending_count = int(_safe_float((previous or {}).get("pending_count") if isinstance(previous, dict) else 0))
+    pending_count = 0
+    active_mode = previous_mode
+    switched = False
+    if candidate_mode == previous_mode:
+        pending_mode = None
+    else:
+        pending_mode = candidate_mode
+        pending_count = previous_pending_count + 1 if previous_pending_mode == candidate_mode else 1
+        if pending_count >= safe_confirm_cycles:
+            active_mode = candidate_mode
+            pending_mode = None
+            pending_count = 0
+            switched = True
+
+    report = {
+        "mode": active_mode,
+        "near_market_entries_allowed": active_mode == "near_market",
+        "center_distance_steps": distance,
+        "near_market_entry_max_center_distance_steps": near_max,
+        "grid_inventory_rebalance_min_center_distance_steps": grid_min,
+        "near_market_reentry_confirm_cycles": safe_confirm_cycles,
+        "candidate_mode": candidate_mode,
+        "pending_mode": pending_mode,
+        "pending_count": pending_count,
+        "switched": switched,
+        "reason": reason,
+    }
+    state["near_market_entry_state"] = dict(report)
     return report
 
 
@@ -5503,6 +5795,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_avg_price = max(actual_entry_price, 0.0)
         elif actual_net_qty < -1e-12:
             current_short_avg_price = max(actual_entry_price, 0.0)
+    exchange_long_avg_price = current_long_avg_price
+    exchange_short_avg_price = current_short_avg_price
     synthetic_ledger_snapshot: dict[str, Any] | None = None
     excess_inventory_gate = {
         "enabled": bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
@@ -5647,6 +5941,37 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "current_inventory_direction": None,
         "current_inventory_qty": 0.0,
     }
+    center_entry_guard = {
+        "enabled": False,
+        "supported": strategy_mode in {"hedge_neutral", "synthetic_neutral"},
+        "drift_steps": 0.0,
+        "max_mid_drift_steps": getattr(args, "max_mid_drift_steps", None),
+        "reduce_only_active": False,
+        "reduce_only_direction": None,
+        "long_pause_active": False,
+        "short_pause_active": False,
+        "long_pause_reasons": [],
+        "short_pause_reasons": [],
+    }
+    near_market_entry_state = {
+        "mode": "near_market",
+        "near_market_entries_allowed": True,
+        "center_distance_steps": 0.0,
+        "near_market_entry_max_center_distance_steps": max(
+            _safe_float(getattr(effective_args, "near_market_entry_max_center_distance_steps", 2.0)),
+            0.0,
+        ),
+        "grid_inventory_rebalance_min_center_distance_steps": max(
+            _safe_float(getattr(effective_args, "grid_inventory_rebalance_min_center_distance_steps", 3.0)),
+            _safe_float(getattr(effective_args, "near_market_entry_max_center_distance_steps", 2.0)),
+        ),
+        "near_market_reentry_confirm_cycles": max(int(getattr(effective_args, "near_market_reentry_confirm_cycles", 2) or 1), 1),
+        "candidate_mode": "near_market",
+        "pending_mode": None,
+        "pending_count": 0,
+        "switched": False,
+        "reason": "unsupported",
+    }
 
     if startup_pending and not _is_custom_grid_mode(args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
         flat_start_guard = assess_flat_start_guard(
@@ -5756,6 +6081,43 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if synthetic_lot_cost_guard_enabled
         else 0.0
     )
+    if center_entry_guard["supported"]:
+        center_guard_step_price = max(_safe_float(effective_args.step_price), 0.0)
+        center_guard_max_steps = max(_safe_float(getattr(args, "max_mid_drift_steps", None)), 0.0)
+        if center_guard_step_price > 0 and center_guard_max_steps > 0 and center_price > 0 and mid_price > 0:
+            center_drift_steps = (mid_price - center_price) / center_guard_step_price
+            near_market_entry_state = resolve_near_market_entry_state(
+                state=state,
+                center_distance_steps=abs(center_drift_steps),
+                near_market_max_steps=getattr(effective_args, "near_market_entry_max_center_distance_steps", 2.0),
+                grid_rebalance_min_steps=getattr(effective_args, "grid_inventory_rebalance_min_center_distance_steps", 3.0),
+                confirm_cycles=getattr(effective_args, "near_market_reentry_confirm_cycles", 2),
+            )
+            center_entry_guard.update(
+                {
+                    "enabled": True,
+                    "drift_steps": center_drift_steps,
+                    "max_mid_drift_steps": center_guard_max_steps,
+                    "near_market_entry_state": dict(near_market_entry_state),
+                }
+            )
+            grid_rebalance_confirmed = str(near_market_entry_state.get("mode") or "") == "grid_rebalance"
+            if grid_rebalance_confirmed and center_drift_steps > 0:
+                center_entry_guard["long_pause_active"] = True
+                center_entry_guard["long_pause_reasons"].append(
+                    "center_entry_guard: "
+                    f"mid_price={_price(mid_price)} is {center_drift_steps:.2f} steps above "
+                    f"center_price={_price(center_price)}, confirmed grid_rebalance mode after "
+                    f"{near_market_entry_state.get('near_market_reentry_confirm_cycles')} cycles"
+                )
+            if grid_rebalance_confirmed and center_drift_steps < 0:
+                center_entry_guard["short_pause_active"] = True
+                center_entry_guard["short_pause_reasons"].append(
+                    "center_entry_guard: "
+                    f"mid_price={_price(mid_price)} is {abs(center_drift_steps):.2f} steps below "
+                    f"center_price={_price(center_price)}, confirmed grid_rebalance mode after "
+                    f"{near_market_entry_state.get('near_market_reentry_confirm_cycles')} cycles"
+                )
 
     if _is_custom_grid_mode(args):
         excess_inventory_gate["enabled"] = False
@@ -5947,6 +6309,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_qty=current_short_qty,
             startup_entry_multiplier=getattr(effective_args, "startup_entry_multiplier", 1.0),
             startup_large_entry_active=(startup_pending or (current_long_qty <= 1e-12 and current_short_qty <= 1e-12)),
+            near_market_entry_max_center_distance_steps=getattr(
+                effective_args,
+                "near_market_entry_max_center_distance_steps",
+                2.0,
+            ),
+            near_market_entries_allowed=bool(near_market_entry_state.get("near_market_entries_allowed")),
             buy_offset_steps=(
                 float(getattr(effective_args, "static_buy_offset_steps", 0.0))
                 + float((market_bias or {}).get("buy_offset_steps", 0.0))
@@ -5962,8 +6330,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             residual_short_flat_notional=synthetic_residual_short_flat_notional,
             synthetic_tiny_long_residual_notional=synthetic_tiny_long_residual_notional,
             synthetic_tiny_short_residual_notional=synthetic_tiny_short_residual_notional,
-            entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
-            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"] or inventory_short_pause_active),
+            entry_long_paused=bool(
+                market_guard["buy_pause_active"]
+                or market_bias_entry_pause["buy_pause_active"]
+                or center_entry_guard["long_pause_active"]
+            ),
+            entry_short_paused=bool(
+                market_bias_entry_pause["short_pause_active"]
+                or inventory_short_pause_active
+                or center_entry_guard["short_pause_active"]
+            ),
             paused_entry_short_scale=combined_short_probe_scale,
         )
         controls = apply_hedge_position_controls(
@@ -5974,11 +6350,25 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             pause_long_position_notional=effective_args.pause_buy_position_notional,
             pause_short_position_notional=effective_args.pause_short_position_notional,
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
-            external_long_pause=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
-            external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
-            external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
-            external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
-            preserve_short_entry_on_external_pause=strong_short_probe_scale > 0,
+            external_long_pause=bool(
+                market_guard["buy_pause_active"]
+                or market_bias_entry_pause["buy_pause_active"]
+                or center_entry_guard["long_pause_active"]
+            ),
+            external_pause_reasons=(
+                list(market_guard["buy_pause_reasons"])
+                + list(market_bias_entry_pause["buy_pause_reasons"])
+                + list(center_entry_guard["long_pause_reasons"])
+            ),
+            external_short_pause=bool(
+                market_bias_entry_pause["short_pause_active"] or center_entry_guard["short_pause_active"]
+            ),
+            external_short_pause_reasons=(
+                list(market_bias_entry_pause["short_pause_reasons"])
+                + list(center_entry_guard["short_pause_reasons"])
+            ),
+            preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
+            and not center_entry_guard["short_pause_active"],
             preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
         )
         cap_controls = apply_hedge_position_notional_caps(
@@ -6070,6 +6460,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_lots=list(synthetic_ledger_snapshot.get("virtual_short_lots") or []),
             startup_entry_multiplier=getattr(effective_args, "startup_entry_multiplier", 1.0),
             startup_large_entry_active=(startup_pending or (current_long_qty <= 1e-12 and current_short_qty <= 1e-12)),
+            near_market_entry_max_center_distance_steps=getattr(
+                effective_args,
+                "near_market_entry_max_center_distance_steps",
+                2.0,
+            ),
+            near_market_entries_allowed=bool(near_market_entry_state.get("near_market_entries_allowed")),
             buy_offset_steps=(
                 float(getattr(effective_args, "static_buy_offset_steps", 0.0))
                 + float((market_bias or {}).get("buy_offset_steps", 0.0))
@@ -6085,8 +6481,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             residual_short_flat_notional=synthetic_residual_short_flat_notional,
             synthetic_tiny_long_residual_notional=synthetic_tiny_long_residual_notional,
             synthetic_tiny_short_residual_notional=synthetic_tiny_short_residual_notional,
-            entry_long_paused=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
-            entry_short_paused=bool(market_bias_entry_pause["short_pause_active"] or inventory_short_pause_active),
+            entry_long_paused=bool(
+                market_guard["buy_pause_active"]
+                or market_bias_entry_pause["buy_pause_active"]
+                or center_entry_guard["long_pause_active"]
+            ),
+            entry_short_paused=bool(
+                market_bias_entry_pause["short_pause_active"]
+                or inventory_short_pause_active
+                or center_entry_guard["short_pause_active"]
+            ),
             paused_entry_short_scale=combined_short_probe_scale,
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
@@ -6118,11 +6522,25 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             pause_long_position_notional=effective_args.pause_buy_position_notional,
             pause_short_position_notional=effective_args.pause_short_position_notional,
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
-            external_long_pause=bool(market_guard["buy_pause_active"] or market_bias_entry_pause["buy_pause_active"]),
-            external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
-            external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
-            external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
-            preserve_short_entry_on_external_pause=strong_short_probe_scale > 0,
+            external_long_pause=bool(
+                market_guard["buy_pause_active"]
+                or market_bias_entry_pause["buy_pause_active"]
+                or center_entry_guard["long_pause_active"]
+            ),
+            external_pause_reasons=(
+                list(market_guard["buy_pause_reasons"])
+                + list(market_bias_entry_pause["buy_pause_reasons"])
+                + list(center_entry_guard["long_pause_reasons"])
+            ),
+            external_short_pause=bool(
+                market_bias_entry_pause["short_pause_active"] or center_entry_guard["short_pause_active"]
+            ),
+            external_short_pause_reasons=(
+                list(market_bias_entry_pause["short_pause_reasons"])
+                + list(center_entry_guard["short_pause_reasons"])
+            ),
+            preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
+            and not center_entry_guard["short_pause_active"],
             preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
         )
         cap_controls = apply_hedge_position_notional_caps(
@@ -6175,8 +6593,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             plan=plan,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
-            current_long_avg_price=current_long_avg_price,
-            current_short_avg_price=current_short_avg_price,
+            current_long_avg_price=exchange_long_avg_price,
+            current_short_avg_price=exchange_short_avg_price,
+            synthetic_long_avg_price=current_long_avg_price,
+            synthetic_short_avg_price=current_short_avg_price,
             current_long_notional=current_long_notional,
             current_short_notional=current_short_notional,
             pause_long_position_notional=effective_args.pause_buy_position_notional,
@@ -6648,6 +7068,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "neutral_hourly_scale": neutral_hourly_scale,
         "market_bias": market_bias,
         "market_bias_regime_switch": market_bias_regime_switch,
+        "center_entry_guard": center_entry_guard,
+        "near_market_entry_state": near_market_entry_state,
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
@@ -7177,6 +7599,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--first-order-multiplier", type=float, default=4.0)
     parser.add_argument("--threshold-position-notional", type=float, default=50.0)
     parser.add_argument("--short-threshold-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--near-market-entry-max-center-distance-steps", type=float, default=2.0)
+    parser.add_argument("--grid-inventory-rebalance-min-center-distance-steps", type=float, default=3.0)
+    parser.add_argument("--near-market-reentry-confirm-cycles", type=int, default=2)
+    parser.add_argument("--threshold-reduce-target-ratio", type=float, default=0.0)
+    parser.add_argument("--threshold-reduce-taker-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--max-order-position-notional", type=float, default=80.0)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -7242,6 +7669,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--auto-regime-defensive-15m-return-ratio", type=float, default=-0.015)
     parser.add_argument("--auto-regime-defensive-60m-return-ratio", type=float, default=-0.03)
     parser.add_argument("--neutral-center-interval-minutes", type=int, default=3)
+    parser.add_argument("--synthetic-center-fast-catchup-trigger-steps", type=float, default=6.0)
+    parser.add_argument("--synthetic-center-fast-catchup-confirm-cycles", type=int, default=3)
+    parser.add_argument("--synthetic-center-fast-catchup-shift-steps", type=int, default=2)
     parser.add_argument("--neutral-band1-offset-ratio", type=float, default=0.005)
     parser.add_argument("--neutral-band2-offset-ratio", type=float, default=0.01)
     parser.add_argument("--neutral-band3-offset-ratio", type=float, default=0.02)
@@ -7568,6 +7998,12 @@ def main() -> None:
         raise SystemExit("--first-order-multiplier must be > 0")
     if args.threshold_position_notional < 0:
         raise SystemExit("--threshold-position-notional must be >= 0")
+    if args.near_market_entry_max_center_distance_steps < 0:
+        raise SystemExit("--near-market-entry-max-center-distance-steps must be >= 0")
+    if args.grid_inventory_rebalance_min_center_distance_steps < 0:
+        raise SystemExit("--grid-inventory-rebalance-min-center-distance-steps must be >= 0")
+    if args.near_market_reentry_confirm_cycles <= 0:
+        raise SystemExit("--near-market-reentry-confirm-cycles must be > 0")
     if args.short_threshold_timeout_seconds < 0:
         raise SystemExit("--short-threshold-timeout-seconds must be >= 0")
     if args.max_order_position_notional < 0:
@@ -7649,8 +8085,14 @@ def main() -> None:
         raise SystemExit("--auto-regime-stable-60m-return-floor-ratio must be < 0")
     if args.auto_regime_defensive_15m_return_ratio >= 0 or args.auto_regime_defensive_60m_return_ratio >= 0:
         raise SystemExit("--auto-regime defensive return thresholds must be < 0")
-    if args.neutral_center_interval_minutes not in {3, 5}:
-        raise SystemExit("--neutral-center-interval-minutes must be 3 or 5")
+    if args.neutral_center_interval_minutes <= 0:
+        raise SystemExit("--neutral-center-interval-minutes must be > 0")
+    if args.synthetic_center_fast_catchup_trigger_steps < 0:
+        raise SystemExit("--synthetic-center-fast-catchup-trigger-steps must be >= 0")
+    if args.synthetic_center_fast_catchup_confirm_cycles <= 0:
+        raise SystemExit("--synthetic-center-fast-catchup-confirm-cycles must be > 0")
+    if args.synthetic_center_fast_catchup_shift_steps <= 0:
+        raise SystemExit("--synthetic-center-fast-catchup-shift-steps must be > 0")
     neutral_offsets = [
         args.neutral_band1_offset_ratio,
         args.neutral_band2_offset_ratio,

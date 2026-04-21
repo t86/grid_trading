@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
@@ -151,26 +152,49 @@ def shift_center_price(
     moves: list[dict[str, Any]] = []
     down_trigger = step_price * down_trigger_steps
     up_trigger = step_price * up_trigger_steps
-    shift_size = step_price * shift_steps
+
+    def _proportional_shift_steps(drift_steps: float) -> int:
+        abs_drift_steps = abs(float(drift_steps))
+        scaled = int(math.floor((abs_drift_steps / 3.0) + 0.5))
+        max_without_overshoot = max(int(math.floor(abs_drift_steps)), 1)
+        return min(max(scaled, 1), max_without_overshoot)
 
     if mid_price <= center - down_trigger:
-        while mid_price <= center - down_trigger:
-            center = _shift_center_by_minimum_increment(
-                center_price=center,
-                shift_size=shift_size,
-                tick_size=tick_size,
-                direction="down",
-            )
-            moves.append({"direction": "down", "new_center_price": center})
+        drift_steps = (center - float(mid_price)) / float(step_price)
+        effective_shift_steps = _proportional_shift_steps(drift_steps)
+        center = _shift_center_by_minimum_increment(
+            center_price=center,
+            shift_size=step_price * effective_shift_steps,
+            tick_size=tick_size,
+            direction="down",
+        )
+        moves.append(
+            {
+                "direction": "down",
+                "new_center_price": center,
+                "drift_steps": drift_steps,
+                "shift_steps": effective_shift_steps,
+                "shift_ratio": 1.0 / 3.0,
+            }
+        )
     elif mid_price >= center + up_trigger:
-        while mid_price >= center + up_trigger:
-            center = _shift_center_by_minimum_increment(
-                center_price=center,
-                shift_size=shift_size,
-                tick_size=tick_size,
-                direction="up",
-            )
-            moves.append({"direction": "up", "new_center_price": center})
+        drift_steps = (float(mid_price) - center) / float(step_price)
+        effective_shift_steps = _proportional_shift_steps(drift_steps)
+        center = _shift_center_by_minimum_increment(
+            center_price=center,
+            shift_size=step_price * effective_shift_steps,
+            tick_size=tick_size,
+            direction="up",
+        )
+        moves.append(
+            {
+                "direction": "up",
+                "new_center_price": center,
+                "drift_steps": drift_steps,
+                "shift_steps": effective_shift_steps,
+                "shift_ratio": 1.0 / 3.0,
+            }
+        )
     return center, moves
 
 
@@ -829,6 +853,8 @@ def build_hedge_micro_grid_plan(
     current_short_lots: list[dict[str, Any]] | None = None,
     startup_entry_multiplier: float = 1.0,
     startup_large_entry_active: bool = False,
+    near_market_entry_max_center_distance_steps: float = 2.0,
+    near_market_entries_allowed: bool | None = None,
     buy_offset_steps: float = 0.0,
     sell_offset_steps: float = 0.0,
     entry_long_cost_guard_release_notional: float = 0.0,
@@ -858,6 +884,7 @@ def build_hedge_micro_grid_plan(
     current_long_lots = _normalize_lots(current_long_lots)
     current_short_lots = _normalize_lots(current_short_lots)
     startup_multiplier = max(float(startup_entry_multiplier), 1.0)
+    near_market_entry_max_center_distance_steps = max(float(near_market_entry_max_center_distance_steps), 0.0)
     buy_offset_steps = float(buy_offset_steps)
     sell_offset_steps = float(sell_offset_steps)
     paused_entry_short_scale = min(max(float(paused_entry_short_scale), 0.0), 1.0)
@@ -866,6 +893,11 @@ def build_hedge_micro_grid_plan(
         if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0
         else float(center_price)
     )
+    center_distance_steps = abs(float(mid_price) - float(center_price)) / float(step_price)
+    if near_market_entries_allowed is None:
+        near_market_entries_allowed = center_distance_steps <= (near_market_entry_max_center_distance_steps + 1e-12)
+    else:
+        near_market_entries_allowed = bool(near_market_entries_allowed)
     long_inventory_dust = (
         current_long_qty > 0
         and min_notional is not None
@@ -1074,7 +1106,10 @@ def build_hedge_micro_grid_plan(
         return _round_order_price(price_raw, tick_size, "SELL")
 
     def _entry_buy_price(level: int) -> float:
-        if flat_inventory:
+        if not near_market_entries_allowed:
+            distance_steps = max(float(level) + buy_offset_steps, 1.0)
+            price_raw = float(Decimal(str(center_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        elif flat_inventory:
             distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
             price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         elif held_long_same_side_entry and lowest_long_lot_price is not None:
@@ -1093,7 +1128,10 @@ def build_hedge_micro_grid_plan(
         return _round_order_price(price_raw, tick_size, "BUY")
 
     def _entry_sell_price(level: int) -> float:
-        if flat_inventory:
+        if not near_market_entries_allowed:
+            distance_steps = max(float(level) + sell_offset_steps, 1.0)
+            price_raw = float(Decimal(str(center_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        elif flat_inventory:
             distance_steps = max((float(level) - 1.0) + sell_offset_steps, 0.0)
             price_raw = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         elif held_short_same_side_entry and highest_short_lot_price is not None:

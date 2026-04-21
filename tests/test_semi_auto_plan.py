@@ -49,9 +49,10 @@ class SemiAutoPlanTests(unittest.TestCase):
             shift_steps=4,
         )
 
-        self.assertAlmostEqual(new_center, 0.05042, places=8)
+        self.assertAlmostEqual(new_center, 0.05046, places=8)
         self.assertEqual(len(moves), 1)
         self.assertEqual(moves[0]["direction"], "down")
+        self.assertEqual(moves[0]["shift_steps"], 2)
 
         new_center, moves = shift_center_price(
             center_price=0.05040,
@@ -63,9 +64,10 @@ class SemiAutoPlanTests(unittest.TestCase):
             shift_steps=4,
         )
 
-        self.assertAlmostEqual(new_center, 0.05048, places=8)
+        self.assertAlmostEqual(new_center, 0.05046, places=8)
         self.assertEqual(len(moves), 1)
         self.assertEqual(moves[0]["direction"], "up")
+        self.assertEqual(moves[0]["shift_steps"], 3)
 
     def test_shift_center_price_terminates_when_tick_size_exceeds_shift_size_down(self) -> None:
         new_center, moves = self._run_shift_center_price(
@@ -548,6 +550,29 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][1]["price"], 4600.0)
         self.assertEqual(plan["sell_orders"][0]["price"], 4600.02)
         self.assertEqual(plan["sell_orders"][1]["price"], 4600.03)
+
+    def test_build_hedge_micro_grid_plan_uses_center_grid_when_near_market_entries_are_disabled(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=100.0,
+            step_price=0.5,
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=20.0,
+            base_position_notional=0.0,
+            bid_price=99.9,
+            ask_price=100.1,
+            tick_size=0.1,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=0.0,
+            near_market_entry_max_center_distance_steps=2.0,
+            near_market_entries_allowed=False,
+        )
+
+        self.assertEqual([item["price"] for item in plan["buy_orders"]], [99.5, 99.0])
+        self.assertEqual([item["price"] for item in plan["sell_orders"]], [100.5, 101.0])
 
     def test_build_hedge_micro_grid_plan_keeps_one_small_short_probe_when_short_entries_paused_and_flat(self) -> None:
         plan = build_hedge_micro_grid_plan(
