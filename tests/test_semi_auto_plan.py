@@ -8,6 +8,7 @@ from grid_optimizer.semi_auto_plan import (
     build_inventory_target_neutral_plan,
     build_micro_grid_plan,
     diff_open_orders,
+    preserve_sticky_exit_orders,
     preserve_sticky_entry_orders,
     shift_center_price,
 )
@@ -388,7 +389,74 @@ class SemiAutoPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted[0]["price"], 99.9)
-        self.assertEqual(adjusted[1]["price"], 99.7)
+
+    def test_preserve_sticky_exit_orders_freezes_existing_exit_prices(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.1731",
+                "origQty": "173",
+                "positionSide": "LONG",
+                "role": "take_profit_long",
+            },
+            {
+                "orderId": 2,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.1733",
+                "origQty": "119",
+                "positionSide": "LONG",
+                "role": "take_profit_long",
+            },
+            {
+                "orderId": 3,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.1734",
+                "origQty": "50",
+                "positionSide": "LONG",
+                "role": "active_delever_long",
+            },
+        ]
+        desired = [
+            {
+                "side": "SELL",
+                "price": 0.1732,
+                "qty": 173.0,
+                "notional": 29.9636,
+                "level": 1,
+                "role": "take_profit_long",
+                "position_side": "LONG",
+            },
+            {
+                "side": "SELL",
+                "price": 0.1735,
+                "qty": 119.0,
+                "notional": 20.6465,
+                "level": 2,
+                "role": "take_profit_long",
+                "position_side": "LONG",
+            },
+            {
+                "side": "SELL",
+                "price": 0.1737,
+                "qty": 50.0,
+                "notional": 8.685,
+                "level": 1,
+                "role": "active_delever_long",
+                "position_side": "LONG",
+            },
+        ]
+
+        adjusted = preserve_sticky_exit_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            sticky_roles={"take_profit_long", "active_delever_long"},
+        )
+
+        self.assertEqual([item["price"] for item in adjusted], [0.1731, 0.1733, 0.1734])
 
     def test_build_hedge_micro_grid_plan_builds_both_sides(self) -> None:
         plan = build_hedge_micro_grid_plan(

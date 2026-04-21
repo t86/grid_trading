@@ -1822,6 +1822,83 @@ def preserve_sticky_entry_orders(
     return adjusted_orders
 
 
+def preserve_sticky_exit_orders(
+    *,
+    existing_orders: list[dict[str, Any]],
+    desired_orders: list[dict[str, Any]],
+    sticky_roles: set[str] | None = None,
+) -> list[dict[str, Any]]:
+    normalized_roles = {
+        str(role).strip()
+        for role in (sticky_roles or set())
+        if str(role).strip()
+    }
+    if not normalized_roles:
+        return [dict(order) for order in desired_orders]
+
+    adjusted_orders = [dict(order) for order in desired_orders]
+
+    def _position_side(order: dict[str, Any]) -> str:
+        raw = str(order.get("position_side", order.get("positionSide", "BOTH"))).upper().strip()
+        return raw or "BOTH"
+
+    def _price(order: dict[str, Any]) -> float:
+        return _safe_float(order.get("price"))
+
+    def _qty(order: dict[str, Any]) -> float:
+        return _safe_float(order.get("qty", order.get("quantity", order.get("origQty"))))
+
+    def _sort_key(order: dict[str, Any]) -> tuple[float, float]:
+        side = str(order.get("side", "")).upper().strip()
+        price = _price(order)
+        if side == "BUY":
+            return (-price, price)
+        return (price, price)
+
+    desired_groups: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
+    for index, order in enumerate(adjusted_orders):
+        role = str(order.get("role", "")).strip()
+        if role not in normalized_roles:
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            continue
+        key = (role, side, _position_side(order))
+        desired_groups.setdefault(key, []).append((index, order))
+
+    existing_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    for order in existing_orders:
+        role = str(order.get("role", "")).strip()
+        if role not in normalized_roles:
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            continue
+        if _price(order) <= 0 or _qty(order) <= 0:
+            continue
+        key = (role, side, _position_side(order))
+        existing_groups.setdefault(key, []).append(order)
+
+    for key, desired_group in desired_groups.items():
+        existing_group = existing_groups.get(key, [])
+        if not existing_group:
+            continue
+        desired_sorted = sorted(desired_group, key=lambda item: _sort_key(item[1]))
+        existing_sorted = sorted(existing_group, key=_sort_key)
+        for (index, _desired_order), existing_order in zip(desired_sorted, existing_sorted):
+            existing_price = _price(existing_order)
+            if existing_price <= 0:
+                continue
+            adjusted_order = dict(adjusted_orders[index])
+            qty = _qty(adjusted_order)
+            adjusted_order["price"] = existing_price
+            if "notional" in adjusted_order:
+                adjusted_order["notional"] = existing_price * qty
+            adjusted_orders[index] = adjusted_order
+
+    return adjusted_orders
+
+
 def _config_payload(args: argparse.Namespace, symbol_info: dict[str, Any]) -> dict[str, Any]:
     config = {
         "symbol": args.symbol.upper().strip(),

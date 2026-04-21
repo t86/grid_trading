@@ -29,6 +29,7 @@ from grid_optimizer.loop_runner import (
     apply_excess_inventory_reduce_only,
     apply_active_delever_short,
     apply_active_delever_long,
+    apply_synthetic_inventory_exit_priority,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
     apply_inventory_tiering,
@@ -939,7 +940,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
-    def test_generate_plan_report_synthetic_neutral_prioritizes_short_exit_over_new_short_entries(
+    def test_generate_plan_report_synthetic_neutral_keeps_short_entries_while_near_market_below_pause(
         self,
         mock_symbol_config,
         mock_book_tickers,
@@ -1021,9 +1022,51 @@ class LoopRunnerTests(unittest.TestCase):
         entry_short_prices = [item["price"] for item in report["sell_orders"] if item["role"] == "entry_short"]
 
         self.assertEqual(take_profit_prices, [0.981])
-        self.assertEqual(entry_short_prices, [])
-        self.assertTrue(report["synthetic_inventory_exit_priority"]["active"])
+        self.assertEqual(entry_short_prices, [1.03, 1.04])
+        self.assertFalse(report["synthetic_inventory_exit_priority"]["active"])
         self.assertEqual(report["synthetic_inventory_exit_priority"]["direction"], "short")
+
+    def test_apply_synthetic_inventory_exit_priority_prunes_pure_short_inventory_after_pause_threshold(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.981,
+                    "qty": 260.0,
+                    "notional": 255.06,
+                    "role": "take_profit_short",
+                    "position_side": "SHORT",
+                }
+            ],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "price": 1.01,
+                    "qty": 25.0,
+                    "notional": 25.25,
+                    "role": "entry_short",
+                    "position_side": "SHORT",
+                }
+            ],
+        }
+
+        report = apply_synthetic_inventory_exit_priority(
+            plan=plan,
+            strategy_mode="synthetic_neutral",
+            current_long_qty=0.0,
+            current_short_qty=260.0,
+            current_long_notional=0.0,
+            current_short_notional=260.0,
+            pause_long_position_notional=250.0,
+            pause_short_position_notional=250.0,
+            near_market_entries_allowed=True,
+            step_size=1.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["direction"], "short")
+        self.assertEqual(plan["sell_orders"], [])
 
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")

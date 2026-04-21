@@ -71,6 +71,7 @@ from .semi_auto_plan import (
     build_best_quote_short_flip_plan,
     diff_open_orders,
     load_or_initialize_state,
+    preserve_sticky_exit_orders,
     preserve_sticky_entry_orders,
     shift_center_price,
 )
@@ -1150,6 +1151,11 @@ def apply_synthetic_inventory_exit_priority(
     strategy_mode: str,
     current_long_qty: float,
     current_short_qty: float,
+    current_long_notional: float,
+    current_short_notional: float,
+    pause_long_position_notional: float | None,
+    pause_short_position_notional: float | None,
+    near_market_entries_allowed: bool,
     step_size: float | None,
 ) -> dict[str, Any]:
     qty_tolerance = max(_safe_float(step_size) * 0.5, 1e-9)
@@ -1181,6 +1187,11 @@ def apply_synthetic_inventory_exit_priority(
         report["exit_ready"] = exit_ready
         if not exit_ready:
             return report
+        pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
+        pause_reached = pause_notional > 0 and current_long_notional >= pause_notional - 1e-12
+        if near_market_entries_allowed and not pause_reached:
+            report["reason"] = "near_market_below_pause"
+            return report
         bootstrap_before = len(plan.get("bootstrap_orders", []))
         entry_before = len(plan.get("buy_orders", []))
         plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
@@ -1200,6 +1211,11 @@ def apply_synthetic_inventory_exit_priority(
     report["direction"] = "short"
     report["exit_ready"] = exit_ready
     if not exit_ready:
+        return report
+    pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
+    pause_reached = pause_notional > 0 and current_short_notional >= pause_notional - 1e-12
+    if near_market_entries_allowed and not pause_reached:
+        report["reason"] = "near_market_below_pause"
         return report
     bootstrap_before = len(plan.get("bootstrap_orders", []))
     entry_before = len(plan.get("sell_orders", []))
@@ -1233,6 +1249,38 @@ def _window_directional_efficiency(window: dict[str, Any] | None) -> float:
 
 def _is_synthetic_neutral_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "synthetic_neutral"
+
+
+def resolve_sticky_exit_mode(
+    *,
+    active_delever: dict[str, Any],
+    synthetic_inventory_exit_priority: dict[str, Any],
+) -> dict[str, Any]:
+    keys: list[str] = []
+    roles: set[str] = set()
+
+    if bool(active_delever.get("active")):
+        trigger_mode = str(active_delever.get("trigger_mode") or "active").strip() or "active"
+        if int(active_delever.get("active_sell_order_count") or 0) > 0:
+            keys.append(f"active_delever_long:{trigger_mode}")
+            roles.update({"take_profit_long", "active_delever_long"})
+        if int(active_delever.get("active_buy_order_count") or 0) > 0:
+            keys.append(f"active_delever_short:{trigger_mode}")
+            roles.update({"take_profit_short", "active_delever_short"})
+
+    if not keys and bool(synthetic_inventory_exit_priority.get("active")):
+        direction = str(synthetic_inventory_exit_priority.get("direction") or "").strip()
+        if direction == "long":
+            keys.append("synthetic_inventory_exit_priority:long")
+            roles.add("take_profit_long")
+        elif direction == "short":
+            keys.append("synthetic_inventory_exit_priority:short")
+            roles.add("take_profit_short")
+
+    return {
+        "key": "|".join(keys) if keys else None,
+        "roles": sorted(roles),
+    }
 
 
 def _is_inventory_target_neutral_mode(strategy_mode: str) -> bool:
@@ -6659,6 +6707,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             strategy_mode=strategy_mode,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            near_market_entries_allowed=bool(near_market_entry_state.get("near_market_entries_allowed")),
             step_size=symbol_info.get("step_size"),
         )
         target_base_qty = hedge_plan["target_long_base_qty"]
@@ -7022,8 +7075,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         *plan["sell_orders"],
     ]
     open_orders_for_diff = open_orders
+    sticky_exit_mode = {"key": None, "roles": []}
+    previous_sticky_exit_mode_key = str(state.get("sticky_exit_mode_key") or "").strip() or None
     if _is_synthetic_neutral_mode(strategy_mode):
         open_orders_for_diff = _decorate_synthetic_open_orders(state=state, open_orders=open_orders)
+        sticky_exit_mode = resolve_sticky_exit_mode(
+            active_delever=active_delever,
+            synthetic_inventory_exit_priority=synthetic_inventory_exit_priority,
+        )
+        if (
+            sticky_exit_mode["key"]
+            and sticky_exit_mode["key"] == previous_sticky_exit_mode_key
+            and sticky_exit_mode["roles"]
+        ):
+            desired_orders = preserve_sticky_exit_orders(
+                existing_orders=open_orders_for_diff,
+                desired_orders=desired_orders,
+                sticky_roles=set(sticky_exit_mode["roles"]),
+            )
         desired_orders = preserve_sticky_entry_orders(
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
@@ -7064,6 +7133,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state["last_mid_price"] = mid_price
     state["updated_at"] = state_now
     state["version"] = STATE_VERSION
+    if sticky_exit_mode["key"]:
+        state["sticky_exit_mode_key"] = sticky_exit_mode["key"]
+    else:
+        state.pop("sticky_exit_mode_key", None)
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -7095,6 +7168,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "market_bias_regime_switch": market_bias_regime_switch,
         "center_entry_guard": center_entry_guard,
         "near_market_entry_state": near_market_entry_state,
+        "sticky_exit_mode": sticky_exit_mode,
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
