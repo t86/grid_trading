@@ -97,6 +97,8 @@
 
 - 生产机器上的策略 runner、flatten runner、`output/*_loop_runner.pid`、`output/*_loop_runner_control.json` 必须由 `ubuntu` 用户持有和启动。
 - 日常启动、停止、重启，优先走监控台页面，或由 `ubuntu` 用户调用本机 `grid-web` / `wangge-web` 提供的 `/api/runner/start`、`/api/runner/stop`。
+- 日常代码部署只能走服务器本机固定脚本，例如 `/usr/local/bin/grid-web-update`、`/usr/local/bin/grid-web-api2-update`。脚本内部必须通过 `git pull --ff-only origin main` 拉取主线代码，明确禁止 `scp`、`rsync`、临时 `cp`、手工 copy 文件热更。
+- 如果是 saved runner 的手工启停，必须走固定脚本，例如仓库内的 `deploy/oracle/manage_saved_runner.sh` 或服务器上安装好的 wrapper；不要手敲 `nohup env BINANCE_API_KEY=... python -m ...`。
 - 不要用 `root` 直接执行 `python -m grid_optimizer.loop_runner`、`python -m grid_optimizer.maker_flatten_runner`，也不要让 `root` 写入 runner 的 pid / control / state 文件。
 - 手工热更前先确认“真实运行目录”，不要只看端口或 release 名字猜路径。`state-path`、`plan-json`、`summary-jsonl`、日志默认都是相对路径，runner 从哪个 cwd 启动，就会把 `output/*` 写到哪个目录。
 - 同一台机器可以同时存在多个代码树，例如老 release 和常驻工作目录；重启前先用 `ps` / `/proc/<pid>/cwd` 确认当前进程到底跑在哪个目录，再去覆盖对应代码。

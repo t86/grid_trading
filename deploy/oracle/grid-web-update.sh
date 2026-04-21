@@ -36,9 +36,13 @@ cleanup_stale_web_processes() {
 }
 
 cd "${APP_DIR}"
+if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+  echo "Refusing to update ${APP_DIR}: tracked local changes detected." >&2
+  exit 1
+fi
 git fetch origin "${BRANCH}"
 git checkout "${BRANCH}"
-git reset --hard "origin/${BRANCH}"
+git pull --ff-only origin "${BRANCH}"
 
 sudo systemctl stop "${SERVICE_NAME}.service" || true
 cleanup_stale_web_processes

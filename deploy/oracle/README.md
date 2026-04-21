@@ -45,6 +45,14 @@ The server-local `/usr/local/bin/grid-web-update` should match the tracked scrip
 - restarting `grid-web`
 - checking the local `/api/health` endpoint
 
+Routine deployment standard:
+
+- routine deployment must use a server-local wrapper such as `/usr/local/bin/grid-web-update`
+  or `/usr/local/bin/grid-web-api2-update`
+- the wrapper must update code by `git pull --ff-only origin main` against a clean working tree
+- do not use `scp`, `rsync`, ad hoc `cp`, or manual file copy to push code onto the server
+- do not patch production code directly on the server and then keep running from a dirty tree
+
 Do not use GitHub Actions, `rsync`, or ad hoc copy commands for routine deployment.
 
 ## 2.1) Installing A Second Web Instance
@@ -143,12 +151,37 @@ GRID_API_ENV_FILE=/home/ubuntu/.config/wangge/binance_api_env_api2.env \
 deploy/oracle/manage_saved_runner.sh restart BASEDUSDT
 ```
 
+If you want a host-local fixed runner entrypoint, install it through `deploy/oracle/install_or_update.sh`:
+
+```bash
+APP_DIR=/home/ubuntu/wangge_api2 \
+SERVICE_WORKING_DIR=/home/ubuntu/wangge_api2 \
+SERVICE_NAME=grid-web-api2 \
+SERVICE_DESCRIPTION="Grid Optimizer Web Service (API2)" \
+GRID_WEB_PORT=8789 \
+SYSTEMD_ENV_FILE=/home/ubuntu/.config/wangge/grid_web_api2.env \
+PYTHONPATH_VALUE=/home/ubuntu/wangge_api2/src \
+UPDATE_WRAPPER_NAME=grid-web-api2-update \
+INSTALL_RUNNER_WRAPPER=1 \
+RUNNER_ENV_FILE=/home/ubuntu/.config/wangge/binance_api_env_api2.env \
+RUNNER_WRAPPER_NAME=grid-saved-runner-api2 \
+deploy/oracle/install_or_update.sh
+```
+
+After that, routine runner operations become:
+
+```bash
+ssh <host> '/usr/local/bin/grid-saved-runner-api2 restart SOONUSDT'
+ssh <host> '/usr/local/bin/grid-saved-runner-api2 status SOONUSDT'
+```
+
 Recommended pattern:
 
 - keep each account in its own env file, for example `binance_api_env.env` and `binance_api_env_api2.env`
 - keep each web instance in its own env file, for example `grid_web.env` and `grid_web_api2.env`
 - keep the env file out of Git and set permissions to `0600`
 - always restart saved runners through `manage_saved_runner.sh`, not ad hoc inline env commands
+- when installed, prefer the host-local saved runner wrapper over hand-typed repo paths
 - always update extra web instances through their dedicated wrapper, for example `grid-web-api2-update`
 - when the code lives in a release directory, point `PYTHON_BIN` and `PYTHONPATH_VALUE` at that release explicitly
 

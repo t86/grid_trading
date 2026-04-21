@@ -2980,7 +2980,7 @@ def apply_take_profit_profit_guard(
     long_relax_threshold = max(long_pause_threshold, long_threshold_notional)
     short_relax_threshold = max(short_pause_threshold, short_threshold_notional)
     report = {
-        "enabled": safe_ratio is not None and safe_ratio > 0,
+        "enabled": safe_ratio is not None,
         "min_profit_ratio": min_profit_ratio,
         "long_active": False,
         "short_active": False,
@@ -2993,7 +2993,7 @@ def apply_take_profit_profit_guard(
         "dropped_sell_orders": 0,
         "dropped_buy_orders": 0,
     }
-    if safe_ratio is None or safe_ratio <= 0:
+    if safe_ratio is None:
         return report
 
     actual_long_avg = max(_safe_float(current_long_avg_price), 0.0)
@@ -4584,7 +4584,7 @@ def _parse_state_datetime(value: Any) -> datetime | None:
     return parsed.astimezone(timezone.utc)
 
 
-CENTER_INTERVAL_SHIFT_RATIO = 1.0 / 3.0
+CENTER_INTERVAL_SHIFT_RATIO = 1.0 / 2.0
 
 
 def _proportional_center_shift_steps(drift_steps: float, ratio: float = CENTER_INTERVAL_SHIFT_RATIO) -> int:
@@ -5012,6 +5012,18 @@ def build_effective_runner_args(
     if desired_step > 0:
         effective.step_price = _round_up_to_step(desired_step, tick_size if tick_size > 0 else None)
     return effective
+
+
+def _resolve_effective_take_profit_min_profit_ratio(
+    *,
+    strategy_mode: str,
+    configured_ratio: float | None,
+) -> float | None:
+    if configured_ratio is not None:
+        return configured_ratio
+    if strategy_mode in {"synthetic_neutral", "hedge_neutral"}:
+        return 0.0
+    return None
 
 
 def _clamp_ratio(value: float) -> float:
@@ -5643,6 +5655,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             effective_args.max_short_position_notional = float(adaptive_step["effective_max_short_position_notional"])
         if adaptive_step.get("effective_max_total_notional") is not None:
             effective_args.max_total_notional = float(adaptive_step["effective_max_total_notional"])
+
+    effective_args = argparse.Namespace(**vars(effective_args))
+    effective_args.take_profit_min_profit_ratio = _resolve_effective_take_profit_min_profit_ratio(
+        strategy_mode=requested_strategy_mode,
+        configured_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+    )
     market_guard = assess_market_guard(
         symbol=symbol,
         buy_pause_amp_trigger_ratio=effective_args.buy_pause_amp_trigger_ratio,
@@ -5811,8 +5829,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "short_cover_pause_reasons": [],
     }
     take_profit_guard = {
-        "enabled": bool(getattr(args, "take_profit_min_profit_ratio", None) is not None),
-        "min_profit_ratio": getattr(args, "take_profit_min_profit_ratio", None),
+        "enabled": bool(getattr(effective_args, "take_profit_min_profit_ratio", None) is not None),
+        "min_profit_ratio": getattr(effective_args, "take_profit_min_profit_ratio", None),
         "long_active": False,
         "short_active": False,
         "long_floor_price": None,
@@ -5842,9 +5860,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     }
     short_threshold_timeout = {
         "enabled": False,
-        "threshold_notional": getattr(args, "threshold_position_notional", None),
-        "target_notional": getattr(args, "pause_short_position_notional", None),
-        "hold_seconds": _safe_float(getattr(args, "short_threshold_timeout_seconds", None)),
+        "threshold_notional": getattr(effective_args, "threshold_position_notional", None),
+        "target_notional": getattr(effective_args, "pause_short_position_notional", None),
+        "hold_seconds": _safe_float(getattr(effective_args, "short_threshold_timeout_seconds", None)),
         "above_threshold": False,
         "armed": False,
         "timeout_active": False,
@@ -6560,12 +6578,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_avg_price=max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_avg_price")), 0.0),
             current_long_lots=list(synthetic_ledger_snapshot.get("virtual_long_lots") or []),
             pause_long_position_notional=effective_args.pause_buy_position_notional,
-            threshold_position_notional=getattr(args, "threshold_position_notional", None),
+            threshold_position_notional=getattr(effective_args, "threshold_position_notional", None),
             per_order_notional=inventory_tier["effective_per_order_notional"],
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
             ask_price=ask_price,
-            min_profit_ratio=getattr(args, "take_profit_min_profit_ratio", None),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             market_guard_buy_pause_active=bool(market_guard["buy_pause_active"]),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
@@ -6577,13 +6595,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price=max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0),
             current_short_lots=list(synthetic_ledger_snapshot.get("virtual_short_lots") or []),
             pause_short_position_notional=effective_args.pause_short_position_notional,
-            threshold_position_notional=getattr(args, "threshold_position_notional", None),
+            threshold_position_notional=getattr(effective_args, "threshold_position_notional", None),
             per_order_notional=inventory_tier["effective_per_order_notional"],
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,
             ask_price=ask_price,
-            min_profit_ratio=getattr(args, "take_profit_min_profit_ratio", None),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
             threshold_timeout_active=bool(short_threshold_timeout.get("timeout_active")),
@@ -7597,7 +7615,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-bias-regime-switch-weak-threshold", type=float, default=0.15)
     parser.add_argument("--market-bias-regime-switch-strong-threshold", type=float, default=0.15)
     parser.add_argument("--first-order-multiplier", type=float, default=4.0)
-    parser.add_argument("--threshold-position-notional", type=float, default=50.0)
+    parser.add_argument("--threshold-position-notional", type=float, default=0.0)
     parser.add_argument("--short-threshold-timeout-seconds", type=float, default=60.0)
     parser.add_argument("--near-market-entry-max-center-distance-steps", type=float, default=2.0)
     parser.add_argument("--grid-inventory-rebalance-min-center-distance-steps", type=float, default=3.0)

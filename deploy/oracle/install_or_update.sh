@@ -15,6 +15,9 @@ PYTHONPATH_VALUE="${PYTHONPATH_VALUE:-${APP_DIR}/src}"
 GRID_SYMBOL_LISTS_PATH="${GRID_SYMBOL_LISTS_PATH:-}"
 INSTALL_UPDATE_WRAPPER="${INSTALL_UPDATE_WRAPPER:-1}"
 UPDATE_WRAPPER_NAME="${UPDATE_WRAPPER_NAME:-${SERVICE_NAME}-update}"
+INSTALL_RUNNER_WRAPPER="${INSTALL_RUNNER_WRAPPER:-0}"
+RUNNER_ENV_FILE="${RUNNER_ENV_FILE:-}"
+RUNNER_WRAPPER_NAME="${RUNNER_WRAPPER_NAME:-${SERVICE_NAME}-saved-runner}"
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   echo "Python binary not found: ${PYTHON_BIN}" >&2
@@ -38,6 +41,16 @@ fi
 
 if [ -n "${SYSTEMD_ENV_FILE}" ] && [ ! -f "${SYSTEMD_ENV_FILE}" ]; then
   echo "SYSTEMD_ENV_FILE does not exist: ${SYSTEMD_ENV_FILE}" >&2
+  exit 1
+fi
+
+if [ -n "${RUNNER_ENV_FILE}" ] && [ ! -f "${RUNNER_ENV_FILE}" ]; then
+  echo "RUNNER_ENV_FILE does not exist: ${RUNNER_ENV_FILE}" >&2
+  exit 1
+fi
+
+if [ "${INSTALL_RUNNER_WRAPPER}" != "0" ] && [ -z "${RUNNER_ENV_FILE}" ]; then
+  echo "RUNNER_ENV_FILE is required when INSTALL_RUNNER_WRAPPER=1" >&2
   exit 1
 fi
 
@@ -103,6 +116,20 @@ EOF
   sudo chmod 755 "${UPDATE_WRAPPER_PATH}"
 fi
 
+if [ "${INSTALL_RUNNER_WRAPPER}" != "0" ]; then
+  RUNNER_WRAPPER_PATH="/usr/local/bin/${RUNNER_WRAPPER_NAME}"
+  sudo tee "${RUNNER_WRAPPER_PATH}" >/dev/null <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+export APP_DIR='${SERVICE_WORKING_DIR}'
+export PYTHON_BIN='${EXEC_PYTHON_BIN}'
+export PYTHONPATH_VALUE='${PYTHONPATH_VALUE}'
+export GRID_API_ENV_FILE='${RUNNER_ENV_FILE}'
+exec '${APP_DIR}/deploy/oracle/manage_saved_runner.sh' "\$@"
+EOF
+  sudo chmod 755 "${RUNNER_WRAPPER_PATH}"
+fi
+
 sudo systemctl daemon-reload
 sudo systemctl enable "${SERVICE_NAME}.service"
 sudo systemctl restart "${SERVICE_NAME}.service"
@@ -113,4 +140,7 @@ sudo systemctl --no-pager --full status "${SERVICE_NAME}.service" | sed -n '1,25
 echo "Deployment complete. Listening on ${GRID_WEB_HOST}:${GRID_WEB_PORT}"
 if [ "${INSTALL_UPDATE_WRAPPER}" != "0" ]; then
   echo "Update wrapper installed at /usr/local/bin/${UPDATE_WRAPPER_NAME}"
+fi
+if [ "${INSTALL_RUNNER_WRAPPER}" != "0" ]; then
+  echo "Saved runner wrapper installed at /usr/local/bin/${RUNNER_WRAPPER_NAME}"
 fi

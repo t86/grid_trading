@@ -155,7 +155,7 @@ def shift_center_price(
 
     def _proportional_shift_steps(drift_steps: float) -> int:
         abs_drift_steps = abs(float(drift_steps))
-        scaled = int(math.floor((abs_drift_steps / 3.0) + 0.5))
+        scaled = int(math.floor((abs_drift_steps / 2.0) + 0.5))
         max_without_overshoot = max(int(math.floor(abs_drift_steps)), 1)
         return min(max(scaled, 1), max_without_overshoot)
 
@@ -174,7 +174,7 @@ def shift_center_price(
                 "new_center_price": center,
                 "drift_steps": drift_steps,
                 "shift_steps": effective_shift_steps,
-                "shift_ratio": 1.0 / 3.0,
+                "shift_ratio": 1.0 / 2.0,
             }
         )
     elif mid_price >= center + up_trigger:
@@ -192,7 +192,7 @@ def shift_center_price(
                 "new_center_price": center,
                 "drift_steps": drift_steps,
                 "shift_steps": effective_shift_steps,
-                "shift_ratio": 1.0 / 3.0,
+                "shift_ratio": 1.0 / 2.0,
             }
         )
     return center, moves

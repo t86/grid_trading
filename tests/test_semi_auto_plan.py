@@ -49,10 +49,11 @@ class SemiAutoPlanTests(unittest.TestCase):
             shift_steps=4,
         )
 
-        self.assertAlmostEqual(new_center, 0.05046, places=8)
+        self.assertAlmostEqual(new_center, 0.05044, places=8)
         self.assertEqual(len(moves), 1)
         self.assertEqual(moves[0]["direction"], "down")
-        self.assertEqual(moves[0]["shift_steps"], 2)
+        self.assertEqual(moves[0]["shift_steps"], 3)
+        self.assertEqual(moves[0]["shift_ratio"], 0.5)
 
         new_center, moves = shift_center_price(
             center_price=0.05040,
@@ -64,10 +65,11 @@ class SemiAutoPlanTests(unittest.TestCase):
             shift_steps=4,
         )
 
-        self.assertAlmostEqual(new_center, 0.05046, places=8)
+        self.assertAlmostEqual(new_center, 0.05048, places=8)
         self.assertEqual(len(moves), 1)
         self.assertEqual(moves[0]["direction"], "up")
-        self.assertEqual(moves[0]["shift_steps"], 3)
+        self.assertEqual(moves[0]["shift_steps"], 4)
+        self.assertEqual(moves[0]["shift_ratio"], 0.5)
 
     def test_shift_center_price_terminates_when_tick_size_exceeds_shift_size_down(self) -> None:
         new_center, moves = self._run_shift_center_price(
