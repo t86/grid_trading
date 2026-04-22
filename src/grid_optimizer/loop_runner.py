@@ -983,6 +983,10 @@ def _uses_non_regressive_take_profit_repricing(strategy_profile: str | None) -> 
     return str(strategy_profile or "").strip() == "volume_long_v4"
 
 
+def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
+    return str(strategy_profile or "").strip() == "volume_long_v4"
+
+
 def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: bool = False) -> float:
     keys = ("entryPrice", "breakEvenPrice") if prefer_entry_price else ("breakEvenPrice", "entryPrice")
     for key in keys:
@@ -1000,13 +1004,47 @@ def _order_role(order: dict[str, Any]) -> str:
     return str(order.get("role", "")).lower().strip()
 
 
+def _volume_long_v4_order_role(order: dict[str, Any]) -> str:
+    explicit_role = _order_role(order)
+    if explicit_role:
+        return explicit_role
+    client_order_id = str(order.get("clientOrderId", "")).strip().lower()
+    if not client_order_id.startswith("gx-"):
+        return ""
+    if "-takeprof-" in client_order_id:
+        return "take_profit"
+    if "-softdele-" in client_order_id:
+        return "soft_delever_long"
+    if "-harddele-" in client_order_id:
+        return "hard_delever_long"
+    if "-activede-" in client_order_id:
+        return "active_delever_long"
+    return ""
+
+
+def _decorate_volume_long_v4_open_orders(open_orders: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    decorated_orders: list[dict[str, Any]] = []
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        decorated = dict(order)
+        role = _volume_long_v4_order_role(decorated)
+        if role:
+            decorated["role"] = role
+        decorated_orders.append(decorated)
+    return decorated_orders
+
+
 def _is_volume_long_take_profit_sell_order(order: dict[str, Any]) -> bool:
     if str(order.get("side", "")).upper().strip() != "SELL":
         return False
-    if _order_role(order) == "take_profit":
-        return True
-    client_order_id = str(order.get("clientOrderId", "")).strip().lower()
-    return client_order_id.startswith("gx-") and "-takeprof-" in client_order_id
+    return _volume_long_v4_order_role(order) == "take_profit"
+
+
+def _is_volume_long_staged_delever_sell_order(order: dict[str, Any]) -> bool:
+    if str(order.get("side", "")).upper().strip() != "SELL":
+        return False
+    return _volume_long_v4_order_role(order) in {"soft_delever_long", "hard_delever_long"}
 
 
 def preserve_non_regressive_take_profit_sell_orders(
@@ -1053,6 +1091,116 @@ def preserve_non_regressive_take_profit_sell_orders(
     return adjusted_orders
 
 
+def apply_volume_long_v4_staged_delever(
+    *,
+    plan: dict[str, Any],
+    current_long_qty: float,
+    current_long_notional: float,
+    current_long_avg_price: float,
+    pause_long_position_notional: float | None,
+    max_position_notional: float | None,
+    per_order_notional: float,
+    step_price: float,
+    tick_size: float | None,
+    bid_price: float,
+    ask_price: float,
+    soft_loss_steps: float = 0.5,
+    hard_loss_steps: float = 1.5,
+    soft_max_levels: int = 2,
+    hard_max_levels: int = 4,
+) -> dict[str, Any]:
+    pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
+    hard_notional = max(_safe_float(max_position_notional), 0.0)
+    report = {
+        "enabled": True,
+        "active": False,
+        "stage": None,
+        "pause_long_position_notional": pause_long_position_notional,
+        "hard_long_position_notional": max_position_notional,
+        "active_sell_order_count": 0,
+        "loss_budget_steps": 0.0,
+        "loss_floor_price": None,
+    }
+    if current_long_qty <= 1e-12 or step_price <= 0 or pause_notional <= 0 or current_long_notional < pause_notional:
+        return report
+
+    take_profit_orders = [
+        dict(item)
+        for item in plan.get("sell_orders", [])
+        if isinstance(item, dict) and _order_role(item) == "take_profit"
+    ]
+    if not take_profit_orders:
+        return report
+    take_profit_orders.sort(key=lambda item: _safe_float(item.get("price")))
+    other_sell_orders = [
+        dict(item)
+        for item in plan.get("sell_orders", [])
+        if isinstance(item, dict) and _order_role(item) != "take_profit"
+    ]
+
+    hard_stage_active = hard_notional > pause_notional and current_long_notional >= hard_notional - 1e-12
+    stage = "hard" if hard_stage_active else "soft"
+    safe_per_order_notional = max(_safe_float(per_order_notional), 1e-12)
+    if stage == "hard":
+        excess_notional = max(current_long_notional - max(hard_notional, pause_notional), 0.0)
+        requested_count = max(2, 2 + int(math.ceil(excess_notional / safe_per_order_notional)))
+        max_levels = max(int(hard_max_levels), 0)
+        loss_budget_steps = max(_safe_float(hard_loss_steps), 0.0)
+        role = "hard_delever_long"
+    else:
+        excess_notional = max(current_long_notional - pause_notional, 0.0)
+        requested_count = max(1, int(math.ceil(excess_notional / safe_per_order_notional)))
+        max_levels = max(int(soft_max_levels), 0)
+        loss_budget_steps = max(_safe_float(soft_loss_steps), 0.0)
+        role = "soft_delever_long"
+    active_count = min(len(take_profit_orders), max_levels, requested_count)
+    if active_count <= 0:
+        return report
+
+    loss_floor_price = None
+    if current_long_avg_price > 0 and loss_budget_steps >= 0:
+        floor_raw = max(current_long_avg_price - (loss_budget_steps * step_price), 0.0)
+        loss_floor_price = _round_order_price(floor_raw, tick_size, "SELL")
+        if loss_floor_price is not None and loss_floor_price <= 0:
+            loss_floor_price = None
+
+    active_orders: list[dict[str, Any]] = []
+    for index, order in enumerate(take_profit_orders[:active_count], start=1):
+        active = dict(order)
+        target_price_raw = max(float(ask_price), 0.0) + (max(index - 1, 0) * float(step_price))
+        target_price = _round_order_price(target_price_raw, tick_size, "SELL")
+        if loss_floor_price is not None:
+            target_price = max(target_price, loss_floor_price)
+        minimum_resting_price = _round_order_price(
+            max(float(bid_price) + (float(tick_size) if tick_size and tick_size > 0 else 0.0), 0.0),
+            tick_size,
+            "SELL",
+        )
+        target_price = max(target_price, minimum_resting_price)
+        active["role"] = role
+        active["price"] = target_price
+        active["notional"] = target_price * _safe_float(active.get("qty"))
+        active["level"] = index
+        active["delever_stage"] = stage
+        active["loss_budget_steps"] = loss_budget_steps
+        active_orders.append(active)
+
+    plan["sell_orders"] = sorted(
+        [*active_orders, *take_profit_orders[active_count:], *other_sell_orders],
+        key=lambda item: (_safe_float(item.get("price")), str(item.get("side", "")).upper().strip()),
+    )
+    report.update(
+        {
+            "active": True,
+            "stage": stage,
+            "active_sell_order_count": active_count,
+            "loss_budget_steps": loss_budget_steps,
+            "loss_floor_price": loss_floor_price,
+        }
+    )
+    return report
+
+
 def _is_long_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
     position_side = _order_position_side(order)
@@ -1067,7 +1215,7 @@ def _is_short_entry_order(order: dict[str, Any]) -> bool:
 
 
 def _is_long_exit_order(order: dict[str, Any]) -> bool:
-    return _order_role(order) in {"take_profit_long", "active_delever_long"}
+    return _order_role(order) in {"take_profit_long", "active_delever_long", "soft_delever_long", "hard_delever_long"}
 
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
@@ -1092,6 +1240,8 @@ def _resolve_reduce_only_flag(
         "take_profit",
         "take_profit_long",
         "active_delever_long",
+        "soft_delever_long",
+        "hard_delever_long",
     }:
         return True
     if normalized_side == "BUY" and normalized_role in {
@@ -6022,6 +6172,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "dropped_sell_orders": 0,
         "dropped_buy_orders": 0,
     }
+    volume_long_v4_delever = {
+        "enabled": False,
+        "active": False,
+        "stage": None,
+        "pause_long_position_notional": getattr(effective_args, "pause_buy_position_notional", None),
+        "hard_long_position_notional": getattr(effective_args, "max_position_notional", None),
+        "active_sell_order_count": 0,
+        "loss_budget_steps": 0.0,
+        "loss_floor_price": None,
+    }
     active_delever = {
         "enabled": True,
         "active": False,
@@ -7181,6 +7341,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
         )
+        if _uses_volume_long_v4_staged_delever(effective_strategy_profile):
+            volume_long_v4_delever = apply_volume_long_v4_staged_delever(
+                plan=plan,
+                current_long_qty=current_long_qty,
+                current_long_notional=controls["current_long_notional"],
+                current_long_avg_price=current_long_avg_price,
+                pause_long_position_notional=effective_args.pause_buy_position_notional,
+                max_position_notional=effective_args.max_position_notional,
+                per_order_notional=inventory_tier["effective_per_order_notional"],
+                step_price=effective_args.step_price,
+                tick_size=symbol_info.get("tick_size"),
+                bid_price=bid_price,
+                ask_price=ask_price,
+            )
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
@@ -7195,9 +7369,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         bootstrap_qty = _safe_float(plan.get("bootstrap_qty", bootstrap_qty))
 
+    volume_long_v4_open_orders = (
+        _decorate_volume_long_v4_open_orders(open_orders)
+        if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long"
+        else open_orders
+    )
     if _uses_non_regressive_take_profit_repricing(effective_strategy_profile) and strategy_mode == "one_way_long":
         plan["sell_orders"] = preserve_non_regressive_take_profit_sell_orders(
-            existing_orders=open_orders,
+            existing_orders=volume_long_v4_open_orders,
             desired_orders=list(plan.get("sell_orders") or []),
         )
 
@@ -7205,6 +7384,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         *plan["buy_orders"],
         *plan["sell_orders"],
     ]
+    if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long":
+        desired_orders = preserve_sticky_exit_orders(
+            existing_orders=volume_long_v4_open_orders,
+            desired_orders=desired_orders,
+            sticky_roles={"soft_delever_long", "hard_delever_long"},
+        )
+        plan["buy_orders"] = [
+            dict(item)
+            for item in desired_orders
+            if str(item.get("side", "")).upper().strip() == "BUY"
+        ]
+        plan["sell_orders"] = [
+            dict(item)
+            for item in desired_orders
+            if str(item.get("side", "")).upper().strip() == "SELL"
+        ]
     open_orders_for_diff = open_orders
     sticky_exit_mode = {"key": None, "roles": []}
     previous_sticky_exit_mode_key = str(state.get("sticky_exit_mode_key") or "").strip() or None
@@ -7305,6 +7500,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "adaptive_step": adaptive_step,
         "synthetic_trend_follow": synthetic_trend_follow,
         "take_profit_guard": take_profit_guard,
+        "volume_long_v4_delever": volume_long_v4_delever,
         "active_delever": active_delever,
         "short_threshold_timeout": short_threshold_timeout,
         "position_cost_basis_source": "entryPrice" if prefer_entry_price_cost_basis else "breakEvenPrice",
@@ -8065,6 +8261,17 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"cost_missing="
             f"{'long' if take_profit_guard.get('long_cost_basis_missing') else ''}"
             f"{'short' if take_profit_guard.get('short_cost_basis_missing') else ''}"
+        )
+    volume_long_v4_delever = (
+        summary.get("volume_long_v4_delever") if isinstance(summary.get("volume_long_v4_delever"), dict) else {}
+    )
+    if volume_long_v4_delever.get("active"):
+        print(
+            "  volume_delever: "
+            f"stage={volume_long_v4_delever.get('stage')} "
+            f"active_sells={int(volume_long_v4_delever.get('active_sell_order_count', 0) or 0)} "
+            f"loss_steps={_safe_float(volume_long_v4_delever.get('loss_budget_steps', 0.0)):.2f} "
+            f"loss_floor={_price(_safe_float(volume_long_v4_delever.get('loss_floor_price')))}"
         )
     if summary.get("strategy_mode") == "synthetic_neutral":
         print(

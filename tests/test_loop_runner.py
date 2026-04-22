@@ -30,6 +30,7 @@ from grid_optimizer.loop_runner import (
     apply_excess_inventory_reduce_only,
     apply_active_delever_short,
     apply_active_delever_long,
+    apply_volume_long_v4_staged_delever,
     apply_synthetic_inventory_exit_priority,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
@@ -1099,6 +1100,108 @@ class LoopRunnerTests(unittest.TestCase):
         sell_prices = [item["price"] for item in report["sell_orders"] if item["role"] == "take_profit"]
         self.assertGreaterEqual(len(sell_prices), 2)
         self.assertEqual(sell_prices[:2], [0.1665, 0.1667])
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_volume_long_v4_keeps_existing_soft_delever_prices(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_load_state,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 0.1652,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.1653", "ask_price": "0.1654"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "SOONUSDT",
+                    "positionAmt": "5000",
+                    "entryPrice": "0.1656407549484",
+                    "breakEvenPrice": "0.1661000000000",
+                },
+            ],
+        }
+        mock_open_orders.return_value = [
+            {
+                "symbol": "SOONUSDT",
+                "side": "SELL",
+                "price": "0.1658",
+                "origQty": "422",
+                "executedQty": "0",
+                "reduceOnly": True,
+                "positionSide": "BOTH",
+                "clientOrderId": "gx-soonu-softdele-1-12345678",
+            },
+            {
+                "symbol": "SOONUSDT",
+                "side": "SELL",
+                "price": "0.1660",
+                "origQty": "422",
+                "executedQty": "0",
+                "reduceOnly": True,
+                "positionSide": "BOTH",
+                "clientOrderId": "gx-soonu-softdele-2-12345679",
+            },
+        ]
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "shift_freeze_reasons": [],
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "SOONUSDT"
+            args.strategy_mode = "one_way_long"
+            args.strategy_profile = "volume_long_v4"
+            args.step_price = 0.0002
+            args.buy_levels = 8
+            args.sell_levels = 8
+            args.per_order_notional = 70.0
+            args.base_position_notional = 420.0
+            args.take_profit_min_profit_ratio = None
+            args.pause_buy_position_notional = 750.0
+            args.max_position_notional = 900.0
+            args.reset_state = False
+            args.state_path = str(Path(tmpdir) / "soonusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "soonusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        soft_prices = [item["price"] for item in report["sell_orders"] if item["role"] == "soft_delever_long"]
+        self.assertEqual(soft_prices[:2], [0.1658, 0.1660])
+        self.assertTrue(report["volume_long_v4_delever"]["active"])
+        self.assertEqual(report["volume_long_v4_delever"]["stage"], "soft")
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
@@ -2469,6 +2572,69 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["active"])
         self.assertIsNone(report["trigger_mode"])
         self.assertFalse(any(item["role"] == "active_delever_long" for item in plan["sell_orders"]))
+
+    def test_apply_volume_long_v4_staged_delever_soft_stage_keeps_front_sell_volume_near_market(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.001, "qty": 50.0, "notional": 50.05, "role": "take_profit"},
+                {"side": "SELL", "price": 1.011, "qty": 50.0, "notional": 50.55, "role": "take_profit"},
+                {"side": "SELL", "price": 1.021, "qty": 50.0, "notional": 51.05, "role": "take_profit"},
+            ],
+        }
+
+        report = apply_volume_long_v4_staged_delever(
+            plan=plan,
+            current_long_qty=150.0,
+            current_long_notional=260.0,
+            current_long_avg_price=1.0,
+            pause_long_position_notional=200.0,
+            max_position_notional=300.0,
+            per_order_notional=30.0,
+            step_price=0.001,
+            tick_size=0.001,
+            bid_price=0.997,
+            ask_price=0.998,
+        )
+
+        staged_sells = [item for item in plan["sell_orders"] if item["role"] == "soft_delever_long"]
+        self.assertTrue(report["active"])
+        self.assertEqual(report["stage"], "soft")
+        self.assertEqual(report["active_sell_order_count"], 2)
+        self.assertEqual([item["price"] for item in staged_sells], [1.0, 1.0])
+        self.assertEqual([item["role"] for item in plan["sell_orders"][:2]], ["soft_delever_long", "soft_delever_long"])
+
+    def test_apply_volume_long_v4_staged_delever_hard_stage_respects_loss_floor(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.001, "qty": 50.0, "notional": 50.05, "role": "take_profit"},
+                {"side": "SELL", "price": 1.011, "qty": 50.0, "notional": 50.55, "role": "take_profit"},
+                {"side": "SELL", "price": 1.021, "qty": 50.0, "notional": 51.05, "role": "take_profit"},
+                {"side": "SELL", "price": 1.031, "qty": 50.0, "notional": 51.55, "role": "take_profit"},
+            ],
+        }
+
+        report = apply_volume_long_v4_staged_delever(
+            plan=plan,
+            current_long_qty=200.0,
+            current_long_notional=330.0,
+            current_long_avg_price=1.0,
+            pause_long_position_notional=200.0,
+            max_position_notional=300.0,
+            per_order_notional=30.0,
+            step_price=0.01,
+            tick_size=0.001,
+            bid_price=0.979,
+            ask_price=0.98,
+        )
+
+        staged_sells = [item for item in plan["sell_orders"] if item["role"] == "hard_delever_long"]
+        self.assertTrue(report["active"])
+        self.assertEqual(report["stage"], "hard")
+        self.assertEqual(report["active_sell_order_count"], 3)
+        self.assertEqual([item["price"] for item in staged_sells], [0.985, 0.99, 1.0])
+        self.assertAlmostEqual(report["loss_floor_price"], 0.985, places=8)
 
     def test_apply_active_delever_short_disabled_threshold_waits_for_pause_notional(self) -> None:
         plan = {
