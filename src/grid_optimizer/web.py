@@ -11843,7 +11843,7 @@ MONITOR_PAGE = """<!doctype html>
       <div class="editor-grid">
         <div class="param-editor-stack">
           <div id="runner_params_form" class="runner-form-grid">
-            <section class="runner-form-section">
+            <section class="runner-form-section" data-runner-section="base">
               <h3>基础下单</h3>
               <div class="runner-form-fields">
                 <label>策略模式
@@ -11884,7 +11884,7 @@ MONITOR_PAGE = """<!doctype html>
                 </label>
               </div>
             </section>
-            <section class="runner-form-section">
+            <section class="runner-form-section" data-runner-section="position_caps">
               <h3>仓位与硬限制</h3>
               <div class="runner-form-fields">
                 <label>基础底仓 / 基础空仓
@@ -11913,7 +11913,7 @@ MONITOR_PAGE = """<!doctype html>
                 </label>
               </div>
             </section>
-            <section class="runner-form-section">
+            <section class="runner-form-section" data-runner-section="center">
               <h3>中心迁移</h3>
               <div class="runner-form-fields">
                 <label>固定中心价
@@ -11936,7 +11936,275 @@ MONITOR_PAGE = """<!doctype html>
                 </label>
               </div>
             </section>
-            <section class="runner-form-section">
+            <section class="runner-form-section" data-runner-section="inventory_tier">
+              <h3>库存分层</h3>
+              <div class="runner-form-fields">
+                <label>分层起始名义
+                  <input id="runner_field_inventory_tier_start_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>分层完全生效名义
+                  <input id="runner_field_inventory_tier_end_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>分层后买格数
+                  <input id="runner_field_inventory_tier_buy_levels" type="number" min="0" step="1" />
+                </label>
+                <label>分层后卖格数
+                  <input id="runner_field_inventory_tier_sell_levels" type="number" min="0" step="1" />
+                </label>
+                <label>分层后单笔金额
+                  <input id="runner_field_inventory_tier_per_order_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>分层后基础仓位
+                  <input id="runner_field_inventory_tier_base_position_notional" type="number" min="0" step="0.01" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="pause_guards">
+              <h3>分钟停买 / 冻结</h3>
+              <div class="runner-form-fields">
+                <label>低价停买线
+                  <input id="runner_field_min_mid_price_for_buys" type="number" min="0" step="0.0000001" />
+                </label>
+                <label>停买振幅阈值
+                  <input id="runner_field_buy_pause_amp_trigger_ratio" type="number" step="0.000001" />
+                </label>
+                <label>停买跌幅阈值
+                  <input id="runner_field_buy_pause_down_return_trigger_ratio" type="number" step="0.000001" />
+                </label>
+                <label>回补暂停振幅阈值
+                  <input id="runner_field_short_cover_pause_amp_trigger_ratio" type="number" step="0.000001" />
+                </label>
+                <label>回补暂停跌幅阈值
+                  <input id="runner_field_short_cover_pause_down_return_trigger_ratio" type="number" step="0.000001" />
+                </label>
+                <label>冻结迁移绝对涨跌阈值
+                  <input id="runner_field_freeze_shift_abs_return_trigger_ratio" type="number" step="0.000001" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="fixed_center">
+              <h3>固定中心 / 偏移</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_fixed_center_enabled" type="checkbox" />
+                    <span>启用固定中心价</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_fixed_center_roll_enabled" type="checkbox" />
+                    <span>固定中心允许缓慢滚动</span>
+                  </span>
+                </label>
+                <label>买单静态偏移格数
+                  <input id="runner_field_static_buy_offset_steps" type="number" step="0.1" />
+                </label>
+                <label>卖单静态偏移格数
+                  <input id="runner_field_static_sell_offset_steps" type="number" step="0.1" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="market_bias">
+              <h3>市场偏置</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_market_bias_enabled" type="checkbox" />
+                    <span>启用偏置信号</span>
+                  </span>
+                </label>
+                <label>最大偏移格数
+                  <input id="runner_field_market_bias_max_shift_steps" type="number" min="0" step="0.01" />
+                </label>
+                <label>信号格数门槛
+                  <input id="runner_field_market_bias_signal_steps" type="number" min="0" step="0.01" />
+                </label>
+                <label>漂移权重
+                  <input id="runner_field_market_bias_drift_weight" type="number" min="0" step="0.01" />
+                </label>
+                <label>涨跌权重
+                  <input id="runner_field_market_bias_return_weight" type="number" min="0" step="0.01" />
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_market_bias_weak_buy_pause_enabled" type="checkbox" />
+                    <span>弱偏空暂停做多</span>
+                  </span>
+                </label>
+                <label>弱偏空阈值
+                  <input id="runner_field_market_bias_weak_buy_pause_threshold" type="number" min="0" step="0.01" />
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_market_bias_strong_short_pause_enabled" type="checkbox" />
+                    <span>强偏多暂停做空</span>
+                  </span>
+                </label>
+                <label>强偏多阈值
+                  <input id="runner_field_market_bias_strong_short_pause_threshold" type="number" min="0" step="0.01" />
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_market_bias_regime_switch_enabled" type="checkbox" />
+                    <span>允许偏置切换子策略</span>
+                  </span>
+                </label>
+                <label>切换确认轮数
+                  <input id="runner_field_market_bias_regime_switch_confirm_cycles" type="number" min="1" step="1" />
+                </label>
+                <label>切换弱阈值
+                  <input id="runner_field_market_bias_regime_switch_weak_threshold" type="number" min="0" step="0.01" />
+                </label>
+                <label>切换强阈值
+                  <input id="runner_field_market_bias_regime_switch_strong_threshold" type="number" min="0" step="0.01" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="adaptive_step">
+              <h3>自适应步长</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_adaptive_step_enabled" type="checkbox" />
+                    <span>启用自适应步长</span>
+                  </span>
+                </label>
+                <label>30 秒绝对涨跌阈值
+                  <input id="runner_field_adaptive_step_30s_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>30 秒振幅阈值
+                  <input id="runner_field_adaptive_step_30s_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>1 分钟绝对涨跌阈值
+                  <input id="runner_field_adaptive_step_1m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>1 分钟振幅阈值
+                  <input id="runner_field_adaptive_step_1m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>3 分钟绝对涨跌阈值
+                  <input id="runner_field_adaptive_step_3m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>5 分钟绝对涨跌阈值
+                  <input id="runner_field_adaptive_step_5m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>最大放大倍数
+                  <input id="runner_field_adaptive_step_max_scale" type="number" min="0" step="0.01" />
+                </label>
+                <label>最小单笔缩放
+                  <input id="runner_field_adaptive_step_min_per_order_scale" type="number" min="0" step="0.01" />
+                </label>
+                <label>最小仓位上限缩放
+                  <input id="runner_field_adaptive_step_min_position_limit_scale" type="number" min="0" step="0.01" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="auto_regime">
+              <h3>自动切换</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_auto_regime_enabled" type="checkbox" />
+                    <span>启用行情状态自动切换</span>
+                  </span>
+                </label>
+                <label>切换确认轮数
+                  <input id="runner_field_auto_regime_confirm_cycles" type="number" min="1" step="1" />
+                </label>
+                <label>稳定 15 分钟最大振幅
+                  <input id="runner_field_auto_regime_stable_15m_max_amplitude_ratio" type="number" step="0.000001" />
+                </label>
+                <label>稳定 60 分钟最大振幅
+                  <input id="runner_field_auto_regime_stable_60m_max_amplitude_ratio" type="number" step="0.000001" />
+                </label>
+                <label>稳定 60 分钟最低涨跌
+                  <input id="runner_field_auto_regime_stable_60m_return_floor_ratio" type="number" step="0.000001" />
+                </label>
+                <label>防守 15 分钟振幅
+                  <input id="runner_field_auto_regime_defensive_15m_amplitude_ratio" type="number" step="0.000001" />
+                </label>
+                <label>防守 60 分钟振幅
+                  <input id="runner_field_auto_regime_defensive_60m_amplitude_ratio" type="number" step="0.000001" />
+                </label>
+                <label>防守 15 分钟涨跌
+                  <input id="runner_field_auto_regime_defensive_15m_return_ratio" type="number" step="0.000001" />
+                </label>
+                <label>防守 60 分钟涨跌
+                  <input id="runner_field_auto_regime_defensive_60m_return_ratio" type="number" step="0.000001" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="synthetic_trend_follow">
+              <h3>合成中性跟随</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_synthetic_trend_follow_enabled" type="checkbox" />
+                    <span>启用趋势跟随</span>
+                  </span>
+                </label>
+                <label>1 分钟绝对涨跌阈值
+                  <input id="runner_field_synthetic_trend_follow_1m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>1 分钟振幅阈值
+                  <input id="runner_field_synthetic_trend_follow_1m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>3 分钟绝对涨跌阈值
+                  <input id="runner_field_synthetic_trend_follow_3m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>3 分钟振幅阈值
+                  <input id="runner_field_synthetic_trend_follow_3m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>最小效率阈值
+                  <input id="runner_field_synthetic_trend_follow_min_efficiency_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>反向延迟秒数
+                  <input id="runner_field_synthetic_trend_follow_reverse_delay_seconds" type="number" min="0" step="0.1" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="target_neutral">
+              <h3>目标中性</h3>
+              <div class="runner-form-fields">
+                <label>中心重算周期（分钟）
+                  <input id="runner_field_neutral_center_interval_minutes" type="number" min="1" step="1" />
+                </label>
+                <label>Band1 偏移比例
+                  <input id="runner_field_neutral_band1_offset_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>Band2 偏移比例
+                  <input id="runner_field_neutral_band2_offset_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>Band3 偏移比例
+                  <input id="runner_field_neutral_band3_offset_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>Band1 目标仓位比例
+                  <input id="runner_field_neutral_band1_target_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>Band2 目标仓位比例
+                  <input id="runner_field_neutral_band2_target_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>Band3 目标仓位比例
+                  <input id="runner_field_neutral_band3_target_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_neutral_hourly_scale_enabled" type="checkbox" />
+                    <span>启用小时级仓位缩放</span>
+                  </span>
+                </label>
+                <label>稳定行情缩放
+                  <input id="runner_field_neutral_hourly_scale_stable" type="number" min="0" step="0.01" />
+                </label>
+                <label>过渡行情缩放
+                  <input id="runner_field_neutral_hourly_scale_transition" type="number" min="0" step="0.01" />
+                </label>
+                <label>防守行情缩放
+                  <input id="runner_field_neutral_hourly_scale_defensive" type="number" min="0" step="0.01" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section" data-runner-section="toggles">
               <h3>执行开关</h3>
               <div class="runner-form-fields">
                 <label class="inline-check">
@@ -11977,21 +12245,15 @@ MONITOR_PAGE = """<!doctype html>
                 </label>
                 <label class="inline-check">
                   <span class="check-row">
-                    <input id="runner_field_adaptive_step_enabled" type="checkbox" />
-                    <span>自适应步长</span>
-                  </span>
-                </label>
-                <label class="inline-check">
-                  <span class="check-row">
                     <input id="runner_field_excess_inventory_reduce_only_enabled" type="checkbox" />
                     <span>超仓只减不加</span>
                   </span>
                 </label>
               </div>
             </section>
-            <section class="runner-form-section full">
+            <section class="runner-form-section full" data-runner-section="hint">
               <h3>说明</h3>
-              <div class="runner-form-hint">这里先覆盖最常用、最容易出风险的字段。库存分层、分钟级停买、市场偏置、自定义中心、特殊触发器等细项仍保留在下方“高级模式 / 原始 JSON”里。</div>
+              <div class="runner-form-hint">字段已经按策略模式做显隐：单向做多只看做多相关参数，单向做空只看做空相关参数，合成/双向中性显示双边与中性护栏，目标中性只显示真正参与仓位曲线计算的参数。极少用的路径类字段仍保留在下方“高级模式 / 原始 JSON”里。</div>
             </section>
           </div>
           <details id="runner_params_advanced_panel" class="advanced-panel">
@@ -13354,39 +13616,113 @@ MONITOR_PAGE = """<!doctype html>
     let latestCustomGridPreview = null;
     let monitorSymbols = [];
     let latestRunnerEditorConfig = null;
+    const GRID_BASED_RUNNER_MODE_LIST = ["one_way_long", "one_way_short", "synthetic_neutral", "hedge_neutral"];
+    const GRID_BASED_RUNNER_MODES = new Set(GRID_BASED_RUNNER_MODE_LIST);
+    const LONG_CAPABLE_RUNNER_MODE_LIST = ["one_way_long", "synthetic_neutral", "hedge_neutral", "inventory_target_neutral"];
+    const SHORT_CAPABLE_RUNNER_MODE_LIST = ["one_way_short", "synthetic_neutral", "hedge_neutral", "inventory_target_neutral"];
+    const NEUTRAL_RUNNER_MODE_LIST = ["synthetic_neutral", "hedge_neutral", "inventory_target_neutral"];
+    const MARKET_BIAS_RUNNER_MODE_LIST = ["one_way_long", "synthetic_neutral", "hedge_neutral"];
+    const SYNTHETIC_RUNNER_MODE_LIST = ["synthetic_neutral"];
+    const TARGET_NEUTRAL_RUNNER_MODE_LIST = ["inventory_target_neutral"];
+    const LONG_ONLY_RUNNER_MODE_LIST = ["one_way_long"];
     const RUNNER_FORM_FIELDS = [
       { key: "strategy_mode", id: "runner_field_strategy_mode", type: "string", defaultValue: "one_way_long" },
-      { key: "step_price", id: "runner_field_step_price", type: "number" },
-      { key: "buy_levels", id: "runner_field_buy_levels", type: "integer" },
-      { key: "sell_levels", id: "runner_field_sell_levels", type: "integer" },
-      { key: "per_order_notional", id: "runner_field_per_order_notional", type: "number" },
-      { key: "startup_entry_multiplier", id: "runner_field_startup_entry_multiplier", type: "number", allowNull: true },
+      { key: "step_price", id: "runner_field_step_price", type: "number", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "buy_levels", id: "runner_field_buy_levels", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "sell_levels", id: "runner_field_sell_levels", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "per_order_notional", id: "runner_field_per_order_notional", type: "number", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "startup_entry_multiplier", id: "runner_field_startup_entry_multiplier", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "sleep_seconds", id: "runner_field_sleep_seconds", type: "number" },
       { key: "leverage", id: "runner_field_leverage", type: "integer" },
       { key: "maker_retries", id: "runner_field_maker_retries", type: "integer" },
       { key: "max_new_orders", id: "runner_field_max_new_orders", type: "integer" },
-      { key: "base_position_notional", id: "runner_field_base_position_notional", type: "number" },
-      { key: "pause_buy_position_notional", id: "runner_field_pause_buy_position_notional", type: "number", allowNull: true },
-      { key: "pause_short_position_notional", id: "runner_field_pause_short_position_notional", type: "number", allowNull: true },
-      { key: "max_position_notional", id: "runner_field_max_position_notional", type: "number", allowNull: true },
-      { key: "max_short_position_notional", id: "runner_field_max_short_position_notional", type: "number", allowNull: true },
+      { key: "base_position_notional", id: "runner_field_base_position_notional", type: "number", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "pause_buy_position_notional", id: "runner_field_pause_buy_position_notional", type: "number", allowNull: true, modes: LONG_CAPABLE_RUNNER_MODE_LIST },
+      { key: "pause_short_position_notional", id: "runner_field_pause_short_position_notional", type: "number", allowNull: true, modes: SHORT_CAPABLE_RUNNER_MODE_LIST },
+      { key: "max_position_notional", id: "runner_field_max_position_notional", type: "number", allowNull: true, modes: LONG_CAPABLE_RUNNER_MODE_LIST },
+      { key: "max_short_position_notional", id: "runner_field_max_short_position_notional", type: "number", allowNull: true, modes: SHORT_CAPABLE_RUNNER_MODE_LIST },
       { key: "max_total_notional", id: "runner_field_max_total_notional", type: "number", allowNull: true },
-      { key: "max_actual_net_notional", id: "runner_field_max_actual_net_notional", type: "number", allowNull: true },
-      { key: "max_synthetic_drift_notional", id: "runner_field_max_synthetic_drift_notional", type: "number", allowNull: true },
-      { key: "center_price", id: "runner_field_center_price", type: "number", allowNull: true },
-      { key: "up_trigger_steps", id: "runner_field_up_trigger_steps", type: "integer" },
-      { key: "down_trigger_steps", id: "runner_field_down_trigger_steps", type: "integer" },
-      { key: "shift_steps", id: "runner_field_shift_steps", type: "integer" },
+      { key: "max_actual_net_notional", id: "runner_field_max_actual_net_notional", type: "number", allowNull: true, modes: NEUTRAL_RUNNER_MODE_LIST },
+      { key: "max_synthetic_drift_notional", id: "runner_field_max_synthetic_drift_notional", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "center_price", id: "runner_field_center_price", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "up_trigger_steps", id: "runner_field_up_trigger_steps", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "down_trigger_steps", id: "runner_field_down_trigger_steps", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "shift_steps", id: "runner_field_shift_steps", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "max_plan_age_seconds", id: "runner_field_max_plan_age_seconds", type: "number", allowNull: true },
       { key: "max_mid_drift_steps", id: "runner_field_max_mid_drift_steps", type: "number", allowNull: true },
+      { key: "inventory_tier_start_notional", id: "runner_field_inventory_tier_start_notional", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "inventory_tier_end_notional", id: "runner_field_inventory_tier_end_notional", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "inventory_tier_buy_levels", id: "runner_field_inventory_tier_buy_levels", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "inventory_tier_sell_levels", id: "runner_field_inventory_tier_sell_levels", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "inventory_tier_per_order_notional", id: "runner_field_inventory_tier_per_order_notional", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "inventory_tier_base_position_notional", id: "runner_field_inventory_tier_base_position_notional", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "min_mid_price_for_buys", id: "runner_field_min_mid_price_for_buys", type: "number", allowNull: true, modes: LONG_CAPABLE_RUNNER_MODE_LIST },
+      { key: "buy_pause_amp_trigger_ratio", id: "runner_field_buy_pause_amp_trigger_ratio", type: "number", allowNull: true, modes: LONG_CAPABLE_RUNNER_MODE_LIST },
+      { key: "buy_pause_down_return_trigger_ratio", id: "runner_field_buy_pause_down_return_trigger_ratio", type: "number", allowNull: true, modes: LONG_CAPABLE_RUNNER_MODE_LIST },
+      { key: "short_cover_pause_amp_trigger_ratio", id: "runner_field_short_cover_pause_amp_trigger_ratio", type: "number", allowNull: true, modes: SHORT_CAPABLE_RUNNER_MODE_LIST },
+      { key: "short_cover_pause_down_return_trigger_ratio", id: "runner_field_short_cover_pause_down_return_trigger_ratio", type: "number", allowNull: true, modes: SHORT_CAPABLE_RUNNER_MODE_LIST },
+      { key: "freeze_shift_abs_return_trigger_ratio", id: "runner_field_freeze_shift_abs_return_trigger_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "fixed_center_enabled", id: "runner_field_fixed_center_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "fixed_center_roll_enabled", id: "runner_field_fixed_center_roll_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "static_buy_offset_steps", id: "runner_field_static_buy_offset_steps", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "static_sell_offset_steps", id: "runner_field_static_sell_offset_steps", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "market_bias_enabled", id: "runner_field_market_bias_enabled", type: "boolean", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_max_shift_steps", id: "runner_field_market_bias_max_shift_steps", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_signal_steps", id: "runner_field_market_bias_signal_steps", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_drift_weight", id: "runner_field_market_bias_drift_weight", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_return_weight", id: "runner_field_market_bias_return_weight", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_weak_buy_pause_enabled", id: "runner_field_market_bias_weak_buy_pause_enabled", type: "boolean", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_weak_buy_pause_threshold", id: "runner_field_market_bias_weak_buy_pause_threshold", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_strong_short_pause_enabled", id: "runner_field_market_bias_strong_short_pause_enabled", type: "boolean", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_strong_short_pause_threshold", id: "runner_field_market_bias_strong_short_pause_threshold", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_regime_switch_enabled", id: "runner_field_market_bias_regime_switch_enabled", type: "boolean", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_regime_switch_confirm_cycles", id: "runner_field_market_bias_regime_switch_confirm_cycles", type: "integer", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_regime_switch_weak_threshold", id: "runner_field_market_bias_regime_switch_weak_threshold", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "market_bias_regime_switch_strong_threshold", id: "runner_field_market_bias_regime_switch_strong_threshold", type: "number", modes: MARKET_BIAS_RUNNER_MODE_LIST },
+      { key: "adaptive_step_enabled", id: "runner_field_adaptive_step_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_30s_abs_return_ratio", id: "runner_field_adaptive_step_30s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_30s_amplitude_ratio", id: "runner_field_adaptive_step_30s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_1m_abs_return_ratio", id: "runner_field_adaptive_step_1m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_1m_amplitude_ratio", id: "runner_field_adaptive_step_1m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_3m_abs_return_ratio", id: "runner_field_adaptive_step_3m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_5m_abs_return_ratio", id: "runner_field_adaptive_step_5m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_max_scale", id: "runner_field_adaptive_step_max_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_min_per_order_scale", id: "runner_field_adaptive_step_min_per_order_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_min_position_limit_scale", id: "runner_field_adaptive_step_min_position_limit_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "auto_regime_enabled", id: "runner_field_auto_regime_enabled", type: "boolean", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_confirm_cycles", id: "runner_field_auto_regime_confirm_cycles", type: "integer", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_stable_15m_max_amplitude_ratio", id: "runner_field_auto_regime_stable_15m_max_amplitude_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_stable_60m_max_amplitude_ratio", id: "runner_field_auto_regime_stable_60m_max_amplitude_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_stable_60m_return_floor_ratio", id: "runner_field_auto_regime_stable_60m_return_floor_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_defensive_15m_amplitude_ratio", id: "runner_field_auto_regime_defensive_15m_amplitude_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_defensive_60m_amplitude_ratio", id: "runner_field_auto_regime_defensive_60m_amplitude_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_defensive_15m_return_ratio", id: "runner_field_auto_regime_defensive_15m_return_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "auto_regime_defensive_60m_return_ratio", id: "runner_field_auto_regime_defensive_60m_return_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "synthetic_trend_follow_enabled", id: "runner_field_synthetic_trend_follow_enabled", type: "boolean", modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "synthetic_trend_follow_1m_abs_return_ratio", id: "runner_field_synthetic_trend_follow_1m_abs_return_ratio", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "synthetic_trend_follow_1m_amplitude_ratio", id: "runner_field_synthetic_trend_follow_1m_amplitude_ratio", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "synthetic_trend_follow_3m_abs_return_ratio", id: "runner_field_synthetic_trend_follow_3m_abs_return_ratio", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "synthetic_trend_follow_3m_amplitude_ratio", id: "runner_field_synthetic_trend_follow_3m_amplitude_ratio", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "synthetic_trend_follow_min_efficiency_ratio", id: "runner_field_synthetic_trend_follow_min_efficiency_ratio", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "synthetic_trend_follow_reverse_delay_seconds", id: "runner_field_synthetic_trend_follow_reverse_delay_seconds", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "neutral_center_interval_minutes", id: "runner_field_neutral_center_interval_minutes", type: "integer", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_band1_offset_ratio", id: "runner_field_neutral_band1_offset_ratio", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_band2_offset_ratio", id: "runner_field_neutral_band2_offset_ratio", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_band3_offset_ratio", id: "runner_field_neutral_band3_offset_ratio", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_band1_target_ratio", id: "runner_field_neutral_band1_target_ratio", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_band2_target_ratio", id: "runner_field_neutral_band2_target_ratio", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_band3_target_ratio", id: "runner_field_neutral_band3_target_ratio", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_hourly_scale_enabled", id: "runner_field_neutral_hourly_scale_enabled", type: "boolean", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_hourly_scale_stable", id: "runner_field_neutral_hourly_scale_stable", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_hourly_scale_transition", id: "runner_field_neutral_hourly_scale_transition", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
+      { key: "neutral_hourly_scale_defensive", id: "runner_field_neutral_hourly_scale_defensive", type: "number", modes: TARGET_NEUTRAL_RUNNER_MODE_LIST },
       { key: "flat_start_enabled", id: "runner_field_flat_start_enabled", type: "boolean" },
       { key: "warm_start_enabled", id: "runner_field_warm_start_enabled", type: "boolean" },
       { key: "cancel_stale", id: "runner_field_cancel_stale", type: "boolean" },
       { key: "apply", id: "runner_field_apply", type: "boolean" },
       { key: "reset_state", id: "runner_field_reset_state", type: "boolean" },
       { key: "autotune_symbol_enabled", id: "runner_field_autotune_symbol_enabled", type: "boolean" },
-      { key: "adaptive_step_enabled", id: "runner_field_adaptive_step_enabled", type: "boolean" },
-      { key: "excess_inventory_reduce_only_enabled", id: "runner_field_excess_inventory_reduce_only_enabled", type: "boolean" },
+      { key: "excess_inventory_reduce_only_enabled", id: "runner_field_excess_inventory_reduce_only_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
     ];
     const RUNNER_PARAM_EXPLAIN = {
       strategy_profile: "策略模板标识。用于区分量优先做空、做多、防守或自定义策略。",
@@ -13756,6 +14092,36 @@ MONITOR_PAGE = """<!doctype html>
       return document.getElementById(field.id);
     }
 
+    function runnerFormFieldLabelEl(field) {
+      const el = runnerFormFieldEl(field);
+      return el ? el.closest("label") : null;
+    }
+
+    function runnerFieldMatchesMode(field, mode) {
+      if (!field || !Array.isArray(field.modes) || !field.modes.length) {
+        return true;
+      }
+      return field.modes.includes(mode);
+    }
+
+    function applyRunnerModeVisibility(mode) {
+      const normalizedMode = String(mode || "one_way_long").trim() || "one_way_long";
+      RUNNER_FORM_FIELDS.forEach((field) => {
+        const label = runnerFormFieldLabelEl(field);
+        if (!label) return;
+        label.hidden = !runnerFieldMatchesMode(field, normalizedMode);
+      });
+      if (!runnerParamsFormEl) return;
+      runnerParamsFormEl.querySelectorAll(".runner-form-section").forEach((section) => {
+        const labels = Array.from(section.querySelectorAll(".runner-form-fields > label"));
+        if (!labels.length) {
+          section.hidden = false;
+          return;
+        }
+        section.hidden = labels.every((label) => label.hidden);
+      });
+    }
+
     function syncRunnerFormFromConfig(config) {
       const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
       RUNNER_FORM_FIELDS.forEach((field) => {
@@ -13772,6 +14138,7 @@ MONITOR_PAGE = """<!doctype html>
         }
         el.value = String(value);
       });
+      applyRunnerModeVisibility(String(source.strategy_mode || "one_way_long"));
     }
 
     function mergeRunnerConfigFromForm(baseConfig) {
@@ -13821,6 +14188,7 @@ MONITOR_PAGE = """<!doctype html>
       );
       latestRunnerEditorConfig = nextConfig;
       runnerParamsEditorEl.value = JSON.stringify(nextConfig, null, 2);
+      applyRunnerModeVisibility(String(nextConfig.strategy_mode || "one_way_long"));
       renderRunnerParamGuide(nextConfig);
       runnerParamsMetaEl.textContent = "字段表单已同步到高级 JSON，可继续保存或直接应用。";
     }

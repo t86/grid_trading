@@ -1544,6 +1544,19 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("高级模式 / 原始 JSON", MONITOR_PAGE)
         self.assertIn('id="runner_params_editor"', MONITOR_PAGE)
 
+    def test_monitor_page_exposes_advanced_runner_fields_and_mode_visibility_logic(self) -> None:
+        self.assertIn('id="runner_field_inventory_tier_start_notional"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_buy_pause_amp_trigger_ratio"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_market_bias_enabled"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_auto_regime_enabled"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_synthetic_trend_follow_enabled"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_neutral_band1_offset_ratio"', MONITOR_PAGE)
+        self.assertIn("库存分层", MONITOR_PAGE)
+        self.assertIn("合成中性跟随", MONITOR_PAGE)
+        self.assertIn("目标中性", MONITOR_PAGE)
+        self.assertIn("function applyRunnerModeVisibility(mode)", MONITOR_PAGE)
+        self.assertIn("GRID_BASED_RUNNER_MODES", MONITOR_PAGE)
+
     def test_strategies_page_contains_manual_symbol_list_controls(self) -> None:
         self.assertIn('id="monitor_symbol_input"', STRATEGIES_PAGE)
         self.assertIn('id="competition_symbol_input"', STRATEGIES_PAGE)
