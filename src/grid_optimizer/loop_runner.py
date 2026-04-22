@@ -2081,6 +2081,120 @@ def _ensure_synthetic_buffer_fields(ledger: dict[str, Any]) -> None:
     ledger["grid_buffer_spent_notional"] = max(_safe_float(ledger.get("grid_buffer_spent_notional")), 0.0)
 
 
+def _snapshot_synthetic_ledger(
+    ledger: dict[str, Any],
+    *,
+    applied_trade_count: int = 0,
+    unmatched_trade_count: int = 0,
+) -> dict[str, Any]:
+    return {
+        "virtual_long_qty": max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
+        "virtual_long_avg_price": max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
+        "virtual_long_lots": list(ledger.get("virtual_long_lots") or []),
+        "virtual_short_qty": max(_safe_float(ledger.get("virtual_short_qty")), 0.0),
+        "virtual_short_avg_price": max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0),
+        "virtual_short_lots": list(ledger.get("virtual_short_lots") or []),
+        "grid_buffer_realized_notional": max(_safe_float(ledger.get("grid_buffer_realized_notional")), 0.0),
+        "grid_buffer_spent_notional": max(_safe_float(ledger.get("grid_buffer_spent_notional")), 0.0),
+        "synthetic_net_compacted_qty_total": max(
+            _safe_float(ledger.get("synthetic_net_compacted_qty_total")),
+            0.0,
+        ),
+        "synthetic_net_compacted_last_qty": max(
+            _safe_float(ledger.get("synthetic_net_compacted_last_qty")),
+            0.0,
+        ),
+        "synthetic_net_compacted_at": str(ledger.get("synthetic_net_compacted_at") or ""),
+        "applied_trade_count": int(applied_trade_count or 0),
+        "unmatched_trade_count": int(unmatched_trade_count or 0),
+    }
+
+
+def _compact_synthetic_ledger_matched_exposure(
+    *,
+    ledger: dict[str, Any],
+    actual_position_qty: float,
+    entry_price: float,
+    fallback_price: float,
+    qty_tolerance: float | None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    _ensure_synthetic_buffer_fields(ledger)
+    long_lots = _normalize_synthetic_lots(
+        ledger.get("virtual_long_lots"),
+        fallback_qty=max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
+        fallback_price=max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
+    )
+    short_lots = _normalize_synthetic_lots(
+        ledger.get("virtual_short_lots"),
+        fallback_qty=max(_safe_float(ledger.get("virtual_short_qty")), 0.0),
+        fallback_price=max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0),
+    )
+    long_qty, long_avg = _synthetic_book_from_lots(long_lots)
+    short_qty, short_avg = _synthetic_book_from_lots(short_lots)
+    matched_qty = min(long_qty, short_qty)
+    if matched_qty <= 1e-12:
+        ledger["virtual_long_qty"] = long_qty
+        ledger["virtual_long_avg_price"] = long_avg
+        ledger["virtual_long_lots"] = long_lots
+        ledger["virtual_short_qty"] = short_qty
+        ledger["virtual_short_avg_price"] = short_avg
+        ledger["virtual_short_lots"] = short_lots
+        ledger["synthetic_net_compacted_last_qty"] = 0.0
+        return {"compacted": False, "matched_qty": 0.0}
+
+    tolerance = max(_safe_float(qty_tolerance), 0.0)
+    synthetic_net_qty = long_qty - short_qty
+    actual_net_qty = float(actual_position_qty)
+    use_actual_net = tolerance > 0 and abs(actual_net_qty - synthetic_net_qty) <= tolerance
+    target_net_qty = actual_net_qty if use_actual_net else synthetic_net_qty
+    if abs(target_net_qty) <= max(tolerance, 1e-12):
+        target_net_qty = 0.0
+
+    residual_long_lots, _ = _consume_synthetic_lots_fifo_with_cost(long_lots, matched_qty)
+    residual_short_lots, _ = _consume_synthetic_lots_fifo_with_cost(short_lots, matched_qty)
+    residual_long_qty, residual_long_avg = _synthetic_book_from_lots(residual_long_lots)
+    residual_short_qty, residual_short_avg = _synthetic_book_from_lots(residual_short_lots)
+    authoritative_price = max(_safe_float(entry_price), 0.0) if use_actual_net else 0.0
+    fallback = max(_safe_float(fallback_price), 0.0)
+
+    if target_net_qty > 0:
+        qty = max(float(target_net_qty), 0.0)
+        price = authoritative_price or residual_long_avg or long_avg or fallback
+        ledger["virtual_long_lots"] = [{"qty": qty, "price": price}] if price > 0 else residual_long_lots
+        ledger["virtual_short_lots"] = []
+    elif target_net_qty < 0:
+        qty = max(abs(float(target_net_qty)), 0.0)
+        price = authoritative_price or residual_short_avg or short_avg or fallback
+        ledger["virtual_long_lots"] = []
+        ledger["virtual_short_lots"] = [{"qty": qty, "price": price}] if price > 0 else residual_short_lots
+    else:
+        ledger["virtual_long_lots"] = []
+        ledger["virtual_short_lots"] = []
+
+    ledger["virtual_long_qty"], ledger["virtual_long_avg_price"] = _synthetic_book_from_lots(
+        ledger["virtual_long_lots"]
+    )
+    ledger["virtual_short_qty"], ledger["virtual_short_avg_price"] = _synthetic_book_from_lots(
+        ledger["virtual_short_lots"]
+    )
+    ledger["synthetic_net_compacted_qty_total"] = max(
+        _safe_float(ledger.get("synthetic_net_compacted_qty_total")),
+        0.0,
+    ) + matched_qty
+    ledger["synthetic_net_compacted_last_qty"] = matched_qty
+    ledger["synthetic_net_compacted_at"] = (now or _utc_now()).isoformat()
+    ledger["synthetic_net_compacted_actual_net_used"] = bool(use_actual_net)
+    ledger["synthetic_net_compacted_residual_long_qty"] = residual_long_qty
+    ledger["synthetic_net_compacted_residual_short_qty"] = residual_short_qty
+    return {
+        "compacted": True,
+        "matched_qty": matched_qty,
+        "target_net_qty": target_net_qty,
+        "used_actual_net": bool(use_actual_net),
+    }
+
+
 def _apply_synthetic_trade_fill(
     *,
     ledger: dict[str, Any],
@@ -2197,19 +2311,13 @@ def _maybe_resync_synthetic_ledger_to_actual(
         entry_price=resolved_price,
         reason="actual_position_drift",
     )
-    return {
-        "virtual_long_qty": max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
-        "virtual_long_avg_price": max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
-        "virtual_long_lots": list(ledger.get("virtual_long_lots") or []),
-        "virtual_short_qty": max(_safe_float(ledger.get("virtual_short_qty")), 0.0),
-        "virtual_short_avg_price": max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0),
-        "virtual_short_lots": list(ledger.get("virtual_short_lots") or []),
-        "grid_buffer_realized_notional": max(_safe_float(ledger.get("grid_buffer_realized_notional")), 0.0),
-        "grid_buffer_spent_notional": max(_safe_float(ledger.get("grid_buffer_spent_notional")), 0.0),
-        "applied_trade_count": int(snapshot.get("applied_trade_count") or 0),
-        "unmatched_trade_count": int(snapshot.get("unmatched_trade_count") or 0),
-        "resynced_to_actual": True,
-    }
+    result = _snapshot_synthetic_ledger(
+        ledger,
+        applied_trade_count=int(snapshot.get("applied_trade_count") or 0),
+        unmatched_trade_count=int(snapshot.get("unmatched_trade_count") or 0),
+    )
+    result["resynced_to_actual"] = True
+    return result
 
 
 def sync_synthetic_ledger(
@@ -2261,19 +2369,12 @@ def sync_synthetic_ledger(
     ledger["last_trade_keys_at_time"] = list(keys_at_time)
     ledger["unmatched_trade_count"] = int(ledger.get("unmatched_trade_count") or 0) + unmatched
     state["synthetic_ledger"] = ledger
-    snapshot = {
-        "virtual_long_qty": max(_safe_float(ledger.get("virtual_long_qty")), 0.0),
-        "virtual_long_avg_price": max(_safe_float(ledger.get("virtual_long_avg_price")), 0.0),
-        "virtual_long_lots": list(ledger.get("virtual_long_lots") or []),
-        "virtual_short_qty": max(_safe_float(ledger.get("virtual_short_qty")), 0.0),
-        "virtual_short_avg_price": max(_safe_float(ledger.get("virtual_short_avg_price")), 0.0),
-        "virtual_short_lots": list(ledger.get("virtual_short_lots") or []),
-        "grid_buffer_realized_notional": max(_safe_float(ledger.get("grid_buffer_realized_notional")), 0.0),
-        "grid_buffer_spent_notional": max(_safe_float(ledger.get("grid_buffer_spent_notional")), 0.0),
-        "applied_trade_count": applied,
-        "unmatched_trade_count": unmatched,
-    }
-    return _maybe_resync_synthetic_ledger_to_actual(
+    snapshot = _snapshot_synthetic_ledger(
+        ledger,
+        applied_trade_count=applied,
+        unmatched_trade_count=unmatched,
+    )
+    snapshot = _maybe_resync_synthetic_ledger_to_actual(
         state=state,
         snapshot=snapshot,
         actual_position_qty=actual_position_qty,
@@ -2281,6 +2382,29 @@ def sync_synthetic_ledger(
         fallback_price=fallback_price,
         qty_tolerance=qty_tolerance,
     )
+    if not _truthy(snapshot.get("resynced_to_actual")):
+        ledger = dict(state.get("synthetic_ledger") or ledger)
+        compact_report = _compact_synthetic_ledger_matched_exposure(
+            ledger=ledger,
+            actual_position_qty=actual_position_qty,
+            entry_price=entry_price,
+            fallback_price=fallback_price,
+            qty_tolerance=qty_tolerance,
+        )
+        if bool(compact_report.get("compacted")):
+            state["synthetic_ledger"] = ledger
+            snapshot = _snapshot_synthetic_ledger(
+                ledger,
+                applied_trade_count=applied,
+                unmatched_trade_count=unmatched,
+            )
+            snapshot["resynced_to_actual"] = False
+            snapshot["synthetic_net_compacted"] = True
+            snapshot["synthetic_net_compacted_qty"] = float(compact_report.get("matched_qty") or 0.0)
+            snapshot["synthetic_net_compacted_used_actual_net"] = bool(compact_report.get("used_actual_net"))
+        else:
+            snapshot["synthetic_net_compacted"] = False
+    return snapshot
 
 
 def update_synthetic_order_refs(

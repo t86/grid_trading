@@ -2595,6 +2595,96 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot["virtual_short_lots"], [{"qty": 140.0, "price": 0.3198}])
         self.assertFalse(snapshot.get("resynced_to_actual"))
 
+    def test_sync_synthetic_ledger_compacts_matched_virtual_books_to_flat_actual_position(self) -> None:
+        now = datetime(2026, 4, 8, 5, 0, tzinfo=timezone.utc)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 299.0,
+                "virtual_long_avg_price": 0.168,
+                "virtual_long_lots": [{"qty": 299.0, "price": 0.168}],
+                "virtual_short_qty": 299.0,
+                "virtual_short_avg_price": 0.166,
+                "virtual_short_lots": [{"qty": 299.0, "price": 0.166}],
+                "grid_buffer_realized_notional": 1.5,
+                "grid_buffer_spent_notional": 0.25,
+                "last_trade_time_ms": int((now - timedelta(seconds=2)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            }
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="SOONUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=0.0,
+                entry_price=0.0,
+                qty_tolerance=1.0,
+                fallback_price=0.1668,
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_long_qty"], 0.0)
+        self.assertAlmostEqual(snapshot["virtual_short_qty"], 0.0)
+        self.assertEqual(snapshot["virtual_long_lots"], [])
+        self.assertEqual(snapshot["virtual_short_lots"], [])
+        self.assertFalse(snapshot["resynced_to_actual"])
+        self.assertTrue(snapshot["synthetic_net_compacted"])
+        self.assertAlmostEqual(snapshot["synthetic_net_compacted_qty"], 299.0)
+        self.assertAlmostEqual(snapshot["grid_buffer_realized_notional"], 1.5)
+        self.assertAlmostEqual(snapshot["grid_buffer_spent_notional"], 0.25)
+        self.assertEqual(state["synthetic_ledger"]["virtual_long_lots"], [])
+        self.assertEqual(state["synthetic_ledger"]["virtual_short_lots"], [])
+
+    def test_sync_synthetic_ledger_compacts_matched_virtual_books_to_actual_net_cost_basis(self) -> None:
+        now = datetime(2026, 4, 8, 5, 0, tzinfo=timezone.utc)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 300.0,
+                "virtual_long_avg_price": 0.17,
+                "virtual_long_lots": [
+                    {"qty": 100.0, "price": 0.16},
+                    {"qty": 200.0, "price": 0.175},
+                ],
+                "virtual_short_qty": 120.0,
+                "virtual_short_avg_price": 0.165,
+                "virtual_short_lots": [{"qty": 120.0, "price": 0.165}],
+                "last_trade_time_ms": int((now - timedelta(seconds=2)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            }
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="SOONUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=180.0,
+                entry_price=0.168,
+                qty_tolerance=1.0,
+                fallback_price=0.1668,
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_long_qty"], 180.0)
+        self.assertAlmostEqual(snapshot["virtual_long_avg_price"], 0.168)
+        self.assertEqual(snapshot["virtual_long_lots"], [{"qty": 180.0, "price": 0.168}])
+        self.assertAlmostEqual(snapshot["virtual_short_qty"], 0.0)
+        self.assertTrue(snapshot["synthetic_net_compacted"])
+        self.assertTrue(snapshot["synthetic_net_compacted_used_actual_net"])
+
     def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
