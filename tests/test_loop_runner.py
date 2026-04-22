@@ -38,6 +38,7 @@ from grid_optimizer.loop_runner import (
     apply_max_position_notional_cap,
     apply_position_controls,
     apply_take_profit_profit_guard,
+    apply_synthetic_flow_sleeve,
     apply_short_cover_pause,
     apply_warm_start_bootstrap_guard,
     assess_synthetic_tp_only_watchdog,
@@ -208,6 +209,98 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.synthetic_center_fast_catchup_trigger_steps, 6.0)
         self.assertEqual(args.synthetic_center_fast_catchup_confirm_cycles, 3)
         self.assertEqual(args.synthetic_center_fast_catchup_shift_steps, 2)
+
+    def test_build_parser_accepts_synthetic_flow_sleeve_args(self) -> None:
+        parser = _build_parser()
+
+        args = parser.parse_args(
+            [
+                "--synthetic-flow-sleeve-enabled",
+                "--synthetic-flow-sleeve-trigger-notional",
+                "180",
+                "--synthetic-flow-sleeve-notional",
+                "120",
+                "--synthetic-flow-sleeve-levels",
+                "3",
+                "--synthetic-flow-sleeve-order-notional",
+                "45",
+                "--synthetic-flow-sleeve-max-loss-ratio",
+                "0.003",
+            ]
+        )
+
+        self.assertTrue(args.synthetic_flow_sleeve_enabled)
+        self.assertEqual(args.synthetic_flow_sleeve_trigger_notional, 180)
+        self.assertEqual(args.synthetic_flow_sleeve_notional, 120)
+        self.assertEqual(args.synthetic_flow_sleeve_levels, 3)
+        self.assertEqual(args.synthetic_flow_sleeve_order_notional, 45)
+        self.assertEqual(args.synthetic_flow_sleeve_max_loss_ratio, 0.003)
+
+    def test_synthetic_flow_sleeve_adds_bounded_opposite_entries(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
+
+        report = apply_synthetic_flow_sleeve(
+            plan=plan,
+            enabled=True,
+            current_long_notional=220,
+            current_short_notional=0,
+            current_long_avg_price=0.165,
+            current_short_avg_price=0,
+            trigger_notional=180,
+            sleeve_notional=120,
+            levels=3,
+            per_order_notional=45,
+            order_notional=None,
+            max_loss_ratio=0.003,
+            step_price=0.0002,
+            tick_size=0.0001,
+            step_size=1,
+            min_qty=1,
+            min_notional=5,
+            bid_price=0.1653,
+            ask_price=0.1654,
+            buy_offset_steps=0.25,
+            sell_offset_steps=0.25,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["direction"], "long_inventory_sell_flow")
+        self.assertEqual(report["placed_order_count"], 3)
+        self.assertLessEqual(report["placed_notional"], 120)
+        self.assertEqual(len(plan["sell_orders"]), 3)
+        self.assertTrue(all(item["role"] == "entry_short" for item in plan["sell_orders"]))
+        self.assertTrue(all(item["flow_sleeve"] for item in plan["sell_orders"]))
+
+    def test_synthetic_flow_sleeve_respects_loss_guard(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
+
+        report = apply_synthetic_flow_sleeve(
+            plan=plan,
+            enabled=True,
+            current_long_notional=220,
+            current_short_notional=0,
+            current_long_avg_price=0.17,
+            current_short_avg_price=0,
+            trigger_notional=180,
+            sleeve_notional=120,
+            levels=3,
+            per_order_notional=45,
+            order_notional=None,
+            max_loss_ratio=0.003,
+            step_price=0.0002,
+            tick_size=0.0001,
+            step_size=1,
+            min_qty=1,
+            min_notional=5,
+            bid_price=0.1653,
+            ask_price=0.1654,
+            buy_offset_steps=0.25,
+            sell_offset_steps=0.25,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "loss_guard")
+        self.assertEqual(plan["sell_orders"], [])
 
     @patch("grid_optimizer.loop_runner.determine_interval_center_price")
     def test_resolve_interval_locked_center_price_rolls_halfway_to_target_center(self, mock_determine_interval_center_price) -> None:

@@ -3385,6 +3385,184 @@ def apply_take_profit_profit_guard(
     return report
 
 
+def apply_synthetic_flow_sleeve(
+    *,
+    plan: dict[str, Any],
+    enabled: bool,
+    current_long_notional: float,
+    current_short_notional: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    trigger_notional: float | None,
+    sleeve_notional: float,
+    levels: int,
+    per_order_notional: float,
+    order_notional: float | None,
+    max_loss_ratio: float | None,
+    step_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+    buy_offset_steps: float = 0.0,
+    sell_offset_steps: float = 0.0,
+) -> dict[str, Any]:
+    report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "direction": None,
+        "trigger_notional": trigger_notional,
+        "sleeve_notional": sleeve_notional,
+        "remaining_sleeve_notional": 0.0,
+        "order_notional": order_notional,
+        "levels": levels,
+        "max_loss_ratio": max_loss_ratio,
+        "placed_order_count": 0,
+        "placed_notional": 0.0,
+        "blocked_reason": None,
+    }
+    if not enabled:
+        return report
+
+    safe_sleeve_notional = max(_safe_float(sleeve_notional), 0.0)
+    safe_levels = max(int(levels or 0), 0)
+    safe_step_price = max(_safe_float(step_price), 0.0)
+    safe_per_order_notional = max(_safe_float(order_notional), _safe_float(per_order_notional), 0.0)
+    safe_trigger_notional = max(_safe_float(trigger_notional), 0.0)
+    safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
+    if safe_sleeve_notional <= 0 or safe_levels <= 0 or safe_step_price <= 0 or safe_per_order_notional <= 0:
+        report["blocked_reason"] = "invalid_config"
+        return report
+    if safe_trigger_notional <= 0:
+        report["blocked_reason"] = "missing_trigger_notional"
+        return report
+
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    short_notional = max(_safe_float(current_short_notional), 0.0)
+    if long_notional < safe_trigger_notional and short_notional < safe_trigger_notional:
+        report["blocked_reason"] = "below_trigger"
+        return report
+
+    direction: str
+    if long_notional >= short_notional:
+        direction = "long_inventory_sell_flow"
+        remaining_sleeve_notional = max(safe_sleeve_notional - short_notional, 0.0)
+    else:
+        direction = "short_inventory_buy_flow"
+        remaining_sleeve_notional = max(safe_sleeve_notional - long_notional, 0.0)
+    report["direction"] = direction
+    report["remaining_sleeve_notional"] = remaining_sleeve_notional
+    if remaining_sleeve_notional <= 1e-12:
+        report["blocked_reason"] = "sleeve_full"
+        return report
+
+    existing_keys = {
+        f"{str(item.get('side', '')).upper().strip()}:{_safe_float(item.get('price')):.10f}"
+        for key in ("buy_orders", "sell_orders", "bootstrap_orders")
+        for item in plan.get(key, [])
+        if isinstance(item, dict)
+    }
+
+    def _append_flow_order(*, side: str, price: float, notional_budget: float, role: str, level: int) -> float:
+        qty = _round_order_qty(max(notional_budget, 0.0) / price, step_size)
+        notional = price * qty
+        if qty <= 0:
+            return 0.0
+        if min_qty is not None and qty < min_qty:
+            return 0.0
+        if min_notional is not None and notional < min_notional:
+            return 0.0
+        key = f"{side}:{price:.10f}"
+        if key in existing_keys:
+            return 0.0
+        existing_keys.add(key)
+        order = {
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "notional": notional,
+            "level": level,
+            "role": role,
+            "position_side": "BOTH",
+            "flow_sleeve": True,
+        }
+        if side == "BUY":
+            plan.setdefault("buy_orders", []).append(order)
+        else:
+            plan.setdefault("sell_orders", []).append(order)
+        return notional
+
+    placed_count = 0
+    placed_notional = 0.0
+    remaining = remaining_sleeve_notional
+    if direction == "long_inventory_sell_flow":
+        min_allowed_price = 0.0
+        if safe_max_loss_ratio > 0 and current_long_avg_price > 0:
+            min_allowed_price = float(current_long_avg_price) * (1.0 - safe_max_loss_ratio)
+        for level in range(1, safe_levels + 1):
+            distance_steps = max((float(level) - 1.0) + float(sell_offset_steps), 0.0)
+            raw_price = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(safe_step_price))))
+            price = _round_order_price(raw_price, tick_size, "SELL")
+            if price <= bid_price:
+                continue
+            if min_allowed_price > 0 and price < min_allowed_price:
+                report["blocked_reason"] = "loss_guard"
+                break
+            consumed = _append_flow_order(
+                side="SELL",
+                price=price,
+                notional_budget=min(safe_per_order_notional, remaining),
+                role="entry_short",
+                level=900 + level,
+            )
+            if consumed <= 0:
+                continue
+            placed_count += 1
+            placed_notional += consumed
+            remaining = max(remaining - consumed, 0.0)
+            if remaining <= 1e-12:
+                break
+    else:
+        max_allowed_price = 0.0
+        if safe_max_loss_ratio > 0 and current_short_avg_price > 0:
+            max_allowed_price = float(current_short_avg_price) * (1.0 + safe_max_loss_ratio)
+        for level in range(1, safe_levels + 1):
+            distance_steps = max((float(level) - 1.0) + float(buy_offset_steps), 0.0)
+            raw_price = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(safe_step_price))))
+            price = _round_order_price(raw_price, tick_size, "BUY")
+            if price <= 0 or price >= ask_price:
+                continue
+            if max_allowed_price > 0 and price > max_allowed_price:
+                report["blocked_reason"] = "loss_guard"
+                break
+            consumed = _append_flow_order(
+                side="BUY",
+                price=price,
+                notional_budget=min(safe_per_order_notional, remaining),
+                role="entry_long",
+                level=900 + level,
+            )
+            if consumed <= 0:
+                continue
+            placed_count += 1
+            placed_notional += consumed
+            remaining = max(remaining - consumed, 0.0)
+            if remaining <= 1e-12:
+                break
+
+    report["active"] = placed_count > 0
+    report["placed_order_count"] = placed_count
+    report["placed_notional"] = placed_notional
+    report["remaining_sleeve_notional"] = max(remaining, 0.0)
+    if placed_count > 0:
+        report["blocked_reason"] = None
+    elif not report.get("blocked_reason"):
+        report["blocked_reason"] = "no_valid_order"
+    return report
+
+
 def resolve_short_threshold_timeout_state(
     *,
     state: dict[str, Any],
@@ -5865,6 +6043,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     xaut_adaptive: dict[str, Any] | None = None
     synthetic_tp_only_watchdog: dict[str, Any] | None = None
     synthetic_inventory_exit_priority: dict[str, Any] | None = None
+    synthetic_flow_sleeve: dict[str, Any] = {
+        "enabled": bool(getattr(args, "synthetic_flow_sleeve_enabled", False)),
+        "active": False,
+        "direction": None,
+        "trigger_notional": getattr(args, "synthetic_flow_sleeve_trigger_notional", None),
+        "sleeve_notional": getattr(args, "synthetic_flow_sleeve_notional", 0.0),
+        "remaining_sleeve_notional": 0.0,
+        "order_notional": getattr(args, "synthetic_flow_sleeve_order_notional", None),
+        "levels": getattr(args, "synthetic_flow_sleeve_levels", 0),
+        "max_loss_ratio": getattr(args, "synthetic_flow_sleeve_max_loss_ratio", None),
+        "placed_order_count": 0,
+        "placed_notional": 0.0,
+        "blocked_reason": "not_evaluated",
+    }
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
@@ -6852,6 +7044,35 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             paused_entry_short_scale=combined_short_probe_scale,
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
+        synthetic_flow_sleeve = apply_synthetic_flow_sleeve(
+            plan=plan,
+            enabled=bool(getattr(effective_args, "synthetic_flow_sleeve_enabled", False)),
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            trigger_notional=getattr(effective_args, "synthetic_flow_sleeve_trigger_notional", None),
+            sleeve_notional=getattr(effective_args, "synthetic_flow_sleeve_notional", 0.0),
+            levels=int(getattr(effective_args, "synthetic_flow_sleeve_levels", 0) or 0),
+            per_order_notional=inventory_tier["effective_per_order_notional"],
+            order_notional=getattr(effective_args, "synthetic_flow_sleeve_order_notional", None),
+            max_loss_ratio=getattr(effective_args, "synthetic_flow_sleeve_max_loss_ratio", None),
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            buy_offset_steps=(
+                float(getattr(effective_args, "static_buy_offset_steps", 0.0))
+                + float((market_bias or {}).get("buy_offset_steps", 0.0))
+            ),
+            sell_offset_steps=(
+                float(getattr(effective_args, "static_sell_offset_steps", 0.0))
+                + float((market_bias or {}).get("sell_offset_steps", 0.0))
+            ),
+        )
         synthetic_trend_follow = resolve_synthetic_trend_follow(
             state=state,
             market_guard=market_guard,
@@ -7499,6 +7720,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
         "synthetic_trend_follow": synthetic_trend_follow,
+        "synthetic_flow_sleeve": synthetic_flow_sleeve,
         "take_profit_guard": take_profit_guard,
         "volume_long_v4_delever": volume_long_v4_delever,
         "active_delever": active_delever,
@@ -8103,6 +8325,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthetic-trend-follow-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--synthetic-trend-follow-min-efficiency-ratio", type=float, default=0.0)
     parser.add_argument("--synthetic-trend-follow-reverse-delay-seconds", type=float, default=0.0)
+    parser.add_argument("--synthetic-flow-sleeve-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--synthetic-flow-sleeve-trigger-notional", type=float, default=None)
+    parser.add_argument("--synthetic-flow-sleeve-notional", type=float, default=0.0)
+    parser.add_argument("--synthetic-flow-sleeve-levels", type=int, default=2)
+    parser.add_argument("--synthetic-flow-sleeve-order-notional", type=float, default=None)
+    parser.add_argument("--synthetic-flow-sleeve-max-loss-ratio", type=float, default=0.0025)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -8909,6 +9137,23 @@ def main() -> None:
                 ),
                 "synthetic_trend_follow_reverse_delay_remaining_seconds": _safe_float(
                     (plan_report.get("synthetic_trend_follow") or {}).get("reverse_delay_remaining_seconds")
+                ),
+                "synthetic_flow_sleeve_enabled": bool(((plan_report.get("synthetic_flow_sleeve") or {}).get("enabled"))),
+                "synthetic_flow_sleeve_active": bool(((plan_report.get("synthetic_flow_sleeve") or {}).get("active"))),
+                "synthetic_flow_sleeve_direction": str(
+                    ((plan_report.get("synthetic_flow_sleeve") or {}).get("direction", "") or "")
+                ),
+                "synthetic_flow_sleeve_placed_order_count": int(
+                    ((plan_report.get("synthetic_flow_sleeve") or {}).get("placed_order_count", 0) or 0)
+                ),
+                "synthetic_flow_sleeve_placed_notional": _safe_float(
+                    (plan_report.get("synthetic_flow_sleeve") or {}).get("placed_notional")
+                ),
+                "synthetic_flow_sleeve_remaining_notional": _safe_float(
+                    (plan_report.get("synthetic_flow_sleeve") or {}).get("remaining_sleeve_notional")
+                ),
+                "synthetic_flow_sleeve_blocked_reason": (
+                    (plan_report.get("synthetic_flow_sleeve") or {}).get("blocked_reason")
                 ),
                 "effective_buy_levels": int(plan_report.get("effective_buy_levels", 0) or 0),
                 "effective_sell_levels": int(plan_report.get("effective_sell_levels", 0) or 0),

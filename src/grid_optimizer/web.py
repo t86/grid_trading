@@ -1390,6 +1390,12 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "synthetic_trend_follow_3m_amplitude_ratio": 0.0,
     "synthetic_trend_follow_min_efficiency_ratio": 0.0,
     "synthetic_trend_follow_reverse_delay_seconds": 0.0,
+    "synthetic_flow_sleeve_enabled": False,
+    "synthetic_flow_sleeve_trigger_notional": None,
+    "synthetic_flow_sleeve_notional": 0.0,
+    "synthetic_flow_sleeve_levels": 2,
+    "synthetic_flow_sleeve_order_notional": None,
+    "synthetic_flow_sleeve_max_loss_ratio": 0.0025,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -3242,6 +3248,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_trend_follow_3m_amplitude_ratio",
         "synthetic_trend_follow_min_efficiency_ratio",
         "synthetic_trend_follow_reverse_delay_seconds",
+        "synthetic_flow_sleeve_trigger_notional",
+        "synthetic_flow_sleeve_notional",
+        "synthetic_flow_sleeve_order_notional",
+        "synthetic_flow_sleeve_max_loss_ratio",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -3293,6 +3303,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "near_market_reentry_confirm_cycles",
         "auto_regime_confirm_cycles",
         "market_bias_regime_switch_confirm_cycles",
+        "synthetic_flow_sleeve_levels",
         "neutral_center_interval_minutes",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
@@ -3309,6 +3320,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_enabled",
         "adaptive_step_enabled",
         "synthetic_trend_follow_enabled",
+        "synthetic_flow_sleeve_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
@@ -3368,6 +3380,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_trend_follow_3m_amplitude_ratio",
         "synthetic_trend_follow_min_efficiency_ratio",
         "synthetic_trend_follow_reverse_delay_seconds",
+        "synthetic_flow_sleeve_trigger_notional",
+        "synthetic_flow_sleeve_order_notional",
+        "synthetic_flow_sleeve_max_loss_ratio",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -3833,6 +3848,36 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--synthetic-trend-follow-reverse-delay-seconds",
             str(config["synthetic_trend_follow_reverse_delay_seconds"]),
         ])
+    command.append(
+        "--synthetic-flow-sleeve-enabled"
+        if config.get("synthetic_flow_sleeve_enabled", False)
+        else "--no-synthetic-flow-sleeve-enabled"
+    )
+    if config.get("synthetic_flow_sleeve_trigger_notional") is not None:
+        command.extend([
+            "--synthetic-flow-sleeve-trigger-notional",
+            str(config["synthetic_flow_sleeve_trigger_notional"]),
+        ])
+    if config.get("synthetic_flow_sleeve_notional") is not None:
+        command.extend([
+            "--synthetic-flow-sleeve-notional",
+            str(config["synthetic_flow_sleeve_notional"]),
+        ])
+    if config.get("synthetic_flow_sleeve_levels") is not None:
+        command.extend([
+            "--synthetic-flow-sleeve-levels",
+            str(config["synthetic_flow_sleeve_levels"]),
+        ])
+    if config.get("synthetic_flow_sleeve_order_notional") is not None:
+        command.extend([
+            "--synthetic-flow-sleeve-order-notional",
+            str(config["synthetic_flow_sleeve_order_notional"]),
+        ])
+    if config.get("synthetic_flow_sleeve_max_loss_ratio") is not None:
+        command.extend([
+            "--synthetic-flow-sleeve-max-loss-ratio",
+            str(config["synthetic_flow_sleeve_max_loss_ratio"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -4018,6 +4063,12 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "synthetic_trend_follow_3m_amplitude_ratio",
             "synthetic_trend_follow_min_efficiency_ratio",
             "synthetic_trend_follow_reverse_delay_seconds",
+            "synthetic_flow_sleeve_enabled",
+            "synthetic_flow_sleeve_trigger_notional",
+            "synthetic_flow_sleeve_notional",
+            "synthetic_flow_sleeve_levels",
+            "synthetic_flow_sleeve_order_notional",
+            "synthetic_flow_sleeve_max_loss_ratio",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",
