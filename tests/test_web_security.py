@@ -2309,6 +2309,17 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="custom_grid_roll_upper_distance_ratio"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_roll_shift_levels"', MONITOR_PAGE)
 
+    def test_monitor_page_exposes_readable_runner_param_form(self) -> None:
+        self.assertIn('id="runner_params_form"', MONITOR_PAGE)
+        self.assertIn("单笔金额", MONITOR_PAGE)
+        self.assertIn("软停买", MONITOR_PAGE)
+        self.assertIn("硬上限", MONITOR_PAGE)
+
+    def test_monitor_page_keeps_raw_json_in_advanced_panel(self) -> None:
+        self.assertIn('id="runner_params_advanced_panel"', MONITOR_PAGE)
+        self.assertIn("高级模式 / 原始 JSON", MONITOR_PAGE)
+        self.assertIn('id="runner_params_editor"', MONITOR_PAGE)
+
     def test_strategies_page_contains_manual_symbol_list_controls(self) -> None:
         self.assertIn('id="monitor_symbol_input"', STRATEGIES_PAGE)
         self.assertIn('id="competition_symbol_input"', STRATEGIES_PAGE)
