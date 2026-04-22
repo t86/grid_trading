@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 DEFAULT_AUDIT_LOOKBACK_DAYS = 7
+BINANCE_FUTURES_MAX_QUERY_WINDOW_MS = 7 * 24 * 60 * 60 * 1000 - 1
 _JSONL_LINE_COUNT_CACHE: dict[str, tuple[int, int, int]] = {}
 _ISO_BOUNDS_CACHE: dict[str, tuple[int, int, datetime | None, datetime | None]] = {}
 
@@ -217,6 +218,57 @@ def fetch_time_paged(
         if end_time_ms is not None and next_cursor > end_time_ms:
             break
         cursor = next_cursor
+    return rows
+
+
+def fetch_time_paged_by_windows(
+    *,
+    fetch_page: Callable[..., list[dict[str, Any]]],
+    start_time_ms: int | None,
+    end_time_ms: int | None,
+    limit: int,
+    row_time_ms: Callable[[dict[str, Any]], int],
+    row_key: Callable[[dict[str, Any]], str],
+    max_window_ms: int = BINANCE_FUTURES_MAX_QUERY_WINDOW_MS,
+    max_pages: int = 200,
+) -> list[dict[str, Any]]:
+    if start_time_ms is None or end_time_ms is None or max_window_ms <= 0:
+        return fetch_time_paged(
+            fetch_page=fetch_page,
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=limit,
+            row_time_ms=row_time_ms,
+            row_key=row_key,
+            max_pages=max_pages,
+        )
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    cursor = start_time_ms
+    while cursor <= end_time_ms:
+        chunk_end = min(cursor + max_window_ms, end_time_ms)
+        chunk_rows = fetch_time_paged(
+            fetch_page=fetch_page,
+            start_time_ms=cursor,
+            end_time_ms=chunk_end,
+            limit=limit,
+            row_time_ms=row_time_ms,
+            row_key=row_key,
+            max_pages=max_pages,
+        )
+        for item in chunk_rows:
+            ts_ms = row_time_ms(item)
+            key = row_key(item)
+            if ts_ms <= 0 or not key:
+                continue
+            identity = (ts_ms, key)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append(item)
+        cursor = chunk_end + 1
+    rows.sort(key=lambda item: (row_time_ms(item), row_key(item)))
     return rows
 
 

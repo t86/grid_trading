@@ -7,8 +7,8 @@ from typing import Any
 
 SYMBOL_LISTS_PATH = Path("output/symbol_lists.json")
 DEFAULT_SYMBOL_LISTS: dict[str, list[str]] = {
-    "monitor": ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"],
-    "competition": ["ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"],
+    "monitor": ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT", "BASEDUSDT"],
+    "competition": ["ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT", "BASEDUSDT"],
 }
 SUPPORTED_SYMBOL_LIST_TYPES = tuple(DEFAULT_SYMBOL_LISTS.keys())
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_]{3,40}$")

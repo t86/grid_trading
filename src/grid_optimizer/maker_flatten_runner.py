@@ -59,6 +59,14 @@ def _build_client_order_id(prefix: str, tag: str, side: str) -> str:
     return f"{prefix}_{tag[:8]}_{side_text}_{nonce}"
 
 
+def _position_cost_basis_price(position: dict[str, Any]) -> float:
+    for key in ("breakEvenPrice", "entryPrice"):
+        price = max(_safe_float(position.get(key)), 0.0)
+        if price > 0:
+            return price
+    return 0.0
+
+
 def build_flatten_orders_from_snapshot(
     *,
     symbol: str,
@@ -67,14 +75,19 @@ def build_flatten_orders_from_snapshot(
     dual_side_position: bool,
     account_info: dict[str, Any],
     symbol_info: dict[str, Any],
+    allow_loss: bool = False,
+    min_profit_ratio: float = 0.0,
 ) -> dict[str, Any]:
     if bid_price <= 0 or ask_price <= 0:
         raise ValueError("bid_price and ask_price must be > 0")
 
+    safe_min_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
     result = {
         "orders": [],
         "warnings": [],
         "dual_side_position": bool(dual_side_position),
+        "allow_loss": bool(allow_loss),
+        "min_profit_ratio": safe_min_profit_ratio,
         "long_qty": 0.0,
         "short_qty": 0.0,
         "net_qty": 0.0,
@@ -92,6 +105,7 @@ def build_flatten_orders_from_snapshot(
         reduce_only: bool | None,
         position_side: str | None,
         tag: str,
+        cost_basis_price: float,
     ) -> None:
         rounded_price = _round_order_price(price, tick_size, side)
         rounded_qty = _round_order_qty(abs(qty), step_size)
@@ -104,6 +118,27 @@ def build_flatten_orders_from_snapshot(
         if min_notional is not None and rounded_qty * rounded_price < float(min_notional):
             result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓名义低于最小下单额，已跳过")
             return
+        if not allow_loss:
+            safe_cost = max(_safe_float(cost_basis_price), 0.0)
+            side_text = str(side).upper().strip()
+            side_label = position_side or "BOTH"
+            if safe_cost <= 0:
+                result["warnings"].append(f"{symbol} {side_label} 缺少成本基准，默认禁止 maker_flatten 平仓")
+                return
+            if side_text == "SELL":
+                floor_price = _round_order_price(safe_cost * (1.0 + safe_min_profit_ratio), tick_size, "SELL")
+                if rounded_price + 1e-12 < floor_price:
+                    result["warnings"].append(
+                        f"{symbol} {side_label} maker_flatten 价格 {rounded_price} 低于成本保护价 {floor_price}，默认禁止亏损平仓"
+                    )
+                    return
+            elif side_text == "BUY":
+                ceiling_price = _round_order_price(safe_cost * (1.0 - safe_min_profit_ratio), tick_size, "BUY")
+                if ceiling_price <= 0 or rounded_price > ceiling_price + 1e-12:
+                    result["warnings"].append(
+                        f"{symbol} {side_label} maker_flatten 价格 {rounded_price} 高于成本保护价 {ceiling_price}，默认禁止亏损平仓"
+                    )
+                    return
         order = {
             "symbol": symbol,
             "side": side,
@@ -134,6 +169,7 @@ def build_flatten_orders_from_snapshot(
                 reduce_only=None,
                 position_side="LONG",
                 tag="closelong",
+                cost_basis_price=_position_cost_basis_price(long_position),
             )
         if short_qty > 0:
             _append_order(
@@ -143,6 +179,7 @@ def build_flatten_orders_from_snapshot(
                 reduce_only=None,
                 position_side="SHORT",
                 tag="closeshort",
+                cost_basis_price=_position_cost_basis_price(short_position),
             )
     else:
         position = extract_symbol_position(account_info, symbol)
@@ -158,6 +195,7 @@ def build_flatten_orders_from_snapshot(
                 reduce_only=True,
                 position_side=None,
                 tag="closelong",
+                cost_basis_price=_position_cost_basis_price(position),
             )
         elif position_amt < 0:
             _append_order(
@@ -167,12 +205,50 @@ def build_flatten_orders_from_snapshot(
                 reduce_only=True,
                 position_side=None,
                 tag="closeshort",
+                cost_basis_price=_position_cost_basis_price(position),
             )
 
     return result
 
 
-def load_live_flatten_snapshot(symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+def _normalize_position_side_filter(value: Any) -> str | None:
+    text = str(value or "").strip().upper()
+    if text in {"LONG", "CLOSELONG", "CLOSE_LONG"}:
+        return "LONG"
+    if text in {"SHORT", "CLOSESHORT", "CLOSE_SHORT"}:
+        return "SHORT"
+    return None
+
+
+def filter_flatten_orders_for_position_side(
+    orders: list[dict[str, Any]],
+    position_side_filter: Any,
+) -> list[dict[str, Any]]:
+    normalized_filter = _normalize_position_side_filter(position_side_filter)
+    if normalized_filter is None:
+        return list(orders)
+    expected_tag = "closelong" if normalized_filter == "LONG" else "closeshort"
+    expected_side = "SELL" if normalized_filter == "LONG" else "BUY"
+    return [
+        order
+        for order in orders
+        if str(order.get("tag", "")).strip().lower() == expected_tag
+        or str(order.get("position_side", "")).strip().upper() == normalized_filter
+        or (
+            str(order.get("position_side", "")).strip().upper() in {"", "BOTH"}
+            and str(order.get("side", "")).strip().upper() == expected_side
+        )
+    ]
+
+
+def load_live_flatten_snapshot(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    *,
+    allow_loss: bool = False,
+    min_profit_ratio: float = 0.0,
+) -> dict[str, Any]:
     symbol_info = fetch_futures_symbol_config(symbol)
     book = fetch_futures_book_tickers(symbol=symbol)
     if not book:
@@ -191,6 +267,8 @@ def load_live_flatten_snapshot(symbol: str, api_key: str, api_secret: str) -> di
         dual_side_position=dual_side_position,
         account_info=account_info,
         symbol_info=symbol_info,
+        allow_loss=allow_loss,
+        min_profit_ratio=min_profit_ratio,
     )
     snapshot["bid_price"] = bid_price
     snapshot["ask_price"] = ask_price
@@ -312,10 +390,24 @@ def _run(args: argparse.Namespace) -> int:
             )
             return 0
         try:
-            snapshot = load_live_flatten_snapshot(args.symbol, api_key, api_secret)
+            snapshot = load_live_flatten_snapshot(
+                args.symbol,
+                api_key,
+                api_secret,
+                allow_loss=bool(args.allow_loss),
+                min_profit_ratio=float(args.min_profit_ratio),
+            )
             open_orders = fetch_futures_open_orders(args.symbol, api_key, api_secret, recv_window=args.recv_window)
             our_orders = [order for order in open_orders if isinstance(order, dict) and is_flatten_order(order, prefix)]
-            orders = list(snapshot.get("orders", []))
+            raw_orders = list(snapshot.get("orders", []))
+            orders = filter_flatten_orders_for_position_side(raw_orders, args.position_side_filter)
+            if args.position_side_filter:
+                snapshot = {
+                    **snapshot,
+                    "orders": orders,
+                    "unfiltered_order_count": len(raw_orders),
+                    "position_side_filter": _normalize_position_side_filter(args.position_side_filter),
+                }
             desired_orders = [
                 {
                     **order,
@@ -424,6 +516,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--recv-window", type=int, default=5000)
     parser.add_argument("--max-consecutive-errors", type=int, default=20)
     parser.add_argument("--events-jsonl", type=str, required=True)
+    parser.add_argument("--position-side-filter", type=str, default="")
+    parser.add_argument("--allow-loss", action="store_true")
+    parser.add_argument("--min-profit-ratio", type=float, default=0.0)
     return parser
 
 
@@ -436,6 +531,8 @@ def main() -> None:
         raise SystemExit("--sleep-seconds must be > 0")
     if args.max_consecutive_errors <= 0:
         raise SystemExit("--max-consecutive-errors must be > 0")
+    if args.min_profit_ratio < 0:
+        raise SystemExit("--min-profit-ratio must be >= 0")
     raise SystemExit(_run(args))
 
 

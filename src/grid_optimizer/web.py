@@ -26,6 +26,7 @@ from statistics import mean
 from typing import Any, Union
 from urllib.parse import parse_qs, urlparse
 
+from .audit import build_audit_paths
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -39,14 +40,13 @@ from .competition_board import (
     delete_competition_entry,
     upsert_competition_entry,
 )
-from .console_overview import build_console_overview
-from .console_page import build_console_page
-from .console_registry import load_console_registry, serialize_console_registry
 from .data import (
     cache_file_path,
     delete_futures_order,
     delete_spot_order,
     fetch_futures_account_info_v3,
+    fetch_futures_quote_volume_sum,
+    fetch_futures_window_price_stats,
     fetch_futures_open_orders,
     fetch_futures_position_mode,
     fetch_spot_account_info,
@@ -103,7 +103,15 @@ from .maker_flatten_runner import (
     is_flatten_order,
     load_live_flatten_snapshot,
 )
+from .notifications import alert_source_label, send_alert_email
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
+from .runtime_guards import (
+    evaluate_runtime_guards,
+    normalize_runtime_guard_config,
+    normalize_runtime_guard_payload,
+    summarize_futures_runtime_guard_inputs,
+)
+from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
     get_symbol_list,
@@ -116,8 +124,17 @@ from .types import Candle
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
+LIVE_SPOT_TRADE_SUMMARY_CACHE: dict[str, tuple[float, list[dict[str, Any]], str, str]] = {}
+LIVE_SPOT_TRADE_SUMMARY_CACHE_LOCK = threading.Lock()
+LIVE_SPOT_TRADE_SUMMARY_TTL_SECONDS = 120.0
 RANKING_CACHE: dict[str, dict[str, Any]] = {}
 RANKING_CACHE_LOCK = threading.Lock()
+COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS = 1200.0
+COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS = 60.0
+MONITOR_REFRESH_DEFAULT_SECONDS = 15
+SPOT_RUNNER_REFRESH_DEFAULT_SECONDS = 15
+SPOT_STRATEGIES_REFRESH_DEFAULT_SECONDS = 20
+STRATEGIES_REFRESH_DEFAULT_SECONDS = 20
 BASIS_CACHE: dict[str, dict[str, Any]] = {}
 BASIS_CACHE_LOCK = threading.Lock()
 DETAIL_CACHE: dict[str, dict[str, Any]] = {}
@@ -128,13 +145,31 @@ SPOT_SNAPSHOT_CACHE: dict[str, dict[str, Any]] = {}
 SPOT_SNAPSHOT_CACHE_LOCK = threading.Lock()
 BORROW_LOOKUP_CACHE: dict[str, dict[str, Any]] = {}
 BORROW_LOOKUP_CACHE_LOCK = threading.Lock()
+VOLUME_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
+VOLUME_TRIGGER_STATUS_LOCK = threading.Lock()
+VOLATILITY_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
+VOLATILITY_TRIGGER_STATUS_LOCK = threading.Lock()
 FUNDING_MARGIN_RATIO = 0.5
 GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
 STABLE_SPOT_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD")
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
+HOURLY_EMAIL_REPORT_STATE_PATH = Path("output/hourly_email_report_state.json")
 MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
-CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
+DEFAULT_RUNNER_USER_PRESETS_PATH = Path("config/runner_user_presets.json")
+CUSTOM_RUNNER_PRESETS_PATH = DEFAULT_RUNNER_USER_PRESETS_PATH
+RUNNER_USER_PRESETS_PATH = CUSTOM_RUNNER_PRESETS_PATH
+VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
+    "15m": 15,
+    "30m": 30,
+    "1h": 60,
+    "4h": 240,
+    "24h": 1440,
+}
+DEFAULT_VOLUME_TRIGGER_WINDOW = "1h"
+VOLUME_TRIGGER_POLL_SECONDS = 20.0
+DEFAULT_VOLATILITY_TRIGGER_WINDOW = "1h"
+VOLATILITY_TRIGGER_POLL_SECONDS = 20.0
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     "volume_long_v4": {
         "label": "量优先做多 v4",
@@ -226,6 +261,474 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "auto_regime_defensive_60m_return_ratio": -0.03,
         },
     },
+    "bard_volume_long_v2": {
+        "label": "BARD 量优先做多 v2",
+        "description": "BARDUSDT 专用做多预设。加入启动门禁和首轮 warm-start，避免带仓或带旧挂单时一上来补到底仓。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "BARDUSDT",
+        "config": {
+            "symbol": "BARDUSDT",
+            "strategy_mode": "one_way_long",
+            "step_price": 0.0002,
+            "buy_levels": 5,
+            "sell_levels": 11,
+            "per_order_notional": 40.0,
+            "base_position_notional": 120.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 2,
+            "shift_steps": 2,
+            "pause_buy_position_notional": 420.0,
+            "max_position_notional": 560.0,
+            "buy_pause_amp_trigger_ratio": 0.0048,
+            "buy_pause_down_return_trigger_ratio": -0.002,
+            "freeze_shift_abs_return_trigger_ratio": 0.004,
+            "inventory_tier_start_notional": 260.0,
+            "inventory_tier_end_notional": 380.0,
+            "inventory_tier_buy_levels": 2,
+            "inventory_tier_sell_levels": 14,
+            "inventory_tier_per_order_notional": 35.0,
+            "inventory_tier_base_position_notional": 80.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": True,
+            "sleep_seconds": 5.0,
+        },
+    },
+    "bard_12h_push_neutral_v2": {
+        "label": "BARD 双向冲量 v2",
+        "description": "BARDUSDT 专用双向冲量模板。固定细步长、双边 8 档、零底仓，适合高成交窗口短时冲量。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "BARDUSDT",
+        "config": {
+            "symbol": "BARDUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 100.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 2000.0,
+            "pause_short_position_notional": 2000.0,
+            "max_position_notional": 2400.0,
+            "max_short_position_notional": 2400.0,
+            "max_total_notional": 3600.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "sleep_seconds": 3.0,
+            "rolling_hourly_loss_limit": None,
+            "max_cumulative_notional": 600000.0,
+            "excess_inventory_reduce_only_enabled": False,
+            "autotune_symbol_enabled": False,
+        },
+    },
+    "based_volume_long_trigger_v1": {
+        "label": "BASED 放量做多 v1",
+        "description": "BASEDUSDT 专用轻仓顺势做多。参考 BARD 的活跃窗口做法，但把步长放宽、仓位缩小，并默认按最近 15m 市场成交额自动启停。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "BASEDUSDT",
+        "config": {
+            "symbol": "BASEDUSDT",
+            "strategy_mode": "one_way_long",
+            "step_price": 0.0002,
+            "buy_levels": 4,
+            "sell_levels": 10,
+            "per_order_notional": 20.0,
+            "base_position_notional": 60.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 2,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 220.0,
+            "max_position_notional": 320.0,
+            "buy_pause_amp_trigger_ratio": 0.0065,
+            "buy_pause_down_return_trigger_ratio": -0.003,
+            "freeze_shift_abs_return_trigger_ratio": 0.0045,
+            "inventory_tier_start_notional": 160.0,
+            "inventory_tier_end_notional": 240.0,
+            "inventory_tier_buy_levels": 2,
+            "inventory_tier_sell_levels": 12,
+            "inventory_tier_per_order_notional": 18.0,
+            "inventory_tier_base_position_notional": 40.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": True,
+            "max_total_notional": 420.0,
+            "sleep_seconds": 5.0,
+            "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
+            "rolling_hourly_loss_limit": 4.0,
+            "volume_trigger_enabled": True,
+            "volume_trigger_window": "15m",
+            "volume_trigger_start_threshold": 260000.0,
+            "volume_trigger_stop_threshold": 180000.0,
+            "volume_trigger_stop_cancel_open_orders": True,
+            "volume_trigger_stop_close_all_positions": True,
+        },
+    },
+    "based_volume_push_bard_v1": {
+        "label": "通用双向冲量自适应 v1",
+        "description": "通用的 synthetic_neutral 双向冲量模板。启动时会按币价、tick、点差和最小下单约束自动重设基础步长与单笔名义，并在 30s/1m 急波动和 3m/5m 持续单边时动态放大 step_price、收紧仓位阈值。",
+        "startable": True,
+        "kind": "synthetic",
+        "config": {
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 100.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 2000.0,
+            "pause_short_position_notional": 2000.0,
+            "max_position_notional": 2400.0,
+            "max_short_position_notional": 2400.0,
+            "max_total_notional": 3600.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "adaptive_step_enabled": True,
+            "adaptive_step_30s_abs_return_ratio": 0.0028,
+            "adaptive_step_30s_amplitude_ratio": 0.0035,
+            "adaptive_step_1m_abs_return_ratio": 0.0045,
+            "adaptive_step_1m_amplitude_ratio": 0.0065,
+            "adaptive_step_3m_abs_return_ratio": 0.0100,
+            "adaptive_step_5m_abs_return_ratio": 0.0140,
+            "adaptive_step_max_scale": 3.0,
+            "adaptive_step_min_per_order_scale": 1.0,
+            "adaptive_step_min_position_limit_scale": 0.65,
+            "autotune_symbol_enabled": True,
+            "excess_inventory_reduce_only_enabled": False,
+            "rolling_hourly_loss_limit": None,
+            "sleep_seconds": 3.0,
+        },
+    },
+    "xaut_long_adaptive_v1": {
+        "label": "XAUT 自适应做多 v1",
+        "description": "仅用于 XAUTUSDT 的三态自适应做多。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤买单并只保留卖单减仓。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "one_way_long",
+            "step_price": 7.5,
+            "buy_levels": 6,
+            "sell_levels": 10,
+            "per_order_notional": 80.0,
+            "base_position_notional": 320.0,
+            "up_trigger_steps": 5,
+            "down_trigger_steps": 4,
+            "shift_steps": 3,
+            "pause_buy_position_notional": 520.0,
+            "max_position_notional": 680.0,
+            "buy_pause_amp_trigger_ratio": 0.0060,
+            "buy_pause_down_return_trigger_ratio": -0.0045,
+            "freeze_shift_abs_return_trigger_ratio": 0.0048,
+            "inventory_tier_start_notional": 420.0,
+            "inventory_tier_end_notional": 520.0,
+            "inventory_tier_buy_levels": 3,
+            "inventory_tier_sell_levels": 12,
+            "inventory_tier_per_order_notional": 70.0,
+            "inventory_tier_base_position_notional": 160.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+    },
+    "xaut_short_adaptive_v1": {
+        "label": "XAUT 自适应做空 v1",
+        "description": "仅用于 XAUTUSDT 的三态自适应做空。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤卖单并只保留买单回补减仓。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "one_way_short",
+            "step_price": 7.4,
+            "buy_levels": 10,
+            "sell_levels": 6,
+            "per_order_notional": 60.0,
+            "base_position_notional": 220.0,
+            "up_trigger_steps": 4,
+            "down_trigger_steps": 5,
+            "shift_steps": 3,
+            "pause_short_position_notional": 620.0,
+            "max_short_position_notional": 720.0,
+            "inventory_tier_start_notional": 320.0,
+            "inventory_tier_end_notional": 520.0,
+            "inventory_tier_buy_levels": 14,
+            "inventory_tier_sell_levels": 3,
+            "inventory_tier_per_order_notional": 45.0,
+            "inventory_tier_base_position_notional": 100.0,
+            "short_cover_pause_amp_trigger_ratio": 0.0060,
+            "short_cover_pause_down_return_trigger_ratio": -0.0045,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+        },
+    },
+    "xaut_guarded_ping_pong_v1": {
+        "label": "XAUT 护栏回转 v1",
+        "description": "仅用于 XAUTUSDT 的轻库存 synthetic_neutral。零底仓、单边 1x1、费率感知固定步长；急速单边时只保留顺风挂单，成交后延迟反向回补，并在短线扩振、净敞口和账本漂移放大时优先停新增、回到空仓。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 2.2,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "per_order_notional": 100.0,
+            "startup_entry_multiplier": 1.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 180.0,
+            "pause_short_position_notional": 180.0,
+            "max_position_notional": 220.0,
+            "max_short_position_notional": 220.0,
+            "max_total_notional": 260.0,
+            "max_new_orders": 6,
+            "buy_pause_amp_trigger_ratio": 0.0035,
+            "buy_pause_down_return_trigger_ratio": -0.0022,
+            "freeze_shift_abs_return_trigger_ratio": 0.0028,
+            "market_bias_enabled": True,
+            "market_bias_max_shift_steps": 0.5,
+            "market_bias_signal_steps": 1.0,
+            "market_bias_drift_weight": 0.7,
+            "market_bias_return_weight": 0.3,
+            "market_bias_weak_buy_pause_enabled": True,
+            "market_bias_weak_buy_pause_threshold": 0.12,
+            "market_bias_strong_short_pause_enabled": True,
+            "market_bias_strong_short_pause_threshold": 0.12,
+            "market_bias_regime_switch_enabled": True,
+            "market_bias_regime_switch_confirm_cycles": 2,
+            "market_bias_regime_switch_weak_threshold": 0.12,
+            "market_bias_regime_switch_strong_threshold": 0.12,
+            "adaptive_step_enabled": True,
+            "adaptive_step_30s_abs_return_ratio": 0.0010,
+            "adaptive_step_30s_amplitude_ratio": 0.0014,
+            "adaptive_step_1m_abs_return_ratio": 0.0016,
+            "adaptive_step_1m_amplitude_ratio": 0.0022,
+            "adaptive_step_3m_abs_return_ratio": 0.0035,
+            "adaptive_step_5m_abs_return_ratio": 0.0050,
+            "adaptive_step_max_scale": 2.2,
+            "adaptive_step_min_per_order_scale": 1.0,
+            "adaptive_step_min_position_limit_scale": 0.75,
+            "synthetic_trend_follow_enabled": True,
+            "synthetic_trend_follow_1m_abs_return_ratio": 0.00045,
+            "synthetic_trend_follow_1m_amplitude_ratio": 0.00070,
+            "synthetic_trend_follow_3m_abs_return_ratio": 0.00090,
+            "synthetic_trend_follow_3m_amplitude_ratio": 0.00120,
+            "synthetic_trend_follow_min_efficiency_ratio": 0.58,
+            "synthetic_trend_follow_reverse_delay_seconds": 18.0,
+            "rolling_hourly_loss_limit": 6.0,
+            "max_cumulative_notional": 120000.0,
+            "max_actual_net_notional": 120.0,
+            "max_synthetic_drift_notional": 60.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+            "sleep_seconds": 3.0,
+        },
+    },
+    "xaut_near_price_guarded_v1": {
+        "label": "XAUT 近价护栏 v1",
+        "description": "仅用于 XAUTUSDT 的研究版近价 synthetic_neutral。零底仓、双边轻挂单，默认在现价外保留约 1 tick 安全距离；短线扩振时自动加宽报价、压缩库存上限，并在单边加速时优先停新增、回到空仓。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.02,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "per_order_notional": 80.0,
+            "startup_entry_multiplier": 1.0,
+            "base_position_notional": 0.0,
+            "static_buy_offset_steps": 0.5,
+            "static_sell_offset_steps": 0.5,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 2,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 140.0,
+            "pause_short_position_notional": 140.0,
+            "max_position_notional": 180.0,
+            "max_short_position_notional": 180.0,
+            "max_total_notional": 220.0,
+            "max_new_orders": 4,
+            "buy_pause_amp_trigger_ratio": 0.0028,
+            "buy_pause_down_return_trigger_ratio": -0.0018,
+            "short_cover_pause_amp_trigger_ratio": 0.0038,
+            "short_cover_pause_down_return_trigger_ratio": -0.0026,
+            "freeze_shift_abs_return_trigger_ratio": 0.0020,
+            "market_bias_enabled": False,
+            "market_bias_weak_buy_pause_enabled": False,
+            "market_bias_strong_short_pause_enabled": False,
+            "market_bias_regime_switch_enabled": False,
+            "adaptive_step_enabled": True,
+            "adaptive_step_30s_abs_return_ratio": 0.0006,
+            "adaptive_step_30s_amplitude_ratio": 0.0010,
+            "adaptive_step_1m_abs_return_ratio": 0.0012,
+            "adaptive_step_1m_amplitude_ratio": 0.0018,
+            "adaptive_step_3m_abs_return_ratio": 0.0028,
+            "adaptive_step_5m_abs_return_ratio": 0.0040,
+            "adaptive_step_max_scale": 3.0,
+            "adaptive_step_min_per_order_scale": 1.0,
+            "adaptive_step_min_position_limit_scale": 0.8,
+            "synthetic_trend_follow_enabled": True,
+            "synthetic_trend_follow_1m_abs_return_ratio": 0.00040,
+            "synthetic_trend_follow_1m_amplitude_ratio": 0.00060,
+            "synthetic_trend_follow_3m_abs_return_ratio": 0.00080,
+            "synthetic_trend_follow_3m_amplitude_ratio": 0.00100,
+            "synthetic_trend_follow_min_efficiency_ratio": 0.55,
+            "synthetic_trend_follow_reverse_delay_seconds": 12.0,
+            "rolling_hourly_loss_limit": 4.0,
+            "max_cumulative_notional": 60000.0,
+            "max_actual_net_notional": 90.0,
+            "max_synthetic_drift_notional": 45.0,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+            "sleep_seconds": 2.0,
+        },
+    },
+    "xaut_volume_guarded_bard_v3": {
+        "label": "XAUT 冲量控损 v3",
+        "description": "仅用于 XAUTUSDT 的固定节奏 synthetic_neutral。延续 111 线上 v2 的逐笔 lot 配对止盈思路，但把单笔、底仓、挂单层数和总挂单容量整体上调，用更高的双边周转去换成交额。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 1.0,
+            "buy_levels": 10,
+            "sell_levels": 6,
+            "per_order_notional": 35.0,
+            "startup_entry_multiplier": 3.0,
+            "base_position_notional": 120.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 2600.0,
+            "pause_short_position_notional": 2600.0,
+            "max_position_notional": 3200.0,
+            "max_short_position_notional": 3200.0,
+            "max_total_notional": 3000.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.0045,
+            "short_cover_pause_amp_trigger_ratio": 0.005,
+            "short_cover_pause_down_return_trigger_ratio": -0.0022,
+            "take_profit_min_profit_ratio": 0.0,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "market_bias_enabled": False,
+            "market_bias_weak_buy_pause_enabled": False,
+            "market_bias_strong_short_pause_enabled": False,
+            "market_bias_regime_switch_enabled": False,
+            "adaptive_step_enabled": False,
+            "synthetic_trend_follow_enabled": False,
+            "auto_regime_enabled": False,
+            "neutral_hourly_scale_enabled": False,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+            "margin_type": "KEEP",
+            "leverage": 10,
+            "max_plan_age_seconds": 30.0,
+            "max_mid_drift_steps": 4.0,
+            "maker_retries": 2,
+            "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
+            "rolling_hourly_loss_limit": 6.0,
+            "sleep_seconds": 3.0,
+            "cancel_stale": True,
+            "apply": True,
+            "reset_state": False,
+            "state_path": "output/xautusdt_loop_state.json",
+            "plan_json": "output/xautusdt_loop_latest_plan.json",
+            "submit_report_json": "output/xautusdt_loop_latest_submit.json",
+            "summary_jsonl": "output/xautusdt_loop_events.jsonl",
+        },
+    },
+    "xaut_volume_guarded_bard_v3_1": {
+        "label": "XAUT 冲量控损 v3.1",
+        "description": "仅用于 XAUTUSDT 的压损版冲量 synthetic_neutral。在 v3 的基础上把 step_price 放宽到 1.25，并收缩启动仓，目标是在尽量保住成交额的前提下压低单位损耗。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "symbol": "XAUTUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 1.25,
+            "buy_levels": 10,
+            "sell_levels": 6,
+            "per_order_notional": 35.0,
+            "startup_entry_multiplier": 2.0,
+            "base_position_notional": 80.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 2600.0,
+            "pause_short_position_notional": 2600.0,
+            "max_position_notional": 3200.0,
+            "max_short_position_notional": 3200.0,
+            "max_total_notional": 3000.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.0045,
+            "short_cover_pause_amp_trigger_ratio": 0.005,
+            "short_cover_pause_down_return_trigger_ratio": -0.0022,
+            "take_profit_min_profit_ratio": 0.0,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "market_bias_enabled": False,
+            "market_bias_weak_buy_pause_enabled": False,
+            "market_bias_strong_short_pause_enabled": False,
+            "market_bias_regime_switch_enabled": False,
+            "adaptive_step_enabled": False,
+            "synthetic_trend_follow_enabled": False,
+            "auto_regime_enabled": False,
+            "neutral_hourly_scale_enabled": False,
+            "autotune_symbol_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+            "margin_type": "KEEP",
+            "leverage": 10,
+            "max_plan_age_seconds": 30.0,
+            "max_mid_drift_steps": 4.0,
+            "maker_retries": 2,
+            "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
+            "rolling_hourly_loss_limit": 6.0,
+            "sleep_seconds": 3.0,
+            "cancel_stale": True,
+            "apply": True,
+            "reset_state": False,
+            "state_path": "output/xautusdt_loop_state.json",
+            "plan_json": "output/xautusdt_loop_latest_plan.json",
+            "submit_report_json": "output/xautusdt_loop_latest_submit.json",
+            "summary_jsonl": "output/xautusdt_loop_events.jsonl",
+        },
+    },
     "volume_short_v1": {
         "label": "量优先做空 v1",
         "description": "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
@@ -284,7 +787,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     },
     "night_volume_short_v1": {
         "label": "NIGHT 专用做空高换手",
-        "description": "针对 NIGHTUSDT 的低价高换手做空预设。收紧中心迁移触发与轮询周期，让第一笔卖空和第一笔买回更靠近，优先提升来回成交密度。",
+        "description": "针对 NIGHTUSDT 的低价高换手做空预设。仍然保留更快轮询和更近的首笔往返，但降低单笔、底仓和总空仓上限，并在急跌放量时暂停追着买回。",
         "startable": True,
         "kind": "one_way",
         "config": {
@@ -292,23 +795,24 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "step_price": 0.00002,
             "buy_levels": 8,
             "sell_levels": 8,
-            "per_order_notional": 70.0,
-            "base_position_notional": 420.0,
-            "up_trigger_steps": 2,
-            "down_trigger_steps": 2,
+            "per_order_notional": 45.0,
+            "base_position_notional": 180.0,
+            "up_trigger_steps": 4,
+            "down_trigger_steps": 4,
             "shift_steps": 2,
-            "pause_short_position_notional": 900.0,
-            "max_short_position_notional": 900.0,
-            "inventory_tier_start_notional": 600.0,
-            "inventory_tier_end_notional": 750.0,
-            "inventory_tier_buy_levels": 12,
+            "pause_short_position_notional": 450.0,
+            "max_short_position_notional": 600.0,
+            "inventory_tier_start_notional": 300.0,
+            "inventory_tier_end_notional": 450.0,
+            "inventory_tier_buy_levels": 10,
             "inventory_tier_sell_levels": 4,
-            "inventory_tier_per_order_notional": 70.0,
-            "inventory_tier_base_position_notional": 280.0,
-            "sleep_seconds": 5.0,
+            "inventory_tier_per_order_notional": 45.0,
+            "inventory_tier_base_position_notional": 90.0,
+            "sleep_seconds": 10.0,
             "autotune_symbol_enabled": False,
-            "short_cover_pause_amp_trigger_ratio": 0.0055,
-            "short_cover_pause_down_return_trigger_ratio": -0.0025,
+            "short_cover_pause_amp_trigger_ratio": 0.004,
+            "short_cover_pause_down_return_trigger_ratio": -0.0018,
+            "freeze_shift_abs_return_trigger_ratio": 0.0045,
         },
     },
     "volume_short_v1_conservative": {
@@ -335,6 +839,34 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "inventory_tier_base_position_notional": 90.0,
             "short_cover_pause_amp_trigger_ratio": 0.0045,
             "short_cover_pause_down_return_trigger_ratio": -0.002,
+        },
+    },
+    "xaut_volume_short_v1": {
+        "label": "XAUT 专用做空高换手",
+        "description": "面向 XAUTUSDT 的高换手空头预设。维持 1000 USDT 空仓上限，收紧动态步长到现价约 0.017%，优先把小时成交额顶到 1 万附近。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "strategy_mode": "one_way_short",
+            "step_price": 0.00002,
+            "buy_levels": 10,
+            "sell_levels": 10,
+            "per_order_notional": 100.0,
+            "base_position_notional": 240.0,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 3,
+            "shift_steps": 2,
+            "pause_short_position_notional": 850.0,
+            "max_short_position_notional": 1000.0,
+            "inventory_tier_start_notional": 650.0,
+            "inventory_tier_end_notional": 850.0,
+            "inventory_tier_buy_levels": 14,
+            "inventory_tier_sell_levels": 6,
+            "inventory_tier_per_order_notional": 100.0,
+            "inventory_tier_base_position_notional": 150.0,
+            "sleep_seconds": 5.0,
+            "autotune_symbol_enabled": True,
         },
     },
     "defensive_quasi_neutral_aggressive_v1": {
@@ -402,6 +934,82 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "neutral_hourly_scale_stable": 1.0,
             "neutral_hourly_scale_transition": 0.85,
             "neutral_hourly_scale_defensive": 0.65,
+        },
+    },
+    "based_competition_neutral_v1": {
+        "label": "合约竞赛库存网格",
+        "description": "BASEDUSDT 专用的偏空中性交易赛预设。按目标净仓曲线运行，但净空上限高于净多上限，适合高波动、宽震荡、整体偏弱的刷量窗口。",
+        "startable": True,
+        "kind": "target_neutral",
+        "symbol": "BASEDUSDT",
+        "config": {
+            "symbol": "BASEDUSDT",
+            "strategy_mode": "inventory_target_neutral",
+            "buy_levels": 3,
+            "sell_levels": 3,
+            "per_order_notional": 45.0,
+            "base_position_notional": 0.0,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 360.0,
+            "pause_short_position_notional": 540.0,
+            "max_position_notional": 360.0,
+            "max_short_position_notional": 540.0,
+            "max_total_notional": 900.0,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "neutral_center_interval_minutes": 3,
+            "neutral_band1_offset_ratio": 0.009,
+            "neutral_band2_offset_ratio": 0.018,
+            "neutral_band3_offset_ratio": 0.036,
+            "neutral_band1_target_ratio": 0.20,
+            "neutral_band2_target_ratio": 0.50,
+            "neutral_band3_target_ratio": 1.00,
+            "neutral_hourly_scale_enabled": True,
+            "neutral_hourly_scale_stable": 1.0,
+            "neutral_hourly_scale_transition": 0.85,
+            "neutral_hourly_scale_defensive": 0.65,
+            "autotune_symbol_enabled": False,
+        },
+    },
+    "based_competition_neutral_aggressive_v1": {
+        "label": "合约竞赛库存网格（激进）",
+        "description": "BASEDUSDT 专用的冲量中性交易赛预设。把目标净仓带收紧到 0.5% / 1.0% / 2.0%，同时显著抬高净仓与总名义上限，适合优先冲成交量的比赛窗口。",
+        "startable": True,
+        "kind": "target_neutral",
+        "symbol": "BASEDUSDT",
+        "config": {
+            "symbol": "BASEDUSDT",
+            "strategy_mode": "inventory_target_neutral",
+            "buy_levels": 3,
+            "sell_levels": 3,
+            "per_order_notional": 60.0,
+            "base_position_notional": 0.0,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 540.0,
+            "pause_short_position_notional": 900.0,
+            "max_position_notional": 540.0,
+            "max_short_position_notional": 900.0,
+            "max_total_notional": 1440.0,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "neutral_center_interval_minutes": 3,
+            "neutral_band1_offset_ratio": 0.005,
+            "neutral_band2_offset_ratio": 0.010,
+            "neutral_band3_offset_ratio": 0.020,
+            "neutral_band1_target_ratio": 0.30,
+            "neutral_band2_target_ratio": 0.70,
+            "neutral_band3_target_ratio": 1.00,
+            "neutral_hourly_scale_enabled": True,
+            "neutral_hourly_scale_stable": 1.0,
+            "neutral_hourly_scale_transition": 0.85,
+            "neutral_hourly_scale_defensive": 0.65,
+            "autotune_symbol_enabled": False,
         },
     },
     "defensive_quasi_neutral_v1": {
@@ -477,7 +1085,134 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "freeze_shift_abs_return_trigger_ratio": 0.005,
         },
     },
+    "volume_neutral_push_v1": {
+        "label": "通用刷量V1",
+        "description": "BASEDUSDT 专用固定双向刷量模板。零底仓、双边 8 档、3 格触发迁移中心，并把单笔和单边库存压到适合 BASED 当前盘口的范围。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "BASEDUSDT",
+        "config": {
+            "symbol": "BASEDUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 45.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 3,
+            "down_trigger_steps": 3,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 1000.0,
+            "pause_short_position_notional": 1000.0,
+            "max_position_notional": 1000.0,
+            "max_short_position_notional": 1000.0,
+            "max_total_notional": 2200.0,
+            "max_new_orders": 40,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "short_cover_pause_amp_trigger_ratio": 0.004,
+            "short_cover_pause_down_return_trigger_ratio": -0.0018,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "sleep_seconds": 3.0,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+        },
+    },
+    "volume_neutral_push_guarded_v1": {
+        "label": "中性冲量护栏 v1",
+        "description": "在通用中性冲量上追加更强护栏。保留高换手结构，但更早停双边新增，并加入净暴露与 synthetic drift 停机线。",
+        "startable": True,
+        "kind": "synthetic",
+        "config": {
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0001,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 100.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 1200.0,
+            "pause_short_position_notional": 1200.0,
+            "max_position_notional": 1600.0,
+            "max_short_position_notional": 1600.0,
+            "max_total_notional": 2400.0,
+            "max_new_orders": 32,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "market_bias_enabled": True,
+            "market_bias_max_shift_steps": 0.75,
+            "market_bias_signal_steps": 2.0,
+            "market_bias_drift_weight": 0.65,
+            "market_bias_return_weight": 0.35,
+            "market_bias_weak_buy_pause_enabled": True,
+            "market_bias_weak_buy_pause_threshold": 0.15,
+            "market_bias_strong_short_pause_enabled": True,
+            "market_bias_strong_short_pause_threshold": 0.15,
+            "rolling_hourly_loss_limit": 25.0,
+            "max_cumulative_notional": 150000.0,
+            "max_actual_net_notional": 900.0,
+            "max_synthetic_drift_notional": 250.0,
+            "sleep_seconds": 3.0,
+            "autotune_symbol_enabled": True,
+        },
+    },
+    "volume_neutral_ping_pong_v1": {
+        "label": "量优先中性 v1",
+        "description": "零底仓启动的单向合成中性。启动时买一/卖一放大，后续用更小的反手单回转；弱市切到做空、强市切到做多、震荡时回到中性 ping-pong。",
+        "startable": True,
+        "kind": "synthetic",
+        "config": {
+            "strategy_mode": "synthetic_neutral",
+            "buy_levels": 4,
+            "sell_levels": 4,
+            "per_order_notional": 45.0,
+            "startup_entry_multiplier": 4.0,
+            "base_position_notional": 0.0,
+            "up_trigger_steps": 2,
+            "down_trigger_steps": 2,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 500.0,
+            "pause_short_position_notional": 500.0,
+            "max_position_notional": 600.0,
+            "max_short_position_notional": 600.0,
+            "buy_pause_amp_trigger_ratio": 0.0075,
+            "buy_pause_down_return_trigger_ratio": -0.0035,
+            "freeze_shift_abs_return_trigger_ratio": 0.005,
+            "market_bias_enabled": True,
+            "market_bias_max_shift_steps": 0.75,
+            "market_bias_signal_steps": 2.0,
+            "market_bias_drift_weight": 0.65,
+            "market_bias_return_weight": 0.35,
+            "market_bias_weak_buy_pause_enabled": True,
+            "market_bias_weak_buy_pause_threshold": 0.15,
+            "market_bias_strong_short_pause_enabled": True,
+            "market_bias_strong_short_pause_threshold": 0.15,
+            "market_bias_regime_switch_enabled": True,
+            "market_bias_regime_switch_confirm_cycles": 2,
+            "market_bias_regime_switch_weak_threshold": 0.15,
+            "market_bias_regime_switch_strong_threshold": 0.15,
+            "sleep_seconds": 5.0,
+        },
+    },
 }
+
+RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
+    {
+        "volume_long_v4",
+        "based_volume_push_bard_v1",
+        "based_competition_neutral_v1",
+        "based_competition_neutral_aggressive_v1",
+        "volume_short_v1",
+        "xaut_volume_guarded_bard_v2",
+    }
+)
 RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "strategy_profile": "volume_long_v4",
     "strategy_mode": "one_way_long",
@@ -486,8 +1221,27 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "buy_levels": 8,
     "sell_levels": 8,
     "per_order_notional": 70.0,
+    "startup_entry_multiplier": 1.0,
     "base_position_notional": 420.0,
+    "near_market_entry_max_center_distance_steps": 2.0,
+    "static_buy_offset_steps": 0.0,
+    "static_sell_offset_steps": 0.0,
+    "market_bias_enabled": False,
+    "market_bias_max_shift_steps": 0.75,
+    "market_bias_signal_steps": 2.0,
+    "market_bias_drift_weight": 0.65,
+    "market_bias_return_weight": 0.35,
+    "market_bias_weak_buy_pause_enabled": False,
+    "market_bias_weak_buy_pause_threshold": 0.15,
+    "market_bias_strong_short_pause_enabled": False,
+    "market_bias_strong_short_pause_threshold": 0.15,
+    "market_bias_regime_switch_enabled": False,
+    "market_bias_regime_switch_confirm_cycles": 2,
+    "market_bias_regime_switch_weak_threshold": 0.15,
+    "market_bias_regime_switch_strong_threshold": 0.15,
     "center_price": None,
+    "flat_start_enabled": True,
+    "warm_start_enabled": True,
     "fixed_center_enabled": False,
     "fixed_center_roll_enabled": False,
     "excess_inventory_reduce_only_enabled": False,
@@ -501,10 +1255,29 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "down_trigger_steps": 4,
     "shift_steps": 4,
     "pause_buy_position_notional": 750.0,
+    "threshold_reduce_target_ratio": 0.0,
+    "threshold_reduce_taker_timeout_seconds": 60.0,
     "max_position_notional": 900.0,
     "buy_pause_amp_trigger_ratio": 0.0075,
     "buy_pause_down_return_trigger_ratio": -0.0035,
     "freeze_shift_abs_return_trigger_ratio": 0.005,
+    "adaptive_step_enabled": False,
+    "adaptive_step_30s_abs_return_ratio": 0.0,
+    "adaptive_step_30s_amplitude_ratio": 0.0,
+    "adaptive_step_1m_abs_return_ratio": 0.0,
+    "adaptive_step_1m_amplitude_ratio": 0.0,
+    "adaptive_step_3m_abs_return_ratio": 0.0,
+    "adaptive_step_5m_abs_return_ratio": 0.0,
+    "adaptive_step_max_scale": 1.0,
+    "adaptive_step_min_per_order_scale": 1.0,
+    "adaptive_step_min_position_limit_scale": 1.0,
+    "synthetic_trend_follow_enabled": False,
+    "synthetic_trend_follow_1m_abs_return_ratio": 0.0,
+    "synthetic_trend_follow_1m_amplitude_ratio": 0.0,
+    "synthetic_trend_follow_3m_abs_return_ratio": 0.0,
+    "synthetic_trend_follow_3m_amplitude_ratio": 0.0,
+    "synthetic_trend_follow_min_efficiency_ratio": 0.0,
+    "synthetic_trend_follow_reverse_delay_seconds": 0.0,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -538,6 +1311,27 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "maker_retries": 2,
     "max_new_orders": 20,
     "max_total_notional": 1000.0,
+    "run_start_time": None,
+    "run_end_time": None,
+    "runtime_guard_stats_start_time": None,
+    "rolling_hourly_loss_limit": None,
+    "max_cumulative_notional": None,
+    "max_actual_net_notional": None,
+    "max_synthetic_drift_notional": None,
+    "volume_trigger_enabled": False,
+    "volume_trigger_window": DEFAULT_VOLUME_TRIGGER_WINDOW,
+    "volume_trigger_start_threshold": None,
+    "volume_trigger_stop_threshold": None,
+    "volume_trigger_stop_cancel_open_orders": True,
+    "volume_trigger_stop_close_all_positions": False,
+    "volatility_trigger_enabled": True,
+    "volatility_trigger_window": DEFAULT_VOLATILITY_TRIGGER_WINDOW,
+    "volatility_trigger_amplitude_ratio": 0.04,
+    "volatility_trigger_abs_return_ratio": 0.02,
+    "volatility_trigger_stop_cancel_open_orders": True,
+    "volatility_trigger_stop_close_all_positions": True,
+    "volatility_trigger_directional_flatten_enabled": False,
+    "volatility_trigger_directional_taker_enabled": False,
     "sleep_seconds": 15.0,
     "cancel_stale": True,
     "apply": True,
@@ -546,6 +1340,22 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "plan_json": "output/night_loop_latest_plan.json",
     "submit_report_json": "output/night_loop_latest_submit.json",
     "summary_jsonl": "output/night_loop_events.jsonl",
+}
+RUNNER_AUTOTUNE_STEP_HINTS: dict[str, tuple[float, int]] = {
+    "volume_long_v4": (0.0004, 2),
+    "volatility_defensive_v1": (0.0008, 4),
+    "xaut_volume_short_v1": (0.00017, 2),
+    "volume_neutral_target_v1": (0.0006, 3),
+    "neutral_hedge_v1": (0.0005, 3),
+    "synthetic_neutral_v1": (0.0005, 3),
+    "based_volume_push_bard_v1": (0.00028, 1),
+    "volume_neutral_push_v1": (0.00028, 1),
+    "volume_neutral_push_guarded_v1": (0.00032, 2),
+    "volume_neutral_ping_pong_v1": (0.00035, 2),
+    "xaut_guarded_ping_pong_v1": (0.00048, 180),
+    "xaut_near_price_guarded_v1": (0.00012, 1),
+    "xaut_volume_guarded_bard_v3": (0.00021, 100),
+    "xaut_volume_guarded_bard_v3_1": (0.00026, 125),
 }
 RUNNER_SERVICE_NAME = "grid-loop.service"
 RUNNER_LAUNCH_AGENT_LABEL = "com.tl.grid-optimizer.loop"
@@ -562,6 +1372,69 @@ def _security_headers() -> dict[str, str]:
         "Cache-Control": "no-store",
         "Pragma": "no-cache",
     }
+
+
+def _competition_board_auto_refresh_enabled() -> bool:
+    raw = os.environ.get("GRID_COMPETITION_BOARD_AUTO_REFRESH", "").strip().lower()
+    if not raw:
+        return True
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _competition_board_auto_refresh_interval_seconds() -> float:
+    raw = os.environ.get("GRID_COMPETITION_BOARD_REFRESH_SECONDS", "").strip()
+    if not raw:
+        return COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS
+    if value <= 0:
+        return COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS
+    return max(COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS, value)
+
+
+def _web_refresh_default_seconds(env_key: str, default_seconds: int, min_seconds: int) -> int:
+    raw = os.environ.get(env_key, "").strip()
+    if not raw:
+        return max(min_seconds, int(default_seconds))
+    try:
+        value = int(float(raw))
+    except ValueError:
+        return max(min_seconds, int(default_seconds))
+    return max(min_seconds, value)
+
+
+def _monitor_refresh_default_seconds() -> int:
+    return _web_refresh_default_seconds(
+        "GRID_WEB_MONITOR_REFRESH_DEFAULT_SECONDS",
+        MONITOR_REFRESH_DEFAULT_SECONDS,
+        2,
+    )
+
+
+def _spot_runner_refresh_default_seconds() -> int:
+    return _web_refresh_default_seconds(
+        "GRID_WEB_SPOT_RUNNER_REFRESH_DEFAULT_SECONDS",
+        SPOT_RUNNER_REFRESH_DEFAULT_SECONDS,
+        2,
+    )
+
+
+def _spot_strategies_refresh_default_seconds() -> int:
+    return _web_refresh_default_seconds(
+        "GRID_WEB_SPOT_STRATEGIES_REFRESH_DEFAULT_SECONDS",
+        SPOT_STRATEGIES_REFRESH_DEFAULT_SECONDS,
+        3,
+    )
+
+
+def _strategies_refresh_default_seconds() -> int:
+    return _web_refresh_default_seconds(
+        "GRID_WEB_STRATEGIES_REFRESH_DEFAULT_SECONDS",
+        STRATEGIES_REFRESH_DEFAULT_SECONDS,
+        3,
+    )
 
 
 def _load_web_auth_credentials() -> tuple[str, str] | None:
@@ -632,6 +1505,332 @@ def _read_json_dict(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
+def _write_json_dict(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _read_last_jsonl_row(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    last_line = ""
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if line:
+                    last_line = line
+    except OSError:
+        return None
+    if not last_line:
+        return None
+    try:
+        payload = json.loads(last_line)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _iter_jsonl_rows(path: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    if not path.exists():
+        return rows
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for raw_line in handle:
+                line = raw_line.strip()
+                if not line:
+                    continue
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(payload, dict):
+                    rows.append(payload)
+    except OSError:
+        return []
+    return rows
+
+
+def _find_closest_event_context(summary_path: Path, trade_time_ms: int) -> dict[str, Any]:
+    closest: dict[str, Any] = {}
+    smallest_gap_ms: int | None = None
+    for row in _iter_jsonl_rows(summary_path):
+        ts = str(row.get("ts") or "").strip()
+        if not ts:
+            continue
+        try:
+            event_time_ms = int(datetime.fromisoformat(ts.replace("Z", "+00:00")).timestamp() * 1000)
+        except ValueError:
+            continue
+        gap_ms = abs(event_time_ms - trade_time_ms)
+        if smallest_gap_ms is None or gap_ms < smallest_gap_ms:
+            closest = row
+            smallest_gap_ms = gap_ms
+    return closest
+
+
+def _summarize_symbol_trade_window(summary_path: Path, *, window_minutes: int) -> dict[str, Any]:
+    audit_paths = build_audit_paths(summary_path)
+    trade_path = audit_paths["trade_audit"]
+    income_path = audit_paths["income_audit"]
+    window_start = datetime.now(timezone.utc) - timedelta(minutes=window_minutes)
+    summary = {
+        "gross_notional": 0.0,
+        "realized_pnl": 0.0,
+        "commission": 0.0,
+        "funding": 0.0,
+        "trade_count": 0,
+    }
+    for row in _iter_jsonl_rows(trade_path):
+        ts_ms = int(float(row.get("time") or 0))
+        if ts_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        if ts < window_start:
+            continue
+        price = float(row.get("price") or 0.0)
+        qty = abs(float(row.get("qty") or 0.0))
+        summary["gross_notional"] += price * qty
+        summary["realized_pnl"] += float(row.get("realizedPnl") or 0.0)
+        summary["commission"] += float(row.get("commission") or 0.0)
+        summary["trade_count"] += 1
+    for row in _iter_jsonl_rows(income_path):
+        ts_ms = int(float(row.get("time") or 0))
+        if ts_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        if ts < window_start:
+            continue
+        summary["funding"] += float(row.get("income") or 0.0)
+    summary["net_realized"] = (
+        float(summary["realized_pnl"]) + float(summary["funding"]) - float(summary["commission"])
+    )
+    return summary
+
+
+def _collect_symbol_loss_anomalies(
+    summary_path: Path,
+    *,
+    window_minutes: int,
+    loss_threshold: float = -0.5,
+) -> list[dict[str, Any]]:
+    audit_paths = build_audit_paths(summary_path)
+    trade_path = audit_paths["trade_audit"]
+    window_start_ms = int((datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).timestamp() * 1000)
+    anomalies: list[dict[str, Any]] = []
+    for row in _iter_jsonl_rows(trade_path):
+        realized_pnl = float(row.get("realizedPnl") or 0.0)
+        trade_time_ms = int(float(row.get("time") or 0))
+        if trade_time_ms < window_start_ms or realized_pnl >= loss_threshold:
+            continue
+        event_context = _find_closest_event_context(summary_path, trade_time_ms)
+        anomalies.append(
+            {
+                "time": datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc).isoformat(),
+                "order_id": row.get("orderId"),
+                "side": str(row.get("side") or "").upper().strip(),
+                "position_side": str(row.get("positionSide") or row.get("position_side") or "").upper().strip(),
+                "price": float(row.get("price") or 0.0),
+                "qty": abs(float(row.get("qty") or 0.0)),
+                "realized_pnl": realized_pnl,
+                "center_price": float(event_context.get("center_price") or 0.0),
+                "mid_price": float(event_context.get("mid_price") or 0.0),
+                "actual_net_qty": float(event_context.get("actual_net_qty") or 0.0),
+                "cycle": int(event_context.get("cycle") or 0),
+            }
+        )
+    anomalies.sort(key=lambda item: (str(item.get("time") or ""), float(item.get("realized_pnl") or 0.0)))
+    return anomalies
+
+
+def _build_hourly_symbol_report_email(config: dict[str, Any], *, window_minutes: int = 30) -> dict[str, Any] | None:
+    symbol = str(config.get("symbol") or "").upper().strip()
+    summary_text = str(config.get("summary_jsonl") or "").strip()
+    if not symbol or not summary_text:
+        return None
+    summary_path = Path(summary_text)
+    latest = _read_last_jsonl_row(summary_path) or {}
+    window_stats = _summarize_symbol_trade_window(summary_path, window_minutes=window_minutes)
+    anomalies = _collect_symbol_loss_anomalies(summary_path, window_minutes=window_minutes)
+    body_lines = [
+        f"symbol: {symbol}",
+        f"report_window: {window_minutes}m",
+        f"runtime_status: {latest.get('runtime_status') or '--'}",
+        f"center_price: {float(latest.get('center_price') or 0.0):.8f}",
+        f"mid_price: {float(latest.get('mid_price') or 0.0):.8f}",
+        f"actual_net_qty: {float(latest.get('actual_net_qty') or 0.0):.8f}",
+        f"actual_net_notional: {float(latest.get('actual_net_notional') or 0.0):.4f}",
+        f"{window_minutes}m_gross_notional: {float(window_stats['gross_notional']):.4f}",
+        f"{window_minutes}m_trade_count: {int(window_stats['trade_count'])}",
+        f"{window_minutes}m_commission: {float(window_stats['commission']):.6f}",
+        f"{window_minutes}m_realized_pnl: {float(window_stats['realized_pnl']):.6f}",
+        f"{window_minutes}m_funding: {float(window_stats['funding']):.6f}",
+        f"{window_minutes}m_net_pnl: {float(window_stats['net_realized']):.6f}",
+        f"cumulative_gross_notional: {float(latest.get('cumulative_gross_notional') or 0.0):.4f}",
+        f"large_loss_count: {len(anomalies)}",
+    ]
+    if anomalies:
+        body_lines.append("")
+        body_lines.append("large_loss_trades:")
+        for item in anomalies:
+            body_lines.append(
+                "  - "
+                f"time={item['time']} cycle={item['cycle']} side={item['side']} position_side={item['position_side']} "
+                f"price={item['price']:.7f} qty={item['qty']:.8f} realized_pnl={item['realized_pnl']:.8f} "
+                f"center_price={item['center_price']:.8f} mid_price={item['mid_price']:.8f} actual_net_qty={item['actual_net_qty']:.8f}"
+            )
+    return {
+        "subject": f"[grid][{alert_source_label()}] {symbol} {window_minutes}m report",
+        "body": "\n".join(body_lines),
+        "anomalies": anomalies,
+    }
+
+
+def _send_hourly_symbol_report(config: dict[str, Any]) -> None:
+    payload = _build_hourly_symbol_report_email(config)
+    if payload is None:
+        return
+    send_alert_email(subject=str(payload["subject"]), body=str(payload["body"]))
+
+
+def _run_hourly_email_report_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        now = datetime.now(timezone.utc)
+        half_hour = 0 if now.minute < 30 else 30
+        report_bucket = now.replace(minute=half_hour, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%MZ")
+        state = _read_json_dict(HOURLY_EMAIL_REPORT_STATE_PATH) or {}
+        sent_map = state.get("sent") if isinstance(state.get("sent"), dict) else {}
+        changed = False
+        for config in _iter_saved_runner_control_configs():
+            symbol = str(config.get("symbol") or "").upper().strip()
+            if not symbol or sent_map.get(symbol) == report_bucket:
+                continue
+            process = read_symbol_runner_process(symbol)
+            if not bool(process.get("is_running")):
+                continue
+            try:
+                _send_hourly_symbol_report(config)
+                sent_map[symbol] = report_bucket
+                changed = True
+            except Exception:
+                continue
+        if changed:
+            _write_json_dict(HOURLY_EMAIL_REPORT_STATE_PATH, {"sent": sent_map, "updated_at": now.isoformat()})
+        stop_event.wait(60.0)
+
+
+def _normalize_volume_trigger_window(value: Any) -> str:
+    text = str(value or DEFAULT_VOLUME_TRIGGER_WINDOW).strip().lower()
+    return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLUME_TRIGGER_WINDOW
+
+
+def _normalize_volatility_trigger_window(value: Any) -> str:
+    text = str(value or DEFAULT_VOLATILITY_TRIGGER_WINDOW).strip().lower()
+    return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLATILITY_TRIGGER_WINDOW
+
+
+def _normalize_runner_volume_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    normalized["volume_trigger_enabled"] = bool(normalized.get("volume_trigger_enabled", False))
+    normalized["volume_trigger_window"] = _normalize_volume_trigger_window(normalized.get("volume_trigger_window"))
+    for key in {"volume_trigger_start_threshold", "volume_trigger_stop_threshold"}:
+        value = normalized.get(key)
+        if value in {"", None}:
+            normalized[key] = None
+            continue
+        threshold = float(value)
+        if threshold <= 0:
+            raise ValueError(f"{key} must be > 0")
+        normalized[key] = threshold
+    normalized["volume_trigger_stop_cancel_open_orders"] = bool(
+        normalized.get("volume_trigger_stop_cancel_open_orders", True)
+    )
+    normalized["volume_trigger_stop_close_all_positions"] = bool(
+        normalized.get("volume_trigger_stop_close_all_positions", False)
+    )
+    if normalized["volume_trigger_stop_close_all_positions"]:
+        normalized["volume_trigger_stop_cancel_open_orders"] = True
+    if normalized["volume_trigger_enabled"]:
+        if (
+            normalized.get("volume_trigger_start_threshold") is None
+            and normalized.get("volume_trigger_stop_threshold") is None
+        ):
+            raise ValueError("volume trigger enabled requires at least one threshold")
+        start_threshold = normalized.get("volume_trigger_start_threshold")
+        stop_threshold = normalized.get("volume_trigger_stop_threshold")
+        if start_threshold is not None and stop_threshold is not None and stop_threshold > start_threshold:
+            raise ValueError("volume trigger stop threshold cannot exceed start threshold")
+    return normalized
+
+
+def _normalize_runner_volatility_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    normalized["volatility_trigger_enabled"] = bool(normalized.get("volatility_trigger_enabled", True))
+    normalized["volatility_trigger_window"] = _normalize_volatility_trigger_window(
+        normalized.get("volatility_trigger_window")
+    )
+    for key in {"volatility_trigger_amplitude_ratio", "volatility_trigger_abs_return_ratio"}:
+        value = normalized.get(key)
+        if value in {"", None}:
+            normalized[key] = None
+            continue
+        threshold = float(value)
+        if threshold <= 0:
+            raise ValueError(f"{key} must be > 0")
+        normalized[key] = threshold
+    normalized["volatility_trigger_stop_cancel_open_orders"] = bool(
+        normalized.get("volatility_trigger_stop_cancel_open_orders", True)
+    )
+    normalized["volatility_trigger_stop_close_all_positions"] = bool(
+        normalized.get("volatility_trigger_stop_close_all_positions", True)
+    )
+    normalized["volatility_trigger_directional_flatten_enabled"] = bool(
+        normalized.get("volatility_trigger_directional_flatten_enabled", False)
+    )
+    normalized["volatility_trigger_directional_taker_enabled"] = bool(
+        normalized.get("volatility_trigger_directional_taker_enabled", False)
+    )
+    if normalized["volatility_trigger_stop_close_all_positions"]:
+        normalized["volatility_trigger_stop_cancel_open_orders"] = True
+    if normalized["volatility_trigger_enabled"]:
+        if (
+            normalized.get("volatility_trigger_amplitude_ratio") is None
+            and normalized.get("volatility_trigger_abs_return_ratio") is None
+        ):
+            raise ValueError("volatility trigger enabled requires at least one threshold")
+    return normalized
+
+
+def _resolve_volatility_directional_flatten_filter(
+    *,
+    current_return_ratio: float,
+    live_snapshot: dict[str, Any],
+) -> dict[str, Any]:
+    long_qty = max(float(live_snapshot.get("long_qty") or 0.0), 0.0)
+    short_qty = max(float(live_snapshot.get("short_qty") or 0.0), 0.0)
+    if current_return_ratio < 0 and long_qty > 0:
+        return {
+            "position_side_filter": "LONG",
+            "reason": "close_long_on_down_move",
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+        }
+    if current_return_ratio > 0 and short_qty > 0:
+        return {
+            "position_side_filter": "SHORT",
+            "reason": "close_short_on_up_move",
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+        }
+    return {
+        "position_side_filter": None,
+        "reason": "no_adverse_position",
+        "long_qty": long_qty,
+        "short_qty": short_qty,
+    }
+
+
 def _legacy_runner_symbol() -> str:
     stored = _read_json_dict(RUNNER_CONTROL_PATH) or {}
     symbol = str(stored.get("symbol", "")).upper().strip()
@@ -687,10 +1886,10 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     if stored:
         config.update(stored)
     runner = _read_runner_process_for_symbol(normalized_symbol)
-    if runner.get("config"):
+    if not stored and runner.get("config"):
         config.update(runner["config"])
     config = _normalize_runner_runtime_paths(config, normalized_symbol)
-    return config
+    return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -732,6 +1931,487 @@ def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = 
     control_path = _runner_control_path(normalized_symbol)
     control_path.parent.mkdir(parents=True, exist_ok=True)
     control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _iter_saved_runner_control_configs() -> list[dict[str, Any]]:
+    output_dir = Path("output")
+    paths: list[Path] = []
+    if output_dir.exists():
+        paths.extend(sorted(output_dir.glob("*_loop_runner_control.json")))
+    if RUNNER_CONTROL_PATH.exists() and RUNNER_CONTROL_PATH not in paths:
+        paths.append(RUNNER_CONTROL_PATH)
+
+    seen_symbols: set[str] = set()
+    configs: list[dict[str, Any]] = []
+    for path in paths:
+        stored = _read_json_dict(path)
+        if not stored:
+            continue
+        symbol = str(stored.get("symbol", "")).upper().strip()
+        if not symbol or symbol in seen_symbols:
+            continue
+        try:
+            configs.append(_normalize_runner_control_payload(stored))
+        except Exception:
+            continue
+        seen_symbols.add(symbol)
+    return configs
+
+
+def _volatility_trigger_status_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_volatility_trigger_status.json")
+
+
+def _resolve_runner_volume_trigger_action(
+    config: dict[str, Any],
+    *,
+    current_quote_volume: float,
+    runner_running: bool,
+    flatten_running: bool,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volume_trigger_config(config)
+    if not normalized_config.get("volume_trigger_enabled"):
+        return {"action": None, "reason": "disabled"}
+
+    start_threshold = normalized_config.get("volume_trigger_start_threshold")
+    stop_threshold = normalized_config.get("volume_trigger_stop_threshold")
+
+    if flatten_running and not runner_running:
+        return {"action": None, "reason": "flatten_running"}
+    if runner_running:
+        if stop_threshold is not None and current_quote_volume < float(stop_threshold):
+            return {
+                "action": "stop",
+                "reason": "volume_below_stop_threshold",
+                "threshold": float(stop_threshold),
+            }
+        return {"action": None, "reason": "runner_running"}
+    if start_threshold is not None and current_quote_volume >= float(start_threshold):
+        return {
+            "action": "start",
+            "reason": "volume_above_start_threshold",
+            "threshold": float(start_threshold),
+        }
+    return {"action": None, "reason": "waiting_for_start_threshold"}
+
+
+def _update_volume_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    with VOLUME_TRIGGER_STATUS_LOCK:
+        VOLUME_TRIGGER_STATUS_CACHE[normalized_symbol] = dict(payload)
+
+
+def _runner_volume_trigger_status(symbol: str) -> dict[str, Any] | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return None
+    with VOLUME_TRIGGER_STATUS_LOCK:
+        status = VOLUME_TRIGGER_STATUS_CACHE.get(normalized_symbol)
+        return dict(status) if isinstance(status, dict) else None
+
+
+def _update_volatility_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    normalized_payload = dict(payload)
+    status_path = _volatility_trigger_status_path(normalized_symbol)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(normalized_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with VOLATILITY_TRIGGER_STATUS_LOCK:
+        VOLATILITY_TRIGGER_STATUS_CACHE[normalized_symbol] = normalized_payload
+
+
+def _runner_volatility_trigger_status(symbol: str) -> dict[str, Any] | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return None
+    with VOLATILITY_TRIGGER_STATUS_LOCK:
+        cached = VOLATILITY_TRIGGER_STATUS_CACHE.get(normalized_symbol)
+        if isinstance(cached, dict):
+            return dict(cached)
+    payload = _read_json_dict(_volatility_trigger_status_path(normalized_symbol))
+    if isinstance(payload, dict):
+        with VOLATILITY_TRIGGER_STATUS_LOCK:
+            VOLATILITY_TRIGGER_STATUS_CACHE[normalized_symbol] = dict(payload)
+        return dict(payload)
+    return None
+
+
+def _clear_volatility_trigger_status(symbol: str, *, reason: str = "manual_clear") -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    status = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": normalized_symbol,
+        "action": None,
+        "reason": reason,
+        "paused_by_trigger": False,
+        "last_error": None,
+    }
+    _update_volatility_trigger_status(normalized_symbol, status)
+
+
+def _runner_volume_trigger_start_allowed(config: dict[str, Any], *, current_quote_volume: float) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volume_trigger_config(config)
+    if not normalized_config.get("volume_trigger_enabled"):
+        return {"allowed": True, "reason": "disabled"}
+    start_threshold = normalized_config.get("volume_trigger_start_threshold")
+    if start_threshold is None:
+        return {"allowed": True, "reason": "no_start_threshold"}
+    if current_quote_volume >= float(start_threshold):
+        return {
+            "allowed": True,
+            "reason": "volume_above_start_threshold",
+            "threshold": float(start_threshold),
+        }
+    return {
+        "allowed": False,
+        "reason": "volume_below_start_threshold",
+        "threshold": float(start_threshold),
+    }
+
+
+def _evaluate_runner_volatility_trigger_signal(
+    config: dict[str, Any],
+    *,
+    current_amplitude_ratio: float,
+    current_return_ratio: float,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    amplitude_threshold = normalized_config.get("volatility_trigger_amplitude_ratio")
+    abs_return_threshold = normalized_config.get("volatility_trigger_abs_return_ratio")
+    matched_reasons: list[str] = []
+    if amplitude_threshold is not None and float(current_amplitude_ratio) >= float(amplitude_threshold):
+        matched_reasons.append("amplitude_above_threshold")
+    if abs_return_threshold is not None and abs(float(current_return_ratio)) >= float(abs_return_threshold):
+        matched_reasons.append("abs_return_above_threshold")
+    return {
+        "hit": bool(matched_reasons),
+        "matched_reasons": matched_reasons,
+        "amplitude_threshold": amplitude_threshold,
+        "abs_return_threshold": abs_return_threshold,
+    }
+
+
+def _resolve_runner_volatility_trigger_action(
+    config: dict[str, Any],
+    *,
+    current_amplitude_ratio: float,
+    current_return_ratio: float,
+    runner_running: bool,
+    flatten_running: bool,
+    paused_by_trigger: bool,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    if not normalized_config.get("volatility_trigger_enabled"):
+        return {"action": None, "reason": "disabled"}
+
+    signal_summary = _evaluate_runner_volatility_trigger_signal(
+        normalized_config,
+        current_amplitude_ratio=current_amplitude_ratio,
+        current_return_ratio=current_return_ratio,
+    )
+    if flatten_running and not runner_running:
+        return {"action": None, "reason": "flatten_running", **signal_summary}
+    if runner_running:
+        if signal_summary["hit"]:
+            return {
+                "action": "stop",
+                "reason": "volatility_above_threshold",
+                **signal_summary,
+            }
+        return {"action": None, "reason": "runner_running", **signal_summary}
+    if paused_by_trigger:
+        if signal_summary["hit"]:
+            return {"action": None, "reason": "waiting_for_volatility_cooldown", **signal_summary}
+        return {"action": "start", "reason": "volatility_back_within_threshold", **signal_summary}
+    if signal_summary["hit"]:
+        return {"action": None, "reason": "volatility_above_threshold", **signal_summary}
+    return {"action": None, "reason": "runner_stopped", **signal_summary}
+
+
+def _volatility_trigger_start_allowed(config: dict[str, Any]) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    if not normalized_config.get("volatility_trigger_enabled"):
+        return {"allowed": True, "reason": "disabled"}
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    if not symbol:
+        return {"allowed": True, "reason": "missing_symbol"}
+    window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
+    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
+    signal_summary = _evaluate_runner_volatility_trigger_signal(
+        normalized_config,
+        current_amplitude_ratio=float(stats.get("amplitude_ratio") or 0.0),
+        current_return_ratio=float(stats.get("return_ratio") or 0.0),
+    )
+    if signal_summary["hit"]:
+        return {
+            "allowed": False,
+            "reason": "volatility_above_threshold",
+            "window": window_key,
+            "window_minutes": window_minutes,
+            "current_amplitude_ratio": float(stats.get("amplitude_ratio") or 0.0),
+            "current_return_ratio": float(stats.get("return_ratio") or 0.0),
+            **signal_summary,
+        }
+    return {
+        "allowed": True,
+        "reason": "volatility_within_threshold",
+        "window": window_key,
+        "window_minutes": window_minutes,
+        "current_amplitude_ratio": float(stats.get("amplitude_ratio") or 0.0),
+        "current_return_ratio": float(stats.get("return_ratio") or 0.0),
+        **signal_summary,
+    }
+
+
+def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
+    normalized_config = _normalize_runner_volume_trigger_config(config)
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    if not symbol or not normalized_config.get("volume_trigger_enabled"):
+        return
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    window_key = _normalize_volume_trigger_window(normalized_config.get("volume_trigger_window"))
+    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    quote_volume = fetch_futures_quote_volume_sum(symbol, window_minutes=window_minutes)
+    runner = _read_runner_process_for_symbol(symbol)
+    flatten = _read_flatten_process_for_symbol(symbol)
+    decision = _resolve_runner_volume_trigger_action(
+        normalized_config,
+        current_quote_volume=quote_volume,
+        runner_running=bool(runner.get("is_running")),
+        flatten_running=bool(flatten.get("is_running")),
+    )
+    status: dict[str, Any] = {
+        "checked_at": checked_at,
+        "symbol": symbol,
+        "window": window_key,
+        "window_minutes": window_minutes,
+        "current_quote_volume": quote_volume,
+        "start_threshold": normalized_config.get("volume_trigger_start_threshold"),
+        "stop_threshold": normalized_config.get("volume_trigger_stop_threshold"),
+        "runner_running": bool(runner.get("is_running")),
+        "flatten_running": bool(flatten.get("is_running")),
+        "action": decision.get("action"),
+        "reason": decision.get("reason"),
+        "last_error": None,
+    }
+    try:
+        if decision.get("action") == "start":
+            volatility_gate = _volatility_trigger_start_allowed(normalized_config)
+            if not volatility_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "blocked_by_volatility_trigger"
+                status["volatility_block"] = volatility_gate
+                _update_volume_trigger_status(symbol, status)
+                return
+            result = _start_runner_process(normalized_config)
+            status["result"] = {
+                "started": bool(result.get("started")),
+                "already_running": bool(result.get("already_running")),
+                "restarted": bool(result.get("restarted")),
+            }
+            print(
+                f"[volume-trigger] {symbol} start window={window_key} quote_volume={quote_volume:.4f} "
+                f">= {float(decision.get('threshold') or 0.0):.4f}"
+            )
+        elif decision.get("action") == "stop":
+            result = _stop_runner_process(
+                symbol,
+                cancel_open_orders=bool(normalized_config.get("volume_trigger_stop_cancel_open_orders", True)),
+                close_all_positions=bool(normalized_config.get("volume_trigger_stop_close_all_positions", False)),
+            )
+            status["result"] = {
+                "stopped": bool(result.get("stopped")),
+                "already_stopped": bool(result.get("already_stopped")),
+            }
+            print(
+                f"[volume-trigger] {symbol} stop window={window_key} quote_volume={quote_volume:.4f} "
+                f"< {float(decision.get('threshold') or 0.0):.4f}"
+            )
+    except Exception as exc:  # pragma: no cover
+        status["last_error"] = f"{type(exc).__name__}: {exc}"
+    _update_volume_trigger_status(symbol, status)
+
+
+def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        for config in _iter_saved_runner_control_configs():
+            if not config.get("volume_trigger_enabled"):
+                continue
+            try:
+                _reconcile_runner_volume_trigger(config)
+            except Exception as exc:  # pragma: no cover
+                symbol = str(config.get("symbol", "")).upper().strip()
+                _update_volume_trigger_status(
+                    symbol,
+                    {
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "symbol": symbol,
+                        "action": None,
+                        "reason": "error",
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+        stop_event.wait(VOLUME_TRIGGER_POLL_SECONDS)
+
+
+def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    if not symbol or not normalized_config.get("volatility_trigger_enabled"):
+        return
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
+    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    price_stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
+    current_amplitude_ratio = float(price_stats.get("amplitude_ratio") or 0.0)
+    current_return_ratio = float(price_stats.get("return_ratio") or 0.0)
+    runner = _read_runner_process_for_symbol(symbol)
+    flatten = _read_flatten_process_for_symbol(symbol)
+    previous_status = _runner_volatility_trigger_status(symbol) or {}
+    decision = _resolve_runner_volatility_trigger_action(
+        normalized_config,
+        current_amplitude_ratio=current_amplitude_ratio,
+        current_return_ratio=current_return_ratio,
+        runner_running=bool(runner.get("is_running")),
+        flatten_running=bool(flatten.get("is_running")),
+        paused_by_trigger=bool(previous_status.get("paused_by_trigger", False)),
+    )
+    status: dict[str, Any] = {
+        "checked_at": checked_at,
+        "symbol": symbol,
+        "window": window_key,
+        "window_minutes": window_minutes,
+        "current_amplitude_ratio": current_amplitude_ratio,
+        "current_return_ratio": current_return_ratio,
+        "amplitude_ratio": normalized_config.get("volatility_trigger_amplitude_ratio"),
+        "abs_return_ratio": normalized_config.get("volatility_trigger_abs_return_ratio"),
+        "runner_running": bool(runner.get("is_running")),
+        "flatten_running": bool(flatten.get("is_running")),
+        "action": decision.get("action"),
+        "reason": decision.get("reason"),
+        "matched_reasons": decision.get("matched_reasons") or [],
+        "paused_by_trigger": bool(previous_status.get("paused_by_trigger", False)),
+        "last_error": None,
+    }
+    try:
+        if decision.get("action") == "start":
+            volume_gate = {"allowed": True, "reason": "disabled"}
+            if normalized_config.get("volume_trigger_enabled"):
+                volume_window_key = _normalize_volume_trigger_window(normalized_config.get("volume_trigger_window"))
+                volume_window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[volume_window_key]
+                quote_volume = fetch_futures_quote_volume_sum(symbol, window_minutes=volume_window_minutes)
+                volume_gate = {
+                    **_runner_volume_trigger_start_allowed(normalized_config, current_quote_volume=quote_volume),
+                    "window": volume_window_key,
+                    "window_minutes": volume_window_minutes,
+                    "current_quote_volume": quote_volume,
+                }
+            if not volume_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "resume_blocked_by_volume_trigger"
+                status["volume_block"] = volume_gate
+                _update_volatility_trigger_status(symbol, status)
+                return
+            result = _start_runner_process(normalized_config)
+            status["result"] = {
+                "started": bool(result.get("started")),
+                "already_running": bool(result.get("already_running")),
+                "restarted": bool(result.get("restarted")),
+            }
+            status["paused_by_trigger"] = False
+            print(
+                f"[volatility-trigger] {symbol} resume window={window_key} "
+                f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%}"
+            )
+        elif decision.get("action") == "stop":
+            close_all_positions = bool(normalized_config.get("volatility_trigger_stop_close_all_positions", True))
+            result = _stop_runner_process(
+                symbol,
+                cancel_open_orders=bool(normalized_config.get("volatility_trigger_stop_cancel_open_orders", True)),
+                close_all_positions=close_all_positions,
+            )
+            status["result"] = {
+                "stopped": bool(result.get("stopped")),
+                "already_stopped": bool(result.get("already_stopped")),
+            }
+            if (
+                not close_all_positions
+                and bool(normalized_config.get("volatility_trigger_directional_flatten_enabled", False))
+            ):
+                status["directional_flatten"] = _start_volatility_directional_flatten_process(
+                    symbol=symbol,
+                    current_return_ratio=current_return_ratio,
+                    recv_window=int(normalized_config.get("recv_window", 5000) or 5000),
+                    taker_enabled=bool(normalized_config.get("volatility_trigger_directional_taker_enabled", False)),
+                )
+            status["paused_by_trigger"] = True
+            print(
+                f"[volatility-trigger] {symbol} stop window={window_key} "
+                f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%}"
+            )
+        elif bool(runner.get("is_running")):
+            status["paused_by_trigger"] = False
+    except Exception as exc:  # pragma: no cover
+        status["last_error"] = f"{type(exc).__name__}: {exc}"
+    _update_volatility_trigger_status(symbol, status)
+
+
+def _run_volatility_trigger_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        for config in _iter_saved_runner_control_configs():
+            if not config.get("volatility_trigger_enabled"):
+                continue
+            try:
+                _reconcile_runner_volatility_trigger(config)
+            except Exception as exc:  # pragma: no cover
+                symbol = str(config.get("symbol", "")).upper().strip()
+                _update_volatility_trigger_status(
+                    symbol,
+                    {
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "symbol": symbol,
+                        "action": None,
+                        "reason": "error",
+                        "paused_by_trigger": bool((_runner_volatility_trigger_status(symbol) or {}).get("paused_by_trigger")),
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+        stop_event.wait(VOLATILITY_TRIGGER_POLL_SECONDS)
+
+
+def _run_competition_board_auto_refresh_loop(stop_event: threading.Event, interval_seconds: float) -> None:
+    interval = max(COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS, float(interval_seconds))
+    next_run = time.monotonic()
+    while not stop_event.is_set():
+        now = time.monotonic()
+        if now < next_run:
+            stop_event.wait(next_run - now)
+            continue
+        started = time.monotonic()
+        try:
+            snapshot = build_competition_board_snapshot(refresh=True)
+            duration = time.monotonic() - started
+            boards = len(snapshot.get("boards", [])) if isinstance(snapshot, dict) else 0
+            errors = snapshot.get("errors", []) if isinstance(snapshot, dict) else []
+            error_count = len(errors) if isinstance(errors, list) else 0
+            generated_at = snapshot.get("generated_at_utc", "") if isinstance(snapshot, dict) else ""
+            print(
+                f"[competition-board] auto refresh ok duration={duration:.1f}s "
+                f"boards={boards} errors={error_count} generated_at={generated_at}"
+            )
+        except Exception as exc:  # pragma: no cover
+            duration = time.monotonic() - started
+            print(f"[competition-board] auto refresh failed after {duration:.1f}s: {type(exc).__name__}: {exc}")
+        next_run = time.monotonic() + interval
 
 
 def _symbol_output_slug(symbol: str) -> str:
@@ -815,6 +2495,7 @@ def _normalize_runner_runtime_paths(config: dict[str, Any], symbol: str) -> dict
 
 SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "market_type": "spot",
+    "strategy_profile": "manual_spot",
     "strategy_mode": "spot_one_way_long",
     "symbol": "BTCUSDT",
     "grid_level_mode": "arithmetic",
@@ -847,8 +2528,234 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "inventory_recycle_age_minutes": 40.0,
     "inventory_recycle_loss_tolerance_ratio": 0.006,
     "inventory_recycle_min_profit_ratio": 0.001,
+    "attack_market_entry_enabled": False,
+    "attack_market_entry_trigger_multiplier": 1.0,
+    "attack_market_entry_target_multiplier": 4.0,
+    "attack_market_entry_cooldown_seconds": 60.0,
+    "lot_take_profit_offset": 1.25,
     "max_single_cycle_new_orders": 8,
+    "base_position_notional": 120.0,
+    "max_inventory_multiplier": 2.0,
+    "quote_buy_order_notional": 20.0,
+    "quote_sell_order_notional": 20.0,
+    "min_profit_offset": 0.0,
+    "reduce_only_timeout_seconds": 60.0,
+    "reduce_only_taker_target_multiplier": 1.4,
+    "run_start_time": None,
+    "run_end_time": None,
+    "runtime_guard_stats_start_time": None,
+    "rolling_hourly_loss_limit": None,
+    "max_cumulative_notional": None,
+    "max_cumulative_loss_limit": None,
 }
+
+
+SPOT_RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
+    "xaut_spot_competition_1_25_v1": {
+        "label": "1.25XAUT现货交易赛",
+        "description": "XAUT/USDT 现货交易赛冲 100 万成交额的量优先移中心预设。按 0.0675% 费率和 800U 最大损耗预算回测，建议启动前账户持有约 550U XAUT 与 450U USDT。",
+        "startable": True,
+        "kind": "spot_volume_shift_long",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "market_type": "spot",
+            "strategy_profile": "xaut_spot_competition_1_25_v1",
+            "strategy_mode": "spot_volume_shift_long",
+            "symbol": "XAUTUSDT",
+            "grid_level_mode": "arithmetic",
+            "min_price": 0.0,
+            "max_price": 0.0,
+            "n": 0,
+            "total_quote_budget": 1000.0,
+            "sleep_seconds": 5.0,
+            "cancel_stale": True,
+            "apply": True,
+            "reset_state": True,
+            "grid_band_ratio": 0.00084,
+            "attack_buy_levels": 5,
+            "attack_sell_levels": 5,
+            "attack_per_order_notional": 40.0,
+            "defense_buy_levels": 5,
+            "defense_sell_levels": 5,
+            "defense_per_order_notional": 40.0,
+            "inventory_soft_limit_notional": 750.0,
+            "inventory_hard_limit_notional": 950.0,
+            "center_shift_trigger_ratio": 0.00135,
+            "center_shift_confirm_cycles": 3,
+            "center_shift_step_ratio": 0.00135,
+            "buy_pause_amp_trigger_ratio": 0.0035,
+            "buy_pause_down_return_trigger_ratio": -0.0020,
+            "freeze_shift_abs_return_trigger_ratio": 0.0030,
+            "inventory_recycle_age_minutes": 40.0,
+            "inventory_recycle_loss_tolerance_ratio": 0.006,
+            "inventory_recycle_min_profit_ratio": 0.001,
+            "attack_market_entry_enabled": False,
+            "attack_market_entry_trigger_multiplier": 1.0,
+            "attack_market_entry_target_multiplier": 4.0,
+            "attack_market_entry_cooldown_seconds": 60.0,
+            "lot_take_profit_offset": 1.25,
+            "max_single_cycle_new_orders": 8,
+            "rolling_hourly_loss_limit": 120.0,
+            "max_cumulative_notional": 1_000_000.0,
+            "max_cumulative_loss_limit": 800.0,
+        },
+    },
+    "xaut_spot_competition_0_8_v1": {
+        "label": "0.8XAUT现货交易赛",
+        "description": "XAUT/USDT 现货交易赛低波动加速成交预设。与 1.25 版参数一致，但按 lot 卖出止盈偏移收窄到 0.8 USDT，且单笔买入/防守金额下调到 15U，更容易贴近现价连续成交。",
+        "startable": True,
+        "kind": "spot_volume_shift_long",
+        "symbol": "XAUTUSDT",
+        "config": {
+            "market_type": "spot",
+            "strategy_profile": "xaut_spot_competition_0_8_v1",
+            "strategy_mode": "spot_volume_shift_long",
+            "symbol": "XAUTUSDT",
+            "grid_level_mode": "arithmetic",
+            "min_price": 0.0,
+            "max_price": 0.0,
+            "n": 0,
+            "total_quote_budget": 1000.0,
+            "sleep_seconds": 5.0,
+            "cancel_stale": True,
+            "apply": True,
+            "reset_state": True,
+            "grid_band_ratio": 0.00084,
+            "attack_buy_levels": 5,
+            "attack_sell_levels": 5,
+            "attack_per_order_notional": 15.0,
+            "defense_buy_levels": 5,
+            "defense_sell_levels": 5,
+            "defense_per_order_notional": 15.0,
+            "inventory_soft_limit_notional": 750.0,
+            "inventory_hard_limit_notional": 950.0,
+            "center_shift_trigger_ratio": 0.00135,
+            "center_shift_confirm_cycles": 3,
+            "center_shift_step_ratio": 0.00135,
+            "buy_pause_amp_trigger_ratio": 0.0035,
+            "buy_pause_down_return_trigger_ratio": -0.0020,
+            "freeze_shift_abs_return_trigger_ratio": 0.0030,
+            "inventory_recycle_age_minutes": 40.0,
+            "inventory_recycle_loss_tolerance_ratio": 0.006,
+            "inventory_recycle_min_profit_ratio": 0.001,
+            "attack_market_entry_enabled": True,
+            "attack_market_entry_trigger_multiplier": 2.0,
+            "attack_market_entry_target_multiplier": 4.0,
+            "attack_market_entry_cooldown_seconds": 60.0,
+            "lot_take_profit_offset": 0.8,
+            "max_single_cycle_new_orders": 8,
+            "rolling_hourly_loss_limit": 120.0,
+            "max_cumulative_notional": 1_000_000.0,
+            "max_cumulative_loss_limit": 800.0,
+        },
+    },
+    "bard_spot_best_quote_inventory_v1": {
+        "label": "BARD现货贴盘口刷量 v1",
+        "description": "BARDUSDT 现货交易赛专用。先补到底仓，再在轻仓区间贴买一卖一刷量；库存到 2 倍底仓后只减仓，60 秒压不下来时允许 taker 回到安全区。",
+        "startable": True,
+        "kind": "spot_best_quote_inventory",
+        "symbol": "BARDUSDT",
+        "config": {
+            "market_type": "spot",
+            "strategy_profile": "bard_spot_best_quote_inventory_v1",
+            "strategy_mode": "spot_best_quote_inventory",
+            "symbol": "BARDUSDT",
+            "grid_level_mode": "arithmetic",
+            "min_price": 0.0,
+            "max_price": 0.0,
+            "n": 0,
+            "total_quote_budget": 600.0,
+            "sleep_seconds": 3.0,
+            "cancel_stale": True,
+            "apply": True,
+            "reset_state": True,
+            "grid_band_ratio": 0.0001,
+            "attack_buy_levels": 1,
+            "attack_sell_levels": 1,
+            "attack_per_order_notional": 20.0,
+            "defense_buy_levels": 1,
+            "defense_sell_levels": 1,
+            "defense_per_order_notional": 20.0,
+            "inventory_soft_limit_notional": 120.0,
+            "inventory_hard_limit_notional": 240.0,
+            "center_shift_trigger_ratio": 0.0001,
+            "center_shift_confirm_cycles": 1,
+            "center_shift_step_ratio": 0.0001,
+            "buy_pause_amp_trigger_ratio": 0.02,
+            "buy_pause_down_return_trigger_ratio": -0.01,
+            "freeze_shift_abs_return_trigger_ratio": 0.02,
+            "inventory_recycle_age_minutes": 999999.0,
+            "inventory_recycle_loss_tolerance_ratio": 0.006,
+            "inventory_recycle_min_profit_ratio": 0.001,
+            "attack_market_entry_enabled": False,
+            "attack_market_entry_trigger_multiplier": 1.0,
+            "attack_market_entry_target_multiplier": 4.0,
+            "attack_market_entry_cooldown_seconds": 60.0,
+            "lot_take_profit_offset": 0.0001,
+            "max_single_cycle_new_orders": 4,
+            "base_position_notional": 120.0,
+            "max_inventory_multiplier": 2.0,
+            "quote_buy_order_notional": 20.0,
+            "quote_sell_order_notional": 20.0,
+            "min_profit_offset": 0.0001,
+            "reduce_only_timeout_seconds": 60.0,
+            "reduce_only_taker_target_multiplier": 1.4,
+            "rolling_hourly_loss_limit": None,
+            "max_cumulative_notional": 300000.0,
+            "max_cumulative_loss_limit": None,
+        },
+    },
+}
+
+
+def _spot_runner_preset_map(symbol: str | None = None) -> dict[str, dict[str, Any]]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    result: dict[str, dict[str, Any]] = {}
+    for key, item in SPOT_RUNNER_STRATEGY_PRESETS.items():
+        preset_symbol = str(item.get("symbol") or "").upper().strip()
+        if preset_symbol and normalized_symbol and preset_symbol != normalized_symbol:
+            continue
+        result[key] = item
+    return result
+
+
+def _spot_runner_preset_payload(profile: str, base_config: dict[str, Any] | None = None) -> dict[str, Any]:
+    normalized = str(profile or "manual_spot").strip()
+    if normalized in {"", "manual_spot"}:
+        payload = dict(base_config or {})
+        payload["strategy_profile"] = "manual_spot"
+        return payload
+    preset = _spot_runner_preset_map().get(normalized)
+    if preset is None:
+        raise ValueError(f"Unknown spot strategy_profile: {normalized}")
+    payload = dict(preset.get("config") or {})
+    base = dict(base_config or {})
+    preset_symbol = str(preset.get("symbol") or "").upper().strip()
+    requested_symbol = str(base.get("symbol") or payload.get("symbol") or "").upper().strip()
+    if preset_symbol and requested_symbol and requested_symbol != preset_symbol:
+        raise ValueError(f"{preset.get('label', normalized)} requires symbol={preset_symbol}")
+    payload.update({key: value for key, value in base.items() if key in {"symbol", "strategy_profile"}})
+    payload["strategy_profile"] = normalized
+    if preset_symbol:
+        payload["symbol"] = preset_symbol
+    return payload
+
+
+def _spot_runner_preset_summaries(symbol: str | None = None) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for key, item in _spot_runner_preset_map(symbol).items():
+        summaries.append(
+            {
+                "key": key,
+                "label": str(item.get("label") or key),
+                "description": str(item.get("description") or ""),
+                "startable": bool(item.get("startable", True)),
+                "kind": str(item.get("kind") or ""),
+                "symbol": str(item.get("symbol") or ""),
+                "config": dict(item.get("config") or {}),
+            }
+        )
+    return summaries
 
 
 def _spot_runner_pid_path(symbol: str) -> Path:
@@ -938,7 +2845,13 @@ def _tail_jsonl_dicts(path: Path, limit: int = 20) -> list[dict[str, Any]]:
 
 def _is_spot_strategy_order(order: dict[str, Any], prefix: str) -> bool:
     client_order_id = str(order.get("clientOrderId", "") or "")
-    return client_order_id.startswith(prefix)
+    prefix_text = str(prefix or "").strip()
+    if not prefix_text:
+        return False
+    if client_order_id.startswith(prefix_text):
+        return True
+    legacy_prefix = prefix_text[:8]
+    return bool(legacy_prefix) and client_order_id.startswith(legacy_prefix)
 
 
 def _extract_spot_balance(account_info: dict[str, Any], asset: str) -> tuple[float, float]:
@@ -953,6 +2866,229 @@ def _extract_spot_balance(account_info: dict[str, Any], asset: str) -> tuple[flo
             continue
         return _safe_float(item.get("free"), f"{wanted}.free"), _safe_float(item.get("locked"), f"{wanted}.locked")
     return 0.0, 0.0
+
+
+def _safe_trade_float(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _spot_commission_quote_value(
+    *,
+    commission: float,
+    commission_asset: str,
+    price: float,
+    base_asset: str,
+    quote_asset: str,
+) -> float:
+    asset = str(commission_asset or "").upper().strip()
+    quote = str(quote_asset or "").upper().strip()
+    base = str(base_asset or "").upper().strip()
+    if commission <= 0 or not asset:
+        return 0.0
+    if asset == quote:
+        return commission
+    if asset == base:
+        return commission * max(price, 0.0)
+    if quote:
+        for pair in (f"{asset}{quote}", f"{quote}{asset}"):
+            try:
+                rate = fetch_spot_latest_price(pair)
+            except Exception:
+                continue
+            if rate > 0:
+                return commission * rate if pair == f"{asset}{quote}" else commission / rate
+    return 0.0
+
+
+def _build_live_spot_trade_summary(
+    *,
+    symbol: str,
+    trades: list[dict[str, Any]],
+    bid_price: float,
+    ask_price: float,
+    base_asset: str,
+    quote_asset: str,
+    now_ms: int | None = None,
+    recent_limit: int = 50,
+) -> dict[str, Any]:
+    current_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+    windows_ms = {
+        "10m": 10 * 60_000,
+        "1h": 60 * 60_000,
+        "2h": 2 * 60 * 60_000,
+    }
+    normalized = [
+        item
+        for item in trades
+        if isinstance(item, dict) and int(item.get("time", 0) or 0) > 0
+    ]
+    normalized.sort(key=lambda item: int(item.get("time", 0) or 0), reverse=True)
+    conversion_cache: dict[str, float] = {}
+
+    def _commission_quote(commission: float, commission_asset: str, price: float) -> float:
+        asset = str(commission_asset or "").upper().strip()
+        quote = str(quote_asset or "").upper().strip()
+        base = str(base_asset or "").upper().strip()
+        if commission <= 0 or not asset:
+            return 0.0
+        if asset == quote:
+            return commission
+        if asset == base:
+            return commission * max(price, 0.0)
+        cached = conversion_cache.get(asset)
+        if cached is not None:
+            return commission * cached
+        value = _spot_commission_quote_value(
+            commission=1.0,
+            commission_asset=asset,
+            price=price,
+            base_asset=base,
+            quote_asset=quote,
+        )
+        conversion_cache[asset] = value
+        return commission * value
+
+    def _window_summary(span_ms: int) -> dict[str, Any]:
+        start_ms = current_ms - span_ms
+        rows = [item for item in normalized if int(item.get("time", 0) or 0) >= start_ms]
+        buy_notional = 0.0
+        sell_notional = 0.0
+        buy_qty = 0.0
+        sell_qty = 0.0
+        commission_quote = 0.0
+        commission_by_asset: dict[str, float] = {}
+        first_trade_ms = None
+        last_trade_ms = None
+        for item in rows:
+            trade_ms = int(item.get("time", 0) or 0)
+            first_trade_ms = trade_ms if first_trade_ms is None else min(first_trade_ms, trade_ms)
+            last_trade_ms = trade_ms if last_trade_ms is None else max(last_trade_ms, trade_ms)
+            price = _safe_trade_float(item.get("price"))
+            qty = _safe_trade_float(item.get("qty"))
+            quote_qty = _safe_trade_float(item.get("quoteQty")) or (price * qty)
+            commission = max(_safe_trade_float(item.get("commission")), 0.0)
+            commission_asset = str(item.get("commissionAsset", "") or "").upper().strip()
+            commission_quote_value = _commission_quote(commission, commission_asset, price)
+            commission_quote += commission_quote_value
+            if commission > 0 and commission_asset:
+                commission_by_asset[commission_asset] = commission_by_asset.get(commission_asset, 0.0) + commission
+            if bool(item.get("isBuyer")):
+                buy_notional += quote_qty
+                buy_qty += qty
+            else:
+                sell_notional += quote_qty
+                sell_qty += qty
+        gross_notional = buy_notional + sell_notional
+        net_base_qty = buy_qty - sell_qty
+        cash_pnl = sell_notional - buy_notional - commission_quote
+        mark_price = max(bid_price, 0.0) if net_base_qty >= 0 else max(ask_price, 0.0)
+        mtm_pnl = cash_pnl + net_base_qty * mark_price
+        loss = max(-mtm_pnl, 0.0)
+        return {
+            "trade_count": len(rows),
+            "window_start_ms": start_ms,
+            "first_trade_ms": first_trade_ms,
+            "last_trade_ms": last_trade_ms,
+            "gross_notional": gross_notional,
+            "buy_notional": buy_notional,
+            "sell_notional": sell_notional,
+            "buy_qty": buy_qty,
+            "sell_qty": sell_qty,
+            "net_base_qty": net_base_qty,
+            "commission_quote": commission_quote,
+            "commission_raw_by_asset": commission_by_asset,
+            "cash_pnl": cash_pnl,
+            "mtm_pnl": mtm_pnl,
+            "loss": loss,
+            "loss_per_10000u": (loss / gross_notional * 10000.0) if gross_notional > 0 else 0.0,
+            "pnl_per_10000u": (mtm_pnl / gross_notional * 10000.0) if gross_notional > 0 else 0.0,
+        }
+
+    recent_trades = []
+    for item in normalized[: max(int(recent_limit), 0)]:
+        price = _safe_trade_float(item.get("price"))
+        qty = _safe_trade_float(item.get("qty"))
+        quote_qty = _safe_trade_float(item.get("quoteQty")) or price * qty
+        commission = max(_safe_trade_float(item.get("commission")), 0.0)
+        commission_asset = str(item.get("commissionAsset", "") or "").upper().strip()
+        recent_trades.append(
+            {
+                "id": item.get("id"),
+                "order_id": item.get("orderId"),
+                "time": int(item.get("time", 0) or 0),
+                "side": "BUY" if bool(item.get("isBuyer")) else "SELL",
+                "price": price,
+                "qty": qty,
+                "notional": quote_qty,
+                "commission": commission,
+                "commission_asset": commission_asset,
+                "commission_quote": _commission_quote(commission, commission_asset, price),
+                "is_maker": bool(item.get("isMaker")),
+                "source": "binance",
+            }
+        )
+    return {
+        "symbol": str(symbol or "").upper().strip(),
+        "base_asset": str(base_asset or "").upper().strip(),
+        "quote_asset": str(quote_asset or "").upper().strip(),
+        "generated_at_ms": current_ms,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "windows": {label: _window_summary(span_ms) for label, span_ms in windows_ms.items()},
+        "recent_trades": recent_trades,
+    }
+
+
+def _load_live_spot_trade_summary_cached(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    bid_price: float,
+    ask_price: float,
+    base_asset: str,
+    quote_asset: str,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    cache_key = normalized_symbol
+    now = time.time()
+    with LIVE_SPOT_TRADE_SUMMARY_CACHE_LOCK:
+        cached = LIVE_SPOT_TRADE_SUMMARY_CACHE.get(cache_key)
+        if cached and now - cached[0] <= LIVE_SPOT_TRADE_SUMMARY_TTL_SECONDS:
+            _cached_ts, cached_trades, cached_base_asset, cached_quote_asset = cached
+            return _build_live_spot_trade_summary(
+                symbol=normalized_symbol,
+                trades=list(cached_trades),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                base_asset=cached_base_asset,
+                quote_asset=cached_quote_asset,
+                now_ms=int(now * 1000),
+            )
+    now_ms = int(now * 1000)
+    start_ms = now_ms - 2 * 60 * 60_000
+    trades = fetch_spot_user_trades(
+        symbol=normalized_symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        start_time_ms=start_ms,
+        limit=1000,
+    )
+    summary = _build_live_spot_trade_summary(
+        symbol=normalized_symbol,
+        trades=trades,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+        now_ms=now_ms,
+    )
+    with LIVE_SPOT_TRADE_SUMMARY_CACHE_LOCK:
+        LIVE_SPOT_TRADE_SUMMARY_CACHE[cache_key] = (now, list(trades), str(base_asset), str(quote_asset))
+    return summary
 
 
 def _round_up_to_step(value: float, step: float | None) -> float:
@@ -987,17 +3123,7 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
     spread = max(ask_price - bid_price, 0.0)
 
     profile = str(tuned.get("strategy_profile", "volume_long_v4")).strip() or "volume_long_v4"
-    step_ratio = 0.0004
-    min_ticks = 2
-    if profile == "volatility_defensive_v1":
-        step_ratio = 0.0008
-        min_ticks = 4
-    elif profile == "volume_neutral_target_v1":
-        step_ratio = 0.0006
-        min_ticks = 3
-    elif profile in {"neutral_hedge_v1", "synthetic_neutral_v1"}:
-        step_ratio = 0.0005
-        min_ticks = 3
+    step_ratio, min_ticks = RUNNER_AUTOTUNE_STEP_HINTS.get(profile, RUNNER_AUTOTUNE_STEP_HINTS["volume_long_v4"])
     desired_step = max(mid_price * step_ratio, tick_size * min_ticks, spread * 2.0)
     if desired_step > 0:
         tuned["step_price"] = _round_up_to_step(desired_step, tick_size if tick_size > 0 else None)
@@ -1036,15 +3162,34 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_custom_runner_presets() -> dict[str, dict[str, Any]]:
-    payload = _read_json_dict(CUSTOM_RUNNER_PRESETS_PATH)
+    payload = _read_json_dict(_runner_user_presets_path())
     if not payload:
         return {}
     return {str(key): value for key, value in payload.items() if isinstance(value, dict)}
 
 
 def _save_custom_runner_presets(presets: dict[str, dict[str, Any]]) -> None:
-    CUSTOM_RUNNER_PRESETS_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CUSTOM_RUNNER_PRESETS_PATH.write_text(json.dumps(presets, ensure_ascii=False, indent=2), encoding="utf-8")
+    path = _runner_user_presets_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(presets, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _runner_user_presets_path() -> Path:
+    custom_path = Path(globals().get("CUSTOM_RUNNER_PRESETS_PATH", DEFAULT_RUNNER_USER_PRESETS_PATH))
+    runner_path = Path(globals().get("RUNNER_USER_PRESETS_PATH", DEFAULT_RUNNER_USER_PRESETS_PATH))
+    if custom_path != DEFAULT_RUNNER_USER_PRESETS_PATH:
+        return custom_path
+    if runner_path != DEFAULT_RUNNER_USER_PRESETS_PATH:
+        return runner_path
+    return custom_path
+
+
+def _load_runner_user_presets() -> dict[str, dict[str, Any]]:
+    return _load_custom_runner_presets()
+
+
+def _save_runner_user_presets(presets: dict[str, dict[str, Any]]) -> None:
+    _save_custom_runner_presets(presets)
 
 
 def _current_symbol_lists() -> dict[str, list[str]]:
@@ -1060,11 +3205,18 @@ def _current_competition_symbols() -> list[str]:
 
 
 def _runner_preset_map(symbol: str | None = None) -> dict[str, dict[str, Any]]:
-    merged = dict(RUNNER_STRATEGY_PRESETS)
     requested_symbol = str(symbol or "").upper().strip()
+    merged: dict[str, dict[str, Any]] = {}
+    for key, item in RUNNER_STRATEGY_PRESETS.items():
+        preset_symbol = str(item.get("symbol", "")).upper().strip()
+        if requested_symbol and preset_symbol and preset_symbol != requested_symbol:
+            continue
+        merged[key] = item
     for key, item in _load_custom_runner_presets().items():
         preset_symbol = str(item.get("symbol", "")).upper().strip()
         if requested_symbol and preset_symbol and preset_symbol != requested_symbol:
+            continue
+        if key in merged:
             continue
         merged[key] = item
     return merged
@@ -1075,11 +3227,17 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
     requested_symbol = str((base_config or {}).get("symbol", "")).upper().strip()
     preset = _runner_preset_map(requested_symbol).get(normalized)
     if preset is None:
+        preset = _runner_preset_map().get(normalized)
+    if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
+    preset_symbol = str(preset.get("symbol", "")).upper().strip()
     config = dict(RUNNER_DEFAULT_CONFIG)
     config.update(preset.get("config", {}))
     if base_config:
         config.update(base_config)
+    resolved_symbol = str(config.get("symbol", "")).upper().strip()
+    if preset_symbol and resolved_symbol and resolved_symbol != preset_symbol:
+        raise ValueError(f"{preset.get('label', normalized)} requires symbol={preset_symbol}")
     if preset.get("kind") == "custom_grid":
         preview_params = dict(preset.get("grid_preview_params") or {})
         preview_summary = dict(preset.get("preview_summary") or {})
@@ -1108,6 +3266,8 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
 def _runner_preset_summaries(symbol: str | None = None) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for key, item in _runner_preset_map(symbol).items():
+        if not item.get("custom", False) and key not in RUNNER_PRESET_VISIBILITY_WHITELIST:
+            continue
         config = item.get("config", {})
         summaries.append(
             {
@@ -1149,6 +3309,68 @@ def _custom_runner_preset_key(symbol: str, name: str) -> str:
     while f"{base}_{index}" in existing:
         index += 1
     return f"{base}_{index}"
+
+
+def _runner_user_preset_key(symbol: str, name: str, *, prefix: str = "captured") -> str:
+    base = f"{prefix}_{_symbol_output_slug(symbol)}_{_slugify_runner_preset_name(name)}"
+    existing = set(_runner_preset_map().keys())
+    if base not in existing:
+        return base
+    index = 2
+    while f"{base}_{index}" in existing:
+        index += 1
+    return f"{base}_{index}"
+
+
+def _preset_kind_from_strategy_mode(strategy_mode: str) -> str:
+    normalized = str(strategy_mode or "").strip()
+    if normalized == "synthetic_neutral":
+        return "synthetic"
+    if normalized == "hedge_neutral":
+        return "hedge"
+    if normalized == "inventory_target_neutral":
+        return "target_neutral"
+    return "one_way"
+
+
+def _save_running_runner_preset(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    name = str(payload.get("name", "")).strip()
+    description = str(payload.get("description", "")).strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    if not name:
+        raise ValueError("strategy name is required")
+    runner = _read_runner_process_for_symbol(symbol)
+    runner_config = dict(runner.get("config") or {})
+    if not runner.get("is_running") or not runner_config:
+        raise ValueError(f"{symbol} 当前没有运行中策略")
+    runner_config.setdefault("symbol", symbol)
+    normalized_config = _normalize_runner_control_payload(runner_config)
+    normalized_config = _normalize_runner_runtime_paths(normalized_config, symbol)
+    preset_key = _runner_user_preset_key(symbol, name)
+    preset = {
+        "key": preset_key,
+        "label": name,
+        "description": description or f"{symbol} 当前运行策略抓取",
+        "symbol": symbol,
+        "custom": True,
+        "startable": True,
+        "kind": _preset_kind_from_strategy_mode(str(normalized_config.get("strategy_mode", "one_way_long"))),
+        "source": "captured_running_config",
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "config": normalized_config,
+    }
+    presets = _load_runner_user_presets()
+    presets[preset_key] = preset
+    _save_runner_user_presets(presets)
+    return {
+        "ok": True,
+        "preset_key": preset_key,
+        "preset": preset,
+        "runner_presets": _runner_preset_summaries(symbol),
+    }
 
 
 def _normalize_grid_strategy_create_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -1228,6 +3450,8 @@ def _normalize_custom_grid_runtime_config(config: dict[str, Any]) -> dict[str, A
     for field in {
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
@@ -1400,6 +3624,7 @@ def _build_custom_grid_runner_preset(params: dict[str, Any]) -> dict[str, Any]:
         "startable": True,
         "kind": "custom_grid",
         "custom": True,
+        "source": "custom_grid",
         "symbol": symbol,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "grid_preview_params": {
@@ -1502,15 +3727,46 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "center_price",
         "step_price",
         "per_order_notional",
+        "startup_entry_multiplier",
         "base_position_notional",
+        "near_market_entry_max_center_distance_steps",
+        "market_bias_max_shift_steps",
+        "market_bias_signal_steps",
+        "market_bias_drift_weight",
+        "market_bias_return_weight",
+        "market_bias_weak_buy_pause_threshold",
+        "market_bias_strong_short_pause_threshold",
+        "market_bias_regime_switch_weak_threshold",
+        "market_bias_regime_switch_strong_threshold",
         "pause_buy_position_notional",
         "pause_short_position_notional",
+        "threshold_reduce_target_ratio",
+        "threshold_reduce_taker_timeout_seconds",
         "max_position_notional",
         "max_short_position_notional",
         "min_mid_price_for_buys",
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
+        "adaptive_step_30s_abs_return_ratio",
+        "adaptive_step_30s_amplitude_ratio",
+        "adaptive_step_1m_abs_return_ratio",
+        "adaptive_step_1m_amplitude_ratio",
+        "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_max_scale",
+        "adaptive_step_min_per_order_scale",
+        "adaptive_step_min_position_limit_scale",
+        "static_buy_offset_steps",
+        "static_sell_offset_steps",
+        "synthetic_trend_follow_1m_abs_return_ratio",
+        "synthetic_trend_follow_1m_amplitude_ratio",
+        "synthetic_trend_follow_3m_abs_return_ratio",
+        "synthetic_trend_follow_3m_amplitude_ratio",
+        "synthetic_trend_follow_min_efficiency_ratio",
+        "synthetic_trend_follow_reverse_delay_seconds",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -1534,6 +3790,15 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_plan_age_seconds",
         "max_mid_drift_steps",
         "max_total_notional",
+        "rolling_hourly_loss_limit",
+        "max_cumulative_notional",
+        "max_cumulative_loss_limit",
+        "max_actual_net_notional",
+        "max_synthetic_drift_notional",
+        "volume_trigger_start_threshold",
+        "volume_trigger_stop_threshold",
+        "volatility_trigger_amplitude_ratio",
+        "volatility_trigger_abs_return_ratio",
         "sleep_seconds",
     }
     int_fields = {
@@ -1546,6 +3811,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "maker_retries",
         "max_new_orders",
         "auto_regime_confirm_cycles",
+        "market_bias_regime_switch_confirm_cycles",
         "neutral_center_interval_minutes",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
@@ -1554,12 +3820,26 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "cancel_stale",
         "apply",
         "reset_state",
+        "flat_start_enabled",
+        "warm_start_enabled",
+        "market_bias_enabled",
+        "market_bias_weak_buy_pause_enabled",
+        "market_bias_strong_short_pause_enabled",
+        "market_bias_regime_switch_enabled",
+        "adaptive_step_enabled",
+        "synthetic_trend_follow_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
         "fixed_center_roll_enabled",
         "excess_inventory_reduce_only_enabled",
         "autotune_symbol_enabled",
+        "volume_trigger_enabled",
+        "volume_trigger_stop_cancel_open_orders",
+        "volume_trigger_stop_close_all_positions",
+        "volatility_trigger_enabled",
+        "volatility_trigger_stop_cancel_open_orders",
+        "volatility_trigger_stop_close_all_positions",
     }
     str_fields = {
         "strategy_profile",
@@ -1570,6 +3850,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "plan_json",
         "submit_report_json",
         "summary_jsonl",
+        "run_start_time",
+        "run_end_time",
+        "runtime_guard_stats_start_time",
+        "volume_trigger_window",
+        "volatility_trigger_window",
     }
     noneable_fields = {
         "center_price",
@@ -1580,13 +3865,44 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "min_mid_price_for_buys",
         "buy_pause_amp_trigger_ratio",
         "buy_pause_down_return_trigger_ratio",
+        "short_cover_pause_amp_trigger_ratio",
+        "short_cover_pause_down_return_trigger_ratio",
         "freeze_shift_abs_return_trigger_ratio",
+        "adaptive_step_30s_abs_return_ratio",
+        "adaptive_step_30s_amplitude_ratio",
+        "adaptive_step_1m_abs_return_ratio",
+        "adaptive_step_1m_amplitude_ratio",
+        "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_max_scale",
+        "adaptive_step_min_per_order_scale",
+        "adaptive_step_min_position_limit_scale",
+        "static_buy_offset_steps",
+        "static_sell_offset_steps",
+        "synthetic_trend_follow_1m_abs_return_ratio",
+        "synthetic_trend_follow_1m_amplitude_ratio",
+        "synthetic_trend_follow_3m_abs_return_ratio",
+        "synthetic_trend_follow_3m_amplitude_ratio",
+        "synthetic_trend_follow_min_efficiency_ratio",
+        "synthetic_trend_follow_reverse_delay_seconds",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
         "inventory_tier_base_position_notional",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
+        "rolling_hourly_loss_limit",
+        "max_cumulative_notional",
+        "max_cumulative_loss_limit",
+        "max_actual_net_notional",
+        "max_synthetic_drift_notional",
+        "run_start_time",
+        "run_end_time",
+        "runtime_guard_stats_start_time",
+        "volume_trigger_start_threshold",
+        "volume_trigger_stop_threshold",
+        "volatility_trigger_amplitude_ratio",
+        "volatility_trigger_abs_return_ratio",
     }
 
     for key, value in payload.items():
@@ -1612,26 +3928,157 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     config["symbol"] = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"
     config["margin_type"] = str(config.get("margin_type", "KEEP")).upper().strip() or "KEEP"
-    return config
+    threshold_reduce_ratio = _safe_float(config.get("threshold_reduce_target_ratio", 0.0), "threshold_reduce_target_ratio")
+    if threshold_reduce_ratio < 0 or threshold_reduce_ratio >= 1:
+        raise ValueError("threshold_reduce_target_ratio must be >= 0 and < 1")
+    config["threshold_reduce_target_ratio"] = threshold_reduce_ratio
+    threshold_reduce_timeout = _safe_float(
+        config.get("threshold_reduce_taker_timeout_seconds", 60.0),
+        "threshold_reduce_taker_timeout_seconds",
+    )
+    if threshold_reduce_timeout < 0:
+        raise ValueError("threshold_reduce_taker_timeout_seconds must be >= 0")
+    config["threshold_reduce_taker_timeout_seconds"] = threshold_reduce_timeout
+    config.update(
+        normalize_runtime_guard_payload(
+            config,
+            symbol=str(config.get("symbol", "")),
+            market="futures",
+        )
+    )
+    return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 
 
 def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
-    raw_payload = dict(payload)
     config = _normalize_runner_control_payload(payload)
     profile = str(config.get("strategy_profile", RUNNER_DEFAULT_CONFIG["strategy_profile"])).strip() or RUNNER_DEFAULT_CONFIG["strategy_profile"]
     preset = _runner_preset_map(str(config.get("symbol", ""))).get(profile)
     if preset is None:
+        preset = _runner_preset_map().get(profile)
+    if preset is None:
         raise ValueError(f"Unknown strategy_profile: {profile}")
     if not preset.get("startable", True):
         raise ValueError(f"{preset.get('label', profile)} 当前是模板预设，页面已展示参数，但还不能直接启动。")
-    raw_payload.setdefault("symbol", config.get("symbol"))
-    raw_payload.setdefault("strategy_profile", profile)
-    resolved = _normalize_runner_control_payload(_runner_preset_payload(profile, raw_payload))
+    preset_symbol = str(preset.get("symbol", "")).upper().strip()
+    resolved_symbol = str(config.get("symbol", "")).upper().strip()
+    if preset_symbol and resolved_symbol and resolved_symbol != preset_symbol:
+        raise ValueError(f"{preset.get('label', profile)} requires symbol={preset_symbol}")
+    saved_config = _read_json_dict(_runner_control_path(resolved_symbol)) or {}
+    preset_base_config = dict(saved_config)
+    preset_base_config.update(dict(payload))
+    preset_base_config.setdefault("symbol", resolved_symbol)
+    preset_base_config.setdefault("strategy_profile", profile)
+    resolved = _normalize_runner_control_payload(_runner_preset_payload(profile, preset_base_config))
     runtime_paths = _default_runtime_paths_for_symbol(str(resolved.get("symbol", "")))
     for key, value in runtime_paths.items():
         if not str(payload.get(key, "")).strip():
             resolved[key] = value
     return _autotune_runner_symbol_config(resolved)
+
+
+def _runtime_guard_input_summary(
+    summary_path: Path,
+    *,
+    runtime_guard_stats_start_time: Any = None,
+    symbol: str | None = None,
+    now: datetime | None = None,
+) -> tuple[float, list[dict[str, Any]], datetime | None]:
+    return summarize_futures_runtime_guard_inputs(
+        summary_path,
+        runtime_guard_stats_start_time=runtime_guard_stats_start_time,
+        symbol=symbol,
+        now=now,
+    )
+
+
+def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
+    runtime_guard_config = normalize_runtime_guard_config(config)
+    if not any(
+        (
+            runtime_guard_config.run_start_time,
+            runtime_guard_config.run_end_time,
+            runtime_guard_config.rolling_hourly_loss_limit,
+            runtime_guard_config.max_cumulative_notional,
+            runtime_guard_config.max_actual_net_notional,
+            runtime_guard_config.max_synthetic_drift_notional,
+        )
+    ):
+        return
+
+    summary_text = str(config.get("summary_jsonl", "")).strip()
+    if not summary_text:
+        return
+
+    summary_path = Path(summary_text)
+    current = datetime.now(timezone.utc)
+    symbol = str(config.get("symbol", "")).upper().strip()
+    cumulative_gross_notional, pnl_events, stats_start_time = _runtime_guard_input_summary(
+        summary_path,
+        runtime_guard_stats_start_time=config.get("runtime_guard_stats_start_time"),
+        symbol=symbol,
+        now=current,
+    )
+    runtime_guard_result = evaluate_runtime_guards(
+        config=runtime_guard_config,
+        now=current,
+        cumulative_gross_notional=cumulative_gross_notional,
+        pnl_events=pnl_events,
+    )
+    if runtime_guard_result.runtime_status == "waiting" or runtime_guard_result.tradable:
+        return
+
+    audit_paths = build_audit_paths(summary_path)
+    reasons = set(runtime_guard_result.matched_reasons)
+    detail_lines: list[str] = []
+    if "after_end_window" in reasons and runtime_guard_config.run_end_time is not None:
+        detail_lines.append(f"当前时间已超过 run_end_time={runtime_guard_config.run_end_time.isoformat()}")
+    if "rolling_hourly_loss_limit_hit" in reasons and runtime_guard_config.rolling_hourly_loss_limit is not None:
+        detail_lines.append(
+            "最近 60 分钟滚动亏损 "
+            f"{runtime_guard_result.rolling_hourly_loss:.4f} >= 阈值 {runtime_guard_config.rolling_hourly_loss_limit:.4f}"
+        )
+    if "max_cumulative_notional_hit" in reasons and runtime_guard_config.max_cumulative_notional is not None:
+        detail_lines.append(
+            f"累计成交额{f'（自 {stats_start_time.isoformat()} 起）' if stats_start_time else ''} "
+            f"{runtime_guard_result.cumulative_gross_notional:.4f} >= 阈值 {runtime_guard_config.max_cumulative_notional:.4f}"
+        )
+    if "max_actual_net_notional_hit" in reasons and runtime_guard_config.max_actual_net_notional is not None:
+        detail_lines.append(
+            "实际净敞口 "
+            f"{runtime_guard_result.actual_net_notional_abs:.4f} >= 阈值 {runtime_guard_config.max_actual_net_notional:.4f}"
+        )
+    if (
+        "max_synthetic_drift_notional_hit" in reasons
+        and runtime_guard_config.max_synthetic_drift_notional is not None
+    ):
+        detail_lines.append(
+            "synthetic 漂移 "
+            f"{runtime_guard_result.synthetic_drift_notional:.4f} >= 阈值 {runtime_guard_config.max_synthetic_drift_notional:.4f}"
+        )
+    if not detail_lines:
+        detail_lines.append(f"stop_reason={runtime_guard_result.primary_reason}")
+    if stats_start_time is not None:
+        detail_lines.append(f"风控统计起点 {stats_start_time.isoformat()}")
+
+    raise ValueError(
+        "启动前风控预检已拦截："
+        + "；".join(detail_lines)
+        + "。注意：reset_state 只重置本地状态，不会清空 runtime guard 审计计数。"
+        + f"如需重新启动，请调高阈值，或清理 {audit_paths['trade_audit']} / {audit_paths['income_audit']} 后再启动。"
+    )
+
+
+def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
+    config = _resolve_runner_start_config(payload)
+    symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
+    _save_runner_control_config(config, symbol=symbol)
+    _clear_volatility_trigger_status(symbol, reason="saved_without_start")
+    return {
+        "saved": True,
+        "symbol": symbol,
+        "config": config,
+        "runner": _read_runner_process_for_symbol(symbol),
+    }
 
 
 def _build_runner_command(config: dict[str, Any]) -> list[str]:
@@ -1653,8 +4100,16 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config["sell_levels"]),
         "--per-order-notional",
         str(config["per_order_notional"]),
+        "--startup-entry-multiplier",
+        str(config.get("startup_entry_multiplier", 1.0)),
         "--base-position-notional",
         str(config["base_position_notional"]),
+        "--near-market-entry-max-center-distance-steps",
+        str(config.get("near_market_entry_max_center_distance_steps", 2.0)),
+        "--grid-inventory-rebalance-min-center-distance-steps",
+        str(config.get("grid_inventory_rebalance_min_center_distance_steps", 3.0)),
+        "--near-market-reentry-confirm-cycles",
+        str(config.get("near_market_reentry_confirm_cycles", 2)),
         "--margin-type",
         str(config.get("margin_type", "KEEP")),
         "--leverage",
@@ -1680,8 +4135,48 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--summary-jsonl",
         str(config.get("summary_jsonl", RUNNER_DEFAULT_CONFIG["summary_jsonl"])),
     ]
+    if config.get("static_buy_offset_steps") is not None:
+        command.extend(["--static-buy-offset-steps", str(config["static_buy_offset_steps"])])
+    if config.get("static_sell_offset_steps") is not None:
+        command.extend(["--static-sell-offset-steps", str(config["static_sell_offset_steps"])])
     if config.get("center_price") is not None:
         command.extend(["--center-price", str(config["center_price"])])
+    command.append("--market-bias-enabled" if config.get("market_bias_enabled", False) else "--no-market-bias-enabled")
+    if config.get("market_bias_max_shift_steps") is not None:
+        command.extend(["--market-bias-max-shift-steps", str(config["market_bias_max_shift_steps"])])
+    if config.get("market_bias_signal_steps") is not None:
+        command.extend(["--market-bias-signal-steps", str(config["market_bias_signal_steps"])])
+    if config.get("market_bias_drift_weight") is not None:
+        command.extend(["--market-bias-drift-weight", str(config["market_bias_drift_weight"])])
+    if config.get("market_bias_return_weight") is not None:
+        command.extend(["--market-bias-return-weight", str(config["market_bias_return_weight"])])
+    command.append(
+        "--market-bias-weak-buy-pause-enabled"
+        if config.get("market_bias_weak_buy_pause_enabled", False)
+        else "--no-market-bias-weak-buy-pause-enabled"
+    )
+    if config.get("market_bias_weak_buy_pause_threshold") is not None:
+        command.extend(["--market-bias-weak-buy-pause-threshold", str(config["market_bias_weak_buy_pause_threshold"])])
+    command.append(
+        "--market-bias-strong-short-pause-enabled"
+        if config.get("market_bias_strong_short_pause_enabled", False)
+        else "--no-market-bias-strong-short-pause-enabled"
+    )
+    if config.get("market_bias_strong_short_pause_threshold") is not None:
+        command.extend(["--market-bias-strong-short-pause-threshold", str(config["market_bias_strong_short_pause_threshold"])])
+    command.append(
+        "--market-bias-regime-switch-enabled"
+        if config.get("market_bias_regime_switch_enabled", False)
+        else "--no-market-bias-regime-switch-enabled"
+    )
+    if config.get("market_bias_regime_switch_confirm_cycles") is not None:
+        command.extend(["--market-bias-regime-switch-confirm-cycles", str(config["market_bias_regime_switch_confirm_cycles"])])
+    if config.get("market_bias_regime_switch_weak_threshold") is not None:
+        command.extend(["--market-bias-regime-switch-weak-threshold", str(config["market_bias_regime_switch_weak_threshold"])])
+    if config.get("market_bias_regime_switch_strong_threshold") is not None:
+        command.extend(["--market-bias-regime-switch-strong-threshold", str(config["market_bias_regime_switch_strong_threshold"])])
+    command.append("--flat-start-enabled" if config.get("flat_start_enabled", True) else "--no-flat-start-enabled")
+    command.append("--warm-start-enabled" if config.get("warm_start_enabled", True) else "--no-warm-start-enabled")
     command.append("--fixed-center-enabled" if config.get("fixed_center_enabled", False) else "--no-fixed-center-enabled")
     command.append("--fixed-center-roll-enabled" if config.get("fixed_center_roll_enabled", False) else "--no-fixed-center-roll-enabled")
     command.append(
@@ -1733,6 +4228,10 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--pause-buy-position-notional", str(config["pause_buy_position_notional"])])
     if config.get("pause_short_position_notional") is not None:
         command.extend(["--pause-short-position-notional", str(config["pause_short_position_notional"])])
+    if config.get("threshold_reduce_target_ratio") is not None:
+        command.extend(["--threshold-reduce-target-ratio", str(config["threshold_reduce_target_ratio"])])
+    if config.get("threshold_reduce_taker_timeout_seconds") is not None:
+        command.extend(["--threshold-reduce-taker-timeout-seconds", str(config["threshold_reduce_taker_timeout_seconds"])])
     if config.get("max_position_notional") is not None:
         command.extend(["--max-position-notional", str(config["max_position_notional"])])
     if config.get("max_short_position_notional") is not None:
@@ -1743,8 +4242,82 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--buy-pause-amp-trigger-ratio", str(config["buy_pause_amp_trigger_ratio"])])
     if config.get("buy_pause_down_return_trigger_ratio") is not None:
         command.extend(["--buy-pause-down-return-trigger-ratio", str(config["buy_pause_down_return_trigger_ratio"])])
+    if config.get("short_cover_pause_amp_trigger_ratio") is not None:
+        command.extend(["--short-cover-pause-amp-trigger-ratio", str(config["short_cover_pause_amp_trigger_ratio"])])
+    if config.get("short_cover_pause_down_return_trigger_ratio") is not None:
+        command.extend(["--short-cover-pause-down-return-trigger-ratio", str(config["short_cover_pause_down_return_trigger_ratio"])])
     if config.get("freeze_shift_abs_return_trigger_ratio") is not None:
         command.extend(["--freeze-shift-abs-return-trigger-ratio", str(config["freeze_shift_abs_return_trigger_ratio"])])
+    command.append("--adaptive-step-enabled" if config.get("adaptive_step_enabled", False) else "--no-adaptive-step-enabled")
+    if config.get("adaptive_step_30s_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-30s-abs-return-ratio", str(config["adaptive_step_30s_abs_return_ratio"])])
+    if config.get("adaptive_step_30s_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-30s-amplitude-ratio", str(config["adaptive_step_30s_amplitude_ratio"])])
+    if config.get("adaptive_step_1m_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-1m-abs-return-ratio", str(config["adaptive_step_1m_abs_return_ratio"])])
+    if config.get("adaptive_step_1m_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-1m-amplitude-ratio", str(config["adaptive_step_1m_amplitude_ratio"])])
+    if config.get("adaptive_step_3m_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-3m-abs-return-ratio", str(config["adaptive_step_3m_abs_return_ratio"])])
+    if config.get("adaptive_step_5m_abs_return_ratio") is not None:
+        command.extend(["--adaptive-step-5m-abs-return-ratio", str(config["adaptive_step_5m_abs_return_ratio"])])
+    if config.get("adaptive_step_max_scale") is not None:
+        command.extend(["--adaptive-step-max-scale", str(config["adaptive_step_max_scale"])])
+    if config.get("adaptive_step_min_per_order_scale") is not None:
+        command.extend(["--adaptive-step-min-per-order-scale", str(config["adaptive_step_min_per_order_scale"])])
+    if config.get("adaptive_step_min_position_limit_scale") is not None:
+        command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
+    command.append(
+        "--synthetic-trend-follow-enabled"
+        if config.get("synthetic_trend_follow_enabled", False)
+        else "--no-synthetic-trend-follow-enabled"
+    )
+    if config.get("synthetic_trend_follow_1m_abs_return_ratio") is not None:
+        command.extend([
+            "--synthetic-trend-follow-1m-abs-return-ratio",
+            str(config["synthetic_trend_follow_1m_abs_return_ratio"]),
+        ])
+    if config.get("synthetic_trend_follow_1m_amplitude_ratio") is not None:
+        command.extend([
+            "--synthetic-trend-follow-1m-amplitude-ratio",
+            str(config["synthetic_trend_follow_1m_amplitude_ratio"]),
+        ])
+    if config.get("synthetic_trend_follow_3m_abs_return_ratio") is not None:
+        command.extend([
+            "--synthetic-trend-follow-3m-abs-return-ratio",
+            str(config["synthetic_trend_follow_3m_abs_return_ratio"]),
+        ])
+    if config.get("synthetic_trend_follow_3m_amplitude_ratio") is not None:
+        command.extend([
+            "--synthetic-trend-follow-3m-amplitude-ratio",
+            str(config["synthetic_trend_follow_3m_amplitude_ratio"]),
+        ])
+    if config.get("synthetic_trend_follow_min_efficiency_ratio") is not None:
+        command.extend([
+            "--synthetic-trend-follow-min-efficiency-ratio",
+            str(config["synthetic_trend_follow_min_efficiency_ratio"]),
+        ])
+    if config.get("synthetic_trend_follow_reverse_delay_seconds") is not None:
+        command.extend([
+            "--synthetic-trend-follow-reverse-delay-seconds",
+            str(config["synthetic_trend_follow_reverse_delay_seconds"]),
+        ])
+    if config.get("run_start_time") is not None:
+        command.extend(["--run-start-time", str(config["run_start_time"])])
+    if config.get("run_end_time") is not None:
+        command.extend(["--run-end-time", str(config["run_end_time"])])
+    if config.get("runtime_guard_stats_start_time") is not None:
+        command.extend(["--runtime-guard-stats-start-time", str(config["runtime_guard_stats_start_time"])])
+    if config.get("rolling_hourly_loss_limit") is not None:
+        command.extend(["--rolling-hourly-loss-limit", str(config["rolling_hourly_loss_limit"])])
+    if config.get("max_cumulative_notional") is not None:
+        command.extend(["--max-cumulative-notional", str(config["max_cumulative_notional"])])
+    if config.get("max_cumulative_loss_limit") is not None:
+        command.extend(["--max-cumulative-loss-limit", str(config["max_cumulative_loss_limit"])])
+    if config.get("max_actual_net_notional") is not None:
+        command.extend(["--max-actual-net-notional", str(config["max_actual_net_notional"])])
+    if config.get("max_synthetic_drift_notional") is not None:
+        command.extend(["--max-synthetic-drift-notional", str(config["max_synthetic_drift_notional"])])
     command.append("--auto-regime-enabled" if config.get("auto_regime_enabled", False) else "--no-auto-regime-enabled")
     if config.get("auto_regime_confirm_cycles") is not None:
         command.extend(["--auto-regime-confirm-cycles", str(config["auto_regime_confirm_cycles"])])
@@ -1838,6 +4411,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip() or "NIGHTUSDT"
     _stop_flatten_process(symbol, cancel_orders=True)
     runner = _read_runner_process_for_symbol(symbol)
+    _preflight_runner_runtime_guards(config)
     restarted = False
     if runner.get("is_running"):
         current_config = dict(runner.get("config") or {})
@@ -1846,18 +4420,39 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "strategy_mode",
             "symbol",
             "center_price",
+            "flat_start_enabled",
+            "warm_start_enabled",
             "fixed_center_enabled",
             "autotune_symbol_enabled",
             "step_price",
             "buy_levels",
             "sell_levels",
             "per_order_notional",
+            "startup_entry_multiplier",
             "base_position_notional",
+            "near_market_entry_max_center_distance_steps",
+            "static_buy_offset_steps",
+            "static_sell_offset_steps",
+            "market_bias_enabled",
+            "market_bias_max_shift_steps",
+            "market_bias_signal_steps",
+            "market_bias_drift_weight",
+            "market_bias_return_weight",
+            "market_bias_weak_buy_pause_enabled",
+            "market_bias_weak_buy_pause_threshold",
+            "market_bias_strong_short_pause_enabled",
+            "market_bias_strong_short_pause_threshold",
+            "market_bias_regime_switch_enabled",
+            "market_bias_regime_switch_confirm_cycles",
+            "market_bias_regime_switch_weak_threshold",
+            "market_bias_regime_switch_strong_threshold",
             "up_trigger_steps",
             "down_trigger_steps",
             "shift_steps",
             "pause_buy_position_notional",
             "pause_short_position_notional",
+            "threshold_reduce_target_ratio",
+            "threshold_reduce_taker_timeout_seconds",
             "max_position_notional",
             "max_short_position_notional",
             "custom_grid_roll_enabled",
@@ -1868,7 +4463,26 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "min_mid_price_for_buys",
             "buy_pause_amp_trigger_ratio",
             "buy_pause_down_return_trigger_ratio",
+            "short_cover_pause_amp_trigger_ratio",
+            "short_cover_pause_down_return_trigger_ratio",
             "freeze_shift_abs_return_trigger_ratio",
+            "adaptive_step_enabled",
+            "adaptive_step_30s_abs_return_ratio",
+            "adaptive_step_30s_amplitude_ratio",
+            "adaptive_step_1m_abs_return_ratio",
+            "adaptive_step_1m_amplitude_ratio",
+            "adaptive_step_3m_abs_return_ratio",
+            "adaptive_step_5m_abs_return_ratio",
+            "adaptive_step_max_scale",
+            "adaptive_step_min_per_order_scale",
+            "adaptive_step_min_position_limit_scale",
+            "synthetic_trend_follow_enabled",
+            "synthetic_trend_follow_1m_abs_return_ratio",
+            "synthetic_trend_follow_1m_amplitude_ratio",
+            "synthetic_trend_follow_3m_abs_return_ratio",
+            "synthetic_trend_follow_3m_amplitude_ratio",
+            "synthetic_trend_follow_min_efficiency_ratio",
+            "synthetic_trend_follow_reverse_delay_seconds",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",
@@ -1902,6 +4516,13 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "maker_retries",
             "max_new_orders",
             "max_total_notional",
+            "run_start_time",
+            "run_end_time",
+            "runtime_guard_stats_start_time",
+            "rolling_hourly_loss_limit",
+            "max_cumulative_notional",
+            "max_actual_net_notional",
+            "max_synthetic_drift_notional",
             "sleep_seconds",
             "cancel_stale",
             "apply",
@@ -1913,11 +4534,14 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
         }
         config_changed = any(current_config.get(field) != config.get(field) for field in compare_fields)
         if not config_changed:
+            _save_runner_control_config(config, symbol=symbol)
+            _clear_volatility_trigger_status(symbol, reason="runner_running")
             return {"started": False, "already_running": True, "runner": runner, "symbol": symbol, "restarted": False}
         _stop_runner_process(symbol)
         restarted = True
 
     _save_runner_control_config(config, symbol=symbol)
+    _clear_volatility_trigger_status(symbol, reason="runner_started")
     use_legacy_runner = _uses_legacy_runner(symbol)
     service_name = _runner_service_name_for_symbol(symbol)
     if use_legacy_runner and _runner_launch_agent_available():
@@ -2007,7 +4631,7 @@ def _cancel_flatten_orders(*, symbol: str, api_key: str, api_secret: str, prefix
 
 
 def _build_flatten_command(config: dict[str, Any]) -> list[str]:
-    return [
+    command = [
         sys.executable,
         "-m",
         "grid_optimizer.maker_flatten_runner",
@@ -2024,6 +4648,15 @@ def _build_flatten_command(config: dict[str, Any]) -> list[str]:
         "--events-jsonl",
         str(config["events_jsonl"]),
     ]
+    position_side_filter = str(config.get("position_side_filter") or "").strip()
+    if position_side_filter:
+        command.extend(["--position-side-filter", position_side_filter])
+    if _truthy(config.get("allow_loss", False)):
+        command.append("--allow-loss")
+    min_profit_ratio = float(config.get("min_profit_ratio") or 0.0)
+    if min_profit_ratio > 0:
+        command.extend(["--min-profit-ratio", str(min_profit_ratio)])
+    return command
 
 
 def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
@@ -2036,10 +4669,23 @@ def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
         "recv_window": int(config.get("recv_window", 5000)),
         "max_consecutive_errors": int(config.get("max_consecutive_errors", 20)),
         "events_jsonl": str(config.get("events_jsonl") or _flatten_events_path(symbol)),
+        "position_side_filter": str(config.get("position_side_filter") or "").strip().upper(),
+        "allow_loss": bool(_truthy(config.get("allow_loss", False))),
+        "min_profit_ratio": max(float(config.get("min_profit_ratio") or 0.0), 0.0),
     }
     if flatten.get("is_running"):
         current_config = dict(flatten.get("config") or {})
-        compare_fields = {"symbol", "client_order_prefix", "sleep_seconds", "recv_window", "max_consecutive_errors", "events_jsonl"}
+        compare_fields = {
+            "symbol",
+            "client_order_prefix",
+            "sleep_seconds",
+            "recv_window",
+            "max_consecutive_errors",
+            "events_jsonl",
+            "position_side_filter",
+            "allow_loss",
+            "min_profit_ratio",
+        }
         if all(current_config.get(field) == desired.get(field) for field in compare_fields):
             return {"started": False, "already_running": True, "flatten_runner": flatten, "symbol": symbol}
         _stop_flatten_process(symbol, cancel_orders=True)
@@ -2114,6 +4760,7 @@ def _stop_runner_process(
     *,
     cancel_open_orders: bool = False,
     close_all_positions: bool = False,
+    clear_volatility_resume_state: bool = False,
 ) -> dict[str, Any]:
     normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
     runner = _read_runner_process_for_symbol(normalized_symbol)
@@ -2130,6 +4777,8 @@ def _stop_runner_process(
                     pid_path.unlink()
                 except OSError:
                     pass
+            if clear_volatility_resume_state:
+                _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": False,
                 "already_stopped": True,
@@ -2149,6 +4798,8 @@ def _stop_runner_process(
                 pid_path.unlink()
             except OSError:
                 pass
+        if clear_volatility_resume_state:
+            _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
         post_stop_actions = _execute_stop_actions(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
@@ -2171,6 +4822,8 @@ def _stop_runner_process(
                     pid_path.unlink()
                 except OSError:
                     pass
+            if clear_volatility_resume_state:
+                _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": False,
                 "already_stopped": True,
@@ -2190,6 +4843,8 @@ def _stop_runner_process(
                 pid_path.unlink()
             except OSError:
                 pass
+        if clear_volatility_resume_state:
+            _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
         post_stop_actions = _execute_stop_actions(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
@@ -2211,6 +4866,8 @@ def _stop_runner_process(
                 pid_path.unlink()
             except OSError:
                 pass
+        if clear_volatility_resume_state:
+            _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
         return {
             "stopped": False,
             "already_stopped": True,
@@ -2233,6 +4890,8 @@ def _stop_runner_process(
                     pid_path.unlink()
                 except OSError:
                     pass
+            if clear_volatility_resume_state:
+                _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": True,
                 "killed": False,
@@ -2253,6 +4912,8 @@ def _stop_runner_process(
             pid_path.unlink()
         except OSError:
             pass
+    if clear_volatility_resume_state:
+        _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
     post_stop_actions = _execute_stop_actions(
         symbol=normalized_symbol,
         cancel_open_orders=cancel_open_orders,
@@ -2369,7 +5030,13 @@ def _build_close_order_request(
     return request
 
 
-def _close_symbol_positions_at_top_of_book(*, symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+def _close_symbol_positions_at_top_of_book(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    position_side_filter: str | None = None,
+) -> dict[str, Any]:
     result = {"attempted": 0, "submitted": 0, "orders": [], "errors": [], "warnings": []}
     symbol_info = fetch_futures_symbol_config(symbol)
     book = fetch_futures_book_tickers(symbol=symbol)
@@ -2382,6 +5049,9 @@ def _close_symbol_positions_at_top_of_book(*, symbol: str, api_key: str, api_sec
     account_info = fetch_futures_account_info_v3(api_key, api_secret)
     position_mode = fetch_futures_position_mode(api_key, api_secret)
     dual_side = str(position_mode.get("dualSidePosition", "")).strip().lower() in {"true", "1", "yes"}
+    normalized_filter = str(position_side_filter or "").strip().upper()
+    if normalized_filter not in {"LONG", "SHORT"}:
+        normalized_filter = ""
 
     orders_to_submit: list[dict[str, Any]] = []
     tick_size = symbol_info.get("tick_size")
@@ -2417,16 +5087,16 @@ def _close_symbol_positions_at_top_of_book(*, symbol: str, api_key: str, api_sec
         short_position = _extract_futures_position(account_info, symbol, "SHORT")
         long_qty = _safe_numeric(long_position.get("positionAmt"))
         short_qty = abs(_safe_numeric(short_position.get("positionAmt")))
-        if long_qty > 0:
+        if long_qty > 0 and normalized_filter in {"", "LONG"}:
             _append_close_order(long_qty, side="SELL", price=bid_price, reduce_only=None, position_side="LONG")
-        if short_qty > 0:
+        if short_qty > 0 and normalized_filter in {"", "SHORT"}:
             _append_close_order(short_qty, side="BUY", price=ask_price, reduce_only=None, position_side="SHORT")
     else:
         both_position = _extract_futures_position(account_info, symbol)
         position_amt = _safe_numeric(both_position.get("positionAmt"))
-        if position_amt > 0:
+        if position_amt > 0 and normalized_filter != "SHORT":
             _append_close_order(position_amt, side="SELL", price=bid_price, reduce_only=True, position_side=None)
-        elif position_amt < 0:
+        elif position_amt < 0 and normalized_filter != "LONG":
             _append_close_order(abs(position_amt), side="BUY", price=ask_price, reduce_only=True, position_side=None)
 
     result["attempted"] = len(orders_to_submit)
@@ -2513,7 +5183,71 @@ def _execute_stop_actions(
     return summary
 
 
+def _start_volatility_directional_flatten_process(
+    *,
+    symbol: str,
+    current_return_ratio: float,
+    recv_window: int,
+    taker_enabled: bool,
+) -> dict[str, Any]:
+    result: dict[str, Any] = {
+        "enabled": True,
+        "started": False,
+        "already_running": False,
+        "position_side_filter": None,
+        "reason": None,
+        "mode": "maker",
+    }
+    creds = load_binance_api_credentials()
+    if not creds:
+        raise RuntimeError("未加载 Binance API 凭据，无法判断方向性平仓仓位")
+    api_key, api_secret = creds
+    live_snapshot = load_live_flatten_snapshot(symbol, api_key, api_secret)
+    direction = _resolve_volatility_directional_flatten_filter(
+        current_return_ratio=current_return_ratio,
+        live_snapshot=live_snapshot,
+    )
+    result.update(direction)
+    position_side_filter = direction.get("position_side_filter")
+    if not position_side_filter:
+        return result
+    if taker_enabled:
+        taker_result = _close_symbol_positions_at_top_of_book(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            position_side_filter=str(position_side_filter),
+        )
+        result["mode"] = "taker"
+        result["attempted"] = int(taker_result.get("attempted", 0))
+        result["submitted"] = int(taker_result.get("submitted", 0))
+        result["orders"] = list(taker_result.get("orders", []))
+        result["errors"] = list(taker_result.get("errors", []))
+        result["warnings"] = list(taker_result.get("warnings", []))
+        result["started"] = bool(taker_result.get("submitted"))
+        return result
+    flatten_result = _start_flatten_process(
+        {
+            "symbol": symbol,
+            "client_order_prefix": flatten_client_order_prefix(symbol),
+            "sleep_seconds": 2.0,
+            "recv_window": recv_window,
+            "max_consecutive_errors": 20,
+            "events_jsonl": str(_flatten_events_path(symbol)),
+            "position_side_filter": position_side_filter,
+        }
+    )
+    result["started"] = bool(flatten_result.get("started"))
+    result["already_running"] = bool(flatten_result.get("already_running"))
+    return result
+
+
 def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(payload)
+    strategy_profile = str(payload.get("strategy_profile", SPOT_RUNNER_DEFAULT_CONFIG.get("strategy_profile", "manual_spot"))).strip() or "manual_spot"
+    if strategy_profile != "manual_spot":
+        payload = _spot_runner_preset_payload(strategy_profile, payload)
+        strategy_profile = str(payload.get("strategy_profile", strategy_profile)).strip() or strategy_profile
     symbol = str(payload.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
     strategy_mode = str(payload.get("strategy_mode", SPOT_RUNNER_DEFAULT_CONFIG["strategy_mode"])).strip() or "spot_one_way_long"
     grid_level_mode = str(payload.get("grid_level_mode", "arithmetic")).strip().lower()
@@ -2597,9 +5331,74 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "inventory_recycle_min_profit_ratio",
     )
+    attack_market_entry_enabled = _safe_bool(
+        payload.get("attack_market_entry_enabled", SPOT_RUNNER_DEFAULT_CONFIG["attack_market_entry_enabled"]),
+        "attack_market_entry_enabled",
+    )
+    attack_market_entry_trigger_multiplier = _safe_float(
+        payload.get(
+            "attack_market_entry_trigger_multiplier",
+            SPOT_RUNNER_DEFAULT_CONFIG["attack_market_entry_trigger_multiplier"],
+        ),
+        "attack_market_entry_trigger_multiplier",
+    )
+    attack_market_entry_target_multiplier = _safe_float(
+        payload.get(
+            "attack_market_entry_target_multiplier",
+            SPOT_RUNNER_DEFAULT_CONFIG["attack_market_entry_target_multiplier"],
+        ),
+        "attack_market_entry_target_multiplier",
+    )
+    attack_market_entry_cooldown_seconds = _safe_float(
+        payload.get(
+            "attack_market_entry_cooldown_seconds",
+            SPOT_RUNNER_DEFAULT_CONFIG["attack_market_entry_cooldown_seconds"],
+        ),
+        "attack_market_entry_cooldown_seconds",
+    )
+    lot_take_profit_offset = _safe_float(
+        payload.get("lot_take_profit_offset", SPOT_RUNNER_DEFAULT_CONFIG["lot_take_profit_offset"]),
+        "lot_take_profit_offset",
+    )
     max_single_cycle_new_orders = _safe_int(
         payload.get("max_single_cycle_new_orders", SPOT_RUNNER_DEFAULT_CONFIG["max_single_cycle_new_orders"]),
         "max_single_cycle_new_orders",
+    )
+    base_position_notional = _safe_float(
+        payload.get("base_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["base_position_notional"]),
+        "base_position_notional",
+    )
+    max_inventory_multiplier = _safe_float(
+        payload.get("max_inventory_multiplier", SPOT_RUNNER_DEFAULT_CONFIG["max_inventory_multiplier"]),
+        "max_inventory_multiplier",
+    )
+    quote_buy_order_notional = _safe_float(
+        payload.get("quote_buy_order_notional", SPOT_RUNNER_DEFAULT_CONFIG["quote_buy_order_notional"]),
+        "quote_buy_order_notional",
+    )
+    quote_sell_order_notional = _safe_float(
+        payload.get("quote_sell_order_notional", SPOT_RUNNER_DEFAULT_CONFIG["quote_sell_order_notional"]),
+        "quote_sell_order_notional",
+    )
+    min_profit_offset = _safe_float(
+        payload.get("min_profit_offset", SPOT_RUNNER_DEFAULT_CONFIG["min_profit_offset"]),
+        "min_profit_offset",
+    )
+    reduce_only_timeout_seconds = _safe_float(
+        payload.get("reduce_only_timeout_seconds", SPOT_RUNNER_DEFAULT_CONFIG["reduce_only_timeout_seconds"]),
+        "reduce_only_timeout_seconds",
+    )
+    reduce_only_taker_target_multiplier = _safe_float(
+        payload.get(
+            "reduce_only_taker_target_multiplier",
+            SPOT_RUNNER_DEFAULT_CONFIG["reduce_only_taker_target_multiplier"],
+        ),
+        "reduce_only_taker_target_multiplier",
+    )
+    runtime_guard_config = normalize_runtime_guard_payload(
+        payload,
+        symbol=str(payload.get("symbol", "")),
+        market="spot",
     )
 
     if grid_level_mode not in set(supported_grid_level_modes()):
@@ -2607,7 +5406,7 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             f"unsupported grid_level_mode: {grid_level_mode}; "
             f"supported: {','.join(supported_grid_level_modes())}"
         )
-    if strategy_mode not in {"spot_one_way_long", "spot_volume_shift_long"}:
+    if strategy_mode not in {"spot_one_way_long", "spot_volume_shift_long", "spot_best_quote_inventory", "spot_best_quote"}:
         raise ValueError("unsupported strategy_mode")
     if strategy_mode == "spot_one_way_long":
         if min_price <= 0 or max_price <= 0 or min_price >= max_price:
@@ -2630,14 +5429,35 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("inventory_soft_limit_notional cannot exceed inventory_hard_limit_notional")
     if center_shift_trigger_ratio <= 0 or center_shift_confirm_cycles <= 0 or center_shift_step_ratio <= 0:
         raise ValueError("center shift params must be > 0")
+    if attack_market_entry_trigger_multiplier < 0 or attack_market_entry_target_multiplier <= 0:
+        raise ValueError("attack market entry multipliers must be positive")
+    if attack_market_entry_target_multiplier < attack_market_entry_trigger_multiplier:
+        raise ValueError("attack_market_entry_target_multiplier cannot be < attack_market_entry_trigger_multiplier")
+    if attack_market_entry_cooldown_seconds < 0:
+        raise ValueError("attack_market_entry_cooldown_seconds must be >= 0")
+    if lot_take_profit_offset <= 0:
+        raise ValueError("lot_take_profit_offset must be > 0")
     if max_single_cycle_new_orders <= 0:
         raise ValueError("max_single_cycle_new_orders must be > 0")
+    if base_position_notional < 0:
+        raise ValueError("base_position_notional must be >= 0")
+    if max_inventory_multiplier < 1:
+        raise ValueError("max_inventory_multiplier must be >= 1")
+    if quote_buy_order_notional < 0 or quote_sell_order_notional < 0:
+        raise ValueError("quote order notionals must be >= 0")
+    if min_profit_offset < 0:
+        raise ValueError("min_profit_offset must be >= 0")
+    if reduce_only_timeout_seconds < 0:
+        raise ValueError("reduce_only_timeout_seconds must be >= 0")
+    if reduce_only_taker_target_multiplier < 1:
+        raise ValueError("reduce_only_taker_target_multiplier must be >= 1")
     _validate_market_symbol(symbol=symbol, market_type="spot", contract_type=None)
 
     config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
     config.update(
         {
             "market_type": "spot",
+            "strategy_profile": strategy_profile,
             "strategy_mode": strategy_mode,
             "symbol": symbol,
             "grid_level_mode": grid_level_mode,
@@ -2667,7 +5487,25 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_age_minutes": inventory_recycle_age_minutes,
             "inventory_recycle_loss_tolerance_ratio": inventory_recycle_loss_tolerance_ratio,
             "inventory_recycle_min_profit_ratio": inventory_recycle_min_profit_ratio,
+            "attack_market_entry_enabled": attack_market_entry_enabled,
+            "attack_market_entry_trigger_multiplier": attack_market_entry_trigger_multiplier,
+            "attack_market_entry_target_multiplier": attack_market_entry_target_multiplier,
+            "attack_market_entry_cooldown_seconds": attack_market_entry_cooldown_seconds,
+            "lot_take_profit_offset": lot_take_profit_offset,
             "max_single_cycle_new_orders": max_single_cycle_new_orders,
+            "base_position_notional": base_position_notional,
+            "max_inventory_multiplier": max_inventory_multiplier,
+            "quote_buy_order_notional": quote_buy_order_notional,
+            "quote_sell_order_notional": quote_sell_order_notional,
+            "min_profit_offset": min_profit_offset,
+            "reduce_only_timeout_seconds": reduce_only_timeout_seconds,
+            "reduce_only_taker_target_multiplier": reduce_only_taker_target_multiplier,
+            "run_start_time": runtime_guard_config["run_start_time"],
+            "run_end_time": runtime_guard_config["run_end_time"],
+            "runtime_guard_stats_start_time": runtime_guard_config["runtime_guard_stats_start_time"],
+            "rolling_hourly_loss_limit": runtime_guard_config["rolling_hourly_loss_limit"],
+            "max_cumulative_notional": runtime_guard_config["max_cumulative_notional"],
+            "max_cumulative_loss_limit": runtime_guard_config["max_cumulative_loss_limit"],
         }
     )
     config.update(_default_spot_runtime_paths_for_symbol(symbol))
@@ -2675,6 +5513,35 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
 
 
 def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
+    strategy_mode = str(config.get("strategy_mode", "spot_one_way_long"))
+    if strategy_mode == "spot_best_quote":
+        return [
+            sys.executable,
+            "-m",
+            "grid_optimizer.spot_best_quote_runner",
+            "--symbol",
+            str(config["symbol"]),
+            "--client-order-prefix",
+            str(config.get("client_order_prefix", _spot_client_order_prefix(str(config["symbol"])))),
+            "--sleep-seconds",
+            str(config.get("sleep_seconds", 10.0)),
+            "--recv-window",
+            str(config.get("recv_window", 5000)),
+            "--max-consecutive-errors",
+            str(config.get("max_consecutive_errors", 20)),
+            "--events-jsonl",
+            str(config.get("best_quote_events_jsonl") or f"output/{_symbol_output_slug(str(config['symbol']))}_spot_best_quote_events.jsonl"),
+            "--base-position-notional",
+            str(config.get("base_position_notional")),
+            "--quote-buy-order-notional",
+            str(config.get("quote_buy_order_notional")),
+            "--quote-sell-order-notional",
+            str(config.get("quote_sell_order_notional")),
+            "--max-inventory-multiplier",
+            str(config.get("max_inventory_multiplier")),
+            "--min-profit-offset",
+            str(config.get("min_profit_offset")),
+        ]
     command = [
         sys.executable,
         "-m",
@@ -2682,7 +5549,7 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         "--symbol",
         str(config["symbol"]),
         "--strategy-mode",
-        str(config.get("strategy_mode", "spot_one_way_long")),
+        strategy_mode,
         "--min-price",
         str(config["min_price"]),
         "--max-price",
@@ -2721,11 +5588,29 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--inventory-recycle-age-minutes", config.get("inventory_recycle_age_minutes")),
         ("--inventory-recycle-loss-tolerance-ratio", config.get("inventory_recycle_loss_tolerance_ratio")),
         ("--inventory-recycle-min-profit-ratio", config.get("inventory_recycle_min_profit_ratio")),
+        ("--attack-market-entry-trigger-multiplier", config.get("attack_market_entry_trigger_multiplier")),
+        ("--attack-market-entry-target-multiplier", config.get("attack_market_entry_target_multiplier")),
+        ("--attack-market-entry-cooldown-seconds", config.get("attack_market_entry_cooldown_seconds")),
+        ("--lot-take-profit-offset", config.get("lot_take_profit_offset")),
         ("--max-single-cycle-new-orders", config.get("max_single_cycle_new_orders")),
+        ("--base-position-notional", config.get("base_position_notional")),
+        ("--max-inventory-multiplier", config.get("max_inventory_multiplier")),
+        ("--quote-buy-order-notional", config.get("quote_buy_order_notional")),
+        ("--quote-sell-order-notional", config.get("quote_sell_order_notional")),
+        ("--min-profit-offset", config.get("min_profit_offset")),
+        ("--reduce-only-timeout-seconds", config.get("reduce_only_timeout_seconds")),
+        ("--reduce-only-taker-target-multiplier", config.get("reduce_only_taker_target_multiplier")),
+        ("--run-start-time", config.get("run_start_time")),
+        ("--run-end-time", config.get("run_end_time")),
+        ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
+        ("--rolling-hourly-loss-limit", config.get("rolling_hourly_loss_limit")),
+        ("--max-cumulative-notional", config.get("max_cumulative_notional")),
+        ("--max-cumulative-loss-limit", config.get("max_cumulative_loss_limit")),
     ]
     for flag, value in extra_args:
         if value is not None:
             command.extend([flag, str(value)])
+    command.append("--attack-market-entry-enabled" if config.get("attack_market_entry_enabled", False) else "--no-attack-market-entry-enabled")
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")
     command.append("--apply" if config.get("apply", True) else "--no-apply")
     return command
@@ -2769,6 +5654,7 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
         current_config = dict(runner.get("config") or {})
         compare_fields = {
             "symbol",
+            "strategy_profile",
             "strategy_mode",
             "grid_level_mode",
             "min_price",
@@ -2799,7 +5685,18 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_age_minutes",
             "inventory_recycle_loss_tolerance_ratio",
             "inventory_recycle_min_profit_ratio",
+            "attack_market_entry_enabled",
+            "attack_market_entry_trigger_multiplier",
+            "attack_market_entry_target_multiplier",
+            "attack_market_entry_cooldown_seconds",
+            "lot_take_profit_offset",
             "max_single_cycle_new_orders",
+            "run_start_time",
+            "run_end_time",
+            "runtime_guard_stats_start_time",
+            "rolling_hourly_loss_limit",
+            "max_cumulative_notional",
+            "max_cumulative_loss_limit",
         }
         config_changed = any(current_config.get(field) != config.get(field) for field in compare_fields)
         if not config_changed:
@@ -2969,6 +5866,7 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
     snapshot: dict[str, Any] = {
         "symbol": normalized_symbol,
         "runner": runner,
+        "spot_runner_presets": _spot_runner_preset_summaries(normalized_symbol),
         "config": config,
         "state": {
             "cycle": int(state.get("cycle", 0) or 0),
@@ -3005,6 +5903,22 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
             "center_price": _float_or_default(state.get("center_price"), "center_price"),
             "center_shift_count": _int_or_default(state.get("center_shift_count"), "center_shift_count"),
             "mode": str(state.get("last_mode", "") or latest_event.get("mode", "") if isinstance(latest_event, dict) else ""),
+            "runtime_status": str(latest_event.get("runtime_status", "") or "running") if isinstance(latest_event, dict) else "running",
+            "stop_triggered": bool(latest_event.get("stop_triggered")) if isinstance(latest_event, dict) else False,
+            "stop_reason": latest_event.get("stop_reason") if isinstance(latest_event, dict) else None,
+            "stop_reasons": list(latest_event.get("stop_reasons") or []) if isinstance(latest_event, dict) else [],
+            "stop_triggered_at": latest_event.get("stop_triggered_at") if isinstance(latest_event, dict) else None,
+            "run_start_time": config.get("run_start_time"),
+            "run_end_time": config.get("run_end_time"),
+            "runtime_guard_stats_start_time": (
+                latest_event.get("runtime_guard_stats_start_time") if isinstance(latest_event, dict) else config.get("runtime_guard_stats_start_time")
+            ),
+            "rolling_hourly_loss_limit": _float_or_default(config.get("rolling_hourly_loss_limit"), "rolling_hourly_loss_limit"),
+            "max_cumulative_notional": _float_or_default(config.get("max_cumulative_notional"), "max_cumulative_notional"),
+            "max_cumulative_loss_limit": _float_or_default(config.get("max_cumulative_loss_limit"), "max_cumulative_loss_limit"),
+            "rolling_hourly_loss": _float_or_default(latest_event.get("rolling_hourly_loss"), "rolling_hourly_loss") if isinstance(latest_event, dict) else 0.0,
+            "cumulative_loss": _float_or_default(latest_event.get("cumulative_loss"), "cumulative_loss") if isinstance(latest_event, dict) else 0.0,
+            "cumulative_gross_notional": _float_or_default(latest_event.get("cumulative_gross_notional"), "cumulative_gross_notional") if isinstance(latest_event, dict) else 0.0,
             "buy_paused": bool(latest_event.get("buy_paused")) if isinstance(latest_event, dict) else False,
             "pause_reasons": list(latest_event.get("pause_reasons") or []) if isinstance(latest_event, dict) else [],
             "inventory_soft_limit_notional": _float_or_default(config.get("inventory_soft_limit_notional"), "inventory_soft_limit_notional"),
@@ -3055,6 +5969,19 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
             quote_asset = str(symbol_info.get("quote_asset") or "").upper().strip()
             base_free, base_locked = _extract_spot_balance(account_info, base_asset)
             quote_free, quote_locked = _extract_spot_balance(account_info, quote_asset)
+            if snapshot.get("market") and base_asset and quote_asset:
+                try:
+                    snapshot["live_trade_summary"] = _load_live_spot_trade_summary_cached(
+                        symbol=normalized_symbol,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        bid_price=_float_or_default(snapshot["market"].get("bid_price"), "bid_price"),
+                        ask_price=_float_or_default(snapshot["market"].get("ask_price"), "ask_price"),
+                        base_asset=base_asset,
+                        quote_asset=quote_asset,
+                    )
+                except Exception as exc:  # pragma: no cover - runtime specific
+                    snapshot["live_trade_summary_error"] = f"{type(exc).__name__}: {exc}"
             snapshot["balances"] = {
                 "base_asset": base_asset,
                 "quote_asset": quote_asset,
@@ -3804,6 +6731,7 @@ HTML_PAGE = """<!doctype html>
         <div class="actions">
           <button id="run_btn" type="submit">开始测算</button>
           <button id="suggest_btn" type="button" class="optimize-only">智能建议 min/max</button>
+          <button id="short_candidate_btn" type="button" class="market-futures-only">空头刷量候选</button>
           <button id="csv_btn" type="button" disabled>下载当前买入计划 CSV</button>
           <span id="status" class="msg">等待输入参数。</span>
         </div>
@@ -3951,7 +6879,7 @@ HTML_PAGE = """<!doctype html>
         </div>
         <div class="field">
           <label>刷新间隔（秒）</label>
-          <input id="rank_refresh_seconds" type="number" step="1" value="60" min="60" max="3600" />
+          <input id="rank_refresh_seconds" type="number" step="1" value="120" min="60" max="3600" />
         </div>
         <div class="rank-actions">
           <button id="rank_run_btn" type="button">刷新排行</button>
@@ -3993,6 +6921,36 @@ HTML_PAGE = """<!doctype html>
           </div>
         </div>
       </div>
+    </section>
+
+    <section class="card market-futures-only">
+      <h3>空头刷量候选</h3>
+      <p class="hint">基于当前交易对、时间窗、预算、手续费和资金费设定，自动生成 3 个纯空候选。点击“应用”会把候选参数回填到上方主表单，你可以继续修改后再点“开始测算”。</p>
+      <div id="short_candidate_summary" class="summary"></div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>候选</th>
+              <th>说明</th>
+              <th>区间</th>
+              <th>N / 模式</th>
+              <th>成交额倍数</th>
+              <th>净收益</th>
+              <th>收益率</th>
+              <th>最大回撤</th>
+              <th>成交数</th>
+              <th>资金费</th>
+              <th>手续费</th>
+              <th>平均占用</th>
+              <th>推荐目标</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="short_candidate_tbody"></tbody>
+        </table>
+      </div>
+      <p id="short_candidate_status" class="hint">等待生成。</p>
     </section>
 
     <section class="card">
@@ -4174,8 +7132,12 @@ HTML_PAGE = """<!doctype html>
     const statusEl = document.getElementById("status");
     const runBtn = document.getElementById("run_btn");
     const suggestBtn = document.getElementById("suggest_btn");
+    const shortCandidateBtn = document.getElementById("short_candidate_btn");
     const csvBtn = document.getElementById("csv_btn");
     const suggestStatusEl = document.getElementById("suggest_status");
+    const shortCandidateStatusEl = document.getElementById("short_candidate_status");
+    const shortCandidateSummaryEl = document.getElementById("short_candidate_summary");
+    const shortCandidateBody = document.getElementById("short_candidate_tbody");
     const rankRunBtn = document.getElementById("rank_run_btn");
     const rankAutoBtn = document.getElementById("rank_auto_btn");
     const rankStatusEl = document.getElementById("rank_status");
@@ -4229,15 +7191,12 @@ HTML_PAGE = """<!doctype html>
     const layerTargetStepFields = Array.from(document.querySelectorAll(".layer-target-step-field"));
     const calcModeEl = document.getElementById("calc_mode");
     const marketTypeEl = document.getElementById("market_type");
-    const symbolEl = document.getElementById("symbol");
     const fixedBuyUnitEl = document.getElementById("fixed_buy_unit");
     const fixedBuyValueLabelEl = document.getElementById("fixed_buy_value_label");
     const fixedBuyValueEl = document.getElementById("fixed_buy_value");
     const strategyDirectionEl = document.getElementById("strategy_direction");
     const gridLevelModeEl = document.getElementById("grid_level_mode");
     const includeFundingEl = document.getElementById("include_funding");
-    const startTimeEl = document.getElementById("start_time");
-    const endTimeEl = document.getElementById("end_time");
     const intervalEl = document.getElementById("interval");
     const progressBoxEl = document.getElementById("progress_box");
     const progressFillEl = document.getElementById("progress_fill");
@@ -4251,6 +7210,8 @@ HTML_PAGE = """<!doctype html>
     let latestPlanRows = [];
     let latestTopCandidates = [];
     let latestRangeSuggestions = [];
+    let latestShortCandidates = [];
+    let latestShortCandidateContext = null;
     let latestCandleCount = 0;
     let latestExpectedCandleCount = 0;
     let latestCandleCoverage = null;
@@ -4261,7 +7222,9 @@ HTML_PAGE = """<!doctype html>
     let latestComparison = null;
     let latestFundingRows = [];
     let selectedTopIndex = 0;
+    let selectedShortCandidateIndex = -1;
     let currentPollToken = 0;
+    let currentShortCandidatePollToken = 0;
     let rankAutoTimer = null;
     let lastFuturesContractType = "usdm";
     let lastFuturesStrategyDirection = "long";
@@ -4298,6 +7261,15 @@ HTML_PAGE = """<!doctype html>
     function fmtNum(v, digits = 4) {
       if (v === null || v === undefined || Number.isNaN(v)) return "-";
       return Number(v).toLocaleString(undefined, { maximumFractionDigits: digits, minimumFractionDigits: digits });
+    }
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
     }
 
     function fmtPct(v) {
@@ -4493,6 +7465,11 @@ HTML_PAGE = """<!doctype html>
       suggestStatusEl.className = isError ? "msg error" : "msg";
     }
 
+    function setShortCandidateStatus(text, isError = false) {
+      shortCandidateStatusEl.textContent = text;
+      shortCandidateStatusEl.className = isError ? "hint msg error" : "hint";
+    }
+
     function setLayerStatus(text, isError = false) {
       layerStatusEl.textContent = text;
       layerStatusEl.className = isError ? "msg error" : "msg";
@@ -4522,6 +7499,22 @@ HTML_PAGE = """<!doctype html>
       previewSummaryEl.innerHTML = "";
       previewBody.innerHTML = "";
       setPreviewStatus(message, false);
+    }
+
+    function clearShortCandidates(message = "等待生成。") {
+      latestShortCandidates = [];
+      latestShortCandidateContext = null;
+      selectedShortCandidateIndex = -1;
+      shortCandidateSummaryEl.innerHTML = "";
+      shortCandidateBody.innerHTML = "";
+      setShortCandidateStatus(message, false);
+    }
+
+    function setAllocationModeSelection(modes) {
+      const normalized = new Set((Array.isArray(modes) ? modes : []).map((item) => String(item || "").trim().toLowerCase()));
+      for (const checkbox of document.querySelectorAll('input[name="allocation_mode"]')) {
+        checkbox.checked = normalized.has(String(checkbox.value || "").trim().toLowerCase());
+      }
     }
 
     function capSecondIntervalRange(startInput, endInput, intervalValue) {
@@ -4945,7 +7938,7 @@ HTML_PAGE = """<!doctype html>
     }
 
     function startRankAutoRefresh() {
-      const seconds = Math.max(60, Number(rankRefreshSecondsEl.value) || 60);
+      const seconds = Math.max(60, Number(rankRefreshSecondsEl.value) || 120);
       stopRankAutoRefresh();
       rankAutoTimer = setInterval(() => {
         runMarketRanking(true);
@@ -5666,6 +8659,96 @@ HTML_PAGE = """<!doctype html>
       `).join("");
     }
 
+    function renderShortCandidateSummary(report) {
+      const context = (report && report.context) || {};
+      const snapshot = (report && report.current_funding_snapshot) || null;
+      const items = [
+        ["窗口涨跌", fmtPct(context.window_return)],
+        ["当前 funding", snapshot ? fmtPct(snapshot.funding_rate) : "-"],
+        ["最近 funding 累计", fmtPct(context.funding_sum)],
+        ["参考收盘价", fmtNum(context.reference_price)],
+        ["区间低/高", `${fmtNum(context.window_low)} / ${fmtNum(context.window_high)}`],
+        ["预算", fmtMoney(context.budget, context.reference_price)],
+        ["K线数", context.candle_count ?? "-"],
+        ["资金费", context.include_funding ? "计入" : "忽略"],
+      ];
+      shortCandidateSummaryEl.innerHTML = items.map(([k, v]) => (
+        `<div class="kpi"><div class="k">${k}</div><div class="v">${v}</div></div>`
+      )).join("");
+    }
+
+    function renderShortCandidates(rows, activeIndex = selectedShortCandidateIndex) {
+      latestShortCandidates = Array.isArray(rows) ? rows : [];
+      if (!latestShortCandidates.length) {
+        shortCandidateBody.innerHTML = '<tr><td colspan="14">当前没有可用候选，请调整时间窗、预算或手续费后重试。</td></tr>';
+        return;
+      }
+      shortCandidateBody.innerHTML = latestShortCandidates.map((item, idx) => {
+        const params = item.params || {};
+        const metrics = item.metrics || {};
+        const isActive = idx === activeIndex;
+        return `
+          <tr class="candidate-row ${isActive ? "active" : ""}">
+            <td>${escapeHtml(item.title || item.label || `候选${idx + 1}`)}</td>
+            <td>${escapeHtml(item.description || "-")}</td>
+            <td>
+              <div>${fmtNum(params.min_price)} - ${fmtNum(params.max_price)}</div>
+              <div class="value-sub">${fmtNum(params.min_offset_pct, 2)}% / +${fmtNum(params.max_offset_pct, 2)}%</div>
+            </td>
+            <td>${params.n || "-"} / ${escapeHtml(`${params.grid_level_mode || "-"} / ${params.allocation_mode || "-"}`)}</td>
+            <td>${fmtNum(metrics.turnover_multiple, 2)}x</td>
+            <td>${fmtMoney(metrics.net_profit, params.max_price)}</td>
+            <td>${fmtPct(metrics.total_return)}</td>
+            <td>${fmtPct(metrics.max_drawdown)}</td>
+            <td>${metrics.trade_count ?? "-"}</td>
+            <td>${fmtMoney(metrics.funding_pnl, params.max_price)}</td>
+            <td>${fmtMoney(metrics.total_fees, params.max_price)}</td>
+            <td>${fmtPct(metrics.avg_capital_usage)}</td>
+            <td>${escapeHtml(item.recommended_objective || "-")}</td>
+            <td><button type="button" data-short-candidate-idx="${idx}">应用</button></td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function applyShortCandidate(index) {
+      if (index < 0 || index >= latestShortCandidates.length) return;
+      const candidate = latestShortCandidates[index];
+      const patch = candidate.form_patch || {};
+      const data = (latestShortCandidateContext && latestShortCandidateContext.data) || {};
+      if (marketTypeEl.value !== "futures") {
+        marketTypeEl.value = "futures";
+        applyMarketTypeUI();
+      }
+      if (data.contract_type && contractTypeEl.value !== data.contract_type) {
+        contractTypeEl.value = data.contract_type;
+      }
+      if (data.symbol && symbolEl.querySelector(`option[value="${data.symbol}"]`)) {
+        symbolEl.value = data.symbol;
+      }
+      calcModeEl.value = String(patch.calc_mode || "optimize");
+      applyCalcModeUI();
+      strategyDirectionEl.value = String(patch.strategy_direction || "short");
+      gridLevelModeEl.value = String(patch.grid_level_mode || "arithmetic");
+      document.getElementById("min_price").value = String(Number(patch.min_price || 0));
+      document.getElementById("max_price").value = String(Number(patch.max_price || 0));
+      document.getElementById("n_min").value = String(Number(patch.n_min || 0));
+      document.getElementById("n_max").value = String(Number(patch.n_max || 0));
+      document.getElementById("objective").value = String(patch.objective || "competition_volume");
+      if (Number.isFinite(Number(data.total_buy_notional)) && Number(data.total_buy_notional) > 0) {
+        document.getElementById("total_buy_notional").value = String(Number(data.total_buy_notional));
+      }
+      if (includeFundingEl && data.include_funding !== undefined) {
+        includeFundingEl.value = data.include_funding ? "1" : "0";
+      }
+      setAllocationModeSelection(patch.allocation_modes || []);
+      selectedShortCandidateIndex = index;
+      renderShortCandidates(latestShortCandidates, selectedShortCandidateIndex);
+      setStatus(
+        `已应用空头候选：${candidate.title || candidate.label}。现在可以直接点“开始测算”，也可以先微调区间、N、分配模式后再回测。`
+      );
+    }
+
     function renderPlanOverview(selected, rows) {
       const planRows = Array.isArray(rows) ? rows : [];
       const totalQty = planRows.reduce((acc, row) => acc + Number(row.qty || 0), 0);
@@ -6099,11 +9182,26 @@ HTML_PAGE = """<!doctype html>
     calcModeEl.addEventListener("change", applyCalcModeUI);
     fixedBuyUnitEl.addEventListener("change", applyFixedBuyUnitUI);
     intervalEl.addEventListener("change", () => applyMainSecondIntervalLimit(true));
+    intervalEl.addEventListener("change", () => clearShortCandidates("参数已变更，请重新生成空头候选。"));
     startTimeEl.addEventListener("change", () => applyMainSecondIntervalLimit(true));
+    startTimeEl.addEventListener("change", () => clearShortCandidates("参数已变更，请重新生成空头候选。"));
     endTimeEl.addEventListener("change", () => applyMainSecondIntervalLimit(true));
+    endTimeEl.addEventListener("change", () => clearShortCandidates("参数已变更，请重新生成空头候选。"));
     rankIntervalEl.addEventListener("change", () => applyRankSecondIntervalLimit(true));
     rankStartTimeEl.addEventListener("change", () => applyRankSecondIntervalLimit(true));
     rankEndTimeEl.addEventListener("change", () => applyRankSecondIntervalLimit(true));
+    document.getElementById("total_buy_notional").addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
+    document.getElementById("fee_rate").addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
+    document.getElementById("slippage").addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
+    includeFundingEl.addEventListener("change", () => {
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
+    });
     marketTypeEl.addEventListener("change", () => {
       stopRankAutoRefresh();
       applyMarketTypeUI();
@@ -6117,6 +9215,7 @@ HTML_PAGE = """<!doctype html>
       latestResultContractType = latestResultMarketType === "futures" ? String(contractTypeEl.value || "usdm") : "";
       latestResultSymbol = String(symbolEl.value || "").toUpperCase();
       selectedTopIndex = 0;
+      clearShortCandidates(getSelectedMarketType() === "spot" ? "现货模式不支持空头刷量候选。" : "等待生成。");
       latestCandleCount = 0;
       latestExpectedCandleCount = 0;
       latestCandleCoverage = null;
@@ -6130,10 +9229,12 @@ HTML_PAGE = """<!doctype html>
     });
     contractTypeEl.addEventListener("change", () => {
       clearGridPreview("交易对已切换，请重新生成当前网格预览。");
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
       loadSymbols(true);
     });
     symbolEl.addEventListener("change", () => {
       clearGridPreview("交易对已切换，请重新生成当前网格预览。");
+      clearShortCandidates("参数已变更，请重新生成空头候选。");
     });
     previewBtn.addEventListener("click", runGridPreview);
     rankRunBtn.addEventListener("click", () => runMarketRanking(false));
@@ -6153,6 +9254,7 @@ HTML_PAGE = """<!doctype html>
     applyRankSecondIntervalLimit(false);
     loadSymbols();
     renderRangeSuggestions([]);
+    clearShortCandidates(getSelectedMarketType() === "spot" ? "现货模式不支持空头刷量候选。" : "等待生成。");
     clearFunding(getSelectedMarketType() === "spot" ? "现货模式无资金费。" : "等待测算结果。");
     clearGridPreview();
 
@@ -6222,15 +9324,90 @@ HTML_PAGE = """<!doctype html>
       });
     }
 
-    async function pollJob(jobId, token) {
-      while (token === currentPollToken) {
+    if (shortCandidateBtn) {
+      shortCandidateBody.addEventListener("click", (e) => {
+        const btn = e.target.closest("button[data-short-candidate-idx]");
+        if (!btn) return;
+        const idx = Number(btn.dataset.shortCandidateIdx);
+        if (Number.isNaN(idx)) return;
+        applyShortCandidate(idx);
+      });
+
+      shortCandidateBtn.addEventListener("click", async () => {
+        const payload = readForm();
+        if (payload.market_type !== "futures") {
+          setShortCandidateStatus("空头刷量候选仅支持合约。", true);
+          return;
+        }
+        const rangeErr = validateSecondIntervalRange(
+          payload.start_time,
+          payload.end_time,
+          payload.interval,
+          "空头候选"
+        );
+        if (rangeErr) {
+          setShortCandidateStatus(rangeErr, true);
+          return;
+        }
+        currentShortCandidatePollToken += 1;
+        const token = currentShortCandidatePollToken;
+        shortCandidateBtn.disabled = true;
+        setShortCandidateStatus("正在提交空头候选任务...");
+        try {
+          const submitResp = await fetch("/api/short_volume_candidates", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const submitData = await submitResp.json();
+          if (!submitResp.ok || !submitData.ok) {
+            throw new Error(submitData.error || `请求失败(${submitResp.status})`);
+          }
+          setShortCandidateStatus(`任务已启动：${submitData.job_id.slice(0, 8)}...`);
+          const data = await pollBackgroundJob(
+            submitData.job_id,
+            token,
+            () => token === currentShortCandidatePollToken,
+            (job) => {
+              const pct = Math.max(0, Math.min(100, Number(job.progress || 0) * 100));
+              setShortCandidateStatus(`${job.message || "正在生成候选..."} · ${pct.toFixed(1)}%`);
+            }
+          );
+          latestShortCandidateContext = data;
+          selectedShortCandidateIndex = -1;
+          renderShortCandidateSummary(data);
+          renderShortCandidates(Array.isArray(data.candidates) ? data.candidates : [], selectedShortCandidateIndex);
+          const candidates = Array.isArray(data.candidates) ? data.candidates : [];
+          if (!candidates.length) {
+            setShortCandidateStatus("未生成可用候选，请放宽时间窗或预算后重试。", true);
+            return;
+          }
+          const cacheLabel = data.data && data.data.cache_file ? ` 缓存：${data.data.cache_file}` : "";
+          const fundingLabel = data.current_funding_snapshot
+            ? ` 当前 funding=${fmtPct(data.current_funding_snapshot.funding_rate)}`
+            : "";
+          setShortCandidateStatus(`已生成 ${candidates.length} 个空头候选。点击“应用”即可回填主表单。${fundingLabel}${cacheLabel}`);
+        } catch (err) {
+          clearShortCandidates("等待生成。");
+          setShortCandidateStatus(`空头候选失败：${err.message}`, true);
+        } finally {
+          if (token === currentShortCandidatePollToken) {
+            shortCandidateBtn.disabled = false;
+          }
+        }
+      });
+    }
+
+    async function pollBackgroundJob(jobId, token, isStillCurrent, onProgress) {
+      while (isStillCurrent()) {
         const resp = await fetch(`/api/job/${jobId}`);
         const data = await resp.json();
         if (!resp.ok || !data.ok) {
           throw new Error(data.error || `任务查询失败(${resp.status})`);
         }
-
-        setProgress(data.progress, data.eta_seconds, data.message || "");
+        if (typeof onProgress === "function") {
+          onProgress(data);
+        }
 
         if (data.status === "done") {
           return data.result;
@@ -6241,6 +9418,15 @@ HTML_PAGE = """<!doctype html>
         await new Promise((resolve) => setTimeout(resolve, 1000));
       }
       throw new Error("任务已被新的测算请求替换");
+    }
+
+    async function pollJob(jobId, token) {
+      return pollBackgroundJob(
+        jobId,
+        token,
+        () => token === currentPollToken,
+        (data) => setProgress(data.progress, data.eta_seconds, data.message || "")
+      );
     }
 
     form.addEventListener("submit", async (e) => {
@@ -6562,7 +9748,7 @@ RANKING_PAGE = """<!doctype html>
         </div>
         <div class="field">
           <label>刷新间隔（秒，最小60）</label>
-          <input id="refresh_seconds" type="number" step="1" value="60" min="60" max="3600" />
+          <input id="refresh_seconds" type="number" step="1" value="120" min="60" max="3600" />
         </div>
         <div class="field">
           <label>并发数</label>
@@ -6829,7 +10015,7 @@ RANKING_PAGE = """<!doctype html>
         rawFundRows = Array.isArray(data.funding && data.funding.rows) ? data.funding.rows : [];
         renderTables();
         const source = payload.cache_only ? "本地缓存" : "缓存+增量拉取";
-        const autoText = autoTimer ? `，自动刷新中(${Math.max(60, Number(refreshSecondsEl.value) || 60)}s)` : "";
+        const autoText = autoTimer ? `，自动刷新中(${Math.max(60, Number(refreshSecondsEl.value) || 120)}s)` : "";
         const topK = Math.max(1, Number(payload.top_k) || 1);
         setStatus(
           `完成：样本=${data.meta.symbols_considered}，波动率有效=${data.volatility.count}，资金费有效=${data.funding.count}，展示Top=${topK}（排序基于全量样本），耗时=${data.meta.elapsed_seconds}s，来源=${source}${autoText}。`
@@ -6850,7 +10036,7 @@ RANKING_PAGE = """<!doctype html>
     }
 
     function startAutoRefresh() {
-      const sec = Math.max(60, Number(refreshSecondsEl.value) || 60);
+      const sec = Math.max(60, Number(refreshSecondsEl.value) || 120);
       stopAutoRefresh();
       autoTimer = setInterval(() => runRanking(true), sec * 1000);
       autoBtn.textContent = "停止自动刷新";
@@ -8048,6 +11234,13 @@ MONITOR_PAGE = """<!doctype html>
       flex-wrap: wrap;
       margin-bottom: 12px;
     }
+    .runtime-guard-toolbar {
+      margin-top: 0;
+      margin-bottom: 8px;
+    }
+    .runtime-guard-toolbar label {
+      min-width: 220px;
+    }
     .editor-grid {
       display: grid;
       grid-template-columns: minmax(0, 1.1fr) minmax(320px, 0.9fr);
@@ -8183,6 +11376,114 @@ MONITOR_PAGE = """<!doctype html>
       padding: 10px 12px;
     }
     .meta { font-size: 13px; color: var(--muted); }
+    .alert-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin-top: 12px;
+    }
+    .alert-item {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      background: #fcfbf7;
+    }
+    .alert-item.critical {
+      border-color: rgba(180, 35, 24, 0.28);
+      background: #fff4f2;
+    }
+    .alert-item.warning {
+      border-color: rgba(183, 110, 0, 0.28);
+      background: #fff9ef;
+    }
+    .alert-item.info {
+      border-color: rgba(15, 118, 110, 0.22);
+      background: #f2fbfa;
+    }
+    .alert-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 6px;
+    }
+    .alert-title {
+      font-size: 14px;
+      font-weight: 800;
+      color: var(--text);
+    }
+    .alert-severity {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 2px 8px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      border: 1px solid transparent;
+    }
+    .alert-item.critical .alert-severity {
+      color: var(--bad);
+      background: rgba(180, 35, 24, 0.08);
+      border-color: rgba(180, 35, 24, 0.12);
+    }
+    .alert-item.warning .alert-severity {
+      color: var(--warn);
+      background: rgba(183, 110, 0, 0.08);
+      border-color: rgba(183, 110, 0, 0.12);
+    }
+    .alert-item.info .alert-severity {
+      color: var(--brand);
+      background: rgba(15, 118, 110, 0.08);
+      border-color: rgba(15, 118, 110, 0.12);
+    }
+    .alert-detail,
+    .alert-action,
+    .alert-ts {
+      font-size: 13px;
+      line-height: 1.6;
+      color: var(--muted);
+    }
+    .alert-action {
+      margin-top: 6px;
+      color: var(--text);
+    }
+    .alert-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .alert-action-btn {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: #0f423f;
+      font-size: 12px;
+      font-weight: 700;
+      height: 32px;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    .alert-action-btn.primary {
+      background: var(--brand-soft);
+      border-color: rgba(15, 118, 110, 0.24);
+      color: var(--brand);
+    }
+    .alert-action-btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
+    .alert-empty {
+      border: 1px dashed var(--line);
+      border-radius: 12px;
+      padding: 12px 14px;
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+      background: #fcfbf7;
+    }
     .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     .metric {
       background: linear-gradient(180deg, #fffefc 0%, #faf8f2 100%);
@@ -8194,6 +11495,34 @@ MONITOR_PAGE = """<!doctype html>
     .metric .label { font-size: 12px; color: var(--muted); margin-bottom: 10px; }
     .metric .value { font-size: 24px; font-weight: 800; letter-spacing: -0.02em; }
     .metric .sub { font-size: 12px; color: var(--muted); margin-top: 8px; line-height: 1.5; }
+    .metric-lines {
+      margin-top: 8px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .metric-line {
+      font-size: 12px;
+      line-height: 1.55;
+      color: var(--muted);
+    }
+    .metric-line strong {
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 800;
+    }
+    .metric-line .inline-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 42px;
+      padding: 2px 8px;
+      border-radius: 999px;
+      background: rgba(15, 118, 110, 0.08);
+      color: var(--brand);
+      font-weight: 700;
+      margin-right: 6px;
+    }
     .good { color: var(--good); }
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
@@ -8268,7 +11597,7 @@ MONITOR_PAGE = """<!doctype html>
           <select id="symbol"></select>
         </label>
         <label>刷新秒数
-          <input id="refresh_sec" type="number" min="2" step="1" value="5" />
+          <input id="refresh_sec" type="number" min="2" step="1" value="__MONITOR_REFRESH_DEFAULT__" />
         </label>
         <label>策略预设
           <select id="strategy_preset"></select>
@@ -8294,6 +11623,9 @@ MONITOR_PAGE = """<!doctype html>
       <div class="meta">监控币种列表可在 <a href="/strategies">策略总览页</a> 手动添加和删除。</div>
       <div id="strategy_action_meta" class="meta"></div>
       <div id="strategy_preset_meta" class="meta"></div>
+      <div id="alert_box" class="alert-stack">
+        <div class="alert-empty">等待首轮数据，拿到 runner 状态后会在这里直接提示“保证金不足 / 频率超限 / 停买停空 / 进程退出”等关键问题。</div>
+      </div>
     </section>
 
     <section class="card">
@@ -8304,8 +11636,106 @@ MONITOR_PAGE = """<!doctype html>
       <div class="editor-toolbar">
         <button id="load_running_params_btn">载入运行参数</button>
         <button id="load_preset_params_btn">载入预设参数</button>
+        <button id="save_params_btn">保存参数不启动</button>
         <button id="apply_params_btn" class="primary">应用参数并启动</button>
       </div>
+      <div class="toolbar">
+        <label>保存预设名称
+          <input id="save_running_preset_name" type="text" placeholder="例如 BARD 8788 当前运行" />
+        </label>
+        <label>预设说明（可选）
+          <input id="save_running_preset_description" type="text" placeholder="来源 / 用途 / 服务器" />
+        </label>
+        <button id="save_running_preset_btn">保存当前运行策略为预设</button>
+      </div>
+      <div class="toolbar runtime-guard-toolbar">
+        <label>起始交易时间
+          <input id="monitor_run_start_time" type="datetime-local" />
+        </label>
+        <label>结束交易时间
+          <input id="monitor_run_end_time" type="datetime-local" />
+        </label>
+        <label>风控统计起点
+          <input id="monitor_runtime_guard_stats_start_time" type="datetime-local" />
+        </label>
+        <label>滚动 60 分钟亏损阈值
+          <input id="monitor_rolling_hourly_loss_limit" type="number" min="0" step="0.01" />
+        </label>
+        <label>累计成交额阈值
+          <input id="monitor_max_cumulative_notional" type="number" min="0" step="0.01" />
+        </label>
+      </div>
+      <div class="toolbar runtime-guard-toolbar">
+        <label class="inline-check" title="启用后，web 服务会按市场成交额自动启动或停止这套策略">
+          <span class="check-row">
+            <input id="monitor_volume_trigger_enabled" type="checkbox" />
+            <span>启用量能自动启停</span>
+          </span>
+        </label>
+        <label>量能窗口
+          <select id="monitor_volume_trigger_window">
+            <option value="15m">最近 15 分钟</option>
+            <option value="30m">最近 30 分钟</option>
+            <option value="1h">最近 1 小时</option>
+            <option value="4h">最近 4 小时</option>
+            <option value="24h">最近 24 小时</option>
+          </select>
+        </label>
+        <label>自动启动成交额阈值
+          <input id="monitor_volume_trigger_start_threshold" type="number" min="0" step="0.01" />
+        </label>
+        <label>自动停止成交额阈值
+          <input id="monitor_volume_trigger_stop_threshold" type="number" min="0" step="0.01" />
+        </label>
+        <label class="inline-check" title="量能低于停止阈值后，自动停机时先撤掉当前交易对全部未成交委托">
+          <span class="check-row">
+            <input id="monitor_volume_trigger_stop_cancel_orders" type="checkbox" />
+            <span>低量停机时自动撤单</span>
+          </span>
+        </label>
+        <label class="inline-check" title="量能低于停止阈值后，自动停机时再启动 maker 跟价平仓，直到仓位归零">
+          <span class="check-row">
+            <input id="monitor_volume_trigger_stop_close_positions" type="checkbox" />
+            <span>低量停机时自动清仓</span>
+          </span>
+        </label>
+      </div>
+      <div class="toolbar runtime-guard-toolbar">
+        <label class="inline-check" title="启用后，web 服务会持续观察最近窗口的振幅和涨跌幅；超过阈值自动暂停，回落后自动恢复">
+          <span class="check-row">
+            <input id="monitor_volatility_trigger_enabled" type="checkbox" />
+            <span>启用波动自动暂停</span>
+          </span>
+        </label>
+        <label>波动窗口
+          <select id="monitor_volatility_trigger_window">
+            <option value="15m">最近 15 分钟</option>
+            <option value="30m">最近 30 分钟</option>
+            <option value="1h">最近 1 小时</option>
+            <option value="4h">最近 4 小时</option>
+            <option value="24h">最近 24 小时</option>
+          </select>
+        </label>
+        <label>振幅阈值
+          <input id="monitor_volatility_trigger_amplitude_ratio" type="number" min="0" step="0.0001" />
+        </label>
+        <label>绝对涨跌阈值
+          <input id="monitor_volatility_trigger_abs_return_ratio" type="number" min="0" step="0.0001" />
+        </label>
+        <label class="inline-check" title="高波动自动暂停时，先撤掉当前交易对全部未成交委托">
+          <span class="check-row">
+            <input id="monitor_volatility_trigger_stop_cancel_orders" type="checkbox" />
+            <span>高波动停机时自动撤单</span>
+          </span>
+        </label>
+        <label class="inline-check" title="高波动自动暂停时，再启动 maker 跟价平仓，直到仓位归零；关闭时只撤单并保留仓位，等波动回落后再恢复">
+          <span class="check-row">
+            <input id="monitor_volatility_trigger_stop_close_positions" type="checkbox" />
+            <span>高波动停机时自动清仓</span>
+          </span>
+        </label>
+      </div>
+      <div class="tiny">上面的运行保护、量能自动启停和波动自动暂停参数会和下方 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
       <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改 JSON。</div>
       <div class="editor-grid">
         <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
@@ -8538,6 +11968,7 @@ MONITOR_PAGE = """<!doctype html>
     const hourlyBody = document.getElementById("hourly_body");
     const hourlyMetaEl = document.getElementById("hourly_meta");
     const metaEl = document.getElementById("meta");
+    const alertBoxEl = document.getElementById("alert_box");
     const openOrderMetaEl = document.getElementById("open_order_meta");
     const symbolEl = document.getElementById("symbol");
     const refreshSecEl = document.getElementById("refresh_sec");
@@ -8552,10 +11983,31 @@ MONITOR_PAGE = """<!doctype html>
     const strategyPresetMetaEl = document.getElementById("strategy_preset_meta");
     const loadRunningParamsBtn = document.getElementById("load_running_params_btn");
     const loadPresetParamsBtn = document.getElementById("load_preset_params_btn");
+    const saveParamsBtn = document.getElementById("save_params_btn");
     const applyParamsBtn = document.getElementById("apply_params_btn");
+    const saveRunningPresetNameEl = document.getElementById("save_running_preset_name");
+    const saveRunningPresetDescriptionEl = document.getElementById("save_running_preset_description");
+    const saveRunningPresetBtn = document.getElementById("save_running_preset_btn");
     const runnerParamsMetaEl = document.getElementById("runner_params_meta");
     const runnerParamsEditorEl = document.getElementById("runner_params_editor");
     const runnerParamsGuideBodyEl = document.getElementById("runner_params_guide_body");
+    const monitorRunStartTimeEl = document.getElementById("monitor_run_start_time");
+    const monitorRunEndTimeEl = document.getElementById("monitor_run_end_time");
+    const monitorRuntimeGuardStatsStartTimeEl = document.getElementById("monitor_runtime_guard_stats_start_time");
+    const monitorRollingHourlyLossLimitEl = document.getElementById("monitor_rolling_hourly_loss_limit");
+    const monitorMaxCumulativeNotionalEl = document.getElementById("monitor_max_cumulative_notional");
+    const monitorVolumeTriggerEnabledEl = document.getElementById("monitor_volume_trigger_enabled");
+    const monitorVolumeTriggerWindowEl = document.getElementById("monitor_volume_trigger_window");
+    const monitorVolumeTriggerStartThresholdEl = document.getElementById("monitor_volume_trigger_start_threshold");
+    const monitorVolumeTriggerStopThresholdEl = document.getElementById("monitor_volume_trigger_stop_threshold");
+    const monitorVolumeTriggerStopCancelOrdersEl = document.getElementById("monitor_volume_trigger_stop_cancel_orders");
+    const monitorVolumeTriggerStopClosePositionsEl = document.getElementById("monitor_volume_trigger_stop_close_positions");
+    const monitorVolatilityTriggerEnabledEl = document.getElementById("monitor_volatility_trigger_enabled");
+    const monitorVolatilityTriggerWindowEl = document.getElementById("monitor_volatility_trigger_window");
+    const monitorVolatilityTriggerAmplitudeRatioEl = document.getElementById("monitor_volatility_trigger_amplitude_ratio");
+    const monitorVolatilityTriggerAbsReturnRatioEl = document.getElementById("monitor_volatility_trigger_abs_return_ratio");
+    const monitorVolatilityTriggerStopCancelOrdersEl = document.getElementById("monitor_volatility_trigger_stop_cancel_orders");
+    const monitorVolatilityTriggerStopClosePositionsEl = document.getElementById("monitor_volatility_trigger_stop_close_positions");
     const customGridNameEl = document.getElementById("custom_grid_name");
     const customGridDirectionEl = document.getElementById("custom_grid_direction");
     const customGridLevelModeEl = document.getElementById("custom_grid_level_mode");
@@ -8578,6 +12030,14 @@ MONITOR_PAGE = """<!doctype html>
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
     const DEFAULT_MONITOR_SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
+    const VISIBLE_STRATEGY_PRESET_KEYS = new Set([
+      "volume_long_v4",
+      "based_volume_push_bard_v1",
+      "based_competition_neutral_v1",
+      "based_competition_neutral_aggressive_v1",
+      "volume_short_v1",
+      "xaut_volume_guarded_bard_v2",
+    ]);
     const LOCAL_STRATEGY_PRESETS = [
       {
         key: "volume_long_v4",
@@ -8670,6 +12130,482 @@ MONITOR_PAGE = """<!doctype html>
         },
       },
       {
+        key: "bard_volume_long_v2",
+        label: "BARD 量优先做多 v2",
+        description: "BARDUSDT 专用做多预设。加入启动门禁和首轮 warm-start，避免带仓或带旧挂单时一上来补到底仓。",
+        startable: true,
+        kind: "one_way",
+        symbol: "BARDUSDT",
+        config: {
+          symbol: "BARDUSDT",
+          buy_levels: 5,
+          sell_levels: 11,
+          per_order_notional: 40.0,
+          base_position_notional: 120.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          step_price: 0.0002,
+          up_trigger_steps: 2,
+          down_trigger_steps: 2,
+          shift_steps: 2,
+          pause_buy_position_notional: 420.0,
+          max_position_notional: 560.0,
+          buy_pause_amp_trigger_ratio: 0.0048,
+          buy_pause_down_return_trigger_ratio: -0.002,
+          freeze_shift_abs_return_trigger_ratio: 0.004,
+          inventory_tier_start_notional: 260.0,
+          inventory_tier_end_notional: 380.0,
+          inventory_tier_buy_levels: 2,
+          inventory_tier_sell_levels: 14,
+          inventory_tier_per_order_notional: 35.0,
+          inventory_tier_base_position_notional: 80.0,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: true,
+          sleep_seconds: 5.0,
+        },
+      },
+      {
+        key: "bard_12h_push_neutral_v2",
+        label: "BARD 双向冲量 v2",
+        description: "BARDUSDT 专用双向冲量模板。固定细步长、双边 8 档、零底仓，适合高成交窗口短时冲量。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "BARDUSDT",
+        config: {
+          symbol: "BARDUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 100.0,
+          base_position_notional: 0.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 2000.0,
+          pause_short_position_notional: 2000.0,
+          max_position_notional: 2400.0,
+          max_short_position_notional: 2400.0,
+          max_total_notional: 3600.0,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          sleep_seconds: 3.0,
+          rolling_hourly_loss_limit: null,
+          excess_inventory_reduce_only_enabled: false,
+          autotune_symbol_enabled: false,
+        },
+      },
+      {
+        key: "based_volume_long_trigger_v1",
+        label: "BASED 放量做多 v1",
+        description: "BASEDUSDT 专用轻仓顺势做多。参考 BARD 的活跃窗口做法，但把步长放宽、仓位缩小，并默认按最近 15m 市场成交额自动启停。",
+        startable: true,
+        kind: "one_way",
+        symbol: "BASEDUSDT",
+        config: {
+          symbol: "BASEDUSDT",
+          strategy_mode: "one_way_long",
+          step_price: 0.0002,
+          buy_levels: 4,
+          sell_levels: 10,
+          per_order_notional: 20.0,
+          base_position_notional: 60.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 2,
+          down_trigger_steps: 2,
+          shift_steps: 1,
+          pause_buy_position_notional: 220.0,
+          max_position_notional: 320.0,
+          buy_pause_amp_trigger_ratio: 0.0065,
+          buy_pause_down_return_trigger_ratio: -0.003,
+          freeze_shift_abs_return_trigger_ratio: 0.0045,
+          inventory_tier_start_notional: 160.0,
+          inventory_tier_end_notional: 240.0,
+          inventory_tier_buy_levels: 2,
+          inventory_tier_sell_levels: 12,
+          inventory_tier_per_order_notional: 18.0,
+          inventory_tier_base_position_notional: 40.0,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: true,
+          max_total_notional: 420.0,
+          sleep_seconds: 5.0,
+          runtime_guard_stats_start_time: "2026-03-31T18:00:00+08:00",
+          rolling_hourly_loss_limit: 4.0,
+          volume_trigger_enabled: true,
+          volume_trigger_window: "15m",
+          volume_trigger_start_threshold: 260000.0,
+          volume_trigger_stop_threshold: 180000.0,
+          volume_trigger_stop_cancel_open_orders: true,
+          volume_trigger_stop_close_all_positions: true,
+        },
+      },
+      {
+        key: "based_volume_push_bard_v1",
+        label: "通用双向冲量自适应 v1",
+        description: "通用的 synthetic_neutral 双向冲量模板。启动时会按币价、tick、点差和最小下单约束自动重设基础步长与单笔名义，并在 30s/1m 急波动和 3m/5m 持续单边时动态放大 step_price、收紧仓位阈值。",
+        startable: true,
+        kind: "synthetic",
+        config: {
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 100.0,
+          base_position_notional: 0.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 2000.0,
+          pause_short_position_notional: 2000.0,
+          max_position_notional: 2400.0,
+          max_short_position_notional: 2400.0,
+          max_total_notional: 3600.0,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.0028,
+          adaptive_step_30s_amplitude_ratio: 0.0035,
+          adaptive_step_1m_abs_return_ratio: 0.0045,
+          adaptive_step_1m_amplitude_ratio: 0.0065,
+          adaptive_step_3m_abs_return_ratio: 0.0100,
+          adaptive_step_5m_abs_return_ratio: 0.0140,
+          adaptive_step_max_scale: 3.0,
+          adaptive_step_min_per_order_scale: 1.0,
+          adaptive_step_min_position_limit_scale: 0.65,
+          autotune_symbol_enabled: true,
+          excess_inventory_reduce_only_enabled: false,
+          rolling_hourly_loss_limit: null,
+          sleep_seconds: 3.0,
+        },
+      },
+      {
+        key: "xaut_long_adaptive_v1",
+        label: "XAUT 自适应做多 v1",
+        description: "仅用于 XAUTUSDT 的三态自适应做多。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤买单并只保留卖单减仓。",
+        startable: true,
+        kind: "one_way",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "one_way_long",
+          step_price: 7.5,
+          buy_levels: 6,
+          sell_levels: 10,
+          per_order_notional: 80.0,
+          base_position_notional: 320.0,
+          up_trigger_steps: 5,
+          down_trigger_steps: 4,
+          shift_steps: 3,
+          pause_buy_position_notional: 520.0,
+          max_position_notional: 680.0,
+          buy_pause_amp_trigger_ratio: 0.0060,
+          buy_pause_down_return_trigger_ratio: -0.0045,
+          freeze_shift_abs_return_trigger_ratio: 0.0048,
+          inventory_tier_start_notional: 420.0,
+          inventory_tier_end_notional: 520.0,
+          inventory_tier_buy_levels: 3,
+          inventory_tier_sell_levels: 12,
+          inventory_tier_per_order_notional: 70.0,
+          inventory_tier_base_position_notional: 160.0,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+        },
+      },
+      {
+        key: "xaut_short_adaptive_v1",
+        label: "XAUT 自适应做空 v1",
+        description: "仅用于 XAUTUSDT 的三态自适应做空。运行时会按 15m/60m 振幅连续缩放 step_price；平稳时收紧刷量，扩振时放大步长，极端波动时立即撤卖单并只保留买单回补减仓。",
+        startable: true,
+        kind: "one_way",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "one_way_short",
+          step_price: 7.4,
+          buy_levels: 10,
+          sell_levels: 6,
+          per_order_notional: 60.0,
+          base_position_notional: 220.0,
+          up_trigger_steps: 4,
+          down_trigger_steps: 5,
+          shift_steps: 3,
+          pause_short_position_notional: 620.0,
+          max_short_position_notional: 720.0,
+          inventory_tier_start_notional: 320.0,
+          inventory_tier_end_notional: 520.0,
+          inventory_tier_buy_levels: 14,
+          inventory_tier_sell_levels: 3,
+          inventory_tier_per_order_notional: 45.0,
+          inventory_tier_base_position_notional: 100.0,
+          short_cover_pause_amp_trigger_ratio: 0.0060,
+          short_cover_pause_down_return_trigger_ratio: -0.0045,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+        },
+      },
+      {
+        key: "xaut_guarded_ping_pong_v1",
+        label: "XAUT 护栏回转 v1",
+        description: "仅用于 XAUTUSDT 的轻库存 synthetic_neutral。零底仓、单边 1x1、费率感知固定步长；急速单边时只保留顺风挂单，成交后延迟反向回补，并在短线扩振、净敞口和账本漂移放大时优先停新增、回到空仓。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 2.2,
+          buy_levels: 1,
+          sell_levels: 1,
+          per_order_notional: 100.0,
+          startup_entry_multiplier: 1.0,
+          base_position_notional: 0.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 180.0,
+          pause_short_position_notional: 180.0,
+          max_position_notional: 220.0,
+          max_short_position_notional: 220.0,
+          max_total_notional: 260.0,
+          max_new_orders: 6,
+          buy_pause_amp_trigger_ratio: 0.0035,
+          buy_pause_down_return_trigger_ratio: -0.0022,
+          freeze_shift_abs_return_trigger_ratio: 0.0028,
+          market_bias_enabled: true,
+          market_bias_max_shift_steps: 0.5,
+          market_bias_signal_steps: 1.0,
+          market_bias_drift_weight: 0.7,
+          market_bias_return_weight: 0.3,
+          market_bias_weak_buy_pause_enabled: true,
+          market_bias_weak_buy_pause_threshold: 0.12,
+          market_bias_strong_short_pause_enabled: true,
+          market_bias_strong_short_pause_threshold: 0.12,
+          market_bias_regime_switch_enabled: true,
+          market_bias_regime_switch_confirm_cycles: 2,
+          market_bias_regime_switch_weak_threshold: 0.12,
+          market_bias_regime_switch_strong_threshold: 0.12,
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.0010,
+          adaptive_step_30s_amplitude_ratio: 0.0014,
+          adaptive_step_1m_abs_return_ratio: 0.0016,
+          adaptive_step_1m_amplitude_ratio: 0.0022,
+          adaptive_step_3m_abs_return_ratio: 0.0035,
+          adaptive_step_5m_abs_return_ratio: 0.0050,
+          adaptive_step_max_scale: 2.2,
+          adaptive_step_min_per_order_scale: 1.0,
+          adaptive_step_min_position_limit_scale: 0.75,
+          synthetic_trend_follow_enabled: true,
+          synthetic_trend_follow_1m_abs_return_ratio: 0.00045,
+          synthetic_trend_follow_1m_amplitude_ratio: 0.00070,
+          synthetic_trend_follow_3m_abs_return_ratio: 0.00090,
+          synthetic_trend_follow_3m_amplitude_ratio: 0.00120,
+          synthetic_trend_follow_min_efficiency_ratio: 0.58,
+          synthetic_trend_follow_reverse_delay_seconds: 18.0,
+          rolling_hourly_loss_limit: 6.0,
+          max_cumulative_notional: 120000.0,
+          max_actual_net_notional: 120.0,
+          max_synthetic_drift_notional: 60.0,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+          sleep_seconds: 3.0,
+        },
+      },
+      {
+        key: "xaut_near_price_guarded_v1",
+        label: "XAUT 近价护栏 v1",
+        description: "仅用于 XAUTUSDT 的研究版近价 synthetic_neutral。零底仓、双边轻挂单，默认在现价外保留约 1 tick 安全距离；短线扩振时自动加宽报价、压缩库存上限，并在单边加速时优先停新增、回到空仓。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.02,
+          buy_levels: 1,
+          sell_levels: 1,
+          per_order_notional: 80.0,
+          startup_entry_multiplier: 1.0,
+          base_position_notional: 0.0,
+          static_buy_offset_steps: 0.5,
+          static_sell_offset_steps: 0.5,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 2,
+          down_trigger_steps: 2,
+          shift_steps: 1,
+          pause_buy_position_notional: 140.0,
+          pause_short_position_notional: 140.0,
+          max_position_notional: 180.0,
+          max_short_position_notional: 180.0,
+          max_total_notional: 220.0,
+          max_new_orders: 4,
+          buy_pause_amp_trigger_ratio: 0.0028,
+          buy_pause_down_return_trigger_ratio: -0.0018,
+          short_cover_pause_amp_trigger_ratio: 0.0038,
+          short_cover_pause_down_return_trigger_ratio: -0.0026,
+          freeze_shift_abs_return_trigger_ratio: 0.0020,
+          market_bias_enabled: false,
+          market_bias_weak_buy_pause_enabled: false,
+          market_bias_strong_short_pause_enabled: false,
+          market_bias_regime_switch_enabled: false,
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.0006,
+          adaptive_step_30s_amplitude_ratio: 0.0010,
+          adaptive_step_1m_abs_return_ratio: 0.0012,
+          adaptive_step_1m_amplitude_ratio: 0.0018,
+          adaptive_step_3m_abs_return_ratio: 0.0028,
+          adaptive_step_5m_abs_return_ratio: 0.0040,
+          adaptive_step_max_scale: 3.0,
+          adaptive_step_min_per_order_scale: 1.0,
+          adaptive_step_min_position_limit_scale: 0.8,
+          synthetic_trend_follow_enabled: true,
+          synthetic_trend_follow_1m_abs_return_ratio: 0.00040,
+          synthetic_trend_follow_1m_amplitude_ratio: 0.00060,
+          synthetic_trend_follow_3m_abs_return_ratio: 0.00080,
+          synthetic_trend_follow_3m_amplitude_ratio: 0.00100,
+          synthetic_trend_follow_min_efficiency_ratio: 0.55,
+          synthetic_trend_follow_reverse_delay_seconds: 12.0,
+          rolling_hourly_loss_limit: 4.0,
+          max_cumulative_notional: 60000.0,
+          max_actual_net_notional: 90.0,
+          max_synthetic_drift_notional: 45.0,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+          sleep_seconds: 2.0,
+        },
+      },
+      {
+        key: "xaut_volume_guarded_bard_v3",
+        label: "XAUT 冲量控损 v3",
+        description: "仅用于 XAUTUSDT 的固定节奏 synthetic_neutral。延续 111 线上 v2 的逐笔 lot 配对止盈思路，但把单笔、底仓、挂单层数和总挂单容量整体上调，用更高的双边周转去换成交额。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 1.0,
+          buy_levels: 10,
+          sell_levels: 6,
+          per_order_notional: 35.0,
+          startup_entry_multiplier: 3.0,
+          base_position_notional: 120.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 2600.0,
+          pause_short_position_notional: 2600.0,
+          max_position_notional: 3200.0,
+          max_short_position_notional: 3200.0,
+          max_total_notional: 3000.0,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.0045,
+          short_cover_pause_amp_trigger_ratio: 0.005,
+          short_cover_pause_down_return_trigger_ratio: -0.0022,
+          take_profit_min_profit_ratio: 0.0,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          market_bias_enabled: false,
+          market_bias_weak_buy_pause_enabled: false,
+          market_bias_strong_short_pause_enabled: false,
+          market_bias_regime_switch_enabled: false,
+          adaptive_step_enabled: false,
+          synthetic_trend_follow_enabled: false,
+          auto_regime_enabled: false,
+          neutral_hourly_scale_enabled: false,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+          margin_type: "KEEP",
+          leverage: 10,
+          max_plan_age_seconds: 30.0,
+          max_mid_drift_steps: 4.0,
+          maker_retries: 2,
+          runtime_guard_stats_start_time: "2026-03-31T18:00:00+08:00",
+          rolling_hourly_loss_limit: 6.0,
+          sleep_seconds: 3.0,
+          cancel_stale: true,
+          apply: true,
+          reset_state: false,
+          state_path: "output/xautusdt_loop_state.json",
+          plan_json: "output/xautusdt_loop_latest_plan.json",
+          submit_report_json: "output/xautusdt_loop_latest_submit.json",
+          summary_jsonl: "output/xautusdt_loop_events.jsonl",
+        },
+      },
+      {
+        key: "xaut_volume_guarded_bard_v3_1",
+        label: "XAUT 冲量控损 v3.1",
+        description: "仅用于 XAUTUSDT 的压损版冲量 synthetic_neutral。在 v3 的基础上把 step_price 放宽到 1.25，并收缩启动仓，目标是在尽量保住成交额的前提下压低单位损耗。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "XAUTUSDT",
+        config: {
+          symbol: "XAUTUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 1.25,
+          buy_levels: 10,
+          sell_levels: 6,
+          per_order_notional: 35.0,
+          startup_entry_multiplier: 2.0,
+          base_position_notional: 80.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 2600.0,
+          pause_short_position_notional: 2600.0,
+          max_position_notional: 3200.0,
+          max_short_position_notional: 3200.0,
+          max_total_notional: 3000.0,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.0045,
+          short_cover_pause_amp_trigger_ratio: 0.005,
+          short_cover_pause_down_return_trigger_ratio: -0.0022,
+          take_profit_min_profit_ratio: 0.0,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          market_bias_enabled: false,
+          market_bias_weak_buy_pause_enabled: false,
+          market_bias_strong_short_pause_enabled: false,
+          market_bias_regime_switch_enabled: false,
+          adaptive_step_enabled: false,
+          synthetic_trend_follow_enabled: false,
+          auto_regime_enabled: false,
+          neutral_hourly_scale_enabled: false,
+          autotune_symbol_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+          margin_type: "KEEP",
+          leverage: 10,
+          max_plan_age_seconds: 30.0,
+          max_mid_drift_steps: 4.0,
+          maker_retries: 2,
+          runtime_guard_stats_start_time: "2026-03-31T18:00:00+08:00",
+          rolling_hourly_loss_limit: 6.0,
+          sleep_seconds: 3.0,
+          cancel_stale: true,
+          apply: true,
+          reset_state: false,
+          state_path: "output/xautusdt_loop_state.json",
+          plan_json: "output/xautusdt_loop_latest_plan.json",
+          submit_report_json: "output/xautusdt_loop_latest_submit.json",
+          summary_jsonl: "output/xautusdt_loop_events.jsonl",
+        },
+      },
+      {
         key: "volume_short_v1",
         label: "量优先做空 v1",
         description: "偏空滚动微网格。结构上镜像量优先做多 v4，适合 OPN 这类偏弱下跌窗口，优先在反抽中开空、在回落中回补。",
@@ -8726,7 +12662,7 @@ MONITOR_PAGE = """<!doctype html>
       {
         key: "night_volume_short_v1",
         label: "NIGHT 专用做空高换手",
-        description: "针对 NIGHTUSDT 的低价高换手做空预设。收紧中心迁移触发与轮询周期，让第一笔卖空和第一笔买回更靠近，优先提升来回成交密度。",
+        description: "针对 NIGHTUSDT 的低价高换手做空预设。仍保留更快轮询和更近的首笔往返，但降低单笔、底仓和总空仓上限，并在急跌放量时暂停追着买回。",
         startable: true,
         kind: "one_way",
         config: {
@@ -8734,23 +12670,24 @@ MONITOR_PAGE = """<!doctype html>
           step_price: 0.00002,
           buy_levels: 8,
           sell_levels: 8,
-          per_order_notional: 70.0,
-          base_position_notional: 420.0,
-          up_trigger_steps: 2,
-          down_trigger_steps: 2,
+          per_order_notional: 45.0,
+          base_position_notional: 180.0,
+          up_trigger_steps: 4,
+          down_trigger_steps: 4,
           shift_steps: 2,
-          pause_short_position_notional: 900.0,
-          max_short_position_notional: 900.0,
-          inventory_tier_start_notional: 600.0,
-          inventory_tier_end_notional: 750.0,
-          inventory_tier_buy_levels: 12,
+          pause_short_position_notional: 450.0,
+          max_short_position_notional: 600.0,
+          inventory_tier_start_notional: 300.0,
+          inventory_tier_end_notional: 450.0,
+          inventory_tier_buy_levels: 10,
           inventory_tier_sell_levels: 4,
-          inventory_tier_per_order_notional: 70.0,
-          inventory_tier_base_position_notional: 280.0,
-          sleep_seconds: 5.0,
+          inventory_tier_per_order_notional: 45.0,
+          inventory_tier_base_position_notional: 90.0,
+          sleep_seconds: 10.0,
           autotune_symbol_enabled: false,
-          short_cover_pause_amp_trigger_ratio: 0.0055,
-          short_cover_pause_down_return_trigger_ratio: -0.0025,
+          short_cover_pause_amp_trigger_ratio: 0.004,
+          short_cover_pause_down_return_trigger_ratio: -0.0018,
+          freeze_shift_abs_return_trigger_ratio: 0.0045,
         },
       },
       {
@@ -8778,6 +12715,35 @@ MONITOR_PAGE = """<!doctype html>
           inventory_tier_base_position_notional: 90.0,
           short_cover_pause_amp_trigger_ratio: 0.0045,
           short_cover_pause_down_return_trigger_ratio: -0.002,
+        },
+      },
+      {
+        key: "xaut_volume_short_v1",
+        label: "XAUT 专用做空高换手",
+        description: "面向 XAUTUSDT 的高换手空头预设。维持 1000 USDT 空仓上限，收紧动态步长到现价约 0.017%，优先把小时成交额顶到 1 万附近。",
+        startable: true,
+        kind: "one_way",
+        symbol: "XAUTUSDT",
+        config: {
+          strategy_mode: "one_way_short",
+          step_price: 0.00002,
+          buy_levels: 10,
+          sell_levels: 10,
+          per_order_notional: 100.0,
+          base_position_notional: 240.0,
+          up_trigger_steps: 2,
+          down_trigger_steps: 3,
+          shift_steps: 2,
+          pause_short_position_notional: 850.0,
+          max_short_position_notional: 1000.0,
+          inventory_tier_start_notional: 650.0,
+          inventory_tier_end_notional: 850.0,
+          inventory_tier_buy_levels: 14,
+          inventory_tier_sell_levels: 6,
+          inventory_tier_per_order_notional: 100.0,
+          inventory_tier_base_position_notional: 150.0,
+          sleep_seconds: 5.0,
+          autotune_symbol_enabled: true,
         },
       },
       {
@@ -8849,6 +12815,84 @@ MONITOR_PAGE = """<!doctype html>
         },
       },
       {
+        key: "based_competition_neutral_v1",
+        label: "合约竞赛库存网格",
+        description: "BASEDUSDT 专用的偏空中性交易赛预设。按目标净仓曲线运行，但净空上限高于净多上限，适合高波动、宽震荡、整体偏弱的刷量窗口。",
+        startable: true,
+        kind: "target_neutral",
+        symbol: "BASEDUSDT",
+        config: {
+          symbol: "BASEDUSDT",
+          strategy_mode: "inventory_target_neutral",
+          buy_levels: 3,
+          sell_levels: 3,
+          per_order_notional: 45.0,
+          base_position_notional: 0.0,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 360.0,
+          pause_short_position_notional: 540.0,
+          max_position_notional: 360.0,
+          max_short_position_notional: 540.0,
+          max_total_notional: 900.0,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          neutral_center_interval_minutes: 3,
+          neutral_band1_offset_ratio: 0.009,
+          neutral_band2_offset_ratio: 0.018,
+          neutral_band3_offset_ratio: 0.036,
+          neutral_band1_target_ratio: 0.20,
+          neutral_band2_target_ratio: 0.50,
+          neutral_band3_target_ratio: 1.00,
+          neutral_hourly_scale_enabled: true,
+          neutral_hourly_scale_stable: 1.0,
+          neutral_hourly_scale_transition: 0.85,
+          neutral_hourly_scale_defensive: 0.65,
+          autotune_symbol_enabled: false,
+        },
+      },
+      {
+        key: "based_competition_neutral_aggressive_v1",
+        label: "合约竞赛库存网格（激进）",
+        description: "BASEDUSDT 专用的冲量中性交易赛预设。把目标净仓带收紧到 0.5% / 1.0% / 2.0%，同时显著抬高净仓与总名义上限，适合优先冲成交量的比赛窗口。",
+        startable: true,
+        kind: "target_neutral",
+        symbol: "BASEDUSDT",
+        config: {
+          symbol: "BASEDUSDT",
+          strategy_mode: "inventory_target_neutral",
+          buy_levels: 3,
+          sell_levels: 3,
+          per_order_notional: 60.0,
+          base_position_notional: 0.0,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 540.0,
+          pause_short_position_notional: 900.0,
+          max_position_notional: 540.0,
+          max_short_position_notional: 900.0,
+          max_total_notional: 1440.0,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          neutral_center_interval_minutes: 3,
+          neutral_band1_offset_ratio: 0.005,
+          neutral_band2_offset_ratio: 0.010,
+          neutral_band3_offset_ratio: 0.020,
+          neutral_band1_target_ratio: 0.30,
+          neutral_band2_target_ratio: 0.70,
+          neutral_band3_target_ratio: 1.00,
+          neutral_hourly_scale_enabled: true,
+          neutral_hourly_scale_stable: 1.0,
+          neutral_hourly_scale_transition: 0.85,
+          neutral_hourly_scale_defensive: 0.65,
+          autotune_symbol_enabled: false,
+        },
+      },
+      {
         key: "defensive_quasi_neutral_v1",
         label: "准中性降损",
         description: "单向兼容的降损预设。减少底仓和买侧权重，增加卖侧卸仓速度，适合量够后控损耗。",
@@ -8917,11 +12961,128 @@ MONITOR_PAGE = """<!doctype html>
           max_short_position_notional: 500,
         },
       },
+      {
+        key: "volume_neutral_push_v1",
+        label: "通用刷量V1",
+        description: "BASEDUSDT 专用固定双向刷量模板。零底仓、双边 8 档、3 格触发迁移中心，并把单笔和单边库存压到适合 BASED 当前盘口的范围。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "BASEDUSDT",
+        config: {
+          symbol: "BASEDUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 45,
+          base_position_notional: 0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 3,
+          down_trigger_steps: 3,
+          shift_steps: 1,
+          pause_buy_position_notional: 1000,
+          pause_short_position_notional: 1000,
+          max_position_notional: 1000,
+          max_short_position_notional: 1000,
+          max_total_notional: 2200,
+          max_new_orders: 40,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          short_cover_pause_amp_trigger_ratio: 0.004,
+          short_cover_pause_down_return_trigger_ratio: -0.0018,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          sleep_seconds: 3,
+          autotune_symbol_enabled: false,
+          adaptive_step_enabled: false,
+        },
+      },
+      {
+        key: "volume_neutral_push_guarded_v1",
+        label: "中性冲量护栏 v1",
+        description: "在通用中性冲量上追加更强护栏。保留高换手结构，但更早停双边新增，并加入净暴露与 synthetic drift 停机线。",
+        startable: true,
+        kind: "synthetic",
+        config: {
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0001,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 100,
+          base_position_notional: 0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 1200,
+          pause_short_position_notional: 1200,
+          max_position_notional: 1600,
+          max_short_position_notional: 1600,
+          max_total_notional: 2400,
+          max_new_orders: 32,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          market_bias_enabled: true,
+          market_bias_max_shift_steps: 0.75,
+          market_bias_signal_steps: 2,
+          market_bias_drift_weight: 0.65,
+          market_bias_return_weight: 0.35,
+          market_bias_weak_buy_pause_enabled: true,
+          market_bias_weak_buy_pause_threshold: 0.15,
+          market_bias_strong_short_pause_enabled: true,
+          market_bias_strong_short_pause_threshold: 0.15,
+          rolling_hourly_loss_limit: 25,
+          max_cumulative_notional: 150000,
+          max_actual_net_notional: 900,
+          max_synthetic_drift_notional: 250,
+          sleep_seconds: 3,
+          autotune_symbol_enabled: true,
+        },
+      },
+      {
+        key: "volume_neutral_ping_pong_v1",
+        label: "量优先中性 v1",
+        description: "零底仓启动的单向合成中性。启动时买一/卖一放大，后续用更小的反手单回转；弱市切到做空、强市切到做多、震荡时回到中性 ping-pong。",
+        startable: true,
+        kind: "synthetic",
+        config: {
+          strategy_mode: "synthetic_neutral",
+          buy_levels: 4,
+          sell_levels: 4,
+          per_order_notional: 45,
+          startup_entry_multiplier: 4,
+          base_position_notional: 0,
+          up_trigger_steps: 2,
+          down_trigger_steps: 2,
+          shift_steps: 1,
+          pause_buy_position_notional: 500,
+          pause_short_position_notional: 500,
+          max_position_notional: 600,
+          max_short_position_notional: 600,
+          market_bias_enabled: true,
+          market_bias_max_shift_steps: 0.75,
+          market_bias_signal_steps: 2,
+          market_bias_drift_weight: 0.65,
+          market_bias_return_weight: 0.35,
+          market_bias_weak_buy_pause_enabled: true,
+          market_bias_weak_buy_pause_threshold: 0.15,
+          market_bias_strong_short_pause_enabled: true,
+          market_bias_strong_short_pause_threshold: 0.15,
+          market_bias_regime_switch_enabled: true,
+          market_bias_regime_switch_confirm_cycles: 2,
+          market_bias_regime_switch_weak_threshold: 0.15,
+          market_bias_regime_switch_strong_threshold: 0.15,
+          sleep_seconds: 5,
+        },
+      },
     ];
 
     let timer = null;
     let paused = false;
     let latestMonitorData = null;
+    let monitorLoadPromise = null;
     let strategyActionPending = false;
     let runnerPresets = [];
     let presetsLoaded = false;
@@ -8936,6 +13097,7 @@ MONITOR_PAGE = """<!doctype html>
       buy_levels: "买单层数。层数越多，向下承接更深，但资金占用也更高。",
       sell_levels: "卖单层数。层数越多，向上卸仓或开空覆盖更广。",
       per_order_notional: "每笔挂单的目标名义金额（U）。直接决定单笔成交额大小。",
+      startup_entry_multiplier: "启动首轮放大倍数。仅在首轮零持仓时把买一/卖一放大成常规单的倍数，后续恢复普通单量。",
       base_position_notional: "基础持仓目标名义。做多会优先建立底仓，做空则对应基础空仓。",
       center_price: "固定中心价；为空时由运行时根据中价和偏移逻辑动态计算。",
       fixed_center_enabled: "是否启用固定中心价。开启后不会按常规触发逻辑自动迁移中心。",
@@ -8949,6 +13111,8 @@ MONITOR_PAGE = """<!doctype html>
       pause_short_position_notional: "做空模式下达到该空仓名义后暂停继续开空。",
       max_position_notional: "做多模式总持仓上限。",
       max_short_position_notional: "做空模式总空仓上限。",
+      static_buy_offset_steps: "静态买单偏移步数。用于在研究版近价策略里给买单离买一保留一点安全距离。",
+      static_sell_offset_steps: "静态卖单偏移步数。用于在研究版近价策略里给卖单离卖一保留一点安全距离。",
       buy_pause_amp_trigger_ratio: "短时间振幅过大时，暂停做多开仓的阈值。",
       buy_pause_down_return_trigger_ratio: "短时间跌幅过大时，暂停做多开仓的阈值。",
       freeze_shift_abs_return_trigger_ratio: "短时波动过大时冻结中心位移，避免不停追价。",
@@ -8988,6 +13152,25 @@ MONITOR_PAGE = """<!doctype html>
       max_new_orders: "单轮最多新增多少笔挂单。",
       max_total_notional: "单轮新增挂单总名义上限。",
       sleep_seconds: "循环轮询周期。越小越跟价，但撤改单更频繁。",
+      run_start_time: "允许开始交易的时间。未到时间前会停止交易、撤策略单并进入清仓逻辑。",
+      run_end_time: "允许结束交易的时间。超过时间后会停止交易、撤策略单并进入清仓逻辑。",
+      runtime_guard_stats_start_time: "风控统计起点。累计成交额和滚动亏损只会统计这个时间之后的审计数据；留空时比赛币会尽量跟随当前赛段起点。",
+      rolling_hourly_loss_limit: "最近 60 分钟滚动亏损阈值。达到后会自动停机、撤单并清仓。",
+      max_cumulative_notional: "累计成交额阈值。达到后会自动停机、撤单并清仓。",
+      max_actual_net_notional: "实际净敞口绝对值阈值。达到后会自动停机、撤单并清仓。",
+      max_synthetic_drift_notional: "synthetic 虚拟净仓和实际净仓偏差折算成名义金额后的阈值。达到后会自动停机、撤单并清仓。",
+      volume_trigger_enabled: "是否启用按市场成交额自动启动/停止策略的后台巡检。",
+      volume_trigger_window: "量能观察窗口。当前按 Binance 合约 1 分钟 K 线的 quote volume 汇总。",
+      volume_trigger_start_threshold: "最近窗口市场成交额达到这个阈值后，后台会自动启动策略。",
+      volume_trigger_stop_threshold: "最近窗口市场成交额低于这个阈值后，后台会自动停止策略。",
+      volume_trigger_stop_cancel_open_orders: "自动停机时是否先撤销当前交易对全部未成交委托。",
+      volume_trigger_stop_close_all_positions: "自动停机时是否继续启动 maker 跟价平仓，直到仓位归零。",
+      volatility_trigger_enabled: "是否启用按最近窗口振幅和绝对涨跌自动暂停/恢复策略的后台巡检。",
+      volatility_trigger_window: "波动观察窗口。按 Binance 合约 1 分钟 K 线聚合整窗的开高低收后计算振幅和涨跌。",
+      volatility_trigger_amplitude_ratio: "最近窗口振幅阈值。整窗最高价 / 最低价 - 1 达到这个值后会自动暂停。",
+      volatility_trigger_abs_return_ratio: "最近窗口绝对涨跌阈值。整窗收盘 / 开盘 - 1 的绝对值达到这个值后会自动暂停。",
+      volatility_trigger_stop_cancel_open_orders: "高波动自动暂停时是否先撤销当前交易对全部未成交委托。",
+      volatility_trigger_stop_close_all_positions: "高波动自动暂停时是否继续启动 maker 跟价平仓，直到仓位归零。",
       cancel_stale: "是否撤掉与当前目标计划不一致的旧单。",
       apply: "是否真实下单。关闭时仅做 dry-run。",
       reset_state: "启动时是否重置本地状态文件。",
@@ -9001,6 +13184,86 @@ MONITOR_PAGE = """<!doctype html>
       custom_grid_roll_trade_threshold: "自上次成功下移后，至少累计多少笔成交才允许再次触发。",
       custom_grid_roll_upper_distance_ratio: "当前价格距上沿还剩多少比例的梯子层数时，才允许触发下移。",
       custom_grid_roll_shift_levels: "每次触发时整个静态梯子向下移动多少层。"
+    };
+    const ALERT_PARAM_KEYS = {
+      margin_insufficient: [
+        "base_position_notional",
+        "per_order_notional",
+        "buy_levels",
+        "sell_levels",
+        "pause_buy_position_notional",
+        "pause_short_position_notional",
+        "max_position_notional",
+        "max_short_position_notional",
+        "max_new_orders",
+      ],
+      rate_limited: [
+        "sleep_seconds",
+        "max_new_orders",
+        "maker_retries",
+      ],
+      post_only_rejected: [
+        "step_price",
+        "maker_retries",
+        "sleep_seconds",
+      ],
+      validation_failed: [
+        "strategy_mode",
+        "margin_type",
+        "leverage",
+      ],
+      buy_paused: [
+        "buy_levels",
+        "per_order_notional",
+        "base_position_notional",
+        "pause_buy_position_notional",
+        "inventory_tier_buy_levels",
+        "inventory_tier_per_order_notional",
+        "excess_inventory_reduce_only_enabled",
+      ],
+      short_paused: [
+        "sell_levels",
+        "per_order_notional",
+        "base_position_notional",
+        "pause_short_position_notional",
+        "inventory_tier_sell_levels",
+        "inventory_tier_per_order_notional",
+        "excess_inventory_reduce_only_enabled",
+      ],
+      buy_cap_applied: [
+        "buy_levels",
+        "per_order_notional",
+        "max_position_notional",
+        "max_new_orders",
+      ],
+      short_cap_applied: [
+        "sell_levels",
+        "per_order_notional",
+        "max_short_position_notional",
+        "max_new_orders",
+      ],
+      volatility_buy_pause: [
+        "buy_pause_amp_trigger_ratio",
+        "buy_pause_down_return_trigger_ratio",
+        "sleep_seconds",
+      ],
+      shift_frozen: [
+        "freeze_shift_abs_return_trigger_ratio",
+        "up_trigger_steps",
+        "down_trigger_steps",
+        "shift_steps",
+      ],
+    };
+    const ALERT_SUGGESTION_LABELS = {
+      margin_insufficient: "保证金不足",
+      rate_limited: "频率超限",
+      post_only_rejected: "Post only 拒单",
+      buy_paused: "停买",
+      short_paused: "停空",
+      buy_cap_applied: "多仓硬上限裁剪",
+      short_cap_applied: "空仓硬上限裁剪",
+      volatility_buy_pause: "分钟级停买",
+      shift_frozen: "冻结中心迁移",
     };
 
     async function loadMonitorSymbols(preferredSymbol = "") {
@@ -9042,6 +13305,24 @@ MONITOR_PAGE = """<!doctype html>
       return sign + fmtNum(num, 4);
     }
 
+    function fmtWanVolume(v) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      const num = Number(v);
+      const wan = num / 10000;
+      if (Math.abs(wan) >= 100) return `${wan.toFixed(0)}万`;
+      if (Math.abs(wan) >= 10) return `${wan.toFixed(1)}万`;
+      return `${wan.toFixed(2)}万`;
+    }
+
+    function formatVolumeTriggerWindowLabel(windowKey) {
+      const normalized = String(windowKey || "1h").trim().toLowerCase();
+      if (normalized === "15m") return "15 分钟";
+      if (normalized === "30m") return "30 分钟";
+      if (normalized === "4h") return "4 小时";
+      if (normalized === "24h") return "24 小时";
+      return "1 小时";
+    }
+
     function formatStartupInventory(summary, quantityDigits = 4, notionalDigits = 4) {
       const direction = String(summary.strategy_direction || "");
       const longQty = Number(summary.startup_long_qty || 0);
@@ -9066,6 +13347,11 @@ MONITOR_PAGE = """<!doctype html>
     function getSelectedCustomPreset() {
       const preset = getPresetByKey(strategyPresetEl.value || "");
       return preset && preset.custom ? preset : null;
+    }
+
+    async function readJsonResponse(resp) {
+      const raw = await resp.text();
+      return raw ? JSON.parse(raw) : {};
     }
 
     function normalizeRunnerEditorConfig(rawConfig, strategyProfile = "") {
@@ -9131,6 +13417,253 @@ MONITOR_PAGE = """<!doctype html>
       return data;
     }
 
+    function alertParamKeys(code) {
+      const normalizedCode = String(code || "").trim();
+      return (ALERT_PARAM_KEYS[normalizedCode] || []).slice();
+    }
+
+    function alertSupportsSuggestion(code) {
+      return Boolean(ALERT_SUGGESTION_LABELS[String(code || "").trim()]);
+    }
+
+    function formatAlertCodeLabel(code) {
+      return ALERT_SUGGESTION_LABELS[String(code || "").trim()] || String(code || "当前告警");
+    }
+
+    function scaleNumber(value, ratio, digits = 4, minValue = null) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return value;
+      const scaled = num * ratio;
+      const clamped = minValue === null ? scaled : Math.max(minValue, scaled);
+      return Number(clamped.toFixed(digits));
+    }
+
+    function reduceInteger(value, delta, minValue = 1) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return value;
+      return Math.max(minValue, Math.round(num - delta));
+    }
+
+    function readRunnerEditorConfigFromTextarea() {
+      const payload = JSON.parse(runnerParamsEditorEl.value || "{}");
+      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+        throw new Error("参数编辑器内容必须是 JSON 对象。");
+      }
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      return normalizeRunnerRuntimePaths(payload, selectedSymbol);
+    }
+
+    function readRuntimeGuardConfigFromInputs() {
+      return {
+        run_start_time: fromLocalInputValue(monitorRunStartTimeEl.value),
+        run_end_time: fromLocalInputValue(monitorRunEndTimeEl.value),
+        runtime_guard_stats_start_time: fromLocalInputValue(monitorRuntimeGuardStatsStartTimeEl.value),
+        rolling_hourly_loss_limit: monitorRollingHourlyLossLimitEl.value ? Number(monitorRollingHourlyLossLimitEl.value) : null,
+        max_cumulative_notional: monitorMaxCumulativeNotionalEl.value ? Number(monitorMaxCumulativeNotionalEl.value) : null,
+        volume_trigger_enabled: Boolean(monitorVolumeTriggerEnabledEl && monitorVolumeTriggerEnabledEl.checked),
+        volume_trigger_window: monitorVolumeTriggerWindowEl ? String(monitorVolumeTriggerWindowEl.value || "1h") : "1h",
+        volume_trigger_start_threshold: monitorVolumeTriggerStartThresholdEl && monitorVolumeTriggerStartThresholdEl.value
+          ? Number(monitorVolumeTriggerStartThresholdEl.value)
+          : null,
+        volume_trigger_stop_threshold: monitorVolumeTriggerStopThresholdEl && monitorVolumeTriggerStopThresholdEl.value
+          ? Number(monitorVolumeTriggerStopThresholdEl.value)
+          : null,
+        volume_trigger_stop_cancel_open_orders: Boolean(
+          monitorVolumeTriggerStopCancelOrdersEl && monitorVolumeTriggerStopCancelOrdersEl.checked
+        ),
+        volume_trigger_stop_close_all_positions: Boolean(
+          monitorVolumeTriggerStopClosePositionsEl && monitorVolumeTriggerStopClosePositionsEl.checked
+        ),
+        volatility_trigger_enabled: Boolean(monitorVolatilityTriggerEnabledEl && monitorVolatilityTriggerEnabledEl.checked),
+        volatility_trigger_window: monitorVolatilityTriggerWindowEl ? String(monitorVolatilityTriggerWindowEl.value || "1h") : "1h",
+        volatility_trigger_amplitude_ratio: monitorVolatilityTriggerAmplitudeRatioEl && monitorVolatilityTriggerAmplitudeRatioEl.value
+          ? Number(monitorVolatilityTriggerAmplitudeRatioEl.value)
+          : null,
+        volatility_trigger_abs_return_ratio: monitorVolatilityTriggerAbsReturnRatioEl && monitorVolatilityTriggerAbsReturnRatioEl.value
+          ? Number(monitorVolatilityTriggerAbsReturnRatioEl.value)
+          : null,
+        volatility_trigger_stop_cancel_open_orders: Boolean(
+          monitorVolatilityTriggerStopCancelOrdersEl && monitorVolatilityTriggerStopCancelOrdersEl.checked
+        ),
+        volatility_trigger_stop_close_all_positions: Boolean(
+          monitorVolatilityTriggerStopClosePositionsEl && monitorVolatilityTriggerStopClosePositionsEl.checked
+        ),
+      };
+    }
+
+    function syncRuntimeGuardInputsFromConfig(config) {
+      const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
+      monitorRunStartTimeEl.value = toLocalInputValue(source.run_start_time);
+      monitorRunEndTimeEl.value = toLocalInputValue(source.run_end_time);
+      monitorRuntimeGuardStatsStartTimeEl.value = toLocalInputValue(source.runtime_guard_stats_start_time);
+      monitorRollingHourlyLossLimitEl.value = source.rolling_hourly_loss_limit ?? "";
+      monitorMaxCumulativeNotionalEl.value = source.max_cumulative_notional ?? "";
+      monitorVolumeTriggerEnabledEl.checked = Boolean(source.volume_trigger_enabled);
+      monitorVolumeTriggerWindowEl.value = source.volume_trigger_window || "1h";
+      monitorVolumeTriggerStartThresholdEl.value = source.volume_trigger_start_threshold ?? "";
+      monitorVolumeTriggerStopThresholdEl.value = source.volume_trigger_stop_threshold ?? "";
+      monitorVolumeTriggerStopCancelOrdersEl.checked = Boolean(source.volume_trigger_stop_cancel_open_orders);
+      monitorVolumeTriggerStopClosePositionsEl.checked = Boolean(source.volume_trigger_stop_close_all_positions);
+      monitorVolatilityTriggerEnabledEl.checked = Boolean(source.volatility_trigger_enabled);
+      monitorVolatilityTriggerWindowEl.value = source.volatility_trigger_window || "1h";
+      monitorVolatilityTriggerAmplitudeRatioEl.value = source.volatility_trigger_amplitude_ratio ?? "";
+      monitorVolatilityTriggerAbsReturnRatioEl.value = source.volatility_trigger_abs_return_ratio ?? "";
+      monitorVolatilityTriggerStopCancelOrdersEl.checked = Boolean(source.volatility_trigger_stop_cancel_open_orders);
+      monitorVolatilityTriggerStopClosePositionsEl.checked = Boolean(source.volatility_trigger_stop_close_all_positions);
+    }
+
+    function mergeRuntimeGuardConfig(payload) {
+      const source = (payload && typeof payload === "object" && !Array.isArray(payload)) ? payload : {};
+      return {
+        ...source,
+        ...readRuntimeGuardConfigFromInputs(),
+      };
+    }
+
+    function syncRuntimeGuardInputsToEditor() {
+      let payload = latestRunnerEditorConfig ? { ...latestRunnerEditorConfig } : {};
+      try {
+        payload = readRunnerEditorConfigFromTextarea();
+      } catch (_err) {
+      }
+      const nextConfig = normalizeRunnerRuntimePaths(
+        mergeRuntimeGuardConfig(payload),
+        symbolEl.value.trim().toUpperCase() || "NIGHTUSDT"
+      );
+      latestRunnerEditorConfig = nextConfig;
+      runnerParamsEditorEl.value = JSON.stringify(nextConfig, null, 2);
+      renderRunnerParamGuide(nextConfig);
+      runnerParamsMetaEl.textContent = "运行保护、量能自动启停和波动自动暂停参数已同步到 JSON，可继续修改后保存或应用。";
+    }
+
+    async function ensureEditorConfigForAlert() {
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      try {
+        const payload = readRunnerEditorConfigFromTextarea();
+        const configSymbol = String(payload.symbol || "").trim().toUpperCase();
+        if (!configSymbol || configSymbol === selectedSymbol) {
+          latestRunnerEditorConfig = payload;
+          return payload;
+        }
+      } catch (_err) {
+      }
+      await loadRunningConfigToEditor(true);
+      return readRunnerEditorConfigFromTextarea();
+    }
+
+    function focusRunnerEditorOnKey(key) {
+      if (!key) return false;
+      const marker = `"${String(key)}"`;
+      const text = runnerParamsEditorEl.value || "";
+      const idx = text.indexOf(marker);
+      runnerParamsEditorEl.focus();
+      if (idx < 0) return false;
+      runnerParamsEditorEl.setSelectionRange(idx, idx + marker.length);
+      const linesBefore = text.slice(0, idx).split("\\n").length - 1;
+      runnerParamsEditorEl.scrollTop = Math.max(0, (linesBefore - 2) * 24);
+      return true;
+    }
+
+    async function locateAlertParams(code) {
+      const keys = alertParamKeys(code);
+      if (!keys.length) {
+        runnerParamsMetaEl.textContent = `告警“${formatAlertCodeLabel(code)}”更偏运行环境或账户状态，没有直接对应的参数可定位。`;
+        return;
+      }
+      const config = await ensureEditorConfigForAlert();
+      const primaryKey = keys.find((key) => Object.prototype.hasOwnProperty.call(config, key)) || keys[0];
+      const located = focusRunnerEditorOnKey(primaryKey);
+      runnerParamsMetaEl.textContent = `已定位“${formatAlertCodeLabel(code)}”相关参数：${keys.join("、")}${located ? "" : "（当前 JSON 里未显式写出首个参数，但建议优先检查它）"}。`;
+      renderRunnerParamGuide(config);
+    }
+
+    function buildAlertSuggestion(code, currentConfig) {
+      const normalizedCode = String(code || "").trim();
+      const nextConfig = JSON.parse(JSON.stringify(currentConfig || {}));
+      const changedKeys = [];
+      const applyChange = (key, value) => {
+        if (value === undefined) return;
+        if (nextConfig[key] === value) return;
+        nextConfig[key] = value;
+        changedKeys.push(key);
+      };
+      if (normalizedCode === "margin_insufficient") {
+        applyChange("autotune_symbol_enabled", false);
+        applyChange("base_position_notional", scaleNumber(nextConfig.base_position_notional, 0.75, 4, 20));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.8, 4, 5));
+        applyChange("buy_levels", reduceInteger(nextConfig.buy_levels, 2, 2));
+        applyChange("sell_levels", reduceInteger(nextConfig.sell_levels, 1, 2));
+        applyChange("pause_buy_position_notional", scaleNumber(nextConfig.pause_buy_position_notional, 0.82, 4, 50));
+        applyChange("pause_short_position_notional", scaleNumber(nextConfig.pause_short_position_notional, 0.82, 4, 50));
+        applyChange("max_position_notional", scaleNumber(nextConfig.max_position_notional, 0.82, 4, 80));
+        applyChange("max_short_position_notional", scaleNumber(nextConfig.max_short_position_notional, 0.82, 4, 80));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 4, 4));
+      } else if (normalizedCode === "rate_limited") {
+        applyChange("sleep_seconds", Math.max(10, Math.round(Number(nextConfig.sleep_seconds || 5) + 3)));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 4, 4));
+        applyChange("maker_retries", reduceInteger(nextConfig.maker_retries, 1, 1));
+      } else if (normalizedCode === "post_only_rejected") {
+        applyChange("step_price", scaleNumber(nextConfig.step_price, 1.5, 7, 0.0000001));
+        applyChange("maker_retries", reduceInteger(nextConfig.maker_retries, 1, 1));
+        applyChange("sleep_seconds", Math.max(6, Math.round(Number(nextConfig.sleep_seconds || 5))));
+      } else if (normalizedCode === "buy_paused") {
+        applyChange("autotune_symbol_enabled", false);
+        applyChange("buy_levels", reduceInteger(nextConfig.buy_levels, 2, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.88, 4, 5));
+        applyChange("base_position_notional", scaleNumber(nextConfig.base_position_notional, 0.9, 4, 20));
+        applyChange("inventory_tier_buy_levels", reduceInteger(nextConfig.inventory_tier_buy_levels, 1, 1));
+        applyChange("inventory_tier_per_order_notional", scaleNumber(nextConfig.inventory_tier_per_order_notional, 0.88, 4, 5));
+        applyChange("excess_inventory_reduce_only_enabled", true);
+      } else if (normalizedCode === "short_paused") {
+        applyChange("autotune_symbol_enabled", false);
+        applyChange("sell_levels", reduceInteger(nextConfig.sell_levels, 2, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.88, 4, 5));
+        applyChange("base_position_notional", scaleNumber(nextConfig.base_position_notional, 0.9, 4, 20));
+        applyChange("inventory_tier_sell_levels", reduceInteger(nextConfig.inventory_tier_sell_levels, 2, 2));
+        applyChange("inventory_tier_per_order_notional", scaleNumber(nextConfig.inventory_tier_per_order_notional, 0.88, 4, 5));
+        applyChange("excess_inventory_reduce_only_enabled", true);
+      } else if (normalizedCode === "buy_cap_applied") {
+        applyChange("buy_levels", reduceInteger(nextConfig.buy_levels, 1, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.92, 4, 5));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 2, 4));
+      } else if (normalizedCode === "short_cap_applied") {
+        applyChange("sell_levels", reduceInteger(nextConfig.sell_levels, 1, 2));
+        applyChange("per_order_notional", scaleNumber(nextConfig.per_order_notional, 0.92, 4, 5));
+        applyChange("max_new_orders", reduceInteger(nextConfig.max_new_orders, 2, 4));
+      } else if (normalizedCode === "volatility_buy_pause") {
+        applyChange("buy_pause_amp_trigger_ratio", scaleNumber(nextConfig.buy_pause_amp_trigger_ratio, 1.15, 6, 0.0001));
+        const downReturn = Number(nextConfig.buy_pause_down_return_trigger_ratio);
+        if (Number.isFinite(downReturn) && downReturn < 0) {
+          applyChange("buy_pause_down_return_trigger_ratio", Number((downReturn * 1.15).toFixed(6)));
+        }
+        applyChange("sleep_seconds", Math.max(6, Math.round(Number(nextConfig.sleep_seconds || 5) + 1)));
+      } else if (normalizedCode === "shift_frozen") {
+        applyChange("freeze_shift_abs_return_trigger_ratio", scaleNumber(nextConfig.freeze_shift_abs_return_trigger_ratio, 1.15, 6, 0.0001));
+        applyChange("shift_steps", Math.max(1, Math.round(Number(nextConfig.shift_steps || 1))));
+      } else {
+        return null;
+      }
+      return { config: normalizeRunnerRuntimePaths(nextConfig, nextConfig.symbol || symbolEl.value), changedKeys };
+    }
+
+    async function applyAlertSuggestion(code) {
+      if (!alertSupportsSuggestion(code)) {
+        runnerParamsMetaEl.textContent = `告警“${formatAlertCodeLabel(code)}”暂时没有安全的通用建议参数，请先手动检查当前配置。`;
+        return;
+      }
+      const config = await ensureEditorConfigForAlert();
+      const suggestion = buildAlertSuggestion(code, config);
+      if (!suggestion || !suggestion.changedKeys.length) {
+        runnerParamsMetaEl.textContent = `告警“${formatAlertCodeLabel(code)}”当前没有可自动生成的建议参数。`;
+        return;
+      }
+      setRunnerEditorConfig(
+        suggestion.config,
+        `已按“${formatAlertCodeLabel(code)}”生成建议参数：${suggestion.changedKeys.join("、")}。请检查后再点“应用参数并启动”。`
+      );
+      focusRunnerEditorOnKey(suggestion.changedKeys[0]);
+    }
+
     const RUNNER_PROFILE_GUIDE_NOTES = {
       volume_long_v4: {
         summary: "偏多滚动微网格，目标是让盘口附近不断有承接买单和减仓卖单，优先把成交密度做高。",
@@ -9151,6 +13684,73 @@ MONITOR_PAGE = """<!doctype html>
           "当 15m/60m 振幅或跌幅触发防守条件时，会连续确认后切换到防守档；稳定后再切回量优先档。",
         ],
       },
+      bard_volume_long_v2: {
+        summary: "BARDUSDT 的量优先做多 v2。核心不是简单把底仓调轻，而是把启动阶段拆成 flat-start 和 warm-start 两层保护。",
+        focus: [
+          "如果账户里还有反向仓位或遗留挂单，启动会直接拒绝，不再把旧状态硬吞进新策略。",
+          "如果启动时已经有同向多仓，首轮会先禁掉 bootstrap，只让网格顺着现有库存继续运转。",
+        ],
+      },
+      bard_12h_push_neutral_v2: {
+        summary: "BARDUSDT 的双向冲量 v2。固定细步长、双边 8 档、零底仓，目标是把高成交窗口里的双边回转密度堆高。",
+        focus: [
+          "这套关闭了 autotune 和 reduce_only 护栏，适合短时冲量，不适合长期常开。",
+        ],
+      },
+      based_volume_long_trigger_v1: {
+        summary: "参考 BARD 放量窗口思路做的 BASED 顺势做多版。默认只在最近 15 分钟市场成交额抬升后自动启动，量能回落就撤单并清仓。",
+        focus: [
+          "和 BARD 相比，这套把步长放宽、底仓和单笔都压低，用更小的库存去承受 BASED 更宽的点差和更大的短线振幅。",
+        ],
+      },
+      based_volume_push_bard_v1: {
+        summary: "通用的双向冲量自适应模板。先按当前币种的价位、tick 和点差自动估一个能工作的基础步长，再用 adaptive step 在急波动和持续单边时把继续接仓速度压下去。",
+        focus: [
+          "这套更适合成交明显抬升时段的 burst 型短开；它不是固定参数集，换币后建议先看 autotune 出来的基础步长和单笔名义是否符合该币的盘口密度。",
+        ],
+      },
+      xaut_long_adaptive_v1: {
+        summary: "XAUT 专用三态做多。除了 normal / defensive 外，还会按 15m/60m 振幅连续缩放 step_price；极端下跌或扩振时进入 reduce_only，立即撤买单，只保留卖单减仓。",
+        focus: [
+          "这套只允许在 XAUTUSDT 上使用，目的是在平静时把挂单贴近一点、在扩振时把继续接仓速度压低。",
+        ],
+      },
+      xaut_short_adaptive_v1: {
+        summary: "XAUT 专用三态做空。除了 normal / defensive 外，还会按 15m/60m 振幅连续缩放 step_price；极端上冲或扩振时进入 reduce_only，立即撤卖单，只保留买单回补减空仓。",
+        focus: [
+          "结构上镜像 xaut_long_adaptive_v1，但风险触发方向反过来。",
+        ],
+      },
+      xaut_guarded_ping_pong_v1: {
+        summary: "XAUTUSDT 的轻库存护栏回转。零底仓、单边 1x1、费率感知固定步长；急速单边时只保留顺风挂单，成交后延迟反向回补。",
+        focus: [
+          "和通用 ping-pong 相比，这套把单边仓位、净敞口和 synthetic drift 的上限都压得更低，更适合 XAUT 这类低波动、高价格品种。",
+          "这套仍然不是无风险中性策略；如果出现连续单边，核心动作是停新增、追求回到空仓，而不是继续堆双边挂单。",
+          "新增的急速单边门槛同时看最近闭合 1m 和 3m 的方向、振幅和单边性，只有条件同时满足才会切到顺风单模式。",
+        ],
+      },
+      xaut_near_price_guarded_v1: {
+        summary: "XAUTUSDT 的研究版近价护栏回转。零底仓、默认离现价外约 1 tick 开始挂，波动放大时会自动加宽报价并更早停新增。",
+        focus: [
+          "它不是严格买一卖一，而是给一级单留出很小的安全距离，目标是在尽量贴近现价和控制手续费磨损之间找平衡。",
+          "这套默认关闭 market bias 位移，避免 center 漂移把一级单继续推离现价；真正的加宽主要交给 adaptive step 和波动护栏。",
+          "如果出现连续单边，优先动作仍然是停新增、延迟反手、回到空仓，而不是硬追当前盘口。",
+        ],
+      },
+      xaut_volume_guarded_bard_v3: {
+        summary: "XAUTUSDT 的固定节奏双向冲量 v3。保持 v2 的 synthetic_neutral 结构，但把单笔、首轮启动仓和挂单层数一并放大，用更高的双边换手去追成交额。",
+        focus: [
+          "这套不是降损版，而是明确把风险预算往成交额倾斜；仓位阈值和总挂单容量都随之抬高。",
+          "step_price 仍固定 1 美元，不走 autotune 或 adaptive step，目标是保持成交节奏稳定、便于实盘复盘比较。",
+        ],
+      },
+      xaut_volume_guarded_bard_v3_1: {
+        summary: "XAUTUSDT 的压损版冲量 v3.1。在 v3 的基础上把固定步长抬到 1.25，并收缩启动仓和基础底仓，目标是少牺牲一点量去换更好的单位损耗。",
+        focus: [
+          "核心变化只有三处：step_price 1.25、startup_entry_multiplier 2、base_position_notional 80，其余结构和 v3 保持一致，便于直接做 A/B 对比。",
+          "这套仍然是冲量策略，不是收益策略；它只是把每 1 万成交额对应的预期磨损往下压一档。",
+        ],
+      },
       volume_short_v1: {
         summary: "one_way_short 镜像网格。上方卖单负责开空，下方买单负责回补，适合弱势或冲高回落窗口。",
         focus: [
@@ -9164,15 +13764,21 @@ MONITOR_PAGE = """<!doctype html>
         ],
       },
       night_volume_short_v1: {
-        summary: "针对 NIGHTUSDT 的高换手做空版。核心是把第一笔卖空和第一笔买回压得更近，尽快做出往返成交。",
+        summary: "针对 NIGHTUSDT 的高换手做空版。仍然偏快，但比原先明显收了单笔、底仓和总空仓，并加入急跌停回补保护。",
         focus: [
-          "比通用空头版更快移中心、更快轮询，所以更适合低价、高成交密度的币种。",
+          "比通用空头版仍然更快移中心、更快轮询，但不会像之前那样一边放大仓位一边追着回补。",
         ],
       },
       volume_short_v1_conservative: {
         summary: "保守型做空网格。底仓和单笔更轻，上移中心更慢，先保证空头库存不要扩太快。",
         focus: [
           "适合先试空或高波动震荡段，不适合把量推到极限。",
+        ],
+      },
+      xaut_volume_short_v1: {
+        summary: "XAUTUSDT 的专用空头高换手方案。仍然是 one_way_short，但把空仓上限钉在 1000 USDT，并把自动步长压到更紧的 0.017%。",
+        focus: [
+          "目标是把小时成交额拉到 1 万附近，所以更依赖 XAUT 自身短周期波动；如果行情突然变钝，量会明显回落。",
         ],
       },
       defensive_quasi_neutral_aggressive_v1: {
@@ -9205,13 +13811,40 @@ MONITOR_PAGE = """<!doctype html>
           "优点是不需要切 hedge mode；代价是实际净仓和虚拟账本需要持续对齐。",
         ],
       },
+      volume_neutral_push_v1: {
+        summary: "给 BASEDUSDT 的固定双向刷量模板。零底仓、双边 8 档，但把单笔、单边上限和中心迁移节奏压到更适合 BASED 当前盘口的范围。",
+        focus: [
+          "这套关闭 autotune 和 adaptive step，启动时会按当前 JSON 原样执行；更适合你已经确认过参数、只想给 BASED 固定刷量时直接拉起。",
+        ],
+      },
+      volume_neutral_push_guarded_v1: {
+        summary: "通用中性冲量的护栏版。保留高换手结构，但更早停新增，并加上净敞口和 synthetic drift 的停机线。",
+        focus: [
+          "当实际净敞口或虚拟账本偏差扩大到阈值时，会直接撤单并转入清仓，比单纯缩单笔更像真正的风控护栏。",
+        ],
+      },
+      volume_neutral_ping_pong_v1: {
+        summary: "量优先的单向合成中性。不开底仓，启动先挂一对更大的近端买卖单；弱市切到做空、强市切到做多，震荡再回到中性回转。",
+        focus: [
+          "如果把 `startup_entry_multiplier` 设成 4，就相当于首轮大单成交后，用约四笔常规小单去拆回；再叠加 bias 三态换挡，就能少扛单边库存。",
+        ],
+      },
     };
     const AUTOTUNE_STEP_HINTS = {
       volume_long_v4: { stepRatio: 0.0004, minTicks: 2 },
       volatility_defensive_v1: { stepRatio: 0.0008, minTicks: 4 },
+      xaut_volume_short_v1: { stepRatio: 0.00017, minTicks: 2 },
       volume_neutral_target_v1: { stepRatio: 0.0006, minTicks: 3 },
       neutral_hedge_v1: { stepRatio: 0.0005, minTicks: 3 },
       synthetic_neutral_v1: { stepRatio: 0.0005, minTicks: 3 },
+      based_volume_push_bard_v1: { stepRatio: 0.00028, minTicks: 1 },
+      volume_neutral_push_v1: { stepRatio: 0.00028, minTicks: 1 },
+      volume_neutral_push_guarded_v1: { stepRatio: 0.00032, minTicks: 2 },
+      volume_neutral_ping_pong_v1: { stepRatio: 0.00035, minTicks: 2 },
+      xaut_guarded_ping_pong_v1: { stepRatio: 0.00048, minTicks: 180 },
+      xaut_near_price_guarded_v1: { stepRatio: 0.00012, minTicks: 1 },
+      xaut_volume_guarded_bard_v3: { stepRatio: 0.00021, minTicks: 100 },
+      xaut_volume_guarded_bard_v3_1: { stepRatio: 0.00026, minTicks: 125 },
     };
 
     function asGuideNumber(value) {
@@ -9404,6 +14037,11 @@ MONITOR_PAGE = """<!doctype html>
         if (maxShort > 0) {
           lines.push(`如果这一轮计划中的新增空仓会把总空仓推过 ${fmtGuideNotional(maxShort)}，多出来的卖单会被裁剪，不会整轮直接放行。`);
         }
+        if (asGuideNumber(config.short_cover_pause_amp_trigger_ratio) > 0 && asGuideNumber(config.short_cover_pause_down_return_trigger_ratio) !== null) {
+          lines.push(
+            `最近 1 分钟如果同时满足“振幅 >= ${fmtGuidePctFromRatio(config.short_cover_pause_amp_trigger_ratio)}”且“收跌 <= ${fmtGuidePctFromRatio(config.short_cover_pause_down_return_trigger_ratio)}”，BUY 回补单会被暂停，避免在急跌里过早回补。`
+          );
+        }
       } else if (mode === "hedge_neutral" || mode === "synthetic_neutral" || mode === "inventory_target_neutral") {
         if (buyPause > 0) {
           lines.push(`LONG 侧名义达到 ${fmtGuideNotional(buyPause)} 时，LONG 开仓买单会被清掉，只保留 LONG 卖出减仓单。`);
@@ -9447,6 +14085,54 @@ MONITOR_PAGE = """<!doctype html>
       const lines = [
         `每 ${fmtGuideNumber(config.sleep_seconds, 2)} 秒重算一次目标计划，再和当前挂单做 diff。`,
       ];
+      if (config.run_start_time) {
+        lines.push(`run_start_time=${fmtTs(config.run_start_time)} 之前不会继续交易；如果当前已有仓位或挂单，会先撤策略单并转入清仓。`);
+      }
+      if (config.run_end_time) {
+        lines.push(`run_end_time=${fmtTs(config.run_end_time)} 之后会自动停止交易、撤策略单并转入清仓。`);
+      }
+      if (config.runtime_guard_stats_start_time) {
+        lines.push(`runtime_guard_stats_start_time=${fmtTs(config.runtime_guard_stats_start_time)} 之后的审计数据才会参与累计成交额和滚动亏损统计。`);
+      }
+      if (asGuideNumber(config.rolling_hourly_loss_limit) > 0) {
+        lines.push(`最近 60 分钟滚动亏损达到 ${fmtGuideNotional(config.rolling_hourly_loss_limit)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (asGuideNumber(config.max_cumulative_notional) > 0) {
+        lines.push(`累计成交额达到 ${fmtGuideNotional(config.max_cumulative_notional)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (asGuideNumber(config.max_actual_net_notional) > 0) {
+        lines.push(`实际净敞口绝对值达到 ${fmtGuideNotional(config.max_actual_net_notional)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (asGuideNumber(config.max_synthetic_drift_notional) > 0) {
+        lines.push(`synthetic 虚拟净仓和真实净仓的偏差折算名义达到 ${fmtGuideNotional(config.max_synthetic_drift_notional)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (config.volume_trigger_enabled) {
+        const windowLabel = formatVolumeTriggerWindowLabel(config.volume_trigger_window);
+        if (asGuideNumber(config.volume_trigger_start_threshold) > 0) {
+          lines.push(`web 后台会持续观察最近 ${windowLabel} 的市场成交额；达到 ${fmtGuideNotional(config.volume_trigger_start_threshold)} 后，会自动启动策略。`);
+        }
+        if (asGuideNumber(config.volume_trigger_stop_threshold) > 0) {
+          const stopActions = [];
+          if (config.volume_trigger_stop_cancel_open_orders) stopActions.push("撤策略单");
+          if (config.volume_trigger_stop_close_all_positions) stopActions.push("清仓");
+          lines.push(
+            `最近 ${windowLabel} 的市场成交额低于 ${fmtGuideNotional(config.volume_trigger_stop_threshold)} 时，会自动停机${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`
+          );
+        }
+      }
+      if (config.volatility_trigger_enabled) {
+        const windowLabel = formatVolumeTriggerWindowLabel(config.volatility_trigger_window);
+        const stopActions = [];
+        if (config.volatility_trigger_stop_cancel_open_orders) stopActions.push("撤策略单");
+        if (config.volatility_trigger_stop_close_all_positions) stopActions.push("清仓");
+        if (asGuideNumber(config.volatility_trigger_amplitude_ratio) > 0) {
+          lines.push(`web 后台会持续观察最近 ${windowLabel} 的整窗振幅；达到 ${fmtGuidePctFromRatio(config.volatility_trigger_amplitude_ratio)} 时，会自动暂停策略${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`);
+        }
+        if (asGuideNumber(config.volatility_trigger_abs_return_ratio) > 0) {
+          lines.push(`最近 ${windowLabel} 的绝对涨跌达到 ${fmtGuidePctFromRatio(config.volatility_trigger_abs_return_ratio)} 时，也会触发同样的自动暂停。`);
+        }
+        lines.push("如果这次停机是由波动触发的，后台会在波动回落到阈值以内后自动恢复；手动点“停止策略”或“保存参数不启动”则会清掉这个自动恢复状态。");
+      }
       if (config.cancel_stale === false) {
         lines.push("当前 cancel_stale=false：如果新计划和旧挂单不一致，提交器会直接拒绝执行，而不是替你撤单。");
       } else {
@@ -9488,13 +14174,6 @@ MONITOR_PAGE = """<!doctype html>
           `15m 振幅 >= ${fmtGuidePctFromRatio(config.auto_regime_defensive_15m_amplitude_ratio)}、60m 振幅 >= ${fmtGuidePctFromRatio(config.auto_regime_defensive_60m_amplitude_ratio)}，或 15m / 60m 跌幅分别 <= ${fmtGuidePctFromRatio(config.auto_regime_defensive_15m_return_ratio)} / ${fmtGuidePctFromRatio(config.auto_regime_defensive_60m_return_ratio)} 时，候选切到 defensive。`
         );
         lines.push(`候选状态连续满足 ${Math.max(Number(config.auto_regime_confirm_cycles) || 1, 1)} 轮后，才会真正切换到另一套参数，避免来回抖动。`);
-      }
-
-      if (mode === "one_way_short" && (
-        config.short_cover_pause_amp_trigger_ratio !== undefined
-        || config.short_cover_pause_down_return_trigger_ratio !== undefined
-      )) {
-        lines.push("注意：当前 JSON 里的 short_cover_pause_* 字段还没有接入 loop_runner 实际暂停逻辑，现在只会展示，不会真的触发“暂停买回补空”。");
       }
 
       if (mode === "inventory_target_neutral") {
@@ -9556,7 +14235,9 @@ MONITOR_PAGE = """<!doctype html>
         if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
           throw new Error("参数编辑器内容必须是 JSON 对象");
         }
-        renderRunnerParamGuide(payload);
+        latestRunnerEditorConfig = normalizeRunnerRuntimePaths(payload, symbolEl.value.trim().toUpperCase() || "NIGHTUSDT");
+        syncRuntimeGuardInputsFromConfig(latestRunnerEditorConfig);
+        renderRunnerParamGuide(latestRunnerEditorConfig);
       } catch (err) {
         runnerParamsGuideBodyEl.innerHTML = `
           <div class="strategy-guide-empty">JSON 解析失败：${escapeHtml(String(err))}</div>
@@ -9567,6 +14248,7 @@ MONITOR_PAGE = """<!doctype html>
     function setRunnerEditorConfig(rawConfig, sourceLabel = "") {
       latestRunnerEditorConfig = normalizeRunnerEditorConfig(rawConfig, rawConfig && rawConfig.strategy_profile ? String(rawConfig.strategy_profile) : "");
       runnerParamsEditorEl.value = JSON.stringify(latestRunnerEditorConfig, null, 2);
+      syncRuntimeGuardInputsFromConfig(latestRunnerEditorConfig);
       runnerParamsMetaEl.textContent = sourceLabel || "参数已载入，可直接修改 JSON 后应用。";
       renderRunnerParamGuide(latestRunnerEditorConfig);
     }
@@ -9617,27 +14299,84 @@ MONITOR_PAGE = """<!doctype html>
       );
     }
 
-    async function applyRunnerParams() {
+    async function saveRunningStrategyAsPreset() {
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      const name = String(saveRunningPresetNameEl.value || "").trim();
+      const description = String(saveRunningPresetDescriptionEl.value || "").trim();
+      if (!name) {
+        runnerParamsMetaEl.textContent = "请先填写预设名称。";
+        return;
+      }
+      saveRunningPresetBtn.disabled = true;
+      runnerParamsMetaEl.textContent = `正在保存 ${selectedSymbol} 当前运行策略到预设...`;
+      try {
+        const resp = await fetch("/api/runner/presets/save_running", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: selectedSymbol, name, description }),
+        });
+        const data = await readJsonResponse(resp);
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        await loadMonitor();
+        if (data.preset_key) {
+          strategyPresetEl.value = data.preset_key;
+          renderPresetMeta(latestMonitorData);
+        }
+        runnerParamsMetaEl.textContent = `已保存预设 ${data.preset?.label || data.preset_key}，后续启动/重启将严格按该预设执行。`;
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `保存预设失败: ${err}`;
+      } finally {
+        saveRunningPresetBtn.disabled = false;
+      }
+    }
+
+    async function saveRunnerParams() {
       const selectedPreset = getPresetByKey(strategyPresetEl.value);
-      const fallbackProfile = selectedPreset
-        ? selectedPreset.key
-        : String((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
       let payload;
       try {
-        payload = JSON.parse(runnerParamsEditorEl.value || "{}");
+        payload = buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset);
       } catch (err) {
         runnerParamsMetaEl.textContent = `JSON 解析失败: ${err}`;
         return;
       }
-      if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-        runnerParamsMetaEl.textContent = "参数编辑器内容必须是 JSON 对象。";
+      saveParamsBtn.disabled = true;
+      applyParamsBtn.disabled = true;
+      loadRunningParamsBtn.disabled = true;
+      loadPresetParamsBtn.disabled = true;
+      runnerParamsMetaEl.textContent = `正在保存 ${selectedSymbol} 参数，不启动策略...`;
+      try {
+        const resp = await fetch("/api/runner/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await readJsonResponse(resp);
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        runnerParamsMetaEl.textContent = `参数已保存到 ${selectedSymbol} 控制配置，当前不会自动启动。`;
+        setRunnerEditorConfig((data && data.config) || payload, `已保存 ${selectedSymbol} 控制参数。`);
+        await loadMonitor();
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `保存失败: ${err}`;
+      } finally {
+        saveParamsBtn.disabled = false;
+        applyParamsBtn.disabled = false;
+        loadRunningParamsBtn.disabled = false;
+        loadPresetParamsBtn.disabled = false;
+      }
+    }
+
+    async function applyRunnerParams() {
+      const selectedPreset = getPresetByKey(strategyPresetEl.value);
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      let payload;
+      try {
+        payload = buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset);
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `JSON 解析失败: ${err}`;
         return;
       }
-      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
-      payload.symbol = selectedSymbol;
-      if (!payload.strategy_profile) {
-        payload.strategy_profile = fallbackProfile;
-      }
+      saveParamsBtn.disabled = true;
       applyParamsBtn.disabled = true;
       loadRunningParamsBtn.disabled = true;
       loadPresetParamsBtn.disabled = true;
@@ -9648,7 +14387,7 @@ MONITOR_PAGE = """<!doctype html>
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        const data = await resp.json();
+        const data = await readJsonResponse(resp);
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         runnerParamsMetaEl.textContent = `参数已应用到 ${selectedSymbol}${data.restarted ? "，策略已重启" : (data.already_running ? "，策略已在运行" : "，策略已启动")}`;
         await loadMonitor();
@@ -9657,6 +14396,7 @@ MONITOR_PAGE = """<!doctype html>
       } catch (err) {
         runnerParamsMetaEl.textContent = `应用失败: ${err}`;
       } finally {
+        saveParamsBtn.disabled = false;
         applyParamsBtn.disabled = false;
         loadRunningParamsBtn.disabled = false;
         loadPresetParamsBtn.disabled = false;
@@ -9671,10 +14411,42 @@ MONITOR_PAGE = """<!doctype html>
       customGridDeleteBtn.disabled = strategyActionPending || !hasCustom;
     }
 
+    function runnerFallbackProfile(selectedPreset = null) {
+      return selectedPreset
+        ? selectedPreset.key
+        : String((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
+    }
+
+    function buildRunnerStartPayload(selectedSymbol, selectedPreset = null) {
+      return {
+        symbol: selectedSymbol,
+        strategy_profile: runnerFallbackProfile(selectedPreset),
+      };
+    }
+
+    function buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset = null) {
+      let payload = readRunnerEditorConfigFromTextarea();
+      const payloadSymbol = String(payload.symbol || "").trim().toUpperCase();
+      if (payloadSymbol && payloadSymbol !== selectedSymbol) {
+        throw new Error(`参数编辑器当前是 ${payloadSymbol}，请先载入 ${selectedSymbol} 的运行参数或预设`);
+      }
+      payload = mergeRuntimeGuardConfig(payload);
+      payload.symbol = selectedSymbol;
+      if (!payload.strategy_profile) {
+        payload.strategy_profile = runnerFallbackProfile(selectedPreset);
+      }
+      return payload;
+    }
+
     function populatePresetOptions(data) {
-      const presets = ((data && data.runner_presets) && data.runner_presets.length)
+      const selectedSymbol = String(symbolEl.value || "").trim().toUpperCase();
+      const presets = (((data && data.runner_presets) && data.runner_presets.length)
         ? data.runner_presets
-        : LOCAL_STRATEGY_PRESETS;
+        : LOCAL_STRATEGY_PRESETS
+          .filter((item) => item.custom || VISIBLE_STRATEGY_PRESET_KEYS.has(String(item.key || "").trim()))).filter((item) => {
+          const presetSymbol = String((item && item.symbol) || "").trim().toUpperCase();
+          return !selectedSymbol || !presetSymbol || presetSymbol === selectedSymbol;
+        });
       runnerPresets = presets;
       const currentProfile = String((((data || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4");
       const existingValue = strategyPresetEl.value || currentProfile;
@@ -9944,6 +14716,22 @@ MONITOR_PAGE = """<!doctype html>
       return dt.toLocaleString("zh-CN", { hour12: false });
     }
 
+    function toLocalInputValue(value) {
+      if (!value) return "";
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) return "";
+      const pad = (num) => String(num).padStart(2, "0");
+      return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    }
+
+    function fromLocalInputValue(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return null;
+      const dt = new Date(raw);
+      if (Number.isNaN(dt.getTime())) return null;
+      return dt.toISOString();
+    }
+
     function escapeHtml(s) {
       return String(s ?? "")
         .replaceAll("&", "&amp;")
@@ -9959,17 +14747,54 @@ MONITOR_PAGE = """<!doctype html>
       return "";
     }
 
+    function buildCompetitionRewardTargetCard(targets) {
+      const payload = (targets && typeof targets === "object") ? targets : {};
+      const tiers = Array.isArray(payload.tiers) ? payload.tiers : [];
+      const message = String(payload.message || "").trim();
+      if (!tiers.length && !message) {
+        return null;
+      }
+      const rows = tiers.map((item) => {
+        const volumes = (item && item.volumes_by_loss_rate) || {};
+        const rewardText = item.reward_value_usdt === null || item.reward_value_usdt === undefined
+          ? "--"
+          : fmtNum(item.reward_value_usdt, 2);
+        return `
+          <div class="metric-line">
+            <strong><span class="inline-badge">${escapeHtml(item.rank_label || "--")}</span>${escapeHtml(item.segment_label || "")}</strong><br />
+            奖励 ${rewardText}U · 万3 ${fmtWanVolume(volumes["3"])} · 万4 ${fmtWanVolume(volumes["4"])} · 万5 ${fmtWanVolume(volumes["5"])}
+          </div>
+        `;
+      }).join("");
+      const rewardPriceText = payload.reward_price_usdt === null || payload.reward_price_usdt === undefined
+        ? "--"
+        : fmtNum(payload.reward_price_usdt, 4);
+      return {
+        label: "奖励回本量",
+        value: "20 / 50 / 200",
+        cls: "",
+        sub: `按当前奖励折 USDT 估算 · 奖励币种 ${String(payload.reward_unit || "--").toUpperCase()} · 现价 ${rewardPriceText}`,
+        bodyHtml: `<div class="metric-lines">${rows || `<div class="metric-line">${escapeHtml(message || "当前没有可用的奖励换手量目标。")}</div>`}</div>`,
+      };
+    }
+
     function renderCards(data) {
       const trade = data.trade_summary || {};
       const income = data.income_summary || {};
       const audit = data.audit || {};
       const pos = data.position || {};
+      const accountAssets = data.account_assets || {};
+      const usdtAsset = accountAssets.USDT || null;
+      const bnbAsset = accountAssets.BNB || null;
       const market = data.market || {};
       const loop = (data.local && data.local.loop_summary) || {};
       const latestLoop = loop.latest || {};
       const runner = data.runner || {};
       const runnerCfg = runner.config || {};
       const competitionWindow = data.competition_window || {};
+      const competitionRewardTargets = data.competition_reward_targets || {};
+      const volumeTrigger = data.volume_trigger || {};
+      const volatilityTrigger = data.volatility_trigger || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const selectedPreset = getPresetByKey(String(strategyPresetEl.value || runnerCfg.strategy_profile || "volume_long_v4"));
       const risk = data.risk_controls || {};
@@ -9979,6 +14804,10 @@ MONITOR_PAGE = """<!doctype html>
       const autoRegimeEnabled = Boolean(risk.auto_regime_enabled);
       const autoRegimeRegime = String(risk.auto_regime_regime || "--");
       const autoRegimePending = `${fmtNum(risk.auto_regime_pending_count || 0, 0)} / ${fmtNum(risk.auto_regime_confirm_cycles || 0, 0)}`;
+      const xautAdaptiveEnabled = Boolean(risk.xaut_adaptive_enabled);
+      const xautAdaptiveState = String(risk.xaut_adaptive_state || "--");
+      const xautAdaptiveCandidateState = String(risk.xaut_adaptive_candidate_state || "--");
+      const xautAdaptivePending = fmtNum(risk.xaut_adaptive_pending_count || 0, 0);
       const neutralHourlyEnabled = Boolean(risk.neutral_hourly_scale_enabled);
       const neutralHourlyRegime = String(risk.neutral_hourly_regime || "--");
       const neutralHourlyScale = fmtNum(risk.neutral_hourly_scale_ratio || 0, 2);
@@ -10003,6 +14832,8 @@ MONITOR_PAGE = """<!doctype html>
         `模式: ${modeLabel}`,
         `最近事件: ${fmtTs(data.session && data.session.last_event)}`,
         `PID: ${runner.pid || "--"}`,
+        `量能自动启停: ${volumeTrigger.enabled ? "开" : "关"}`,
+        `波动自动暂停: ${volatilityTrigger.enabled ? "开" : "关"}`,
         isOneWayShort ? `停空: ${risk.short_paused ? "是" : "否"}` : `停买: ${risk.buy_paused ? "是" : "否"}`,
         isNeutralMode ? `停空: ${risk.short_paused ? "是" : "否"}` : (isOneWayShort ? `空裁单: ${risk.short_cap_applied ? "是" : "否"}` : `硬裁单: ${risk.buy_cap_applied ? "是" : "否"}`),
       ].join(" · ");
@@ -10012,12 +14843,24 @@ MONITOR_PAGE = """<!doctype html>
         : (isOneWayShort
             ? `软停空 ${fmtNum(risk.pause_short_position_notional, 4)} / 硬上限 ${fmtNum(risk.max_short_position_notional, 4)}`
             : `软停买 ${fmtNum(risk.pause_buy_position_notional, 4)} / 硬上限 ${fmtNum(risk.max_position_notional, 4)}`);
-      const riskDetail = [
+        const riskDetail = [
         isNeutralMode ? `当前多/空: ${fmtNum(risk.current_long_notional, 4)} / ${fmtNum(risk.current_short_notional, 4)}` : (isOneWayShort ? `当前空仓: ${fmtNum(risk.current_short_notional, 4)}` : `当前净仓: ${fmtNum(risk.current_long_notional, 4)}`),
         isNeutralMode ? `多/空剩余空间: ${fmtNum(risk.remaining_headroom, 4)} / ${fmtNum(risk.remaining_short_headroom, 4)}` : (isOneWayShort ? `剩余空间: ${fmtNum(risk.remaining_short_headroom, 4)}` : `剩余空间: ${fmtNum(risk.remaining_headroom, 4)}`),
         isNeutralMode ? `计划多/空: ${fmtNum(risk.planned_buy_notional, 4)} / ${fmtNum(risk.planned_short_notional, 4)}` : (isOneWayShort ? `计划卖空: ${fmtNum(risk.planned_short_notional, 4)}` : `计划买单: ${fmtNum(risk.planned_buy_notional, 4)}`),
         isNeutralMode ? `多/空预算: ${fmtNum(risk.buy_budget_notional, 4)} / ${fmtNum(risk.short_budget_notional, 4)}` : (isOneWayShort ? `卖空预算: ${fmtNum(risk.short_budget_notional, 4)}` : `买单预算: ${fmtNum(risk.buy_budget_notional, 4)}`),
+        `运行状态: ${risk.runtime_status || "--"}`,
+        `风控统计起点: ${fmtTs(risk.runtime_guard_stats_start_time || competitionWindow.stats_start_at || risk.run_start_time)}`,
+        `滚动亏损: ${fmtNum(risk.rolling_hourly_loss || 0, 4)} / ${fmtNum(risk.rolling_hourly_loss_limit || 0, 4)}`,
+        `累计成交额: ${fmtNum(risk.cumulative_gross_notional || 0, 4)} / ${fmtNum(risk.max_cumulative_notional || 0, 4)}`,
+        volumeTrigger.enabled
+          ? `量能 ${formatVolumeTriggerWindowLabel(volumeTrigger.window)}: ${fmtNum(volumeTrigger.current_quote_volume, 4)} / 启 ${fmtNum(volumeTrigger.start_threshold, 4)} / 停 ${fmtNum(volumeTrigger.stop_threshold, 4)}`
+          : "量能自动启停: 关闭",
+        volatilityTrigger.enabled
+          ? `波动 ${formatVolumeTriggerWindowLabel(volatilityTrigger.window)}: 振幅 ${fmtPct(volatilityTrigger.current_amplitude_ratio || 0)} / 阈 ${fmtPct(volatilityTrigger.amplitude_ratio || 0)} · 绝对涨跌 ${fmtPct(Math.abs(volatilityTrigger.current_return_ratio || 0))} / 阈 ${fmtPct(volatilityTrigger.abs_return_ratio || 0)} · 自动恢复 ${volatilityTrigger.paused_by_trigger ? "待恢复" : "未挂起"}`
+          : "波动自动暂停: 关闭",
+        `停止原因: ${risk.stop_reason || "--"}`,
         `自适应状态: ${autoRegimeEnabled ? `${autoRegimeRegime} (${autoRegimePending})` : "关闭"}`,
+        `XAUT 三态: ${xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"}`,
         `中性小时缩放: ${neutralHourlyEnabled ? `${neutralHourlyRegime} x${neutralHourlyScale}` : "关闭"}`,
         `分层: ${risk.inventory_tier_active ? `${Math.round((risk.inventory_tier_ratio || 0) * 100)}%` : "未激活"}`,
         `分钟停买: ${risk.volatility_buy_pause ? "是" : "否"}`,
@@ -10034,40 +14877,105 @@ MONITOR_PAGE = """<!doctype html>
         ? `${competitionWindow.label} · 起点 ${fmtTs(competitionWindow.stats_start_at || competitionWindow.activity_start_at)}`
         : `会话起点 ${fmtTs(data.session && data.session.start)}`;
       const cards = [
-        ["策略状态", strategyRunning ? "运行中" : "未活跃", strategyRunning ? "good" : "warn", strategyDetail],
-        ["执行进程", runnerLabel, runner.is_running ? "good" : "warn", runnerDetail],
-        ["统计区间", statsWindowLabel, "", competitionWindow.activity_end_at ? `结束时间: ${fmtTs(competitionWindow.activity_end_at)}` : "未匹配到交易赛窗口，默认按当前会话统计"],
-        ["风控硬限制", riskValue, riskStatusClass, riskDetail],
-        ["会话成交笔数", fmtNum(trade.trade_count || 0, 0), "", `Maker: ${fmtNum(trade.maker_count || 0, 0)} · 买/卖: ${fmtNum(trade.buy_count || 0, 0)} / ${fmtNum(trade.sell_count || 0, 0)}`],
-        ["累计成交额", fmtNum(trade.gross_notional || 0, 4), "", `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}`],
-        ["净收益估算", fmtMoney(trade.net_pnl_estimate || 0), statusClass(trade.net_pnl_estimate || 0), `已实现: ${fmtMoney(trade.realized_pnl || 0)} · 浮盈: ${fmtMoney(pos.unrealized_pnl || 0)}`],
-        ["手续费 / 资金费", `${fmtMoney(-(trade.commission || 0))} / ${fmtMoney(income.funding_fee || 0)}`, "", `左侧为折算 USDT 后的累计手续费 · 原始资产: ${escapeHtml(JSON.stringify(trade.commission_raw_by_asset || {}))}`],
-        ["审计日志", `成交 ${fmtNum(audit.trade_row_count || 0, 0)} / 资金费 ${fmtNum(audit.income_row_count || 0, 0)}`, "", `委托事件: ${fmtNum(audit.order_event_count || 0, 0)} · 提交轮次: ${fmtNum(audit.submit_event_count || 0, 0)} · 计划轮次: ${fmtNum(audit.plan_event_count || 0, 0)}`],
-        ["当前仓位", isNeutralMode ? `净 ${fmtNum(netQty, 0)}` : fmtNum(pos.position_amt || 0, 0), "", isNeutralMode ? `Long/Short: ${fmtNum(longQty, 0)} / ${fmtNum(shortQty, 0)} · ${centerLabelText} · 中价名义: ${fmtNum((longQty + shortQty) * (market.mid_price || 0), 4)}` : `开仓均价: ${fmtNum(pos.entry_price || 0, 7)} · ${centerLabelText} · 持仓名义: ${fmtNum(Math.abs(pos.position_amt || 0) * (market.mid_price || 0), 4)}`],
-        ["当前挂单数", fmtNum((data.open_orders || []).length, 0), "", `买/卖: ${fmtNum((data.open_orders || []).filter(x => x.side === "BUY").length, 0)} / ${fmtNum((data.open_orders || []).filter(x => x.side === "SELL").length, 0)}`],
-        ["市场", `${fmtNum(market.bid_price || 0, 7)} / ${fmtNum(market.ask_price || 0, 7)}`, "", `中价: ${fmtNum(market.mid_price || 0, 7)} · Funding: ${fmtPct(market.funding_rate || 0)}`],
+        { label: "策略状态", value: strategyRunning ? "运行中" : "未活跃", cls: strategyRunning ? "good" : "warn", sub: strategyDetail },
+        { label: "执行进程", value: runnerLabel, cls: runner.is_running ? "good" : "warn", sub: runnerDetail },
+        { label: "统计区间", value: statsWindowLabel, cls: "", sub: competitionWindow.activity_end_at ? `结束时间: ${fmtTs(competitionWindow.activity_end_at)}` : "未匹配到交易赛窗口，默认按当前会话统计" },
+        { label: "风控硬限制", value: riskValue, cls: riskStatusClass, sub: riskDetail },
+        { label: "会话成交笔数", value: fmtNum(trade.trade_count || 0, 0), cls: "", sub: `Maker: ${fmtNum(trade.maker_count || 0, 0)} · 买/卖: ${fmtNum(trade.buy_count || 0, 0)} / ${fmtNum(trade.sell_count || 0, 0)}` },
+        { label: "累计成交额", value: fmtNum(trade.gross_notional || 0, 4), cls: "", sub: `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}` },
+        { label: "净收益估算", value: fmtMoney(trade.net_pnl_estimate || 0), cls: statusClass(trade.net_pnl_estimate || 0), sub: `已实现: ${fmtMoney(trade.realized_pnl || 0)} · 浮盈: ${fmtMoney(pos.unrealized_pnl || 0)}` },
+        { label: "手续费 / 资金费", value: `${fmtMoney(-(trade.commission || 0))} / ${fmtMoney(income.funding_fee || 0)}`, cls: "", sub: `左侧为折算 USDT 后的累计手续费 · 原始资产: ${escapeHtml(JSON.stringify(trade.commission_raw_by_asset || {}))}` },
+        { label: "审计日志", value: `成交 ${fmtNum(audit.trade_row_count || 0, 0)} / 资金费 ${fmtNum(audit.income_row_count || 0, 0)}`, cls: "", sub: `委托事件: ${fmtNum(audit.order_event_count || 0, 0)} · 提交轮次: ${fmtNum(audit.submit_event_count || 0, 0)} · 计划轮次: ${fmtNum(audit.plan_event_count || 0, 0)}` },
+        { label: "当前仓位", value: isNeutralMode ? `净 ${fmtNum(netQty, 0)}` : fmtNum(pos.position_amt || 0, 0), cls: "", sub: isNeutralMode ? `Long/Short: ${fmtNum(longQty, 0)} / ${fmtNum(shortQty, 0)} · ${centerLabelText} · 中价名义: ${fmtNum((longQty + shortQty) * (market.mid_price || 0), 4)}` : `开仓均价: ${fmtNum(pos.entry_price || 0, 7)} · ${centerLabelText} · 持仓名义: ${fmtNum(Math.abs(pos.position_amt || 0) * (market.mid_price || 0), 4)}` },
+        { label: "当前挂单数", value: fmtNum((data.open_orders || []).length, 0), cls: "", sub: `买/卖: ${fmtNum((data.open_orders || []).filter(x => x.side === "BUY").length, 0)} / ${fmtNum((data.open_orders || []).filter(x => x.side === "SELL").length, 0)}` },
+        { label: "合约 USDT", value: usdtAsset ? fmtNum(usdtAsset.wallet_balance || 0, 4) : "--", cls: "", sub: usdtAsset ? `可用: ${fmtNum(usdtAsset.available_balance || 0, 4)} · 可提: ${fmtNum(usdtAsset.max_withdraw_amount || 0, 4)}` : "未读到 USDT 资产" },
+        { label: "合约 BNB", value: bnbAsset ? fmtNum(bnbAsset.wallet_balance || 0, 6) : "--", cls: "", sub: bnbAsset ? `可用: ${fmtNum(bnbAsset.available_balance || 0, 6)} · 可提: ${fmtNum(bnbAsset.max_withdraw_amount || 0, 6)}` : "未读到 BNB 资产" },
+        { label: "市场", value: `${fmtNum(market.bid_price || 0, 7)} / ${fmtNum(market.ask_price || 0, 7)}`, cls: "", sub: `中价: ${fmtNum(market.mid_price || 0, 7)} · Funding: ${fmtPct(market.funding_rate || 0)}` },
       ];
-      summaryEl.innerHTML = cards.map(([label, value, cls, sub]) => `
-        <div class="metric">
-          <div class="label">${escapeHtml(label)}</div>
-          <div class="value ${cls}">${escapeHtml(value)}</div>
-          <div class="sub">${escapeHtml(sub)}</div>
-        </div>
-      `).join("");
+      const rewardTargetCard = buildCompetitionRewardTargetCard(competitionRewardTargets);
+      if (rewardTargetCard) {
+        cards.splice(6, 0, rewardTargetCard);
+      }
+      summaryEl.innerHTML = cards.map((item) => {
+        const label = String(item.label || "");
+        const value = String(item.value || "--");
+        const cls = String(item.cls || "");
+        const sub = String(item.sub || "");
+        const bodyHtml = String(item.bodyHtml || "");
+        return `
+          <div class="metric">
+            <div class="label">${escapeHtml(label)}</div>
+            <div class="value ${cls}">${escapeHtml(value)}</div>
+            <div class="sub">${escapeHtml(sub)}</div>
+            ${bodyHtml}
+          </div>
+        `;
+      }).join("");
       startStrategyBtn.disabled = strategyActionPending || Boolean(selectedPreset && !selectedPreset.startable);
       startStrategyBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
       stopStrategyBtn.disabled = strategyActionPending || !Boolean(runner.is_running);
+    }
+
+    function formatAlertSeverity(severity) {
+      if (severity === "critical") return "严重";
+      if (severity === "warning") return "警告";
+      return "提示";
+    }
+
+    function renderAlerts(data) {
+      const alerts = Array.isArray(data.alerts) ? data.alerts : [];
+      if (!alerts.length) {
+        alertBoxEl.innerHTML = '<div class="alert-empty">当前没有明确的运行告警。这里会直接提示保证金不足、频率超限、停买/停空、进程退出等关键问题。</div>';
+        return;
+      }
+      alertBoxEl.innerHTML = alerts.map((item) => {
+        const severity = ["critical", "warning", "info"].includes(item.severity) ? item.severity : "info";
+        const detail = String(item.detail || "").trim();
+        const action = String(item.action || "").trim();
+        const code = String(item.code || "").trim();
+        const ts = item.ts ? fmtTs(item.ts) : "";
+        const actionButtons = [];
+        if (code && alertParamKeys(code).length) {
+          actionButtons.push(
+            `<button type="button" class="alert-action-btn" data-alert-action="locate" data-alert-code="${escapeHtml(code)}">定位参数</button>`
+          );
+        }
+        if (code && alertSupportsSuggestion(code)) {
+          actionButtons.push(
+            `<button type="button" class="alert-action-btn primary" data-alert-action="suggest" data-alert-code="${escapeHtml(code)}">生成建议参数</button>`
+          );
+        }
+        return `
+          <div class="alert-item ${severity}">
+            <div class="alert-head">
+              <div class="alert-title">${escapeHtml(String(item.title || "运行提示"))}</div>
+              <span class="alert-severity">${escapeHtml(formatAlertSeverity(severity))}</span>
+            </div>
+            ${detail ? `<div class="alert-detail">${escapeHtml(detail)}</div>` : ""}
+            ${action ? `<div class="alert-action">建议：${escapeHtml(action)}</div>` : ""}
+            ${actionButtons.length ? `<div class="alert-actions">${actionButtons.join("")}</div>` : ""}
+            ${ts ? `<div class="alert-ts">时间：${escapeHtml(ts)}</div>` : ""}
+          </div>
+        `;
+      }).join("");
     }
 
     function renderPosition(data) {
       const rawPos = data.position;
       const pos = rawPos || {};
       const risk = data.risk_controls || {};
+      const accountAssets = data.account_assets || {};
+      const usdtAsset = accountAssets.USDT || null;
+      const bnbAsset = accountAssets.BNB || null;
       const runnerCfg = (data.runner && data.runner.config) || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const strategyMode = String(risk.strategy_mode || runnerCfg.strategy_mode || "one_way_long");
       const effectiveProfile = String(risk.effective_strategy_profile || runnerCfg.strategy_profile || "volume_long_v4");
       const effectiveProfileLabel = String(risk.effective_strategy_label || effectiveProfile || "--");
+      const xautAdaptiveEnabled = Boolean(risk.xaut_adaptive_enabled);
+      const xautAdaptiveState = String(risk.xaut_adaptive_state || "--");
+      const xautAdaptiveCandidateState = String(risk.xaut_adaptive_candidate_state || "--");
+      const xautAdaptivePending = fmtNum(risk.xaut_adaptive_pending_count || 0, 0);
       const isOneWayShort = strategyMode === "one_way_short";
       const isHedge = strategyMode === "hedge_neutral";
       const isSyntheticNeutral = strategyMode === "synthetic_neutral";
@@ -10102,6 +15010,12 @@ MONITOR_PAGE = """<!doctype html>
         ["Multi-Assets", pos.multi_assets_margin ? "是" : "否"],
         ["可用余额", fmtNum(pos.available_balance || 0, 4)],
         ["钱包余额", fmtNum(pos.wallet_balance || 0, 4)],
+        ["合约 USDT 余额", usdtAsset ? fmtNum(usdtAsset.wallet_balance || 0, 4) : "--"],
+        ["合约 USDT 可用", usdtAsset ? fmtNum(usdtAsset.available_balance || 0, 4) : "--"],
+        ["合约 USDT 可提", usdtAsset ? fmtNum(usdtAsset.max_withdraw_amount || 0, 4) : "--"],
+        ["合约 BNB 余额", bnbAsset ? fmtNum(bnbAsset.wallet_balance || 0, 6) : "--"],
+        ["合约 BNB 可用", bnbAsset ? fmtNum(bnbAsset.available_balance || 0, 6) : "--"],
+        ["合约 BNB 可提", bnbAsset ? fmtNum(bnbAsset.max_withdraw_amount || 0, 6) : "--"],
         ["每笔名义", fmtNum(runnerCfg.per_order_notional, 4)],
         ["底仓目标名义", fmtNum(runnerCfg.base_position_notional, 4)],
         ["软停买阈值", fmtNum(risk.pause_buy_position_notional, 4)],
@@ -10112,6 +15026,15 @@ MONITOR_PAGE = """<!doctype html>
         ["当前空仓名义", fmtNum(risk.current_short_notional, 4)],
         ["剩余上限空间", fmtNum(risk.remaining_headroom, 4)],
         ["空仓剩余空间", fmtNum(risk.remaining_short_headroom, 4)],
+        ["运行状态", risk.runtime_status || "--"],
+        ["起始时间", risk.run_start_time ? fmtTs(risk.run_start_time) : "--"],
+        ["结束时间", risk.run_end_time ? fmtTs(risk.run_end_time) : "--"],
+        ["风控统计起点", risk.runtime_guard_stats_start_time ? fmtTs(risk.runtime_guard_stats_start_time) : "--"],
+        ["滚动亏损", fmtNum(risk.rolling_hourly_loss, 4)],
+        ["滚动亏损阈值", fmtNum(risk.rolling_hourly_loss_limit, 4)],
+        ["累计成交额", fmtNum(risk.cumulative_gross_notional, 4)],
+        ["累计成交额阈值", fmtNum(risk.max_cumulative_notional, 4)],
+        ["停止原因", risk.stop_reason || "--"],
         ["本轮买单预算", fmtNum(risk.buy_budget_notional, 4)],
         ["本轮卖空预算", fmtNum(risk.short_budget_notional, 4)],
         ["本轮计划买单", fmtNum(risk.planned_buy_notional, 4)],
@@ -10128,6 +15051,8 @@ MONITOR_PAGE = """<!doctype html>
         ["最新1m振幅", fmtPct(risk.market_guard_amplitude_ratio || 0)],
         ["自适应状态", risk.auto_regime_enabled ? `${risk.auto_regime_regime || "--"} (${fmtNum(risk.auto_regime_pending_count || 0, 0)} / ${fmtNum(risk.auto_regime_confirm_cycles || 0, 0)})` : "关闭"],
         ["自适应原因", risk.auto_regime_reason || "--"],
+        ["XAUT 三态状态", xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"],
+        ["XAUT 三态原因", risk.xaut_adaptive_reason || "--"],
         ["中性目标带", (targetBands.offsets && targetBands.target_ratios) ? `${targetBands.offsets.map((v, i) => `${(Number(v) * 100).toFixed(1)}%:${Math.round(Number((targetBands.target_ratios || [])[i] || 0) * 100)}%`).join(' / ')}` : "--"],
         ["中性基础目标带", (targetBands.offsets && targetBands.base_target_ratios) ? `${targetBands.offsets.map((v, i) => `${(Number(v) * 100).toFixed(1)}%:${Math.round(Number((targetBands.base_target_ratios || [])[i] || 0) * 100)}%`).join(' / ')}` : "--"],
         ["当前目标净仓", fmtNum(targetBands.current_target_notional, 4)],
@@ -10304,53 +15229,64 @@ MONITOR_PAGE = """<!doctype html>
     }
 
     async function loadMonitor() {
-      const symbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
-      if (!symbol) {
-        metaEl.textContent = "监控币种列表为空，请先到策略总览页添加币种。";
-        return;
+      if (monitorLoadPromise) {
+        return monitorLoadPromise;
       }
-      metaEl.textContent = `正在刷新 ${symbol} ...`;
-      try {
-        const data = await fetchMonitorSnapshot(symbol);
-        populatePresetOptions(data);
-        renderCards(data);
-        renderPosition(data);
-        renderOpenOrders(data);
-        renderHourlyStats(data);
-        renderTrades(data);
-        renderEvents(data);
-        renderCharts(data);
-        if (!runnerParamsEditorEl.value.trim()) {
-          await loadRunningConfigToEditor(false);
+      monitorLoadPromise = (async () => {
+        const symbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+        if (!symbol) {
+          metaEl.textContent = "监控币种列表为空，请先到策略总览页添加币种。";
+          return;
         }
-        const warnings = (data.warnings || []).join(" | ");
-        metaEl.textContent = `最后刷新: ${fmtTs(data.ts)}${warnings ? ` · 警告: ${warnings}` : ""}`;
-      } catch (err) {
-        metaEl.textContent = `刷新失败: ${err}`;
+        metaEl.textContent = `正在刷新 ${symbol} ...`;
+        try {
+          const data = await fetchMonitorSnapshot(symbol);
+          populatePresetOptions(data);
+          renderCards(data);
+          renderAlerts(data);
+          renderPosition(data);
+          renderOpenOrders(data);
+          renderHourlyStats(data);
+          renderTrades(data);
+          renderEvents(data);
+          renderCharts(data);
+          if (!runnerParamsEditorEl.value.trim()) {
+            await loadRunningConfigToEditor(false);
+          }
+          const warnings = (data.warnings || []).join(" | ");
+          metaEl.textContent = `最后刷新: ${fmtTs(data.ts)}${warnings ? ` · 警告: ${warnings}` : ""}`;
+        } catch (err) {
+          alertBoxEl.innerHTML = '<div class="alert-empty">当前没拿到监控快照，所以还无法判断是参数问题、账户问题还是 Binance 接口异常。</div>';
+          metaEl.textContent = `刷新失败: ${err}`;
+        }
+      })();
+      try {
+        await monitorLoadPromise;
+      } finally {
+        monitorLoadPromise = null;
       }
     }
 
     async function controlStrategy(action) {
       if (strategyActionPending) return;
       const selectedPreset = getPresetByKey(strategyPresetEl.value);
-      if (action === "start" && (!selectedPreset || !selectedPreset.startable)) {
-        strategyActionMetaEl.textContent = selectedPreset
-          ? `${selectedPreset.label} 当前是模板预设，页面已展示参数，但还不能直接启动。`
-          : "请选择可启动的策略预设";
-        return;
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      let startPayload = null;
+      if (action === "start") {
+        startPayload = buildRunnerStartPayload(selectedSymbol, selectedPreset);
+        const effectivePreset = getPresetByKey(String(startPayload.strategy_profile || ""));
+        if (effectivePreset && !effectivePreset.startable) {
+          strategyActionMetaEl.textContent = `${effectivePreset.label} 当前是模板预设，页面已展示参数，但还不能直接启动。`;
+          return;
+        }
       }
       strategyActionPending = true;
-      strategyActionMetaEl.textContent = action === "start" ? "正在启动策略..." : "正在停止策略...";
+      strategyActionMetaEl.textContent = action === "start" ? "正在按当前选中预设启动策略..." : "正在停止策略...";
       startStrategyBtn.disabled = true;
       stopStrategyBtn.disabled = true;
       try {
-        const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
         const payload = action === "start"
-          ? {
-              ...(selectedPreset ? (selectedPreset.config || {}) : {}),
-              symbol: selectedSymbol,
-              strategy_profile: selectedPreset ? selectedPreset.key : ((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "volume_long_v4"),
-            }
+          ? startPayload
           : {
               symbol: selectedSymbol,
               cancel_open_orders: Boolean(stopCancelOrdersEl && stopCancelOrdersEl.checked),
@@ -10361,11 +15297,15 @@ MONITOR_PAGE = """<!doctype html>
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        const data = await resp.json();
+        const data = await readJsonResponse(resp);
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         strategyActionMetaEl.textContent = action === "start"
           ? `策略已启动${data.restarted ? "（已重启应用新配置）" : (data.already_running ? "（已在运行）" : "")}`
           : `策略已停止${data.already_stopped ? "（原本就未运行）" : ""}${formatStopActionSummary(data.post_stop_actions) ? ` · ${formatStopActionSummary(data.post_stop_actions)}` : ""}`;
+        if (action === "start") {
+          const appliedConfig = ((((data || {}).runner || {}).config) || payload);
+          setRunnerEditorConfig(appliedConfig, `已载入 ${selectedSymbol} 当前生效参数。`);
+        }
       } catch (err) {
         strategyActionMetaEl.textContent = `${action === "start" ? "启动" : "停止"}失败: ${err}`;
       } finally {
@@ -10378,7 +15318,7 @@ MONITOR_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(2, Number(refreshSecEl.value || 5));
+      const sec = Math.max(2, Number(refreshSecEl.value || __MONITOR_REFRESH_DEFAULT__));
       timer = setInterval(loadMonitor, sec * 1000);
     }
 
@@ -10397,8 +15337,48 @@ MONITOR_PAGE = """<!doctype html>
     strategyPresetEl.addEventListener("change", () => renderPresetMeta(latestMonitorData));
     loadRunningParamsBtn.addEventListener("click", loadRunningConfigToEditor);
     loadPresetParamsBtn.addEventListener("click", loadPresetConfigToEditor);
+    saveRunningPresetBtn.addEventListener("click", saveRunningStrategyAsPreset);
+    saveParamsBtn.addEventListener("click", saveRunnerParams);
     applyParamsBtn.addEventListener("click", applyRunnerParams);
     runnerParamsEditorEl.addEventListener("input", syncRunnerParamGuideFromEditor);
+    [
+      monitorRunStartTimeEl,
+      monitorRunEndTimeEl,
+      monitorRollingHourlyLossLimitEl,
+      monitorMaxCumulativeNotionalEl,
+      monitorVolumeTriggerEnabledEl,
+      monitorVolumeTriggerWindowEl,
+      monitorVolumeTriggerStartThresholdEl,
+      monitorVolumeTriggerStopThresholdEl,
+      monitorVolumeTriggerStopCancelOrdersEl,
+      monitorVolumeTriggerStopClosePositionsEl,
+      monitorVolatilityTriggerEnabledEl,
+      monitorVolatilityTriggerWindowEl,
+      monitorVolatilityTriggerAmplitudeRatioEl,
+      monitorVolatilityTriggerAbsReturnRatioEl,
+      monitorVolatilityTriggerStopCancelOrdersEl,
+      monitorVolatilityTriggerStopClosePositionsEl,
+    ]
+      .forEach((el) => el.addEventListener("change", syncRuntimeGuardInputsToEditor));
+    alertBoxEl.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-alert-action]");
+      if (!button) return;
+      const action = String(button.getAttribute("data-alert-action") || "").trim();
+      const code = String(button.getAttribute("data-alert-code") || "").trim();
+      if (!action || !code) return;
+      button.disabled = true;
+      try {
+        if (action === "locate") {
+          await locateAlertParams(code);
+        } else if (action === "suggest") {
+          await applyAlertSuggestion(code);
+        }
+      } catch (err) {
+        runnerParamsMetaEl.textContent = `告警动作失败: ${err}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
     customGridPreviewBtn.addEventListener("click", runCustomGridPreview);
     customGridSaveBtn.addEventListener("click", saveCustomGridStrategy);
     customGridLoadBtn.addEventListener("click", loadCustomGridPresetToForm);
@@ -10588,12 +15568,20 @@ SPOT_RUNNER_PAGE = """<!doctype html>
             <option value="spot_one_way_long">Spot V1 单向做多静态网格</option>
           </select>
         </label>
+        <label>策略预设
+          <select id="spot_strategy_preset">
+            <option value="manual_spot">手动参数</option>
+            <option value="xaut_spot_competition_1_25_v1">1.25XAUT现货交易赛</option>
+            <option value="xaut_spot_competition_0_8_v1">0.8XAUT现货交易赛</option>
+          </select>
+        </label>
         <label>自动刷新秒数
-          <input id="refresh_seconds" type="number" min="2" step="1" value="5" />
+          <input id="refresh_seconds" type="number" min="2" step="1" value="__SPOT_RUNNER_REFRESH_DEFAULT__" />
         </label>
         <label>循环秒数
           <input id="sleep_seconds" type="number" min="2" step="1" value="10" />
         </label>
+        <button id="load_spot_preset_btn">载入预设参数</button>
         <button id="preview_btn">预览静态网格</button>
         <button id="refresh_btn">刷新状态</button>
         <button id="start_btn" class="primary">启动策略</button>
@@ -10625,7 +15613,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
           <input id="shift_total_quote_budget" type="number" min="0" step="0.01" />
         </label>
         <label>带宽比例
-          <input id="grid_band_ratio" type="number" min="0.001" step="0.001" />
+          <input id="grid_band_ratio" type="number" min="0.0001" step="0.00001" />
         </label>
         <label>攻击买/卖格
           <input id="attack_levels" type="text" />
@@ -10650,6 +15638,23 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         </label>
         <label>回收年龄/损耗
           <input id="recycle_settings" type="text" />
+        </label>
+      </div>
+      <div class="fields" id="runtime_guard_fields">
+        <label>起始时间
+          <input id="run_start_time" type="datetime-local" />
+        </label>
+        <label>结束时间
+          <input id="run_end_time" type="datetime-local" />
+        </label>
+        <label>滚动 60 分钟亏损阈值
+          <input id="rolling_hourly_loss_limit" type="number" min="0" step="0.01" />
+        </label>
+        <label>累计成交额阈值
+          <input id="max_cumulative_notional" type="number" min="0" step="0.01" />
+        </label>
+        <label>累计亏损阈值
+          <input id="max_cumulative_loss_limit" type="number" min="0" step="0.01" />
         </label>
       </div>
       <div class="actions">
@@ -10754,6 +15759,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const symbolEl = document.getElementById("symbol");
     const symbolSearchEl = document.getElementById("symbol_search");
     const strategyModeEl = document.getElementById("strategy_mode");
+    const strategyPresetEl = document.getElementById("spot_strategy_preset");
     const gridLevelModeEl = document.getElementById("grid_level_mode");
     const minPriceEl = document.getElementById("min_price");
     const maxPriceEl = document.getElementById("max_price");
@@ -10769,12 +15775,18 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const centerShiftRatiosEl = document.getElementById("center_shift_ratios");
     const pauseThresholdsEl = document.getElementById("pause_thresholds");
     const recycleSettingsEl = document.getElementById("recycle_settings");
+    const runStartTimeEl = document.getElementById("run_start_time");
+    const runEndTimeEl = document.getElementById("run_end_time");
+    const rollingHourlyLossLimitEl = document.getElementById("rolling_hourly_loss_limit");
+    const maxCumulativeNotionalEl = document.getElementById("max_cumulative_notional");
+    const maxCumulativeLossLimitEl = document.getElementById("max_cumulative_loss_limit");
     const sleepSecondsEl = document.getElementById("sleep_seconds");
     const refreshSecondsEl = document.getElementById("refresh_seconds");
     const staticFieldsEl = document.getElementById("static_fields");
     const shiftFieldsEl = document.getElementById("shift_fields");
     const previewCardEl = document.getElementById("preview_card");
     const previewBtn = document.getElementById("preview_btn");
+    const loadSpotPresetBtn = document.getElementById("load_spot_preset_btn");
     const refreshBtn = document.getElementById("refresh_btn");
     const startBtn = document.getElementById("start_btn");
     const stopBtn = document.getElementById("stop_btn");
@@ -10787,6 +15799,77 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const ordersBody = document.getElementById("orders_body");
     const tradesBody = document.getElementById("trades_body");
     const eventsBody = document.getElementById("events_body");
+
+    const spotRunnerPresetConfigs = {
+      xaut_spot_competition_1_25_v1: {
+        strategy_profile: "xaut_spot_competition_1_25_v1",
+        symbol: "XAUTUSDT",
+        strategy_mode: "spot_volume_shift_long",
+        grid_level_mode: "arithmetic",
+        min_price: 0,
+        max_price: 0,
+        n: 0,
+        total_quote_budget: 1000,
+        sleep_seconds: 5,
+        grid_band_ratio: 0.00084,
+        attack_buy_levels: 5,
+        attack_sell_levels: 5,
+        attack_per_order_notional: 40,
+        defense_buy_levels: 5,
+        defense_sell_levels: 5,
+        defense_per_order_notional: 40,
+        inventory_soft_limit_notional: 750,
+        inventory_hard_limit_notional: 950,
+        center_shift_trigger_ratio: 0.00135,
+        center_shift_step_ratio: 0.00135,
+        buy_pause_amp_trigger_ratio: 0.0035,
+        buy_pause_down_return_trigger_ratio: -0.002,
+        inventory_recycle_age_minutes: 40,
+        inventory_recycle_loss_tolerance_ratio: 0.006,
+        attack_market_entry_enabled: false,
+        attack_market_entry_trigger_multiplier: 2,
+        attack_market_entry_target_multiplier: 4,
+        attack_market_entry_cooldown_seconds: 60,
+        lot_take_profit_offset: 1.25,
+        rolling_hourly_loss_limit: 120,
+        max_cumulative_notional: 1000000,
+        max_cumulative_loss_limit: 800,
+      },
+      xaut_spot_competition_0_8_v1: {
+        strategy_profile: "xaut_spot_competition_0_8_v1",
+        symbol: "XAUTUSDT",
+        strategy_mode: "spot_volume_shift_long",
+        grid_level_mode: "arithmetic",
+        min_price: 0,
+        max_price: 0,
+        n: 0,
+        total_quote_budget: 1000,
+        sleep_seconds: 5,
+        grid_band_ratio: 0.00084,
+        attack_buy_levels: 5,
+        attack_sell_levels: 5,
+        attack_per_order_notional: 15,
+        defense_buy_levels: 5,
+        defense_sell_levels: 5,
+        defense_per_order_notional: 15,
+        inventory_soft_limit_notional: 750,
+        inventory_hard_limit_notional: 950,
+        center_shift_trigger_ratio: 0.00135,
+        center_shift_step_ratio: 0.00135,
+        buy_pause_amp_trigger_ratio: 0.0035,
+        buy_pause_down_return_trigger_ratio: -0.002,
+        inventory_recycle_age_minutes: 40,
+        inventory_recycle_loss_tolerance_ratio: 0.006,
+        attack_market_entry_enabled: true,
+        attack_market_entry_trigger_multiplier: 1,
+        attack_market_entry_target_multiplier: 4,
+        attack_market_entry_cooldown_seconds: 60,
+        lot_take_profit_offset: 0.8,
+        rolling_hourly_loss_limit: 120,
+        max_cumulative_notional: 1000000,
+        max_cumulative_loss_limit: 800,
+      },
+    };
 
     let latestSnapshot = null;
     let latestPreview = null;
@@ -10820,6 +15903,22 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const dt = new Date(v);
       if (Number.isNaN(dt.getTime())) return String(v);
       return dt.toLocaleString("zh-CN", { hour12: false });
+    }
+
+    function toLocalInputValue(value) {
+      if (!value) return "";
+      const dt = new Date(value);
+      if (Number.isNaN(dt.getTime())) return "";
+      const pad = (num) => String(num).padStart(2, "0");
+      return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}T${pad(dt.getHours())}:${pad(dt.getMinutes())}`;
+    }
+
+    function fromLocalInputValue(value) {
+      const raw = String(value || "").trim();
+      if (!raw) return null;
+      const dt = new Date(raw);
+      if (Number.isNaN(dt.getTime())) return null;
+      return dt.toISOString();
     }
 
     function escapeHtml(s) {
@@ -10873,6 +15972,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const [recycleAge, recycleLoss] = parsePair(recycleSettingsEl.value, 40, 0.006);
       return {
         symbol: getSelectedSymbol(),
+        strategy_profile: String(strategyPresetEl.value || "manual_spot"),
         strategy_mode: strategyMode,
         grid_level_mode: String(gridLevelModeEl.value || "arithmetic"),
         min_price: Number(minPriceEl.value || 0),
@@ -10902,7 +16002,49 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         inventory_recycle_loss_tolerance_ratio: Number(recycleLoss || 0.006),
         inventory_recycle_min_profit_ratio: 0.001,
         max_single_cycle_new_orders: 8,
+        run_start_time: fromLocalInputValue(runStartTimeEl.value),
+        run_end_time: fromLocalInputValue(runEndTimeEl.value),
+        rolling_hourly_loss_limit: rollingHourlyLossLimitEl.value ? Number(rollingHourlyLossLimitEl.value) : null,
+        max_cumulative_notional: maxCumulativeNotionalEl.value ? Number(maxCumulativeNotionalEl.value) : null,
+        max_cumulative_loss_limit: maxCumulativeLossLimitEl.value ? Number(maxCumulativeLossLimitEl.value) : null,
       };
+    }
+
+    function loadSpotPreset() {
+      const presetKey = String(strategyPresetEl.value || "");
+      const preset = spotRunnerPresetConfigs[presetKey];
+      if (!preset) {
+        setStatus("请选择一个可载入的现货策略预设。", true);
+        return;
+      }
+      const presetLabel = strategyPresetEl.options[strategyPresetEl.selectedIndex]?.textContent || presetKey;
+      symbolSearchEl.value = preset.symbol;
+      if (availableSpotSymbols.includes(preset.symbol)) symbolEl.value = preset.symbol;
+      strategyModeEl.value = preset.strategy_mode;
+      gridLevelModeEl.value = preset.grid_level_mode;
+      minPriceEl.value = String(preset.min_price);
+      maxPriceEl.value = String(preset.max_price);
+      nEl.value = String(preset.n);
+      totalQuoteBudgetEl.value = String(preset.total_quote_budget);
+      shiftTotalQuoteBudgetEl.value = String(preset.total_quote_budget);
+      sleepSecondsEl.value = String(preset.sleep_seconds);
+      gridBandRatioEl.value = String(preset.grid_band_ratio);
+      attackLevelsEl.value = `${preset.attack_buy_levels},${preset.attack_sell_levels}`;
+      attackPerOrderNotionalEl.value = String(preset.attack_per_order_notional);
+      defenseLevelsEl.value = `${preset.defense_buy_levels},${preset.defense_sell_levels}`;
+      defensePerOrderNotionalEl.value = String(preset.defense_per_order_notional);
+      inventoryLimitsEl.value = `${preset.inventory_soft_limit_notional},${preset.inventory_hard_limit_notional}`;
+      centerShiftRatiosEl.value = `${preset.center_shift_trigger_ratio},${preset.center_shift_step_ratio}`;
+      pauseThresholdsEl.value = `${preset.buy_pause_amp_trigger_ratio},${preset.buy_pause_down_return_trigger_ratio}`;
+      recycleSettingsEl.value = `${preset.inventory_recycle_age_minutes},${preset.inventory_recycle_loss_tolerance_ratio}`;
+      rollingHourlyLossLimitEl.value = String(preset.rolling_hourly_loss_limit);
+      maxCumulativeNotionalEl.value = String(preset.max_cumulative_notional);
+      maxCumulativeLossLimitEl.value = String(preset.max_cumulative_loss_limit);
+      paused = true;
+      toggleBtn.textContent = "恢复自动刷新";
+      restartTimer();
+      toggleModeFields();
+      setStatus(`已载入 ${presetLabel}；已暂停自动刷新，确认参数后再启动。`);
     }
 
     function populateSymbols(symbols, preferred) {
@@ -10960,10 +16102,13 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       const market = (snapshot && snapshot.market) || {};
       const state = (snapshot && snapshot.state) || {};
       const trade = (snapshot && snapshot.trade_summary) || {};
+      const liveTrade = (snapshot && snapshot.live_trade_summary) || {};
+      const live2h = ((liveTrade.windows || {})["2h"]) || {};
       const risk = (snapshot && snapshot.risk_controls) || {};
       const warnings = Array.isArray(snapshot && snapshot.warnings) ? snapshot.warnings : [];
       const cards = [
         ["策略状态", runner.is_running ? "运行中" : "未运行", runner.is_running ? "good" : "warn", `PID: ${runner.pid || "--"} · 模式: ${risk.mode || config.strategy_mode || "--"}`],
+        ["真实2h万U损耗", fmtNum(live2h.loss_per_10000u, 2), Number(live2h.loss || 0) > 0 ? "bad" : "good", `2h成交: ${fmtNum(live2h.gross_notional, 2)} · 损耗: ${fmtMoney(-(live2h.loss || 0))}`],
         ["累计成交额", fmtNum(trade.gross_notional, 4), "", `买/卖: ${fmtNum(trade.buy_notional, 4)} / ${fmtNum(trade.sell_notional, 4)}`],
         ["净收益估算", fmtMoney(trade.net_pnl_estimate), statusClass(trade.net_pnl_estimate), `已实现: ${fmtMoney(trade.realized_pnl)} · 浮盈: ${fmtMoney(trade.unrealized_pnl)}`],
         ["手续费 / 回收损耗", `${fmtMoney(-(trade.commission_quote || 0))} / ${fmtMoney(-(trade.recycle_loss_abs || 0))}`, "bad", `回收已实现: ${fmtMoney(trade.recycle_realized_pnl || 0)}`],
@@ -10980,9 +16125,14 @@ SPOT_RUNNER_PAGE = """<!doctype html>
 
       const riskPills = [
         ["风控模式", risk.mode || "--"],
+        ["运行状态", risk.runtime_status || "--"],
         ["停买", risk.buy_paused ? "是" : "否"],
         ["软/硬库存上限", `${fmtNum(risk.inventory_soft_limit_notional, 2)} / ${fmtNum(risk.inventory_hard_limit_notional, 2)}`],
         ["1m 涨跌 / 振幅", `${fmtPct(risk.market_guard_return_ratio)} / ${fmtPct(risk.market_guard_amplitude_ratio)}`],
+        ["滚动亏损 / 阈值", `${fmtMoney(-(risk.rolling_hourly_loss || 0))} / ${fmtNum(risk.rolling_hourly_loss_limit, 2)}`],
+        ["累计亏损 / 阈值", `${fmtMoney(-(risk.cumulative_loss || 0))} / ${fmtNum(risk.max_cumulative_loss_limit, 2)}`],
+        ["累计成交额 / 阈值", `${fmtNum(risk.cumulative_gross_notional, 2)} / ${fmtNum(risk.max_cumulative_notional, 2)}`],
+        ["停止原因", risk.stop_reason || "--"],
       ];
       riskSummaryEl.innerHTML = riskPills.map(([k, v]) => `<div class="pill"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`).join("");
       startBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
@@ -11041,7 +16191,10 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     }
 
     function renderTrades(snapshot) {
-      const rows = (((snapshot || {}).trade_summary || {}).recent_trades || []).slice().reverse();
+      const liveRows = (((snapshot || {}).live_trade_summary || {}).recent_trades || []);
+      const rows = liveRows.length
+        ? liveRows.slice()
+        : ((((snapshot || {}).trade_summary || {}).recent_trades || []).slice().reverse());
       if (!rows.length) {
         tradesBody.innerHTML = '<tr><td colspan="7" class="empty">当前还没有策略成交</td></tr>';
         return;
@@ -11053,8 +16206,8 @@ SPOT_RUNNER_PAGE = """<!doctype html>
           <td>${fmtNum(row.price, 8)}</td>
           <td>${fmtNum(row.qty, 8)}</td>
           <td>${fmtNum(row.notional, 4)}</td>
-          <td class="${statusClass(row.realized_pnl)}">${fmtMoney(row.realized_pnl)}</td>
-          <td>${escapeHtml(row.role || "--")}</td>
+          <td class="${statusClass(row.realized_pnl)}">${row.realized_pnl === undefined ? fmtMoney(-(row.commission_quote || 0)) : fmtMoney(row.realized_pnl)}</td>
+          <td>${escapeHtml(row.role || (row.source === "binance" ? `真实成交 ${row.is_maker ? "Maker" : "Taker"}` : "--"))}</td>
         </tr>
       `).join("");
     }
@@ -11082,6 +16235,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
 
     function syncFormFromConfig(snapshot) {
       const config = (snapshot && snapshot.config) || {};
+      strategyPresetEl.value = String(config.strategy_profile || "manual_spot");
       strategyModeEl.value = String(config.strategy_mode || "spot_volume_shift_long");
       if (config.grid_level_mode) gridLevelModeEl.value = String(config.grid_level_mode);
       if (config.min_price !== undefined) minPriceEl.value = String(config.min_price);
@@ -11101,6 +16255,11 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       centerShiftRatiosEl.value = `${config.center_shift_trigger_ratio ?? 0.012},${config.center_shift_step_ratio ?? 0.006}`;
       pauseThresholdsEl.value = `${config.buy_pause_amp_trigger_ratio ?? 0.045},${config.buy_pause_down_return_trigger_ratio ?? -0.022}`;
       recycleSettingsEl.value = `${config.inventory_recycle_age_minutes ?? 40},${config.inventory_recycle_loss_tolerance_ratio ?? 0.006}`;
+      runStartTimeEl.value = toLocalInputValue(config.run_start_time);
+      runEndTimeEl.value = toLocalInputValue(config.run_end_time);
+      rollingHourlyLossLimitEl.value = config.rolling_hourly_loss_limit ?? "";
+      maxCumulativeNotionalEl.value = config.max_cumulative_notional ?? "";
+      maxCumulativeLossLimitEl.value = config.max_cumulative_loss_limit ?? "";
       toggleModeFields();
     }
 
@@ -11202,10 +16361,11 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(2, Number(refreshSecondsEl.value || 5));
+      const sec = Math.max(2, Number(refreshSecondsEl.value || __SPOT_RUNNER_REFRESH_DEFAULT__));
       timer = setInterval(() => loadStatus(true), sec * 1000);
     }
 
+    loadSpotPresetBtn.addEventListener("click", loadSpotPreset);
     previewBtn.addEventListener("click", previewGrid);
     refreshBtn.addEventListener("click", () => {
       loadStatus();
@@ -11519,7 +16679,7 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
           <input id="symbols_input" type="text" value="SAHARAUSDT,NIGHTUSDT,CFGUSDT" />
         </label>
         <label>自动刷新（秒）
-          <input id="refresh_sec" type="number" min="3" step="1" value="8" />
+          <input id="refresh_sec" type="number" min="3" step="1" value="__SPOT_STRATEGIES_REFRESH_DEFAULT__" />
         </label>
         <button id="refresh_btn" class="primary">立即刷新</button>
         <button id="toggle_btn">暂停自动刷新</button>
@@ -11706,7 +16866,7 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(3, Number(refreshSecEl.value || 8));
+      const sec = Math.max(3, Number(refreshSecEl.value || __SPOT_STRATEGIES_REFRESH_DEFAULT__));
       timer = setInterval(loadSpotStrategies, sec * 1000);
     }
 
@@ -11953,7 +17113,7 @@ STRATEGIES_PAGE = """<!doctype html>
       </div>
       <div class="toolbar">
         <label>自动刷新（秒）
-          <input id="refresh_sec" type="number" min="3" step="1" value="8" />
+          <input id="refresh_sec" type="number" min="3" step="1" value="__STRATEGIES_REFRESH_DEFAULT__" />
         </label>
         <button id="refresh_btn" class="primary">立即刷新</button>
         <button id="toggle_btn">暂停自动刷新</button>
@@ -11998,7 +17158,7 @@ STRATEGIES_PAGE = """<!doctype html>
 
   <script>
     const DEFAULT_MONITOR_SYMBOLS = ["NIGHTUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
-    const DEFAULT_COMPETITION_SYMBOLS = ["ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT"];
+    const DEFAULT_COMPETITION_SYMBOLS = ["ENSOUSDT", "OPNUSDT", "ROBOUSDT", "KATUSDT", "BASEDUSDT"];
     const cardsEl = document.getElementById("cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");
@@ -12016,6 +17176,7 @@ STRATEGIES_PAGE = """<!doctype html>
     let timer = null;
     let paused = false;
     let strategySymbols = [];
+    let strategiesLoadPromise = null;
 
     function escapeHtml(value) {
       return String(value ?? "")
@@ -12203,7 +17364,14 @@ STRATEGIES_PAGE = """<!doctype html>
     function currentBehavior(snapshot) {
       const runnerCfg = ((snapshot.runner || {}).config || {});
       const risk = snapshot.risk_controls || {};
+      const strategyMode = String(risk.strategy_mode || runnerCfg.strategy_mode || "one_way_long");
       const parts = [];
+      if (risk.xaut_adaptive_enabled) {
+        parts.push(`XAUT 三态：${risk.xaut_adaptive_state || "--"}，候选 ${risk.xaut_adaptive_candidate_state || "--"}，原因 ${risk.xaut_adaptive_reason || "--"}`);
+        if (String(risk.xaut_adaptive_state || "") === "reduce_only") {
+          parts.push(strategyMode === "one_way_short" ? "已撤掉卖单，只保留买单回补减空仓。" : "已撤掉买单，只保留卖单减仓。");
+        }
+      }
       if (risk.auto_regime_enabled) {
         parts.push(`自适应状态：${risk.auto_regime_regime || "--"}，当前子策略 ${risk.effective_strategy_label || risk.effective_strategy_profile || "--"}`);
       }
@@ -12326,30 +17494,61 @@ STRATEGIES_PAGE = """<!doctype html>
       `;
     }
 
-    async function loadStrategies() {
-      metaEl.textContent = "正在刷新全部策略...";
-      try {
-        const symbols = strategySymbols.slice();
-        if (!symbols.length) {
-          summaryEl.textContent = "当前监控/总览币种列表为空。";
-          cardsEl.innerHTML = '<div class="empty">请先在上方“币种列表管理”里添加至少一个监控币种。</div>';
-          metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
-          return;
-        }
-        const results = await Promise.all(symbols.map(async (symbol) => {
+    async function fetchStrategySnapshots(symbols, concurrency = 2) {
+      const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
+      const results = new Array(symbols.length);
+      let nextIndex = 0;
+
+      async function worker() {
+        while (true) {
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+          if (currentIndex >= symbols.length) {
+            return;
+          }
+          const symbol = symbols[currentIndex];
           const resp = await fetch(`/api/loop_monitor?symbol=${encodeURIComponent(symbol)}`);
           const data = await resp.json();
-          if (!resp.ok || !data.ok) throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
-          return data;
-        }));
-        const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
-        const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
-        summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
-        cardsEl.innerHTML = results.map(renderCard).join("");
-        metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
-      } catch (err) {
-        cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
-        metaEl.textContent = `刷新失败：${err}`;
+          if (!resp.ok || !data.ok) {
+            throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
+          }
+          results[currentIndex] = data;
+        }
+      }
+
+      await Promise.all(Array.from({ length: Math.min(normalizedConcurrency, symbols.length) }, () => worker()));
+      return results;
+    }
+
+    async function loadStrategies() {
+      if (strategiesLoadPromise) {
+        return strategiesLoadPromise;
+      }
+      strategiesLoadPromise = (async () => {
+        metaEl.textContent = "正在刷新全部策略...";
+        try {
+          const symbols = strategySymbols.slice();
+          if (!symbols.length) {
+            summaryEl.textContent = "当前监控/总览币种列表为空。";
+            cardsEl.innerHTML = '<div class="empty">请先在上方“币种列表管理”里添加至少一个监控币种。</div>';
+            metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
+            return;
+          }
+          const results = await fetchStrategySnapshots(symbols, 2);
+          const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
+          const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
+          summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
+          cardsEl.innerHTML = results.map(renderCard).join("");
+          metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
+        } catch (err) {
+          cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
+          metaEl.textContent = `刷新失败：${err}`;
+        }
+      })();
+      try {
+        await strategiesLoadPromise;
+      } finally {
+        strategiesLoadPromise = null;
       }
     }
 
@@ -12357,7 +17556,7 @@ STRATEGIES_PAGE = """<!doctype html>
       if (timer) clearInterval(timer);
       timer = null;
       if (paused) return;
-      const sec = Math.max(3, Number(refreshSecEl.value || 8));
+      const sec = Math.max(3, Number(refreshSecEl.value || __STRATEGIES_REFRESH_DEFAULT__));
       timer = setInterval(loadStrategies, sec * 1000);
     }
 
@@ -12409,6 +17608,41 @@ STRATEGIES_PAGE = """<!doctype html>
 </body>
 </html>
 """
+
+
+def _render_page_refresh_defaults(template: str, replacements: dict[str, int]) -> str:
+    rendered = template
+    for placeholder, value in replacements.items():
+        rendered = rendered.replace(placeholder, str(int(value)))
+    return rendered
+
+
+def _render_monitor_page() -> str:
+    return _render_page_refresh_defaults(
+        MONITOR_PAGE,
+        {"__MONITOR_REFRESH_DEFAULT__": _monitor_refresh_default_seconds()},
+    )
+
+
+def _render_spot_runner_page() -> str:
+    return _render_page_refresh_defaults(
+        SPOT_RUNNER_PAGE,
+        {"__SPOT_RUNNER_REFRESH_DEFAULT__": _spot_runner_refresh_default_seconds()},
+    )
+
+
+def _render_spot_strategies_page() -> str:
+    return _render_page_refresh_defaults(
+        SPOT_STRATEGIES_PAGE,
+        {"__SPOT_STRATEGIES_REFRESH_DEFAULT__": _spot_strategies_refresh_default_seconds()},
+    )
+
+
+def _render_strategies_page() -> str:
+    return _render_page_refresh_defaults(
+        STRATEGIES_PAGE,
+        {"__STRATEGIES_REFRESH_DEFAULT__": _strategies_refresh_default_seconds()},
+    )
 
 
 def _safe_float(value: Any, name: str) -> float:
@@ -12649,6 +17883,17 @@ def _validate_market_symbol(
         )
     except Exception:
         supported_symbols = set()
+    if supported_symbols and symbol not in supported_symbols:
+        try:
+            supported_symbols = set(
+                _load_market_symbols(
+                    market_type=market_type,
+                    contract_type=contract_type,
+                    refresh=True,
+                )
+            )
+        except Exception:
+            pass
     if supported_symbols and symbol not in supported_symbols:
         raise ValueError(f"unsupported symbol: {symbol}")
 
@@ -14745,7 +19990,7 @@ def _run_layer_compare(params: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _create_job(params: dict[str, Any]) -> str:
+def _create_job(params: dict[str, Any], job_kind: str = "optimize") -> str:
     job_id = uuid.uuid4().hex
     now = time.time()
     with JOBS_LOCK:
@@ -14760,6 +20005,7 @@ def _create_job(params: dict[str, Any]) -> str:
 
         JOBS[job_id] = {
             "job_id": job_id,
+            "job_kind": job_kind,
             "status": "queued",
             "created_at": now,
             "updated_at": now,
@@ -14972,6 +20218,101 @@ def _normalize_suggest_payload(payload: dict[str, Any]) -> dict[str, Any]:
     params["allocation_modes"] = _ordered_suggestion_modes(params["allocation_modes"])
     params["top_k"] = min(10, max(1, params["top_k"]))
     return params
+
+
+def _normalize_short_volume_candidates_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    market_type = normalize_market_type(payload.get("market_type", "futures"))
+    if market_type != "futures":
+        raise ValueError("short_volume_candidates only supports futures")
+    contract_type = normalize_contract_type(payload.get("contract_type", "usdm"))
+    symbol = str(payload.get("symbol", "BTCUSDT")).upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    start_time = _safe_datetime(payload.get("start_time"), "start_time")
+    end_time = _safe_datetime(payload.get("end_time"), "end_time")
+    interval = str(payload.get("interval", "1m")).strip()
+    total_buy_notional = _safe_float(
+        payload.get("total_buy_notional", payload.get("max_buy_notional", 0)),
+        "total_buy_notional",
+    )
+    include_funding = _safe_bool(payload.get("include_funding", True), "include_funding")
+    fee_rate = _safe_float(payload.get("fee_rate", 0.0002), "fee_rate")
+    slippage = _safe_float(payload.get("slippage", 0.0), "slippage")
+    refresh = bool(payload.get("refresh", False))
+
+    if start_time >= end_time:
+        raise ValueError("start_time must be earlier than end_time")
+    _enforce_seconds_interval_limit(start_time, end_time, interval)
+    if total_buy_notional <= 0:
+        raise ValueError("total_buy_notional must be > 0")
+    if fee_rate < 0 or slippage < 0:
+        raise ValueError("fee_rate/slippage must be >= 0")
+    _validate_market_symbol(symbol=symbol, market_type=market_type, contract_type=contract_type)
+
+    return {
+        "market_type": market_type,
+        "contract_type": contract_type,
+        "symbol": symbol,
+        "start_time": start_time,
+        "end_time": end_time,
+        "interval": interval,
+        "total_buy_notional": total_buy_notional,
+        "include_funding": include_funding,
+        "fee_rate": fee_rate,
+        "slippage": slippage,
+        "refresh": refresh,
+    }
+
+
+def _run_short_volume_candidates(
+    params: dict[str, Any],
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    cache_path = str(
+        cache_file_path(
+            params["symbol"],
+            params["interval"],
+            cache_dir="data",
+            contract_type=params["contract_type"],
+            market_type=params["market_type"],
+        )
+    )
+    funding_cache_path = str(
+        funding_cache_file_path(
+            params["symbol"],
+            cache_dir="data",
+            contract_type=params["contract_type"],
+            market_type=params["market_type"],
+        )
+    )
+    report = build_short_volume_candidate_report(
+        symbol=params["symbol"],
+        start_time=params["start_time"],
+        end_time=params["end_time"],
+        interval=params["interval"],
+        total_buy_notional=params["total_buy_notional"],
+        contract_type=params["contract_type"],
+        cache_dir="data",
+        include_funding=params["include_funding"],
+        fee_rate=params["fee_rate"],
+        slippage=params["slippage"],
+        refresh=params["refresh"],
+        progress_callback=progress_callback,
+    )
+    report["ok"] = True
+    report["data"] = {
+        "market_type": params["market_type"],
+        "contract_type": params["contract_type"],
+        "symbol": params["symbol"],
+        "interval": params["interval"],
+        "start_time": params["start_time"].isoformat(),
+        "end_time": params["end_time"].isoformat(),
+        "total_buy_notional": params["total_buy_notional"],
+        "include_funding": params["include_funding"],
+        "cache_file": cache_path,
+        "funding_cache_file": funding_cache_path if params["include_funding"] else None,
+    }
+    return report
 
 
 def _run_range_suggestion(params: dict[str, Any]) -> dict[str, Any]:
@@ -15483,6 +20824,7 @@ def _run_job_worker(job_id: str) -> None:
     if not snapshot:
         return
     params = snapshot["params"]
+    job_kind = str(snapshot.get("job_kind", "optimize")).strip().lower()
     start_ts = time.time()
     backtest_start_ts = start_ts
 
@@ -15507,12 +20849,22 @@ def _run_job_worker(job_id: str) -> None:
             eta_seconds = int(elapsed * (1.0 - ratio) / ratio)
 
         progress_value = 0.15 + 0.8 * ratio
-        message = f"回测中 {processed}/{total}"
-        if n is not None:
-            message += f" (N={n}"
-            if mode:
-                message += f", mode={mode}"
-            message += ")"
+        message = str(event.get("message", "")).strip()
+        if not message:
+            if job_kind == "short_volume_candidates":
+                message = f"生成候选中 {processed}/{total}"
+                if n is not None:
+                    message += f" (N={n}"
+                    if mode:
+                        message += f", mode={mode}"
+                    message += ")"
+            else:
+                message = f"回测中 {processed}/{total}"
+                if n is not None:
+                    message += f" (N={n}"
+                    if mode:
+                        message += f", mode={mode}"
+                    message += ")"
 
         _update_job(
             job_id,
@@ -15525,18 +20877,31 @@ def _run_job_worker(job_id: str) -> None:
         )
 
     try:
-        load_message = "加载K线和资金费率数据..." if params.get("include_funding") else "加载K线数据..."
+        if job_kind == "short_volume_candidates":
+            load_message = "加载K线并生成空头刷量候选..."
+        else:
+            load_message = "加载K线和资金费率数据..." if params.get("include_funding") else "加载K线数据..."
         _update_job(job_id, status="running", progress=0.05, message=load_message)
-        result = _run_optimizer(params, progress_callback=_progress)
+        if job_kind == "short_volume_candidates":
+            result = _run_short_volume_candidates(params, progress_callback=_progress)
+        else:
+            result = _run_optimizer(params, progress_callback=_progress)
+        search_info = result.get("search", {})
+        processed = int(search_info.get("tested", 0) or 0)
+        total = int(search_info.get("total", processed) or processed)
         total_elapsed = int(time.time() - start_ts)
         _update_job(
             job_id,
             status="done",
             progress=1.0,
-            processed=result.get("search", {}).get("tested", 0),
-            total=result.get("search", {}).get("tested", 0),
+            processed=processed,
+            total=total,
             eta_seconds=0,
-            message=f"测算完成，用时 {total_elapsed}s",
+            message=(
+                f"候选生成完成，用时 {total_elapsed}s"
+                if job_kind == "short_volume_candidates"
+                else f"测算完成，用时 {total_elapsed}s"
+            ),
             result=result,
             error=None,
         )
@@ -15561,7 +20926,7 @@ def _safe_positive_int_query(value: Any, default: int) -> int:
 
 def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
     symbol = str(query.get("symbol", ["NIGHTUSDT"])[0]).upper().strip() or "NIGHTUSDT"
-    summary_limit = _safe_positive_int_query(query.get("summary_limit", ["500"])[0], 500)
+    summary_limit = min(_safe_positive_int_query(query.get("summary_limit", ["500"])[0], 500), 2000)
     runner = read_symbol_runner_process(symbol)
     if isinstance(runner, dict):
         runner = dict(runner)
@@ -15600,31 +20965,24 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
         summary_limit=summary_limit,
         runner_process=runner,
     )
+    volume_trigger_status = _runner_volume_trigger_status(symbol) or {}
+    snapshot["volume_trigger"] = {
+        "enabled": bool(runner_config.get("volume_trigger_enabled", False)),
+        "window": runner_config.get("volume_trigger_window"),
+        "start_threshold": runner_config.get("volume_trigger_start_threshold"),
+        "stop_threshold": runner_config.get("volume_trigger_stop_threshold"),
+        **volume_trigger_status,
+    }
+    volatility_trigger_status = _runner_volatility_trigger_status(symbol) or {}
+    snapshot["volatility_trigger"] = {
+        "enabled": bool(runner_config.get("volatility_trigger_enabled", False)),
+        "window": runner_config.get("volatility_trigger_window"),
+        "amplitude_ratio": runner_config.get("volatility_trigger_amplitude_ratio"),
+        "abs_return_ratio": runner_config.get("volatility_trigger_abs_return_ratio"),
+        **volatility_trigger_status,
+    }
     snapshot["runner_presets"] = _runner_preset_summaries(symbol)
     return snapshot
-
-
-def _console_redirect_target(path: str) -> str | None:
-    if path in {"/", "/index.html", "/hub", "/hub.html", "/portal", "/portal.html"}:
-        return "/console"
-    return None
-
-
-def _console_registry_payload() -> dict[str, Any]:
-    registry = load_console_registry()
-    payload = serialize_console_registry(registry)
-    return {"ok": True, **payload}
-
-
-def _console_overview_payload(query: dict[str, list[str]]) -> tuple[dict[str, Any], int]:
-    account_id = str(query.get("account_id", [""])[0]).strip()
-    if not account_id:
-        return {"ok": False, "error": "account_id is required"}, HTTPStatus.BAD_REQUEST
-    registry = load_console_registry()
-    try:
-        return build_console_overview(registry, account_id), HTTPStatus.OK
-    except ValueError as exc:
-        return {"ok": False, "error": str(exc)}, HTTPStatus.NOT_FOUND
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -15696,25 +21054,17 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def _send_redirect(self, location: str, status: int = HTTPStatus.FOUND) -> None:
-        self.send_response(status)
-        self.send_header("Location", location)
-        for key, value in _security_headers().items():
-            self.send_header(key, value)
-        self.end_headers()
-
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
         query = parse_qs(parsed.query)
-        redirect_target = _console_redirect_target(path)
-        if redirect_target is not None:
-            self._send_redirect(redirect_target)
-            return
         if not self._authorize_request():
             return
-        if path in {"/console", "/console.html"}:
-            self._send_html(build_console_page(), status=HTTPStatus.OK)
+        if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
+            self._send_html(SERVER_HUB_PAGE, status=HTTPStatus.OK)
+            return
+        if path in {"/", "/index.html"}:
+            self._send_html(HTML_PAGE, status=HTTPStatus.OK)
             return
         if path in {"/rankings", "/rankings.html"}:
             self._send_html(RANKING_PAGE, status=HTTPStatus.OK)
@@ -15726,26 +21076,19 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_html(BASIS_PAGE, status=HTTPStatus.OK)
             return
         if path in {"/monitor", "/monitor.html"}:
-            self._send_html(MONITOR_PAGE, status=HTTPStatus.OK)
+            self._send_html(_render_monitor_page(), status=HTTPStatus.OK)
             return
         if path in {"/spot_runner", "/spot_runner.html"}:
-            self._send_html(SPOT_RUNNER_PAGE, status=HTTPStatus.OK)
+            self._send_html(_render_spot_runner_page(), status=HTTPStatus.OK)
             return
         if path in {"/spot_strategies", "/spot_strategies.html"}:
-            self._send_html(SPOT_STRATEGIES_PAGE, status=HTTPStatus.OK)
+            self._send_html(_render_spot_strategies_page(), status=HTTPStatus.OK)
             return
         if path in {"/strategies", "/strategies.html"}:
-            self._send_html(STRATEGIES_PAGE, status=HTTPStatus.OK)
+            self._send_html(_render_strategies_page(), status=HTTPStatus.OK)
             return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
-            return
-        if path == "/api/console/registry":
-            self._send_json(_console_registry_payload(), status=HTTPStatus.OK)
-            return
-        if path == "/api/console/overview":
-            payload, status = _console_overview_payload(query)
-            self._send_json(payload, status=status)
             return
         if path == "/api/competition_board":
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"
@@ -15939,14 +21282,16 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
-        redirect_target = _console_redirect_target(path)
-        if redirect_target is not None:
-            self._send_redirect(redirect_target)
-            return
         if not self._authorize_request():
             return
-        if path in {"/console", "/console.html"}:
-            body = build_console_page().encode("utf-8")
+        if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
+            body = SERVER_HUB_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
+        if path in {"/", "/index.html"}:
+            body = HTML_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
@@ -15994,18 +21339,6 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path == "/api/health":
-            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self._send_common_headers("application/json; charset=utf-8", len(body))
-            self.end_headers()
-            return
-        if path == "/api/console/registry":
-            body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self._send_common_headers("application/json; charset=utf-8", len(body))
-            self.end_headers()
-            return
-        if path == "/api/console/overview":
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("application/json; charset=utf-8", len(body))
@@ -16074,7 +21407,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
-        if path in {"/api/runner/start", "/api/runner/stop"}:
+        if path in {"/api/runner/start", "/api/runner/stop", "/api/runner/save"}:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -16098,13 +21431,18 @@ class _Handler(BaseHTTPRequestHandler):
                 if path.endswith("/start"):
                     config = _resolve_runner_start_config(payload)
                     result = _start_runner_process(config)
+                elif path.endswith("/save"):
+                    result = _save_runner_config_without_start(payload)
                 else:
                     result = _stop_runner_process(
                         payload.get("symbol"),
                         cancel_open_orders=_safe_bool(payload.get("cancel_open_orders", False), "cancel_open_orders"),
                         close_all_positions=_safe_bool(payload.get("close_all_positions", False), "close_all_positions"),
+                        clear_volatility_resume_state=True,
                     )
                 self._send_json({"ok": True, **result}, status=200)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
@@ -16194,10 +21532,12 @@ class _Handler(BaseHTTPRequestHandler):
 
         if path not in {
             "/api/optimize",
+            "/api/short_volume_candidates",
             "/api/grid_preview",
             "/api/runner/presets/create_grid",
             "/api/runner/presets/update_grid",
             "/api/runner/presets/delete_grid",
+            "/api/runner/presets/save_running",
             "/api/layer_compare",
             "/api/suggest_range",
             "/api/funding_breakdown",
@@ -16233,7 +21573,19 @@ class _Handler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
-            job_id = _create_job(params)
+            job_id = _create_job(params, job_kind="optimize")
+            worker = threading.Thread(target=_run_job_worker, args=(job_id,), daemon=True)
+            worker.start()
+            self._send_json({"ok": True, "job_id": job_id}, status=202)
+            return
+
+        if path == "/api/short_volume_candidates":
+            try:
+                params = _normalize_short_volume_candidates_payload(payload)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            job_id = _create_job(params, job_kind="short_volume_candidates")
             worker = threading.Thread(target=_run_job_worker, args=(job_id,), daemon=True)
             worker.start()
             self._send_json({"ok": True, "job_id": job_id}, status=202)
@@ -16302,6 +21654,18 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 result = _delete_custom_grid_runner_preset(preset_key, symbol or None)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:  # pragma: no cover
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(result, status=200)
+            return
+
+        if path == "/api/runner/presets/save_running":
+            try:
+                result = _save_running_runner_preset(payload)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
@@ -16423,6 +21787,44 @@ def main() -> None:
     parser.add_argument("--port", type=int, default=8787)
     args = parser.parse_args()
 
+    volume_trigger_stop_event = threading.Event()
+    volume_trigger_thread = threading.Thread(
+        target=_run_volume_trigger_loop,
+        args=(volume_trigger_stop_event,),
+        daemon=True,
+        name="runner-volume-trigger",
+    )
+    volume_trigger_thread.start()
+    volatility_trigger_stop_event = threading.Event()
+    volatility_trigger_thread = threading.Thread(
+        target=_run_volatility_trigger_loop,
+        args=(volatility_trigger_stop_event,),
+        daemon=True,
+        name="runner-volatility-trigger",
+    )
+    volatility_trigger_thread.start()
+    competition_refresh_stop_event = threading.Event()
+    hourly_email_stop_event = threading.Event()
+    if _competition_board_auto_refresh_enabled():
+        refresh_interval = _competition_board_auto_refresh_interval_seconds()
+        competition_refresh_thread = threading.Thread(
+            target=_run_competition_board_auto_refresh_loop,
+            args=(competition_refresh_stop_event, refresh_interval),
+            daemon=True,
+            name="competition-board-refresh",
+        )
+        competition_refresh_thread.start()
+        print(
+            "[competition-board] auto refresh every "
+            f"{refresh_interval / 60:.0f}m ({refresh_interval:.0f}s)"
+        )
+    hourly_email_thread = threading.Thread(
+        target=_run_hourly_email_report_loop,
+        args=(hourly_email_stop_event,),
+        daemon=True,
+        name="hourly-email-report",
+    )
+    hourly_email_thread.start()
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(f"Grid Web UI running at http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop.")
@@ -16431,6 +21833,10 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
+        volume_trigger_stop_event.set()
+        volatility_trigger_stop_event.set()
+        competition_refresh_stop_event.set()
+        hourly_email_stop_event.set()
         server.server_close()
 
 

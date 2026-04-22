@@ -9,11 +9,13 @@ from urllib.error import HTTPError
 
 from grid_optimizer import data as data_module
 from grid_optimizer.data import (
+    SPOT_EXCHANGE_INFO_MAX_HTTP_RESPONSE_BYTES,
     COINM_MAX_KLINE_WINDOW_MS,
     FUNDING_DEFAULT_STEP_MS,
     _http_request_json,
     _ipv4_first_getaddrinfo,
     _prefer_ipv4,
+    fetch_spot_markets,
     fetch_funding_rates,
     fetch_futures_klines,
     fetch_futures_symbol_config,
@@ -116,6 +118,23 @@ class DataFetchTests(unittest.TestCase):
             _http_request_json("https://example.com/huge-error", {})
 
         self.assertIn("too large", str(ctx.exception).lower())
+
+    @patch("grid_optimizer.data.MAX_HTTP_RESPONSE_BYTES", 64, create=True)
+    @patch("grid_optimizer.data.urlopen")
+    def test_http_request_json_accepts_endpoint_specific_larger_limit(self, mock_urlopen) -> None:
+        payload = b'{"data":"' + (b"x" * 100) + b'"}'
+        mock_urlopen.return_value = self._FakeResponse(
+            payload,
+            headers={"Content-Length": str(len(payload))},
+        )
+
+        data = _http_request_json(
+            "https://example.com/large-ok",
+            {},
+            max_response_bytes=256,
+        )
+
+        self.assertEqual(data["data"], "x" * 100)
 
     def test_second_level_interval_range_limit(self) -> None:
         start = datetime(2025, 1, 1, tzinfo=timezone.utc)
@@ -324,6 +343,29 @@ class DataFetchTests(unittest.TestCase):
         self.assertAlmostEqual(float(config["tick_size"] or 0.0), 0.0001, places=8)
         self.assertAlmostEqual(float(config["step_size"] or 0.0), 0.1, places=8)
         self.assertAlmostEqual(float(config["min_notional"] or 0.0), 5.0, places=8)
+
+    @patch("grid_optimizer.data._http_get_json")
+    def test_fetch_spot_markets_uses_larger_exchange_info_limit(self, mock_http_get_json) -> None:
+        mock_http_get_json.return_value = {
+            "symbols": [
+                {
+                    "symbol": "BARDUSDT",
+                    "status": "TRADING",
+                    "baseAsset": "BARD",
+                    "quoteAsset": "USDT",
+                    "isSpotTradingAllowed": True,
+                }
+            ]
+        }
+
+        markets = fetch_spot_markets()
+
+        self.assertEqual(markets, [{"symbol": "BARDUSDT", "base_asset": "BARD", "quote_asset": "USDT"}])
+        mock_http_get_json.assert_called_once_with(
+            data_module._SPOT_URLS["exchange_info"],
+            {},
+            max_response_bytes=SPOT_EXCHANGE_INFO_MAX_HTTP_RESPONSE_BYTES,
+        )
 
 
 if __name__ == "__main__":

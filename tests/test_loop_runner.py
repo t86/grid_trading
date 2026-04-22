@@ -7,36 +7,409 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
+from grid_optimizer.web import _validate_market_symbol
 from grid_optimizer.audit import build_audit_paths
 from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _should_sync_account_audit,
     _apply_synthetic_trade_fill,
+    _build_parser,
     _current_check_bucket,
     _custom_grid_levels_above_current,
+    _generate_competition_inventory_grid_plan,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
+    _resolve_synthetic_resync_price,
     _shift_custom_grid_bounds,
     apply_excess_inventory_reduce_only,
+    apply_active_delever_long,
+    apply_active_delever_short,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
+    apply_take_profit_profit_guard,
+    apply_synthetic_overweight_deleveraging,
+    apply_threshold_target_reduce,
     apply_inventory_tiering,
     apply_max_position_notional_cap,
     apply_position_controls,
+    apply_xaut_reduce_only_pruning,
     assess_auto_regime,
     assess_market_guard,
+    assess_xaut_adaptive_regime,
     build_effective_runner_args,
-    generate_plan_report,
+    build_xaut_adaptive_runner_args,
     execute_plan_report,
+    generate_plan_report,
+    main,
+    limit_synthetic_inventory_by_distance,
+    resolve_synthetic_distance_regime,
     resolve_neutral_hourly_scale,
     resolve_auto_regime_profile,
+    resolve_xaut_adaptive_state,
     update_synthetic_order_refs,
 )
+from grid_optimizer.inventory_grid_plan import build_inventory_grid_orders
 from grid_optimizer.semi_auto_plan import build_static_binance_grid_plan
+from grid_optimizer.submit_plan import (
+    prepare_post_only_order_request,
+    preserve_queue_priority_in_execution_actions,
+)
 from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 10.0, "notional": 9.9, "role": "entry_long"},
+                {"side": "BUY", "price": 1.01, "qty": 10.0, "notional": 10.1, "role": "take_profit_short"},
+                {"side": "BUY", "price": 1.02, "qty": 10.0, "notional": 10.2, "role": "active_delever_short"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 10.0, "notional": 10.1, "role": "take_profit_long"},
+                {"side": "SELL", "price": 1.02, "qty": 10.0, "notional": 10.2, "role": "active_delever_long"},
+                {"side": "SELL", "price": 1.03, "qty": 10.0, "notional": 10.3, "role": "entry_short"},
+            ],
+        }
+
+        report = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=100.0,
+            current_short_qty=50.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.0,
+            current_long_notional=100.0,
+            current_short_notional=50.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=None,
+            min_profit_ratio=None,
+            tick_size=0.01,
+            bid_price=1.00,
+            ask_price=1.01,
+        )
+
+        self.assertTrue(report["enabled"])
+        self.assertTrue(report["long_cost_basis_missing"])
+        self.assertTrue(report["short_cost_basis_missing"])
+        self.assertEqual(report["dropped_sell_orders"], 2)
+        self.assertEqual(report["dropped_buy_orders"], 2)
+        self.assertEqual([item["role"] for item in plan["sell_orders"]], ["entry_short"])
+        self.assertEqual([item["role"] for item in plan["buy_orders"]], ["entry_long"])
+
+    def test_take_profit_guard_defaults_to_break_even_when_ratio_is_unset(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.04, "qty": 10.0, "notional": 10.4, "role": "take_profit_long"},
+            ],
+        }
+
+        report = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=100.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.05,
+            current_short_avg_price=0.0,
+            current_long_notional=100.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=None,
+            min_profit_ratio=None,
+            tick_size=0.01,
+            bid_price=1.00,
+            ask_price=1.01,
+        )
+
+        self.assertTrue(report["long_active"])
+        self.assertEqual(report["adjusted_sell_orders"], 1)
+        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.05)
+
+    def test_synthetic_resync_does_not_use_mid_price_as_nonzero_cost_basis(self) -> None:
+        resolved = _resolve_synthetic_resync_price(
+            actual_position_qty=300.0,
+            entry_price=0.0,
+            fallback_price=1.20,
+            snapshot={"virtual_long_avg_price": 0.0, "virtual_short_avg_price": 0.0},
+        )
+
+        self.assertEqual(resolved, 0.0)
+
+    def test_resolve_synthetic_distance_regime_requires_confirmed_reentry(self) -> None:
+        state: dict[str, object] = {}
+
+        exited = resolve_synthetic_distance_regime(
+            state=state,
+            center_price=10.0,
+            mid_price=8.9,
+            step_price=0.5,
+            near_market_max_center_distance_steps=2.0,
+            grid_inventory_rebalance_min_center_distance_steps=3.0,
+            near_market_reentry_confirm_cycles=2,
+        )
+        self.assertFalse(exited["near_market_active"])
+        self.assertEqual(exited["zone"], "grid_transition")
+
+        pending = resolve_synthetic_distance_regime(
+            state=state,
+            center_price=10.0,
+            mid_price=9.1,
+            step_price=0.5,
+            near_market_max_center_distance_steps=2.0,
+            grid_inventory_rebalance_min_center_distance_steps=3.0,
+            near_market_reentry_confirm_cycles=2,
+        )
+        self.assertFalse(pending["near_market_active"])
+        self.assertEqual(pending["reentry_pending_count"], 1)
+        self.assertEqual(pending["zone"], "grid_transition")
+
+        reentered = resolve_synthetic_distance_regime(
+            state=state,
+            center_price=10.0,
+            mid_price=9.2,
+            step_price=0.5,
+            near_market_max_center_distance_steps=2.0,
+            grid_inventory_rebalance_min_center_distance_steps=3.0,
+            near_market_reentry_confirm_cycles=2,
+        )
+        self.assertTrue(reentered["near_market_active"])
+        self.assertEqual(reentered["reentry_pending_count"], 0)
+        self.assertEqual(reentered["zone"], "near_market")
+
+    def test_limit_synthetic_inventory_by_distance_prunes_long_entries_to_missing_levels(self) -> None:
+        plan = {
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 9.95, "qty": 12.0, "notional": 119.4, "role": "bootstrap_long", "level": 0}
+            ],
+            "buy_orders": [
+                {"side": "BUY", "price": 9.5, "qty": 3.0, "notional": 28.5, "role": "entry_long", "level": 1},
+                {"side": "BUY", "price": 9.0, "qty": 3.0, "notional": 27.0, "role": "entry_long", "level": 2},
+                {"side": "BUY", "price": 8.5, "qty": 3.0, "notional": 25.5, "role": "entry_long", "level": 3},
+            ],
+            "sell_orders": [],
+        }
+
+        report = limit_synthetic_inventory_by_distance(
+            plan=plan,
+            displacement_side="long",
+            current_long_notional=30.0,
+            current_short_notional=0.0,
+            target_inventory_levels=3,
+            per_order_notional=30.0,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["target_inventory_levels"], 3)
+        self.assertEqual(report["missing_inventory_levels"], 2)
+        self.assertEqual(len(plan["bootstrap_orders"]), 0)
+        self.assertEqual([order["level"] for order in plan["buy_orders"]], [1, 2])
+
+    def test_limit_synthetic_inventory_by_distance_marks_long_over_target_for_reduction(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 9.5, "qty": 3.0, "notional": 28.5, "role": "entry_long", "level": 1},
+            ],
+            "sell_orders": [],
+        }
+
+        report = limit_synthetic_inventory_by_distance(
+            plan=plan,
+            displacement_side="long",
+            current_long_notional=150.0,
+            current_short_notional=0.0,
+            target_inventory_levels=3,
+            per_order_notional=30.0,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["target_inventory_notional"], 90.0)
+        self.assertAlmostEqual(report["excess_notional"], 60.0)
+        self.assertEqual(plan["buy_orders"], [])
+
+    def test_apply_active_delever_long_supports_forced_inventory_target(self) -> None:
+        plan = {
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 10.0, "role": "take_profit_long", "level": 1},
+                {"side": "SELL", "price": 1.02, "qty": 10.0, "role": "take_profit_long", "level": 2},
+            ]
+        }
+
+        report = apply_active_delever_long(
+            plan=plan,
+            current_long_qty=20.0,
+            current_long_notional=20.0,
+            current_long_avg_price=1.05,
+            current_long_lots=[{"qty": 20.0, "price": 1.05}],
+            pause_long_position_notional=100.0,
+            threshold_position_notional=None,
+            per_order_notional=10.0,
+            step_price=0.01,
+            tick_size=0.001,
+            ask_price=1.0,
+            min_profit_ratio=None,
+            market_guard_buy_pause_active=False,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            synthetic_unmatched_trade_count=0,
+            forced_target_notional=10.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["trigger_mode"], "inventory_rebalance")
+        self.assertEqual(plan["sell_orders"][0]["role"], "active_delever_long")
+
+    def test_preserve_queue_priority_drops_order_that_falls_below_min_notional_after_reprice(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.1847, "qty": 1.0, "notional": 0.1847, "role": "take_profit_long"},
+            ],
+            "cancel_orders": [],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.1846,
+            live_ask_price=0.1847,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(adjusted["place_orders"], [])
+        self.assertEqual(adjusted["place_count"], 0)
+
+    def test_prepare_post_only_order_request_skips_sell_order_when_live_bid_floor_breaks_min_notional(self) -> None:
+        prepared_order, skip_reason = prepare_post_only_order_request(
+            order={"side": "SELL", "price": 0.1847, "qty": 28.0, "notional": 5.1716, "role": "entry_short"},
+            side="SELL",
+            live_bid_price=0.1768,
+            live_ask_price=0.1769,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            post_only=True,
+        )
+
+        self.assertIsNone(prepared_order)
+        self.assertIsNotNone(skip_reason)
+        self.assertEqual(skip_reason["reason"], "reference_notional_below_min_notional")
+
+    def test_apply_active_delever_long_blocks_when_synthetic_ledger_avg_price_invalid(self) -> None:
+        plan = {
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 10.0, "role": "take_profit_long", "level": 1},
+                {"side": "SELL", "price": 1.02, "qty": 10.0, "role": "take_profit_long", "level": 2},
+            ]
+        }
+
+        report = apply_active_delever_long(
+            plan=plan,
+            current_long_qty=20.0,
+            current_long_notional=20.0,
+            current_long_avg_price=0.0,
+            current_long_lots=[],
+            pause_long_position_notional=10.0,
+            threshold_position_notional=None,
+            per_order_notional=10.0,
+            step_price=0.01,
+            tick_size=0.001,
+            ask_price=1.0,
+            min_profit_ratio=None,
+            market_guard_buy_pause_active=False,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            synthetic_unmatched_trade_count=0,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report.get("guard_reason"), "synthetic_long_avg_price_invalid")
+        self.assertEqual([item["role"] for item in plan["sell_orders"]], ["take_profit_long", "take_profit_long"])
+
+    def test_apply_active_delever_long_blocks_when_synthetic_ledger_has_unmatched_trades(self) -> None:
+        plan = {
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 10.0, "role": "take_profit_long", "level": 1},
+                {"side": "SELL", "price": 1.02, "qty": 10.0, "role": "take_profit_long", "level": 2},
+            ]
+        }
+
+        report = apply_active_delever_long(
+            plan=plan,
+            current_long_qty=20.0,
+            current_long_notional=20.0,
+            current_long_avg_price=1.05,
+            current_long_lots=[{"qty": 20.0, "price": 1.05}],
+            pause_long_position_notional=10.0,
+            threshold_position_notional=None,
+            per_order_notional=10.0,
+            step_price=0.01,
+            tick_size=0.001,
+            ask_price=1.0,
+            min_profit_ratio=None,
+            market_guard_buy_pause_active=False,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            synthetic_unmatched_trade_count=3,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report.get("guard_reason"), "synthetic_unmatched_trades")
+        self.assertEqual([item["role"] for item in plan["sell_orders"]], ["take_profit_long", "take_profit_long"])
+
+    def test_apply_active_delever_short_blocks_when_synthetic_ledger_avg_price_invalid(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 10.0, "role": "take_profit_short", "level": 1},
+                {"side": "BUY", "price": 0.98, "qty": 10.0, "role": "take_profit_short", "level": 2},
+            ]
+        }
+
+        report = apply_active_delever_short(
+            plan=plan,
+            current_short_qty=20.0,
+            current_short_notional=20.0,
+            current_short_avg_price=0.0,
+            current_short_lots=[],
+            pause_short_position_notional=10.0,
+            threshold_position_notional=None,
+            per_order_notional=10.0,
+            step_price=0.01,
+            tick_size=0.001,
+            bid_price=1.0,
+            ask_price=1.001,
+            min_profit_ratio=None,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            synthetic_unmatched_trade_count=0,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report.get("guard_reason"), "synthetic_short_avg_price_invalid")
+        self.assertEqual([item["role"] for item in plan["buy_orders"]], ["take_profit_short", "take_profit_short"])
+
+    @patch("grid_optimizer.web._load_market_symbols")
+    def test_validate_market_symbol_refreshes_when_symbol_missing_from_cache(self, mock_load_market_symbols) -> None:
+        mock_load_market_symbols.side_effect = [
+            ["BTCUSDT", "ETHUSDT"],
+            ["BTCUSDT", "ETHUSDT", "BASEDUSDT"],
+        ]
+
+        _validate_market_symbol(symbol="BASEDUSDT", market_type="futures", contract_type="usdm")
+
+        self.assertEqual(mock_load_market_symbols.call_count, 2)
+        first_call = mock_load_market_symbols.call_args_list[0]
+        second_call = mock_load_market_symbols.call_args_list[1]
+        self.assertEqual(first_call.kwargs["refresh"], False)
+        self.assertEqual(second_call.kwargs["refresh"], True)
+
     def test_current_check_bucket_rounds_down_to_interval(self) -> None:
         bucket = _current_check_bucket(
             datetime(2026, 3, 31, 14, 27, 12, tzinfo=timezone.utc),
@@ -176,6 +549,52 @@ class LoopRunnerTests(unittest.TestCase):
             )
         )
 
+    @patch("grid_optimizer.loop_runner.build_inventory_grid_orders")
+    @patch("grid_optimizer.loop_runner._resolve_competition_inventory_grid_runtime")
+    def test_competition_inventory_grid_plan_uses_configured_levels(
+        self,
+        mock_resolve_runtime,
+        mock_build_orders,
+    ) -> None:
+        mock_resolve_runtime.return_value = {
+            "grid_anchor_price": 1.0,
+            "direction_state": "long_active",
+            "pair_credit_steps": 0,
+            "recovery_mode": "live",
+        }
+        mock_build_orders.return_value = {
+            "risk_state": "normal",
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [],
+            "forced_reduce_orders": [],
+            "tail_cleanup_active": False,
+        }
+
+        _generate_competition_inventory_grid_plan(
+            state={},
+            trades=[],
+            current_position_qty=0.0,
+            bid_price=1.0,
+            ask_price=1.01,
+            step_price=0.001,
+            first_order_multiplier=4.0,
+            per_order_notional=35.0,
+            buy_levels=8,
+            sell_levels=7,
+            threshold_position_notional=50.0,
+            max_order_position_notional=80.0,
+            max_position_notional=120.0,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        kwargs = mock_build_orders.call_args.kwargs
+        self.assertEqual(kwargs["buy_levels"], 8)
+        self.assertEqual(kwargs["sell_levels"], 7)
+
     def test_build_static_binance_grid_plan_splits_orders_by_current_price(self) -> None:
         bootstrap = build_static_binance_grid_plan(
             strategy_direction="long",
@@ -246,6 +665,88 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["bootstrap_qty"], 0.0)
         self.assertEqual(plan["target_long_base_qty"], 0.0)
         self.assertEqual(plan["bootstrap_long_qty"], 0.0)
+
+    def test_build_static_binance_grid_plan_prioritizes_nearest_short_take_profit(self) -> None:
+        partial = build_static_binance_grid_plan(
+            strategy_direction="short",
+            grid_level_mode="arithmetic",
+            min_price=10.0,
+            max_price=14.0,
+            n=4,
+            total_grid_notional=400.0,
+            neutral_anchor_price=None,
+            bid_price=11.99,
+            ask_price=12.01,
+            tick_size=0.01,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            current_long_qty=0.0,
+            current_short_qty=7.3,
+            bootstrap_positions=True,
+        )
+
+        self.assertEqual([item["price"] for item in partial["buy_orders"]], [11.0])
+
+    def test_inventory_grid_short_active_uses_multiple_levels(self) -> None:
+        plan = build_inventory_grid_orders(
+            runtime={
+                "market_type": "futures",
+                "direction_state": "short_active",
+                "recovery_mode": "live",
+                "risk_state": "normal",
+                "grid_anchor_price": 1.0000,
+                "position_lots": [{"qty": 60.0, "entry_price": 1.0}],
+            },
+            bid_price=0.9995,
+            ask_price=1.0005,
+            step_price=0.001,
+            per_order_notional=10.0,
+            first_order_multiplier=1.0,
+            threshold_position_notional=120.0,
+            max_order_position_notional=200.0,
+            max_position_notional=500.0,
+            buy_levels=3,
+            sell_levels=3,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertEqual(len(plan["buy_orders"]), 3)
+        self.assertEqual(len(plan["sell_orders"]), 3)
+
+    def test_inventory_grid_flat_futures_bootstrap_uses_multiple_levels(self) -> None:
+        plan = build_inventory_grid_orders(
+            runtime={
+                "market_type": "futures",
+                "direction_state": "flat",
+                "recovery_mode": "live",
+                "risk_state": "normal",
+                "grid_anchor_price": 1.0000,
+                "position_lots": [],
+            },
+            bid_price=0.9995,
+            ask_price=1.0005,
+            step_price=0.001,
+            per_order_notional=10.0,
+            first_order_multiplier=1.0,
+            threshold_position_notional=120.0,
+            max_order_position_notional=200.0,
+            max_position_notional=500.0,
+            buy_levels=3,
+            sell_levels=3,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        bootstrap_orders = plan["bootstrap_orders"]
+        self.assertEqual(len(bootstrap_orders), 6)
+        self.assertEqual(sum(1 for item in bootstrap_orders if item["side"] == "BUY"), 3)
+        self.assertEqual(sum(1 for item in bootstrap_orders if item["side"] == "SELL"), 3)
 
     @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
@@ -372,6 +873,425 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["bootstrap_orders"], [])
         self.assertGreater(len(report["buy_orders"]), 0)
 
+    @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_custom_grid_short_bootstraps_short_inventory(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_resolve_custom_grid_roll,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.1,
+            "min_qty": 0.1,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "11.99", "ask_price": "12.01"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+        }
+        mock_resolve_custom_grid_roll.return_value = (
+            10.0,
+            14.0,
+            {"enabled": False, "checked": False, "triggered": False, "reason": "disabled"},
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                symbol="KATUSDT",
+                strategy_mode="one_way_short",
+                strategy_profile="custom_grid_katusdt_kat_short",
+                step_price=0.01,
+                buy_levels=5,
+                sell_levels=95,
+                per_order_notional=10.0,
+                base_position_notional=30.0,
+                center_price=12.0,
+                fixed_center_enabled=False,
+                fixed_center_roll_enabled=False,
+                fixed_center_roll_trigger_steps=1.0,
+                fixed_center_roll_confirm_cycles=3,
+                fixed_center_roll_shift_steps=1,
+                custom_grid_enabled=True,
+                custom_grid_direction="short",
+                custom_grid_level_mode="arithmetic",
+                custom_grid_min_price=10.0,
+                custom_grid_max_price=14.0,
+                custom_grid_n=4,
+                custom_grid_total_notional=400.0,
+                custom_grid_neutral_anchor_price=None,
+                custom_grid_roll_enabled=False,
+                custom_grid_roll_interval_minutes=5,
+                custom_grid_roll_trade_threshold=100,
+                custom_grid_roll_upper_distance_ratio=0.30,
+                custom_grid_roll_shift_levels=1,
+                down_trigger_steps=1,
+                up_trigger_steps=1,
+                shift_steps=1,
+                neutral_center_interval_minutes=3,
+                neutral_band1_offset_ratio=0.005,
+                neutral_band2_offset_ratio=0.01,
+                neutral_band3_offset_ratio=0.02,
+                neutral_band1_target_ratio=0.20,
+                neutral_band2_target_ratio=0.50,
+                neutral_band3_target_ratio=1.00,
+                neutral_hourly_scale_enabled=False,
+                neutral_hourly_scale_stable=1.0,
+                neutral_hourly_scale_transition=0.85,
+                neutral_hourly_scale_defensive=0.65,
+                max_position_notional=None,
+                max_short_position_notional=2000.0,
+                pause_buy_position_notional=None,
+                pause_short_position_notional=None,
+                min_mid_price_for_buys=None,
+                excess_inventory_reduce_only_enabled=True,
+                auto_regime_enabled=False,
+                auto_regime_confirm_cycles=2,
+                auto_regime_stable_15m_max_amplitude_ratio=0.02,
+                auto_regime_stable_60m_max_amplitude_ratio=0.05,
+                auto_regime_stable_60m_return_floor_ratio=-0.01,
+                auto_regime_defensive_15m_amplitude_ratio=0.035,
+                auto_regime_defensive_60m_amplitude_ratio=0.08,
+                auto_regime_defensive_15m_return_ratio=-0.015,
+                auto_regime_defensive_60m_return_ratio=-0.03,
+                buy_pause_amp_trigger_ratio=None,
+                buy_pause_down_return_trigger_ratio=None,
+                short_cover_pause_amp_trigger_ratio=None,
+                short_cover_pause_down_return_trigger_ratio=None,
+                freeze_shift_abs_return_trigger_ratio=None,
+                recv_window=5000,
+                reset_state=True,
+                state_path=str(Path(tmpdir) / "katusdt_state.json"),
+                summary_jsonl=str(Path(tmpdir) / "katusdt_events.jsonl"),
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertGreater(report["target_short_base_qty"], 0.0)
+        self.assertGreater(report["bootstrap_short_qty"], 0.0)
+        self.assertGreater(report["bootstrap_qty"], 0.0)
+        self.assertTrue(any(item["role"] == "bootstrap_short" for item in report["bootstrap_orders"]))
+
+    @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    def test_generate_plan_report_custom_grid_short_does_not_rebootstrap_after_startup(
+        self,
+        mock_load_state,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_resolve_custom_grid_roll,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 12.0,
+            "startup_pending": False,
+            "startup_completed_at": "2026-04-16T00:00:00+00:00",
+            "config_signature": "x",
+            "config": {},
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.1,
+            "min_qty": 0.1,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "11.99", "ask_price": "12.01"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "KATUSDT", "positionAmt": "-60", "entryPrice": "12.50"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+        }
+        mock_resolve_custom_grid_roll.return_value = (
+            10.0,
+            14.0,
+            {"enabled": False, "checked": False, "triggered": False, "reason": "disabled"},
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            args = Namespace(
+                symbol="KATUSDT",
+                strategy_mode="one_way_short",
+                strategy_profile="custom_grid_katusdt_kat_short",
+                step_price=0.01,
+                buy_levels=5,
+                sell_levels=95,
+                per_order_notional=10.0,
+                base_position_notional=30.0,
+                center_price=12.0,
+                fixed_center_enabled=False,
+                fixed_center_roll_enabled=False,
+                fixed_center_roll_trigger_steps=1.0,
+                fixed_center_roll_confirm_cycles=3,
+                fixed_center_roll_shift_steps=1,
+                custom_grid_enabled=True,
+                custom_grid_direction="short",
+                custom_grid_level_mode="arithmetic",
+                custom_grid_min_price=10.0,
+                custom_grid_max_price=14.0,
+                custom_grid_n=4,
+                custom_grid_total_notional=400.0,
+                custom_grid_neutral_anchor_price=None,
+                custom_grid_roll_enabled=False,
+                custom_grid_roll_interval_minutes=5,
+                custom_grid_roll_trade_threshold=100,
+                custom_grid_roll_upper_distance_ratio=0.30,
+                custom_grid_roll_shift_levels=1,
+                down_trigger_steps=1,
+                up_trigger_steps=1,
+                shift_steps=1,
+                neutral_center_interval_minutes=3,
+                neutral_band1_offset_ratio=0.005,
+                neutral_band2_offset_ratio=0.01,
+                neutral_band3_offset_ratio=0.02,
+                neutral_band1_target_ratio=0.20,
+                neutral_band2_target_ratio=0.50,
+                neutral_band3_target_ratio=1.00,
+                neutral_hourly_scale_enabled=False,
+                neutral_hourly_scale_stable=1.0,
+                neutral_hourly_scale_transition=0.85,
+                neutral_hourly_scale_defensive=0.65,
+                max_position_notional=None,
+                max_short_position_notional=2000.0,
+                pause_buy_position_notional=None,
+                pause_short_position_notional=None,
+                min_mid_price_for_buys=None,
+                excess_inventory_reduce_only_enabled=False,
+                auto_regime_enabled=False,
+                auto_regime_confirm_cycles=2,
+                auto_regime_stable_15m_max_amplitude_ratio=0.02,
+                auto_regime_stable_60m_max_amplitude_ratio=0.05,
+                auto_regime_stable_60m_return_floor_ratio=-0.01,
+                auto_regime_defensive_15m_amplitude_ratio=0.035,
+                auto_regime_defensive_60m_amplitude_ratio=0.08,
+                auto_regime_defensive_15m_return_ratio=-0.015,
+                auto_regime_defensive_60m_return_ratio=-0.03,
+                buy_pause_amp_trigger_ratio=None,
+                buy_pause_down_return_trigger_ratio=None,
+                short_cover_pause_amp_trigger_ratio=None,
+                short_cover_pause_down_return_trigger_ratio=None,
+                freeze_shift_abs_return_trigger_ratio=None,
+                recv_window=5000,
+                reset_state=False,
+                state_path=str(Path(tmpdir) / "katusdt_state.json"),
+                summary_jsonl=str(Path(tmpdir) / "katusdt_events.jsonl"),
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["bootstrap_short_qty"], 0.0)
+        self.assertEqual(report["bootstrap_qty"], 0.0)
+        self.assertEqual(report["bootstrap_orders"], [])
+
+    @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    def test_generate_plan_report_synthetic_neutral_keeps_nearest_sell_level_active(
+        self,
+        mock_load_state,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_sync_synthetic_ledger,
+    ) -> None:
+        mock_load_state.return_value = {"center_price": 1.0}
+        mock_symbol_config.return_value = {
+            "tick_size": 0.001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.999", "ask_price": "1.001"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "TESTUSDT", "positionAmt": "300", "entryPrice": "1.035"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        mock_sync_synthetic_ledger.return_value = {
+            "virtual_long_qty": 300.0,
+            "virtual_long_avg_price": 1.035,
+            "virtual_long_lots": [{"qty": 300.0, "price": 1.035}],
+            "virtual_short_qty": 0.0,
+            "virtual_short_avg_price": 0.0,
+            "virtual_short_lots": [],
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_mode = "synthetic_neutral"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 4
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        sell_prices = [item["price"] for item in report["sell_orders"]]
+
+        self.assertNotIn(1.001, sell_prices)
+        self.assertEqual(min(sell_prices), 1.035)
+        self.assertTrue(report["take_profit_guard"]["long_active"])
+
+    @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    def test_generate_plan_report_synthetic_neutral_blocks_tp_when_cost_basis_missing_after_reset(
+        self,
+        mock_load_state,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_sync_synthetic_ledger,
+    ) -> None:
+        mock_load_state.return_value = {"center_price": 1.0}
+        mock_symbol_config.return_value = {
+            "tick_size": 0.001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.999", "ask_price": "1.001"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "TESTUSDT",
+                    "positionAmt": "300",
+                    "entryPrice": "0",
+                    "breakEvenPrice": "0",
+                },
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        mock_sync_synthetic_ledger.return_value = {
+            "virtual_long_qty": 300.0,
+            "virtual_long_avg_price": 0.0,
+            "virtual_long_lots": [],
+            "virtual_short_qty": 0.0,
+            "virtual_short_avg_price": 0.0,
+            "virtual_short_lots": [],
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_mode = "synthetic_neutral"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 4
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        sell_roles = [item.get("role") for item in report["sell_orders"]]
+        self.assertNotIn("take_profit_long", sell_roles)
+        self.assertNotIn("active_delever_long", sell_roles)
+        self.assertTrue(report["take_profit_guard"]["long_cost_basis_missing"])
+        self.assertGreater(report["take_profit_guard"]["dropped_sell_orders"], 0)
+
     def test_apply_synthetic_trade_fill_tracks_virtual_long_and_short_books(self) -> None:
         ledger = {
             "virtual_long_qty": 0.0,
@@ -417,6 +1337,54 @@ class LoopRunnerTests(unittest.TestCase):
             )
         )
         self.assertAlmostEqual(ledger["virtual_short_qty"], 30.0)
+
+    def test_apply_synthetic_trade_fill_tracks_lifo_lots(self) -> None:
+        ledger = {
+            "virtual_long_qty": 15.0,
+            "virtual_long_avg_price": (10.0 * 1.0 + 5.0 * 1.1) / 15.0,
+            "virtual_short_qty": 0.0,
+            "virtual_short_avg_price": 0.0,
+            "virtual_long_lots": [
+                {"qty": 10.0, "price": 1.0},
+                {"qty": 5.0, "price": 1.1},
+            ],
+            "virtual_short_lots": [],
+        }
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "3", "price": "1.12"},
+                order_ref={"role": "take_profit_long"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_long_qty"], 12.0)
+        self.assertAlmostEqual(ledger["virtual_long_avg_price"], (10.0 * 1.0 + 2.0 * 1.1) / 12.0)
+        self.assertEqual(
+            ledger["virtual_long_lots"],
+            [
+                {"qty": 10.0, "price": 1.0},
+                {"qty": 2.0, "price": 1.1},
+            ],
+        )
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "4", "price": "1.20"},
+                order_ref={"role": "entry_long"},
+            )
+        )
+        self.assertAlmostEqual(ledger["virtual_long_qty"], 16.0)
+        self.assertAlmostEqual(ledger["virtual_long_avg_price"], (10.0 * 1.0 + 2.0 * 1.1 + 4.0 * 1.2) / 16.0)
+        self.assertEqual(
+            ledger["virtual_long_lots"],
+            [
+                {"qty": 10.0, "price": 1.0},
+                {"qty": 2.0, "price": 1.1},
+                {"qty": 4.0, "price": 1.2},
+            ],
+        )
 
     def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:
@@ -514,6 +1482,296 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 0)
         self.assertAlmostEqual(plan["bootstrap_orders"][0]["notional"], 30.0)
         self.assertAlmostEqual(plan["bootstrap_orders"][1]["notional"], 20.0)
+
+    def test_apply_threshold_target_reduce_places_long_reduce_at_best_bid_to_target_ratio(self) -> None:
+        plan = {
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 4837.0, "qty": 0.02, "notional": 96.74, "role": "bootstrap_long"},
+                {"side": "SELL", "price": 4843.0, "qty": 0.02, "notional": 96.86, "role": "entry_short"},
+            ],
+            "buy_orders": [
+                {"side": "BUY", "price": 4836.0, "qty": 0.02, "notional": 96.72, "role": "entry_long"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 4844.0, "qty": 0.02, "notional": 96.88, "role": "take_profit_long"},
+            ],
+        }
+
+        report = apply_threshold_target_reduce(
+            plan=plan,
+            state={},
+            now=datetime(2026, 4, 15, 2, 0, tzinfo=timezone.utc),
+            current_long_qty=0.21,
+            current_long_notional=1000.0,
+            current_short_qty=0.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=800.0,
+            pause_short_position_notional=800.0,
+            target_ratio=0.5,
+            bid_price=4839.0,
+            ask_price=4840.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            taker_timeout_seconds=60.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["long_active"])
+        self.assertAlmostEqual(report["long_target_notional"], 400.0)
+        self.assertEqual(plan["bootstrap_orders"], [plan["bootstrap_orders"][0]])
+        self.assertEqual(plan["bootstrap_orders"][0]["role"], "entry_short")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"][0]["role"], "forced_reduce")
+        self.assertEqual(plan["sell_orders"][0]["side"], "SELL")
+        self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["sell_orders"][0]["execution_type"], "post_only")
+        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 4840.0)
+        self.assertGreater(plan["sell_orders"][0]["notional"], 590.0)
+        self.assertLessEqual(plan["sell_orders"][0]["notional"], 600.0)
+
+    def test_apply_threshold_target_reduce_places_short_reduce_at_best_ask_to_target_ratio(self) -> None:
+        plan = {
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 4837.0, "qty": 0.02, "notional": 96.74, "role": "bootstrap_long"},
+                {"side": "SELL", "price": 4843.0, "qty": 0.02, "notional": 96.86, "role": "bootstrap_short"},
+            ],
+            "buy_orders": [
+                {"side": "BUY", "price": 4835.0, "qty": 0.02, "notional": 96.70, "role": "take_profit_short"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 4844.0, "qty": 0.02, "notional": 96.88, "role": "entry_short"},
+            ],
+        }
+
+        report = apply_threshold_target_reduce(
+            plan=plan,
+            state={},
+            now=datetime(2026, 4, 15, 2, 0, tzinfo=timezone.utc),
+            current_long_qty=0.0,
+            current_long_notional=0.0,
+            current_short_qty=0.21,
+            current_short_notional=1000.0,
+            pause_long_position_notional=800.0,
+            pause_short_position_notional=800.0,
+            target_ratio=0.5,
+            bid_price=4839.0,
+            ask_price=4840.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            taker_timeout_seconds=60.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["short_active"])
+        self.assertAlmostEqual(report["short_target_notional"], 400.0)
+        self.assertEqual(plan["bootstrap_orders"], [plan["bootstrap_orders"][0]])
+        self.assertEqual(plan["bootstrap_orders"][0]["role"], "bootstrap_long")
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["buy_orders"][0]["role"], "forced_reduce")
+        self.assertEqual(plan["buy_orders"][0]["side"], "BUY")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["buy_orders"][0]["execution_type"], "post_only")
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 4839.0)
+        self.assertGreater(plan["buy_orders"][0]["notional"], 590.0)
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 600.0)
+
+    def test_apply_threshold_target_reduce_switches_to_taker_after_timeout(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 4836.0, "qty": 0.02, "notional": 96.72, "role": "entry_long"}],
+            "sell_orders": [],
+        }
+        state = {
+            "threshold_target_reduce": {
+                "long_entered_at": "2026-04-15T02:00:00+00:00",
+                "short_entered_at": None,
+            }
+        }
+
+        report = apply_threshold_target_reduce(
+            plan=plan,
+            state=state,
+            now=datetime(2026, 4, 15, 2, 1, 1, tzinfo=timezone.utc),
+            current_long_qty=0.21,
+            current_long_notional=1000.0,
+            current_short_qty=0.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=800.0,
+            pause_short_position_notional=800.0,
+            target_ratio=0.5,
+            bid_price=4839.0,
+            ask_price=4840.0,
+            tick_size=0.1,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+            taker_timeout_seconds=60.0,
+        )
+
+        self.assertTrue(report["long_taker_timeout_active"])
+        self.assertGreaterEqual(report["long_elapsed_seconds"], 61.0)
+        self.assertEqual(plan["sell_orders"][0]["execution_type"], "aggressive")
+        self.assertEqual(plan["sell_orders"][0]["time_in_force"], "GTC")
+
+    def test_apply_synthetic_overweight_deleveraging_moves_short_exit_to_best_bid_after_timeout(self) -> None:
+        state = {
+            "synthetic_overweight_delever": {
+                "direction": "short",
+                "entered_at": "2026-04-14T01:00:00+00:00",
+                "last_position_qty": 963.0,
+            }
+        }
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 0.3315, "qty": 300.0, "notional": 99.45, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.3314, "qty": 337.0, "notional": 111.6818, "role": "take_profit_short"},
+            ],
+            "sell_orders": [{"side": "SELL", "price": 0.3338, "qty": 150.0, "notional": 50.07, "role": "entry_short"}],
+        }
+
+        report = apply_synthetic_overweight_deleveraging(
+            plan=plan,
+            state=state,
+            now=datetime(2026, 4, 14, 1, 1, 1, tzinfo=timezone.utc),
+            current_short_qty=963.0,
+            current_short_notional=321.1,
+            current_short_avg_price=0.33175,
+            bid_price=0.3334,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            pause_short_position_notional=220.0,
+            max_short_position_notional=320.0,
+            per_order_notional=50.0,
+            timeout_seconds=60.0,
+            take_profit_min_profit_ratio=0.0001,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["direction"], "short")
+        self.assertEqual(report["phase"], "best_quote_timeout")
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.3334)
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 50.0)
+        self.assertGreaterEqual(plan["buy_orders"][0]["notional"], 5.0)
+
+    def test_apply_synthetic_overweight_deleveraging_moves_pause_overweight_to_best_bid_after_timeout(self) -> None:
+        state = {
+            "synthetic_overweight_delever": {
+                "direction": "short",
+                "entered_at": "2026-04-14T07:00:00+00:00",
+                "last_position_qty": 672.0,
+            }
+        }
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 0.3330, "qty": 18.0, "notional": 5.994, "role": "take_profit_short"},
+            ],
+            "sell_orders": [{"side": "SELL", "price": 0.3375, "qty": 133.0, "notional": 44.8875, "role": "entry_short"}],
+        }
+
+        report = apply_synthetic_overweight_deleveraging(
+            plan=plan,
+            state=state,
+            now=datetime(2026, 4, 14, 7, 1, 1, tzinfo=timezone.utc),
+            current_short_qty=672.0,
+            current_short_notional=226.09,
+            current_short_avg_price=0.3330988,
+            bid_price=0.3367,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            pause_short_position_notional=220.0,
+            max_short_position_notional=320.0,
+            per_order_notional=45.0,
+            timeout_seconds=60.0,
+            take_profit_min_profit_ratio=0.0001,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertFalse(report["hard_overweight"])
+        self.assertEqual(report["phase"], "best_quote_timeout")
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.3367)
+
+    def test_apply_synthetic_overweight_deleveraging_uses_minimum_working_size_for_tiny_excess(self) -> None:
+        state: dict[str, object] = {}
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [{"side": "SELL", "price": 0.3338, "qty": 150.0, "notional": 50.07, "role": "entry_short"}],
+        }
+
+        report = apply_synthetic_overweight_deleveraging(
+            plan=plan,
+            state=state,
+            now=datetime(2026, 4, 14, 3, 51, 23, tzinfo=timezone.utc),
+            current_short_qty=665.0,
+            current_short_notional=220.87975,
+            current_short_avg_price=0.33255,
+            bid_price=0.33215,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            pause_short_position_notional=220.0,
+            max_short_position_notional=320.0,
+            per_order_notional=45.0,
+            timeout_seconds=60.0,
+            take_profit_min_profit_ratio=0.0001,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["phase"], "profit_only")
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
+        self.assertGreaterEqual(plan["buy_orders"][0]["notional"], 5.0)
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 45.0)
+
+    def test_apply_synthetic_overweight_deleveraging_uses_minimum_working_qty_when_min_notional_missing(self) -> None:
+        state: dict[str, object] = {}
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [{"side": "SELL", "price": 0.3338, "qty": 150.0, "notional": 50.07, "role": "entry_short"}],
+        }
+
+        report = apply_synthetic_overweight_deleveraging(
+            plan=plan,
+            state=state,
+            now=datetime(2026, 4, 14, 4, 7, 39, tzinfo=timezone.utc),
+            current_short_qty=665.0,
+            current_short_notional=220.21475,
+            current_short_avg_price=0.33255,
+            bid_price=0.33215,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=None,
+            pause_short_position_notional=220.0,
+            max_short_position_notional=320.0,
+            per_order_notional=45.0,
+            timeout_seconds=60.0,
+            take_profit_min_profit_ratio=0.0001,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["phase"], "profit_only")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertGreaterEqual(plan["buy_orders"][0]["qty"], 1.0)
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 45.0)
 
     def test_apply_position_controls_pauses_buys_when_position_notional_is_too_large(self) -> None:
         plan = {
@@ -915,15 +2173,12 @@ class LoopRunnerTests(unittest.TestCase):
 
         report = execute_plan_report(args, plan_report)
 
-        self.assertTrue(report["executed"])
+        self.assertTrue(report["idle"])
+        self.assertFalse(report["executed"])
         self.assertEqual(report["placed_orders"], [])
-        self.assertEqual(len(report["skipped_orders"]), 1)
-        self.assertEqual(
-            report["skipped_orders"][0]["reason"]["reason"],
-            "submitted_notional_below_min_notional",
-        )
+        self.assertEqual(report["skipped_orders"], [])
         mock_post_order.assert_not_called()
-        mock_update_refs.assert_called_once()
+        mock_update_refs.assert_not_called()
 
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     def test_assess_market_guard_flags_extreme_down_candle(self, mock_fetch_futures_klines) -> None:
@@ -951,6 +2206,8 @@ class LoopRunnerTests(unittest.TestCase):
             symbol="NIGHTUSDT",
             buy_pause_amp_trigger_ratio=0.0075,
             buy_pause_down_return_trigger_ratio=-0.0035,
+            short_cover_pause_amp_trigger_ratio=None,
+            short_cover_pause_down_return_trigger_ratio=None,
             freeze_shift_abs_return_trigger_ratio=0.0035,
             now=now,
         )
@@ -980,6 +2237,8 @@ class LoopRunnerTests(unittest.TestCase):
             symbol="NIGHTUSDT",
             buy_pause_amp_trigger_ratio=0.0075,
             buy_pause_down_return_trigger_ratio=-0.0035,
+            short_cover_pause_amp_trigger_ratio=None,
+            short_cover_pause_down_return_trigger_ratio=None,
             freeze_shift_abs_return_trigger_ratio=0.005,
             now=now,
         )
@@ -1095,6 +2354,242 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(effective.sell_levels, 12)
         self.assertEqual(effective.max_position_notional, 420.0)
         self.assertGreaterEqual(effective.step_price, 0.0004)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_xaut_adaptive_regime_prefers_reduce_only_for_long_extreme_drop(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.side_effect = [
+            [
+                Candle(
+                    open_time=now - timedelta(minutes=15),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=100.2,
+                    low=99.1,
+                    close=99.2,
+                )
+            ],
+            [
+                Candle(
+                    open_time=now - timedelta(hours=1),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=100.4,
+                    low=98.4,
+                    close=98.7,
+                )
+            ],
+        ]
+
+        result = assess_xaut_adaptive_regime(
+            symbol="XAUTUSDT",
+            strategy_mode="one_way_long",
+            now=now,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["candidate_state"], "reduce_only")
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    def test_assess_xaut_adaptive_regime_prefers_reduce_only_for_short_extreme_rally(self, mock_fetch_futures_klines) -> None:
+        now = datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc)
+        mock_fetch_futures_klines.side_effect = [
+            [
+                Candle(
+                    open_time=now - timedelta(minutes=15),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=101.0,
+                    low=99.8,
+                    close=100.8,
+                )
+            ],
+            [
+                Candle(
+                    open_time=now - timedelta(hours=1),
+                    close_time=now - timedelta(seconds=1),
+                    open=100.0,
+                    high=101.7,
+                    low=99.9,
+                    close=101.3,
+                )
+            ],
+        ]
+
+        result = assess_xaut_adaptive_regime(
+            symbol="XAUTUSDT",
+            strategy_mode="one_way_short",
+            now=now,
+        )
+
+        self.assertTrue(result["available"])
+        self.assertEqual(result["candidate_state"], "reduce_only")
+
+    def test_resolve_xaut_adaptive_state_enters_reduce_only_immediately_from_normal(self) -> None:
+        state: dict[str, object] = {}
+
+        resolved = resolve_xaut_adaptive_state(
+            state=state,
+            regime_report={"candidate_state": "reduce_only", "reason": "extreme"},
+            strategy_mode="one_way_long",
+            now=datetime(2026, 4, 1, 0, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(resolved["active_state"], "reduce_only")
+        self.assertTrue(resolved["switched"])
+
+    def test_resolve_xaut_adaptive_state_requires_reduce_only_to_pass_through_defensive(self) -> None:
+        state: dict[str, object] = {
+            "xaut_adaptive_state": {
+                "active_state": "reduce_only",
+                "pending_state": None,
+                "pending_count": 0,
+            }
+        }
+
+        resolved = resolve_xaut_adaptive_state(
+            state=state,
+            regime_report={"candidate_state": "normal", "reason": "stable"},
+            strategy_mode="one_way_long",
+            now=datetime(2026, 4, 1, 0, 5, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(resolved["active_state"], "reduce_only")
+        self.assertEqual(resolved["candidate_state"], "defensive")
+        self.assertEqual(resolved["pending_state"], "defensive")
+        self.assertEqual(resolved["pending_count"], 1)
+
+    def test_apply_xaut_reduce_only_pruning_drops_long_opening_orders(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "role": "bootstrap"}],
+            "buy_orders": [{"side": "BUY", "role": "entry"}],
+            "sell_orders": [{"side": "SELL", "role": "take_profit"}],
+        }
+
+        apply_xaut_reduce_only_pruning(plan=plan, strategy_mode="one_way_long")
+
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_apply_xaut_reduce_only_pruning_drops_short_opening_orders(self) -> None:
+        plan = {
+            "bootstrap_orders": [{"side": "SELL", "role": "bootstrap_short"}],
+            "buy_orders": [{"side": "BUY", "role": "take_profit_short"}],
+            "sell_orders": [{"side": "SELL", "role": "entry_short"}],
+        }
+
+        apply_xaut_reduce_only_pruning(plan=plan, strategy_mode="one_way_short")
+
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+
+    def test_build_xaut_adaptive_runner_args_applies_defensive_profile(self) -> None:
+        args = Namespace(
+            strategy_profile="xaut_long_adaptive_v1",
+            strategy_mode="one_way_long",
+            symbol="XAUTUSDT",
+            step_price=7.5,
+            buy_levels=6,
+            sell_levels=10,
+            per_order_notional=80.0,
+            base_position_notional=320.0,
+            up_trigger_steps=5,
+            down_trigger_steps=4,
+            shift_steps=3,
+            pause_buy_position_notional=520.0,
+            max_position_notional=680.0,
+            buy_pause_amp_trigger_ratio=0.0060,
+            buy_pause_down_return_trigger_ratio=-0.0045,
+            freeze_shift_abs_return_trigger_ratio=0.0048,
+            inventory_tier_start_notional=420.0,
+            inventory_tier_end_notional=520.0,
+            inventory_tier_buy_levels=3,
+            inventory_tier_sell_levels=12,
+            inventory_tier_per_order_notional=70.0,
+            inventory_tier_base_position_notional=160.0,
+        )
+
+        effective = build_xaut_adaptive_runner_args(
+            args=args,
+            active_state="defensive",
+        )
+
+        self.assertEqual(effective.buy_levels, 2)
+        self.assertEqual(effective.sell_levels, 14)
+        self.assertEqual(effective.max_position_notional, 260.0)
+        self.assertEqual(effective.step_price, 12.0)
+
+    @patch("grid_optimizer.loop_runner.time.sleep")
+    @patch("grid_optimizer.loop_runner._print_cycle_summary")
+    @patch("grid_optimizer.loop_runner._append_jsonl")
+    @patch("grid_optimizer.loop_runner._maybe_handle_runtime_guard")
+    @patch("grid_optimizer.loop_runner._build_parser")
+    def test_main_preserves_reset_state_while_waiting_for_start_window(
+        self,
+        mock_build_parser,
+        mock_runtime_guard,
+        mock_append_jsonl,
+        mock_print_cycle_summary,
+        mock_sleep,
+    ) -> None:
+        del mock_append_jsonl, mock_print_cycle_summary, mock_sleep
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.iterations = 1
+            args.reset_state = True
+            args.run_start_time = "2026-04-02T07:40:00+00:00"
+            args.state_path = str(Path(tmpdir) / "bardusdt_loop_state.json")
+            args.plan_json = str(Path(tmpdir) / "bardusdt_loop_latest_plan.json")
+            args.submit_report_json = str(Path(tmpdir) / "bardusdt_loop_latest_submit.json")
+            args.summary_jsonl = str(Path(tmpdir) / "bardusdt_loop_events.jsonl")
+
+            parser = unittest.mock.Mock()
+            parser.parse_args.return_value = args
+            mock_build_parser.return_value = parser
+            mock_runtime_guard.return_value = {
+                "runtime_status": "waiting",
+                "stop_triggered": False,
+                "stop_reason": "before_start_window",
+            }
+
+            main()
+
+        self.assertTrue(args.reset_state)
+
+    @patch("grid_optimizer.loop_runner.time.sleep")
+    @patch("grid_optimizer.loop_runner._print_cycle_summary")
+    @patch("grid_optimizer.loop_runner._append_jsonl")
+    @patch("grid_optimizer.loop_runner._maybe_handle_runtime_guard")
+    @patch("grid_optimizer.loop_runner._build_parser")
+    def test_main_preserves_reset_state_after_pre_start_error(
+        self,
+        mock_build_parser,
+        mock_runtime_guard,
+        mock_append_jsonl,
+        mock_print_cycle_summary,
+        mock_sleep,
+    ) -> None:
+        del mock_append_jsonl, mock_print_cycle_summary, mock_sleep
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.iterations = 1
+            args.reset_state = True
+            args.run_start_time = "2026-04-02T07:40:00+00:00"
+            args.state_path = str(Path(tmpdir) / "bardusdt_loop_state.json")
+            args.plan_json = str(Path(tmpdir) / "bardusdt_loop_latest_plan.json")
+            args.submit_report_json = str(Path(tmpdir) / "bardusdt_loop_latest_submit.json")
+            args.summary_jsonl = str(Path(tmpdir) / "bardusdt_loop_events.jsonl")
+
+            parser = unittest.mock.Mock()
+            parser.parse_args.return_value = args
+            mock_build_parser.return_value = parser
+            mock_runtime_guard.side_effect = RuntimeError("transient pre-start failure")
+
+            main()
+
+        self.assertTrue(args.reset_state)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import csv
+import io
 import json
 import math
 import os
@@ -8,6 +10,7 @@ import subprocess
 import threading
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -115,6 +118,13 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         market="futures",
         label="BARD 合约交易挑战赛",
         url="https://www.bmwweb.solutions/zh-CN/activity/trading-competition/futures-bard-challenge2?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_xaut",
+        symbol="XAUT",
+        market="futures",
+        label="XAUT 合约交易挑战赛",
+        url="https://www.bmwweb.technology/zh-CN/activity/trading-competition/futures-xaut-challenge-n?ref=1118658029",
     ),
     CompetitionSource(
         slug="futures_enso",
@@ -407,7 +417,7 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
             },
             {
                 "tabLabel": "交易量挑战赛 - 第二阶段",
-                "resourceId": 46948,
+                "resourceId": 46951,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "KAT",
@@ -553,6 +563,78 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分 150,000 BARD
 """,
             }
+        ]
+    },
+    "futures_xaut": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛 - 第一阶段",
+                "resourceId": 47697,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "XAUT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/03/27 18:00 - 2026/04/06 07:59",
+                "activityEndAt": "2026-04-06T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/03/27 18:00 - 2026/04/06 07:59
+累计 XAUT U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+6.75 XAUT
+第 2 名
+5.4 XAUT
+第 3 名
+3.15 XAUT
+第 4 名
+1.8 XAUT
+第 5 名
+0.9 XAUT
+第 6 - 20 名
+平分 6.75 XAUT
+第 21 - 50 名
+平分 6.75 XAUT
+第 51 - 200 名
+平分 13.5 XAUT
+""",
+            },
+            {
+                "tabLabel": "交易量挑战赛 - 第二阶段",
+                "resourceId": 47699,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "XAUT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/06 08:00 - 2026/04/16 07:59",
+                "activityEndAt": "2026-04-16T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/06 08:00 - 2026/04/16 07:59
+累计 XAUT U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+6.75 XAUT
+第 2 名
+5.4 XAUT
+第 3 名
+3.15 XAUT
+第 4 名
+1.8 XAUT
+第 5 名
+0.9 XAUT
+第 6 - 20 名
+平分 6.75 XAUT
+第 21 - 50 名
+平分 6.75 XAUT
+第 51 - 200 名
+平分 13.5 XAUT
+""",
+            },
         ]
     },
     "futures_enso": {
@@ -1191,10 +1273,14 @@ def _playwright_cli_command(*args: str) -> list[str]:
     return ["npx", "--yes", "--package", "@playwright/cli", "playwright-cli", *args]
 
 
+def _playwright_session_name() -> str:
+    return f"cb-{uuid.uuid4().hex[:8]}"
+
+
 def _run_playwright_extract(url: str) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(3):
-        session = f"competition-board-{uuid.uuid4().hex[:10]}"
+        session = _playwright_session_name()
         try:
             subprocess.run(
                 _playwright_cli_command("--session", session, "open", url),
@@ -1813,6 +1899,62 @@ def _save_reward_price_cache(cache: dict[str, float]) -> None:
     _write_json_file(REWARD_PRICE_CACHE_PATH, cache)
 
 
+def _extract_close_price_from_kline_payload(payload: Any) -> float | None:
+    if not isinstance(payload, list) or not payload:
+        return None
+    row = payload[-1]
+    if not isinstance(row, list) or len(row) < 5:
+        return None
+    price = _safe_float(row[4])
+    if price is None or price <= 0:
+        return None
+    return float(price)
+
+
+def _extract_close_price_from_archive_zip(content: bytes, target_ms: int) -> float | None:
+    try:
+        archive = zipfile.ZipFile(io.BytesIO(content))
+    except zipfile.BadZipFile:
+        return None
+    with archive:
+        names = [name for name in archive.namelist() if name.endswith(".csv")]
+        if not names:
+            return None
+        candidate = None
+        with archive.open(names[0], "r") as raw:
+            reader = csv.reader(io.TextIOWrapper(raw, encoding="utf-8"))
+            for row in reader:
+                if len(row) < 5:
+                    continue
+                open_time = _safe_int(row[0])
+                close_price = _safe_float(row[4])
+                if open_time is None or close_price is None or close_price <= 0:
+                    continue
+                if int(open_time) > target_ms:
+                    break
+                candidate = float(close_price)
+        return candidate
+
+
+def _fetch_archived_symbol_close_price_usdt(symbol: str, end_at: datetime, market_prefix: str) -> float | None:
+    normalized = str(symbol or "").strip().upper()
+    if not normalized:
+        return None
+    trading_symbol = f"{normalized}USDT"
+    target_dt = end_at.astimezone(timezone.utc)
+    date_text = target_dt.strftime("%Y-%m-%d")
+    url = (
+        f"https://data.binance.vision/data/{market_prefix}/daily/klines/"
+        f"{trading_symbol}/1m/{trading_symbol}-1m-{date_text}.zip"
+    )
+    try:
+        resp = requests.get(url, timeout=20)
+        resp.raise_for_status()
+    except Exception:
+        return None
+    return _extract_close_price_from_archive_zip(resp.content, int(target_dt.timestamp() * 1000))
+
+
 def _fetch_symbol_close_price_usdt(symbol: str, end_at: datetime) -> float | None:
     normalized = str(symbol or "").strip().upper()
     if not normalized:
@@ -1830,19 +1972,25 @@ def _fetch_symbol_close_price_usdt(symbol: str, end_at: datetime) -> float | Non
         "limit": 1,
         "endTime": int(end_at.astimezone(timezone.utc).timestamp() * 1000),
     }
-    try:
-        resp = requests.get("https://api.binance.com/api/v3/klines", params=params, timeout=10)
-        resp.raise_for_status()
-        payload = resp.json()
-    except Exception:
-        return None
-    if not isinstance(payload, list) or not payload:
-        return None
-    row = payload[-1]
-    if not isinstance(row, list) or len(row) < 5:
-        return None
-    price = _safe_float(row[4])
-    if price is None or price <= 0:
+    price = None
+    for endpoint in (
+        "https://api.binance.com/api/v3/klines",
+        "https://fapi.binance.com/fapi/v1/klines",
+    ):
+        try:
+            resp = requests.get(endpoint, params=params, timeout=10)
+            resp.raise_for_status()
+            price = _extract_close_price_from_kline_payload(resp.json())
+        except Exception:
+            price = None
+        if price is not None:
+            break
+    if price is None:
+        for market_prefix in ("spot", "futures/um"):
+            price = _fetch_archived_symbol_close_price_usdt(normalized, end_at, market_prefix)
+            if price is not None:
+                break
+    if price is None:
         return None
     with _PRICE_CACHE_LOCK:
         cached = _load_reward_price_cache()
@@ -1872,40 +2020,41 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
     for board in ended_boards:
         board_key = str(board.get("board_key", "")).strip()
         entries = history_index.get(board_key, [])
-        if len(entries) < 2:
-            continue
         final_entry = next((item for item in entries if _history_entry_datetime(item) is not None), None)
-        if final_entry is None:
+        final_board = _load_history_board(final_entry) if final_entry is not None else None
+        if not isinstance(final_board, dict):
+            final_board = board
+        if not isinstance(final_board, dict):
             continue
-        final_dt = _history_entry_datetime(final_entry)
-        if final_dt is None:
-            continue
-        previous_entry = _select_previous_day_entry(entries, final_dt)
-        if previous_entry is None:
-            continue
-        final_board = _load_history_board(final_entry)
-        previous_board = _load_history_board(previous_entry)
-        if not isinstance(final_board, dict) or not isinstance(previous_board, dict):
-            continue
-        final_values = _values_by_rank(final_board)
-        previous_values = _values_by_rank(previous_board)
-        delta_rows.append(
-            {
-                "board_key": board_key,
-                "label": str(final_board.get("label") or board.get("label") or board_key),
-                "symbol": str(final_board.get("symbol") or board.get("symbol") or ""),
-                "market": str(final_board.get("market") or board.get("market") or ""),
-                "final_capture": str(final_entry.get("capture_label", "")),
-                "previous_capture": str(previous_entry.get("capture_label", "")),
-                "last_day_market_volume": ENDED_LAST_DAY_MARKET_VOLUME.get(board_key),
-                "deltas": {
-                    str(rank): round(max(0.0, final_values.get(rank, 0.0) - previous_values.get(rank, 0.0)), 8)
-                    for rank in tracked_ranks
-                },
-            }
-        )
-
         end_at = _parse_iso_datetime(final_board.get("activity_end_at") or board.get("activity_end_at"))
+        activity_end_at = end_at.isoformat() if end_at is not None else str(final_board.get("activity_end_at") or board.get("activity_end_at") or "").strip()
+        final_dt = (
+            _history_entry_datetime(final_entry)
+            if final_entry is not None
+            else _parse_iso_datetime(final_board.get("updated_at_utc") or final_board.get("activity_end_at"))
+        )
+        previous_entry = _select_previous_day_entry(entries, final_dt) if final_dt is not None else None
+        previous_board = _load_history_board(previous_entry) if previous_entry is not None else None
+        if isinstance(previous_board, dict):
+            final_values = _values_by_rank(final_board)
+            previous_values = _values_by_rank(previous_board)
+            delta_rows.append(
+                {
+                    "board_key": board_key,
+                    "label": str(final_board.get("label") or board.get("label") or board_key),
+                    "symbol": str(final_board.get("symbol") or board.get("symbol") or ""),
+                    "market": str(final_board.get("market") or board.get("market") or ""),
+                    "activity_end_at": activity_end_at,
+                    "final_capture": str((final_entry or {}).get("capture_label", "")),
+                    "previous_capture": str(previous_entry.get("capture_label", "")),
+                    "last_day_market_volume": ENDED_LAST_DAY_MARKET_VOLUME.get(board_key),
+                    "deltas": {
+                        str(rank): round(max(0.0, final_values.get(rank, 0.0) - previous_values.get(rank, 0.0)), 8)
+                        for rank in tracked_ranks
+                    },
+                }
+            )
+
         reward_unit = str(final_board.get("reward_unit") or board.get("reward_unit") or "").strip().upper()
         reward_price = _fetch_symbol_close_price_usdt(reward_unit, end_at) if end_at is not None and reward_unit else None
         for segment in final_board.get("segments", []):
@@ -1923,6 +2072,7 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
                     "label": str(final_board.get("label") or board.get("label") or board_key),
                     "symbol": str(final_board.get("symbol") or board.get("symbol") or ""),
                     "market": str(final_board.get("market") or board.get("market") or ""),
+                    "activity_end_at": activity_end_at,
                     "rank_label": str(segment.get("rank_label", "")).strip() or "-",
                     "reward_text": str(segment.get("per_user_reward_text") or segment.get("reward_text") or "").strip() or "-",
                     "reward_unit": reward_unit or str(final_board.get("reward_unit") or "").strip(),
@@ -1964,10 +2114,39 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
         previous_board = _load_history_board(previous_entry) if previous_entry is not None else None
         current_total = _safe_float(board.get("eligible_metric_total"))
         previous_total = _safe_float(previous_board.get("eligible_metric_total")) if isinstance(previous_board, dict) else None
+        previous_values = _values_by_rank(previous_board) if isinstance(previous_board, dict) else {}
+        if previous_total is None or previous_total <= 0 or not previous_values:
+            for candidate_entry in entries:
+                if candidate_entry is previous_entry:
+                    continue
+                candidate_dt = _history_entry_datetime(candidate_entry)
+                if current_dt is not None and candidate_dt is not None and candidate_dt >= current_dt:
+                    continue
+                candidate_board = _load_history_board(candidate_entry)
+                if not isinstance(candidate_board, dict):
+                    continue
+                candidate_total = _safe_float(candidate_board.get("eligible_metric_total"))
+                candidate_values = _values_by_rank(candidate_board)
+                if candidate_total is None or candidate_total <= 0 or not candidate_values:
+                    continue
+                previous_entry = candidate_entry
+                previous_board = candidate_board
+                previous_total = candidate_total
+                previous_values = candidate_values
+                break
         if current_total is not None and previous_total is not None:
             latest_day_volume = max(0.0, float(current_total) - float(previous_total))
         if previous_entry is not None:
             previous_capture = str(previous_entry.get("capture_label", "")).strip()
+        forecast_coefficients: dict[str, float] = {}
+        if latest_day_volume is not None and latest_day_volume > 0:
+            for rank in tracked_ranks:
+                current_value = values.get(rank)
+                previous_value = previous_values.get(rank)
+                if current_value is None or previous_value is None:
+                    continue
+                delta = max(0.0, float(current_value) - float(previous_value))
+                forecast_coefficients[str(rank)] = delta / float(latest_day_volume)
         reward_unit = str(board.get("reward_unit") or "").strip().upper()
         reward_price = _fetch_symbol_close_price_usdt(reward_unit, now) if reward_unit else None
         reward_rows: list[dict[str, Any]] = []
@@ -2010,6 +2189,7 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
                     str(rank): values.get(rank)
                     for rank in tracked_ranks
                 },
+                "forecast_coefficients": forecast_coefficients,
                 "reward_rows": reward_rows,
                 "reward_rows_message": reward_rows_message,
             }
@@ -2071,6 +2251,35 @@ def resolve_active_competition_board(
         reverse=True,
     )
     return candidates[0]
+
+
+def build_reward_volume_targets(board: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(board, dict):
+        return []
+    reward_unit = str(board.get("reward_unit", "")).strip()
+    targets: list[dict[str, Any]] = []
+    for segment in board.get("segments", []):
+        if not isinstance(segment, dict):
+            continue
+        cutoff_value = _safe_float(segment.get("cutoff_value"))
+        per_user_reward = _safe_float(segment.get("per_user_reward"))
+        targets.append(
+            {
+                "rank_label": str(segment.get("rank_label", "")).strip() or "-",
+                "start_rank": _safe_int(segment.get("start_rank")),
+                "end_rank": _safe_int(segment.get("end_rank")),
+                "reward_text": str(segment.get("reward_text", "")).strip() or "-",
+                "reward_unit": reward_unit,
+                "per_user_reward": per_user_reward,
+                "per_user_reward_text": str(segment.get("per_user_reward_text", "")).strip(),
+                "cutoff_value": cutoff_value,
+                "cutoff_value_text": (
+                    str(segment.get("cutoff_value_text", "")).strip()
+                    or (f"{cutoff_value:,.2f}" if cutoff_value is not None else "")
+                ),
+            }
+        )
+    return targets
 
 
 def _attach_snapshot_analytics(snapshot: dict[str, Any]) -> dict[str, Any]:
@@ -2887,7 +3096,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     const ongoingCardsEl = document.getElementById("ongoing_cards");
     const endedCardsEl = document.getElementById("ended_cards");
     const apiBase = `${window.location.protocol}//${window.location.host}`;
-    const FORECAST_COEFFICIENTS = {
+    const FORECAST_DEFAULT_COEFFICIENTS = {
       20: 0.012575,
       30: 0.010699,
       50: 0.009418,
@@ -3180,13 +3389,16 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         const rewards = Array.isArray(group.rewards) ? group.rewards : [];
         const label = (delta && delta.label) || (rewards[0] && rewards[0].label) || "-";
         const symbol = (delta && delta.symbol) || (rewards[0] && rewards[0].symbol) || "-";
+        const activityEndAt = (delta && delta.activity_end_at) || (rewards[0] && rewards[0].activity_end_at) || "";
+        const missingPreviousSnapshot = !delta && rewards.length > 0;
         const metaRow = delta ? `
           <div class="meta-row">
+            <span>结束时间：${escapeHtml(fmtDate(activityEndAt) || "-")}</span>
             <span>最终快照：${escapeHtml(delta.final_capture || "-")}</span>
             <span>对比快照：${escapeHtml(delta.previous_capture || "-")}</span>
             <span>最后一天全市场量：${delta.last_day_market_volume === null || delta.last_day_market_volume === undefined ? "-" : fmtNum(delta.last_day_market_volume, 0)}</span>
           </div>
-        ` : `<div class="meta-row"><span>未找到对应的历史增量快照。</span></div>`;
+        ` : `<div class="meta-row"><span>结束时间：${escapeHtml(fmtDate(activityEndAt) || "-")}</span><span>${missingPreviousSnapshot ? "已拿到最终榜单，但缺少前一天本地快照。" : "未找到对应的历史增量快照。"}</span></div>`;
         const deltas = delta && delta.deltas ? delta.deltas : {};
         const deltaTable = delta ? `
           <div>
@@ -3216,7 +3428,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
               </table>
             </div>
           </div>
-        ` : `<div class="empty">没有可用的最后一天增量数据。</div>`;
+        ` : `<div class="empty">${missingPreviousSnapshot ? "最终门槛数据已获取；最后一天增量需要前一天本地快照，当前仓库没有留存。" : "没有可用的最后一天增量数据。"}</div>`;
         const rewardTable = rewards.length ? `
           <div>
             <div class="meta" style="margin-bottom:8px;">奖励 / 门槛交易量比值</div>
@@ -3343,6 +3555,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         const board = rows.find((item) => item.board_key === boardKey);
         if (!board) return;
         const currentValues = board.current_values || {};
+        const boardForecastCoefficients = board.forecast_coefficients || {};
         const defaultVolume = Number(board.latest_day_volume);
         if (savedVolumes && savedVolumes[boardKey] !== undefined && savedVolumes[boardKey] !== null) {
           input.value = String(savedVolumes[boardKey]);
@@ -3359,14 +3572,23 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
           }
           saveOngoingVolumeState(nextState);
           const predictedValues = {};
+          let previousPredictedValue = null;
           body.querySelectorAll("tr[data-rank]").forEach((row) => {
             const rank = row.dataset.rank || "";
-            const coefficient = FORECAST_COEFFICIENTS[rank];
+            const coefficient = Object.prototype.hasOwnProperty.call(boardForecastCoefficients, rank)
+              ? Number(boardForecastCoefficients[rank])
+              : FORECAST_DEFAULT_COEFFICIENTS[rank];
             const currentValue = currentValues[rank];
             const delta = coefficient ? safeVolume * coefficient : null;
-            const predicted = (currentValue !== null && currentValue !== undefined && delta !== null)
+            let predicted = (currentValue !== null && currentValue !== undefined && delta !== null)
               ? Number(currentValue) + Number(delta)
               : (currentValue !== null && currentValue !== undefined ? Number(currentValue) : null);
+            if (predicted !== null && previousPredictedValue !== null) {
+              predicted = Math.min(predicted, previousPredictedValue);
+            }
+            if (predicted !== null) {
+              previousPredictedValue = predicted;
+            }
             predictedValues[rank] = predicted;
             const cells = row.querySelectorAll("td");
             if (cells.length < 2) return;

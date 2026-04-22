@@ -5,6 +5,7 @@ import json
 import time
 import traceback
 from datetime import datetime, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -54,6 +55,74 @@ def _truthy(value: Any) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes"}
 
 
+def _quantity_decimal(value: Any) -> Decimal:
+    try:
+        return Decimal(str(value))
+    except Exception:
+        return Decimal("0")
+
+
+def _order_position_side(order: dict[str, Any]) -> str:
+    raw = str(order.get("position_side", order.get("positionSide", "BOTH"))).upper().strip()
+    return raw or "BOTH"
+
+
+def _order_bucket_key(side: str, price: float, position_side: str | None = None) -> str:
+    normalized_position_side = str(position_side or "BOTH").upper().strip() or "BOTH"
+    return f"{side.upper()}:{normalized_position_side}:{price:.10f}"
+
+
+def _clone_order_with_qty(order: dict[str, Any], qty: Decimal) -> dict[str, Any]:
+    cloned = dict(order)
+    qty_float = float(qty)
+    cloned["qty"] = qty_float
+    if "quantity" in cloned:
+        cloned["quantity"] = qty_float
+    if "origQty" in cloned:
+        cloned["origQty"] = qty_float
+    if "notional" in cloned:
+        cloned["notional"] = _safe_float(cloned.get("price")) * qty_float
+    return cloned
+
+
+def _choose_preserved_cancel_indices(
+    quantities: list[Decimal],
+    target_qty: Decimal,
+) -> tuple[set[int], Decimal]:
+    safe_target = max(Decimal("0"), target_qty)
+    if safe_target <= Decimal("0") or not quantities:
+        return set(), Decimal("0")
+
+    best_indices: set[int] = set()
+    best_total = Decimal("0")
+
+    def _search(index: int, running_total: Decimal, chosen: list[int]) -> None:
+        nonlocal best_indices, best_total
+        if running_total > safe_target:
+            return
+        chosen_set = set(chosen)
+        if (
+            running_total > best_total
+            or (running_total == best_total and len(chosen_set) > len(best_indices))
+        ):
+            best_total = running_total
+            best_indices = chosen_set
+            if best_total == safe_target and len(best_indices) == len(quantities):
+                return
+        if index >= len(quantities):
+            return
+        remaining_total = sum(quantities[index:], Decimal("0"))
+        if running_total + remaining_total < best_total:
+            return
+        _search(index + 1, running_total + quantities[index], [*chosen, index])
+        if best_total == safe_target:
+            return
+        _search(index + 1, running_total, chosen)
+
+    _search(0, Decimal("0"), [])
+    return best_indices, best_total
+
+
 def _build_client_order_id(*, symbol: str, role: str, index: int) -> str:
     compact_symbol = symbol.lower().replace("usdt", "u")
     compact_role = role.lower().replace("_", "")[:8]
@@ -90,17 +159,28 @@ def prepare_post_only_order_request(
     tick_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    post_only: bool = True,
 ) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
     qty = _safe_float(order.get("qty"))
     desired_price = _safe_float(order.get("price"))
-    submit_price = adjust_post_only_price(
-        desired_price=desired_price,
-        side=side,
-        live_bid_price=live_bid_price,
-        live_ask_price=live_ask_price,
-        tick_size=tick_size,
-    )
+    normalized_side = side.upper().strip()
+    if post_only:
+        submit_price = adjust_post_only_price(
+            desired_price=desired_price,
+            side=normalized_side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+        )
+    elif tick_size and tick_size > 0:
+        submit_price = _round_order_price(desired_price, tick_size, normalized_side)
+    else:
+        submit_price = desired_price
     submit_notional = qty * submit_price
+    reference_price = submit_price
+    if live_bid_price > 0:
+        reference_price = min(reference_price, live_bid_price)
+    reference_notional = qty * reference_price
     if qty <= 0:
         return None, {
             "reason": "non_positive_qty",
@@ -108,6 +188,8 @@ def prepare_post_only_order_request(
             "desired_price": desired_price,
             "submitted_price": submit_price,
             "submitted_notional": submit_notional,
+            "reference_price": reference_price,
+            "reference_notional": reference_notional,
         }
     if min_qty is not None and qty < min_qty:
         return None, {
@@ -117,6 +199,8 @@ def prepare_post_only_order_request(
             "desired_price": desired_price,
             "submitted_price": submit_price,
             "submitted_notional": submit_notional,
+            "reference_price": reference_price,
+            "reference_notional": reference_notional,
         }
     if min_notional is not None and submit_notional < min_notional:
         return None, {
@@ -126,13 +210,32 @@ def prepare_post_only_order_request(
             "desired_price": desired_price,
             "submitted_price": submit_price,
             "submitted_notional": submit_notional,
+            "reference_price": reference_price,
+            "reference_notional": reference_notional,
+        }
+    if min_notional is not None and reference_notional < min_notional:
+        return None, {
+            "reason": "reference_notional_below_min_notional",
+            "qty": qty,
+            "min_notional": float(min_notional),
+            "desired_price": desired_price,
+            "submitted_price": submit_price,
+            "submitted_notional": submit_notional,
+            "reference_price": reference_price,
+            "reference_notional": reference_notional,
         }
     return {
         "qty": qty,
         "desired_price": desired_price,
         "submitted_price": submit_price,
         "submitted_notional": submit_notional,
+        "reference_price": reference_price,
+        "reference_notional": reference_notional,
     }, None
+
+
+def _order_prefers_post_only(order: dict[str, Any]) -> bool:
+    return str(order.get("execution_type", "post_only")).strip().lower() != "aggressive"
 
 
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
@@ -153,6 +256,172 @@ def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
         "place_count": len(place_orders),
         "cancel_count": len(stale_orders),
         "place_notional": place_notional,
+    }
+
+
+def preserve_queue_priority_in_execution_actions(
+    *,
+    actions: dict[str, Any],
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    """Prefer preserving queued orders unless the refreshed plan truly needs less size or a new bucket."""
+    raw_place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
+    place_orders: list[dict[str, Any]] = []
+    for order in raw_place_orders:
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            place_orders.append(order)
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            post_only=_order_prefers_post_only(order),
+        )
+        if prepared_order is None:
+            continue
+        sanitized = dict(order)
+        sanitized["price"] = _safe_float(prepared_order.get("submitted_price"))
+        sanitized["qty"] = _safe_float(prepared_order.get("qty"))
+        sanitized["notional"] = _safe_float(prepared_order.get("submitted_notional"))
+        place_orders.append(sanitized)
+    if not place_orders or not cancel_orders:
+        return {
+            "place_orders": place_orders,
+            "cancel_orders": cancel_orders,
+            "place_count": len(place_orders),
+            "cancel_count": len(cancel_orders),
+            "place_notional": sum(_safe_float(item.get("notional")) for item in place_orders),
+        }
+
+    cancel_indices_by_bucket: dict[str, list[int]] = {}
+    cancel_totals_by_bucket: dict[str, Decimal] = {}
+    for index, order in enumerate(cancel_orders):
+        side = str(order.get("side", "")).upper().strip()
+        price = _safe_float(order.get("price"))
+        qty = _quantity_decimal(order.get("origQty", order.get("qty")))
+        if side not in {"BUY", "SELL"} or price <= 0 or qty <= Decimal("0"):
+            continue
+        key = _order_bucket_key(side, price, _order_position_side(order))
+        cancel_indices_by_bucket.setdefault(key, []).append(index)
+        cancel_totals_by_bucket[key] = cancel_totals_by_bucket.get(key, Decimal("0")) + qty
+
+    projected_place_totals: dict[str, Decimal] = {}
+    projected_place_templates: dict[str, dict[str, Any]] = {}
+    for order in place_orders:
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            post_only=_order_prefers_post_only(order),
+        )
+        if prepared_order is None:
+            continue
+        qty = _quantity_decimal(prepared_order.get("qty"))
+        price = _safe_float(prepared_order.get("submitted_price"))
+        if qty <= Decimal("0") or price <= 0:
+            continue
+        key = _order_bucket_key(side, price, _order_position_side(order))
+        projected_place_totals[key] = projected_place_totals.get(key, Decimal("0")) + qty
+        if key not in projected_place_templates:
+            template = dict(order)
+            template["price"] = price
+            template["qty"] = float(qty)
+            template["notional"] = price * float(qty)
+            projected_place_templates[key] = template
+
+    if not projected_place_totals:
+        return {
+            "place_orders": place_orders,
+            "cancel_orders": cancel_orders,
+            "place_count": len(place_orders),
+            "cancel_count": len(cancel_orders),
+            "place_notional": sum(_safe_float(item.get("notional")) for item in place_orders),
+        }
+
+    preserved_cancel_indices: set[int] = set()
+    reduced_place_totals = dict(projected_place_totals)
+    for key, desired_total in projected_place_totals.items():
+        existing_total = cancel_totals_by_bucket.get(key, Decimal("0"))
+        if existing_total <= Decimal("0"):
+            continue
+        bucket_indices = cancel_indices_by_bucket.get(key, [])
+        bucket_quantities = [
+            _quantity_decimal(cancel_orders[index].get("origQty", cancel_orders[index].get("qty")))
+            for index in bucket_indices
+        ]
+        if desired_total >= existing_total:
+            for cancel_index in bucket_indices:
+                preserved_cancel_indices.add(cancel_index)
+            reduced_place_totals[key] = max(desired_total - existing_total, Decimal("0"))
+            continue
+
+        chosen_local_indices, preserved_qty = _choose_preserved_cancel_indices(bucket_quantities, desired_total)
+        if preserved_qty <= Decimal("0"):
+            continue
+        for local_index in chosen_local_indices:
+            preserved_cancel_indices.add(bucket_indices[local_index])
+        reduced_place_totals[key] = max(desired_total - preserved_qty, Decimal("0"))
+
+    adjusted_place_orders: list[dict[str, Any]] = []
+    consumed_projected_buckets: set[str] = set()
+    for order in place_orders:
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            adjusted_place_orders.append(order)
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            post_only=_order_prefers_post_only(order),
+        )
+        if prepared_order is None:
+            continue
+        projected_key = _order_bucket_key(
+            side,
+            _safe_float(prepared_order.get("submitted_price")),
+            _order_position_side(order),
+        )
+        if projected_key not in reduced_place_totals:
+            adjusted_place_orders.append(order)
+            continue
+        if projected_key in consumed_projected_buckets:
+            continue
+        consumed_projected_buckets.add(projected_key)
+        delta = reduced_place_totals.get(projected_key, Decimal("0"))
+        if delta > Decimal("0"):
+            adjusted_place_orders.append(_clone_order_with_qty(projected_place_templates[projected_key], delta))
+
+    adjusted_cancel_orders = [
+        order for index, order in enumerate(cancel_orders) if index not in preserved_cancel_indices
+    ]
+    return {
+        "place_orders": adjusted_place_orders,
+        "cancel_orders": adjusted_cancel_orders,
+        "place_count": len(adjusted_place_orders),
+        "cancel_count": len(adjusted_cancel_orders),
+        "place_notional": sum(_safe_float(item.get("notional")) for item in adjusted_place_orders),
     }
 
 
@@ -338,6 +607,14 @@ def main() -> None:
             f"live mid drift is {drift_steps:.2f} steps, above max_mid_drift_steps={args.max_mid_drift_steps:.2f}"
         )
         validation["ok"] = False
+    validation["actions"] = preserve_queue_priority_in_execution_actions(
+        actions=validation["actions"],
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+    )
 
     _print_preview(plan_report=plan_report, validation=validation, drift_steps=drift_steps)
 

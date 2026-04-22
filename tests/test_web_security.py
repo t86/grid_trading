@@ -7,22 +7,36 @@ from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.web import (
+    HTML_PAGE,
     MONITOR_PAGE,
+    RANKING_PAGE,
+    SPOT_RUNNER_PAGE,
     STRATEGIES_PAGE,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
+    _build_flatten_command,
     _delete_custom_grid_runner_preset,
+    _create_custom_grid_runner_preset,
     _build_runner_command,
     _client_ip_allowed,
     _default_runtime_paths_for_symbol,
     _get_custom_runner_preset,
     _load_runner_control_config,
+    _normalize_spot_runner_payload,
     _parse_allowed_networks,
     _resolve_runner_start_config,
+    _render_monitor_page,
+    _render_spot_runner_page,
+    _render_spot_strategies_page,
+    _render_strategies_page,
     _run_loop_monitor_query,
     _runner_service_name_for_symbol,
+    _resolve_volatility_directional_flatten_filter,
     _runner_preset_payload,
     _runner_preset_summaries,
+    _save_running_runner_preset,
+    _spot_runner_preset_payload,
+    _spot_runner_preset_summaries,
     _save_runner_control_config,
     _start_runner_process,
     _update_custom_grid_runner_preset,
@@ -48,6 +62,126 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_monitor_page_contains_custom_grid_startup_inventory_text(self) -> None:
         self.assertIn("现价启动底仓", MONITOR_PAGE)
+
+    def test_monitor_page_contains_save_running_preset_controls(self) -> None:
+        self.assertIn('id="save_running_preset_name"', MONITOR_PAGE)
+        self.assertIn('id="save_running_preset_description"', MONITOR_PAGE)
+        self.assertIn('id="save_running_preset_btn"', MONITOR_PAGE)
+        self.assertIn("/api/runner/presets/save_running", MONITOR_PAGE)
+
+    def test_monitor_page_contains_xaut_adaptive_status_text(self) -> None:
+        self.assertIn("XAUT 三态状态", MONITOR_PAGE)
+        self.assertIn("XAUT 三态原因", MONITOR_PAGE)
+
+    def test_monitor_page_uses_safe_json_reader_for_runner_actions(self) -> None:
+        self.assertIn("async function readJsonResponse(resp)", MONITOR_PAGE)
+        self.assertIn("const raw = await resp.text();", MONITOR_PAGE)
+        self.assertIn("return raw ? JSON.parse(raw) : {};", MONITOR_PAGE)
+
+    def test_monitor_page_uses_safe_json_reader_for_stop_action(self) -> None:
+        self.assertIn("const data = await readJsonResponse(resp);", MONITOR_PAGE)
+
+    def test_volatility_directional_flatten_closes_long_on_fast_drop(self) -> None:
+        result = _resolve_volatility_directional_flatten_filter(
+            current_return_ratio=-0.08,
+            live_snapshot={"long_qty": 10.0, "short_qty": 0.0},
+        )
+        self.assertEqual(result["position_side_filter"], "LONG")
+        self.assertEqual(result["reason"], "close_long_on_down_move")
+
+    def test_volatility_directional_flatten_keeps_short_on_fast_drop(self) -> None:
+        result = _resolve_volatility_directional_flatten_filter(
+            current_return_ratio=-0.08,
+            live_snapshot={"long_qty": 0.0, "short_qty": 10.0},
+        )
+        self.assertIsNone(result["position_side_filter"])
+        self.assertEqual(result["reason"], "no_adverse_position")
+
+    def test_volatility_directional_flatten_closes_short_on_fast_rally(self) -> None:
+        result = _resolve_volatility_directional_flatten_filter(
+            current_return_ratio=0.08,
+            live_snapshot={"long_qty": 0.0, "short_qty": 10.0},
+        )
+        self.assertEqual(result["position_side_filter"], "SHORT")
+        self.assertEqual(result["reason"], "close_short_on_up_move")
+
+    def test_spot_runner_page_contains_strategy_preset_controls(self) -> None:
+        self.assertIn('id="spot_strategy_preset"', SPOT_RUNNER_PAGE)
+        self.assertIn("1.25XAUT现货交易赛", SPOT_RUNNER_PAGE)
+        self.assertIn('id="load_spot_preset_btn"', SPOT_RUNNER_PAGE)
+
+    def test_ranking_page_uses_conservative_default_refresh_seconds(self) -> None:
+        self.assertIn('id="rank_refresh_seconds" type="number" step="1" value="120"', HTML_PAGE)
+        self.assertIn("Math.max(60, Number(rankRefreshSecondsEl.value) || 120)", HTML_PAGE)
+        self.assertIn('id="refresh_seconds" type="number" step="1" value="120"', RANKING_PAGE)
+        self.assertIn("Math.max(60, Number(refreshSecondsEl.value) || 120)", RANKING_PAGE)
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_competition_board_auto_refresh_interval_defaults_to_twenty_minutes(self) -> None:
+        from grid_optimizer.web import _competition_board_auto_refresh_interval_seconds
+
+        self.assertEqual(_competition_board_auto_refresh_interval_seconds(), 1200.0)
+
+    @patch.dict("os.environ", {"GRID_COMPETITION_BOARD_REFRESH_SECONDS": "1500"}, clear=False)
+    def test_competition_board_auto_refresh_interval_respects_environment_override(self) -> None:
+        from grid_optimizer.web import _competition_board_auto_refresh_interval_seconds
+
+        self.assertEqual(_competition_board_auto_refresh_interval_seconds(), 1500.0)
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_render_monitor_page_uses_conservative_default_refresh_seconds(self) -> None:
+        page = _render_monitor_page()
+
+        self.assertIn('id="refresh_sec" type="number" min="2" step="1" value="15"', page)
+        self.assertIn("Math.max(2, Number(refreshSecEl.value || 15))", page)
+
+    @patch.dict("os.environ", {"GRID_WEB_MONITOR_REFRESH_DEFAULT_SECONDS": "21"}, clear=False)
+    def test_render_monitor_page_respects_environment_refresh_override(self) -> None:
+        page = _render_monitor_page()
+
+        self.assertIn('id="refresh_sec" type="number" min="2" step="1" value="21"', page)
+        self.assertIn("Math.max(2, Number(refreshSecEl.value || 21))", page)
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_render_spot_runner_page_uses_conservative_default_refresh_seconds(self) -> None:
+        page = _render_spot_runner_page()
+
+        self.assertIn('id="refresh_seconds" type="number" min="2" step="1" value="15"', page)
+        self.assertIn("Math.max(2, Number(refreshSecondsEl.value || 15))", page)
+
+    @patch.dict("os.environ", {"GRID_WEB_SPOT_RUNNER_REFRESH_DEFAULT_SECONDS": "19"}, clear=False)
+    def test_render_spot_runner_page_respects_environment_refresh_override(self) -> None:
+        page = _render_spot_runner_page()
+
+        self.assertIn('id="refresh_seconds" type="number" min="2" step="1" value="19"', page)
+        self.assertIn("Math.max(2, Number(refreshSecondsEl.value || 19))", page)
+
+    @patch.dict("os.environ", {}, clear=False)
+    def test_render_strategy_pages_use_slower_default_refresh_seconds(self) -> None:
+        spot_page = _render_spot_strategies_page()
+        futures_page = _render_strategies_page()
+
+        self.assertIn('id="refresh_sec" type="number" min="3" step="1" value="20"', spot_page)
+        self.assertIn("Math.max(3, Number(refreshSecEl.value || 20))", spot_page)
+        self.assertIn('id="refresh_sec" type="number" min="3" step="1" value="20"', futures_page)
+        self.assertIn("Math.max(3, Number(refreshSecEl.value || 20))", futures_page)
+
+    @patch.dict(
+        "os.environ",
+        {
+            "GRID_WEB_SPOT_STRATEGIES_REFRESH_DEFAULT_SECONDS": "26",
+            "GRID_WEB_STRATEGIES_REFRESH_DEFAULT_SECONDS": "24",
+        },
+        clear=False,
+    )
+    def test_render_strategy_pages_respect_environment_refresh_overrides(self) -> None:
+        spot_page = _render_spot_strategies_page()
+        futures_page = _render_strategies_page()
+
+        self.assertIn('id="refresh_sec" type="number" min="3" step="1" value="26"', spot_page)
+        self.assertIn("Math.max(3, Number(refreshSecEl.value || 26))", spot_page)
+        self.assertIn('id="refresh_sec" type="number" min="3" step="1" value="24"', futures_page)
+        self.assertIn("Math.max(3, Number(refreshSecEl.value || 24))", futures_page)
 
     def test_basic_auth_header_rejects_invalid_credentials(self) -> None:
         token = base64.b64encode(b"grid:wrong-pass").decode("ascii")
@@ -78,6 +212,30 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
         self.assertAlmostEqual(payload["max_short_position_notional"], 500.0)
 
+    def test_runner_preset_payload_applies_volume_neutral_push_v1_for_based(self) -> None:
+        payload = _runner_preset_payload("volume_neutral_push_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "volume_neutral_push_v1")
+        self.assertEqual(payload["symbol"], "BASEDUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertAlmostEqual(payload["step_price"], 0.0001)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 8)
+        self.assertAlmostEqual(payload["per_order_notional"], 45.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 0.0)
+        self.assertEqual(payload["up_trigger_steps"], 3)
+        self.assertEqual(payload["down_trigger_steps"], 3)
+        self.assertEqual(payload["shift_steps"], 1)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 1000.0)
+        self.assertAlmostEqual(payload["pause_short_position_notional"], 1000.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 1000.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 1000.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 2200.0)
+
+    def test_runner_preset_payload_rejects_volume_neutral_push_v1_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BASEDUSDT"):
+            _runner_preset_payload("volume_neutral_push_v1", {"symbol": "BTCUSDT"})
+
     def test_runner_preset_payload_applies_volatility_defensive_profile(self) -> None:
         payload = _runner_preset_payload("volatility_defensive_v1", {"symbol": "OPNUSDT"})
         self.assertEqual(payload["strategy_profile"], "volatility_defensive_v1")
@@ -90,6 +248,146 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["strategy_profile"], "adaptive_volatility_v1")
         self.assertTrue(payload["auto_regime_enabled"])
         self.assertEqual(payload["auto_regime_confirm_cycles"], 2)
+
+    def test_runner_preset_payload_applies_xaut_long_adaptive_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_long_adaptive_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_long_adaptive_v1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertEqual(payload["step_price"], 7.5)
+
+    def test_runner_preset_payload_applies_xaut_short_adaptive_profile(self) -> None:
+        payload = _runner_preset_payload("xaut_short_adaptive_v1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_short_adaptive_v1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "one_way_short")
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertEqual(payload["step_price"], 7.4)
+
+    def test_runner_preset_payload_applies_xaut_volume_guarded_bard_v3(self) -> None:
+        payload = _runner_preset_payload("xaut_volume_guarded_bard_v3", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_volume_guarded_bard_v3")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 1.0)
+        self.assertEqual(payload["buy_levels"], 10)
+        self.assertEqual(payload["sell_levels"], 6)
+        self.assertAlmostEqual(payload["per_order_notional"], 35.0)
+        self.assertAlmostEqual(payload["startup_entry_multiplier"], 3.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 120.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 2600.0)
+        self.assertAlmostEqual(payload["pause_short_position_notional"], 2600.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 3200.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 3200.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 3000.0)
+        self.assertAlmostEqual(payload["sleep_seconds"], 3.0)
+
+    def test_runner_preset_payload_applies_xaut_volume_guarded_bard_v3_1(self) -> None:
+        payload = _runner_preset_payload("xaut_volume_guarded_bard_v3_1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_volume_guarded_bard_v3_1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 1.25)
+        self.assertEqual(payload["buy_levels"], 10)
+        self.assertEqual(payload["sell_levels"], 6)
+        self.assertAlmostEqual(payload["per_order_notional"], 35.0)
+        self.assertAlmostEqual(payload["startup_entry_multiplier"], 2.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 80.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 2600.0)
+        self.assertAlmostEqual(payload["pause_short_position_notional"], 2600.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 3200.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 3200.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 3000.0)
+        self.assertAlmostEqual(payload["sleep_seconds"], 3.0)
+
+    def test_runner_preset_payload_applies_bard_push_neutral_step_and_stop_cap(self) -> None:
+        payload = _runner_preset_payload("bard_12h_push_neutral_v2", {"symbol": "BARDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "bard_12h_push_neutral_v2")
+        self.assertEqual(payload["symbol"], "BARDUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 0.0001)
+        self.assertAlmostEqual(payload["max_cumulative_notional"], 600000.0)
+
+    def test_runner_preset_payload_rejects_xaut_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _runner_preset_payload("xaut_long_adaptive_v1", {"symbol": "BTCUSDT"})
+
+    def test_runner_preset_summaries_hide_xaut_volume_guarded_bard_v3_from_dropdown(self) -> None:
+        xaut_keys = {item["key"] for item in _runner_preset_summaries("XAUTUSDT")}
+        self.assertNotIn("xaut_volume_guarded_bard_v3", xaut_keys)
+        payload = _runner_preset_payload("xaut_volume_guarded_bard_v3", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_volume_guarded_bard_v3")
+
+    def test_runner_preset_summaries_hide_xaut_volume_guarded_bard_v3_1_from_dropdown(self) -> None:
+        xaut_keys = {item["key"] for item in _runner_preset_summaries("XAUTUSDT")}
+        self.assertNotIn("xaut_volume_guarded_bard_v3_1", xaut_keys)
+        payload = _runner_preset_payload("xaut_volume_guarded_bard_v3_1", {"symbol": "XAUTUSDT"})
+        self.assertEqual(payload["strategy_profile"], "xaut_volume_guarded_bard_v3_1")
+
+    def test_spot_runner_preset_payload_applies_xaut_competition_125_profile(self) -> None:
+        payload = _spot_runner_preset_payload("xaut_spot_competition_1_25_v1", {"symbol": "XAUTUSDT"})
+
+        self.assertEqual(payload["strategy_profile"], "xaut_spot_competition_1_25_v1")
+        self.assertEqual(payload["symbol"], "XAUTUSDT")
+        self.assertEqual(payload["strategy_mode"], "spot_volume_shift_long")
+        self.assertAlmostEqual(payload["grid_band_ratio"], 0.00084)
+        self.assertEqual(payload["attack_buy_levels"], 5)
+        self.assertEqual(payload["attack_sell_levels"], 5)
+        self.assertAlmostEqual(payload["attack_per_order_notional"], 40.0)
+        self.assertAlmostEqual(payload["inventory_soft_limit_notional"], 750.0)
+        self.assertAlmostEqual(payload["inventory_hard_limit_notional"], 950.0)
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 120.0)
+        self.assertAlmostEqual(payload["max_cumulative_notional"], 1_000_000.0)
+        self.assertAlmostEqual(payload["max_cumulative_loss_limit"], 800.0)
+
+    def test_spot_runner_preset_summaries_include_xaut_competition_125_for_xaut_only(self) -> None:
+        xaut_keys = {item["key"] for item in _spot_runner_preset_summaries("XAUTUSDT")}
+        btc_keys = {item["key"] for item in _spot_runner_preset_summaries("BTCUSDT")}
+
+        self.assertIn("xaut_spot_competition_1_25_v1", xaut_keys)
+        self.assertNotIn("xaut_spot_competition_1_25_v1", btc_keys)
+
+    def test_spot_runner_preset_payload_applies_bard_best_quote_inventory_profile(self) -> None:
+        payload = _spot_runner_preset_payload("bard_spot_best_quote_inventory_v1", {"symbol": "BARDUSDT"})
+
+        self.assertEqual(payload["strategy_profile"], "bard_spot_best_quote_inventory_v1")
+        self.assertEqual(payload["symbol"], "BARDUSDT")
+        self.assertEqual(payload["strategy_mode"], "spot_best_quote_inventory")
+        self.assertAlmostEqual(payload["base_position_notional"], 120.0)
+        self.assertAlmostEqual(payload["max_inventory_multiplier"], 2.0)
+        self.assertAlmostEqual(payload["quote_buy_order_notional"], 20.0)
+        self.assertAlmostEqual(payload["quote_sell_order_notional"], 20.0)
+        self.assertAlmostEqual(payload["min_profit_offset"], 0.0001)
+        self.assertAlmostEqual(payload["reduce_only_timeout_seconds"], 60.0)
+        self.assertAlmostEqual(payload["reduce_only_taker_target_multiplier"], 1.4)
+
+    def test_spot_runner_preset_summaries_include_bard_best_quote_for_bard_only(self) -> None:
+        bard_keys = {item["key"] for item in _spot_runner_preset_summaries("BARDUSDT")}
+        btc_keys = {item["key"] for item in _spot_runner_preset_summaries("BTCUSDT")}
+
+        self.assertIn("bard_spot_best_quote_inventory_v1", bard_keys)
+        self.assertNotIn("bard_spot_best_quote_inventory_v1", btc_keys)
+
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_normalize_spot_runner_payload_applies_xaut_competition_125_profile(self, mock_validate) -> None:
+        config = _normalize_spot_runner_payload(
+            {
+                "strategy_profile": "xaut_spot_competition_1_25_v1",
+                "symbol": "XAUTUSDT",
+            }
+        )
+
+        mock_validate.assert_called_once_with(symbol="XAUTUSDT", market_type="spot", contract_type=None)
+        self.assertEqual(config["strategy_profile"], "xaut_spot_competition_1_25_v1")
+        self.assertEqual(config["symbol"], "XAUTUSDT")
+        self.assertEqual(config["strategy_mode"], "spot_volume_shift_long")
+        self.assertAlmostEqual(config["grid_band_ratio"], 0.00084)
+        self.assertAlmostEqual(config["attack_per_order_notional"], 40.0)
+        self.assertAlmostEqual(config["inventory_hard_limit_notional"], 950.0)
+        self.assertAlmostEqual(config["max_cumulative_notional"], 1_000_000.0)
+        self.assertAlmostEqual(config["max_cumulative_loss_limit"], 800.0)
+        self.assertEqual(config["state_path"], "output/xautusdt_spot_state.json")
 
     def test_runner_preset_payload_keeps_user_overrides(self) -> None:
         payload = _runner_preset_payload(
@@ -143,6 +441,41 @@ class WebSecurityTests(unittest.TestCase):
         finally:
             control_path.unlink(missing_ok=True)
 
+    def test_load_runner_control_config_prefers_saved_config_over_stale_runner_config(self) -> None:
+        control_path = Path("output/test_basedusdt_loop_runner_control.json")
+        control_path.parent.mkdir(parents=True, exist_ok=True)
+        control_path.write_text(
+            json.dumps(
+                {
+                    "symbol": "BASEDUSDT",
+                    "strategy_profile": "volume_long_v4",
+                    "step_price": 0.003,
+                    "autotune_symbol_enabled": False,
+                    "volatility_trigger_enabled": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            with patch("grid_optimizer.web._runner_control_path", return_value=control_path), patch(
+                "grid_optimizer.web._read_runner_process_for_symbol",
+                return_value={
+                    "config": {
+                        "symbol": "BASEDUSDT",
+                        "strategy_profile": "volume_long_v4",
+                        "step_price": 0.00012,
+                        "autotune_symbol_enabled": True,
+                        "volatility_trigger_enabled": True,
+                    }
+                },
+            ):
+                config = _load_runner_control_config("BASEDUSDT")
+            self.assertEqual(config["step_price"], 0.003)
+            self.assertFalse(config["autotune_symbol_enabled"])
+            self.assertFalse(config["volatility_trigger_enabled"])
+        finally:
+            control_path.unlink(missing_ok=True)
+
     def test_symbol_runner_template_disables_legacy_mode(self) -> None:
         with patch.dict("os.environ", {"GRID_RUNNER_SERVICE_TEMPLATE": "grid-loop@{symbol}.service"}):
             self.assertFalse(_uses_legacy_runner("NIGHTUSDT"))
@@ -163,9 +496,48 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["neutral_band2_target_ratio"], 0.50)
         self.assertAlmostEqual(payload["neutral_band3_target_ratio"], 1.00)
 
-    @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
+    def test_runner_preset_payload_applies_based_competition_neutral_profile(self) -> None:
+        payload = _runner_preset_payload("based_competition_neutral_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "based_competition_neutral_v1")
+        self.assertEqual(payload["symbol"], "BASEDUSDT")
+        self.assertEqual(payload["strategy_mode"], "inventory_target_neutral")
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertEqual(payload["neutral_center_interval_minutes"], 3)
+        self.assertAlmostEqual(payload["neutral_band1_offset_ratio"], 0.009)
+        self.assertAlmostEqual(payload["neutral_band2_offset_ratio"], 0.018)
+        self.assertAlmostEqual(payload["neutral_band3_offset_ratio"], 0.036)
+        self.assertAlmostEqual(payload["max_position_notional"], 360.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 540.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 900.0)
+
+    def test_runner_preset_payload_applies_based_competition_neutral_aggressive_profile(self) -> None:
+        payload = _runner_preset_payload("based_competition_neutral_aggressive_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "based_competition_neutral_aggressive_v1")
+        self.assertEqual(payload["symbol"], "BASEDUSDT")
+        self.assertEqual(payload["strategy_mode"], "inventory_target_neutral")
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertEqual(payload["neutral_center_interval_minutes"], 3)
+        self.assertAlmostEqual(payload["neutral_band1_offset_ratio"], 0.005)
+        self.assertAlmostEqual(payload["neutral_band2_offset_ratio"], 0.010)
+        self.assertAlmostEqual(payload["neutral_band3_offset_ratio"], 0.020)
+        self.assertAlmostEqual(payload["neutral_band1_target_ratio"], 0.30)
+        self.assertAlmostEqual(payload["neutral_band2_target_ratio"], 0.70)
+        self.assertAlmostEqual(payload["neutral_band3_target_ratio"], 1.00)
+        self.assertAlmostEqual(payload["max_position_notional"], 540.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 900.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 1440.0)
+
+    def test_runner_preset_payload_rejects_based_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BASEDUSDT"):
+            _runner_preset_payload("based_competition_neutral_v1", {"symbol": "BTCUSDT"})
+
+    def test_runner_preset_payload_rejects_based_competition_neutral_aggressive_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BASEDUSDT"):
+            _runner_preset_payload("based_competition_neutral_aggressive_v1", {"symbol": "BTCUSDT"})
+
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
-        custom_path = Path("output/test_custom_runner_presets.json")
+        custom_path = Path("output/test_runner_user_presets.json")
         custom_path.parent.mkdir(parents=True, exist_ok=True)
         custom_path.write_text(
             json.dumps(
@@ -281,6 +653,49 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(config["auto_regime_enabled"])
         self.assertEqual(config["state_path"], "output/opnusdt_loop_state.json")
 
+    def test_resolve_runner_start_config_rejects_xaut_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
+            _resolve_runner_start_config({"symbol": "BTCUSDT", "strategy_profile": "xaut_long_adaptive_v1"})
+
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
+    def test_resolve_runner_start_config_uses_selected_captured_preset(self) -> None:
+        path = Path("output/test_runner_user_presets.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "captured_bard": {
+                        "key": "captured_bard",
+                        "label": "BARD captured",
+                        "description": "captured",
+                        "symbol": "BARDUSDT",
+                        "custom": True,
+                        "startable": True,
+                        "kind": "synthetic",
+                        "source": "captured_running_config",
+                        "config": {
+                            "symbol": "BARDUSDT",
+                            "strategy_profile": "captured_bard",
+                            "strategy_mode": "synthetic_neutral",
+                            "step_price": 0.0001,
+                            "per_order_notional": 88.0,
+                            "autotune_symbol_enabled": False,
+                        },
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            config = _resolve_runner_start_config({"symbol": "BARDUSDT", "strategy_profile": "captured_bard"})
+            self.assertEqual(config["strategy_profile"], "captured_bard")
+            self.assertEqual(config["strategy_mode"], "synthetic_neutral")
+            self.assertEqual(config["per_order_notional"], 88.0)
+            self.assertFalse(config["autotune_symbol_enabled"])
+        finally:
+            path.unlink(missing_ok=True)
+
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_starts_volume_neutral_target_profile(self, mock_symbol_config, mock_book_tickers) -> None:
@@ -296,6 +711,41 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["max_short_position_notional"], 900.0)
         self.assertEqual(config["max_total_notional"], 1800.0)
         self.assertTrue(config["neutral_hourly_scale_enabled"])
+
+    def test_resolve_runner_start_config_preserves_saved_manual_runner_config(self) -> None:
+        control_path = Path("output/test_basedusdt_loop_runner_control.json")
+        control_path.parent.mkdir(parents=True, exist_ok=True)
+        control_path.write_text(
+            json.dumps(
+                {
+                    "symbol": "BASEDUSDT",
+                    "strategy_profile": "volume_long_v4",
+                    "step_price": 0.003,
+                    "autotune_symbol_enabled": False,
+                    "volatility_trigger_enabled": False,
+                }
+            ),
+            encoding="utf-8",
+        )
+        try:
+            with patch("grid_optimizer.web._runner_control_path", return_value=control_path), patch(
+                "grid_optimizer.web._read_runner_process_for_symbol",
+                return_value={
+                    "config": {
+                        "symbol": "BASEDUSDT",
+                        "strategy_profile": "volume_long_v4",
+                        "step_price": 0.00012,
+                        "autotune_symbol_enabled": True,
+                        "volatility_trigger_enabled": True,
+                    }
+                },
+            ):
+                config = _resolve_runner_start_config({"symbol": "BASEDUSDT", "strategy_profile": "volume_long_v4"})
+            self.assertEqual(config["step_price"], 0.003)
+            self.assertFalse(config["autotune_symbol_enabled"])
+            self.assertFalse(config["volatility_trigger_enabled"])
+        finally:
+            control_path.unlink(missing_ok=True)
 
     def test_default_runtime_paths_are_symbol_specific(self) -> None:
         paths = _default_runtime_paths_for_symbol("ENSOUSDT")
@@ -379,6 +829,30 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--center-price", command)
         self.assertIn("--fixed-center-enabled", command)
         self.assertIn("--reset-state", command)
+
+    def test_build_flatten_command_requires_explicit_allow_loss_flag(self) -> None:
+        base_config = {
+            "symbol": "TESTUSDT",
+            "client_order_prefix": "mftest",
+            "sleep_seconds": 2.0,
+            "recv_window": 5000,
+            "max_consecutive_errors": 20,
+            "events_jsonl": "output/test_maker_flatten_events.jsonl",
+        }
+
+        default_command = _build_flatten_command(base_config)
+        allow_loss_command = _build_flatten_command(
+            {
+                **base_config,
+                "allow_loss": True,
+                "min_profit_ratio": 0.001,
+            }
+        )
+
+        self.assertNotIn("--allow-loss", default_command)
+        self.assertNotIn("--min-profit-ratio", default_command)
+        self.assertIn("--allow-loss", allow_loss_command)
+        self.assertIn("--min-profit-ratio", allow_loss_command)
 
     def test_build_runner_command_includes_custom_grid_arguments(self) -> None:
         command = _build_runner_command(
@@ -497,6 +971,69 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--pause-short-position-notional", command)
         self.assertIn("--max-short-position-notional", command)
 
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config(
+            {
+                "symbol": "ENSOUSDT",
+                "strategy_profile": "defensive_quasi_neutral_v1",
+                "run_start_time": "2026-03-31T01:00:00+00:00",
+                "run_end_time": "2026-03-31T03:00:00+00:00",
+                "rolling_hourly_loss_limit": 150.0,
+                "max_cumulative_notional": 100000.0,
+                "max_cumulative_loss_limit": 800.0,
+            }
+        )
+        self.assertEqual(config["run_start_time"], "2026-03-31T01:00:00+00:00")
+        self.assertEqual(config["run_end_time"], "2026-03-31T03:00:00+00:00")
+        self.assertEqual(config["rolling_hourly_loss_limit"], 150.0)
+        self.assertEqual(config["max_cumulative_notional"], 100000.0)
+        self.assertEqual(config["max_cumulative_loss_limit"], 800.0)
+
+    def test_build_runner_command_includes_runtime_guard_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "ENSOUSDT",
+                "strategy_profile": "defensive_quasi_neutral_v1",
+                "strategy_mode": "one_way_long",
+                "step_price": 0.0001,
+                "buy_levels": 4,
+                "sell_levels": 8,
+                "per_order_notional": 50.0,
+                "base_position_notional": 100.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 20,
+                "max_total_notional": 500.0,
+                "sleep_seconds": 15,
+                "state_path": "output/ensousdt_loop_state.json",
+                "plan_json": "output/ensousdt_loop_latest_plan.json",
+                "submit_report_json": "output/ensousdt_loop_latest_submit.json",
+                "summary_jsonl": "output/ensousdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+                "run_start_time": "2026-03-31T01:00:00+00:00",
+                "run_end_time": "2026-03-31T03:00:00+00:00",
+                "rolling_hourly_loss_limit": 150.0,
+                "max_cumulative_notional": 100000.0,
+                "max_cumulative_loss_limit": 800.0,
+            }
+        )
+        self.assertIn("--run-start-time", command)
+        self.assertIn("2026-03-31T01:00:00+00:00", command)
+        self.assertIn("--run-end-time", command)
+        self.assertIn("--rolling-hourly-loss-limit", command)
+        self.assertIn("--max-cumulative-notional", command)
+        self.assertIn("--max-cumulative-loss-limit", command)
+        self.assertIn("800.0", command)
+
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:
         mock_preview.return_value = {
@@ -555,9 +1092,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(built["preset"]["config"]["pause_buy_position_notional"], 500.0)
         self.assertEqual(built["preset"]["config"]["pause_short_position_notional"], 500.0)
 
-    @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
     def test_runner_preset_summaries_filter_custom_presets_by_symbol(self) -> None:
-        custom_path = Path("output/test_custom_runner_presets.json")
+        custom_path = Path("output/test_runner_user_presets.json")
         custom_path.parent.mkdir(parents=True, exist_ok=True)
         custom_path.write_text(
             '{"custom_grid_night":{"label":"Night 自定义","symbol":"NIGHTUSDT","custom":true,"config":{"strategy_mode":"one_way_long"}},"custom_grid_opn":{"label":"OPN 自定义","symbol":"OPNUSDT","custom":true,"config":{"strategy_mode":"one_way_long"}}}',
@@ -572,9 +1109,200 @@ class WebSecurityTests(unittest.TestCase):
         finally:
             custom_path.unlink(missing_ok=True)
 
-    @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
+    def test_runner_preset_summaries_hide_non_whitelist_builtins_but_keep_custom_presets(self) -> None:
+        custom_path = Path("output/test_runner_user_presets.json")
+        custom_path.parent.mkdir(parents=True, exist_ok=True)
+        custom_path.write_text(
+            json.dumps(
+                {
+                    "custom_xaut_competition_grid": {
+                        "key": "custom_xaut_competition_grid",
+                        "label": "合约竞赛库存网格",
+                        "symbol": "XAUTUSDT",
+                        "custom": True,
+                        "kind": "synthetic",
+                        "config": {"symbol": "XAUTUSDT", "strategy_mode": "synthetic_neutral"},
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            keys = {item["key"] for item in _runner_preset_summaries("XAUTUSDT")}
+            self.assertEqual(
+                keys,
+                {
+                    "volume_long_v4",
+                    "based_volume_push_bard_v1",
+                    "volume_short_v1",
+                    "custom_xaut_competition_grid",
+                },
+            )
+        finally:
+            custom_path.unlink(missing_ok=True)
+
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
+    def test_runner_preset_summaries_keep_built_in_presets_read_only(self) -> None:
+        custom_path = Path("output/test_runner_user_presets.json")
+        custom_path.parent.mkdir(parents=True, exist_ok=True)
+        custom_path.write_text(
+            json.dumps(
+                {
+                    "volume_long_v4": {
+                        "key": "volume_long_v4",
+                        "label": "用户覆盖版本",
+                        "description": "should be ignored",
+                        "symbol": "OPNUSDT",
+                        "custom": True,
+                        "kind": "one_way",
+                        "source": "custom_grid",
+                        "config": {"strategy_mode": "one_way_short"},
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            summaries = {item["key"]: item for item in _runner_preset_summaries("OPNUSDT")}
+            self.assertEqual(summaries["volume_long_v4"]["label"], "量优先做多 v4")
+            self.assertFalse(summaries["volume_long_v4"]["custom"])
+        finally:
+            custom_path.unlink(missing_ok=True)
+
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"), create=True)
+    def test_runner_preset_summaries_read_repo_managed_user_presets(self) -> None:
+        path = Path("output/test_runner_user_presets.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "captured_bard": {
+                        "key": "captured_bard",
+                        "label": "BARD 线上运行参数",
+                        "description": "captured",
+                        "symbol": "BARDUSDT",
+                        "custom": True,
+                        "startable": True,
+                        "kind": "synthetic",
+                        "source": "captured_running_config",
+                        "config": {"symbol": "BARDUSDT", "strategy_mode": "synthetic_neutral"},
+                    }
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        try:
+            summaries = _runner_preset_summaries("BARDUSDT")
+            preset = next(item for item in summaries if item["key"] == "captured_bard")
+            self.assertTrue(preset["custom"])
+            self.assertEqual(preset["symbol"], "BARDUSDT")
+        finally:
+            path.unlink(missing_ok=True)
+
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"), create=True)
+    def test_custom_grid_runner_preset_is_saved_into_repo_managed_store(self) -> None:
+        path = Path("output/test_runner_user_presets.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        try:
+            with patch("grid_optimizer.web._run_grid_preview") as mock_preview:
+                mock_preview.return_value = {
+                    "ok": True,
+                    "summary": {
+                        "symbol": "OPNUSDT",
+                        "strategy_direction": "long",
+                        "grid_count": 8,
+                        "current_price": 0.25,
+                        "position_budget_notional": 200.0,
+                        "active_buy_orders": 4,
+                        "active_sell_orders": 4,
+                        "startup_long_notional": 30.0,
+                        "full_long_entry_notional": 200.0,
+                        "symbol_info": {"min_notional": 5.0, "min_qty": 1.0},
+                    },
+                    "rows": [],
+                }
+                result = _create_custom_grid_runner_preset(
+                    {
+                        "contract_type": "usdm",
+                        "symbol": "OPNUSDT",
+                        "name": "OPN 自定义",
+                        "strategy_direction": "long",
+                        "grid_level_mode": "arithmetic",
+                        "min_price": 0.20,
+                        "max_price": 0.30,
+                        "n": 8,
+                        "margin_amount": 100.0,
+                        "leverage": 2.0,
+                    }
+                )
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertIn(result["preset_key"], saved)
+            self.assertEqual(saved[result["preset_key"]]["source"], "custom_grid")
+        finally:
+            path.unlink(missing_ok=True)
+
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
+    @patch("grid_optimizer.web._read_runner_process_for_symbol")
+    def test_save_running_runner_preset_captures_current_config(self, mock_read_runner) -> None:
+        path = Path("output/test_runner_user_presets.json")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{}", encoding="utf-8")
+        mock_read_runner.return_value = {
+            "is_running": True,
+            "config": {
+                "symbol": "BARDUSDT",
+                "strategy_profile": "bard_12h_push_neutral_v2",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0001,
+                "per_order_notional": 100.0,
+                "state_path": "output/nightusdt_loop_state.json",
+                "plan_json": "output/nightusdt_loop_latest_plan.json",
+                "submit_report_json": "output/nightusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/nightusdt_loop_events.jsonl",
+            },
+        }
+        try:
+            result = _save_running_runner_preset(
+                {"symbol": "BARDUSDT", "name": "BARD 8788 当前运行", "description": "captured from monitor"}
+            )
+            self.assertEqual(result["preset"]["source"], "captured_running_config")
+            self.assertEqual(result["preset"]["config"]["symbol"], "BARDUSDT")
+            self.assertEqual(result["preset"]["config"]["strategy_mode"], "synthetic_neutral")
+            self.assertEqual(result["preset"]["config"]["state_path"], "output/bardusdt_loop_state.json")
+            self.assertEqual(result["preset"]["config"]["plan_json"], "output/bardusdt_loop_latest_plan.json")
+            self.assertEqual(result["preset"]["config"]["submit_report_json"], "output/bardusdt_loop_latest_submit.json")
+            self.assertEqual(result["preset"]["config"]["summary_jsonl"], "output/bardusdt_loop_events.jsonl")
+        finally:
+            path.unlink(missing_ok=True)
+
+    @patch("grid_optimizer.web._read_runner_process_for_symbol")
+    def test_save_running_runner_preset_rejects_missing_running_config(self, mock_read_runner) -> None:
+        mock_read_runner.return_value = {"is_running": False, "config": {}}
+        with self.assertRaisesRegex(ValueError, "没有运行中策略"):
+            _save_running_runner_preset({"symbol": "BARDUSDT", "name": "bad"})
+
+    def test_runner_preset_summaries_include_based_competition_builtins(self) -> None:
+        based_keys = {item["key"] for item in _runner_preset_summaries("BASEDUSDT")}
+        opn_keys = {item["key"] for item in _runner_preset_summaries("OPNUSDT")}
+        self.assertIn("based_competition_neutral_v1", based_keys)
+        self.assertIn("based_competition_neutral_aggressive_v1", based_keys)
+        self.assertNotIn("based_competition_neutral_v1", opn_keys)
+        self.assertNotIn("based_competition_neutral_aggressive_v1", opn_keys)
+
+    def test_runner_preset_summaries_hide_volume_neutral_push_v1_from_dropdown(self) -> None:
+        based = {item["key"]: item for item in _runner_preset_summaries("BASEDUSDT")}
+        self.assertNotIn("volume_neutral_push_v1", based)
+        payload = _runner_preset_payload("volume_neutral_push_v1", {"symbol": "BASEDUSDT"})
+        self.assertEqual(payload["strategy_profile"], "volume_neutral_push_v1")
+
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
     def test_runner_preset_summaries_include_custom_grid_edit_metadata(self) -> None:
-        custom_path = Path("output/test_custom_runner_presets.json")
+        custom_path = Path("output/test_runner_user_presets.json")
         custom_path.parent.mkdir(parents=True, exist_ok=True)
         custom_path.write_text(
             json.dumps(
@@ -612,9 +1340,9 @@ class WebSecurityTests(unittest.TestCase):
             custom_path.unlink(missing_ok=True)
 
     @patch("grid_optimizer.web._run_grid_preview")
-    @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
     def test_update_custom_grid_runner_preset_preserves_key(self, mock_preview) -> None:
-        custom_path = Path("output/test_custom_runner_presets.json")
+        custom_path = Path("output/test_runner_user_presets.json")
         custom_path.parent.mkdir(parents=True, exist_ok=True)
         custom_path.write_text(
             json.dumps(
@@ -684,9 +1412,9 @@ class WebSecurityTests(unittest.TestCase):
             custom_path.unlink(missing_ok=True)
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
-    @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
+    @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
     def test_delete_custom_grid_runner_preset_removes_saved_preset(self, mock_read_runner) -> None:
-        custom_path = Path("output/test_custom_runner_presets.json")
+        custom_path = Path("output/test_runner_user_presets.json")
         custom_path.parent.mkdir(parents=True, exist_ok=True)
         custom_path.write_text(
             json.dumps(

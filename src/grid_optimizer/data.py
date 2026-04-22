@@ -64,6 +64,7 @@ _CONTRACT_TYPE_ALIASES = {
 }
 DEFAULT_TIMEOUT_SECONDS = 30
 MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
+SPOT_EXCHANGE_INFO_MAX_HTTP_RESPONSE_BYTES = 32 * 1024 * 1024
 HTTP_READ_CHUNK_BYTES = 64 * 1024
 SYMBOL_CACHE_TTL_SECONDS = 6 * 3600
 COINM_MAX_KLINE_WINDOW_MS = 200 * 24 * 60 * 60 * 1000
@@ -169,17 +170,23 @@ def _response_header_value(response: Any, name: str) -> str | None:
     return text or None
 
 
-def _read_http_response_bytes(response: Any, *, url: str) -> bytes:
+def _read_http_response_bytes(
+    response: Any,
+    *,
+    url: str,
+    max_response_bytes: int | None = None,
+) -> bytes:
+    limit = max_response_bytes if max_response_bytes is not None else MAX_HTTP_RESPONSE_BYTES
     content_length = _response_header_value(response, "Content-Length")
     if content_length is not None:
         try:
             expected_size = int(content_length)
         except ValueError:
             expected_size = None
-        if expected_size is not None and expected_size > MAX_HTTP_RESPONSE_BYTES:
+        if expected_size is not None and expected_size > limit:
             raise RuntimeError(
                 f"HTTP response from {url} is too large: "
-                f"{expected_size} bytes exceeds {MAX_HTTP_RESPONSE_BYTES}"
+                f"{expected_size} bytes exceeds {limit}"
             )
 
     payload = bytearray()
@@ -187,10 +194,10 @@ def _read_http_response_bytes(response: Any, *, url: str) -> bytes:
         chunk = response.read(HTTP_READ_CHUNK_BYTES)
         if not chunk:
             break
-        if len(payload) + len(chunk) > MAX_HTTP_RESPONSE_BYTES:
+        if len(payload) + len(chunk) > limit:
             raise RuntimeError(
                 f"HTTP response from {url} is too large: "
-                f"exceeds {MAX_HTTP_RESPONSE_BYTES} bytes"
+                f"exceeds {limit} bytes"
             )
         payload.extend(chunk)
     return bytes(payload)
@@ -201,6 +208,7 @@ def _http_request_json(
     params: dict[str, str | int],
     headers: dict[str, str] | None = None,
     method: str = "GET",
+    max_response_bytes: int | None = None,
 ) -> Any:
     query = urlencode(params)
     full_url = f"{url}?{query}" if query else url
@@ -218,9 +226,17 @@ def _http_request_json(
     try:
         with _prefer_ipv4():
             with urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-                payload = _read_http_response_bytes(response, url=full_url).decode("utf-8")
+                payload = _read_http_response_bytes(
+                    response,
+                    url=full_url,
+                    max_response_bytes=max_response_bytes,
+                ).decode("utf-8")
     except HTTPError as exc:
-        payload = _read_http_response_bytes(exc, url=full_url).decode("utf-8", errors="replace")
+        payload = _read_http_response_bytes(
+            exc,
+            url=full_url,
+            max_response_bytes=max_response_bytes,
+        ).decode("utf-8", errors="replace")
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
@@ -242,8 +258,12 @@ def _http_request_json(
     return data
 
 
-def _http_get_json(url: str, params: dict[str, str | int]) -> Any:
-    return _http_request_json(url, params)
+def _http_get_json(
+    url: str,
+    params: dict[str, str | int],
+    max_response_bytes: int | None = None,
+) -> Any:
+    return _http_request_json(url, params, max_response_bytes=max_response_bytes)
 
 
 def _http_api_key_request_json(
@@ -358,7 +378,11 @@ def _format_request_number(value: float) -> str:
 
 
 def fetch_spot_markets() -> list[dict[str, str]]:
-    data = _http_get_json(_SPOT_URLS["exchange_info"], {})
+    data = _http_get_json(
+        _SPOT_URLS["exchange_info"],
+        {},
+        max_response_bytes=SPOT_EXCHANGE_INFO_MAX_HTTP_RESPONSE_BYTES,
+    )
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected spot exchangeInfo response")
     symbols_raw = data.get("symbols", [])
@@ -903,9 +927,10 @@ def post_spot_order(
         "side": side.upper(),
         "type": normalized_type,
         "quantity": _format_request_number(quantity),
-        "price": _format_request_number(price),
         "recvWindow": recv_window,
     }
+    if normalized_type != "MARKET":
+        params["price"] = _format_request_number(price)
     if normalized_type == "LIMIT":
         params["timeInForce"] = str(time_in_force or "GTC").upper().strip() or "GTC"
     if new_client_order_id:
@@ -1347,6 +1372,143 @@ def fetch_futures_klines(
         )
     candles = [dedup[key] for key in sorted(dedup)]
     return candles
+
+
+def fetch_futures_quote_volume_sum(
+    symbol: str,
+    *,
+    window_minutes: int,
+    contract_type: str = "usdm",
+    end_time_ms: int | None = None,
+    interval: str = "1m",
+    limit: int = 1500,
+) -> float:
+    if window_minutes <= 0:
+        raise ValueError("window_minutes must be > 0")
+    if interval != "1m":
+        raise ValueError("only 1m interval is supported for quote volume aggregation")
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+
+    interval_ms = parse_interval_ms(interval)
+    window_ms = int(window_minutes) * 60 * 1000
+    end_ms = int(end_time_ms if end_time_ms is not None else time.time() * 1000)
+    start_ms = end_ms - window_ms
+    if start_ms >= end_ms:
+        return 0.0
+
+    normalized_contract_type = normalize_contract_type(contract_type)
+    cursor = start_ms
+    request_span_ms = max(interval_ms * max(limit - 1, 1), interval_ms)
+    quote_volume_sum = 0.0
+    seen_open_times: set[int] = set()
+
+    while cursor < end_ms:
+        request_end_ms = min(end_ms - 1, cursor + request_span_ms)
+        data = _http_get_json(
+            _market_api_urls(normalized_contract_type)["kline"],
+            {
+                "symbol": symbol.upper(),
+                "interval": interval,
+                "startTime": cursor,
+                "endTime": request_end_ms,
+                "limit": limit,
+            },
+        )
+        if not data:
+            next_cursor = request_end_ms + interval_ms
+            if next_cursor <= cursor:
+                break
+            cursor = next_cursor
+            continue
+
+        last_open = cursor
+        for row in data:
+            open_ms = int(row[0])
+            if open_ms < start_ms or open_ms >= end_ms or open_ms in seen_open_times:
+                continue
+            seen_open_times.add(open_ms)
+            quote_volume_sum += float(row[7])
+            last_open = max(last_open, open_ms)
+
+        next_cursor = last_open + interval_ms
+        if next_cursor <= cursor:
+            next_cursor = request_end_ms + interval_ms
+            if next_cursor <= cursor:
+                break
+        cursor = next_cursor
+        if len(data) >= limit:
+            time.sleep(0.03)
+
+    return quote_volume_sum
+
+
+def fetch_futures_window_price_stats(
+    symbol: str,
+    *,
+    window_minutes: int,
+    contract_type: str = "usdm",
+    end_time_ms: int | None = None,
+    interval: str = "1m",
+    limit: int = 1500,
+) -> dict[str, float | int | None]:
+    if window_minutes <= 0:
+        raise ValueError("window_minutes must be > 0")
+    if interval != "1m":
+        raise ValueError("only 1m interval is supported for window price stats")
+    if limit <= 0:
+        raise ValueError("limit must be > 0")
+
+    end_ms = int(end_time_ms if end_time_ms is not None else time.time() * 1000)
+    start_ms = end_ms - int(window_minutes) * 60 * 1000
+    if start_ms >= end_ms:
+        return {
+            "window_minutes": int(window_minutes),
+            "candle_count": 0,
+            "open_price": None,
+            "close_price": None,
+            "high_price": None,
+            "low_price": None,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+
+    candles = fetch_futures_klines(
+        symbol=symbol,
+        interval=interval,
+        start_ms=start_ms,
+        end_ms=end_ms,
+        contract_type=contract_type,
+        limit=limit,
+    )
+    if not candles:
+        return {
+            "window_minutes": int(window_minutes),
+            "candle_count": 0,
+            "open_price": None,
+            "close_price": None,
+            "high_price": None,
+            "low_price": None,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+
+    open_price = float(candles[0].open)
+    close_price = float(candles[-1].close)
+    high_price = max(float(candle.high) for candle in candles)
+    low_price = min(float(candle.low) for candle in candles)
+    return_ratio = close_price / open_price - 1.0 if open_price > 0 else 0.0
+    amplitude_ratio = high_price / low_price - 1.0 if low_price > 0 else 0.0
+    return {
+        "window_minutes": int(window_minutes),
+        "candle_count": len(candles),
+        "open_price": open_price,
+        "close_price": close_price,
+        "high_price": high_price,
+        "low_price": low_price,
+        "return_ratio": return_ratio,
+        "amplitude_ratio": amplitude_ratio,
+    }
 
 
 def _cache_file_path(

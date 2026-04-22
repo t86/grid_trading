@@ -3,7 +3,15 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from grid_optimizer.audit import build_audit_paths, collect_new_rows, income_row_key, income_row_time_ms, trade_row_key, trade_row_time_ms
+from grid_optimizer.audit import (
+    build_audit_paths,
+    collect_new_rows,
+    fetch_time_paged_by_windows,
+    income_row_key,
+    income_row_time_ms,
+    trade_row_key,
+    trade_row_time_ms,
+)
 
 
 class AuditTests(unittest.TestCase):
@@ -54,6 +62,29 @@ class AuditTests(unittest.TestCase):
         self.assertEqual([int(item["tranId"]) for item in fresh_rows], [11, 12])
         self.assertEqual(last_time_ms, 3000)
         self.assertEqual(last_keys, [income_row_key(rows[2])])
+
+    def test_fetch_time_paged_by_windows_splits_long_ranges(self) -> None:
+        window_ms = 7 * 24 * 60 * 60 * 1000 - 1
+        calls: list[tuple[int | None, int | None]] = []
+
+        def fetch_page(*, start_time_ms: int | None, end_time_ms: int | None, limit: int) -> list[dict]:
+            calls.append((start_time_ms, end_time_ms))
+            return [{"id": len(calls), "time": int(start_time_ms or 0) + len(calls)}]
+
+        rows = fetch_time_paged_by_windows(
+            fetch_page=fetch_page,
+            start_time_ms=1000,
+            end_time_ms=1000 + window_ms + 3000,
+            limit=1000,
+            row_time_ms=trade_row_time_ms,
+            row_key=trade_row_key,
+            max_window_ms=window_ms,
+        )
+
+        self.assertEqual(len(calls), 2)
+        self.assertLessEqual(calls[0][1] - calls[0][0], window_ms)
+        self.assertEqual(calls[1][0], calls[0][1] + 1)
+        self.assertEqual([int(item["id"]) for item in rows], [1, 2])
 
 
 if __name__ == "__main__":

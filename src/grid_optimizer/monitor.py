@@ -13,9 +13,10 @@ from typing import Any
 
 from .audit import (
     DEFAULT_AUDIT_LOOKBACK_DAYS,
+    BINANCE_FUTURES_MAX_QUERY_WINDOW_MS,
     build_audit_paths,
     count_jsonl_lines,
-    fetch_time_paged,
+    fetch_time_paged_by_windows,
     income_row_key,
     income_row_time_ms,
     parse_iso_ts as _parse_iso_ts,
@@ -38,6 +39,7 @@ from .data import (
 )
 from .live_check import extract_symbol_position
 from .competition_board import resolve_active_competition_board
+from .competition_board import build_reward_volume_targets
 
 
 def _safe_float(value: Any) -> float:
@@ -240,6 +242,8 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--inventory-tier-per-order-notional",
             "--inventory-tier-base-position-notional",
             "--max-total-notional",
+            "--rolling-hourly-loss-limit",
+            "--max-cumulative-notional",
             "--max-mid-drift-steps",
             "--sleep-seconds",
         }:
@@ -263,7 +267,17 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
                 pass
             i += 2
             continue
-        if token in {"--symbol", "--strategy-mode", "--margin-type", "--state-path", "--plan-json", "--submit-report-json", "--summary-jsonl"}:
+        if token in {
+            "--symbol",
+            "--strategy-mode",
+            "--margin-type",
+            "--state-path",
+            "--plan-json",
+            "--submit-report-json",
+            "--summary-jsonl",
+            "--run-start-time",
+            "--run-end-time",
+        }:
             config[key] = next_token
             i += 2
             continue
@@ -405,7 +419,7 @@ def _load_or_fetch_trade_rows(
 
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    rows = fetch_time_paged(
+    rows = fetch_time_paged_by_windows(
         fetch_page=lambda **params: fetch_futures_user_trades(
             symbol=symbol,
             api_key=api_key,
@@ -417,6 +431,7 @@ def _load_or_fetch_trade_rows(
         limit=1000,
         row_time_ms=trade_row_time_ms,
         row_key=trade_row_key,
+        max_window_ms=BINANCE_FUTURES_MAX_QUERY_WINDOW_MS,
     )
     return rows, {
         "source": "api",
@@ -447,7 +462,7 @@ def _load_or_fetch_income_rows(
 
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    rows = fetch_time_paged(
+    rows = fetch_time_paged_by_windows(
         fetch_page=lambda **params: fetch_futures_income_history(
             symbol=symbol,
             income_type="FUNDING_FEE",
@@ -460,6 +475,7 @@ def _load_or_fetch_income_rows(
         limit=1000,
         row_time_ms=income_row_time_ms,
         row_key=income_row_key,
+        max_window_ms=BINANCE_FUTURES_MAX_QUERY_WINDOW_MS,
     )
     return rows, {
         "source": "api",
@@ -798,6 +814,7 @@ def _build_monitor_snapshot_uncached(
             "activity_end_at": competition_end.isoformat() if competition_end else None,
             "stats_start_at": stats_start.isoformat() if stats_start else None,
         },
+        "competition_reward_targets": build_reward_volume_targets(competition_board),
         "local": {
             "loop_summary": loop_summary,
             "plan_report": plan_report,
@@ -1155,6 +1172,21 @@ def _build_monitor_snapshot_uncached(
     effective_strategy_label = str((plan_report or {}).get("effective_strategy_label") or "").strip()
     if not effective_strategy_label:
         effective_strategy_label = effective_strategy_profile
+    xaut_adaptive = (plan_report or {}).get("xaut_adaptive")
+    if not isinstance(xaut_adaptive, dict) or not xaut_adaptive:
+        xaut_adaptive = {}
+    xaut_adaptive_enabled = bool(xaut_adaptive) or bool(latest_loop.get("xaut_adaptive_enabled"))
+    xaut_adaptive_state = str(xaut_adaptive.get("active_state", "")).strip() or str(latest_loop.get("xaut_adaptive_state", "")).strip()
+    xaut_adaptive_candidate_state = (
+        str(xaut_adaptive.get("candidate_state", "")).strip()
+        or str(latest_loop.get("xaut_adaptive_candidate_state", "")).strip()
+    )
+    xaut_adaptive_pending_count = int(
+        xaut_adaptive.get("pending_count", 0)
+        or latest_loop.get("xaut_adaptive_pending_count", 0)
+        or 0
+    )
+    xaut_adaptive_reason = xaut_adaptive.get("reason") or latest_loop.get("xaut_adaptive_reason")
 
     custom_grid_roll = (plan_report or {}).get("custom_grid_roll")
     if not isinstance(custom_grid_roll, dict) or not custom_grid_roll:
@@ -1318,6 +1350,11 @@ def _build_monitor_snapshot_uncached(
         "auto_regime_confirm_cycles": auto_regime_confirm_cycles,
         "effective_strategy_profile": effective_strategy_profile,
         "effective_strategy_label": effective_strategy_label,
+        "xaut_adaptive_enabled": xaut_adaptive_enabled,
+        "xaut_adaptive_state": xaut_adaptive_state,
+        "xaut_adaptive_candidate_state": xaut_adaptive_candidate_state,
+        "xaut_adaptive_pending_count": xaut_adaptive_pending_count,
+        "xaut_adaptive_reason": xaut_adaptive_reason,
         "inventory_target_bands": (plan_report or {}).get("inventory_target_bands"),
         "neutral_hourly_scale": (plan_report or {}).get("neutral_hourly_scale"),
         "neutral_hourly_scale_enabled": bool(((plan_report or {}).get("neutral_hourly_scale") or {}).get("enabled")),
@@ -1329,6 +1366,17 @@ def _build_monitor_snapshot_uncached(
         "effective_sell_levels": int((plan_report or {}).get("effective_sell_levels", 0) or 0),
         "effective_per_order_notional": _safe_float((plan_report or {}).get("effective_per_order_notional")),
         "effective_base_position_notional": _safe_float((plan_report or {}).get("effective_base_position_notional")),
+        "runtime_status": str(latest_loop.get("runtime_status", "") or "running"),
+        "stop_triggered": bool(latest_loop.get("stop_triggered")),
+        "stop_reason": latest_loop.get("stop_reason"),
+        "stop_reasons": list(latest_loop.get("stop_reasons") or []),
+        "stop_triggered_at": latest_loop.get("stop_triggered_at"),
+        "run_start_time": runner_config.get("run_start_time"),
+        "run_end_time": runner_config.get("run_end_time"),
+        "rolling_hourly_loss": _safe_float(latest_loop.get("rolling_hourly_loss")),
+        "rolling_hourly_loss_limit": _safe_float(runner_config.get("rolling_hourly_loss_limit")),
+        "cumulative_gross_notional": _safe_float(latest_loop.get("cumulative_gross_notional")),
+        "max_cumulative_notional": _safe_float(runner_config.get("max_cumulative_notional")),
         "custom_grid_runtime_min_price": custom_grid_runtime_min_price,
         "custom_grid_runtime_max_price": custom_grid_runtime_max_price,
         "custom_grid_roll_enabled": custom_grid_roll_enabled,

@@ -258,3 +258,109 @@
 - short 网格镜像的“条件上移”
 - 与超额减仓接管模式联动
 - 结合 realized pnl 或 inventory notional 做更智能的区间迁移
+
+## Future Extension: Conditional Roll-Up
+
+这部分**不是当前实现范围**，只作为后续扩展草案。
+
+如果后续要解决“价格持续上涨、静态网格逐渐脱离下方、卖格越来越少或完全跑出区间”的问题，建议为 `custom_grid_direction=long` 增加一套与本次“条件下移”对称的`条件上移`能力。
+
+### Goal
+
+在价格长期向上、当前静态网格已经明显偏离现价时，缓慢把整个长网格区间往上搬，避免：
+
+- 现价长期高于上沿
+- 策略逐渐退化成单边残留委托
+- 已持有底仓无法在更合适的位置恢复双边网格
+
+### Proposed Trigger Model
+
+建议仍然沿用“定时检查 + 成交确认 + 价格位置确认 + 单次只移动一格”的框架，保持与条件下移规则对称。
+
+候选配置项：
+
+- `custom_grid_lift_enabled: bool`
+  - 是否启用条件上移
+- `custom_grid_lift_interval_minutes: int`
+  - 检查间隔，建议默认与下移一致
+- `custom_grid_lift_trade_threshold: int`
+  - 自上次成功上移后需要累计的最少成交笔数
+- `custom_grid_lift_lower_distance_ratio: float`
+  - 当前价格距下沿的剩余梯子比例阈值
+- `custom_grid_lift_shift_levels: int`
+  - 每次上移的层数，建议默认 `1`
+
+### Suggested Price Rule
+
+与下移规则保持镜像：
+
+- 先计算当前价格到网格下沿之间，还剩多少个完整梯子层级
+- 记为 `levels_below_current`
+- 计算：
+  - `required_levels_below = ceil(n * lower_distance_ratio)`
+
+当：
+
+- `levels_below_current >= required_levels_below`
+
+时，价格条件成立。
+
+默认可考虑：
+
+- `lower_distance_ratio = 0.30`
+
+直观含义是：
+
+- 当前价格已经比下沿高出了至少 `30%` 的网格宽度
+
+### Suggested Additional Guard
+
+相比下移，上移更容易把长网格做成追涨结构，因此建议额外加一层限制，至少满足以下其一才允许上移：
+
+- 当前价格已连续多个检查桶停留在区间上半部
+- 当前价格高于上沿或非常接近上沿
+- 当前已持仓低于目标底仓，说明原有卖格已大量成交
+
+推荐首选这一条：
+
+- `现价 >= 上沿`
+  - 或 `现价距离上沿不足 1-2 格`
+
+这样能避免区间只因短期反弹就频繁上移。
+
+### State Additions
+
+若未来实现条件上移，建议新增：
+
+- `custom_grid_lift_last_check_bucket`
+- `custom_grid_lift_trade_baseline`
+- `custom_grid_lift_trades_since_last_roll`
+- `custom_grid_lift_last_applied_at`
+- `custom_grid_lift_last_applied_price`
+
+命名与下移保持镜像，减少维护复杂度。
+
+### Interaction With Conditional Roll-Down
+
+如果未来上下移都支持，必须定义优先级，避免同一检查桶内出现相互冲突：
+
+- 同一时间桶最多只允许一个方向生效
+- 若上下条件同时满足，建议优先执行“更接近脱离网格的方向”
+- 或更简单：默认优先保持不动，等待下一检查桶再判定
+
+首版更稳妥的建议是：
+
+- 同时满足时，不移动，并记录 warning
+
+### Recommendation For Future Phase
+
+如果后续要做主动上移，建议按以下顺序推进：
+
+1. 先上线并观察“条件下移”单向规则
+2. 评估长期运行中：
+   - 网格脱离上沿的频率
+   - 卖格消失时的成交效率损失
+   - 人工重设区间的频率
+3. 再决定是否引入条件上移
+
+这样可以避免在还没验证单向区间迁移稳定性之前，就把静态网格过早变成“双向自动追价网格”。

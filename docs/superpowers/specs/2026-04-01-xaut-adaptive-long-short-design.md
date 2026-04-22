@@ -1,193 +1,193 @@
-# XAUT Adaptive Long/Short Design
+# XAUT 自适应多空策略设计
 
-Date: 2026-04-01
+日期：2026-04-01
 
-## Summary
+## 摘要
 
-Add two XAUT-only strategy profiles:
+新增两个仅用于 XAUT 的策略模板：
 
 - `xaut_long_adaptive_v1`
 - `xaut_short_adaptive_v1`
 
-Both profiles are specialized state machines for `XAUTUSDT`. They keep the existing one-way micro-grid execution model, but automatically switch among three risk states:
+这两个模板都是面向 `XAUTUSDT` 的专用状态机策略。它们保留现有单向微网格执行模型，但会在以下三种风控状态之间自动切换：
 
 - `normal`
 - `defensive`
 - `reduce_only`
 
-The goal is:
+目标是：
 
-- keep volume high during stable conditions
-- reduce inventory expansion during elevated volatility
-- immediately stop new same-direction inventory accumulation during extreme moves
-- automatically recover back to normal after volatility cools down
+- 在平稳行情下尽量保持成交量
+- 在波动升高时减少库存继续扩张
+- 在极端波动时立即停止同方向新增库存
+- 在波动回落后自动恢复到正常刷量状态
 
-This design does **not** auto-flatten the entire position and does **not** stop the runner process. In `reduce_only`, the runner continues working but only places orders that reduce existing inventory.
+本设计**不会**自动全平仓，也**不会**停止 runner 进程。在 `reduce_only` 状态下，runner 仍继续运行，但只会下能减少现有库存的订单。
 
-## Problem
+## 问题背景
 
-The current runner has two useful pieces, but neither is enough for XAUT:
+当前 runner 已经有两个可用能力，但对 XAUT 来说都不够：
 
-1. Generic `auto_regime` supports only `stable <-> defensive` switching and is tuned for broad use, not for XAUT.
-2. `excess_inventory_reduce_only_enabled` can prevent further inventory growth once current inventory exceeds target base inventory, but it does not react to XAUT-specific volatility regimes by itself.
+1. 通用 `auto_regime` 只支持 `stable <-> defensive` 切换，而且是按通用品种阈值设计，不适合 XAUT。
+2. `excess_inventory_reduce_only_enabled` 能在当前库存超过目标底仓后阻止继续扩仓，但它本身不会根据 XAUT 的波动状态自动触发。
 
-For `XAUTUSDT`, recent market behavior is materially tighter than the generic thresholds currently used by `auto_regime`.
+对 `XAUTUSDT` 来说，最近的市场波动明显比当前通用 `auto_regime` 的阈值更窄。
 
-Observed on 2026-03-31 from Binance Futures public market data:
+基于 2026-03-31 Binance Futures 公开市场数据观察：
 
-- recent 48h `15m` amplitude median: about `0.204%`
-- recent 48h `15m` amplitude `P95`: about `0.614%`
-- recent 7d `1h` amplitude median: about `0.341%`
-- recent 7d `1h` amplitude `P95`: about `1.186%`
+- 近 48 小时 `15m` 振幅中位数：约 `0.204%`
+- 近 48 小时 `15m` 振幅 `P95`：约 `0.614%`
+- 近 7 天 `1h` 振幅中位数：约 `0.341%`
+- 近 7 天 `1h` 振幅 `P95`：约 `1.186%`
 
-The current generic thresholds are much wider than these ranges, so they would rarely move XAUT out of the stable path. That does not meet the desired risk behavior.
+当前通用阈值明显宽于这些范围，因此 XAUT 很少会真正从 stable 切出，这不符合目标风控行为。
 
-## Scope
+## 范围
 
-In scope:
+纳入范围：
 
-- add XAUT-only adaptive long and short profiles
-- add XAUT-specific regime assessment logic
-- add three-state switching with hysteresis
-- add `reduce_only` behavior that immediately removes new same-direction opening orders
-- add monitor/web visibility for active XAUT state and reason
-- add automated tests for transition logic and order-pruning behavior
+- 新增 XAUT 专用的自适应 long 和 short 模板
+- 新增 XAUT 专用的状态判断逻辑
+- 新增三态切换和滞后确认机制
+- 新增 `reduce_only` 行为：立即移除同方向开仓单
+- 在 monitor/web 中展示当前 XAUT 状态和原因
+- 为状态切换逻辑和订单裁剪行为补测试
 
-Out of scope:
+不纳入范围：
 
-- changing non-XAUT profiles
-- automatic process stop
-- automatic full flatten/clear position
-- generic multi-symbol adaptive framework
+- 修改非 XAUT 策略模板
+- 自动停机
+- 自动全平仓/清仓
+- 抽象成通用多币种自适应框架
 
-## Profiles
+## 策略模板
 
 ### `xaut_long_adaptive_v1`
 
-Direction: `one_way_long`
+方向：`one_way_long`
 
-Behavior:
+行为：
 
-- `normal`: standard XAUT long volume-first grid
-- `defensive`: lighter long accumulation, wider spacing, faster inventory unloading
-- `reduce_only`: immediately remove all new long-opening orders and only keep sell orders that reduce long inventory
+- `normal`：标准 XAUT 做多刷量网格
+- `defensive`：更轻地继续接多，更宽的步长，更快卸掉库存
+- `reduce_only`：立即移除所有新增多仓订单，只保留能卖出减多仓的订单
 
 ### `xaut_short_adaptive_v1`
 
-Direction: `one_way_short`
+方向：`one_way_short`
 
-Behavior:
+行为：
 
-- `normal`: standard XAUT short mirror grid
-- `defensive`: lighter short accumulation, wider spacing, faster short cover bias
-- `reduce_only`: immediately remove all new short-opening orders and only keep buy orders that reduce short inventory
+- `normal`：标准 XAUT 做空镜像网格
+- `defensive`：更轻地继续加空，更宽的步长，更偏向快速回补空仓
+- `reduce_only`：立即移除所有新增空仓订单，只保留能买回减空仓的订单
 
-## State Model
+## 状态模型
 
-Both profiles use the same state names:
+两个模板都使用相同的状态名：
 
 - `normal`
 - `defensive`
 - `reduce_only`
 
-Both profiles use the same volatility inputs:
+两个模板都使用相同的波动输入：
 
-- `15m` amplitude
-- `60m` amplitude
-- `15m` return
-- `60m` return
+- `15m` 振幅
+- `60m` 振幅
+- `15m` 涨跌幅
+- `60m` 涨跌幅
 
-Definitions:
+定义：
 
-- amplitude = `(high - low) / open`
-- return = `(close - open) / open`
+- 振幅 = `(high - low) / open`
+- 涨跌幅 = `(close - open) / open`
 
-State priority:
+状态优先级：
 
 1. `reduce_only`
 2. `defensive`
 3. `normal`
 
-If multiple conditions match, the higher-priority state wins.
+如果多个条件同时满足，取优先级更高的状态。
 
-## Thresholds
+## 阈值设计
 
-These thresholds are XAUT-specific and based on the observed amplitude distribution from 2026-03-31 market data. They are intentionally tighter than the current generic auto-regime thresholds.
+这些阈值是 XAUT 专用的，依据 2026-03-31 的波动分布设定，刻意比当前通用 `auto_regime` 更紧。
 
-### Shared stable-amplitude gate
+### 共享稳定阈值
 
-Used for both long and short recovery:
+用于 long 和 short 的恢复判断：
 
 - `stable_15m_max_amplitude_ratio = 0.0035`
 - `stable_60m_max_amplitude_ratio = 0.0075`
 
-### Long thresholds
+### Long 阈值
 
-`normal` eligibility:
+进入 `normal` 的条件：
 
 - `15m amplitude <= 0.35%`
 - `60m amplitude <= 0.75%`
 - `60m return >= -0.30%`
 
-Enter `defensive` when any of these is true:
+进入 `defensive` 的条件，满足任一即可：
 
 - `15m amplitude >= 0.60%`
 - `60m amplitude >= 1.20%`
 - `15m return <= -0.40%`
 - `60m return <= -0.80%`
 
-Enter `reduce_only` when any of these is true:
+进入 `reduce_only` 的条件，满足任一即可：
 
 - `15m amplitude >= 0.90%`
 - `60m amplitude >= 1.60%`
 - `15m return <= -0.70%`
 - `60m return <= -1.20%`
 
-### Short thresholds
+### Short 阈值
 
-`normal` eligibility:
+进入 `normal` 的条件：
 
 - `15m amplitude <= 0.35%`
 - `60m amplitude <= 0.75%`
 - `60m return <= 0.30%`
 
-Enter `defensive` when any of these is true:
+进入 `defensive` 的条件，满足任一即可：
 
 - `15m amplitude >= 0.60%`
 - `60m amplitude >= 1.20%`
 - `15m return >= 0.40%`
 - `60m return >= 0.80%`
 
-Enter `reduce_only` when any of these is true:
+进入 `reduce_only` 的条件，满足任一即可：
 
 - `15m amplitude >= 0.90%`
 - `60m amplitude >= 1.60%`
 - `15m return >= 0.70%`
 - `60m return >= 1.20%`
 
-## Transition Rules
+## 状态切换规则
 
-Adjacent-state transitions require confirmation to avoid flip-flopping:
+相邻状态切换需要连续确认，以避免来回抖动：
 
-- `normal -> defensive`: 2 consecutive loops
-- `defensive -> normal`: 2 consecutive loops
-- `defensive -> reduce_only`: 1 loop
-- `reduce_only -> defensive`: 2 consecutive loops
+- `normal -> defensive`：连续 2 轮
+- `defensive -> normal`：连续 2 轮
+- `defensive -> reduce_only`：连续 1 轮
+- `reduce_only -> defensive`：连续 2 轮
 
-Direct transitions:
+直接切换规则：
 
-- `normal -> reduce_only`: allowed immediately on first qualifying loop
-- `reduce_only -> normal`: not allowed directly; must pass through `defensive`
+- `normal -> reduce_only`：允许首轮满足即立刻切换
+- `reduce_only -> normal`：不允许直接切，必须先经过 `defensive`
 
-Reasoning:
+设计原因：
 
-- escalation into `reduce_only` should be fast because the user explicitly wants to stop buying/opening immediately during extreme moves
-- recovery should be slower than escalation
-- forcing `reduce_only -> defensive -> normal` gives a cooldown phase instead of snapping straight back to aggressive volume mode
+- 进入 `reduce_only` 必须足够快，因为用户明确要求极端波动时立即停止继续买入/开仓
+- 恢复速度要慢于升级速度
+- 强制 `reduce_only -> defensive -> normal`，可以让系统先经历冷却阶段，而不是立刻回到激进刷量模式
 
-## Parameter Sets
+## 参数集
 
-These values are intentionally lighter than the current generic presets and are tuned for XAUT’s price level and volatility.
+这些参数有意比当前通用模板更轻，更适合 XAUT 的价格水平和波动结构。
 
 ### Long `normal`
 
@@ -235,12 +235,12 @@ These values are intentionally lighter than the current generic presets and are 
 
 ### Long `reduce_only`
 
-Keep the `defensive` parameter set, plus these behavioral overrides:
+沿用 `defensive` 参数集，并额外施加以下行为覆盖：
 
-- force `excess_inventory_reduce_only_enabled = true`
-- remove all `bootstrap_orders`
-- remove all `buy_orders`
-- rely on stale-order cancellation to remove existing runner-owned buy orders from the book immediately
+- 强制 `excess_inventory_reduce_only_enabled = true`
+- 移除所有 `bootstrap_orders`
+- 移除所有 `buy_orders`
+- 依赖 stale-order cancellation 立即把当前属于本 runner 的买单从盘口撤掉
 
 ### Short `normal`
 
@@ -286,61 +286,61 @@ Keep the `defensive` parameter set, plus these behavioral overrides:
 
 ### Short `reduce_only`
 
-Keep the `defensive` parameter set, plus these behavioral overrides:
+沿用 `defensive` 参数集，并额外施加以下行为覆盖：
 
-- force `excess_inventory_reduce_only_enabled = true`
-- remove all `bootstrap_orders`
-- remove all `sell_orders`
-- rely on stale-order cancellation to remove existing runner-owned sell orders from the book immediately
+- 强制 `excess_inventory_reduce_only_enabled = true`
+- 移除所有 `bootstrap_orders`
+- 移除所有 `sell_orders`
+- 依赖 stale-order cancellation 立即把当前属于本 runner 的卖单从盘口撤掉
 
-## Execution Flow
+## 执行流程
 
-Per loop:
+每轮执行：
 
-1. Load market data and symbol info as today’s runner already does.
-2. If selected profile is one of the new XAUT adaptive profiles, compute XAUT regime metrics from recent `15m` and `1h` klines.
-3. Evaluate the state candidate for the chosen direction.
-4. Resolve the active state using the per-transition confirmation rules.
-5. Overlay the parameter set for the active state onto the runner args.
-6. Generate the plan using the existing one-way long or one-way short planner.
-7. If the active state is `reduce_only`, strip same-direction opening orders from the generated plan.
-8. Submit/cancel orders as normal with existing stale-order cancellation behavior.
+1. 像现在的 runner 一样加载市场数据和 symbol info。
+2. 如果选中的模板是新的 XAUT 自适应模板，则从最近 `15m` 和 `1h` K 线计算 XAUT 状态指标。
+3. 根据方向评估候选状态。
+4. 按状态切换确认规则解析当前生效状态。
+5. 用当前状态对应的参数集覆盖 runner 运行参数。
+6. 沿用现有单向 long 或单向 short planner 生成计划。
+7. 如果当前状态是 `reduce_only`，则从计划中裁掉同方向开仓单。
+8. 像现在一样执行提交/撤单逻辑，并依赖现有 stale-order cancellation 撤掉旧单。
 
-This preserves the existing execution path and only changes parameter selection and final same-direction order pruning.
+这样可以保留当前执行主路径，只改变参数选择和最终订单裁剪。
 
-## Implementation Shape
+## 实现形态
 
-### Presets
+### Preset
 
-Add new preset definitions in the web/server preset registry:
+在 web/server 的 preset 注册表中新增：
 
 - `xaut_long_adaptive_v1`
 - `xaut_short_adaptive_v1`
 
-These presets should:
+这些 preset 应该：
 
-- set `symbol = XAUTUSDT`
-- enable a new XAUT adaptive mode flag
-- include the state thresholds and confirmation counts
-- default `autotune_symbol_enabled = false`
-- default `cancel_stale = true`
+- 固定 `symbol = XAUTUSDT`
+- 打开新的 XAUT 自适应模式开关
+- 包含状态阈值和确认轮数
+- 默认 `autotune_symbol_enabled = false`
+- 默认 `cancel_stale = true`
 
 ### Loop runner
 
-Add XAUT-specific helpers in `loop_runner.py`:
+在 `loop_runner.py` 中新增 XAUT 专用辅助逻辑：
 
-- state constants
-- state config tables for long and short
-- helper to assess current XAUT regime
-- helper to resolve state transitions with hysteresis
-- helper to overlay active-state parameters onto runtime args
-- helper to apply `reduce_only` order pruning after plan generation
+- 状态常量
+- long 和 short 各自的状态参数表
+- XAUT 当前状态评估函数
+- 带滞后的状态切换解析函数
+- 当前状态参数覆盖函数
+- 计划生成后的 `reduce_only` 裁单函数
 
-This should be kept separate from the existing generic `auto_regime` path rather than trying to stretch the generic stable/defensive model into a three-state XAUT-specific controller.
+这部分应与现有通用 `auto_regime` 路径保持分离，而不是硬把通用 stable/defensive 模型扩成三态 XAUT 控制器。
 
 ### Monitor/Web
 
-Expose these fields in summary output:
+在 summary 输出中增加以下字段：
 
 - `xaut_adaptive_enabled`
 - `xaut_adaptive_direction`
@@ -350,49 +350,49 @@ Expose these fields in summary output:
 - `xaut_adaptive_reason`
 - `xaut_adaptive_metrics`
 
-Web/monitor should clearly show when `reduce_only` is active and that same-direction opening orders are being suppressed.
+web/monitor 需要清晰展示当前是否处于 `reduce_only`，以及是否正在抑制同方向开仓单。
 
-## Failure Handling
+## 异常处理
 
-If regime metrics cannot be computed:
+如果无法计算状态指标：
 
-- keep the previously active state
-- record a warning in the loop summary
-- do not switch state based on missing data
+- 保持上一个生效状态不变
+- 在 loop summary 中记录 warning
+- 不因缺失数据进行状态切换
 
-If the user somehow selects an XAUT adaptive profile on a symbol other than `XAUTUSDT`:
+如果用户把 XAUT 自适应模板错误地用在非 `XAUTUSDT` 的 symbol 上：
 
-- fail startup with a clear configuration error
+- 启动时直接报清晰的配置错误
 
-If stale-order cancellation is disabled:
+如果关闭了 stale-order cancellation：
 
-- `reduce_only` should still remove opening orders from the generated plan
-- but preset defaults should keep `cancel_stale = true`
-- monitor output should indicate that existing opening orders may remain on-book until manually cleared
+- `reduce_only` 仍然应当从生成计划中移除开仓单
+- 但 preset 默认仍保持 `cancel_stale = true`
+- monitor 输出中要提示：盘口上已有的同方向旧单可能不会立即消失，需要手动清理
 
-## Testing
+## 测试
 
-Add tests for:
+新增测试覆盖：
 
-- long state classification for normal/defensive/reduce_only
-- short state classification for normal/defensive/reduce_only
-- confirmation-count transition behavior
-- forced `normal -> reduce_only`
-- forced `reduce_only -> defensive`
-- no direct `reduce_only -> normal`
-- long `reduce_only` strips `buy_orders` and `bootstrap_orders`
-- short `reduce_only` strips `sell_orders` and `bootstrap_orders`
-- preset wiring and symbol guard
-- monitor/web summary includes the new state fields
+- long 在 normal/defensive/reduce_only 三态下的分类
+- short 在 normal/defensive/reduce_only 三态下的分类
+- 带确认轮数的状态切换行为
+- 强制 `normal -> reduce_only`
+- 强制 `reduce_only -> defensive`
+- 不允许直接 `reduce_only -> normal`
+- long 在 `reduce_only` 下裁掉 `buy_orders` 和 `bootstrap_orders`
+- short 在 `reduce_only` 下裁掉 `sell_orders` 和 `bootstrap_orders`
+- preset 接线和 symbol 保护
+- monitor/web summary 正确展示新状态字段
 
-## Risks
+## 风险
 
-- overfitting thresholds to a narrow sample window
-- state flapping if recovery thresholds are too loose
-- stale-order cancellation latency could leave same-direction orders live briefly after entering `reduce_only`
+- 阈值可能对当前样本窗口拟合过度
+- 如果恢复阈值过松，状态可能仍会来回抖动
+- 即使进入 `reduce_only`，旧的同方向挂单也可能因撤单延迟而短暂残留在盘口
 
-## Non-Goals
+## 非目标
 
-- generic adaptive framework across all symbols
-- dynamic threshold re-estimation at runtime
-- auto-stop or auto-flatten behavior
+- 面向所有币种的通用自适应框架
+- 运行时动态重估阈值
+- 自动停机或自动全平仓
