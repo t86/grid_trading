@@ -24,7 +24,12 @@ class SymbolListsTests(unittest.TestCase):
 
     def test_load_symbol_lists_defaults_when_file_missing(self) -> None:
         self.assertEqual(load_symbol_lists(self.path), DEFAULT_SYMBOL_LISTS)
-        self.assertEqual(DEFAULT_SYMBOL_LISTS["competition"], ["SOONUSDT"])
+
+    def test_default_symbol_lists_include_sprint_symbols(self) -> None:
+        loaded = load_symbol_lists(self.path)
+        for symbol in ("BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"):
+            self.assertIn(symbol, loaded["monitor"])
+            self.assertIn(symbol, loaded["competition"])
 
     def test_set_symbol_list_normalizes_and_deduplicates(self) -> None:
         symbols = set_symbol_list("monitor", [" soonusdt ", "soonusdt", "SOONUSDT"], self.path)
