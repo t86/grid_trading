@@ -5069,6 +5069,7 @@ def _build_stop_execution_summary(
         "close_submitted_count": 0,
         "close_errors": [],
         "close_orders": [],
+        "close_target_reached": False,
         "flatten_started": False,
         "flatten_already_running": False,
         "warnings": [],
@@ -5263,10 +5264,20 @@ def _execute_stop_actions(
         summary["warnings"].extend(live_snapshot.get("warnings", []))
         if not live_snapshot.get("orders"):
             if target_notional > 0:
-                summary["warnings"].append(f"当前仓位已不高于 {target_notional:.4f}U，未启动跟价减仓进程")
+                target_reached = bool(live_snapshot.get("long_target_reached")) or bool(
+                    live_snapshot.get("short_target_reached")
+                )
+                summary["close_target_reached"] = target_reached
+                if target_reached:
+                    summary["warnings"].append(f"当前仓位已不高于 {target_notional:.4f}U，未启动跟价减仓进程")
+                else:
+                    summary["warnings"].append(
+                        f"当前仓位仍高于 {target_notional:.4f}U，但未生成跟价减仓单；可能被成本、限损或交易所最小下单规则挡住"
+                    )
             else:
                 summary["warnings"].append("当前无可平持仓，未启动跟价平仓进程")
         else:
+            summary["close_target_reached"] = False
             flatten_result = _start_flatten_process(
                 {
                     "symbol": symbol,

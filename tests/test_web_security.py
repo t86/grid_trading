@@ -19,6 +19,7 @@ from grid_optimizer.web import (
     _build_runner_command,
     _client_ip_allowed,
     _default_runtime_paths_for_symbol,
+    _execute_stop_actions,
     _get_custom_runner_preset,
     _load_runner_control_config,
     _normalize_runner_control_payload,
@@ -422,6 +423,35 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--allow-loss", allow_loss_command)
         self.assertIn("--min-profit-ratio", allow_loss_command)
         self.assertIn("--max-loss-ratio", allow_loss_command)
+
+    @patch("grid_optimizer.web.load_live_flatten_snapshot")
+    @patch("grid_optimizer.web._cancel_symbol_open_orders")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_execute_stop_actions_does_not_mark_blocked_reduce_as_target_reached(
+        self,
+        mock_creds,
+        mock_cancel_orders,
+        mock_flatten_snapshot,
+    ) -> None:
+        mock_creds.return_value = ("key", "secret")
+        mock_cancel_orders.return_value = {"attempted": 0, "success": 0, "errors": []}
+        mock_flatten_snapshot.return_value = {
+            "orders": [],
+            "warnings": ["SOONUSDT BOTH maker_flatten 价格 0.173 高于最大亏损保护价 0.1711，已跳过"],
+            "short_target_reached": False,
+        }
+
+        result = _execute_stop_actions(
+            symbol="SOONUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+            close_position_target_notional=150.0,
+            close_position_allow_loss=True,
+            close_position_max_loss_ratio=0.015,
+        )
+
+        self.assertFalse(result["close_target_reached"])
+        self.assertTrue(any("仍高于 150.0000U" in warning for warning in result["warnings"]))
 
     def test_normalize_runner_control_payload_supports_adaptive_step_fields(self) -> None:
         payload = _normalize_runner_control_payload(
