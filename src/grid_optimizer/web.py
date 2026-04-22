@@ -1396,6 +1396,13 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "synthetic_flow_sleeve_levels": 2,
     "synthetic_flow_sleeve_order_notional": None,
     "synthetic_flow_sleeve_max_loss_ratio": 0.0025,
+    "volume_long_v4_flow_sleeve_enabled": False,
+    "volume_long_v4_flow_sleeve_trigger_notional": None,
+    "volume_long_v4_flow_sleeve_reduce_to_notional": None,
+    "volume_long_v4_flow_sleeve_notional": 0.0,
+    "volume_long_v4_flow_sleeve_levels": 2,
+    "volume_long_v4_flow_sleeve_order_notional": None,
+    "volume_long_v4_flow_sleeve_max_loss_ratio": 0.0025,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -3252,6 +3259,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_flow_sleeve_notional",
         "synthetic_flow_sleeve_order_notional",
         "synthetic_flow_sleeve_max_loss_ratio",
+        "volume_long_v4_flow_sleeve_trigger_notional",
+        "volume_long_v4_flow_sleeve_reduce_to_notional",
+        "volume_long_v4_flow_sleeve_notional",
+        "volume_long_v4_flow_sleeve_order_notional",
+        "volume_long_v4_flow_sleeve_max_loss_ratio",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -3304,6 +3316,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "auto_regime_confirm_cycles",
         "market_bias_regime_switch_confirm_cycles",
         "synthetic_flow_sleeve_levels",
+        "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
@@ -3321,6 +3334,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_enabled",
         "synthetic_trend_follow_enabled",
         "synthetic_flow_sleeve_enabled",
+        "volume_long_v4_flow_sleeve_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
@@ -3383,6 +3397,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_flow_sleeve_trigger_notional",
         "synthetic_flow_sleeve_order_notional",
         "synthetic_flow_sleeve_max_loss_ratio",
+        "volume_long_v4_flow_sleeve_trigger_notional",
+        "volume_long_v4_flow_sleeve_reduce_to_notional",
+        "volume_long_v4_flow_sleeve_order_notional",
+        "volume_long_v4_flow_sleeve_max_loss_ratio",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -3878,6 +3896,41 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--synthetic-flow-sleeve-max-loss-ratio",
             str(config["synthetic_flow_sleeve_max_loss_ratio"]),
         ])
+    command.append(
+        "--volume-long-v4-flow-sleeve-enabled"
+        if config.get("volume_long_v4_flow_sleeve_enabled", False)
+        else "--no-volume-long-v4-flow-sleeve-enabled"
+    )
+    if config.get("volume_long_v4_flow_sleeve_trigger_notional") is not None:
+        command.extend([
+            "--volume-long-v4-flow-sleeve-trigger-notional",
+            str(config["volume_long_v4_flow_sleeve_trigger_notional"]),
+        ])
+    if config.get("volume_long_v4_flow_sleeve_reduce_to_notional") is not None:
+        command.extend([
+            "--volume-long-v4-flow-sleeve-reduce-to-notional",
+            str(config["volume_long_v4_flow_sleeve_reduce_to_notional"]),
+        ])
+    if config.get("volume_long_v4_flow_sleeve_notional") is not None:
+        command.extend([
+            "--volume-long-v4-flow-sleeve-notional",
+            str(config["volume_long_v4_flow_sleeve_notional"]),
+        ])
+    if config.get("volume_long_v4_flow_sleeve_levels") is not None:
+        command.extend([
+            "--volume-long-v4-flow-sleeve-levels",
+            str(config["volume_long_v4_flow_sleeve_levels"]),
+        ])
+    if config.get("volume_long_v4_flow_sleeve_order_notional") is not None:
+        command.extend([
+            "--volume-long-v4-flow-sleeve-order-notional",
+            str(config["volume_long_v4_flow_sleeve_order_notional"]),
+        ])
+    if config.get("volume_long_v4_flow_sleeve_max_loss_ratio") is not None:
+        command.extend([
+            "--volume-long-v4-flow-sleeve-max-loss-ratio",
+            str(config["volume_long_v4_flow_sleeve_max_loss_ratio"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -4069,6 +4122,13 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "synthetic_flow_sleeve_levels",
             "synthetic_flow_sleeve_order_notional",
             "synthetic_flow_sleeve_max_loss_ratio",
+            "volume_long_v4_flow_sleeve_enabled",
+            "volume_long_v4_flow_sleeve_trigger_notional",
+            "volume_long_v4_flow_sleeve_reduce_to_notional",
+            "volume_long_v4_flow_sleeve_notional",
+            "volume_long_v4_flow_sleeve_levels",
+            "volume_long_v4_flow_sleeve_order_notional",
+            "volume_long_v4_flow_sleeve_max_loss_ratio",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",

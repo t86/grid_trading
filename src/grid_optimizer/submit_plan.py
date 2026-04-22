@@ -120,6 +120,9 @@ def _resolve_reduce_only_flag(
         "take_profit",
         "take_profit_long",
         "active_delever_long",
+        "soft_delever_long",
+        "hard_delever_long",
+        "flow_sleeve_long",
     }:
         return True
     if normalized_side == "BUY" and normalized_role in {

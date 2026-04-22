@@ -31,6 +31,7 @@ from grid_optimizer.loop_runner import (
     apply_active_delever_short,
     apply_active_delever_long,
     apply_volume_long_v4_staged_delever,
+    apply_volume_long_v4_flow_sleeve,
     apply_synthetic_inventory_exit_priority,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
@@ -235,6 +236,35 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.synthetic_flow_sleeve_levels, 3)
         self.assertEqual(args.synthetic_flow_sleeve_order_notional, 45)
         self.assertEqual(args.synthetic_flow_sleeve_max_loss_ratio, 0.003)
+
+    def test_build_parser_accepts_volume_long_v4_flow_sleeve_args(self) -> None:
+        parser = _build_parser()
+
+        args = parser.parse_args(
+            [
+                "--volume-long-v4-flow-sleeve-enabled",
+                "--volume-long-v4-flow-sleeve-trigger-notional",
+                "820",
+                "--volume-long-v4-flow-sleeve-reduce-to-notional",
+                "720",
+                "--volume-long-v4-flow-sleeve-notional",
+                "180",
+                "--volume-long-v4-flow-sleeve-levels",
+                "3",
+                "--volume-long-v4-flow-sleeve-order-notional",
+                "60",
+                "--volume-long-v4-flow-sleeve-max-loss-ratio",
+                "0.012",
+            ]
+        )
+
+        self.assertTrue(args.volume_long_v4_flow_sleeve_enabled)
+        self.assertEqual(args.volume_long_v4_flow_sleeve_trigger_notional, 820)
+        self.assertEqual(args.volume_long_v4_flow_sleeve_reduce_to_notional, 720)
+        self.assertEqual(args.volume_long_v4_flow_sleeve_notional, 180)
+        self.assertEqual(args.volume_long_v4_flow_sleeve_levels, 3)
+        self.assertEqual(args.volume_long_v4_flow_sleeve_order_notional, 60)
+        self.assertEqual(args.volume_long_v4_flow_sleeve_max_loss_ratio, 0.012)
 
     def test_synthetic_flow_sleeve_adds_bounded_opposite_entries(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
@@ -2728,6 +2758,77 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["active_sell_order_count"], 3)
         self.assertEqual([item["price"] for item in staged_sells], [0.985, 0.99, 1.0])
         self.assertAlmostEqual(report["loss_floor_price"], 0.985, places=8)
+
+    def test_apply_volume_long_v4_flow_sleeve_adds_reduce_only_near_market_sells(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 0.1700, "qty": 411.0, "notional": 69.87, "role": "take_profit"},
+                {"side": "SELL", "price": 0.1704, "qty": 411.0, "notional": 70.03, "role": "take_profit"},
+                {"side": "SELL", "price": 0.1710, "qty": 411.0, "notional": 70.28, "role": "take_profit"},
+            ],
+            "bootstrap_orders": [],
+        }
+
+        report = apply_volume_long_v4_flow_sleeve(
+            plan=plan,
+            enabled=True,
+            current_long_qty=5400.0,
+            current_long_notional=885.0,
+            current_long_cost_basis_price=0.1676,
+            trigger_notional=820.0,
+            reduce_to_notional=720.0,
+            sleeve_notional=180.0,
+            levels=3,
+            per_order_notional=70.0,
+            order_notional=60.0,
+            max_loss_ratio=0.012,
+            step_price=0.0002,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.1658,
+            ask_price=0.1659,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["placed_order_count"], 3)
+        self.assertEqual(report["released_take_profit_order_count"], 3)
+        self.assertLessEqual(report["placed_notional"], 165.0)
+        self.assertEqual(len(plan["sell_orders"]), 3)
+        self.assertTrue(all(item["role"] == "flow_sleeve_long" for item in plan["sell_orders"]))
+        self.assertTrue(all(item["force_reduce_only"] for item in plan["sell_orders"]))
+        self.assertEqual([item["price"] for item in plan["sell_orders"]], [0.1659, 0.1661, 0.1663])
+
+    def test_apply_volume_long_v4_flow_sleeve_respects_loss_guard(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
+
+        report = apply_volume_long_v4_flow_sleeve(
+            plan=plan,
+            enabled=True,
+            current_long_qty=5400.0,
+            current_long_notional=885.0,
+            current_long_cost_basis_price=0.1695,
+            trigger_notional=820.0,
+            reduce_to_notional=720.0,
+            sleeve_notional=180.0,
+            levels=3,
+            per_order_notional=70.0,
+            order_notional=60.0,
+            max_loss_ratio=0.005,
+            step_price=0.0002,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.1658,
+            ask_price=0.1659,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "loss_guard")
+        self.assertEqual(plan["sell_orders"], [])
 
     def test_apply_active_delever_short_disabled_threshold_waits_for_pause_notional(self) -> None:
         plan = {

@@ -1017,6 +1017,8 @@ def _volume_long_v4_order_role(order: dict[str, Any]) -> str:
         return "soft_delever_long"
     if "-harddele-" in client_order_id:
         return "hard_delever_long"
+    if "-flowslee-" in client_order_id:
+        return "flow_sleeve_long"
     if "-activede-" in client_order_id:
         return "active_delever_long"
     return ""
@@ -1201,6 +1203,177 @@ def apply_volume_long_v4_staged_delever(
     return report
 
 
+def apply_volume_long_v4_flow_sleeve(
+    *,
+    plan: dict[str, Any],
+    enabled: bool,
+    current_long_qty: float,
+    current_long_notional: float,
+    current_long_cost_basis_price: float,
+    trigger_notional: float | None,
+    reduce_to_notional: float | None,
+    sleeve_notional: float,
+    levels: int,
+    per_order_notional: float,
+    order_notional: float | None,
+    max_loss_ratio: float | None,
+    step_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+    sell_offset_steps: float = 0.0,
+) -> dict[str, Any]:
+    report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "trigger_notional": trigger_notional,
+        "reduce_to_notional": reduce_to_notional,
+        "sleeve_notional": sleeve_notional,
+        "remaining_sleeve_notional": 0.0,
+        "order_notional": order_notional,
+        "levels": levels,
+        "max_loss_ratio": max_loss_ratio,
+        "cost_basis_price": current_long_cost_basis_price,
+        "loss_floor_price": None,
+        "released_take_profit_order_count": 0,
+        "released_take_profit_notional": 0.0,
+        "placed_order_count": 0,
+        "placed_notional": 0.0,
+        "blocked_reason": None,
+    }
+    if not enabled:
+        return report
+
+    safe_trigger_notional = max(_safe_float(trigger_notional), 0.0)
+    safe_reduce_to_notional = max(_safe_float(reduce_to_notional), 0.0)
+    safe_sleeve_notional = max(_safe_float(sleeve_notional), 0.0)
+    safe_levels = max(int(levels or 0), 0)
+    safe_step_price = max(_safe_float(step_price), 0.0)
+    safe_order_notional = max(_safe_float(order_notional), _safe_float(per_order_notional), 0.0)
+    safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    long_qty = max(_safe_float(current_long_qty), 0.0)
+    if (
+        long_qty <= 1e-12
+        or long_notional <= 1e-12
+        or safe_trigger_notional <= 0
+        or safe_sleeve_notional <= 0
+        or safe_levels <= 0
+        or safe_step_price <= 0
+        or safe_order_notional <= 0
+    ):
+        report["blocked_reason"] = "invalid_config_or_position"
+        return report
+    if long_notional < safe_trigger_notional:
+        report["blocked_reason"] = "below_trigger"
+        return report
+    if safe_reduce_to_notional <= 0:
+        report["blocked_reason"] = "missing_reduce_to_notional"
+        return report
+    sell_budget_notional = min(safe_sleeve_notional, max(long_notional - safe_reduce_to_notional, 0.0))
+    report["remaining_sleeve_notional"] = sell_budget_notional
+    if sell_budget_notional <= 1e-12:
+        report["blocked_reason"] = "at_or_below_reduce_target"
+        return report
+
+    safe_cost_basis_price = max(_safe_float(current_long_cost_basis_price), 0.0)
+    if safe_cost_basis_price <= 0 or safe_max_loss_ratio <= 0:
+        report["blocked_reason"] = "missing_loss_guard"
+        return report
+    min_allowed_price = safe_cost_basis_price * (1.0 - safe_max_loss_ratio)
+    floor_price = _round_order_price(min_allowed_price, tick_size, "SELL")
+    report["loss_floor_price"] = floor_price if floor_price > 0 else None
+
+    kept_sell_orders: list[dict[str, Any]] = []
+    take_profit_candidates: list[dict[str, Any]] = []
+    for item in plan.get("sell_orders", []):
+        if not isinstance(item, dict):
+            continue
+        order = dict(item)
+        if _volume_long_v4_order_role(order) == "take_profit":
+            take_profit_candidates.append(order)
+        else:
+            kept_sell_orders.append(order)
+    released_notional = 0.0
+    released_count = 0
+    for order in sorted(take_profit_candidates, key=lambda item: _safe_float(item.get("price")), reverse=True):
+        if released_notional < sell_budget_notional - 1e-12:
+            released_notional += _safe_float(order.get("notional"))
+            released_count += 1
+            continue
+        kept_sell_orders.append(order)
+    if released_count:
+        plan["sell_orders"] = kept_sell_orders
+        report["released_take_profit_order_count"] = released_count
+        report["released_take_profit_notional"] = released_notional
+
+    existing_keys = {
+        f"{str(item.get('side', '')).upper().strip()}:{_safe_float(item.get('price')):.10f}"
+        for key in ("buy_orders", "sell_orders", "bootstrap_orders")
+        for item in plan.get(key, [])
+        if isinstance(item, dict)
+    }
+    placed_count = 0
+    placed_notional = 0.0
+    remaining = sell_budget_notional
+    for level in range(1, safe_levels + 1):
+        distance_steps = max((float(level) - 1.0) + float(sell_offset_steps), 0.0)
+        raw_price = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(safe_step_price))))
+        price = _round_order_price(raw_price, tick_size, "SELL")
+        if price <= bid_price:
+            continue
+        if min_allowed_price > 0 and price < min_allowed_price:
+            report["blocked_reason"] = "loss_guard"
+            break
+        qty = _round_order_qty(min(safe_order_notional, remaining) / price, step_size)
+        notional = price * qty
+        if qty <= 0:
+            continue
+        if min_qty is not None and qty < min_qty:
+            continue
+        if min_notional is not None and notional < min_notional:
+            continue
+        key = f"SELL:{price:.10f}"
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        plan.setdefault("sell_orders", []).append(
+            {
+                "side": "SELL",
+                "price": price,
+                "qty": qty,
+                "notional": notional,
+                "level": 940 + level,
+                "role": "flow_sleeve_long",
+                "position_side": "BOTH",
+                "force_reduce_only": True,
+                "flow_sleeve": True,
+            }
+        )
+        placed_count += 1
+        placed_notional += notional
+        remaining = max(remaining - notional, 0.0)
+        if remaining <= 1e-12:
+            break
+
+    plan["sell_orders"] = sorted(
+        [dict(item) for item in plan.get("sell_orders", []) if isinstance(item, dict)],
+        key=lambda item: (_safe_float(item.get("price")), str(item.get("side", "")).upper().strip()),
+    )
+    report["active"] = placed_count > 0
+    report["placed_order_count"] = placed_count
+    report["placed_notional"] = placed_notional
+    report["remaining_sleeve_notional"] = max(remaining, 0.0)
+    if placed_count > 0:
+        report["blocked_reason"] = None
+    elif not report.get("blocked_reason"):
+        report["blocked_reason"] = "no_valid_order"
+    return report
+
+
 def _is_long_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
     position_side = _order_position_side(order)
@@ -1215,7 +1388,13 @@ def _is_short_entry_order(order: dict[str, Any]) -> bool:
 
 
 def _is_long_exit_order(order: dict[str, Any]) -> bool:
-    return _order_role(order) in {"take_profit_long", "active_delever_long", "soft_delever_long", "hard_delever_long"}
+    return _order_role(order) in {
+        "take_profit_long",
+        "active_delever_long",
+        "soft_delever_long",
+        "hard_delever_long",
+        "flow_sleeve_long",
+    }
 
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
@@ -1242,6 +1421,7 @@ def _resolve_reduce_only_flag(
         "active_delever_long",
         "soft_delever_long",
         "hard_delever_long",
+        "flow_sleeve_long",
     }:
         return True
     if normalized_side == "BUY" and normalized_role in {
@@ -6057,6 +6237,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "placed_notional": 0.0,
         "blocked_reason": "not_evaluated",
     }
+    volume_long_v4_flow_sleeve: dict[str, Any] = {
+        "enabled": bool(getattr(args, "volume_long_v4_flow_sleeve_enabled", False)),
+        "active": False,
+        "trigger_notional": getattr(args, "volume_long_v4_flow_sleeve_trigger_notional", None),
+        "reduce_to_notional": getattr(args, "volume_long_v4_flow_sleeve_reduce_to_notional", None),
+        "sleeve_notional": getattr(args, "volume_long_v4_flow_sleeve_notional", 0.0),
+        "remaining_sleeve_notional": 0.0,
+        "order_notional": getattr(args, "volume_long_v4_flow_sleeve_order_notional", None),
+        "levels": getattr(args, "volume_long_v4_flow_sleeve_levels", 0),
+        "max_loss_ratio": getattr(args, "volume_long_v4_flow_sleeve_max_loss_ratio", None),
+        "cost_basis_price": 0.0,
+        "loss_floor_price": None,
+        "released_take_profit_order_count": 0,
+        "released_take_profit_notional": 0.0,
+        "placed_order_count": 0,
+        "placed_notional": 0.0,
+        "blocked_reason": "not_evaluated",
+    }
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
@@ -6301,6 +6499,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         actual_position,
         prefer_entry_price=prefer_entry_price_cost_basis,
     )
+    actual_break_even_price = max(_safe_float(actual_position.get("breakEvenPrice")), 0.0)
     long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
     short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
     if _is_inventory_target_neutral_mode(requested_strategy_mode) or _is_competition_inventory_grid_mode(requested_strategy_mode):
@@ -7576,6 +7775,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 bid_price=bid_price,
                 ask_price=ask_price,
             )
+            flow_cost_basis_price = actual_break_even_price if actual_break_even_price > 0 else current_long_avg_price
+            volume_long_v4_flow_sleeve = apply_volume_long_v4_flow_sleeve(
+                plan=plan,
+                enabled=bool(getattr(effective_args, "volume_long_v4_flow_sleeve_enabled", False)),
+                current_long_qty=current_long_qty,
+                current_long_notional=controls["current_long_notional"],
+                current_long_cost_basis_price=flow_cost_basis_price,
+                trigger_notional=getattr(effective_args, "volume_long_v4_flow_sleeve_trigger_notional", None),
+                reduce_to_notional=getattr(effective_args, "volume_long_v4_flow_sleeve_reduce_to_notional", None),
+                sleeve_notional=getattr(effective_args, "volume_long_v4_flow_sleeve_notional", 0.0),
+                levels=int(getattr(effective_args, "volume_long_v4_flow_sleeve_levels", 0) or 0),
+                per_order_notional=inventory_tier["effective_per_order_notional"],
+                order_notional=getattr(effective_args, "volume_long_v4_flow_sleeve_order_notional", None),
+                max_loss_ratio=getattr(effective_args, "volume_long_v4_flow_sleeve_max_loss_ratio", None),
+                step_price=effective_args.step_price,
+                tick_size=symbol_info.get("tick_size"),
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                sell_offset_steps=getattr(effective_args, "static_sell_offset_steps", 0.0),
+            )
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
@@ -7723,6 +7945,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
         "take_profit_guard": take_profit_guard,
         "volume_long_v4_delever": volume_long_v4_delever,
+        "volume_long_v4_flow_sleeve": volume_long_v4_flow_sleeve,
         "active_delever": active_delever,
         "short_threshold_timeout": short_threshold_timeout,
         "position_cost_basis_source": "entryPrice" if prefer_entry_price_cost_basis else "breakEvenPrice",
@@ -8331,6 +8554,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--synthetic-flow-sleeve-levels", type=int, default=2)
     parser.add_argument("--synthetic-flow-sleeve-order-notional", type=float, default=None)
     parser.add_argument("--synthetic-flow-sleeve-max-loss-ratio", type=float, default=0.0025)
+    parser.add_argument("--volume-long-v4-flow-sleeve-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--volume-long-v4-flow-sleeve-trigger-notional", type=float, default=None)
+    parser.add_argument("--volume-long-v4-flow-sleeve-reduce-to-notional", type=float, default=None)
+    parser.add_argument("--volume-long-v4-flow-sleeve-notional", type=float, default=0.0)
+    parser.add_argument("--volume-long-v4-flow-sleeve-levels", type=int, default=2)
+    parser.add_argument("--volume-long-v4-flow-sleeve-order-notional", type=float, default=None)
+    parser.add_argument("--volume-long-v4-flow-sleeve-max-loss-ratio", type=float, default=0.0025)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -8500,6 +8730,19 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"active_sells={int(volume_long_v4_delever.get('active_sell_order_count', 0) or 0)} "
             f"loss_steps={_safe_float(volume_long_v4_delever.get('loss_budget_steps', 0.0)):.2f} "
             f"loss_floor={_price(_safe_float(volume_long_v4_delever.get('loss_floor_price')))}"
+        )
+    volume_long_v4_flow_sleeve = (
+        summary.get("volume_long_v4_flow_sleeve") if isinstance(summary.get("volume_long_v4_flow_sleeve"), dict) else {}
+    )
+    if volume_long_v4_flow_sleeve.get("enabled"):
+        print(
+            "  volume_flow: "
+            f"active={'yes' if volume_long_v4_flow_sleeve.get('active') else 'no'} "
+            f"placed={int(volume_long_v4_flow_sleeve.get('placed_order_count', 0) or 0)} "
+            f"notional={_float(volume_long_v4_flow_sleeve.get('placed_notional', 0.0))} "
+            f"release={int(volume_long_v4_flow_sleeve.get('released_take_profit_order_count', 0) or 0)} "
+            f"floor={_price(_safe_float(volume_long_v4_flow_sleeve.get('loss_floor_price')))} "
+            f"reason={volume_long_v4_flow_sleeve.get('blocked_reason') or '-'}"
         )
     if summary.get("strategy_mode") == "synthetic_neutral":
         print(
@@ -8767,6 +9010,18 @@ def main() -> None:
         )
     ):
         raise SystemExit("synthetic trend follow requires at least one positive trigger threshold")
+    if args.volume_long_v4_flow_sleeve_levels < 0:
+        raise SystemExit("--volume-long-v4-flow-sleeve-levels must be >= 0")
+    for value, label in (
+        (args.volume_long_v4_flow_sleeve_trigger_notional, "--volume-long-v4-flow-sleeve-trigger-notional"),
+        (args.volume_long_v4_flow_sleeve_reduce_to_notional, "--volume-long-v4-flow-sleeve-reduce-to-notional"),
+        (args.volume_long_v4_flow_sleeve_order_notional, "--volume-long-v4-flow-sleeve-order-notional"),
+        (args.volume_long_v4_flow_sleeve_max_loss_ratio, "--volume-long-v4-flow-sleeve-max-loss-ratio"),
+    ):
+        if value is not None and value < 0:
+            raise SystemExit(f"{label} must be >= 0")
+    if args.volume_long_v4_flow_sleeve_notional < 0:
+        raise SystemExit("--volume-long-v4-flow-sleeve-notional must be >= 0")
     if args.auto_regime_confirm_cycles <= 0:
         raise SystemExit("--auto-regime-confirm-cycles must be > 0")
     if args.auto_regime_stable_15m_max_amplitude_ratio <= 0 or args.auto_regime_stable_60m_max_amplitude_ratio <= 0:
@@ -9083,6 +9338,9 @@ def main() -> None:
                     (plan_report.get("synthetic_tp_only_watchdog") or {}).get("sell_gap_steps")
                 ),
                 "synthetic_tp_only_watchdog_reason": (plan_report.get("synthetic_tp_only_watchdog") or {}).get("reason"),
+                "take_profit_guard": dict(plan_report.get("take_profit_guard") or {}),
+                "volume_long_v4_delever": dict(plan_report.get("volume_long_v4_delever") or {}),
+                "volume_long_v4_flow_sleeve": dict(plan_report.get("volume_long_v4_flow_sleeve") or {}),
                 "inventory_tier_active": bool((plan_report.get("inventory_tier") or {}).get("active")),
                 "inventory_tier_ratio": _safe_float((plan_report.get("inventory_tier") or {}).get("ratio")),
                 "volatility_buy_pause": bool((plan_report.get("market_guard") or {}).get("buy_pause_active")),
@@ -9154,6 +9412,33 @@ def main() -> None:
                 ),
                 "synthetic_flow_sleeve_blocked_reason": (
                     (plan_report.get("synthetic_flow_sleeve") or {}).get("blocked_reason")
+                ),
+                "volume_long_v4_flow_sleeve_enabled": bool(
+                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("enabled"))
+                ),
+                "volume_long_v4_flow_sleeve_active": bool(
+                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("active"))
+                ),
+                "volume_long_v4_flow_sleeve_placed_order_count": int(
+                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("placed_order_count", 0) or 0)
+                ),
+                "volume_long_v4_flow_sleeve_placed_notional": _safe_float(
+                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("placed_notional")
+                ),
+                "volume_long_v4_flow_sleeve_released_take_profit_order_count": int(
+                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("released_take_profit_order_count", 0) or 0)
+                ),
+                "volume_long_v4_flow_sleeve_released_take_profit_notional": _safe_float(
+                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("released_take_profit_notional")
+                ),
+                "volume_long_v4_flow_sleeve_remaining_notional": _safe_float(
+                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("remaining_sleeve_notional")
+                ),
+                "volume_long_v4_flow_sleeve_loss_floor_price": _safe_float(
+                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("loss_floor_price")
+                ),
+                "volume_long_v4_flow_sleeve_blocked_reason": (
+                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("blocked_reason")
                 ),
                 "effective_buy_levels": int(plan_report.get("effective_buy_levels", 0) or 0),
                 "effective_sell_levels": int(plan_report.get("effective_sell_levels", 0) or 0),
