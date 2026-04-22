@@ -266,7 +266,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.volume_long_v4_flow_sleeve_order_notional, 60)
         self.assertEqual(args.volume_long_v4_flow_sleeve_max_loss_ratio, 0.012)
 
-    def test_synthetic_flow_sleeve_adds_bounded_opposite_entries(self) -> None:
+    def test_synthetic_flow_sleeve_adds_reduce_only_long_flow_exits(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
 
         report = apply_synthetic_flow_sleeve(
@@ -298,10 +298,11 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["placed_order_count"], 3)
         self.assertLessEqual(report["placed_notional"], 120)
         self.assertEqual(len(plan["sell_orders"]), 3)
-        self.assertTrue(all(item["role"] == "entry_short" for item in plan["sell_orders"]))
+        self.assertTrue(all(item["role"] == "flow_sleeve_long" for item in plan["sell_orders"]))
+        self.assertTrue(all(item["force_reduce_only"] for item in plan["sell_orders"]))
         self.assertTrue(all(item["flow_sleeve"] for item in plan["sell_orders"]))
 
-    def test_synthetic_flow_sleeve_respects_loss_guard(self) -> None:
+    def test_synthetic_flow_sleeve_clamps_long_flow_exits_to_loss_floor(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
 
         report = apply_synthetic_flow_sleeve(
@@ -328,9 +329,47 @@ class LoopRunnerTests(unittest.TestCase):
             sell_offset_steps=0.25,
         )
 
-        self.assertFalse(report["active"])
-        self.assertEqual(report["blocked_reason"], "loss_guard")
-        self.assertEqual(plan["sell_orders"], [])
+        self.assertTrue(report["active"])
+        self.assertIsNone(report["blocked_reason"])
+        self.assertEqual(report["loss_floor_price"], 0.1695)
+        self.assertEqual(report["loss_guard_clamped_order_count"], 3)
+        self.assertEqual([item["price"] for item in plan["sell_orders"]], [0.1695])
+
+    def test_synthetic_flow_sleeve_adds_reduce_only_short_flow_exits_at_loss_ceiling(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
+
+        report = apply_synthetic_flow_sleeve(
+            plan=plan,
+            enabled=True,
+            current_long_notional=0,
+            current_short_notional=220,
+            current_long_avg_price=0,
+            current_short_avg_price=0.168575,
+            trigger_notional=90,
+            sleeve_notional=180,
+            levels=4,
+            per_order_notional=60,
+            order_notional=60,
+            max_loss_ratio=0.003,
+            step_price=0.0002,
+            tick_size=0.0001,
+            step_size=1,
+            min_qty=1,
+            min_notional=5,
+            bid_price=0.1692,
+            ask_price=0.1693,
+            buy_offset_steps=0.0,
+            sell_offset_steps=0.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["direction"], "short_inventory_buy_flow")
+        self.assertEqual(report["loss_ceiling_price"], 0.169)
+        self.assertEqual(report["loss_guard_clamped_order_count"], 1)
+        self.assertEqual(report["placed_order_count"], 3)
+        self.assertEqual([item["price"] for item in plan["buy_orders"]], [0.169, 0.1688, 0.1686])
+        self.assertTrue(all(item["role"] == "flow_sleeve_short" for item in plan["buy_orders"]))
+        self.assertTrue(all(item["force_reduce_only"] for item in plan["buy_orders"]))
 
     @patch("grid_optimizer.loop_runner.determine_interval_center_price")
     def test_resolve_interval_locked_center_price_rolls_halfway_to_target_center(self, mock_determine_interval_center_price) -> None:
@@ -2300,6 +2339,27 @@ class LoopRunnerTests(unittest.TestCase):
         )
         self.assertAlmostEqual(ledger["virtual_short_qty"], 30.0)
 
+    def test_apply_synthetic_trade_fill_flow_sleeve_short_reduces_virtual_short_book(self) -> None:
+        ledger = {
+            "virtual_long_qty": 0.0,
+            "virtual_long_avg_price": 0.0,
+            "virtual_short_qty": 100.0,
+            "virtual_short_avg_price": 0.168,
+            "virtual_long_lots": [],
+            "virtual_short_lots": [{"qty": 100.0, "price": 0.168}],
+        }
+
+        self.assertTrue(
+            _apply_synthetic_trade_fill(
+                ledger=ledger,
+                trade={"qty": "30", "price": "0.169"},
+                order_ref={"role": "flow_sleeve_short"},
+            )
+        )
+
+        self.assertAlmostEqual(ledger["virtual_short_qty"], 70.0)
+        self.assertAlmostEqual(ledger["grid_buffer_spent_notional"], 30.0 * (0.169 - 0.168))
+
     def test_apply_synthetic_trade_fill_tracks_lifo_lots(self) -> None:
         ledger = {
             "virtual_long_qty": 15.0,
@@ -4251,6 +4311,7 @@ class LoopRunnerTests(unittest.TestCase):
                 "place_orders": [
                     {"role": "take_profit_short", "side": "BUY", "qty": 100.0, "price": 0.10},
                     {"role": "active_delever_short", "side": "BUY", "qty": 100.0, "price": 0.09},
+                    {"role": "flow_sleeve_short", "side": "BUY", "qty": 50.0, "price": 0.095},
                 ],
             },
         }
@@ -4259,13 +4320,14 @@ class LoopRunnerTests(unittest.TestCase):
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
             "multiAssetsMargin": False,
-            "positions": [{"symbol": "SOONUSDT", "positionAmt": "-200", "entryPrice": "0.18"}],
+            "positions": [{"symbol": "SOONUSDT", "positionAmt": "-250", "entryPrice": "0.18"}],
         }
         mock_open_orders.return_value = []
         mock_change_leverage.return_value = {"leverage": 2}
         mock_post_order.side_effect = [
             {"orderId": 1, "clientOrderId": "a"},
             {"orderId": 2, "clientOrderId": "b"},
+            {"orderId": 3, "clientOrderId": "c"},
         ]
 
         args = Namespace(
@@ -4291,8 +4353,8 @@ class LoopRunnerTests(unittest.TestCase):
             "step_price": 0.01,
             "open_order_count": 0,
             "current_long_qty": 0.0,
-            "current_short_qty": 200.0,
-            "actual_net_qty": -200.0,
+            "current_short_qty": 250.0,
+            "actual_net_qty": -250.0,
             "symbol_info": {
                 "tick_size": 0.01,
                 "min_qty": 0.1,
@@ -4303,7 +4365,7 @@ class LoopRunnerTests(unittest.TestCase):
         execute_plan_report(args, plan_report)
 
         reduce_only_values = [call.kwargs["reduce_only"] for call in mock_post_order.call_args_list]
-        self.assertEqual(reduce_only_values, [True, True])
+        self.assertEqual(reduce_only_values, [True, True, True])
         mock_update_synthetic_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 

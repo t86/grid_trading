@@ -1350,7 +1350,7 @@ def _is_long_exit_order(order: dict[str, Any]) -> bool:
 
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
-    return _order_role(order) in {"take_profit_short", "active_delever_short"}
+    return _order_role(order) in {"take_profit_short", "active_delever_short", "flow_sleeve_short"}
 
 
 
@@ -1379,6 +1379,7 @@ def _resolve_reduce_only_flag(
     if normalized_side == "BUY" and normalized_role in {
         "take_profit_short",
         "active_delever_short",
+        "flow_sleeve_short",
     }:
         return True
     return None
@@ -2238,7 +2239,7 @@ def _apply_synthetic_trade_fill(
     elif role == "take_profit_long":
         long_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(long_lots, qty)
         ledger["grid_buffer_realized_notional"] += max((qty * price) - realized_cost, 0.0)
-    elif role == "active_delever_long":
+    elif role in {"active_delever_long", "flow_sleeve_long"}:
         long_lots, realized_cost = _consume_synthetic_lots_with_cost(
             long_lots,
             qty,
@@ -2250,7 +2251,7 @@ def _apply_synthetic_trade_fill(
     elif role == "take_profit_short":
         short_lots, realized_cost = _consume_synthetic_lots_lifo_with_cost(short_lots, qty)
         ledger["grid_buffer_realized_notional"] += max(realized_cost - (qty * price), 0.0)
-    elif role == "active_delever_short":
+    elif role in {"active_delever_short", "flow_sleeve_short"}:
         short_lots, realized_cost = _consume_synthetic_lots_with_cost(
             short_lots,
             qty,
@@ -3675,6 +3676,9 @@ def apply_synthetic_flow_sleeve(
         "order_notional": order_notional,
         "levels": levels,
         "max_loss_ratio": max_loss_ratio,
+        "loss_floor_price": None,
+        "loss_ceiling_price": None,
+        "loss_guard_clamped_order_count": 0,
         "placed_order_count": 0,
         "placed_notional": 0.0,
         "blocked_reason": None,
@@ -3742,6 +3746,7 @@ def apply_synthetic_flow_sleeve(
             "level": level,
             "role": role,
             "position_side": "BOTH",
+            "force_reduce_only": True,
             "flow_sleeve": True,
         }
         if side == "BUY":
@@ -3752,25 +3757,33 @@ def apply_synthetic_flow_sleeve(
 
     placed_count = 0
     placed_notional = 0.0
+    clamped_count = 0
     remaining = remaining_sleeve_notional
     if direction == "long_inventory_sell_flow":
         min_allowed_price = 0.0
         if safe_max_loss_ratio > 0 and current_long_avg_price > 0:
             min_allowed_price = float(current_long_avg_price) * (1.0 - safe_max_loss_ratio)
+            floor_price = _round_order_price(min_allowed_price, tick_size, "SELL")
+            if floor_price > 0:
+                report["loss_floor_price"] = floor_price
         for level in range(1, safe_levels + 1):
             distance_steps = max((float(level) - 1.0) + float(sell_offset_steps), 0.0)
             raw_price = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(safe_step_price))))
             price = _round_order_price(raw_price, tick_size, "SELL")
+            floor_price = max(_safe_float(report.get("loss_floor_price")), 0.0)
+            if floor_price > 0 and price < floor_price:
+                price = floor_price
+                clamped_count += 1
             if price <= bid_price:
                 continue
-            if min_allowed_price > 0 and price < min_allowed_price:
+            if min_allowed_price > 0 and price < min_allowed_price - 1e-12:
                 report["blocked_reason"] = "loss_guard"
                 break
             consumed = _append_flow_order(
                 side="SELL",
                 price=price,
                 notional_budget=min(safe_per_order_notional, remaining),
-                role="entry_short",
+                role="flow_sleeve_long",
                 level=900 + level,
             )
             if consumed <= 0:
@@ -3784,20 +3797,27 @@ def apply_synthetic_flow_sleeve(
         max_allowed_price = 0.0
         if safe_max_loss_ratio > 0 and current_short_avg_price > 0:
             max_allowed_price = float(current_short_avg_price) * (1.0 + safe_max_loss_ratio)
+            ceiling_price = _round_order_price(max_allowed_price, tick_size, "BUY")
+            if ceiling_price > 0:
+                report["loss_ceiling_price"] = ceiling_price
         for level in range(1, safe_levels + 1):
             distance_steps = max((float(level) - 1.0) + float(buy_offset_steps), 0.0)
             raw_price = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(safe_step_price))))
             price = _round_order_price(raw_price, tick_size, "BUY")
+            ceiling_price = max(_safe_float(report.get("loss_ceiling_price")), 0.0)
+            if ceiling_price > 0 and price > ceiling_price:
+                price = ceiling_price
+                clamped_count += 1
             if price <= 0 or price >= ask_price:
                 continue
-            if max_allowed_price > 0 and price > max_allowed_price:
+            if max_allowed_price > 0 and price > max_allowed_price + 1e-12:
                 report["blocked_reason"] = "loss_guard"
                 break
             consumed = _append_flow_order(
                 side="BUY",
                 price=price,
                 notional_budget=min(safe_per_order_notional, remaining),
-                role="entry_long",
+                role="flow_sleeve_short",
                 level=900 + level,
             )
             if consumed <= 0:
@@ -3811,6 +3831,7 @@ def apply_synthetic_flow_sleeve(
     report["active"] = placed_count > 0
     report["placed_order_count"] = placed_count
     report["placed_notional"] = placed_notional
+    report["loss_guard_clamped_order_count"] = clamped_count
     report["remaining_sleeve_notional"] = max(remaining, 0.0)
     if placed_count > 0:
         report["blocked_reason"] = None

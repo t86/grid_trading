@@ -128,6 +128,7 @@ def _resolve_reduce_only_flag(
     if normalized_side == "BUY" and normalized_role in {
         "take_profit_short",
         "active_delever_short",
+        "flow_sleeve_short",
     }:
         return True
     return None

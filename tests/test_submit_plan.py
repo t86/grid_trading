@@ -69,6 +69,29 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["reduce_only_position_cap"]["remaining_buy_reduce_qty"], 0.0)
         self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 1)
 
+    def test_reduce_only_cap_treats_flow_sleeve_short_as_reduce_only_buy(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.1690, "qty": 150.0, "notional": 25.35, "role": "flow_sleeve_short"},
+                {"side": "BUY", "price": 0.1688, "qty": 150.0, "notional": 25.32, "role": "flow_sleeve_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+
+        capped = cap_reduce_only_place_orders_to_position(
+            actions=actions,
+            strategy_mode="synthetic_neutral",
+            current_actual_net_qty=-200.0,
+            current_open_orders=[],
+        )
+
+        self.assertEqual(capped["place_count"], 2)
+        self.assertEqual(capped["place_orders"][0]["qty"], 150.0)
+        self.assertEqual(capped["place_orders"][1]["qty"], 50.0)
+        self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
     def test_preserve_queue_priority_drops_replace_when_post_only_projects_back_to_same_bucket(self) -> None:
         actions = {
             "place_orders": [
