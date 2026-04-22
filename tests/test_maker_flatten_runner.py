@@ -221,6 +221,57 @@ class MakerFlattenRunnerTests(unittest.TestCase):
         self.assertEqual(len(result["orders"]), 1)
         self.assertEqual(result["orders"][0]["side"], "SELL")
 
+    def test_flatten_allows_loss_within_max_loss_ratio(self) -> None:
+        result = build_flatten_orders_from_snapshot(
+            symbol="TESTUSDT",
+            bid_price=1.11,
+            ask_price=1.12,
+            dual_side_position=False,
+            account_info={
+                "positions": [
+                    {
+                        "symbol": "TESTUSDT",
+                        "positionAmt": "-8",
+                        "positionSide": "BOTH",
+                        "entryPrice": "1.10",
+                    }
+                ]
+            },
+            symbol_info={"tick_size": 0.01, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            allow_loss=True,
+            max_loss_ratio=0.02,
+        )
+
+        self.assertEqual(len(result["orders"]), 1)
+        self.assertEqual(result["orders"][0]["side"], "BUY")
+        self.assertEqual(result["orders"][0]["price"], 1.11)
+
+    def test_flatten_blocks_loss_above_max_loss_ratio(self) -> None:
+        result = build_flatten_orders_from_snapshot(
+            symbol="TESTUSDT",
+            bid_price=1.14,
+            ask_price=1.15,
+            dual_side_position=False,
+            account_info={
+                "positions": [
+                    {
+                        "symbol": "TESTUSDT",
+                        "positionAmt": "-8",
+                        "positionSide": "BOTH",
+                        "entryPrice": "1.10",
+                    }
+                ]
+            },
+            symbol_info={"tick_size": 0.01, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            target_position_notional=1.0,
+            allow_loss=True,
+            max_loss_ratio=0.02,
+        )
+
+        self.assertEqual(result["orders"], [])
+        self.assertTrue(any("最大亏损保护价" in warning for warning in result["warnings"]))
+        self.assertFalse(any("已不高于目标" in warning for warning in result["warnings"]))
+
     def test_matching_flatten_order_is_kept(self) -> None:
         desired = {
             "side": "SELL",

@@ -36,6 +36,7 @@ from grid_optimizer.web import (
     _update_custom_grid_runner_preset,
     _uses_legacy_runner,
     _volatility_reduce_escalation_reason,
+    _volatility_trigger_orphan_recovery_action,
 )
 
 
@@ -86,6 +87,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_volatility_trigger_amplitude_ratio"', MONITOR_PAGE)
         self.assertIn('id="monitor_volatility_trigger_abs_return_ratio"', MONITOR_PAGE)
         self.assertIn('id="monitor_volatility_trigger_stop_reduce_to_notional"', MONITOR_PAGE)
+        self.assertIn('id="monitor_volatility_trigger_reduce_max_loss_ratio"', MONITOR_PAGE)
         self.assertIn('id="save_params_btn"', MONITOR_PAGE)
 
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
@@ -184,6 +186,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["autotune_symbol_enabled"])
         self.assertTrue(payload["autotune_min_order_notional_only"])
         self.assertEqual(payload["volatility_trigger_stop_reduce_to_notional"], 150.0)
+        self.assertEqual(payload["volatility_trigger_reduce_max_loss_ratio"], 0.015)
         self.assertEqual(payload["volatility_trigger_reduce_escalate_after_seconds"], 900.0)
         self.assertEqual(payload["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.02)
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
@@ -356,6 +359,7 @@ class WebSecurityTests(unittest.TestCase):
                 "volatility_trigger_amplitude_ratio": 0.04,
                 "volatility_trigger_abs_return_ratio": 0.02,
                 "volatility_trigger_stop_reduce_to_notional": 150,
+                "volatility_trigger_reduce_max_loss_ratio": 0.015,
                 "volatility_trigger_reduce_escalate_after_seconds": 900,
                 "volatility_trigger_reduce_escalate_abs_return_ratio": 0.03,
                 "volatility_trigger_stop_cancel_open_orders": False,
@@ -368,6 +372,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_amplitude_ratio"], 0.04)
         self.assertEqual(payload["volatility_trigger_abs_return_ratio"], 0.02)
         self.assertEqual(payload["volatility_trigger_stop_reduce_to_notional"], 150)
+        self.assertEqual(payload["volatility_trigger_reduce_max_loss_ratio"], 0.015)
         self.assertEqual(payload["volatility_trigger_reduce_escalate_after_seconds"], 900)
         self.assertEqual(payload["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.03)
         self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
@@ -407,13 +412,16 @@ class WebSecurityTests(unittest.TestCase):
                 **base_config,
                 "allow_loss": True,
                 "min_profit_ratio": 0.001,
+                "max_loss_ratio": 0.015,
             }
         )
 
         self.assertNotIn("--allow-loss", default_command)
         self.assertNotIn("--min-profit-ratio", default_command)
+        self.assertNotIn("--max-loss-ratio", default_command)
         self.assertIn("--allow-loss", allow_loss_command)
         self.assertIn("--min-profit-ratio", allow_loss_command)
+        self.assertIn("--max-loss-ratio", allow_loss_command)
 
     def test_normalize_runner_control_payload_supports_adaptive_step_fields(self) -> None:
         payload = _normalize_runner_control_payload(
@@ -557,6 +565,7 @@ class WebSecurityTests(unittest.TestCase):
                 "phase": "reduce_to_notional",
                 "reduce_started_at": "2026-04-21T13:53:03+00:00",
                 "reduce_effective": False,
+                "reduce_target_reached": True,
                 "result": {
                     "post_stop_actions": {
                         "close_attempted_count": 0,
@@ -569,6 +578,72 @@ class WebSecurityTests(unittest.TestCase):
         )
 
         self.assertIsNone(reason)
+
+    def test_volatility_orphan_recovery_retries_reduce_when_runner_stopped(self) -> None:
+        action = _volatility_trigger_orphan_recovery_action(
+            {"volatility_trigger_stop_close_all_positions": True},
+            {
+                "paused_by_trigger": True,
+                "phase": "reduce_to_notional",
+                "reduce_target_reached": False,
+            },
+            signal_hit=True,
+            runner_running=False,
+            flatten_running=False,
+            reduce_target_notional=150.0,
+        )
+
+        self.assertEqual(action, {"action": "reduce_to_notional", "reason": "retry_reduce_to_notional"})
+
+    def test_volatility_orphan_recovery_does_not_retry_reached_reduce_target(self) -> None:
+        action = _volatility_trigger_orphan_recovery_action(
+            {"volatility_trigger_stop_close_all_positions": True},
+            {
+                "paused_by_trigger": True,
+                "phase": "reduce_to_notional",
+                "reduce_target_reached": True,
+            },
+            signal_hit=True,
+            runner_running=False,
+            flatten_running=False,
+            reduce_target_notional=150.0,
+        )
+
+        self.assertIsNone(action)
+
+    def test_volatility_orphan_recovery_retries_full_flatten_when_runner_stopped(self) -> None:
+        action = _volatility_trigger_orphan_recovery_action(
+            {"volatility_trigger_stop_close_all_positions": True},
+            {
+                "paused_by_trigger": True,
+                "phase": "full_flatten",
+                "full_flatten_target_reached": False,
+            },
+            signal_hit=True,
+            runner_running=False,
+            flatten_running=False,
+            reduce_target_notional=150.0,
+        )
+
+        self.assertEqual(action, {"action": "full_flatten", "reason": "retry_full_flatten"})
+
+    def test_volatility_reduce_escalates_when_reduce_was_blocked(self) -> None:
+        reason = _volatility_reduce_escalation_reason(
+            {
+                "volatility_trigger_reduce_escalate_after_seconds": 900,
+                "volatility_trigger_reduce_escalate_abs_return_ratio": 0.02,
+            },
+            {
+                "phase": "reduce_to_notional",
+                "reduce_started_at": "2026-04-21T13:53:03+00:00",
+                "reduce_effective": False,
+                "reduce_target_reached": False,
+            },
+            checked_at=datetime(2026, 4, 21, 13, 54, 0, tzinfo=timezone.utc),
+            current_return_ratio=-0.025,
+        )
+
+        self.assertEqual(reason, "reduce_escalate_abs_return_ratio")
 
     def test_volatility_reduce_escalates_after_effective_reduce(self) -> None:
         reason = _volatility_reduce_escalation_reason(
@@ -863,6 +938,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(config["pause_buy_position_notional"], 220.0)
         self.assertAlmostEqual(config["max_position_notional"], 260.0)
         self.assertEqual(config["volatility_trigger_stop_reduce_to_notional"], 150.0)
+        self.assertEqual(config["volatility_trigger_reduce_max_loss_ratio"], 0.015)
         self.assertEqual(config["volatility_trigger_reduce_escalate_after_seconds"], 900.0)
         self.assertEqual(config["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.02)
         self.assertTrue(config["volatility_trigger_stop_close_all_positions"])

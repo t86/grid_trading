@@ -78,11 +78,13 @@ def build_flatten_orders_from_snapshot(
     target_position_notional: float = 0.0,
     allow_loss: bool = False,
     min_profit_ratio: float = 0.0,
+    max_loss_ratio: float | None = None,
 ) -> dict[str, Any]:
     if bid_price <= 0 or ask_price <= 0:
         raise ValueError("bid_price and ask_price must be > 0")
     target_notional = max(float(target_position_notional or 0.0), 0.0)
     safe_min_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    safe_max_loss_ratio = max(_safe_float(max_loss_ratio), 0.0)
 
     result = {
         "orders": [],
@@ -90,6 +92,7 @@ def build_flatten_orders_from_snapshot(
         "dual_side_position": bool(dual_side_position),
         "allow_loss": bool(allow_loss),
         "min_profit_ratio": safe_min_profit_ratio,
+        "max_loss_ratio": safe_max_loss_ratio,
         "long_qty": 0.0,
         "short_qty": 0.0,
         "net_qty": 0.0,
@@ -122,10 +125,10 @@ def build_flatten_orders_from_snapshot(
         if min_notional is not None and rounded_qty * rounded_price < float(min_notional):
             result["warnings"].append(f"{symbol} {position_side or 'BOTH'} 平仓名义低于最小下单额，已跳过")
             return
+        side_text = str(side).upper().strip()
+        side_label = position_side or "BOTH"
+        safe_cost = max(_safe_float(cost_basis_price), 0.0)
         if not allow_loss:
-            safe_cost = max(_safe_float(cost_basis_price), 0.0)
-            side_text = str(side).upper().strip()
-            side_label = position_side or "BOTH"
             if safe_cost <= 0:
                 result["warnings"].append(f"{symbol} {side_label} 缺少成本基准，默认禁止 maker_flatten 平仓")
                 return
@@ -141,6 +144,24 @@ def build_flatten_orders_from_snapshot(
                 if ceiling_price <= 0 or rounded_price > ceiling_price + 1e-12:
                     result["warnings"].append(
                         f"{symbol} {side_label} maker_flatten 价格 {rounded_price} 高于成本保护价 {ceiling_price}，默认禁止亏损平仓"
+                    )
+                    return
+        elif safe_max_loss_ratio > 0:
+            if safe_cost <= 0:
+                result["warnings"].append(f"{symbol} {side_label} 缺少成本基准，无法按最大亏损比例平仓")
+                return
+            if side_text == "SELL":
+                floor_price = _round_order_price(safe_cost * (1.0 - safe_max_loss_ratio), tick_size, "SELL")
+                if rounded_price + 1e-12 < floor_price:
+                    result["warnings"].append(
+                        f"{symbol} {side_label} maker_flatten 价格 {rounded_price} 低于最大亏损保护价 {floor_price}，已跳过"
+                    )
+                    return
+            elif side_text == "BUY":
+                ceiling_price = _round_order_price(safe_cost * (1.0 + safe_max_loss_ratio), tick_size, "BUY")
+                if ceiling_price <= 0 or rounded_price > ceiling_price + 1e-12:
+                    result["warnings"].append(
+                        f"{symbol} {side_label} maker_flatten 价格 {rounded_price} 高于最大亏损保护价 {ceiling_price}，已跳过"
                     )
                     return
         order = {
@@ -230,7 +251,9 @@ def build_flatten_orders_from_snapshot(
                     cost_basis_price=_position_cost_basis_price(position),
                 )
 
-    if target_notional > 0 and not result["orders"]:
+    if target_notional > 0 and not result["orders"] and (
+        bool(result.get("long_target_reached")) or bool(result.get("short_target_reached"))
+    ):
         result["warnings"].append(f"{symbol} 当前仓位名义已不高于目标 {target_notional:.4f}U，未继续减仓")
 
     return result
@@ -244,6 +267,7 @@ def load_live_flatten_snapshot(
     target_position_notional: float = 0.0,
     allow_loss: bool = False,
     min_profit_ratio: float = 0.0,
+    max_loss_ratio: float | None = None,
 ) -> dict[str, Any]:
     symbol_info = fetch_futures_symbol_config(symbol)
     book = fetch_futures_book_tickers(symbol=symbol)
@@ -266,6 +290,7 @@ def load_live_flatten_snapshot(
         target_position_notional=target_position_notional,
         allow_loss=allow_loss,
         min_profit_ratio=min_profit_ratio,
+        max_loss_ratio=max_loss_ratio,
     )
     snapshot["bid_price"] = bid_price
     snapshot["ask_price"] = ask_price
@@ -394,6 +419,7 @@ def _run(args: argparse.Namespace) -> int:
                 target_position_notional=args.target_position_notional,
                 allow_loss=bool(args.allow_loss),
                 min_profit_ratio=float(args.min_profit_ratio),
+                max_loss_ratio=args.max_loss_ratio,
             )
             open_orders = fetch_futures_open_orders(args.symbol, api_key, api_secret, recv_window=args.recv_window)
             our_orders = [order for order in open_orders if isinstance(order, dict) and is_flatten_order(order, prefix)]
@@ -509,6 +535,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--target-position-notional", type=float, default=0.0)
     parser.add_argument("--allow-loss", action="store_true")
     parser.add_argument("--min-profit-ratio", type=float, default=0.0)
+    parser.add_argument("--max-loss-ratio", type=float, default=None)
     return parser
 
 
@@ -525,6 +552,8 @@ def main() -> None:
         raise SystemExit("--target-position-notional must be >= 0")
     if args.min_profit_ratio < 0:
         raise SystemExit("--min-profit-ratio must be >= 0")
+    if args.max_loss_ratio is not None and args.max_loss_ratio < 0:
+        raise SystemExit("--max-loss-ratio must be >= 0")
     raise SystemExit(_run(args))
 
 
