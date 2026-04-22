@@ -13,11 +13,11 @@ from grid_optimizer.competition import (
 
 class CompetitionTests(unittest.TestCase):
     @patch("grid_optimizer.competition.get_symbol_list", return_value=list(COMPETITION_SYMBOLS))
-    def test_supported_competition_symbols_include_kat_opn_and_robo(self, mock_get_symbol_list) -> None:
+    def test_supported_competition_symbols_include_current_sprint_symbols(self, mock_get_symbol_list) -> None:
         self.assertEqual(tuple(competition_symbols()), COMPETITION_SYMBOLS)
-        self.assertIn("KATUSDT", COMPETITION_SYMBOLS)
-        self.assertIn("OPNUSDT", COMPETITION_SYMBOLS)
-        self.assertIn("ROBOUSDT", COMPETITION_SYMBOLS)
+        self.assertIn("BTCUSDC", COMPETITION_SYMBOLS)
+        self.assertIn("XAUUSDT", COMPETITION_SYMBOLS)
+        self.assertIn("CLUSDT", COMPETITION_SYMBOLS)
         mock_get_symbol_list.assert_called_once_with("competition")
 
     @patch("grid_optimizer.competition.get_symbol_list", return_value=["XAUTUSDT", "KATUSDT"])

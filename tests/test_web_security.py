@@ -1536,6 +1536,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("软停买", MONITOR_PAGE)
         self.assertIn("硬上限", MONITOR_PAGE)
 
+    def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', MONITOR_PAGE)
+
     def test_monitor_page_keeps_raw_json_in_advanced_panel(self) -> None:
         self.assertIn('id="runner_params_advanced_panel"', MONITOR_PAGE)
         self.assertIn("高级模式 / 原始 JSON", MONITOR_PAGE)
@@ -1547,6 +1550,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_symbol_chips"', STRATEGIES_PAGE)
         self.assertIn('id="competition_symbol_chips"', STRATEGIES_PAGE)
         self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
+
+    def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
+        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', STRATEGIES_PAGE)
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:

@@ -25,10 +25,11 @@ class SymbolListsTests(unittest.TestCase):
     def test_load_symbol_lists_defaults_when_file_missing(self) -> None:
         self.assertEqual(load_symbol_lists(self.path), DEFAULT_SYMBOL_LISTS)
 
-    def test_default_symbol_lists_include_basedusdt(self) -> None:
+    def test_default_symbol_lists_include_sprint_symbols(self) -> None:
         loaded = load_symbol_lists(self.path)
-        self.assertIn("BASEDUSDT", loaded["monitor"])
-        self.assertIn("BASEDUSDT", loaded["competition"])
+        for symbol in ("BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"):
+            self.assertIn(symbol, loaded["monitor"])
+            self.assertIn(symbol, loaded["competition"])
 
     def test_set_symbol_list_normalizes_and_deduplicates(self) -> None:
         symbols = set_symbol_list("monitor", [" nightusdt ", "xautusdt", "NIGHTUSDT"], self.path)
