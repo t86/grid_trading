@@ -78,6 +78,7 @@ from .semi_auto_plan import (
 from .submit_plan import (
     _build_client_order_id,
     _ignore_noop_error,
+    _is_reduce_only_reject,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
@@ -8359,6 +8360,29 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             },
                             "reason": {
                                 "reason": "exchange_min_notional_reject",
+                                "error": str(exc),
+                            },
+                        }
+                    )
+                    last_exc = None
+                    break
+                if reduce_only is True and _is_reduce_only_reject(exc):
+                    report["skipped_orders"].append(
+                        {
+                            "request": {
+                                "role": role,
+                                "side": side,
+                                "position_side": position_side,
+                                "qty": _safe_float(prepared_order.get("qty")),
+                                "desired_price": _safe_float(prepared_order.get("desired_price")),
+                                "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                                "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
+                                "attempt": attempt + 1,
+                                "time_in_force": time_in_force,
+                                "reduce_only": reduce_only,
+                            },
+                            "reason": {
+                                "reason": "reduce_only_rejected",
                                 "error": str(exc),
                             },
                         }

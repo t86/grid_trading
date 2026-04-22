@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     build_execution_actions,
+    cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
@@ -31,6 +32,42 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(actions["place_count"], 3)
         self.assertEqual(actions["cancel_count"], 1)
         self.assertAlmostEqual(actions["place_notional"], 202.32531, places=8)
+
+    def test_reduce_only_cap_counts_orders_pending_cancel_until_exchange_releases_qty(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.1674, "qty": 358.0, "notional": 59.9292, "role": "take_profit_short"}
+            ],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.1676", "origQty": "358", "reduceOnly": True}
+            ],
+            "place_count": 1,
+            "cancel_count": 1,
+        }
+        current_open_orders = [
+            {
+                "orderId": 1,
+                "side": "BUY",
+                "price": "0.1676",
+                "origQty": "358",
+                "executedQty": "0",
+                "reduceOnly": True,
+            }
+        ]
+
+        capped = cap_reduce_only_place_orders_to_position(
+            actions=actions,
+            strategy_mode="synthetic_neutral",
+            current_actual_net_qty=-358.0,
+            current_open_orders=current_open_orders,
+        )
+
+        self.assertEqual(capped["place_orders"], [])
+        self.assertEqual(capped["cancel_orders"], actions["cancel_orders"])
+        self.assertEqual(capped["place_count"], 0)
+        self.assertEqual(capped["cancel_count"], 1)
+        self.assertEqual(capped["reduce_only_position_cap"]["remaining_buy_reduce_qty"], 0.0)
+        self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 1)
 
     def test_preserve_queue_priority_drops_replace_when_post_only_projects_back_to_same_bucket(self) -> None:
         actions = {

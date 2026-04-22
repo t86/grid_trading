@@ -352,17 +352,15 @@ def cap_reduce_only_place_orders_to_position(
         "BUY": max(-net_qty, Decimal("0")),
         "SELL": max(net_qty, Decimal("0")),
     }
-    remaining_open_orders = [
-        item
-        for item in current_open_orders
-        if isinstance(item, dict)
-        and not any(_order_matches_cancel(item, cancel_order) for cancel_order in cancel_orders)
-    ]
-    for open_order in remaining_open_orders:
+    for open_order in current_open_orders:
+        if not isinstance(open_order, dict):
+            continue
         if not _truthy(open_order.get("reduceOnly")):
             continue
         side = str(open_order.get("side", "")).upper().strip()
         if side in available_qty_by_side:
+            # Binance only releases reduce-only capacity after the exchange confirms
+            # cancellation, so pending-cancel orders must still count this cycle.
             available_qty_by_side[side] = max(
                 available_qty_by_side[side] - _order_remaining_qty(open_order),
                 Decimal("0"),
@@ -641,6 +639,12 @@ def validate_plan_report(
 def _ignore_noop_error(exc: RuntimeError, allowed_markers: tuple[str, ...]) -> bool:
     message = str(exc).lower()
     return any(marker in message for marker in allowed_markers)
+
+
+def _is_reduce_only_reject(exc: RuntimeError) -> bool:
+    message = str(exc).lower()
+    compact = message.replace(" ", "")
+    return "-2022" in message and "reduceonlyorderisrejected" in compact
 
 
 def _print_preview(
@@ -988,6 +992,27 @@ def main() -> None:
                                 },
                                 "reason": {
                                     "reason": "exchange_min_notional_reject",
+                                    "error": str(exc),
+                                },
+                            }
+                        )
+                        last_exc = None
+                        break
+                    if reduce_only is True and _is_reduce_only_reject(exc):
+                        report["skipped_orders"].append(
+                            {
+                                "request": {
+                                    "role": role,
+                                    "side": side,
+                                    "qty": _safe_float(prepared_order.get("qty")),
+                                    "desired_price": _safe_float(prepared_order.get("desired_price")),
+                                    "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                                    "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
+                                    "attempt": attempt + 1,
+                                    "reduce_only": reduce_only,
+                                },
+                                "reason": {
+                                    "reason": "reduce_only_rejected",
                                     "error": str(exc),
                                 },
                             }
