@@ -510,6 +510,24 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["max_short_position_notional"], 540.0)
         self.assertAlmostEqual(payload["max_total_notional"], 900.0)
 
+    def test_runner_preset_payload_applies_btcusdc_competition_neutral_profile(self) -> None:
+        payload = _runner_preset_payload("btcusdc_competition_maker_neutral_v1", {"symbol": "BTCUSDC"})
+        self.assertEqual(payload["strategy_profile"], "btcusdc_competition_maker_neutral_v1")
+        self.assertEqual(payload["symbol"], "BTCUSDC")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 1.0)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 8)
+        self.assertAlmostEqual(payload["per_order_notional"], 120.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 360.0)
+        self.assertAlmostEqual(payload["pause_short_position_notional"], 360.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 450.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 450.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 1800.0)
+        self.assertAlmostEqual(payload["max_actual_net_notional"], 300.0)
+        self.assertAlmostEqual(payload["max_synthetic_drift_notional"], 160.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+
     def test_runner_preset_payload_applies_based_competition_neutral_aggressive_profile(self) -> None:
         payload = _runner_preset_payload("based_competition_neutral_aggressive_v1", {"symbol": "BASEDUSDT"})
         self.assertEqual(payload["strategy_profile"], "based_competition_neutral_aggressive_v1")
@@ -534,6 +552,10 @@ class WebSecurityTests(unittest.TestCase):
     def test_runner_preset_payload_rejects_based_competition_neutral_aggressive_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=BASEDUSDT"):
             _runner_preset_payload("based_competition_neutral_aggressive_v1", {"symbol": "BTCUSDT"})
+
+    def test_runner_preset_payload_rejects_btcusdc_competition_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
+            _runner_preset_payload("btcusdc_competition_maker_neutral_v1", {"symbol": "ETHUSDC"})
 
     @patch("grid_optimizer.web.RUNNER_USER_PRESETS_PATH", new=Path("output/test_runner_user_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
@@ -1294,6 +1316,19 @@ class WebSecurityTests(unittest.TestCase):
         self.assertNotIn("based_competition_neutral_v1", opn_keys)
         self.assertNotIn("based_competition_neutral_aggressive_v1", opn_keys)
 
+    def test_runner_preset_summaries_include_sprint_symbol_presets_with_config(self) -> None:
+        btc_summaries = {item["key"]: item for item in _runner_preset_summaries("BTCUSDC")}
+        xau_summaries = {item["key"]: item for item in _runner_preset_summaries("XAUUSDT")}
+        eth_summaries = {item["key"]: item for item in _runner_preset_summaries("ETHUSDC")}
+        self.assertIn("btcusdc_competition_maker_neutral_v1", btc_summaries)
+        self.assertNotIn("btcusdc_competition_maker_neutral_v1", xau_summaries)
+        self.assertNotIn("btcusdc_competition_maker_neutral_v1", eth_summaries)
+        preset = btc_summaries["btcusdc_competition_maker_neutral_v1"]
+        self.assertEqual(preset["label"], "UM 冲刺赛 BTCUSDC")
+        self.assertEqual(preset["config"]["symbol"], "BTCUSDC")
+        self.assertEqual(preset["config"]["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(preset["config"]["per_order_notional"], 120.0)
+
     def test_runner_preset_summaries_hide_volume_neutral_push_v1_from_dropdown(self) -> None:
         based = {item["key"]: item for item in _runner_preset_summaries("BASEDUSDT")}
         self.assertNotIn("volume_neutral_push_v1", based)
@@ -1556,6 +1591,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("目标中性", MONITOR_PAGE)
         self.assertIn("function applyRunnerModeVisibility(mode)", MONITOR_PAGE)
         self.assertIn("GRID_BASED_RUNNER_MODES", MONITOR_PAGE)
+
+    def test_monitor_page_contains_sprint_preset_labels_and_auto_selects_first_available(self) -> None:
+        self.assertIn("UM 冲刺赛 BTCUSDC", MONITOR_PAGE)
+        self.assertIn("黄金冲刺赛 XAUUSDT", MONITOR_PAGE)
+        self.assertIn("TradFi 冲刺赛 CLUSDT", MONITOR_PAGE)
+        self.assertIn("Alt 冲刺赛 ORDIUSDC", MONITOR_PAGE)
+        self.assertIn("presets[0]?.key", MONITOR_PAGE)
 
     def test_strategies_page_contains_manual_symbol_list_controls(self) -> None:
         self.assertIn('id="monitor_symbol_input"', STRATEGIES_PAGE)
