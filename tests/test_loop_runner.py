@@ -1000,6 +1000,107 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(report["take_profit_guard"]["long_floor_price"], 0.1619, places=8)
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_volume_long_v4_keeps_existing_higher_take_profit_prices(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_load_state,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 0.1630,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.1630", "ask_price": "0.1631"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "SOONUSDT",
+                    "positionAmt": "4340",
+                    "entryPrice": "0.1620887365948",
+                    "breakEvenPrice": "0.1655863054659",
+                },
+            ],
+        }
+        mock_open_orders.return_value = [
+            {
+                "symbol": "SOONUSDT",
+                "side": "SELL",
+                "price": "0.1665",
+                "origQty": "420",
+                "executedQty": "0",
+                "reduceOnly": True,
+                "positionSide": "BOTH",
+                "clientOrderId": "gx-soonu-takeprof-1-12345678",
+            },
+            {
+                "symbol": "SOONUSDT",
+                "side": "SELL",
+                "price": "0.1667",
+                "origQty": "419",
+                "executedQty": "0",
+                "reduceOnly": True,
+                "positionSide": "BOTH",
+                "clientOrderId": "gx-soonu-takeprof-2-12345679",
+            },
+        ]
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "shift_freeze_reasons": [],
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "SOONUSDT"
+            args.strategy_mode = "one_way_long"
+            args.strategy_profile = "volume_long_v4"
+            args.step_price = 0.0002
+            args.buy_levels = 8
+            args.sell_levels = 8
+            args.per_order_notional = 70.0
+            args.base_position_notional = 420.0
+            args.take_profit_min_profit_ratio = None
+            args.pause_buy_position_notional = 750.0
+            args.max_position_notional = 900.0
+            args.reset_state = False
+            args.state_path = str(Path(tmpdir) / "soonusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "soonusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        sell_prices = [item["price"] for item in report["sell_orders"] if item["role"] == "take_profit"]
+        self.assertGreaterEqual(len(sell_prices), 2)
+        self.assertEqual(sell_prices[:2], [0.1665, 0.1667])
+
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
