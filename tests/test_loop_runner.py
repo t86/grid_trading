@@ -2891,7 +2891,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(all(item["force_reduce_only"] for item in plan["sell_orders"]))
         self.assertEqual([item["price"] for item in plan["sell_orders"]], [0.1659, 0.1661, 0.1663])
 
-    def test_apply_volume_long_v4_flow_sleeve_respects_loss_guard(self) -> None:
+    def test_apply_volume_long_v4_flow_sleeve_clamps_near_market_sells_to_loss_floor(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
 
         report = apply_volume_long_v4_flow_sleeve(
@@ -2916,9 +2916,49 @@ class LoopRunnerTests(unittest.TestCase):
             ask_price=0.1659,
         )
 
+        self.assertTrue(report["active"])
+        self.assertIsNone(report["blocked_reason"])
+        self.assertAlmostEqual(report["loss_floor_price"], 0.1687)
+        self.assertEqual(report["loss_guard_clamped_order_count"], 3)
+        self.assertEqual(report["placed_order_count"], 1)
+        self.assertEqual([item["price"] for item in plan["sell_orders"]], [0.1687])
+
+    def test_apply_volume_long_v4_flow_sleeve_does_not_release_take_profit_when_no_flow_order_places(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 0.1700, "qty": 411.0, "notional": 69.87, "role": "take_profit"},
+                {"side": "SELL", "price": 0.1704, "qty": 411.0, "notional": 70.03, "role": "take_profit"},
+            ],
+            "bootstrap_orders": [],
+        }
+
+        report = apply_volume_long_v4_flow_sleeve(
+            plan=plan,
+            enabled=True,
+            current_long_qty=5400.0,
+            current_long_notional=885.0,
+            current_long_cost_basis_price=0.1695,
+            trigger_notional=820.0,
+            reduce_to_notional=720.0,
+            sleeve_notional=180.0,
+            levels=3,
+            per_order_notional=70.0,
+            order_notional=60.0,
+            max_loss_ratio=0.005,
+            step_price=0.0002,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=500.0,
+            bid_price=0.1658,
+            ask_price=0.1659,
+        )
+
         self.assertFalse(report["active"])
-        self.assertEqual(report["blocked_reason"], "loss_guard")
-        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(report["blocked_reason"], "no_valid_order")
+        self.assertEqual(report["released_take_profit_order_count"], 0)
+        self.assertEqual([item["role"] for item in plan["sell_orders"]], ["take_profit", "take_profit"])
 
     def test_apply_active_delever_short_disabled_threshold_waits_for_pause_notional(self) -> None:
         plan = {

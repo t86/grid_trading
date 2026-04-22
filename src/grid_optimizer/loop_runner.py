@@ -1183,6 +1183,7 @@ def apply_volume_long_v4_flow_sleeve(
         "released_take_profit_notional": 0.0,
         "placed_order_count": 0,
         "placed_notional": 0.0,
+        "loss_guard_clamped_order_count": 0,
         "blocked_reason": None,
     }
     if not enabled:
@@ -1246,27 +1247,34 @@ def apply_volume_long_v4_flow_sleeve(
             released_count += 1
             continue
         kept_sell_orders.append(order)
-    if released_count:
-        plan["sell_orders"] = kept_sell_orders
-        report["released_take_profit_order_count"] = released_count
-        report["released_take_profit_notional"] = released_notional
+    prospective_sell_orders = kept_sell_orders
 
     existing_keys = {
         f"{str(item.get('side', '')).upper().strip()}:{_safe_float(item.get('price')):.10f}"
-        for key in ("buy_orders", "sell_orders", "bootstrap_orders")
+        for key in ("buy_orders", "bootstrap_orders")
         for item in plan.get(key, [])
         if isinstance(item, dict)
     }
+    existing_keys.update(
+        f"{str(item.get('side', '')).upper().strip()}:{_safe_float(item.get('price')):.10f}"
+        for item in prospective_sell_orders
+        if isinstance(item, dict)
+    )
+    flow_orders: list[dict[str, Any]] = []
     placed_count = 0
     placed_notional = 0.0
+    clamped_count = 0
     remaining = sell_budget_notional
     for level in range(1, safe_levels + 1):
         distance_steps = max((float(level) - 1.0) + float(sell_offset_steps), 0.0)
         raw_price = float(Decimal(str(ask_price)) + (Decimal(str(distance_steps)) * Decimal(str(safe_step_price))))
         price = _round_order_price(raw_price, tick_size, "SELL")
+        if floor_price > 0 and price < floor_price:
+            price = floor_price
+            clamped_count += 1
         if price <= bid_price:
             continue
-        if min_allowed_price > 0 and price < min_allowed_price:
+        if min_allowed_price > 0 and price < min_allowed_price - 1e-12:
             report["blocked_reason"] = "loss_guard"
             break
         qty = _round_order_qty(min(safe_order_notional, remaining) / price, step_size)
@@ -1281,7 +1289,7 @@ def apply_volume_long_v4_flow_sleeve(
         if key in existing_keys:
             continue
         existing_keys.add(key)
-        plan.setdefault("sell_orders", []).append(
+        flow_orders.append(
             {
                 "side": "SELL",
                 "price": price,
@@ -1300,15 +1308,18 @@ def apply_volume_long_v4_flow_sleeve(
         if remaining <= 1e-12:
             break
 
-    plan["sell_orders"] = sorted(
-        [dict(item) for item in plan.get("sell_orders", []) if isinstance(item, dict)],
-        key=lambda item: (_safe_float(item.get("price")), str(item.get("side", "")).upper().strip()),
-    )
     report["active"] = placed_count > 0
     report["placed_order_count"] = placed_count
     report["placed_notional"] = placed_notional
+    report["loss_guard_clamped_order_count"] = clamped_count
     report["remaining_sleeve_notional"] = max(remaining, 0.0)
     if placed_count > 0:
+        plan["sell_orders"] = sorted(
+            [*prospective_sell_orders, *flow_orders],
+            key=lambda item: (_safe_float(item.get("price")), str(item.get("side", "")).upper().strip()),
+        )
+        report["released_take_profit_order_count"] = released_count
+        report["released_take_profit_notional"] = released_notional
         report["blocked_reason"] = None
     elif not report.get("blocked_reason"):
         report["blocked_reason"] = "no_valid_order"
