@@ -11247,9 +11247,110 @@ MONITOR_PAGE = """<!doctype html>
       gap: 16px;
       align-items: start;
     }
+    .param-editor-stack {
+      display: grid;
+      gap: 12px;
+    }
+    .runner-form-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .runner-form-section {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      background: #fcfbf7;
+      display: grid;
+      gap: 12px;
+    }
+    .runner-form-section.full {
+      grid-column: 1 / -1;
+    }
+    .runner-form-section h3 {
+      margin: 0;
+      font-size: 14px;
+      color: #0f423f;
+    }
+    .runner-form-fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px 12px;
+    }
+    .runner-form-fields label {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--muted);
+      min-width: 0;
+    }
+    .runner-form-fields input,
+    .runner-form-fields select {
+      height: 38px;
+      border-radius: 10px;
+      border: 1px solid var(--line);
+      padding: 0 10px;
+      background: #fff;
+      color: var(--text);
+      font-size: 14px;
+      width: 100%;
+    }
+    .runner-form-fields .inline-check {
+      min-width: 0;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      padding: 10px 12px;
+      justify-content: center;
+    }
+    .runner-form-fields .inline-check .check-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.5;
+    }
+    .runner-form-fields .inline-check input[type="checkbox"] {
+      width: 16px;
+      height: 16px;
+      margin: 0;
+    }
+    .runner-form-hint {
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .advanced-panel {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fcfbf7;
+      overflow: hidden;
+    }
+    .advanced-panel summary {
+      cursor: pointer;
+      list-style: none;
+      padding: 12px 14px;
+      font-size: 13px;
+      font-weight: 700;
+      color: #0f423f;
+      background: #f7f3ea;
+    }
+    .advanced-panel summary::-webkit-details-marker {
+      display: none;
+    }
+    .advanced-panel[open] summary {
+      border-bottom: 1px solid var(--line);
+    }
+    .advanced-panel-body {
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
     .editor-box {
       width: 100%;
-      min-height: 360px;
+      min-height: 280px;
       border-radius: 12px;
       border: 1px solid var(--line);
       padding: 12px 14px;
@@ -11573,6 +11674,8 @@ MONITOR_PAGE = """<!doctype html>
       .status-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .grid-2 { grid-template-columns: 1fr; }
       .editor-grid { grid-template-columns: 1fr; }
+      .runner-form-grid,
+      .runner-form-fields { grid-template-columns: 1fr; }
     }
     @media (max-width: 640px) {
       .status-row { grid-template-columns: 1fr; }
@@ -11735,10 +11838,170 @@ MONITOR_PAGE = """<!doctype html>
           </span>
         </label>
       </div>
-      <div class="tiny">上面的运行保护、量能自动启停和波动自动暂停参数会和下方 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
-      <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改 JSON。</div>
+      <div class="tiny">上面的运行保护、量能自动启停和波动自动暂停参数会和下方字段表单及高级 JSON 同步；时间按当前浏览器所在时区录入，提交时自动转成 UTC 时间戳。</div>
+      <div id="runner_params_meta" class="meta">先载入运行参数或预设参数，再按需要修改字段表单；更细的参数仍可在高级 JSON 里直接编辑。</div>
       <div class="editor-grid">
-        <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
+        <div class="param-editor-stack">
+          <div id="runner_params_form" class="runner-form-grid">
+            <section class="runner-form-section">
+              <h3>基础下单</h3>
+              <div class="runner-form-fields">
+                <label>策略模式
+                  <select id="runner_field_strategy_mode">
+                    <option value="one_way_long">单向做多</option>
+                    <option value="one_way_short">单向做空</option>
+                    <option value="synthetic_neutral">单向合成中性</option>
+                    <option value="inventory_target_neutral">单向目标中性</option>
+                    <option value="hedge_neutral">双向中性</option>
+                  </select>
+                </label>
+                <label>步长
+                  <input id="runner_field_step_price" type="number" step="0.0000001" />
+                </label>
+                <label>买格数
+                  <input id="runner_field_buy_levels" type="number" min="0" step="1" />
+                </label>
+                <label>卖格数
+                  <input id="runner_field_sell_levels" type="number" min="0" step="1" />
+                </label>
+                <label>单笔金额
+                  <input id="runner_field_per_order_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>启动放大倍数
+                  <input id="runner_field_startup_entry_multiplier" type="number" min="0" step="0.01" />
+                </label>
+                <label>循环秒数
+                  <input id="runner_field_sleep_seconds" type="number" min="0" step="0.1" />
+                </label>
+                <label>杠杆
+                  <input id="runner_field_leverage" type="number" min="1" step="1" />
+                </label>
+                <label>Post-only 重试
+                  <input id="runner_field_maker_retries" type="number" min="0" step="1" />
+                </label>
+                <label>单轮最大新单数
+                  <input id="runner_field_max_new_orders" type="number" min="0" step="1" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section">
+              <h3>仓位与硬限制</h3>
+              <div class="runner-form-fields">
+                <label>基础底仓 / 基础空仓
+                  <input id="runner_field_base_position_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>软停买
+                  <input id="runner_field_pause_buy_position_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>软停空
+                  <input id="runner_field_pause_short_position_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>多仓硬上限
+                  <input id="runner_field_max_position_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>空仓硬上限
+                  <input id="runner_field_max_short_position_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>总挂单名义上限
+                  <input id="runner_field_max_total_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>实际净敞口上限
+                  <input id="runner_field_max_actual_net_notional" type="number" min="0" step="0.01" />
+                </label>
+                <label>账本漂移上限
+                  <input id="runner_field_max_synthetic_drift_notional" type="number" min="0" step="0.01" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section">
+              <h3>中心迁移</h3>
+              <div class="runner-form-fields">
+                <label>固定中心价
+                  <input id="runner_field_center_price" type="number" min="0" step="0.0000001" />
+                </label>
+                <label>上移触发格数
+                  <input id="runner_field_up_trigger_steps" type="number" min="0" step="1" />
+                </label>
+                <label>下移触发格数
+                  <input id="runner_field_down_trigger_steps" type="number" min="0" step="1" />
+                </label>
+                <label>每次移动格数
+                  <input id="runner_field_shift_steps" type="number" min="0" step="1" />
+                </label>
+                <label>计划最大年龄（秒）
+                  <input id="runner_field_max_plan_age_seconds" type="number" min="0" step="0.1" />
+                </label>
+                <label>允许中价漂移（格）
+                  <input id="runner_field_max_mid_drift_steps" type="number" min="0" step="0.1" />
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section">
+              <h3>执行开关</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_flat_start_enabled" type="checkbox" />
+                    <span>平仓启动保护</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_warm_start_enabled" type="checkbox" />
+                    <span>Warm start</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_cancel_stale" type="checkbox" />
+                    <span>自动撤旧单</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_apply" type="checkbox" />
+                    <span>真实下单</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_reset_state" type="checkbox" />
+                    <span>启动时重置状态</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_autotune_symbol_enabled" type="checkbox" />
+                    <span>按币种自动调参</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_adaptive_step_enabled" type="checkbox" />
+                    <span>自适应步长</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_excess_inventory_reduce_only_enabled" type="checkbox" />
+                    <span>超仓只减不加</span>
+                  </span>
+                </label>
+              </div>
+            </section>
+            <section class="runner-form-section full">
+              <h3>说明</h3>
+              <div class="runner-form-hint">这里先覆盖最常用、最容易出风险的字段。库存分层、分钟级停买、市场偏置、自定义中心、特殊触发器等细项仍保留在下方“高级模式 / 原始 JSON”里。</div>
+            </section>
+          </div>
+          <details id="runner_params_advanced_panel" class="advanced-panel">
+            <summary>高级模式 / 原始 JSON</summary>
+            <div class="advanced-panel-body">
+              <div class="tiny">字段表单会和这里双向同步。表单没覆盖到的参数，可以继续直接改 JSON。</div>
+              <textarea id="runner_params_editor" class="editor-box" spellcheck="false"></textarea>
+            </div>
+          </details>
+        </div>
         <div class="param-guide">
           <div class="tiny">右侧直接解释这份 JSON 会怎样下单、何时移中心、何时暂停或撤单。完整文档在仓库 `docs` 目录下的 `STRATEGY_EXECUTION_GUIDE.md`。</div>
           <div class="param-guide-scroll">
@@ -11989,6 +12252,8 @@ MONITOR_PAGE = """<!doctype html>
     const saveRunningPresetDescriptionEl = document.getElementById("save_running_preset_description");
     const saveRunningPresetBtn = document.getElementById("save_running_preset_btn");
     const runnerParamsMetaEl = document.getElementById("runner_params_meta");
+    const runnerParamsFormEl = document.getElementById("runner_params_form");
+    const runnerParamsAdvancedPanelEl = document.getElementById("runner_params_advanced_panel");
     const runnerParamsEditorEl = document.getElementById("runner_params_editor");
     const runnerParamsGuideBodyEl = document.getElementById("runner_params_guide_body");
     const monitorRunStartTimeEl = document.getElementById("monitor_run_start_time");
@@ -13089,6 +13354,40 @@ MONITOR_PAGE = """<!doctype html>
     let latestCustomGridPreview = null;
     let monitorSymbols = [];
     let latestRunnerEditorConfig = null;
+    const RUNNER_FORM_FIELDS = [
+      { key: "strategy_mode", id: "runner_field_strategy_mode", type: "string", defaultValue: "one_way_long" },
+      { key: "step_price", id: "runner_field_step_price", type: "number" },
+      { key: "buy_levels", id: "runner_field_buy_levels", type: "integer" },
+      { key: "sell_levels", id: "runner_field_sell_levels", type: "integer" },
+      { key: "per_order_notional", id: "runner_field_per_order_notional", type: "number" },
+      { key: "startup_entry_multiplier", id: "runner_field_startup_entry_multiplier", type: "number", allowNull: true },
+      { key: "sleep_seconds", id: "runner_field_sleep_seconds", type: "number" },
+      { key: "leverage", id: "runner_field_leverage", type: "integer" },
+      { key: "maker_retries", id: "runner_field_maker_retries", type: "integer" },
+      { key: "max_new_orders", id: "runner_field_max_new_orders", type: "integer" },
+      { key: "base_position_notional", id: "runner_field_base_position_notional", type: "number" },
+      { key: "pause_buy_position_notional", id: "runner_field_pause_buy_position_notional", type: "number", allowNull: true },
+      { key: "pause_short_position_notional", id: "runner_field_pause_short_position_notional", type: "number", allowNull: true },
+      { key: "max_position_notional", id: "runner_field_max_position_notional", type: "number", allowNull: true },
+      { key: "max_short_position_notional", id: "runner_field_max_short_position_notional", type: "number", allowNull: true },
+      { key: "max_total_notional", id: "runner_field_max_total_notional", type: "number", allowNull: true },
+      { key: "max_actual_net_notional", id: "runner_field_max_actual_net_notional", type: "number", allowNull: true },
+      { key: "max_synthetic_drift_notional", id: "runner_field_max_synthetic_drift_notional", type: "number", allowNull: true },
+      { key: "center_price", id: "runner_field_center_price", type: "number", allowNull: true },
+      { key: "up_trigger_steps", id: "runner_field_up_trigger_steps", type: "integer" },
+      { key: "down_trigger_steps", id: "runner_field_down_trigger_steps", type: "integer" },
+      { key: "shift_steps", id: "runner_field_shift_steps", type: "integer" },
+      { key: "max_plan_age_seconds", id: "runner_field_max_plan_age_seconds", type: "number", allowNull: true },
+      { key: "max_mid_drift_steps", id: "runner_field_max_mid_drift_steps", type: "number", allowNull: true },
+      { key: "flat_start_enabled", id: "runner_field_flat_start_enabled", type: "boolean" },
+      { key: "warm_start_enabled", id: "runner_field_warm_start_enabled", type: "boolean" },
+      { key: "cancel_stale", id: "runner_field_cancel_stale", type: "boolean" },
+      { key: "apply", id: "runner_field_apply", type: "boolean" },
+      { key: "reset_state", id: "runner_field_reset_state", type: "boolean" },
+      { key: "autotune_symbol_enabled", id: "runner_field_autotune_symbol_enabled", type: "boolean" },
+      { key: "adaptive_step_enabled", id: "runner_field_adaptive_step_enabled", type: "boolean" },
+      { key: "excess_inventory_reduce_only_enabled", id: "runner_field_excess_inventory_reduce_only_enabled", type: "boolean" },
+    ];
     const RUNNER_PARAM_EXPLAIN = {
       strategy_profile: "策略模板标识。用于区分量优先做空、做多、防守或自定义策略。",
       strategy_mode: "策略方向/模式。one_way_long 做多，one_way_short 做空，neutral/synthetic 是中性或合成中性。",
@@ -13453,6 +13752,79 @@ MONITOR_PAGE = """<!doctype html>
       return normalizeRunnerRuntimePaths(payload, selectedSymbol);
     }
 
+    function runnerFormFieldEl(field) {
+      return document.getElementById(field.id);
+    }
+
+    function syncRunnerFormFromConfig(config) {
+      const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
+      RUNNER_FORM_FIELDS.forEach((field) => {
+        const el = runnerFormFieldEl(field);
+        if (!el) return;
+        const value = source[field.key];
+        if (field.type === "boolean") {
+          el.checked = Boolean(value);
+          return;
+        }
+        if (value === null || value === undefined || value === "") {
+          el.value = field.defaultValue ?? "";
+          return;
+        }
+        el.value = String(value);
+      });
+    }
+
+    function mergeRunnerConfigFromForm(baseConfig) {
+      const nextConfig = { ...(baseConfig || {}) };
+      RUNNER_FORM_FIELDS.forEach((field) => {
+        const el = runnerFormFieldEl(field);
+        if (!el) return;
+        if (field.type === "boolean") {
+          nextConfig[field.key] = Boolean(el.checked);
+          return;
+        }
+        const raw = String(el.value || "").trim();
+        if (!raw) {
+          if (field.allowNull) {
+            nextConfig[field.key] = null;
+          }
+          return;
+        }
+        if (field.type === "integer") {
+          const value = Number(raw);
+          if (Number.isFinite(value)) {
+            nextConfig[field.key] = Math.round(value);
+          }
+          return;
+        }
+        if (field.type === "number") {
+          const value = Number(raw);
+          if (Number.isFinite(value)) {
+            nextConfig[field.key] = value;
+          }
+          return;
+        }
+        nextConfig[field.key] = raw;
+      });
+      return nextConfig;
+    }
+
+    function syncRunnerFormToEditor() {
+      let payload = latestRunnerEditorConfig ? { ...latestRunnerEditorConfig } : {};
+      try {
+        payload = readRunnerEditorConfigFromTextarea();
+      } catch (_err) {
+      }
+      const nextConfig = normalizeRunnerRuntimePaths(
+        mergeRuntimeGuardConfig(mergeRunnerConfigFromForm(payload)),
+        symbolEl.value.trim().toUpperCase() || "NIGHTUSDT"
+      );
+      latestRunnerEditorConfig = nextConfig;
+      runnerParamsEditorEl.value = JSON.stringify(nextConfig, null, 2);
+      renderRunnerParamGuide(nextConfig);
+      runnerParamsMetaEl.textContent = "字段表单已同步到高级 JSON，可继续保存或直接应用。";
+    }
+
     function readRuntimeGuardConfigFromInputs() {
       return {
         run_start_time: fromLocalInputValue(monitorRunStartTimeEl.value),
@@ -13527,13 +13899,14 @@ MONITOR_PAGE = """<!doctype html>
       } catch (_err) {
       }
       const nextConfig = normalizeRunnerRuntimePaths(
-        mergeRuntimeGuardConfig(payload),
+        mergeRuntimeGuardConfig(mergeRunnerConfigFromForm(payload)),
         symbolEl.value.trim().toUpperCase() || "NIGHTUSDT"
       );
       latestRunnerEditorConfig = nextConfig;
       runnerParamsEditorEl.value = JSON.stringify(nextConfig, null, 2);
+      syncRunnerFormFromConfig(nextConfig);
       renderRunnerParamGuide(nextConfig);
-      runnerParamsMetaEl.textContent = "运行保护、量能自动启停和波动自动暂停参数已同步到 JSON，可继续修改后保存或应用。";
+      runnerParamsMetaEl.textContent = "运行保护、量能自动启停和波动自动暂停参数已同步到字段表单和高级 JSON。";
     }
 
     async function ensureEditorConfigForAlert() {
@@ -13555,6 +13928,9 @@ MONITOR_PAGE = """<!doctype html>
       if (!key) return false;
       const marker = `"${String(key)}"`;
       const text = runnerParamsEditorEl.value || "";
+      if (runnerParamsAdvancedPanelEl) {
+        runnerParamsAdvancedPanelEl.open = true;
+      }
       const idx = text.indexOf(marker);
       runnerParamsEditorEl.focus();
       if (idx < 0) return false;
@@ -14237,8 +14613,12 @@ MONITOR_PAGE = """<!doctype html>
         }
         latestRunnerEditorConfig = normalizeRunnerRuntimePaths(payload, symbolEl.value.trim().toUpperCase() || "NIGHTUSDT");
         syncRuntimeGuardInputsFromConfig(latestRunnerEditorConfig);
+        syncRunnerFormFromConfig(latestRunnerEditorConfig);
         renderRunnerParamGuide(latestRunnerEditorConfig);
       } catch (err) {
+        if (runnerParamsAdvancedPanelEl) {
+          runnerParamsAdvancedPanelEl.open = true;
+        }
         runnerParamsGuideBodyEl.innerHTML = `
           <div class="strategy-guide-empty">JSON 解析失败：${escapeHtml(String(err))}</div>
         `;
@@ -14249,6 +14629,7 @@ MONITOR_PAGE = """<!doctype html>
       latestRunnerEditorConfig = normalizeRunnerEditorConfig(rawConfig, rawConfig && rawConfig.strategy_profile ? String(rawConfig.strategy_profile) : "");
       runnerParamsEditorEl.value = JSON.stringify(latestRunnerEditorConfig, null, 2);
       syncRuntimeGuardInputsFromConfig(latestRunnerEditorConfig);
+      syncRunnerFormFromConfig(latestRunnerEditorConfig);
       runnerParamsMetaEl.textContent = sourceLabel || "参数已载入，可直接修改 JSON 后应用。";
       renderRunnerParamGuide(latestRunnerEditorConfig);
     }
@@ -14425,7 +14806,7 @@ MONITOR_PAGE = """<!doctype html>
     }
 
     function buildRunnerPayloadFromEditor(selectedSymbol, selectedPreset = null) {
-      let payload = readRunnerEditorConfigFromTextarea();
+      let payload = mergeRunnerConfigFromForm(readRunnerEditorConfigFromTextarea());
       const payloadSymbol = String(payload.symbol || "").trim().toUpperCase();
       if (payloadSymbol && payloadSymbol !== selectedSymbol) {
         throw new Error(`参数编辑器当前是 ${payloadSymbol}，请先载入 ${selectedSymbol} 的运行参数或预设`);
@@ -15340,6 +15721,10 @@ MONITOR_PAGE = """<!doctype html>
     saveRunningPresetBtn.addEventListener("click", saveRunningStrategyAsPreset);
     saveParamsBtn.addEventListener("click", saveRunnerParams);
     applyParamsBtn.addEventListener("click", applyRunnerParams);
+    if (runnerParamsFormEl) {
+      runnerParamsFormEl.addEventListener("input", syncRunnerFormToEditor);
+      runnerParamsFormEl.addEventListener("change", syncRunnerFormToEditor);
+    }
     runnerParamsEditorEl.addEventListener("input", syncRunnerParamGuideFromEditor);
     [
       monitorRunStartTimeEl,
