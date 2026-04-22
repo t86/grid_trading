@@ -979,10 +979,6 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
     return str(strategy_profile or "").strip() == "volume_long_v4"
 
 
-def _uses_non_regressive_take_profit_repricing(strategy_profile: str | None) -> bool:
-    return str(strategy_profile or "").strip() == "volume_long_v4"
-
-
 def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
     return str(strategy_profile or "").strip() == "volume_long_v4"
 
@@ -1035,62 +1031,6 @@ def _decorate_volume_long_v4_open_orders(open_orders: list[dict[str, Any]]) -> l
             decorated["role"] = role
         decorated_orders.append(decorated)
     return decorated_orders
-
-
-def _is_volume_long_take_profit_sell_order(order: dict[str, Any]) -> bool:
-    if str(order.get("side", "")).upper().strip() != "SELL":
-        return False
-    return _volume_long_v4_order_role(order) == "take_profit"
-
-
-def _is_volume_long_staged_delever_sell_order(order: dict[str, Any]) -> bool:
-    if str(order.get("side", "")).upper().strip() != "SELL":
-        return False
-    return _volume_long_v4_order_role(order) in {"soft_delever_long", "hard_delever_long"}
-
-
-def preserve_non_regressive_take_profit_sell_orders(
-    *,
-    existing_orders: list[dict[str, Any]],
-    desired_orders: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    adjusted_orders = [dict(order) for order in desired_orders]
-    desired_group: list[tuple[int, dict[str, Any]]] = []
-    for index, order in enumerate(adjusted_orders):
-        if _is_volume_long_take_profit_sell_order(order):
-            desired_group.append((index, order))
-
-    existing_group = [
-        dict(order)
-        for order in existing_orders
-        if isinstance(order, dict)
-        and _is_volume_long_take_profit_sell_order(order)
-        and _safe_float(order.get("price")) > 0
-        and _safe_float(order.get("origQty", order.get("qty"))) > 0
-    ]
-    if not desired_group or not existing_group:
-        return adjusted_orders
-
-    desired_sorted = sorted(
-        desired_group,
-        key=lambda item: (_safe_float(item[1].get("price")), _safe_float(item[1].get("qty"))),
-    )
-    existing_sorted = sorted(
-        existing_group,
-        key=lambda order: (_safe_float(order.get("price")), _safe_float(order.get("origQty", order.get("qty")))),
-    )
-    for (index, desired_order), existing_order in zip(desired_sorted, existing_sorted):
-        desired_price = _safe_float(desired_order.get("price"))
-        existing_price = _safe_float(existing_order.get("price"))
-        adjusted_price = max(desired_price, existing_price)
-        if adjusted_price <= 0 or abs(adjusted_price - desired_price) <= 1e-12:
-            continue
-        adjusted_order = dict(adjusted_orders[index])
-        qty = _safe_float(adjusted_order.get("qty", adjusted_order.get("quantity")))
-        adjusted_order["price"] = adjusted_price
-        adjusted_order["notional"] = adjusted_price * qty
-        adjusted_orders[index] = adjusted_order
-    return adjusted_orders
 
 
 def apply_volume_long_v4_staged_delever(
@@ -7817,12 +7757,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long"
         else open_orders
     )
-    if _uses_non_regressive_take_profit_repricing(effective_strategy_profile) and strategy_mode == "one_way_long":
-        plan["sell_orders"] = preserve_non_regressive_take_profit_sell_orders(
-            existing_orders=volume_long_v4_open_orders,
-            desired_orders=list(plan.get("sell_orders") or []),
-        )
-
     desired_orders = [
         *plan["buy_orders"],
         *plan["sell_orders"],

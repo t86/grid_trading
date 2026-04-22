@@ -1132,7 +1132,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
-    def test_generate_plan_report_volume_long_v4_keeps_existing_higher_take_profit_prices(
+    def test_generate_plan_report_volume_long_v4_reprices_normal_take_profit_to_current_grid(
         self,
         mock_symbol_config,
         mock_book_tickers,
@@ -1222,7 +1222,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         sell_prices = [item["price"] for item in report["sell_orders"] if item["role"] == "take_profit"]
         self.assertGreaterEqual(len(sell_prices), 2)
-        self.assertEqual(sell_prices[:2], [0.1665, 0.1667])
+        self.assertEqual(sell_prices[:2], [0.1632, 0.1635])
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
