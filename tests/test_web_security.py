@@ -313,13 +313,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["per_order_notional"], 20.0)
         self.assertEqual(payload["synthetic_tiny_long_residual_notional"], 45.0)
         self.assertEqual(payload["synthetic_tiny_short_residual_notional"], 45.0)
-        self.assertEqual(payload["pause_buy_position_notional"], 2000.0)
-        self.assertEqual(payload["pause_short_position_notional"], 2000.0)
-        self.assertEqual(payload["max_position_notional"], 2500.0)
-        self.assertEqual(payload["max_short_position_notional"], 2500.0)
+        self.assertEqual(payload["pause_buy_position_notional"], 200.0)
+        self.assertEqual(payload["pause_short_position_notional"], 200.0)
+        self.assertEqual(payload["max_position_notional"], 320.0)
+        self.assertEqual(payload["max_short_position_notional"], 320.0)
         self.assertEqual(payload["max_total_notional"], 2200.0)
-        self.assertEqual(payload["max_new_orders"], 32)
-        self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0)
+        self.assertEqual(payload["max_new_orders"], 24)
+        self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0001)
         self.assertFalse(payload["adaptive_step_enabled"])
         self.assertFalse(payload["synthetic_trend_follow_enabled"])
         self.assertEqual(payload["leverage"], 10)
@@ -390,6 +390,30 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertIn("--target-position-notional", command)
         self.assertIn("150.0", command)
+
+    def test_build_flatten_command_requires_explicit_allow_loss_flag(self) -> None:
+        base_config = {
+            "symbol": "SOONUSDT",
+            "client_order_prefix": "mfsoon",
+            "sleep_seconds": 2.0,
+            "recv_window": 5000,
+            "max_consecutive_errors": 20,
+            "events_jsonl": "output/soonusdt_maker_flatten_events.jsonl",
+        }
+
+        default_command = _build_flatten_command(base_config)
+        allow_loss_command = _build_flatten_command(
+            {
+                **base_config,
+                "allow_loss": True,
+                "min_profit_ratio": 0.001,
+            }
+        )
+
+        self.assertNotIn("--allow-loss", default_command)
+        self.assertNotIn("--min-profit-ratio", default_command)
+        self.assertIn("--allow-loss", allow_loss_command)
+        self.assertIn("--min-profit-ratio", allow_loss_command)
 
     def test_normalize_runner_control_payload_supports_adaptive_step_fields(self) -> None:
         payload = _normalize_runner_control_payload(
@@ -942,10 +966,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["per_order_notional"], 20.0)
         self.assertEqual(config["synthetic_tiny_long_residual_notional"], 45.0)
         self.assertEqual(config["synthetic_tiny_short_residual_notional"], 45.0)
-        self.assertEqual(config["pause_buy_position_notional"], 2000.0)
-        self.assertEqual(config["pause_short_position_notional"], 2000.0)
-        self.assertEqual(config["max_position_notional"], 2500.0)
-        self.assertEqual(config["max_short_position_notional"], 2500.0)
+        self.assertEqual(config["pause_buy_position_notional"], 200.0)
+        self.assertEqual(config["pause_short_position_notional"], 200.0)
+        self.assertEqual(config["max_position_notional"], 320.0)
+        self.assertEqual(config["max_short_position_notional"], 320.0)
         self.assertEqual(config["max_total_notional"], 2200.0)
         self.assertEqual(config["leverage"], 10)
         self.assertFalse(config["adaptive_step_enabled"])

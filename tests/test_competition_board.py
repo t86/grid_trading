@@ -187,7 +187,7 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertIsNotNone(hinted)
         _, boards = hinted or ({}, [])
         self.assertEqual(len(boards), 2)
-        self.assertEqual(boards[1].get("resourceId"), 46948)
+        self.assertEqual(boards[1].get("resourceId"), 46951)
         self.assertEqual(boards[1]["tabLabel"], "交易量挑战赛 - 第二阶段")
 
     def test_parse_activity_period_bounds_extracts_start_and_end(self) -> None:

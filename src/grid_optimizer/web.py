@@ -4186,6 +4186,11 @@ def _build_flatten_command(config: dict[str, Any]) -> list[str]:
     target_notional = max(float(config.get("target_position_notional") or 0.0), 0.0)
     if target_notional > 0:
         command.extend(["--target-position-notional", str(target_notional)])
+    if _truthy(config.get("allow_loss", False)):
+        command.append("--allow-loss")
+    min_profit_ratio = float(config.get("min_profit_ratio") or 0.0)
+    if min_profit_ratio > 0:
+        command.extend(["--min-profit-ratio", str(min_profit_ratio)])
     return command
 
 
@@ -4200,6 +4205,8 @@ def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
         "max_consecutive_errors": int(config.get("max_consecutive_errors", 20)),
         "events_jsonl": str(config.get("events_jsonl") or _flatten_events_path(symbol)),
         "target_position_notional": max(float(config.get("target_position_notional") or 0.0), 0.0),
+        "allow_loss": bool(_truthy(config.get("allow_loss", False))),
+        "min_profit_ratio": max(float(config.get("min_profit_ratio") or 0.0), 0.0),
     }
     if flatten.get("is_running"):
         current_config = dict(flatten.get("config") or {})
@@ -4211,6 +4218,8 @@ def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
             "max_consecutive_errors",
             "events_jsonl",
             "target_position_notional",
+            "allow_loss",
+            "min_profit_ratio",
         }
         if all(current_config.get(field) == desired.get(field) for field in compare_fields):
             return {"started": False, "already_running": True, "flatten_runner": flatten, "symbol": symbol}

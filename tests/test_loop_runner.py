@@ -23,6 +23,7 @@ from grid_optimizer.loop_runner import (
     _generate_competition_inventory_grid_plan,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
+    _resolve_synthetic_resync_price,
     _shift_custom_grid_bounds,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
@@ -67,6 +68,84 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 10.0, "notional": 9.9, "role": "entry_long"},
+                {"side": "BUY", "price": 1.01, "qty": 10.0, "notional": 10.1, "role": "take_profit_short"},
+                {"side": "BUY", "price": 1.02, "qty": 10.0, "notional": 10.2, "role": "active_delever_short"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 10.0, "notional": 10.1, "role": "take_profit_long"},
+                {"side": "SELL", "price": 1.02, "qty": 10.0, "notional": 10.2, "role": "active_delever_long"},
+                {"side": "SELL", "price": 1.03, "qty": 10.0, "notional": 10.3, "role": "entry_short"},
+            ],
+        }
+
+        report = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=100.0,
+            current_short_qty=50.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.0,
+            current_long_notional=100.0,
+            current_short_notional=50.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=None,
+            min_profit_ratio=None,
+            tick_size=0.01,
+            bid_price=1.00,
+            ask_price=1.01,
+        )
+
+        self.assertTrue(report["enabled"])
+        self.assertTrue(report["long_cost_basis_missing"])
+        self.assertTrue(report["short_cost_basis_missing"])
+        self.assertEqual(report["dropped_sell_orders"], 2)
+        self.assertEqual(report["dropped_buy_orders"], 2)
+        self.assertEqual([item["role"] for item in plan["sell_orders"]], ["entry_short"])
+        self.assertEqual([item["role"] for item in plan["buy_orders"]], ["entry_long"])
+
+    def test_take_profit_guard_defaults_to_break_even_when_ratio_is_unset(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.04, "qty": 10.0, "notional": 10.4, "role": "take_profit_long"},
+            ],
+        }
+
+        report = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=100.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.05,
+            current_short_avg_price=0.0,
+            current_long_notional=100.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=None,
+            min_profit_ratio=None,
+            tick_size=0.01,
+            bid_price=1.00,
+            ask_price=1.01,
+        )
+
+        self.assertTrue(report["long_active"])
+        self.assertEqual(report["adjusted_sell_orders"], 1)
+        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.05)
+
+    def test_synthetic_resync_does_not_use_mid_price_as_nonzero_cost_basis(self) -> None:
+        resolved = _resolve_synthetic_resync_price(
+            actual_position_qty=300.0,
+            entry_price=0.0,
+            fallback_price=1.20,
+            snapshot={"virtual_long_avg_price": 0.0, "virtual_short_avg_price": 0.0},
+        )
+
+        self.assertEqual(resolved, 0.0)
+
     def test_bard_profile_has_human_readable_label(self) -> None:
         self.assertEqual(AUTO_REGIME_PROFILE_LABELS["bard_12h_push_neutral_v2"], "通用刷量V1")
 

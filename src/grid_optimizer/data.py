@@ -623,28 +623,43 @@ def fetch_spot_klines(
     return [dedup[key] for key in sorted(dedup)]
 
 
-def fetch_futures_symbols(contract_type: str = "usdm") -> list[str]:
-    data = _http_get_json(_market_api_urls(contract_type)["exchange_info"], {})
-    if not isinstance(data, dict):
-        raise RuntimeError("Unexpected exchangeInfo response")
-    symbols_raw = data.get("symbols", [])
+def _filter_futures_symbols(
+    *,
+    exchange_info: dict[str, Any],
+    quote_asset: str | None = None,
+    contract_type: str | None = "PERPETUAL",
+    only_trading: bool = True,
+) -> list[str]:
+    symbols_raw = exchange_info.get("symbols", [])
     if not isinstance(symbols_raw, list):
         raise RuntimeError("Unexpected exchangeInfo symbols payload")
+    normalized_quote = str(quote_asset or "").upper().strip()
+    normalized_contract = str(contract_type or "").upper().strip()
     symbols: list[str] = []
     for item in symbols_raw:
         if not isinstance(item, dict):
             continue
         symbol = str(item.get("symbol", "")).upper().strip()
         status = str(item.get("status") or item.get("contractStatus") or "").upper().strip()
+        item_quote_asset = str(item.get("quoteAsset", "")).upper().strip()
         item_contract_type = str(item.get("contractType", "")).upper().strip()
         if not symbol:
             continue
-        if status != "TRADING":
+        if only_trading and status != "TRADING":
             continue
-        if item_contract_type != "PERPETUAL":
+        if normalized_quote and item_quote_asset != normalized_quote:
+            continue
+        if normalized_contract and item_contract_type != normalized_contract:
             continue
         symbols.append(symbol)
-    symbols = sorted(set(symbols))
+    return sorted(set(symbols))
+
+
+def fetch_futures_symbols(contract_type: str = "usdm") -> list[str]:
+    data = _http_get_json(_market_api_urls(contract_type)["exchange_info"], {})
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected exchangeInfo response")
+    symbols = _filter_futures_symbols(exchange_info=data, contract_type="PERPETUAL", only_trading=True)
     if not symbols:
         raise RuntimeError("No futures symbols returned from Binance")
     return symbols
