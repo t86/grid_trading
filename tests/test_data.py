@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from grid_optimizer.data import _filter_futures_symbols
+from grid_optimizer.data import _filter_futures_symbols, _merge_futures_position_risk_into_account_info
 
 
 class DataHelpersTests(unittest.TestCase):
@@ -73,6 +73,35 @@ class DataHelpersTests(unittest.TestCase):
             only_trading=True,
         )
         self.assertEqual(symbols, ["BTCUSDT", "BTCUSDT_260327"])
+
+    def test_merge_futures_position_risk_restores_cost_basis_fields(self) -> None:
+        account_info = {
+            "positions": [
+                {
+                    "symbol": "SOONUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "1852",
+                }
+            ]
+        }
+        merged = _merge_futures_position_risk_into_account_info(
+            account_info,
+            [
+                {
+                    "symbol": "SOONUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "1852",
+                    "entryPrice": "0.1620",
+                    "breakEvenPrice": "0.1621",
+                    "unRealizedProfit": "-0.10",
+                }
+            ],
+        )
+
+        position = merged["positions"][0]
+        self.assertEqual(position["entryPrice"], "0.1620")
+        self.assertEqual(position["breakEvenPrice"], "0.1621")
+        self.assertEqual(position["unRealizedProfit"], "-0.10")
 
 
 if __name__ == "__main__":

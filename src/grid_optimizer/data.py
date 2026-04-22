@@ -968,6 +968,78 @@ def delete_spot_order(
     return data
 
 
+def fetch_futures_position_risk_v3(
+    api_key: str,
+    api_secret: str,
+    symbol: str | None = None,
+    contract_type: str = "usdm",
+    recv_window: int = 5000,
+) -> list[dict[str, Any]]:
+    params: dict[str, str | int] = {"recvWindow": recv_window}
+    normalized_symbol = str(symbol or "").upper().strip()
+    if normalized_symbol:
+        params["symbol"] = normalized_symbol
+    data = _http_signed_request_json(
+        f"{_futures_trade_base_url(contract_type)}/fapi/v3/positionRisk",
+        params,
+        api_key,
+        api_secret,
+        method="GET",
+    )
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected futures positionRisk response")
+    return [dict(item) for item in data if isinstance(item, dict)]
+
+
+def _merge_futures_position_risk_into_account_info(
+    account_info: dict[str, Any],
+    position_risk: list[dict[str, Any]],
+) -> dict[str, Any]:
+    positions = account_info.get("positions", [])
+    if not isinstance(positions, list):
+        return account_info
+    risk_by_key: dict[tuple[str, str], dict[str, Any]] = {}
+    risk_by_symbol: dict[str, list[dict[str, Any]]] = {}
+    for item in position_risk:
+        symbol = str(item.get("symbol", "")).upper().strip()
+        if not symbol:
+            continue
+        side = str(item.get("positionSide") or "BOTH").upper().strip() or "BOTH"
+        risk_by_key[(symbol, side)] = item
+        risk_by_symbol.setdefault(symbol, []).append(item)
+
+    enriched_positions: list[Any] = []
+    risk_fields = (
+        "entryPrice",
+        "breakEvenPrice",
+        "markPrice",
+        "liquidationPrice",
+        "unRealizedProfit",
+        "notional",
+    )
+    for raw_position in positions:
+        if not isinstance(raw_position, dict):
+            enriched_positions.append(raw_position)
+            continue
+        position = dict(raw_position)
+        symbol = str(position.get("symbol", "")).upper().strip()
+        side = str(position.get("positionSide") or "BOTH").upper().strip() or "BOTH"
+        risk = risk_by_key.get((symbol, side)) or risk_by_key.get((symbol, "BOTH"))
+        if risk is None:
+            symbol_risks = risk_by_symbol.get(symbol, [])
+            if len(symbol_risks) == 1:
+                risk = symbol_risks[0]
+        if risk:
+            for field in risk_fields:
+                value = risk.get(field)
+                if value is not None and str(value).strip():
+                    position[field] = value
+        enriched_positions.append(position)
+    enriched = dict(account_info)
+    enriched["positions"] = enriched_positions
+    return enriched
+
+
 def fetch_futures_account_info_v3(
     api_key: str,
     api_secret: str,
@@ -983,6 +1055,16 @@ def fetch_futures_account_info_v3(
     )
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected futures account response")
+    try:
+        position_risk = fetch_futures_position_risk_v3(
+            api_key,
+            api_secret,
+            contract_type=contract_type,
+            recv_window=recv_window,
+        )
+    except Exception:
+        return data
+    data = _merge_futures_position_risk_into_account_info(data, position_risk)
     return data
 
 
