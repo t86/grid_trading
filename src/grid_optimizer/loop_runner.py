@@ -975,8 +975,13 @@ def _position_qty(position: dict[str, Any], *, position_side: str | None = None)
     return abs(qty)
 
 
-def _position_cost_basis_price(position: dict[str, Any]) -> float:
-    for key in ("breakEvenPrice", "entryPrice"):
+def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
+    return str(strategy_profile or "").strip() == "volume_long_v4"
+
+
+def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: bool = False) -> float:
+    keys = ("entryPrice", "breakEvenPrice") if prefer_entry_price else ("breakEvenPrice", "entryPrice")
+    for key in keys:
         price = max(_safe_float(position.get(key)), 0.0)
         if price > 0:
             return price
@@ -5892,7 +5897,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     dual_side_position = _truthy(position_mode.get("dualSidePosition"))
     actual_position = extract_symbol_position(account_info, symbol)
     actual_net_qty = _safe_float(actual_position.get("positionAmt"))
-    actual_cost_basis_price = _position_cost_basis_price(actual_position)
+    prefer_entry_price_cost_basis = _uses_entry_price_cost_basis(effective_strategy_profile)
+    actual_cost_basis_price = _position_cost_basis_price(
+        actual_position,
+        prefer_entry_price=prefer_entry_price_cost_basis,
+    )
     long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
     short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
     if _is_inventory_target_neutral_mode(requested_strategy_mode) or _is_competition_inventory_grid_mode(requested_strategy_mode):
@@ -5909,8 +5918,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     current_long_avg_price = 0.0
     current_short_avg_price = 0.0
     if requested_strategy_mode == "hedge_neutral":
-        current_long_avg_price = _position_cost_basis_price(long_position) if current_long_qty > 1e-12 else 0.0
-        current_short_avg_price = _position_cost_basis_price(short_position) if current_short_qty > 1e-12 else 0.0
+        current_long_avg_price = (
+            _position_cost_basis_price(long_position, prefer_entry_price=prefer_entry_price_cost_basis)
+            if current_long_qty > 1e-12
+            else 0.0
+        )
+        current_short_avg_price = (
+            _position_cost_basis_price(short_position, prefer_entry_price=prefer_entry_price_cost_basis)
+            if current_short_qty > 1e-12
+            else 0.0
+        )
     else:
         if actual_net_qty > 1e-12:
             current_long_avg_price = max(actual_cost_basis_price, 0.0)
@@ -7227,6 +7244,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "take_profit_guard": take_profit_guard,
         "active_delever": active_delever,
         "short_threshold_timeout": short_threshold_timeout,
+        "position_cost_basis_source": "entryPrice" if prefer_entry_price_cost_basis else "breakEvenPrice",
         "auto_regime": auto_regime,
         "xaut_adaptive": xaut_adaptive,
         "current_long_qty": current_long_qty,
