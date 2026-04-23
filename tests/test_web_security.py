@@ -1,17 +1,19 @@
 from __future__ import annotations
 
 import base64
+import io
 import json
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from grid_optimizer.web import (
     MONITOR_PAGE,
     HTML_PAGE,
     STRATEGIES_PAGE,
+    _Handler,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
     _build_flatten_command,
@@ -98,6 +100,46 @@ class WebSecurityTests(unittest.TestCase):
     def test_main_page_does_not_duplicate_symbol_element_declaration(self) -> None:
         needle = 'const symbolEl = document.getElementById("symbol");'
         self.assertEqual(HTML_PAGE.count(needle), 1)
+
+    def test_monitor_page_includes_quick_runner_controls(self) -> None:
+        self.assertIn('id="quick_start_last_btn"', MONITOR_PAGE)
+        self.assertIn('id="quick_flatten_btn"', MONITOR_PAGE)
+        self.assertIn("/api/runner/quick_start_last", MONITOR_PAGE)
+        self.assertIn("/api/runner/quick_flatten", MONITOR_PAGE)
+
+    @patch("grid_optimizer.web._quick_flatten_runner_symbol")
+    def test_handler_routes_quick_flatten_post(self, mock_quick_flatten) -> None:
+        mock_quick_flatten.return_value = {"symbol": "SOONUSDT", "post_stop_actions": {}}
+        payload = b'{"symbol":"SOONUSDT"}'
+        handler = object.__new__(_Handler)
+        handler.path = "/api/runner/quick_flatten"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        handler._authorize_request = lambda: True
+        handler._send_json = Mock()
+
+        _Handler.do_POST(handler)
+
+        mock_quick_flatten.assert_called_once_with("SOONUSDT")
+        handler._send_json.assert_called_once()
+        self.assertTrue(handler._send_json.call_args.args[0]["ok"])
+
+    @patch("grid_optimizer.web._start_runner_from_last_config")
+    def test_handler_routes_quick_start_last_post(self, mock_start_last) -> None:
+        mock_start_last.return_value = {"symbol": "SOONUSDT", "runner": {"config": {}}}
+        payload = b'{"symbol":"SOONUSDT"}'
+        handler = object.__new__(_Handler)
+        handler.path = "/api/runner/quick_start_last"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        handler._authorize_request = lambda: True
+        handler._send_json = Mock()
+
+        _Handler.do_POST(handler)
+
+        mock_start_last.assert_called_once_with("SOONUSDT")
+        handler._send_json.assert_called_once()
+        self.assertTrue(handler._send_json.call_args.args[0]["ok"])
 
     def test_monitor_page_keeps_newline_escape_in_editor_locator(self) -> None:
         self.assertIn('split("\\n").length - 1', MONITOR_PAGE)

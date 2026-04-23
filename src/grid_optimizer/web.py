@@ -2060,6 +2060,34 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
 
 
+def _load_last_runner_control_config(symbol: str) -> tuple[dict[str, Any], str]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+
+    stored = _read_json_dict(_runner_control_path(normalized_symbol))
+    source = ""
+    candidate: dict[str, Any] | None = None
+    if isinstance(stored, dict) and stored:
+        candidate = dict(stored)
+        source = "saved_control"
+    else:
+        runner = _read_runner_process_for_symbol(normalized_symbol)
+        runner_config = dict(runner.get("config") or {})
+        runner_symbol = str(runner_config.get("symbol", "")).upper().strip()
+        if runner_config and (not runner_symbol or runner_symbol == normalized_symbol):
+            candidate = runner_config
+            source = "runner_process"
+
+    if not candidate:
+        raise ValueError(f"{normalized_symbol} 暂无最近运行策略配置，请先保存参数或成功启动一次策略")
+
+    candidate.setdefault("symbol", normalized_symbol)
+    normalized = _normalize_runner_control_payload(candidate)
+    normalized = _normalize_runner_runtime_paths(normalized, normalized_symbol)
+    return _autotune_runner_symbol_config(normalized), source
+
+
 def _flatten_pid_path(symbol: str) -> Path:
     return Path(f"output/{_symbol_output_slug(symbol)}_maker_flatten.pid")
 
@@ -3998,6 +4026,38 @@ def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]
         "symbol": symbol,
         "config": config,
         "runner": _read_runner_process_for_symbol(symbol),
+    }
+
+
+def _start_runner_from_last_config(symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    config, config_source = _load_last_runner_control_config(normalized_symbol)
+    result = _start_runner_process(config)
+    return {
+        **result,
+        "symbol": normalized_symbol,
+        "config": config,
+        "config_source": config_source,
+    }
+
+
+def _quick_flatten_runner_symbol(symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    result = _stop_runner_process(
+        normalized_symbol,
+        cancel_open_orders=True,
+        close_all_positions=True,
+        close_position_allow_loss=True,
+        clear_volatility_resume_state=True,
+    )
+    return {
+        **result,
+        "symbol": normalized_symbol,
+        "flatten_allow_loss": True,
     }
 
 
@@ -11684,6 +11744,8 @@ MONITOR_PAGE = """<!doctype html>
         <button id="toggle_btn">暂停自动刷新</button>
         <button id="start_strategy_btn" class="primary">启动策略</button>
         <button id="stop_strategy_btn">停止策略</button>
+        <button id="quick_start_last_btn" class="primary">一键启动</button>
+        <button id="quick_flatten_btn">一键清仓</button>
         <label class="inline-check" title="停止策略后撤销当前交易对全部未成交委托">
           <span class="check-row">
             <input id="stop_cancel_orders" type="checkbox" />
@@ -12474,6 +12536,8 @@ MONITOR_PAGE = """<!doctype html>
     const strategyPresetEl = document.getElementById("strategy_preset");
     const startStrategyBtn = document.getElementById("start_strategy_btn");
     const stopStrategyBtn = document.getElementById("stop_strategy_btn");
+    const quickStartLastBtn = document.getElementById("quick_start_last_btn");
+    const quickFlattenBtn = document.getElementById("quick_flatten_btn");
     const stopCancelOrdersEl = document.getElementById("stop_cancel_orders");
     const stopClosePositionsEl = document.getElementById("stop_close_positions");
     const strategyActionMetaEl = document.getElementById("strategy_action_meta");
@@ -16024,6 +16088,8 @@ MONITOR_PAGE = """<!doctype html>
       startStrategyBtn.disabled = strategyActionPending || Boolean(selectedPreset && !selectedPreset.startable);
       startStrategyBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
       stopStrategyBtn.disabled = strategyActionPending || !Boolean(runner.is_running);
+      if (quickStartLastBtn) quickStartLastBtn.disabled = strategyActionPending;
+      if (quickFlattenBtn) quickFlattenBtn.disabled = strategyActionPending;
     }
 
     function formatAlertSeverity(severity) {
@@ -16392,8 +16458,7 @@ MONITOR_PAGE = """<!doctype html>
       }
       strategyActionPending = true;
       strategyActionMetaEl.textContent = action === "start" ? "正在按当前选中预设启动策略..." : "正在停止策略...";
-      startStrategyBtn.disabled = true;
-      stopStrategyBtn.disabled = true;
+      setStrategyActionButtonsDisabled(true);
       try {
         const payload = action === "start"
           ? startPayload
@@ -16420,6 +16485,52 @@ MONITOR_PAGE = """<!doctype html>
         strategyActionMetaEl.textContent = `${action === "start" ? "启动" : "停止"}失败: ${err}`;
       } finally {
         strategyActionPending = false;
+        setStrategyActionButtonsDisabled(false);
+        await loadMonitor();
+      }
+    }
+
+    function setStrategyActionButtonsDisabled(disabled) {
+      startStrategyBtn.disabled = disabled;
+      stopStrategyBtn.disabled = disabled;
+      if (quickStartLastBtn) quickStartLastBtn.disabled = disabled;
+      if (quickFlattenBtn) quickFlattenBtn.disabled = disabled;
+    }
+
+    async function controlQuickRunnerAction(action) {
+      if (strategyActionPending) return;
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      const endpoint = action === "quick_start_last" ? "/api/runner/quick_start_last" : "/api/runner/quick_flatten";
+      strategyActionPending = true;
+      strategyActionMetaEl.textContent = action === "quick_start_last"
+        ? "正在按该币种最近一次运行配置启动策略..."
+        : "正在停机、撤全部委托并启动贴盘口清仓...";
+      setStrategyActionButtonsDisabled(true);
+      try {
+        const resp = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: selectedSymbol }),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        if (action === "quick_start_last") {
+          const sourceText = data.config_source === "runner_process" ? "最近运行配置" : "最近保存配置";
+          strategyActionMetaEl.textContent =
+            `已按${sourceText}启动策略${data.restarted ? "（已重启应用旧配置）" : (data.already_running ? "（已在运行）" : "")}`;
+          const appliedConfig = ((((data || {}).runner || {}).config) || data.config || {});
+          if (appliedConfig && Object.keys(appliedConfig).length) {
+            setRunnerEditorConfig(appliedConfig, `已载入 ${selectedSymbol} 当前生效参数。`);
+          }
+        } else {
+          strategyActionMetaEl.textContent =
+            `一键清仓已执行${data.already_stopped ? "（runner 原本就未运行）" : ""}${formatStopActionSummary(data.post_stop_actions) ? ` · ${formatStopActionSummary(data.post_stop_actions)}` : ""}`;
+        }
+      } catch (err) {
+        strategyActionMetaEl.textContent = `${action === "quick_start_last" ? "一键启动" : "一键清仓"}失败: ${err}`;
+      } finally {
+        strategyActionPending = false;
+        setStrategyActionButtonsDisabled(false);
         await loadMonitor();
       }
     }
@@ -16443,6 +16554,8 @@ MONITOR_PAGE = """<!doctype html>
     });
     startStrategyBtn.addEventListener("click", () => controlStrategy("start"));
     stopStrategyBtn.addEventListener("click", () => controlStrategy("stop"));
+    quickStartLastBtn.addEventListener("click", () => controlQuickRunnerAction("quick_start_last"));
+    quickFlattenBtn.addEventListener("click", () => controlQuickRunnerAction("quick_flatten"));
     refreshSecEl.addEventListener("change", restartTimer);
     strategyPresetEl.addEventListener("change", () => renderPresetMeta(latestMonitorData));
     loadRunningParamsBtn.addEventListener("click", loadRunningConfigToEditor);
@@ -22414,7 +22527,7 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
-        if path in {"/api/runner/start", "/api/runner/stop", "/api/runner/save"}:
+        if path in {"/api/runner/start", "/api/runner/stop", "/api/runner/save", "/api/runner/quick_start_last", "/api/runner/quick_flatten"}:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -22435,7 +22548,11 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
                     return
             try:
-                if path.endswith("/start"):
+                if path.endswith("/quick_start_last"):
+                    result = _start_runner_from_last_config(payload.get("symbol"))
+                elif path.endswith("/quick_flatten"):
+                    result = _quick_flatten_runner_symbol(payload.get("symbol"))
+                elif path.endswith("/start"):
                     config = _resolve_runner_start_config(payload)
                     result = _start_runner_process(config)
                 elif path.endswith("/save"):
