@@ -2104,6 +2104,86 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(all(item["time_in_force"] == "GTC" for item in active_buys))
         self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_buys))
 
+    def test_apply_active_delever_short_pause_notional_creates_passive_release_orders(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 0.999, "qty": 30.0, "notional": 29.97, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.989, "qty": 30.0, "notional": 29.67, "role": "take_profit_short"},
+            ],
+            "sell_orders": [],
+        }
+
+        result = apply_active_delever_short(
+            plan=plan,
+            current_short_qty=240.0,
+            current_short_notional=240.0,
+            current_short_avg_price=0.965,
+            current_short_lots=[{"qty": 240.0, "price": 0.965}],
+            pause_short_position_notional=200.0,
+            threshold_position_notional=0.0,
+            per_order_notional=30.0,
+            step_price=0.01,
+            tick_size=0.001,
+            bid_price=0.999,
+            ask_price=1.001,
+            min_profit_ratio=0.0,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            max_active_levels=2,
+        )
+
+        active_buys = [item for item in plan["buy_orders"] if item["role"] == "active_delever_short"]
+        self.assertTrue(result["active"])
+        self.assertEqual(result["trigger_mode"], "pause")
+        self.assertEqual(result["release_buy_order_count"], 2)
+        self.assertEqual([item["price"] for item in active_buys], [0.999, 0.989])
+        self.assertTrue(all(item["execution_type"] == "passive_release" for item in active_buys))
+        self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_buys))
+
+    def test_take_profit_guard_preserves_release_ceiling_for_active_short_delever_orders(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "price": 1.003,
+                    "qty": 25.0,
+                    "notional": 25.075,
+                    "role": "active_delever_short",
+                    "execution_type": "aggressive",
+                    "force_reduce_only": True,
+                    "take_profit_guard_release_ceiling": 1.003,
+                },
+                {"side": "BUY", "price": 0.999, "qty": 25.0, "notional": 24.975, "role": "take_profit_short"},
+            ],
+            "sell_orders": [],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=50.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.965,
+            current_long_notional=0.0,
+            current_short_notional=50.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=200.0,
+            min_profit_ratio=0.0,
+            tick_size=0.001,
+            bid_price=0.999,
+            ask_price=1.001,
+        )
+
+        active_buys = [item for item in plan["buy_orders"] if item["role"] == "active_delever_short"]
+        tp_buys = [item for item in plan["buy_orders"] if item["role"] == "take_profit_short"]
+        self.assertEqual(len(active_buys), 1)
+        self.assertAlmostEqual(active_buys[0]["price"], 1.003, places=8)
+        self.assertEqual(len(tp_buys), 1)
+        self.assertAlmostEqual(tp_buys[0]["price"], 0.965, places=8)
+        self.assertEqual(result["relaxed_buy_orders"], 1)
+        self.assertAlmostEqual(result["release_ceiling_price"], 1.003, places=8)
+
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
@@ -2800,6 +2880,7 @@ class LoopRunnerTests(unittest.TestCase):
             per_order_notional=50.0,
             step_price=0.01,
             tick_size=0.001,
+            bid_price=0.999,
             ask_price=1.001,
             min_profit_ratio=0.01,
             market_guard_buy_pause_active=False,
@@ -2834,6 +2915,7 @@ class LoopRunnerTests(unittest.TestCase):
             per_order_notional=30.0,
             step_price=0.01,
             tick_size=0.001,
+            bid_price=0.999,
             ask_price=1.001,
             min_profit_ratio=0.0,
             market_guard_buy_pause_active=False,
@@ -2845,6 +2927,43 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["active"])
         self.assertIsNone(report["trigger_mode"])
         self.assertFalse(any(item["role"] == "active_delever_long" for item in plan["sell_orders"]))
+
+    def test_apply_active_delever_long_pause_notional_creates_passive_release_orders(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.001, "qty": 30.0, "notional": 30.03, "role": "take_profit_long"},
+                {"side": "SELL", "price": 1.011, "qty": 30.0, "notional": 30.33, "role": "take_profit_long"},
+            ],
+        }
+
+        report = apply_active_delever_long(
+            plan=plan,
+            current_long_qty=240.0,
+            current_long_notional=240.0,
+            current_long_avg_price=1.0,
+            current_long_lots=[{"qty": 240.0, "price": 1.0}],
+            pause_long_position_notional=200.0,
+            threshold_position_notional=0.0,
+            per_order_notional=30.0,
+            step_price=0.01,
+            tick_size=0.001,
+            bid_price=0.999,
+            ask_price=1.001,
+            min_profit_ratio=0.0,
+            market_guard_buy_pause_active=False,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            max_active_levels=2,
+        )
+
+        active_sells = [item for item in plan["sell_orders"] if item["role"] == "active_delever_long"]
+        self.assertTrue(report["active"])
+        self.assertEqual(report["trigger_mode"], "pause")
+        self.assertEqual(report["release_sell_order_count"], 2)
+        self.assertEqual([item["price"] for item in active_sells], [1.001, 1.011])
+        self.assertTrue(all(item["execution_type"] == "passive_release" for item in active_sells))
+        self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_sells))
 
     def test_apply_volume_long_v4_staged_delever_soft_stage_keeps_front_sell_volume_near_market(self) -> None:
         plan = {
@@ -5582,7 +5701,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertGreater(result["scale"], 2.0)
         self.assertAlmostEqual(result["effective_step_price"], 0.00026, places=8)
         self.assertAlmostEqual(result["effective_per_order_notional"], 38.64583333, places=6)
-        self.assertAlmostEqual(result["effective_pause_buy_position_notional"], 900.0, places=6)
+        self.assertAlmostEqual(result["effective_pause_buy_position_notional"], 2000.0, places=6)
         self.assertAlmostEqual(result["effective_max_position_notional"], 1080.0, places=6)
 
     def test_resolve_adaptive_step_price_keeps_widened_step_during_sustained_trend(self) -> None:
@@ -5623,7 +5742,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(result["dominant_metric"], "abs_return_ratio")
         self.assertGreater(result["effective_step_price"], 0.0001)
         self.assertLess(result["effective_per_order_notional"], 100.0)
-        self.assertLess(result["effective_pause_buy_position_notional"], 2000.0)
+        self.assertAlmostEqual(result["effective_pause_buy_position_notional"], 2000.0, places=8)
 
     def test_resolve_adaptive_step_price_returns_to_base_when_market_calms(self) -> None:
         state = {

@@ -621,8 +621,8 @@ def resolve_adaptive_step_price(
             "effective_inventory_tier_end_notional": _scale_if_positive(base_inventory_tier_end_notional, position_limit_scale),
             "effective_inventory_tier_per_order_notional": _scale_if_positive(base_inventory_tier_per_order_notional, per_order_scale),
             "effective_inventory_tier_base_position_notional": _scale_if_positive(base_inventory_tier_base_position_notional, position_limit_scale),
-            "effective_pause_buy_position_notional": _scale_if_positive(base_pause_buy_position_notional, position_limit_scale),
-            "effective_pause_short_position_notional": _scale_if_positive(base_pause_short_position_notional, position_limit_scale),
+            "effective_pause_buy_position_notional": _scale_if_positive(base_pause_buy_position_notional, 1.0),
+            "effective_pause_short_position_notional": _scale_if_positive(base_pause_short_position_notional, 1.0),
             "effective_max_position_notional": _scale_if_positive(base_max_position_notional, position_limit_scale),
             "effective_max_short_position_notional": _scale_if_positive(base_max_short_position_notional, position_limit_scale),
             "effective_max_total_notional": _scale_if_positive(base_max_total_notional, position_limit_scale),
@@ -3522,6 +3522,10 @@ def apply_take_profit_profit_guard(
         "adjusted_buy_orders": 0,
         "dropped_sell_orders": 0,
         "dropped_buy_orders": 0,
+        "relaxed_sell_orders": 0,
+        "relaxed_buy_orders": 0,
+        "release_floor_price": None,
+        "release_ceiling_price": None,
     }
 
     actual_long_avg = max(_safe_float(current_long_avg_price), 0.0)
@@ -3608,7 +3612,18 @@ def apply_take_profit_profit_guard(
             if _order_role(order) not in long_guard_roles:
                 updated_sell_orders.append(order)
                 continue
-            adjusted_price = max(_safe_float(order.get("price")), long_floor_price)
+            release_floor = max(_safe_float(order.get("take_profit_guard_release_floor")), 0.0)
+            effective_floor = long_floor_price
+            if release_floor > 0:
+                effective_floor = min(effective_floor, release_floor)
+                report["relaxed_sell_orders"] += 1
+                current_release_floor = _safe_float(report.get("release_floor_price"))
+                report["release_floor_price"] = (
+                    release_floor
+                    if current_release_floor <= 0
+                    else min(current_release_floor, release_floor)
+                )
+            adjusted_price = max(_safe_float(order.get("price")), effective_floor)
             if adjusted_price <= bid_price:
                 report["dropped_sell_orders"] += 1
                 continue
@@ -3628,8 +3643,19 @@ def apply_take_profit_profit_guard(
             if _order_role(order) not in short_guard_roles:
                 updated_buy_orders.append(order)
                 continue
-            adjusted_price = min(_safe_float(order.get("price")), short_ceiling_price)
-            if adjusted_price <= 0 or adjusted_price >= ask_price:
+            release_ceiling = max(_safe_float(order.get("take_profit_guard_release_ceiling")), 0.0)
+            effective_ceiling = short_ceiling_price
+            if release_ceiling > 0:
+                effective_ceiling = max(effective_ceiling, release_ceiling)
+                report["relaxed_buy_orders"] += 1
+                current_release_ceiling = _safe_float(report.get("release_ceiling_price"))
+                report["release_ceiling_price"] = max(current_release_ceiling, release_ceiling)
+            adjusted_price = min(_safe_float(order.get("price")), effective_ceiling)
+            allow_cross = bool(order.get("force_reduce_only")) and str(order.get("execution_type", "")).strip().lower() in {
+                "aggressive",
+                "passive_release",
+            }
+            if adjusted_price <= 0 or (adjusted_price >= ask_price and not allow_cross):
                 report["dropped_buy_orders"] += 1
                 continue
             if abs(adjusted_price - _safe_float(order.get("price"))) > 1e-12:
@@ -4110,6 +4136,39 @@ def _project_nearest_short_non_loss_exit_price(
     return nearest_exit_price if nearest_exit_price is not None and nearest_exit_price > 0 else None
 
 
+def _resolve_near_market_release_price(
+    *,
+    side: str,
+    level_index: int,
+    bid_price: float,
+    ask_price: float,
+    step_price: float,
+    tick_size: float | None,
+) -> float:
+    safe_side = str(side or "").upper().strip()
+    safe_level_index = max(int(level_index or 1), 1)
+    safe_bid = max(_safe_float(bid_price), 0.0)
+    safe_ask = max(_safe_float(ask_price), 0.0)
+    safe_step = max(_safe_float(step_price), 0.0)
+    safe_tick = max(_safe_float(tick_size), 0.0)
+    distance = max(float(safe_level_index - 1), 0.0) * safe_step
+
+    if safe_side == "BUY":
+        raw_price = max(safe_bid - distance, 0.0)
+        price = _round_order_price(raw_price, tick_size, "BUY")
+        if safe_ask > 0 and price >= safe_ask:
+            fallback = max(safe_ask - safe_tick, 0.0) if safe_tick > 0 else min(safe_bid, safe_ask)
+            price = _round_order_price(max(fallback, 0.0), tick_size, "BUY")
+        return max(_safe_float(price), 0.0)
+
+    raw_price = safe_ask + distance
+    price = _round_order_price(raw_price, tick_size, "SELL")
+    if safe_bid > 0 and price <= safe_bid:
+        fallback = safe_bid + safe_tick if safe_tick > 0 else max(safe_bid, safe_ask)
+        price = _round_order_price(max(fallback, 0.0), tick_size, "SELL")
+    return max(_safe_float(price), 0.0)
+
+
 def apply_active_delever_long(
     *,
     plan: dict[str, Any],
@@ -4122,6 +4181,7 @@ def apply_active_delever_long(
     per_order_notional: float,
     step_price: float,
     tick_size: float | None,
+    bid_price: float,
     ask_price: float,
     min_profit_ratio: float | None,
     market_guard_buy_pause_active: bool,
@@ -4140,6 +4200,8 @@ def apply_active_delever_long(
         "active_buy_order_count": 0,
         "pause_long_position_notional": pause_long_position_notional,
         "pause_short_position_notional": None,
+        "release_sell_order_count": 0,
+        "release_floor_price": None,
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
@@ -4179,6 +4241,7 @@ def apply_active_delever_long(
     active_count = 0
     estimated_cost = 0.0
     trigger_mode: str | None = None
+    projected_exit_price = None
     if threshold_enabled and current_long_notional >= threshold_notional:
         threshold_consume_mode = "fifo"
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
@@ -4248,18 +4311,35 @@ def apply_active_delever_long(
         )
         trigger_mode = "market_guard"
     else:
-        for level_count in range(1, requested_levels + 1):
-            level_cost = _estimate_long_delever_cost(
+        safe_per_order_notional = max(float(per_order_notional), 1e-12)
+        if pause_notional > 0 and current_long_notional >= pause_notional - 1e-12:
+            excess_notional = max(current_long_notional - pause_notional, 0.0)
+            active_count = min(
+                len(take_profit_orders),
+                requested_levels,
+                max(1, int(math.ceil(max(excess_notional, safe_per_order_notional) / safe_per_order_notional))),
+            )
+            estimated_cost = _estimate_long_delever_cost(
                 current_long_lots=current_long_lots,
                 current_long_qty=current_long_qty,
                 current_long_avg_price=current_long_avg_price,
-                sell_orders=take_profit_orders[:level_count],
+                sell_orders=take_profit_orders[:active_count],
+                consume_mode="fifo",
             )
-            if available_buffer + 1e-12 >= level_cost:
-                active_count = level_count
-                estimated_cost = level_cost
-        if active_count > 0:
-            trigger_mode = "buffer"
+            trigger_mode = "pause"
+        else:
+            for level_count in range(1, requested_levels + 1):
+                level_cost = _estimate_long_delever_cost(
+                    current_long_lots=current_long_lots,
+                    current_long_qty=current_long_qty,
+                    current_long_avg_price=current_long_avg_price,
+                    sell_orders=take_profit_orders[:level_count],
+                )
+                if available_buffer + 1e-12 >= level_cost:
+                    active_count = level_count
+                    estimated_cost = level_cost
+            if active_count > 0:
+                trigger_mode = "buffer"
 
     if active_count <= 0:
         return report
@@ -4275,12 +4355,41 @@ def apply_active_delever_long(
         shifted_take_profit_orders.append(shifted)
 
     active_orders: list[dict[str, Any]] = []
+    release_active = (
+        trigger_mode in {"threshold", "pause"}
+        and pause_notional > 0
+        and current_long_notional >= pause_notional - 1e-12
+    )
+    release_floor_price: float | None = None
+    release_order_count = 0
     for index, order in enumerate(take_profit_orders[:active_count], start=1):
         active = dict(order)
         active["role"] = "active_delever_long"
         active["level"] = index
-        if trigger_mode == "threshold":
+        if trigger_mode in {"threshold", "pause"}:
             active["lot_consume_mode"] = "fifo"
+        if release_active:
+            release_price = _resolve_near_market_release_price(
+                side="SELL",
+                level_index=index,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                step_price=step_price,
+                tick_size=tick_size,
+            )
+            if release_price > 0:
+                active["price"] = release_price
+                active["notional"] = release_price * _safe_float(active.get("qty"))
+                active["execution_type"] = "passive_release"
+                active["time_in_force"] = "GTC"
+                active["force_reduce_only"] = True
+                active["take_profit_guard_release_floor"] = release_price
+                release_floor_price = (
+                    release_price
+                    if release_floor_price is None
+                    else min(release_floor_price, release_price)
+                )
+                release_order_count += 1
         active_orders.append(active)
 
     plan["sell_orders"] = sorted(
@@ -4293,6 +4402,8 @@ def apply_active_delever_long(
             "trigger_mode": trigger_mode,
             "estimated_cost_notional": estimated_cost,
             "active_sell_order_count": active_count,
+            "release_sell_order_count": release_order_count,
+            "release_floor_price": release_floor_price,
         }
     )
     return report
@@ -4333,6 +4444,8 @@ def apply_active_delever_short(
         "threshold_timeout_active": bool(threshold_timeout_active),
         "threshold_timeout_target_notional": timeout_target_notional,
         "threshold_timeout_aggressive": False,
+        "release_buy_order_count": 0,
+        "release_ceiling_price": None,
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
@@ -4373,6 +4486,7 @@ def apply_active_delever_short(
     active_count = 0
     estimated_cost = 0.0
     trigger_mode: str | None = None
+    projected_exit_price = None
     if threshold_timeout_active and timeout_target > 0 and current_short_notional > timeout_target:
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
         excess_notional = max(current_short_notional - timeout_target, 0.0)
@@ -4445,18 +4559,35 @@ def apply_active_delever_short(
             )
         trigger_mode = "threshold"
     else:
-        for level_count in range(1, requested_levels + 1):
-            level_cost = _estimate_short_delever_cost(
+        safe_per_order_notional = max(float(per_order_notional), 1e-12)
+        if pause_notional > 0 and current_short_notional >= pause_notional - 1e-12:
+            excess_notional = max(current_short_notional - pause_notional, 0.0)
+            active_count = min(
+                len(take_profit_orders),
+                requested_levels,
+                max(1, int(math.ceil(max(excess_notional, safe_per_order_notional) / safe_per_order_notional))),
+            )
+            estimated_cost = _estimate_short_delever_cost(
                 current_short_lots=current_short_lots,
                 current_short_qty=current_short_qty,
                 current_short_avg_price=current_short_avg_price,
-                buy_orders=take_profit_orders[:level_count],
+                buy_orders=take_profit_orders[:active_count],
+                consume_mode="fifo",
             )
-            if available_buffer + 1e-12 >= level_cost:
-                active_count = level_count
-                estimated_cost = level_cost
-        if active_count > 0:
-            trigger_mode = "buffer"
+            trigger_mode = "pause"
+        else:
+            for level_count in range(1, requested_levels + 1):
+                level_cost = _estimate_short_delever_cost(
+                    current_short_lots=current_short_lots,
+                    current_short_qty=current_short_qty,
+                    current_short_avg_price=current_short_avg_price,
+                    buy_orders=take_profit_orders[:level_count],
+                )
+                if available_buffer + 1e-12 >= level_cost:
+                    active_count = level_count
+                    estimated_cost = level_cost
+            if active_count > 0:
+                trigger_mode = "buffer"
 
     if active_count <= 0:
         return report
@@ -4472,11 +4603,18 @@ def apply_active_delever_short(
         shifted_take_profit_orders.append(shifted)
 
     active_orders: list[dict[str, Any]] = []
+    release_active = (
+        trigger_mode in {"threshold", "pause"}
+        and pause_notional > 0
+        and current_short_notional >= pause_notional - 1e-12
+    )
+    release_ceiling_price: float | None = None
+    release_order_count = 0
     for index, order in enumerate(take_profit_orders[:active_count], start=1):
         active = dict(order)
         active["role"] = "active_delever_short"
         active["level"] = index
-        if trigger_mode in {"threshold", "threshold_timeout"}:
+        if trigger_mode in {"threshold", "threshold_timeout", "pause"}:
             active["lot_consume_mode"] = "fifo"
         if trigger_mode == "threshold_timeout":
             safe_ask_price = max(_safe_float(ask_price), 0.0)
@@ -4488,9 +4626,38 @@ def apply_active_delever_short(
                     aggressive_price = safe_ask_price
                 active["price"] = aggressive_price
                 active["notional"] = _safe_float(active.get("price")) * _safe_float(active.get("qty"))
+                active["take_profit_guard_release_ceiling"] = aggressive_price
             active["execution_type"] = "aggressive"
             active["time_in_force"] = "GTC"
             active["force_reduce_only"] = True
+            release_ceiling_price = (
+                _safe_float(active.get("price"))
+                if release_ceiling_price is None
+                else max(release_ceiling_price, _safe_float(active.get("price")))
+            )
+            release_order_count += 1
+        elif release_active:
+            release_price = _resolve_near_market_release_price(
+                side="BUY",
+                level_index=index,
+                bid_price=bid_price,
+                ask_price=_safe_float(ask_price),
+                step_price=step_price,
+                tick_size=tick_size,
+            )
+            if release_price > 0:
+                active["price"] = release_price
+                active["notional"] = release_price * _safe_float(active.get("qty"))
+                active["execution_type"] = "passive_release"
+                active["time_in_force"] = "GTC"
+                active["force_reduce_only"] = True
+                active["take_profit_guard_release_ceiling"] = release_price
+                release_ceiling_price = (
+                    release_price
+                    if release_ceiling_price is None
+                    else max(release_ceiling_price, release_price)
+                )
+                release_order_count += 1
         active_orders.append(active)
 
     plan["buy_orders"] = sorted(
@@ -4504,6 +4671,8 @@ def apply_active_delever_short(
             "estimated_cost_notional": estimated_cost,
             "active_buy_order_count": active_count,
             "threshold_timeout_aggressive": trigger_mode == "threshold_timeout",
+            "release_buy_order_count": release_order_count,
+            "release_ceiling_price": release_ceiling_price,
         }
     )
     return report
@@ -7439,6 +7608,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             per_order_notional=inventory_tier["effective_per_order_notional"],
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
             ask_price=ask_price,
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             market_guard_buy_pause_active=bool(market_guard["buy_pause_active"]),
