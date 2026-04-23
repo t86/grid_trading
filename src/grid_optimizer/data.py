@@ -11,6 +11,7 @@ import threading
 import time
 from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError
@@ -353,7 +354,7 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _format_request_number(value: float) -> str:
-    text = f"{float(value):.12f}".rstrip("0").rstrip(".")
+    text = format(Decimal(str(value)), "f").rstrip("0").rstrip(".")
     return text or "0"
 
 

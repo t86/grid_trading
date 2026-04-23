@@ -2,10 +2,19 @@ from __future__ import annotations
 
 import unittest
 
-from grid_optimizer.data import _filter_futures_symbols, _merge_futures_position_risk_into_account_info
+from grid_optimizer.data import (
+    _filter_futures_symbols,
+    _format_request_number,
+    _merge_futures_position_risk_into_account_info,
+)
 
 
 class DataHelpersTests(unittest.TestCase):
+    def test_format_request_number_avoids_float_artifacts(self) -> None:
+        self.assertEqual(_format_request_number(78078.6), "78078.6")
+        self.assertEqual(_format_request_number(78078.7), "78078.7")
+        self.assertEqual(_format_request_number(78000.1), "78000.1")
+
     def test_filter_futures_symbols_perpetual_usdt_trading(self) -> None:
         exchange_info = {
             "symbols": [
