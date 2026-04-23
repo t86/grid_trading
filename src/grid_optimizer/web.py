@@ -149,6 +149,8 @@ VOLUME_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
 VOLUME_TRIGGER_STATUS_LOCK = threading.Lock()
 VOLATILITY_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
 VOLATILITY_TRIGGER_STATUS_LOCK = threading.Lock()
+SELF_VOLUME_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
+SELF_VOLUME_TRIGGER_STATUS_LOCK = threading.Lock()
 FUNDING_MARGIN_RATIO = 0.5
 GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
@@ -160,6 +162,7 @@ DEFAULT_RUNNER_USER_PRESETS_PATH = Path("config/runner_user_presets.json")
 CUSTOM_RUNNER_PRESETS_PATH = DEFAULT_RUNNER_USER_PRESETS_PATH
 RUNNER_USER_PRESETS_PATH = CUSTOM_RUNNER_PRESETS_PATH
 VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
+    "1m": 1,
     "15m": 15,
     "30m": 30,
     "1h": 60,
@@ -168,6 +171,9 @@ VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
 }
 DEFAULT_VOLUME_TRIGGER_WINDOW = "1h"
 VOLUME_TRIGGER_POLL_SECONDS = 20.0
+DEFAULT_SELF_VOLUME_TRIGGER_WINDOW = "15m"
+DEFAULT_SELF_VOLUME_TRIGGER_RESUME_WINDOW = "15m"
+SELF_VOLUME_TRIGGER_POLL_SECONDS = 20.0
 DEFAULT_VOLATILITY_TRIGGER_WINDOW = "1h"
 VOLATILITY_TRIGGER_POLL_SECONDS = 20.0
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
@@ -1580,6 +1586,218 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "synthetic_trend_follow_enabled": False,
         },
     },
+    "chip_short_bias_ping_pong_guarded_v2": {
+        "label": "CHIP 偏空护栏 v2",
+        "description": "CHIPUSDT 专用低仓位偏空 ping-pong。追加单边亏损主动减仓、自成交量过低停机清仓，并把硬风控压到先控回撤。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "CHIPUSDT",
+        "config": {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0012,
+            "buy_levels": 6,
+            "sell_levels": 10,
+            "per_order_notional": 20.0,
+            "startup_entry_multiplier": 1.5,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 90.0,
+            "pause_short_position_notional": 160.0,
+            "max_position_notional": 120.0,
+            "max_short_position_notional": 220.0,
+            "max_total_notional": 300.0,
+            "max_actual_net_notional": 70.0,
+            "max_synthetic_drift_notional": 25.0,
+            "static_buy_offset_steps": 1.2,
+            "static_sell_offset_steps": 0.6,
+            "near_market_entry_max_center_distance_steps": 3.0,
+            "grid_inventory_rebalance_min_center_distance_steps": 5.0,
+            "near_market_reentry_confirm_cycles": 4,
+            "take_profit_min_profit_ratio": 0.0008,
+            "threshold_reduce_target_ratio": 0.0,
+            "adverse_reduce_enabled": True,
+            "adverse_reduce_short_trigger_ratio": 0.010,
+            "adverse_reduce_long_trigger_ratio": 0.015,
+            "adverse_reduce_target_ratio": 0.50,
+            "adverse_reduce_maker_timeout_seconds": 30.0,
+            "adverse_reduce_max_order_notional": 40.0,
+            "adverse_reduce_keep_probe_scale": 0.20,
+            "max_new_orders": 20,
+            "buy_pause_amp_trigger_ratio": 0.018,
+            "buy_pause_down_return_trigger_ratio": -0.010,
+            "short_cover_pause_amp_trigger_ratio": 0.010,
+            "short_cover_pause_down_return_trigger_ratio": -0.006,
+            "freeze_shift_abs_return_trigger_ratio": 0.012,
+            "rolling_hourly_loss_limit": 4.0,
+            "max_cumulative_notional": 30000.0,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "1m",
+            "volatility_trigger_amplitude_ratio": 0.035,
+            "volatility_trigger_abs_return_ratio": 0.020,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": False,
+            "self_volume_trigger_enabled": True,
+            "self_volume_trigger_window": "15m",
+            "self_volume_trigger_start_threshold": 1800.0,
+            "self_volume_trigger_stop_threshold": 1000.0,
+            "self_volume_trigger_stop_cancel_open_orders": True,
+            "self_volume_trigger_stop_close_all_positions": True,
+            "sleep_seconds": 3.0,
+            "leverage": 3,
+            "maker_retries": 2,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+            "market_bias_enabled": False,
+            "synthetic_trend_follow_enabled": False,
+        },
+    },
+    "chip_short_bias_ping_pong_guarded_v3": {
+        "label": "CHIP 偏空护栏 v3",
+        "description": "CHIPUSDT 专用条件低量停机版。低量只作为背景，叠加净敞口或空侧逆向偏离过大才停机，并在 15m 波动回落后自动恢复。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "CHIPUSDT",
+        "config": {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0012,
+            "buy_levels": 6,
+            "sell_levels": 10,
+            "per_order_notional": 40.0,
+            "startup_entry_multiplier": 1.5,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 120.0,
+            "pause_short_position_notional": 220.0,
+            "max_position_notional": 160.0,
+            "max_short_position_notional": 300.0,
+            "max_total_notional": 400.0,
+            "max_actual_net_notional": 180.0,
+            "max_synthetic_drift_notional": 25.0,
+            "static_buy_offset_steps": 1.2,
+            "static_sell_offset_steps": 0.6,
+            "near_market_entry_max_center_distance_steps": 3.0,
+            "grid_inventory_rebalance_min_center_distance_steps": 5.0,
+            "near_market_reentry_confirm_cycles": 4,
+            "take_profit_min_profit_ratio": 0.0008,
+            "threshold_reduce_target_ratio": 0.0,
+            "adverse_reduce_enabled": True,
+            "adverse_reduce_short_trigger_ratio": 0.010,
+            "adverse_reduce_long_trigger_ratio": 0.015,
+            "adverse_reduce_target_ratio": 0.50,
+            "adverse_reduce_maker_timeout_seconds": 30.0,
+            "adverse_reduce_max_order_notional": 40.0,
+            "adverse_reduce_keep_probe_scale": 0.20,
+            "max_new_orders": 20,
+            "buy_pause_amp_trigger_ratio": 0.018,
+            "buy_pause_down_return_trigger_ratio": -0.010,
+            "short_cover_pause_amp_trigger_ratio": 0.010,
+            "short_cover_pause_down_return_trigger_ratio": -0.006,
+            "freeze_shift_abs_return_trigger_ratio": 0.012,
+            "rolling_hourly_loss_limit": 4.0,
+            "max_cumulative_notional": 30000.0,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "1m",
+            "volatility_trigger_amplitude_ratio": 0.035,
+            "volatility_trigger_abs_return_ratio": 0.020,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": False,
+            "self_volume_trigger_enabled": True,
+            "self_volume_trigger_window": "30m",
+            "self_volume_trigger_start_threshold": None,
+            "self_volume_trigger_stop_threshold": 300.0,
+            "self_volume_trigger_resume_window": "15m",
+            "self_volume_trigger_resume_amplitude_ratio": 0.050,
+            "self_volume_trigger_resume_abs_return_ratio": 0.030,
+            "self_volume_trigger_risk_actual_net_notional": 180.0,
+            "self_volume_trigger_risk_short_adverse_ratio": 0.040,
+            "self_volume_trigger_stop_cancel_open_orders": True,
+            "self_volume_trigger_stop_close_all_positions": True,
+            "sleep_seconds": 3.0,
+            "leverage": 3,
+            "maker_retries": 2,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+            "market_bias_enabled": False,
+            "synthetic_trend_follow_enabled": False,
+        },
+    },
+    "soon_volume_neutral_ping_pong_guarded_v2": {
+        "label": "SOON 中性护栏 v2",
+        "description": "SOONUSDT 专用中性回转。加入单边亏损主动减仓和自成交量过低停机清仓，先修复单边打穿问题再放量。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "SOONUSDT",
+        "config": {
+            "symbol": "SOONUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.00025,
+            "buy_levels": 12,
+            "sell_levels": 10,
+            "per_order_notional": 25.0,
+            "startup_entry_multiplier": 1.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 180.0,
+            "pause_short_position_notional": 120.0,
+            "max_position_notional": 220.0,
+            "max_short_position_notional": 160.0,
+            "max_total_notional": 340.0,
+            "max_actual_net_notional": 50.0,
+            "max_synthetic_drift_notional": 18.0,
+            "static_buy_offset_steps": 0.70,
+            "static_sell_offset_steps": 0.95,
+            "take_profit_min_profit_ratio": 0.0004,
+            "threshold_reduce_target_ratio": 0.0,
+            "adverse_reduce_enabled": True,
+            "adverse_reduce_short_trigger_ratio": 0.007,
+            "adverse_reduce_long_trigger_ratio": 0.010,
+            "adverse_reduce_target_ratio": 0.50,
+            "adverse_reduce_maker_timeout_seconds": 45.0,
+            "adverse_reduce_max_order_notional": 50.0,
+            "adverse_reduce_keep_probe_scale": 0.20,
+            "max_new_orders": 24,
+            "buy_pause_amp_trigger_ratio": 0.009,
+            "buy_pause_down_return_trigger_ratio": -0.005,
+            "short_cover_pause_amp_trigger_ratio": 0.006,
+            "short_cover_pause_down_return_trigger_ratio": -0.003,
+            "freeze_shift_abs_return_trigger_ratio": 0.006,
+            "adaptive_step_enabled": True,
+            "rolling_hourly_loss_limit": 3.0,
+            "max_cumulative_notional": 20000.0,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "1m",
+            "volatility_trigger_amplitude_ratio": 0.012,
+            "volatility_trigger_abs_return_ratio": 0.008,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": False,
+            "self_volume_trigger_enabled": True,
+            "self_volume_trigger_window": "15m",
+            "self_volume_trigger_start_threshold": 1200.0,
+            "self_volume_trigger_stop_threshold": 600.0,
+            "self_volume_trigger_stop_cancel_open_orders": True,
+            "self_volume_trigger_stop_close_all_positions": True,
+            "sleep_seconds": 3.0,
+            "leverage": 3,
+            "maker_retries": 2,
+            "autotune_symbol_enabled": False,
+            "market_bias_enabled": False,
+            "synthetic_trend_follow_enabled": False,
+        },
+    },
 }
 
 RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
@@ -1596,6 +1814,9 @@ RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
         "bzusdt_competition_maker_neutral_v1",
         "ordiusdc_competition_maker_neutral_v1",
         "chip_short_bias_ping_pong_v1",
+        "chip_short_bias_ping_pong_guarded_v2",
+        "chip_short_bias_ping_pong_guarded_v3",
+        "soon_volume_neutral_ping_pong_guarded_v2",
         "volume_short_v1",
         "xaut_volume_guarded_bard_v2",
     }
@@ -1644,6 +1865,13 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "pause_buy_position_notional": 750.0,
     "threshold_reduce_target_ratio": 0.0,
     "threshold_reduce_taker_timeout_seconds": 60.0,
+    "adverse_reduce_enabled": False,
+    "adverse_reduce_short_trigger_ratio": 0.01,
+    "adverse_reduce_long_trigger_ratio": 0.01,
+    "adverse_reduce_target_ratio": 0.75,
+    "adverse_reduce_maker_timeout_seconds": 45.0,
+    "adverse_reduce_max_order_notional": 0.0,
+    "adverse_reduce_keep_probe_scale": None,
     "max_position_notional": 900.0,
     "buy_pause_amp_trigger_ratio": 0.0075,
     "buy_pause_down_return_trigger_ratio": -0.0035,
@@ -1711,6 +1939,17 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volume_trigger_stop_threshold": None,
     "volume_trigger_stop_cancel_open_orders": True,
     "volume_trigger_stop_close_all_positions": False,
+    "self_volume_trigger_enabled": False,
+    "self_volume_trigger_window": DEFAULT_SELF_VOLUME_TRIGGER_WINDOW,
+    "self_volume_trigger_start_threshold": None,
+    "self_volume_trigger_stop_threshold": None,
+    "self_volume_trigger_resume_window": DEFAULT_SELF_VOLUME_TRIGGER_RESUME_WINDOW,
+    "self_volume_trigger_resume_amplitude_ratio": None,
+    "self_volume_trigger_resume_abs_return_ratio": None,
+    "self_volume_trigger_risk_actual_net_notional": None,
+    "self_volume_trigger_risk_short_adverse_ratio": None,
+    "self_volume_trigger_stop_cancel_open_orders": True,
+    "self_volume_trigger_stop_close_all_positions": True,
     "volatility_trigger_enabled": True,
     "volatility_trigger_window": DEFAULT_VOLATILITY_TRIGGER_WINDOW,
     "volatility_trigger_amplitude_ratio": 0.04,
@@ -1740,6 +1979,9 @@ RUNNER_AUTOTUNE_STEP_HINTS: dict[str, tuple[float, int]] = {
     "volume_neutral_push_guarded_v1": (0.00032, 2),
     "volume_neutral_ping_pong_v1": (0.00035, 2),
     "chip_short_bias_ping_pong_v1": (0.009, 10),
+    "chip_short_bias_ping_pong_guarded_v2": (0.009, 10),
+    "chip_short_bias_ping_pong_guarded_v3": (0.009, 10),
+    "soon_volume_neutral_ping_pong_guarded_v2": (0.00035, 2),
     "xaut_guarded_ping_pong_v1": (0.00048, 180),
     "xaut_near_price_guarded_v1": (0.00012, 1),
     "xaut_volume_guarded_bard_v3": (0.00021, 100),
@@ -2113,6 +2355,11 @@ def _normalize_volume_trigger_window(value: Any) -> str:
     return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLUME_TRIGGER_WINDOW
 
 
+def _normalize_self_volume_trigger_window(value: Any) -> str:
+    text = str(value or DEFAULT_SELF_VOLUME_TRIGGER_WINDOW).strip().lower()
+    return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_SELF_VOLUME_TRIGGER_WINDOW
+
+
 def _normalize_volatility_trigger_window(value: Any) -> str:
     text = str(value or DEFAULT_VOLATILITY_TRIGGER_WINDOW).strip().lower()
     return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLATILITY_TRIGGER_WINDOW
@@ -2149,6 +2396,49 @@ def _normalize_runner_volume_trigger_config(config: dict[str, Any]) -> dict[str,
         stop_threshold = normalized.get("volume_trigger_stop_threshold")
         if start_threshold is not None and stop_threshold is not None and stop_threshold > start_threshold:
             raise ValueError("volume trigger stop threshold cannot exceed start threshold")
+    return normalized
+
+
+def _normalize_runner_self_volume_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(config)
+    normalized["self_volume_trigger_enabled"] = bool(normalized.get("self_volume_trigger_enabled", False))
+    normalized["self_volume_trigger_window"] = _normalize_self_volume_trigger_window(
+        normalized.get("self_volume_trigger_window")
+    )
+    normalized["self_volume_trigger_resume_window"] = _normalize_self_volume_trigger_window(
+        normalized.get("self_volume_trigger_resume_window")
+    )
+    for key in {
+        "self_volume_trigger_start_threshold",
+        "self_volume_trigger_stop_threshold",
+        "self_volume_trigger_resume_amplitude_ratio",
+        "self_volume_trigger_resume_abs_return_ratio",
+        "self_volume_trigger_risk_actual_net_notional",
+        "self_volume_trigger_risk_short_adverse_ratio",
+    }:
+        value = normalized.get(key)
+        if value in {"", None}:
+            normalized[key] = None
+            continue
+        threshold = float(value)
+        if threshold <= 0:
+            raise ValueError(f"{key} must be > 0")
+        normalized[key] = threshold
+    normalized["self_volume_trigger_stop_cancel_open_orders"] = bool(
+        normalized.get("self_volume_trigger_stop_cancel_open_orders", True)
+    )
+    normalized["self_volume_trigger_stop_close_all_positions"] = bool(
+        normalized.get("self_volume_trigger_stop_close_all_positions", True)
+    )
+    if normalized["self_volume_trigger_stop_close_all_positions"]:
+        normalized["self_volume_trigger_stop_cancel_open_orders"] = True
+    if normalized["self_volume_trigger_enabled"]:
+        start_threshold = normalized.get("self_volume_trigger_start_threshold")
+        stop_threshold = normalized.get("self_volume_trigger_stop_threshold")
+        if stop_threshold is None:
+            raise ValueError("self volume trigger enabled requires stop threshold")
+        if start_threshold is not None and float(start_threshold) <= float(stop_threshold):
+            raise ValueError("self volume trigger start threshold must exceed stop threshold")
     return normalized
 
 
@@ -2277,7 +2567,37 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     if not stored and runner.get("config"):
         config.update(runner["config"])
     config = _normalize_runner_runtime_paths(config, normalized_symbol)
-    return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
+    return _normalize_runner_self_volume_trigger_config(
+        _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
+    )
+
+
+def _load_last_runner_control_config(symbol: str) -> tuple[dict[str, Any], str]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+
+    stored = _read_json_dict(_runner_control_path(normalized_symbol))
+    source = ""
+    candidate: dict[str, Any] | None = None
+    if isinstance(stored, dict) and stored:
+        candidate = dict(stored)
+        source = "saved_control"
+    else:
+        runner = _read_runner_process_for_symbol(normalized_symbol)
+        runner_config = dict(runner.get("config") or {})
+        runner_symbol = str(runner_config.get("symbol", "")).upper().strip()
+        if runner_config and (not runner_symbol or runner_symbol == normalized_symbol):
+            candidate = runner_config
+            source = "runner_process"
+
+    if not candidate:
+        raise ValueError(f"{normalized_symbol} 暂无最近运行策略配置，请先保存参数或成功启动一次策略")
+
+    candidate.setdefault("symbol", normalized_symbol)
+    normalized = _normalize_runner_control_payload(candidate)
+    normalized = _normalize_runner_runtime_paths(normalized, normalized_symbol)
+    return _autotune_runner_symbol_config(normalized), source
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -2350,6 +2670,10 @@ def _volatility_trigger_status_path(symbol: str) -> Path:
     return Path(f"output/{_symbol_output_slug(symbol)}_volatility_trigger_status.json")
 
 
+def _self_volume_trigger_status_path(symbol: str) -> Path:
+    return Path(f"output/{_symbol_output_slug(symbol)}_self_volume_trigger_status.json")
+
+
 def _resolve_runner_volume_trigger_action(
     config: dict[str, Any],
     *,
@@ -2383,6 +2707,103 @@ def _resolve_runner_volume_trigger_action(
     return {"action": None, "reason": "waiting_for_start_threshold"}
 
 
+def _resolve_runner_self_volume_trigger_action(
+    config: dict[str, Any],
+    *,
+    current_gross_notional: float,
+    runner_running: bool,
+    flatten_running: bool,
+    paused_by_trigger: bool,
+    warmup_complete: bool = True,
+    actual_net_notional_abs: float = 0.0,
+    short_adverse_ratio: float = 0.0,
+    resume_allowed: bool | None = None,
+    resume_reason: str | None = None,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_self_volume_trigger_config(config)
+    if not normalized_config.get("self_volume_trigger_enabled"):
+        return {"action": None, "reason": "disabled"}
+
+    stop_threshold = float(normalized_config["self_volume_trigger_stop_threshold"])
+    current = float(current_gross_notional)
+    actual_net_notional_abs = abs(float(actual_net_notional_abs))
+    short_adverse_ratio = float(short_adverse_ratio)
+    risk_actual_threshold = normalized_config.get("self_volume_trigger_risk_actual_net_notional")
+    risk_short_threshold = normalized_config.get("self_volume_trigger_risk_short_adverse_ratio")
+    low_volume_condition_met = current < stop_threshold
+    risk_actual_net_notional_met = (
+        risk_actual_threshold is not None and actual_net_notional_abs >= float(risk_actual_threshold)
+    )
+    risk_short_adverse_ratio_met = (
+        risk_short_threshold is not None and short_adverse_ratio >= float(risk_short_threshold)
+    )
+    risk_condition_met = bool(risk_actual_net_notional_met or risk_short_adverse_ratio_met)
+    context = {
+        "threshold": stop_threshold,
+        "low_volume_condition_met": low_volume_condition_met,
+        "risk_actual_net_notional_threshold": risk_actual_threshold,
+        "risk_actual_net_notional_met": risk_actual_net_notional_met,
+        "risk_short_adverse_ratio_threshold": risk_short_threshold,
+        "risk_short_adverse_ratio_met": risk_short_adverse_ratio_met,
+        "risk_condition_met": risk_condition_met,
+        "actual_net_notional_abs": actual_net_notional_abs,
+        "short_adverse_ratio": short_adverse_ratio,
+    }
+
+    if flatten_running and not runner_running:
+        return {"action": None, "reason": "flatten_running", **context}
+    if runner_running:
+        if current < stop_threshold:
+            if not warmup_complete:
+                return {
+                    "action": None,
+                    "reason": "warming_up_self_volume_window",
+                    **context,
+                }
+            if risk_condition_met:
+                return {
+                    "action": "stop",
+                    "reason": "low_self_volume_with_risk",
+                    **context,
+                }
+            return {
+                "action": None,
+                "reason": "low_self_volume_without_risk",
+                **context,
+            }
+        return {"action": None, "reason": "runner_running", **context}
+    if paused_by_trigger:
+        if resume_allowed is not None:
+            if resume_allowed:
+                return {
+                    "action": "start",
+                    "reason": str(resume_reason or "self_volume_resume_allowed"),
+                    **context,
+                }
+            return {
+                "action": None,
+                "reason": str(resume_reason or "waiting_for_self_volume_resume"),
+                **context,
+            }
+        start_threshold = normalized_config.get("self_volume_trigger_start_threshold")
+        if start_threshold is None:
+            return {"action": None, "reason": "waiting_for_manual_resume", **context}
+        if current >= start_threshold:
+            return {
+                "action": "start",
+                "reason": "self_volume_above_start_threshold",
+                "threshold": float(start_threshold),
+                **context,
+            }
+        return {
+            "action": None,
+            "reason": "waiting_for_self_volume_start_threshold",
+            "threshold": float(start_threshold),
+            **context,
+        }
+    return {"action": None, "reason": "runner_stopped", **context}
+
+
 def _update_volume_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
     normalized_symbol = str(symbol or "").upper().strip()
     if not normalized_symbol:
@@ -2398,6 +2819,49 @@ def _runner_volume_trigger_status(symbol: str) -> dict[str, Any] | None:
     with VOLUME_TRIGGER_STATUS_LOCK:
         status = VOLUME_TRIGGER_STATUS_CACHE.get(normalized_symbol)
         return dict(status) if isinstance(status, dict) else None
+
+
+def _update_self_volume_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    normalized_payload = dict(payload)
+    status_path = _self_volume_trigger_status_path(normalized_symbol)
+    status_path.parent.mkdir(parents=True, exist_ok=True)
+    status_path.write_text(json.dumps(normalized_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    with SELF_VOLUME_TRIGGER_STATUS_LOCK:
+        SELF_VOLUME_TRIGGER_STATUS_CACHE[normalized_symbol] = normalized_payload
+
+
+def _runner_self_volume_trigger_status(symbol: str) -> dict[str, Any] | None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return None
+    with SELF_VOLUME_TRIGGER_STATUS_LOCK:
+        cached = SELF_VOLUME_TRIGGER_STATUS_CACHE.get(normalized_symbol)
+        if isinstance(cached, dict):
+            return dict(cached)
+    payload = _read_json_dict(_self_volume_trigger_status_path(normalized_symbol))
+    if isinstance(payload, dict):
+        with SELF_VOLUME_TRIGGER_STATUS_LOCK:
+            SELF_VOLUME_TRIGGER_STATUS_CACHE[normalized_symbol] = dict(payload)
+        return dict(payload)
+    return None
+
+
+def _clear_self_volume_trigger_status(symbol: str, *, reason: str = "manual_clear") -> None:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return
+    status = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "symbol": normalized_symbol,
+        "action": None,
+        "reason": reason,
+        "paused_by_trigger": False,
+        "last_error": None,
+    }
+    _update_self_volume_trigger_status(normalized_symbol, status)
 
 
 def _update_volatility_trigger_status(symbol: str, payload: dict[str, Any]) -> None:
@@ -2460,6 +2924,209 @@ def _runner_volume_trigger_start_allowed(config: dict[str, Any], *, current_quot
         "allowed": False,
         "reason": "volume_below_start_threshold",
         "threshold": float(start_threshold),
+    }
+
+
+def _self_volume_trigger_window_stats(config: dict[str, Any]) -> dict[str, Any]:
+    normalized_config = _normalize_runner_self_volume_trigger_config(config)
+    window_key = _normalize_self_volume_trigger_window(normalized_config.get("self_volume_trigger_window"))
+    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    summary_text = str(normalized_config.get("summary_jsonl", "")).strip()
+    stats = {
+        "window": window_key,
+        "window_minutes": window_minutes,
+        "current_gross_notional": 0.0,
+        "trade_count": 0,
+        "net_realized": 0.0,
+        "summary_jsonl": summary_text,
+    }
+    if not summary_text:
+        return stats
+    window_stats = _summarize_symbol_trade_window(Path(summary_text), window_minutes=window_minutes)
+    stats.update(
+        {
+            "current_gross_notional": float(window_stats.get("gross_notional") or 0.0),
+            "trade_count": int(window_stats.get("trade_count") or 0),
+            "net_realized": float(window_stats.get("net_realized") or 0.0),
+        }
+    )
+    return stats
+
+
+def _self_volume_trigger_risk_snapshot(config: dict[str, Any]) -> dict[str, Any]:
+    normalized_config = _normalize_runner_self_volume_trigger_config(config)
+    summary_text = str(normalized_config.get("summary_jsonl", "")).strip()
+    snapshot = {
+        "events_path": summary_text,
+        "latest_event_ts": None,
+        "actual_net_notional": 0.0,
+        "actual_net_notional_abs": 0.0,
+        "short_adverse_ratio": 0.0,
+    }
+    if not summary_text:
+        return snapshot
+    latest = _read_last_jsonl_row(Path(summary_text)) or {}
+    actual_net_notional = float(latest.get("actual_net_notional") or 0.0)
+    snapshot.update(
+        {
+            "latest_event_ts": latest.get("ts"),
+            "actual_net_notional": actual_net_notional,
+            "actual_net_notional_abs": abs(actual_net_notional),
+            "short_adverse_ratio": float(latest.get("adverse_reduce_short_adverse_ratio") or 0.0),
+        }
+    )
+    return snapshot
+
+
+def _evaluate_runner_self_volume_resume_signal(
+    config: dict[str, Any],
+    *,
+    current_amplitude_ratio: float,
+    current_return_ratio: float,
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_self_volume_trigger_config(config)
+    amplitude_threshold = normalized_config.get("self_volume_trigger_resume_amplitude_ratio")
+    abs_return_threshold = normalized_config.get("self_volume_trigger_resume_abs_return_ratio")
+    matched_reasons: list[str] = []
+    if amplitude_threshold is not None and float(current_amplitude_ratio) > float(amplitude_threshold):
+        matched_reasons.append("resume_amplitude_above_threshold")
+    if abs_return_threshold is not None and abs(float(current_return_ratio)) > float(abs_return_threshold):
+        matched_reasons.append("resume_abs_return_above_threshold")
+    return {
+        "configured": amplitude_threshold is not None or abs_return_threshold is not None,
+        "ready": not bool(matched_reasons),
+        "matched_reasons": matched_reasons,
+        "resume_amplitude_threshold": amplitude_threshold,
+        "resume_abs_return_threshold": abs_return_threshold,
+    }
+
+
+def _self_volume_trigger_live_exposure(symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    exposure = {
+        "symbol": normalized_symbol,
+        "has_position": False,
+        "position_amt": 0.0,
+        "long_qty": 0.0,
+        "short_qty": 0.0,
+        "open_order_count": 0,
+        "has_open_orders": False,
+        "last_error": None,
+    }
+    creds = load_binance_api_credentials()
+    if creds is None:
+        exposure["last_error"] = "missing_binance_credentials"
+        return exposure
+    api_key, api_secret = creds
+    try:
+        account_info = fetch_futures_account_info_v3(api_key, api_secret)
+        position_mode = fetch_futures_position_mode(api_key, api_secret)
+        dual_side = str(position_mode.get("dualSidePosition", "")).strip().lower() in {"true", "1", "yes"}
+        if dual_side:
+            long_position = _extract_futures_position(account_info, normalized_symbol, "LONG")
+            short_position = _extract_futures_position(account_info, normalized_symbol, "SHORT")
+            long_qty = max(_safe_numeric(long_position.get("positionAmt")), 0.0)
+            short_qty = abs(_safe_numeric(short_position.get("positionAmt")))
+            position_amt = long_qty - short_qty
+            exposure["long_qty"] = long_qty
+            exposure["short_qty"] = short_qty
+            exposure["position_amt"] = position_amt
+            exposure["has_position"] = long_qty > 1e-12 or short_qty > 1e-12
+        else:
+            both_position = _extract_futures_position(account_info, normalized_symbol)
+            position_amt = _safe_numeric(both_position.get("positionAmt"))
+            exposure["position_amt"] = position_amt
+            exposure["long_qty"] = max(position_amt, 0.0)
+            exposure["short_qty"] = max(-position_amt, 0.0)
+            exposure["has_position"] = abs(position_amt) > 1e-12
+        open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
+        exposure["open_order_count"] = len(open_orders)
+        exposure["has_open_orders"] = bool(open_orders)
+    except Exception as exc:  # pragma: no cover
+        exposure["last_error"] = f"{type(exc).__name__}: {exc}"
+    return exposure
+
+
+def _runner_self_volume_trigger_start_allowed(config: dict[str, Any]) -> dict[str, Any]:
+    normalized_config = _normalize_runner_self_volume_trigger_config(config)
+    if not normalized_config.get("self_volume_trigger_enabled"):
+        return {"allowed": True, "reason": "disabled"}
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    previous_status = _runner_self_volume_trigger_status(symbol) or {}
+    if not bool(previous_status.get("paused_by_trigger", False)):
+        return {"allowed": True, "reason": "not_paused_by_self_volume_trigger"}
+    flatten = _read_flatten_process_for_symbol(symbol)
+    if bool(flatten.get("is_running")):
+        return {"allowed": False, "reason": "flatten_running"}
+    resume_window_key = _normalize_self_volume_trigger_window(normalized_config.get("self_volume_trigger_resume_window"))
+    resume_window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[resume_window_key]
+    resume_signal = {
+        "configured": False,
+        "ready": False,
+        "matched_reasons": [],
+        "resume_amplitude_threshold": normalized_config.get("self_volume_trigger_resume_amplitude_ratio"),
+        "resume_abs_return_threshold": normalized_config.get("self_volume_trigger_resume_abs_return_ratio"),
+    }
+    if resume_signal["resume_amplitude_threshold"] is not None or resume_signal["resume_abs_return_threshold"] is not None:
+        market_stats = fetch_futures_window_price_stats(symbol, window_minutes=resume_window_minutes)
+        current_amplitude_ratio = float(market_stats.get("amplitude_ratio") or 0.0)
+        current_return_ratio = float(market_stats.get("return_ratio") or 0.0)
+        resume_signal = {
+            **_evaluate_runner_self_volume_resume_signal(
+                normalized_config,
+                current_amplitude_ratio=current_amplitude_ratio,
+                current_return_ratio=current_return_ratio,
+            ),
+            "resume_window": resume_window_key,
+            "resume_window_minutes": resume_window_minutes,
+            "resume_market_amplitude": current_amplitude_ratio,
+            "resume_market_abs_return": abs(current_return_ratio),
+            "resume_market_return": current_return_ratio,
+        }
+        if not resume_signal.get("ready", False):
+            return {
+                "allowed": False,
+                "reason": "waiting_for_self_volume_resume_volatility",
+                **resume_signal,
+            }
+        exposure = _self_volume_trigger_live_exposure(symbol)
+        if exposure.get("last_error"):
+            return {
+                "allowed": False,
+                "reason": "waiting_for_self_volume_resume_exposure_check",
+                **resume_signal,
+                **exposure,
+            }
+        if exposure.get("has_position") or exposure.get("has_open_orders"):
+            return {
+                "allowed": False,
+                "reason": "waiting_for_self_volume_resume_flat",
+                **resume_signal,
+                **exposure,
+            }
+        return {
+            "allowed": True,
+            "reason": "self_volume_resume_volatility_within_threshold",
+            **resume_signal,
+            **exposure,
+        }
+    start_threshold = normalized_config.get("self_volume_trigger_start_threshold")
+    if start_threshold is None:
+        return {"allowed": False, "reason": "manual_resume_required"}
+    stats = _self_volume_trigger_window_stats(normalized_config)
+    start_threshold = float(start_threshold)
+    if float(stats["current_gross_notional"]) >= start_threshold:
+        return {
+            "allowed": True,
+            "reason": "self_volume_above_start_threshold",
+            "threshold": start_threshold,
+            **stats,
+        }
+    return {
+        "allowed": False,
+        "reason": "self_volume_below_start_threshold",
+        "threshold": start_threshold,
+        **stats,
     }
 
 
@@ -2599,6 +3266,13 @@ def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
                 status["volatility_block"] = volatility_gate
                 _update_volume_trigger_status(symbol, status)
                 return
+            self_volume_gate = _runner_self_volume_trigger_start_allowed(normalized_config)
+            if not self_volume_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "blocked_by_self_volume_trigger"
+                status["self_volume_block"] = self_volume_gate
+                _update_volume_trigger_status(symbol, status)
+                return
             result = _start_runner_process(normalized_config)
             status["result"] = {
                 "started": bool(result.get("started")),
@@ -2648,6 +3322,187 @@ def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
                     },
                 )
         stop_event.wait(VOLUME_TRIGGER_POLL_SECONDS)
+
+
+def _reconcile_runner_self_volume_trigger(config: dict[str, Any]) -> None:
+    normalized_config = _normalize_runner_self_volume_trigger_config(config)
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    if not symbol or not normalized_config.get("self_volume_trigger_enabled"):
+        return
+
+    checked_at = datetime.now(timezone.utc).isoformat()
+    stats = _self_volume_trigger_window_stats(normalized_config)
+    risk_snapshot = _self_volume_trigger_risk_snapshot(normalized_config)
+    runner = _read_runner_process_for_symbol(symbol)
+    flatten = _read_flatten_process_for_symbol(symbol)
+    previous_status = _runner_self_volume_trigger_status(symbol) or {}
+    running_observed_since = None
+    running_observed_seconds = 0.0
+    warmup_complete = True
+    if bool(runner.get("is_running")):
+        previous_running_since = str(previous_status.get("running_observed_since") or "").strip()
+        running_observed_since = previous_running_since or checked_at
+        try:
+            observed_start = datetime.fromisoformat(running_observed_since.replace("Z", "+00:00"))
+            running_observed_seconds = max(
+                (datetime.fromisoformat(checked_at).astimezone(timezone.utc) - observed_start.astimezone(timezone.utc)).total_seconds(),
+                0.0,
+            )
+        except ValueError:
+            running_observed_since = checked_at
+            running_observed_seconds = 0.0
+        warmup_complete = running_observed_seconds >= float(stats["window_minutes"]) * 60.0
+    resume_gate: dict[str, Any] | None = None
+    if bool(previous_status.get("paused_by_trigger", False)) and not bool(runner.get("is_running")):
+        resume_gate = _runner_self_volume_trigger_start_allowed(normalized_config)
+    decision = _resolve_runner_self_volume_trigger_action(
+        normalized_config,
+        current_gross_notional=float(stats.get("current_gross_notional") or 0.0),
+        runner_running=bool(runner.get("is_running")),
+        flatten_running=bool(flatten.get("is_running")),
+        paused_by_trigger=bool(previous_status.get("paused_by_trigger", False)),
+        warmup_complete=warmup_complete,
+        actual_net_notional_abs=float(risk_snapshot.get("actual_net_notional_abs") or 0.0),
+        short_adverse_ratio=float(risk_snapshot.get("short_adverse_ratio") or 0.0),
+        resume_allowed=resume_gate.get("allowed") if isinstance(resume_gate, dict) else None,
+        resume_reason=resume_gate.get("reason") if isinstance(resume_gate, dict) else None,
+    )
+    status: dict[str, Any] = {
+        "checked_at": checked_at,
+        "symbol": symbol,
+        "window": stats["window"],
+        "window_minutes": stats["window_minutes"],
+        "current_gross_notional": stats["current_gross_notional"],
+        "trade_count": stats["trade_count"],
+        "net_realized": stats["net_realized"],
+        "actual_net_notional": risk_snapshot["actual_net_notional"],
+        "actual_net_notional_abs": risk_snapshot["actual_net_notional_abs"],
+        "short_adverse_ratio": risk_snapshot["short_adverse_ratio"],
+        "risk_actual_net_notional_threshold": normalized_config.get("self_volume_trigger_risk_actual_net_notional"),
+        "risk_short_adverse_ratio_threshold": normalized_config.get("self_volume_trigger_risk_short_adverse_ratio"),
+        "start_threshold": normalized_config.get("self_volume_trigger_start_threshold"),
+        "stop_threshold": normalized_config.get("self_volume_trigger_stop_threshold"),
+        "resume_window": normalized_config.get("self_volume_trigger_resume_window"),
+        "resume_amplitude_ratio": normalized_config.get("self_volume_trigger_resume_amplitude_ratio"),
+        "resume_abs_return_ratio": normalized_config.get("self_volume_trigger_resume_abs_return_ratio"),
+        "runner_running": bool(runner.get("is_running")),
+        "flatten_running": bool(flatten.get("is_running")),
+        "running_observed_since": running_observed_since,
+        "running_observed_seconds": running_observed_seconds,
+        "warmup_complete": warmup_complete,
+        "action": decision.get("action"),
+        "reason": decision.get("reason"),
+        "low_volume_condition_met": bool(decision.get("low_volume_condition_met", False)),
+        "risk_actual_net_notional_met": bool(decision.get("risk_actual_net_notional_met", False)),
+        "risk_short_adverse_ratio_met": bool(decision.get("risk_short_adverse_ratio_met", False)),
+        "risk_condition_met": bool(decision.get("risk_condition_met", False)),
+        "paused_by_trigger": bool(previous_status.get("paused_by_trigger", False)),
+        "last_error": None,
+    }
+    if isinstance(resume_gate, dict):
+        status["resume_gate"] = resume_gate
+        status["resume_ready"] = bool(resume_gate.get("allowed", False))
+        for key in {
+            "resume_window",
+            "resume_window_minutes",
+            "resume_market_amplitude",
+            "resume_market_abs_return",
+            "resume_market_return",
+            "has_position",
+            "position_amt",
+            "long_qty",
+            "short_qty",
+            "open_order_count",
+            "has_open_orders",
+        }:
+            if key in resume_gate:
+                status[key] = resume_gate.get(key)
+    try:
+        if decision.get("action") == "start":
+            volume_gate = {"allowed": True, "reason": "disabled"}
+            if normalized_config.get("volume_trigger_enabled"):
+                volume_window_key = _normalize_volume_trigger_window(normalized_config.get("volume_trigger_window"))
+                volume_window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[volume_window_key]
+                quote_volume = fetch_futures_quote_volume_sum(symbol, window_minutes=volume_window_minutes)
+                volume_gate = {
+                    **_runner_volume_trigger_start_allowed(normalized_config, current_quote_volume=quote_volume),
+                    "window": volume_window_key,
+                    "window_minutes": volume_window_minutes,
+                    "current_quote_volume": quote_volume,
+                }
+            if not volume_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "resume_blocked_by_volume_trigger"
+                status["volume_block"] = volume_gate
+                _update_self_volume_trigger_status(symbol, status)
+                return
+            volatility_gate = _volatility_trigger_start_allowed(normalized_config)
+            if not volatility_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "resume_blocked_by_volatility_trigger"
+                status["volatility_block"] = volatility_gate
+                _update_self_volume_trigger_status(symbol, status)
+                return
+            result = _start_runner_process(normalized_config)
+            status["result"] = {
+                "started": bool(result.get("started")),
+                "already_running": bool(result.get("already_running")),
+                "restarted": bool(result.get("restarted")),
+            }
+            status["paused_by_trigger"] = False
+            print(
+                f"[self-volume-trigger] {symbol} resume window={stats['window']} "
+                f"gross={float(stats['current_gross_notional']):.4f}"
+            )
+        elif decision.get("action") == "stop":
+            result = _stop_runner_process(
+                symbol,
+                cancel_open_orders=bool(normalized_config.get("self_volume_trigger_stop_cancel_open_orders", True)),
+                close_all_positions=bool(normalized_config.get("self_volume_trigger_stop_close_all_positions", True)),
+                hard_close_all_positions=True,
+                flatten_allow_loss=True,
+            )
+            status["result"] = {
+                "stopped": bool(result.get("stopped")),
+                "already_stopped": bool(result.get("already_stopped")),
+            }
+            status["paused_by_trigger"] = True
+            print(
+                f"[self-volume-trigger] {symbol} stop window={stats['window']} "
+                f"gross={float(stats['current_gross_notional']):.4f} "
+                f"risk_net={float(risk_snapshot['actual_net_notional_abs']):.4f} "
+                f"risk_short_adv={float(risk_snapshot['short_adverse_ratio']):.4%}"
+            )
+        elif bool(runner.get("is_running")):
+            status["paused_by_trigger"] = False
+    except Exception as exc:  # pragma: no cover
+        status["last_error"] = f"{type(exc).__name__}: {exc}"
+    _update_self_volume_trigger_status(symbol, status)
+
+
+def _run_self_volume_trigger_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        for config in _iter_saved_runner_control_configs():
+            if not config.get("self_volume_trigger_enabled"):
+                continue
+            try:
+                _reconcile_runner_self_volume_trigger(config)
+            except Exception as exc:  # pragma: no cover
+                symbol = str(config.get("symbol", "")).upper().strip()
+                _update_self_volume_trigger_status(
+                    symbol,
+                    {
+                        "checked_at": datetime.now(timezone.utc).isoformat(),
+                        "symbol": symbol,
+                        "action": None,
+                        "reason": "error",
+                        "paused_by_trigger": bool(
+                            (_runner_self_volume_trigger_status(symbol) or {}).get("paused_by_trigger")
+                        ),
+                        "last_error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+        stop_event.wait(SELF_VOLUME_TRIGGER_POLL_SECONDS)
 
 
 def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
@@ -2707,6 +3562,13 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 status["action"] = None
                 status["reason"] = "resume_blocked_by_volume_trigger"
                 status["volume_block"] = volume_gate
+                _update_volatility_trigger_status(symbol, status)
+                return
+            self_volume_gate = _runner_self_volume_trigger_start_allowed(normalized_config)
+            if not self_volume_gate.get("allowed", True):
+                status["action"] = None
+                status["reason"] = "resume_blocked_by_self_volume_trigger"
+                status["self_volume_block"] = self_volume_gate
                 _update_volatility_trigger_status(symbol, status)
                 return
             result = _start_runner_process(normalized_config)
@@ -4131,6 +4993,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "pause_short_position_notional",
         "threshold_reduce_target_ratio",
         "threshold_reduce_taker_timeout_seconds",
+        "adverse_reduce_short_trigger_ratio",
+        "adverse_reduce_long_trigger_ratio",
+        "adverse_reduce_target_ratio",
+        "adverse_reduce_maker_timeout_seconds",
+        "adverse_reduce_max_order_notional",
+        "adverse_reduce_keep_probe_scale",
         "max_position_notional",
         "max_short_position_notional",
         "min_mid_price_for_buys",
@@ -4186,6 +5054,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_synthetic_drift_notional",
         "volume_trigger_start_threshold",
         "volume_trigger_stop_threshold",
+        "self_volume_trigger_start_threshold",
+        "self_volume_trigger_stop_threshold",
+        "self_volume_trigger_resume_amplitude_ratio",
+        "self_volume_trigger_resume_abs_return_ratio",
+        "self_volume_trigger_risk_actual_net_notional",
+        "self_volume_trigger_risk_short_adverse_ratio",
         "volatility_trigger_amplitude_ratio",
         "volatility_trigger_abs_return_ratio",
         "sleep_seconds",
@@ -4215,6 +5089,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_weak_buy_pause_enabled",
         "market_bias_strong_short_pause_enabled",
         "market_bias_regime_switch_enabled",
+        "adverse_reduce_enabled",
         "adaptive_step_enabled",
         "synthetic_trend_follow_enabled",
         "auto_regime_enabled",
@@ -4226,6 +5101,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_trigger_enabled",
         "volume_trigger_stop_cancel_open_orders",
         "volume_trigger_stop_close_all_positions",
+        "self_volume_trigger_enabled",
+        "self_volume_trigger_stop_cancel_open_orders",
+        "self_volume_trigger_stop_close_all_positions",
         "volatility_trigger_enabled",
         "volatility_trigger_stop_cancel_open_orders",
         "volatility_trigger_stop_close_all_positions",
@@ -4243,12 +5121,15 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "run_end_time",
         "runtime_guard_stats_start_time",
         "volume_trigger_window",
+        "self_volume_trigger_window",
+        "self_volume_trigger_resume_window",
         "volatility_trigger_window",
     }
     noneable_fields = {
         "center_price",
         "pause_buy_position_notional",
         "pause_short_position_notional",
+        "adverse_reduce_keep_probe_scale",
         "max_position_notional",
         "max_short_position_notional",
         "min_mid_price_for_buys",
@@ -4290,6 +5171,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "runtime_guard_stats_start_time",
         "volume_trigger_start_threshold",
         "volume_trigger_stop_threshold",
+        "self_volume_trigger_start_threshold",
+        "self_volume_trigger_stop_threshold",
+        "self_volume_trigger_resume_amplitude_ratio",
+        "self_volume_trigger_resume_abs_return_ratio",
+        "self_volume_trigger_risk_actual_net_notional",
+        "self_volume_trigger_risk_short_adverse_ratio",
         "volatility_trigger_amplitude_ratio",
         "volatility_trigger_abs_return_ratio",
     }
@@ -4328,6 +5215,49 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     if threshold_reduce_timeout < 0:
         raise ValueError("threshold_reduce_taker_timeout_seconds must be >= 0")
     config["threshold_reduce_taker_timeout_seconds"] = threshold_reduce_timeout
+    adverse_short_trigger_ratio = _safe_float(
+        config.get("adverse_reduce_short_trigger_ratio", 0.01),
+        "adverse_reduce_short_trigger_ratio",
+    )
+    if adverse_short_trigger_ratio < 0:
+        raise ValueError("adverse_reduce_short_trigger_ratio must be >= 0")
+    config["adverse_reduce_short_trigger_ratio"] = adverse_short_trigger_ratio
+    adverse_long_trigger_ratio = _safe_float(
+        config.get("adverse_reduce_long_trigger_ratio", 0.01),
+        "adverse_reduce_long_trigger_ratio",
+    )
+    if adverse_long_trigger_ratio < 0:
+        raise ValueError("adverse_reduce_long_trigger_ratio must be >= 0")
+    config["adverse_reduce_long_trigger_ratio"] = adverse_long_trigger_ratio
+    adverse_target_ratio = _safe_float(
+        config.get("adverse_reduce_target_ratio", 0.75),
+        "adverse_reduce_target_ratio",
+    )
+    if adverse_target_ratio < 0 or adverse_target_ratio >= 1:
+        raise ValueError("adverse_reduce_target_ratio must be >= 0 and < 1")
+    config["adverse_reduce_target_ratio"] = adverse_target_ratio
+    adverse_maker_timeout = _safe_float(
+        config.get("adverse_reduce_maker_timeout_seconds", 45.0),
+        "adverse_reduce_maker_timeout_seconds",
+    )
+    if adverse_maker_timeout < 0:
+        raise ValueError("adverse_reduce_maker_timeout_seconds must be >= 0")
+    config["adverse_reduce_maker_timeout_seconds"] = adverse_maker_timeout
+    adverse_max_order_notional = _safe_float(
+        config.get("adverse_reduce_max_order_notional", 0.0),
+        "adverse_reduce_max_order_notional",
+    )
+    if adverse_max_order_notional < 0:
+        raise ValueError("adverse_reduce_max_order_notional must be >= 0")
+    config["adverse_reduce_max_order_notional"] = adverse_max_order_notional
+    adverse_keep_probe_scale = config.get("adverse_reduce_keep_probe_scale")
+    if adverse_keep_probe_scale not in {"", None}:
+        adverse_keep_probe_scale = _safe_float(adverse_keep_probe_scale, "adverse_reduce_keep_probe_scale")
+        if adverse_keep_probe_scale < 0 or adverse_keep_probe_scale > 1:
+            raise ValueError("adverse_reduce_keep_probe_scale must be within [0, 1]")
+        config["adverse_reduce_keep_probe_scale"] = adverse_keep_probe_scale
+    else:
+        config["adverse_reduce_keep_probe_scale"] = None
     config.update(
         normalize_runtime_guard_payload(
             config,
@@ -4335,7 +5265,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
             market="futures",
         )
     )
-    return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
+    return _normalize_runner_self_volume_trigger_config(
+        _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
+    )
 
 
 def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
@@ -4462,11 +5394,45 @@ def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]
     symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     _save_runner_control_config(config, symbol=symbol)
     _clear_volatility_trigger_status(symbol, reason="saved_without_start")
+    _clear_self_volume_trigger_status(symbol, reason="saved_without_start")
     return {
         "saved": True,
         "symbol": symbol,
         "config": config,
         "runner": _read_runner_process_for_symbol(symbol),
+    }
+
+
+def _start_runner_from_last_config(symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    config, config_source = _load_last_runner_control_config(normalized_symbol)
+    result = _start_runner_process(config)
+    return {
+        **result,
+        "symbol": normalized_symbol,
+        "config": config,
+        "config_source": config_source,
+    }
+
+
+def _quick_flatten_runner_symbol(symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    result = _stop_runner_process(
+        normalized_symbol,
+        cancel_open_orders=True,
+        close_all_positions=True,
+        flatten_allow_loss=True,
+        clear_volatility_resume_state=True,
+        clear_self_volume_resume_state=True,
+    )
+    return {
+        **result,
+        "symbol": normalized_symbol,
+        "flatten_allow_loss": True,
     }
 
 
@@ -4621,6 +5587,25 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--threshold-reduce-target-ratio", str(config["threshold_reduce_target_ratio"])])
     if config.get("threshold_reduce_taker_timeout_seconds") is not None:
         command.extend(["--threshold-reduce-taker-timeout-seconds", str(config["threshold_reduce_taker_timeout_seconds"])])
+    command.append("--adverse-reduce-enabled" if config.get("adverse_reduce_enabled", False) else "--no-adverse-reduce-enabled")
+    if config.get("adverse_reduce_short_trigger_ratio") is not None:
+        command.extend(["--adverse-reduce-short-trigger-ratio", str(config["adverse_reduce_short_trigger_ratio"])])
+    if config.get("adverse_reduce_long_trigger_ratio") is not None:
+        command.extend(["--adverse-reduce-long-trigger-ratio", str(config["adverse_reduce_long_trigger_ratio"])])
+    if config.get("adverse_reduce_target_ratio") is not None:
+        command.extend(["--adverse-reduce-target-ratio", str(config["adverse_reduce_target_ratio"])])
+    if config.get("adverse_reduce_maker_timeout_seconds") is not None:
+        command.extend([
+            "--adverse-reduce-maker-timeout-seconds",
+            str(config["adverse_reduce_maker_timeout_seconds"]),
+        ])
+    if config.get("adverse_reduce_max_order_notional") is not None:
+        command.extend([
+            "--adverse-reduce-max-order-notional",
+            str(config["adverse_reduce_max_order_notional"]),
+        ])
+    if config.get("adverse_reduce_keep_probe_scale") is not None:
+        command.extend(["--adverse-reduce-keep-probe-scale", str(config["adverse_reduce_keep_probe_scale"])])
     if config.get("max_position_notional") is not None:
         command.extend(["--max-position-notional", str(config["max_position_notional"])])
     if config.get("max_short_position_notional") is not None:
@@ -4842,6 +5827,13 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "pause_short_position_notional",
             "threshold_reduce_target_ratio",
             "threshold_reduce_taker_timeout_seconds",
+            "adverse_reduce_enabled",
+            "adverse_reduce_short_trigger_ratio",
+            "adverse_reduce_long_trigger_ratio",
+            "adverse_reduce_target_ratio",
+            "adverse_reduce_maker_timeout_seconds",
+            "adverse_reduce_max_order_notional",
+            "adverse_reduce_keep_probe_scale",
             "max_position_notional",
             "max_short_position_notional",
             "custom_grid_roll_enabled",
@@ -4925,12 +5917,14 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
         if not config_changed:
             _save_runner_control_config(config, symbol=symbol)
             _clear_volatility_trigger_status(symbol, reason="runner_running")
+            _clear_self_volume_trigger_status(symbol, reason="runner_running")
             return {"started": False, "already_running": True, "runner": runner, "symbol": symbol, "restarted": False}
         _stop_runner_process(symbol)
         restarted = True
 
     _save_runner_control_config(config, symbol=symbol)
     _clear_volatility_trigger_status(symbol, reason="runner_started")
+    _clear_self_volume_trigger_status(symbol, reason="runner_started")
     use_legacy_runner = _uses_legacy_runner(symbol)
     service_name = _runner_service_name_for_symbol(symbol)
     if use_legacy_runner and _runner_launch_agent_available():
@@ -5149,7 +6143,10 @@ def _stop_runner_process(
     *,
     cancel_open_orders: bool = False,
     close_all_positions: bool = False,
+    hard_close_all_positions: bool = False,
+    flatten_allow_loss: bool = False,
     clear_volatility_resume_state: bool = False,
+    clear_self_volume_resume_state: bool = False,
 ) -> dict[str, Any]:
     normalized_symbol = str(symbol or _legacy_runner_symbol()).upper().strip() or _legacy_runner_symbol()
     runner = _read_runner_process_for_symbol(normalized_symbol)
@@ -5168,6 +6165,8 @@ def _stop_runner_process(
                     pass
             if clear_volatility_resume_state:
                 _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
+            if clear_self_volume_resume_state:
+                _clear_self_volume_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": False,
                 "already_stopped": True,
@@ -5178,6 +6177,8 @@ def _stop_runner_process(
                     symbol=normalized_symbol,
                     cancel_open_orders=cancel_open_orders,
                     close_all_positions=close_all_positions,
+                    hard_close_all_positions=hard_close_all_positions,
+                    flatten_allow_loss=flatten_allow_loss,
                 ),
             }
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}", str(RUNNER_LAUNCH_AGENT_PATH)], check=False)
@@ -5189,10 +6190,14 @@ def _stop_runner_process(
                 pass
         if clear_volatility_resume_state:
             _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
+        if clear_self_volume_resume_state:
+            _clear_self_volume_trigger_status(normalized_symbol, reason="manual_stop")
         post_stop_actions = _execute_stop_actions(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
             close_all_positions=close_all_positions,
+            hard_close_all_positions=hard_close_all_positions,
+            flatten_allow_loss=flatten_allow_loss,
         )
         return {
             "stopped": True,
@@ -5213,6 +6218,8 @@ def _stop_runner_process(
                     pass
             if clear_volatility_resume_state:
                 _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
+            if clear_self_volume_resume_state:
+                _clear_self_volume_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": False,
                 "already_stopped": True,
@@ -5223,6 +6230,8 @@ def _stop_runner_process(
                     symbol=normalized_symbol,
                     cancel_open_orders=cancel_open_orders,
                     close_all_positions=close_all_positions,
+                    hard_close_all_positions=hard_close_all_positions,
+                    flatten_allow_loss=flatten_allow_loss,
                 ),
             }
         _run_systemctl(["stop", service_name], check=True)
@@ -5234,10 +6243,14 @@ def _stop_runner_process(
                 pass
         if clear_volatility_resume_state:
             _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
+        if clear_self_volume_resume_state:
+            _clear_self_volume_trigger_status(normalized_symbol, reason="manual_stop")
         post_stop_actions = _execute_stop_actions(
             symbol=normalized_symbol,
             cancel_open_orders=cancel_open_orders,
             close_all_positions=close_all_positions,
+            hard_close_all_positions=hard_close_all_positions,
+            flatten_allow_loss=flatten_allow_loss,
         )
         return {
             "stopped": True,
@@ -5257,6 +6270,8 @@ def _stop_runner_process(
                 pass
         if clear_volatility_resume_state:
             _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
+        if clear_self_volume_resume_state:
+            _clear_self_volume_trigger_status(normalized_symbol, reason="manual_stop")
         return {
             "stopped": False,
             "already_stopped": True,
@@ -5266,6 +6281,8 @@ def _stop_runner_process(
                 symbol=normalized_symbol,
                 cancel_open_orders=cancel_open_orders,
                 close_all_positions=close_all_positions,
+                hard_close_all_positions=hard_close_all_positions,
+                flatten_allow_loss=flatten_allow_loss,
             ),
         }
 
@@ -5281,6 +6298,8 @@ def _stop_runner_process(
                     pass
             if clear_volatility_resume_state:
                 _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
+            if clear_self_volume_resume_state:
+                _clear_self_volume_trigger_status(normalized_symbol, reason="manual_stop")
             return {
                 "stopped": True,
                 "killed": False,
@@ -5290,6 +6309,8 @@ def _stop_runner_process(
                     symbol=normalized_symbol,
                     cancel_open_orders=cancel_open_orders,
                     close_all_positions=close_all_positions,
+                    hard_close_all_positions=hard_close_all_positions,
+                    flatten_allow_loss=flatten_allow_loss,
                 ),
             }
         time.sleep(0.25)
@@ -5303,10 +6324,14 @@ def _stop_runner_process(
             pass
     if clear_volatility_resume_state:
         _clear_volatility_trigger_status(normalized_symbol, reason="manual_stop")
+    if clear_self_volume_resume_state:
+        _clear_self_volume_trigger_status(normalized_symbol, reason="manual_stop")
     post_stop_actions = _execute_stop_actions(
         symbol=normalized_symbol,
         cancel_open_orders=cancel_open_orders,
         close_all_positions=close_all_positions,
+        hard_close_all_positions=hard_close_all_positions,
+        flatten_allow_loss=flatten_allow_loss,
     )
     return {
         "stopped": True,
@@ -5350,11 +6375,15 @@ def _build_stop_execution_summary(
     symbol: str,
     cancel_open_orders: bool,
     close_all_positions: bool,
+    hard_close_all_positions: bool,
+    flatten_allow_loss: bool,
 ) -> dict[str, Any]:
     return {
         "symbol": symbol,
         "cancel_open_orders_requested": bool(cancel_open_orders),
         "close_all_positions_requested": bool(close_all_positions),
+        "hard_close_all_positions_requested": bool(hard_close_all_positions),
+        "flatten_allow_loss": bool(flatten_allow_loss),
         "cancel_open_orders_executed": False,
         "close_all_positions_executed": False,
         "cancel_attempted_count": 0,
@@ -5364,6 +6393,10 @@ def _build_stop_execution_summary(
         "close_submitted_count": 0,
         "close_errors": [],
         "close_orders": [],
+        "hard_close_attempted_count": 0,
+        "hard_close_submitted_count": 0,
+        "hard_close_errors": [],
+        "hard_close_orders": [],
         "flatten_started": False,
         "flatten_already_running": False,
         "warnings": [],
@@ -5525,11 +6558,15 @@ def _execute_stop_actions(
     symbol: str,
     cancel_open_orders: bool,
     close_all_positions: bool,
+    hard_close_all_positions: bool = False,
+    flatten_allow_loss: bool = False,
 ) -> dict[str, Any]:
     summary = _build_stop_execution_summary(
         symbol=symbol,
         cancel_open_orders=cancel_open_orders,
         close_all_positions=close_all_positions,
+        hard_close_all_positions=hard_close_all_positions,
+        flatten_allow_loss=flatten_allow_loss,
     )
     if not cancel_open_orders and not close_all_positions:
         return summary
@@ -5547,11 +6584,32 @@ def _execute_stop_actions(
         summary["cancel_errors"] = cancel_result["errors"]
     if close_all_positions:
         summary["close_all_positions_executed"] = True
-        live_snapshot = load_live_flatten_snapshot(symbol, api_key, api_secret)
+        if hard_close_all_positions:
+            hard_close_result = _close_symbol_positions_at_top_of_book(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+            )
+            summary["hard_close_attempted_count"] = hard_close_result["attempted"]
+            summary["hard_close_submitted_count"] = hard_close_result["submitted"]
+            summary["hard_close_errors"] = hard_close_result["errors"]
+            summary["hard_close_orders"] = hard_close_result["orders"]
+            summary["warnings"].extend(hard_close_result.get("warnings", []))
+            if hard_close_result["attempted"] > 0:
+                time.sleep(0.5)
+        live_snapshot = load_live_flatten_snapshot(
+            symbol,
+            api_key,
+            api_secret,
+            allow_loss=flatten_allow_loss,
+        )
         summary["close_attempted_count"] = len(live_snapshot.get("orders", []))
         summary["warnings"].extend(live_snapshot.get("warnings", []))
         if not live_snapshot.get("orders"):
-            summary["warnings"].append("当前无可平持仓，未启动跟价平仓进程")
+            if hard_close_all_positions and summary["hard_close_submitted_count"] > 0:
+                summary["warnings"].append("即时平仓后当前无残余持仓，未启动跟价平仓进程")
+            else:
+                summary["warnings"].append("当前无可平持仓，未启动跟价平仓进程")
         else:
             flatten_result = _start_flatten_process(
                 {
@@ -5561,14 +6619,21 @@ def _execute_stop_actions(
                     "recv_window": 5000,
                     "max_consecutive_errors": 20,
                     "events_jsonl": str(_flatten_events_path(symbol)),
+                    "allow_loss": flatten_allow_loss,
                 }
             )
             summary["flatten_started"] = bool(flatten_result.get("started"))
             summary["flatten_already_running"] = bool(flatten_result.get("already_running"))
             if flatten_result.get("started"):
-                summary["warnings"].append("已启动买一/卖一 maker 跟价平仓，直到仓位归零")
+                if flatten_allow_loss:
+                    summary["warnings"].append("已启动允许亏损的买一/卖一 maker 跟价平仓，直到仓位归零")
+                else:
+                    summary["warnings"].append("已启动买一/卖一 maker 跟价平仓，直到仓位归零")
             elif flatten_result.get("already_running"):
-                summary["warnings"].append("买一/卖一 maker 跟价平仓已在运行")
+                if flatten_allow_loss:
+                    summary["warnings"].append("允许亏损的买一/卖一 maker 跟价平仓已在运行")
+                else:
+                    summary["warnings"].append("买一/卖一 maker 跟价平仓已在运行")
     return summary
 
 
@@ -12098,6 +13163,8 @@ MONITOR_PAGE = """<!doctype html>
         <button id="toggle_btn">暂停自动刷新</button>
         <button id="start_strategy_btn" class="primary">启动策略</button>
         <button id="stop_strategy_btn">停止策略</button>
+        <button id="quick_start_last_btn" class="primary">一键启动</button>
+        <button id="quick_flatten_btn">一键清仓</button>
         <label class="inline-check" title="停止策略后撤销当前交易对全部未成交委托">
           <span class="check-row">
             <input id="stop_cancel_orders" type="checkbox" />
@@ -12166,6 +13233,7 @@ MONITOR_PAGE = """<!doctype html>
         </label>
         <label>量能窗口
           <select id="monitor_volume_trigger_window">
+            <option value="1m">最近 1 分钟</option>
             <option value="15m">最近 15 分钟</option>
             <option value="30m">最近 30 分钟</option>
             <option value="1h">最近 1 小时</option>
@@ -12193,6 +13261,66 @@ MONITOR_PAGE = """<!doctype html>
         </label>
       </div>
       <div class="toolbar runtime-guard-toolbar">
+        <label class="inline-check" title="启用后，web 服务会按策略自己的最近成交额判断低量背景，并可叠加净敞口或空侧逆向偏离风险后自动停机清仓">
+          <span class="check-row">
+            <input id="monitor_self_volume_trigger_enabled" type="checkbox" />
+            <span>启用自成交量低量停机</span>
+          </span>
+        </label>
+        <label>自成交量窗口
+          <select id="monitor_self_volume_trigger_window">
+            <option value="1m">最近 1 分钟</option>
+            <option value="15m">最近 15 分钟</option>
+            <option value="30m">最近 30 分钟</option>
+            <option value="1h">最近 1 小时</option>
+            <option value="4h">最近 4 小时</option>
+            <option value="24h">最近 24 小时</option>
+          </select>
+        </label>
+        <label>自成交恢复阈值(可选)
+          <input id="monitor_self_volume_trigger_start_threshold" type="number" min="0" step="0.01" />
+        </label>
+        <label>低量停止成交额阈值
+          <input id="monitor_self_volume_trigger_stop_threshold" type="number" min="0" step="0.01" />
+        </label>
+        <label class="inline-check" title="自成交量低于停止阈值后，自动停机时先撤掉当前交易对全部未成交委托">
+          <span class="check-row">
+            <input id="monitor_self_volume_trigger_stop_cancel_orders" type="checkbox" />
+            <span>低自成交停机时自动撤单</span>
+          </span>
+        </label>
+        <label class="inline-check" title="自成交量低于停止阈值后，自动停机时再启动 maker 跟价平仓，直到仓位归零">
+          <span class="check-row">
+            <input id="monitor_self_volume_trigger_stop_close_positions" type="checkbox" />
+            <span>低自成交停机时自动清仓</span>
+          </span>
+        </label>
+      </div>
+      <div class="toolbar runtime-guard-toolbar">
+        <label>低量恢复波动窗口
+          <select id="monitor_self_volume_trigger_resume_window">
+            <option value="1m">最近 1 分钟</option>
+            <option value="15m">最近 15 分钟</option>
+            <option value="30m">最近 30 分钟</option>
+            <option value="1h">最近 1 小时</option>
+            <option value="4h">最近 4 小时</option>
+            <option value="24h">最近 24 小时</option>
+          </select>
+        </label>
+        <label>恢复振幅阈值
+          <input id="monitor_self_volume_trigger_resume_amplitude_ratio" type="number" min="0" step="0.0001" />
+        </label>
+        <label>恢复绝对涨跌阈值
+          <input id="monitor_self_volume_trigger_resume_abs_return_ratio" type="number" min="0" step="0.0001" />
+        </label>
+        <label>低量风险净敞口阈值
+          <input id="monitor_self_volume_trigger_risk_actual_net_notional" type="number" min="0" step="0.01" />
+        </label>
+        <label>低量风险空侧逆向阈值
+          <input id="monitor_self_volume_trigger_risk_short_adverse_ratio" type="number" min="0" step="0.0001" />
+        </label>
+      </div>
+      <div class="toolbar runtime-guard-toolbar">
         <label class="inline-check" title="启用后，web 服务会持续观察最近窗口的振幅和涨跌幅；超过阈值自动暂停，回落后自动恢复">
           <span class="check-row">
             <input id="monitor_volatility_trigger_enabled" type="checkbox" />
@@ -12201,6 +13329,7 @@ MONITOR_PAGE = """<!doctype html>
         </label>
         <label>波动窗口
           <select id="monitor_volatility_trigger_window">
+            <option value="1m">最近 1 分钟</option>
             <option value="15m">最近 15 分钟</option>
             <option value="30m">最近 30 分钟</option>
             <option value="1h">最近 1 小时</option>
@@ -12891,6 +14020,8 @@ MONITOR_PAGE = """<!doctype html>
     const strategyPresetEl = document.getElementById("strategy_preset");
     const startStrategyBtn = document.getElementById("start_strategy_btn");
     const stopStrategyBtn = document.getElementById("stop_strategy_btn");
+    const quickStartLastBtn = document.getElementById("quick_start_last_btn");
+    const quickFlattenBtn = document.getElementById("quick_flatten_btn");
     const stopCancelOrdersEl = document.getElementById("stop_cancel_orders");
     const stopClosePositionsEl = document.getElementById("stop_close_positions");
     const strategyActionMetaEl = document.getElementById("strategy_action_meta");
@@ -12918,6 +14049,17 @@ MONITOR_PAGE = """<!doctype html>
     const monitorVolumeTriggerStopThresholdEl = document.getElementById("monitor_volume_trigger_stop_threshold");
     const monitorVolumeTriggerStopCancelOrdersEl = document.getElementById("monitor_volume_trigger_stop_cancel_orders");
     const monitorVolumeTriggerStopClosePositionsEl = document.getElementById("monitor_volume_trigger_stop_close_positions");
+    const monitorSelfVolumeTriggerEnabledEl = document.getElementById("monitor_self_volume_trigger_enabled");
+    const monitorSelfVolumeTriggerWindowEl = document.getElementById("monitor_self_volume_trigger_window");
+    const monitorSelfVolumeTriggerStartThresholdEl = document.getElementById("monitor_self_volume_trigger_start_threshold");
+    const monitorSelfVolumeTriggerStopThresholdEl = document.getElementById("monitor_self_volume_trigger_stop_threshold");
+    const monitorSelfVolumeTriggerResumeWindowEl = document.getElementById("monitor_self_volume_trigger_resume_window");
+    const monitorSelfVolumeTriggerResumeAmplitudeRatioEl = document.getElementById("monitor_self_volume_trigger_resume_amplitude_ratio");
+    const monitorSelfVolumeTriggerResumeAbsReturnRatioEl = document.getElementById("monitor_self_volume_trigger_resume_abs_return_ratio");
+    const monitorSelfVolumeTriggerRiskActualNetNotionalEl = document.getElementById("monitor_self_volume_trigger_risk_actual_net_notional");
+    const monitorSelfVolumeTriggerRiskShortAdverseRatioEl = document.getElementById("monitor_self_volume_trigger_risk_short_adverse_ratio");
+    const monitorSelfVolumeTriggerStopCancelOrdersEl = document.getElementById("monitor_self_volume_trigger_stop_cancel_orders");
+    const monitorSelfVolumeTriggerStopClosePositionsEl = document.getElementById("monitor_self_volume_trigger_stop_close_positions");
     const monitorVolatilityTriggerEnabledEl = document.getElementById("monitor_volatility_trigger_enabled");
     const monitorVolatilityTriggerWindowEl = document.getElementById("monitor_volatility_trigger_window");
     const monitorVolatilityTriggerAmplitudeRatioEl = document.getElementById("monitor_volatility_trigger_amplitude_ratio");
@@ -12958,6 +14100,9 @@ MONITOR_PAGE = """<!doctype html>
       "clusdt_competition_maker_neutral_v1",
       "bzusdt_competition_maker_neutral_v1",
       "ordiusdc_competition_maker_neutral_v1",
+      "chip_short_bias_ping_pong_guarded_v3",
+      "chip_short_bias_ping_pong_guarded_v2",
+      "soon_volume_neutral_ping_pong_guarded_v2",
       "volume_short_v1",
       "xaut_volume_guarded_bard_v2",
     ]);
@@ -14240,6 +15385,220 @@ MONITOR_PAGE = """<!doctype html>
           synthetic_trend_follow_enabled: false,
         },
       },
+      {
+        key: "chip_short_bias_ping_pong_guarded_v2",
+        label: "CHIP 偏空护栏 v2",
+        description: "CHIPUSDT 专用低仓位偏空 ping-pong。追加单边亏损主动减仓、自成交量过低停机清仓，并把硬风控压到先控回撤。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "CHIPUSDT",
+        config: {
+          symbol: "CHIPUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0012,
+          buy_levels: 6,
+          sell_levels: 10,
+          per_order_notional: 20,
+          startup_entry_multiplier: 1.5,
+          base_position_notional: 0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 90,
+          pause_short_position_notional: 160,
+          max_position_notional: 120,
+          max_short_position_notional: 220,
+          max_total_notional: 300,
+          max_actual_net_notional: 70,
+          max_synthetic_drift_notional: 25,
+          static_buy_offset_steps: 1.2,
+          static_sell_offset_steps: 0.6,
+          near_market_entry_max_center_distance_steps: 3,
+          grid_inventory_rebalance_min_center_distance_steps: 5,
+          near_market_reentry_confirm_cycles: 4,
+          take_profit_min_profit_ratio: 0.0008,
+          threshold_reduce_target_ratio: 0,
+          adverse_reduce_enabled: true,
+          adverse_reduce_short_trigger_ratio: 0.010,
+          adverse_reduce_long_trigger_ratio: 0.015,
+          adverse_reduce_target_ratio: 0.50,
+          adverse_reduce_maker_timeout_seconds: 30,
+          adverse_reduce_max_order_notional: 40,
+          adverse_reduce_keep_probe_scale: 0.20,
+          max_new_orders: 20,
+          buy_pause_amp_trigger_ratio: 0.018,
+          buy_pause_down_return_trigger_ratio: -0.010,
+          short_cover_pause_amp_trigger_ratio: 0.010,
+          short_cover_pause_down_return_trigger_ratio: -0.006,
+          freeze_shift_abs_return_trigger_ratio: 0.012,
+          rolling_hourly_loss_limit: 4,
+          max_cumulative_notional: 30000,
+          volatility_trigger_enabled: true,
+          volatility_trigger_window: "1m",
+          volatility_trigger_amplitude_ratio: 0.035,
+          volatility_trigger_abs_return_ratio: 0.020,
+          volatility_trigger_stop_cancel_open_orders: true,
+          volatility_trigger_stop_close_all_positions: false,
+          self_volume_trigger_enabled: true,
+          self_volume_trigger_window: "15m",
+          self_volume_trigger_start_threshold: 1800,
+          self_volume_trigger_stop_threshold: 1000,
+          self_volume_trigger_stop_cancel_open_orders: true,
+          self_volume_trigger_stop_close_all_positions: true,
+          sleep_seconds: 3,
+          leverage: 3,
+          maker_retries: 2,
+          autotune_symbol_enabled: false,
+          adaptive_step_enabled: false,
+          market_bias_enabled: false,
+          synthetic_trend_follow_enabled: false,
+        },
+      },
+      {
+        key: "chip_short_bias_ping_pong_guarded_v3",
+        label: "CHIP 偏空护栏 v3",
+        description: "CHIPUSDT 的条件低量停机版。低量只作为背景，叠加净敞口或空侧逆向偏离过大才停机，并在 15m 波动回落后自动恢复。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "CHIPUSDT",
+        config: {
+          symbol: "CHIPUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0012,
+          buy_levels: 6,
+          sell_levels: 10,
+          per_order_notional: 40,
+          startup_entry_multiplier: 1.5,
+          base_position_notional: 0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 120,
+          pause_short_position_notional: 220,
+          max_position_notional: 160,
+          max_short_position_notional: 300,
+          max_total_notional: 400,
+          max_actual_net_notional: 180,
+          max_synthetic_drift_notional: 25,
+          static_buy_offset_steps: 1.2,
+          static_sell_offset_steps: 0.6,
+          near_market_entry_max_center_distance_steps: 3,
+          grid_inventory_rebalance_min_center_distance_steps: 5,
+          near_market_reentry_confirm_cycles: 4,
+          take_profit_min_profit_ratio: 0.0008,
+          threshold_reduce_target_ratio: 0,
+          adverse_reduce_enabled: true,
+          adverse_reduce_short_trigger_ratio: 0.010,
+          adverse_reduce_long_trigger_ratio: 0.015,
+          adverse_reduce_target_ratio: 0.50,
+          adverse_reduce_maker_timeout_seconds: 30,
+          adverse_reduce_max_order_notional: 40,
+          adverse_reduce_keep_probe_scale: 0.20,
+          max_new_orders: 20,
+          buy_pause_amp_trigger_ratio: 0.018,
+          buy_pause_down_return_trigger_ratio: -0.010,
+          short_cover_pause_amp_trigger_ratio: 0.010,
+          short_cover_pause_down_return_trigger_ratio: -0.006,
+          freeze_shift_abs_return_trigger_ratio: 0.012,
+          rolling_hourly_loss_limit: 4,
+          max_cumulative_notional: 30000,
+          volatility_trigger_enabled: true,
+          volatility_trigger_window: "1m",
+          volatility_trigger_amplitude_ratio: 0.035,
+          volatility_trigger_abs_return_ratio: 0.020,
+          volatility_trigger_stop_cancel_open_orders: true,
+          volatility_trigger_stop_close_all_positions: false,
+          self_volume_trigger_enabled: true,
+          self_volume_trigger_window: "30m",
+          self_volume_trigger_stop_threshold: 300,
+          self_volume_trigger_resume_window: "15m",
+          self_volume_trigger_resume_amplitude_ratio: 0.050,
+          self_volume_trigger_resume_abs_return_ratio: 0.030,
+          self_volume_trigger_risk_actual_net_notional: 180,
+          self_volume_trigger_risk_short_adverse_ratio: 0.040,
+          self_volume_trigger_stop_cancel_open_orders: true,
+          self_volume_trigger_stop_close_all_positions: true,
+          sleep_seconds: 3,
+          leverage: 3,
+          maker_retries: 2,
+          autotune_symbol_enabled: false,
+          adaptive_step_enabled: false,
+          market_bias_enabled: false,
+          synthetic_trend_follow_enabled: false,
+        },
+      },
+      {
+        key: "soon_volume_neutral_ping_pong_guarded_v2",
+        label: "SOON 中性护栏 v2",
+        description: "SOONUSDT 专用中性回转。加入单边亏损主动减仓和自成交量过低停机清仓，先修复单边打穿问题再放量。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "SOONUSDT",
+        config: {
+          symbol: "SOONUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.00025,
+          buy_levels: 12,
+          sell_levels: 10,
+          per_order_notional: 25,
+          startup_entry_multiplier: 1,
+          base_position_notional: 0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 180,
+          pause_short_position_notional: 120,
+          max_position_notional: 220,
+          max_short_position_notional: 160,
+          max_total_notional: 340,
+          max_actual_net_notional: 50,
+          max_synthetic_drift_notional: 18,
+          static_buy_offset_steps: 0.70,
+          static_sell_offset_steps: 0.95,
+          take_profit_min_profit_ratio: 0.0004,
+          threshold_reduce_target_ratio: 0,
+          adverse_reduce_enabled: true,
+          adverse_reduce_short_trigger_ratio: 0.007,
+          adverse_reduce_long_trigger_ratio: 0.010,
+          adverse_reduce_target_ratio: 0.50,
+          adverse_reduce_maker_timeout_seconds: 45,
+          adverse_reduce_max_order_notional: 50,
+          adverse_reduce_keep_probe_scale: 0.20,
+          max_new_orders: 24,
+          buy_pause_amp_trigger_ratio: 0.009,
+          buy_pause_down_return_trigger_ratio: -0.005,
+          short_cover_pause_amp_trigger_ratio: 0.006,
+          short_cover_pause_down_return_trigger_ratio: -0.003,
+          freeze_shift_abs_return_trigger_ratio: 0.006,
+          adaptive_step_enabled: true,
+          rolling_hourly_loss_limit: 3,
+          max_cumulative_notional: 20000,
+          volatility_trigger_enabled: true,
+          volatility_trigger_window: "1m",
+          volatility_trigger_amplitude_ratio: 0.012,
+          volatility_trigger_abs_return_ratio: 0.008,
+          volatility_trigger_stop_cancel_open_orders: true,
+          volatility_trigger_stop_close_all_positions: false,
+          self_volume_trigger_enabled: true,
+          self_volume_trigger_window: "15m",
+          self_volume_trigger_start_threshold: 1200,
+          self_volume_trigger_stop_threshold: 600,
+          self_volume_trigger_stop_cancel_open_orders: true,
+          self_volume_trigger_stop_close_all_positions: true,
+          sleep_seconds: 3,
+          leverage: 3,
+          maker_retries: 2,
+          autotune_symbol_enabled: false,
+          market_bias_enabled: false,
+          synthetic_trend_follow_enabled: false,
+        },
+      },
     ];
 
     let timer = null;
@@ -14436,6 +15795,17 @@ MONITOR_PAGE = """<!doctype html>
       volume_trigger_stop_threshold: "最近窗口市场成交额低于这个阈值后，后台会自动停止策略。",
       volume_trigger_stop_cancel_open_orders: "自动停机时是否先撤销当前交易对全部未成交委托。",
       volume_trigger_stop_close_all_positions: "自动停机时是否继续启动 maker 跟价平仓，直到仓位归零。",
+      self_volume_trigger_enabled: "是否启用按策略自己的最近成交额判断低量背景。可配置成低量直接停机，或低量叠加净敞口/逆向偏离风险后再停机。",
+      self_volume_trigger_window: "自成交量观察窗口。按本策略审计成交记录统计最近窗口的 gross notional。",
+      self_volume_trigger_start_threshold: "可选。若填写，则低自成交量停机后，最近窗口自己的成交额重新达到这个阈值才允许自动恢复；若留空，则不使用自成交恢复。",
+      self_volume_trigger_stop_threshold: "运行中最近窗口自己的成交额低于这个阈值时，会进入低量状态；是否真正停机还会结合风险门控一起判断。",
+      self_volume_trigger_resume_window: "低量停机后的恢复波动观察窗口。若填写恢复振幅/涨跌阈值，则改按这个窗口判断市场是否重新回到可刷区间。",
+      self_volume_trigger_resume_amplitude_ratio: "可选。低量停机后，最近恢复窗口振幅不高于该阈值时才允许自动恢复。",
+      self_volume_trigger_resume_abs_return_ratio: "可选。低量停机后，最近恢复窗口绝对涨跌不高于该阈值时才允许自动恢复。",
+      self_volume_trigger_risk_actual_net_notional: "可选。只有最近窗口自成交偏低且实际净敞口绝对值达到这个阈值时，才会触发低量停机。",
+      self_volume_trigger_risk_short_adverse_ratio: "可选。只有最近窗口自成交偏低且空侧逆向偏离达到这个阈值时，才会触发低量停机。",
+      self_volume_trigger_stop_cancel_open_orders: "低自成交量自动停机时是否先撤销当前交易对全部未成交委托。",
+      self_volume_trigger_stop_close_all_positions: "低自成交量自动停机时是否继续清仓。若启用硬清仓语义，会先尝试 IOC/Taker 打平，再用 maker flatten 扫尾。",
       volatility_trigger_enabled: "是否启用按最近窗口振幅和绝对涨跌自动暂停/恢复策略的后台巡检。",
       volatility_trigger_window: "波动观察窗口。按 Binance 合约 1 分钟 K 线聚合整窗的开高低收后计算振幅和涨跌。",
       volatility_trigger_amplitude_ratio: "最近窗口振幅阈值。整窗最高价 / 最低价 - 1 达到这个值后会自动暂停。",
@@ -14587,11 +15957,49 @@ MONITOR_PAGE = """<!doctype html>
 
     function formatVolumeTriggerWindowLabel(windowKey) {
       const normalized = String(windowKey || "1h").trim().toLowerCase();
+      if (normalized === "1m") return "1 分钟";
       if (normalized === "15m") return "15 分钟";
       if (normalized === "30m") return "30 分钟";
       if (normalized === "4h") return "4 小时";
       if (normalized === "24h") return "24 小时";
       return "1 小时";
+    }
+
+    function formatSelfVolumeTriggerSummary(selfVolumeTrigger) {
+      if (!selfVolumeTrigger || !selfVolumeTrigger.enabled) {
+        return "自成交量低量停机: 关闭";
+      }
+      const parts = [
+        `自成交量 ${formatVolumeTriggerWindowLabel(selfVolumeTrigger.window)}: ${fmtNum(selfVolumeTrigger.current_gross_notional, 4)} / 停 ${fmtNum(selfVolumeTrigger.stop_threshold, 4)}`,
+      ];
+      if (selfVolumeTrigger.start_threshold !== null && selfVolumeTrigger.start_threshold !== undefined) {
+        parts[0] += ` / 启 ${fmtNum(selfVolumeTrigger.start_threshold, 4)}`;
+      }
+      const riskParts = [];
+      if (selfVolumeTrigger.risk_actual_net_notional !== null && selfVolumeTrigger.risk_actual_net_notional !== undefined) {
+        riskParts.push(`净敞口 ${fmtNum(selfVolumeTrigger.actual_net_notional_abs || 0, 4)} / 阈 ${fmtNum(selfVolumeTrigger.risk_actual_net_notional, 4)}`);
+      }
+      if (selfVolumeTrigger.risk_short_adverse_ratio !== null && selfVolumeTrigger.risk_short_adverse_ratio !== undefined) {
+        riskParts.push(`空逆向 ${fmtPct(selfVolumeTrigger.short_adverse_ratio || 0)} / 阈 ${fmtPct(selfVolumeTrigger.risk_short_adverse_ratio || 0)}`);
+      }
+      if (riskParts.length) {
+        parts.push(`风险 ${riskParts.join(" · ")}`);
+      }
+      const resumeParts = [];
+      if (selfVolumeTrigger.resume_amplitude_ratio !== null && selfVolumeTrigger.resume_amplitude_ratio !== undefined) {
+        resumeParts.push(`振幅 ${fmtPct(selfVolumeTrigger.resume_market_amplitude || 0)} / 阈 ${fmtPct(selfVolumeTrigger.resume_amplitude_ratio)}`);
+      }
+      if (selfVolumeTrigger.resume_abs_return_ratio !== null && selfVolumeTrigger.resume_abs_return_ratio !== undefined) {
+        const resumeReturn = selfVolumeTrigger.resume_market_return !== undefined
+          ? Math.abs(selfVolumeTrigger.resume_market_return || 0)
+          : Math.abs(selfVolumeTrigger.resume_market_abs_return || 0);
+        resumeParts.push(`绝对涨跌 ${fmtPct(resumeReturn)} / 阈 ${fmtPct(selfVolumeTrigger.resume_abs_return_ratio)}`);
+      }
+      if (resumeParts.length) {
+        parts.push(`恢复 ${formatVolumeTriggerWindowLabel(selfVolumeTrigger.resume_window)}: ${resumeParts.join(" · ")}`);
+      }
+      parts.push(`自动恢复 ${selfVolumeTrigger.paused_by_trigger ? "待恢复" : "未挂起"}`);
+      return parts.join(" · ");
     }
 
     function formatStartupInventory(summary, quantityDigits = 4, notionalDigits = 4) {
@@ -14850,6 +16258,35 @@ MONITOR_PAGE = """<!doctype html>
         volume_trigger_stop_close_all_positions: Boolean(
           monitorVolumeTriggerStopClosePositionsEl && monitorVolumeTriggerStopClosePositionsEl.checked
         ),
+        self_volume_trigger_enabled: Boolean(
+          monitorSelfVolumeTriggerEnabledEl && monitorSelfVolumeTriggerEnabledEl.checked
+        ),
+        self_volume_trigger_window: monitorSelfVolumeTriggerWindowEl ? String(monitorSelfVolumeTriggerWindowEl.value || "15m") : "15m",
+        self_volume_trigger_start_threshold: monitorSelfVolumeTriggerStartThresholdEl && monitorSelfVolumeTriggerStartThresholdEl.value
+          ? Number(monitorSelfVolumeTriggerStartThresholdEl.value)
+          : null,
+        self_volume_trigger_stop_threshold: monitorSelfVolumeTriggerStopThresholdEl && monitorSelfVolumeTriggerStopThresholdEl.value
+          ? Number(monitorSelfVolumeTriggerStopThresholdEl.value)
+          : null,
+        self_volume_trigger_resume_window: monitorSelfVolumeTriggerResumeWindowEl ? String(monitorSelfVolumeTriggerResumeWindowEl.value || "15m") : "15m",
+        self_volume_trigger_resume_amplitude_ratio: monitorSelfVolumeTriggerResumeAmplitudeRatioEl && monitorSelfVolumeTriggerResumeAmplitudeRatioEl.value
+          ? Number(monitorSelfVolumeTriggerResumeAmplitudeRatioEl.value)
+          : null,
+        self_volume_trigger_resume_abs_return_ratio: monitorSelfVolumeTriggerResumeAbsReturnRatioEl && monitorSelfVolumeTriggerResumeAbsReturnRatioEl.value
+          ? Number(monitorSelfVolumeTriggerResumeAbsReturnRatioEl.value)
+          : null,
+        self_volume_trigger_risk_actual_net_notional: monitorSelfVolumeTriggerRiskActualNetNotionalEl && monitorSelfVolumeTriggerRiskActualNetNotionalEl.value
+          ? Number(monitorSelfVolumeTriggerRiskActualNetNotionalEl.value)
+          : null,
+        self_volume_trigger_risk_short_adverse_ratio: monitorSelfVolumeTriggerRiskShortAdverseRatioEl && monitorSelfVolumeTriggerRiskShortAdverseRatioEl.value
+          ? Number(monitorSelfVolumeTriggerRiskShortAdverseRatioEl.value)
+          : null,
+        self_volume_trigger_stop_cancel_open_orders: Boolean(
+          monitorSelfVolumeTriggerStopCancelOrdersEl && monitorSelfVolumeTriggerStopCancelOrdersEl.checked
+        ),
+        self_volume_trigger_stop_close_all_positions: Boolean(
+          monitorSelfVolumeTriggerStopClosePositionsEl && monitorSelfVolumeTriggerStopClosePositionsEl.checked
+        ),
         volatility_trigger_enabled: Boolean(monitorVolatilityTriggerEnabledEl && monitorVolatilityTriggerEnabledEl.checked),
         volatility_trigger_window: monitorVolatilityTriggerWindowEl ? String(monitorVolatilityTriggerWindowEl.value || "1h") : "1h",
         volatility_trigger_amplitude_ratio: monitorVolatilityTriggerAmplitudeRatioEl && monitorVolatilityTriggerAmplitudeRatioEl.value
@@ -14880,6 +16317,17 @@ MONITOR_PAGE = """<!doctype html>
       monitorVolumeTriggerStopThresholdEl.value = source.volume_trigger_stop_threshold ?? "";
       monitorVolumeTriggerStopCancelOrdersEl.checked = Boolean(source.volume_trigger_stop_cancel_open_orders);
       monitorVolumeTriggerStopClosePositionsEl.checked = Boolean(source.volume_trigger_stop_close_all_positions);
+      monitorSelfVolumeTriggerEnabledEl.checked = Boolean(source.self_volume_trigger_enabled);
+      monitorSelfVolumeTriggerWindowEl.value = source.self_volume_trigger_window || "15m";
+      monitorSelfVolumeTriggerStartThresholdEl.value = source.self_volume_trigger_start_threshold ?? "";
+      monitorSelfVolumeTriggerStopThresholdEl.value = source.self_volume_trigger_stop_threshold ?? "";
+      monitorSelfVolumeTriggerResumeWindowEl.value = source.self_volume_trigger_resume_window || "15m";
+      monitorSelfVolumeTriggerResumeAmplitudeRatioEl.value = source.self_volume_trigger_resume_amplitude_ratio ?? "";
+      monitorSelfVolumeTriggerResumeAbsReturnRatioEl.value = source.self_volume_trigger_resume_abs_return_ratio ?? "";
+      monitorSelfVolumeTriggerRiskActualNetNotionalEl.value = source.self_volume_trigger_risk_actual_net_notional ?? "";
+      monitorSelfVolumeTriggerRiskShortAdverseRatioEl.value = source.self_volume_trigger_risk_short_adverse_ratio ?? "";
+      monitorSelfVolumeTriggerStopCancelOrdersEl.checked = Boolean(source.self_volume_trigger_stop_cancel_open_orders);
+      monitorSelfVolumeTriggerStopClosePositionsEl.checked = Boolean(source.self_volume_trigger_stop_close_all_positions);
       monitorVolatilityTriggerEnabledEl.checked = Boolean(source.volatility_trigger_enabled);
       monitorVolatilityTriggerWindowEl.value = source.volatility_trigger_window || "1h";
       monitorVolatilityTriggerAmplitudeRatioEl.value = source.volatility_trigger_amplitude_ratio ?? "";
@@ -15216,6 +16664,24 @@ MONITOR_PAGE = """<!doctype html>
           "首版故意关闭 autotune、adaptive step、market bias 和 trend follow，先用静态护栏确认 CHIP 的真实盘口承受能力，再决定是否放量。",
         ],
       },
+      chip_short_bias_ping_pong_guarded_v2: {
+        summary: "CHIPUSDT 的低仓位偏空护栏版。比 v1 更早限制空侧库存，并加入单边亏损主动减仓和自成交量低量停机清仓。",
+        focus: [
+          "低自成交量触发后不会被市场量能或波动恢复逻辑直接拉起；只有清仓结束且自成交量恢复阈值满足，才允许自动恢复。",
+        ],
+      },
+      chip_short_bias_ping_pong_guarded_v3: {
+        summary: "CHIPUSDT 的条件低量停机版。低量只作为背景信号，只有叠加净敞口或空侧逆向偏离过大时才停机清仓。",
+        focus: [
+          "自动恢复不再看停机后不可能继续增长的自成交，而改成看 15m 波动是否回到可刷区间，并要求残仓和残单都已经清干净。",
+        ],
+      },
+      soon_volume_neutral_ping_pong_guarded_v2: {
+        summary: "SOONUSDT 的守护版中性回转。保留刷量 ping-pong，但把单边亏损减仓、净敞口硬线和低自成交量停机放在优先级前面。",
+        focus: [
+          "这套用于修复单边空单被打穿的问题，默认阈值偏保守；效果稳定后再提高单笔、格数或累计成交额上限。",
+        ],
+      },
     };
     const AUTOTUNE_STEP_HINTS = {
       volume_long_v4: { stepRatio: 0.0004, minTicks: 2 },
@@ -15229,6 +16695,9 @@ MONITOR_PAGE = """<!doctype html>
       volume_neutral_push_guarded_v1: { stepRatio: 0.00032, minTicks: 2 },
       volume_neutral_ping_pong_v1: { stepRatio: 0.00035, minTicks: 2 },
       chip_short_bias_ping_pong_v1: { stepRatio: 0.009, minTicks: 10 },
+      chip_short_bias_ping_pong_guarded_v2: { stepRatio: 0.009, minTicks: 10 },
+      chip_short_bias_ping_pong_guarded_v3: { stepRatio: 0.009, minTicks: 10 },
+      soon_volume_neutral_ping_pong_guarded_v2: { stepRatio: 0.00035, minTicks: 2 },
       xaut_guarded_ping_pong_v1: { stepRatio: 0.00048, minTicks: 180 },
       xaut_near_price_guarded_v1: { stepRatio: 0.00012, minTicks: 1 },
       xaut_volume_guarded_bard_v3: { stepRatio: 0.00021, minTicks: 100 },
@@ -15506,6 +16975,43 @@ MONITOR_PAGE = """<!doctype html>
           lines.push(
             `最近 ${windowLabel} 的市场成交额低于 ${fmtGuideNotional(config.volume_trigger_stop_threshold)} 时，会自动停机${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`
           );
+        }
+      }
+      if (config.self_volume_trigger_enabled) {
+        const windowLabel = formatVolumeTriggerWindowLabel(config.self_volume_trigger_window);
+        if (asGuideNumber(config.self_volume_trigger_stop_threshold) > 0) {
+          const stopActions = [];
+          if (config.self_volume_trigger_stop_cancel_open_orders) stopActions.push("撤策略单");
+          if (config.self_volume_trigger_stop_close_all_positions) stopActions.push("清仓");
+          const riskParts = [];
+          if (asGuideNumber(config.self_volume_trigger_risk_actual_net_notional) > 0) {
+            riskParts.push(`实际净敞口绝对值 >= ${fmtGuideNotional(config.self_volume_trigger_risk_actual_net_notional)}`);
+          }
+          if (asGuideNumber(config.self_volume_trigger_risk_short_adverse_ratio) > 0) {
+            riskParts.push(`空侧逆向偏离 >= ${fmtGuidePctFromRatio(config.self_volume_trigger_risk_short_adverse_ratio)}`);
+          }
+          if (riskParts.length) {
+            lines.push(
+              `最近 ${windowLabel} 策略自己的成交额低于 ${fmtGuideNotional(config.self_volume_trigger_stop_threshold)}，且 ${riskParts.join(" 或 ")} 时，会自动停机${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`
+            );
+          } else {
+            lines.push(
+              `最近 ${windowLabel} 策略自己的成交额低于 ${fmtGuideNotional(config.self_volume_trigger_stop_threshold)} 时，会自动停机${stopActions.length ? `，并执行${stopActions.join(" + ")}` : ""}。`
+            );
+          }
+        }
+        if (asGuideNumber(config.self_volume_trigger_resume_amplitude_ratio) > 0 || asGuideNumber(config.self_volume_trigger_resume_abs_return_ratio) > 0) {
+          const resumeWindowLabel = formatVolumeTriggerWindowLabel(config.self_volume_trigger_resume_window);
+          const parts = [];
+          if (asGuideNumber(config.self_volume_trigger_resume_amplitude_ratio) > 0) {
+            parts.push(`振幅 <= ${fmtGuidePctFromRatio(config.self_volume_trigger_resume_amplitude_ratio)}`);
+          }
+          if (asGuideNumber(config.self_volume_trigger_resume_abs_return_ratio) > 0) {
+            parts.push(`绝对涨跌 <= ${fmtGuidePctFromRatio(config.self_volume_trigger_resume_abs_return_ratio)}`);
+          }
+          lines.push(`低自成交量触发停机后，只有最近 ${resumeWindowLabel} 满足 ${parts.join(" 且 ")}，并且清仓结束、无残仓残单时，后台才允许自动恢复。`);
+        } else if (asGuideNumber(config.self_volume_trigger_start_threshold) > 0) {
+          lines.push(`低自成交量触发停机后，只有最近 ${windowLabel} 策略自己的成交额达到 ${fmtGuideNotional(config.self_volume_trigger_start_threshold)}，且清仓进程结束，后台才允许自动恢复。`);
         }
       }
       if (config.volatility_trigger_enabled) {
@@ -16190,6 +17696,7 @@ MONITOR_PAGE = """<!doctype html>
       const competitionWindow = data.competition_window || {};
       const competitionRewardTargets = data.competition_reward_targets || {};
       const volumeTrigger = data.volume_trigger || {};
+      const selfVolumeTrigger = data.self_volume_trigger || {};
       const volatilityTrigger = data.volatility_trigger || {};
       const currentPreset = getPresetByKey(String(runnerCfg.strategy_profile || "volume_long_v4"));
       const selectedPreset = getPresetByKey(String(strategyPresetEl.value || runnerCfg.strategy_profile || "volume_long_v4"));
@@ -16229,6 +17736,7 @@ MONITOR_PAGE = """<!doctype html>
         `最近事件: ${fmtTs(data.session && data.session.last_event)}`,
         `PID: ${runner.pid || "--"}`,
         `量能自动启停: ${volumeTrigger.enabled ? "开" : "关"}`,
+        `自成交量低量停机: ${selfVolumeTrigger.enabled ? "开" : "关"}`,
         `波动自动暂停: ${volatilityTrigger.enabled ? "开" : "关"}`,
         isOneWayShort ? `停空: ${risk.short_paused ? "是" : "否"}` : `停买: ${risk.buy_paused ? "是" : "否"}`,
         isNeutralMode ? `停空: ${risk.short_paused ? "是" : "否"}` : (isOneWayShort ? `空裁单: ${risk.short_cap_applied ? "是" : "否"}` : `硬裁单: ${risk.buy_cap_applied ? "是" : "否"}`),
@@ -16251,6 +17759,7 @@ MONITOR_PAGE = """<!doctype html>
         volumeTrigger.enabled
           ? `量能 ${formatVolumeTriggerWindowLabel(volumeTrigger.window)}: ${fmtNum(volumeTrigger.current_quote_volume, 4)} / 启 ${fmtNum(volumeTrigger.start_threshold, 4)} / 停 ${fmtNum(volumeTrigger.stop_threshold, 4)}`
           : "量能自动启停: 关闭",
+        formatSelfVolumeTriggerSummary(selfVolumeTrigger),
         volatilityTrigger.enabled
           ? `波动 ${formatVolumeTriggerWindowLabel(volatilityTrigger.window)}: 振幅 ${fmtPct(volatilityTrigger.current_amplitude_ratio || 0)} / 阈 ${fmtPct(volatilityTrigger.amplitude_ratio || 0)} · 绝对涨跌 ${fmtPct(Math.abs(volatilityTrigger.current_return_ratio || 0))} / 阈 ${fmtPct(volatilityTrigger.abs_return_ratio || 0)} · 自动恢复 ${volatilityTrigger.paused_by_trigger ? "待恢复" : "未挂起"}`
           : "波动自动暂停: 关闭",
@@ -16595,6 +18104,9 @@ MONITOR_PAGE = """<!doctype html>
         parts.push(`撤单 ${fmtNum(summary.cancel_success_count || 0, 0)} / ${fmtNum(summary.cancel_attempted_count || 0, 0)}`);
       }
       if (summary.close_all_positions_requested) {
+        if (summary.hard_close_all_positions_requested) {
+          parts.push(`即时平仓 ${fmtNum(summary.hard_close_submitted_count || 0, 0)} / ${fmtNum(summary.hard_close_attempted_count || 0, 0)}`);
+        }
         parts.push(`待平仓方向 ${fmtNum(summary.close_attempted_count || 0, 0)}`);
         if (summary.flatten_started) {
           parts.push("跟价平仓已启动");
@@ -16610,6 +18122,9 @@ MONITOR_PAGE = """<!doctype html>
       }
       if (summary.close_errors && summary.close_errors.length) {
         parts.push(`平仓错误 ${summary.close_errors.length}`);
+      }
+      if (summary.hard_close_errors && summary.hard_close_errors.length) {
+        parts.push(`即时平仓错误 ${summary.hard_close_errors.length}`);
       }
       return parts.join(" · ");
     }
@@ -16678,8 +18193,7 @@ MONITOR_PAGE = """<!doctype html>
       }
       strategyActionPending = true;
       strategyActionMetaEl.textContent = action === "start" ? "正在按当前选中预设启动策略..." : "正在停止策略...";
-      startStrategyBtn.disabled = true;
-      stopStrategyBtn.disabled = true;
+      setStrategyActionButtonsDisabled(true);
       try {
         const payload = action === "start"
           ? startPayload
@@ -16706,6 +18220,52 @@ MONITOR_PAGE = """<!doctype html>
         strategyActionMetaEl.textContent = `${action === "start" ? "启动" : "停止"}失败: ${err}`;
       } finally {
         strategyActionPending = false;
+        setStrategyActionButtonsDisabled(false);
+        await loadMonitor();
+      }
+    }
+
+    function setStrategyActionButtonsDisabled(disabled) {
+      startStrategyBtn.disabled = disabled;
+      stopStrategyBtn.disabled = disabled;
+      if (quickStartLastBtn) quickStartLastBtn.disabled = disabled;
+      if (quickFlattenBtn) quickFlattenBtn.disabled = disabled;
+    }
+
+    async function controlQuickRunnerAction(action) {
+      if (strategyActionPending) return;
+      const selectedSymbol = symbolEl.value.trim().toUpperCase() || "NIGHTUSDT";
+      const endpoint = action === "quick_start_last" ? "/api/runner/quick_start_last" : "/api/runner/quick_flatten";
+      strategyActionPending = true;
+      strategyActionMetaEl.textContent = action === "quick_start_last"
+        ? "正在按该币种最近一次运行配置启动策略..."
+        : "正在停机、撤全部委托并启动贴盘口清仓...";
+      setStrategyActionButtonsDisabled(true);
+      try {
+        const resp = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: selectedSymbol }),
+        });
+        const data = await readJsonResponse(resp);
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        if (action === "quick_start_last") {
+          const sourceText = data.config_source === "runner_process" ? "最近运行配置" : "最近保存配置";
+          strategyActionMetaEl.textContent =
+            `已按${sourceText}启动策略${data.restarted ? "（已重启应用旧配置）" : (data.already_running ? "（已在运行）" : "")}`;
+          const appliedConfig = ((((data || {}).runner || {}).config) || data.config || {});
+          if (appliedConfig && Object.keys(appliedConfig).length) {
+            setRunnerEditorConfig(appliedConfig, `已载入 ${selectedSymbol} 当前生效参数。`);
+          }
+        } else {
+          strategyActionMetaEl.textContent =
+            `一键清仓已执行${data.already_stopped ? "（runner 原本就未运行）" : ""}${formatStopActionSummary(data.post_stop_actions) ? ` · ${formatStopActionSummary(data.post_stop_actions)}` : ""}`;
+        }
+      } catch (err) {
+        strategyActionMetaEl.textContent = `${action === "quick_start_last" ? "一键启动" : "一键清仓"}失败: ${err}`;
+      } finally {
+        strategyActionPending = false;
+        setStrategyActionButtonsDisabled(false);
         await loadMonitor();
       }
     }
@@ -16729,6 +18289,8 @@ MONITOR_PAGE = """<!doctype html>
     });
     startStrategyBtn.addEventListener("click", () => controlStrategy("start"));
     stopStrategyBtn.addEventListener("click", () => controlStrategy("stop"));
+    quickStartLastBtn.addEventListener("click", () => controlQuickRunnerAction("quick_start_last"));
+    quickFlattenBtn.addEventListener("click", () => controlQuickRunnerAction("quick_flatten"));
     refreshSecEl.addEventListener("change", restartTimer);
     strategyPresetEl.addEventListener("change", () => renderPresetMeta(latestMonitorData));
     loadRunningParamsBtn.addEventListener("click", loadRunningConfigToEditor);
@@ -22373,6 +23935,19 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
         "stop_threshold": runner_config.get("volume_trigger_stop_threshold"),
         **volume_trigger_status,
     }
+    self_volume_trigger_status = _runner_self_volume_trigger_status(symbol) or {}
+    snapshot["self_volume_trigger"] = {
+        "enabled": bool(runner_config.get("self_volume_trigger_enabled", False)),
+        "window": runner_config.get("self_volume_trigger_window"),
+        "start_threshold": runner_config.get("self_volume_trigger_start_threshold"),
+        "stop_threshold": runner_config.get("self_volume_trigger_stop_threshold"),
+        "resume_window": runner_config.get("self_volume_trigger_resume_window"),
+        "resume_amplitude_ratio": runner_config.get("self_volume_trigger_resume_amplitude_ratio"),
+        "resume_abs_return_ratio": runner_config.get("self_volume_trigger_resume_abs_return_ratio"),
+        "risk_actual_net_notional": runner_config.get("self_volume_trigger_risk_actual_net_notional"),
+        "risk_short_adverse_ratio": runner_config.get("self_volume_trigger_risk_short_adverse_ratio"),
+        **self_volume_trigger_status,
+    }
     volatility_trigger_status = _runner_volatility_trigger_status(symbol) or {}
     snapshot["volatility_trigger"] = {
         "enabled": bool(runner_config.get("volatility_trigger_enabled", False)),
@@ -22807,7 +24382,13 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
-        if path in {"/api/runner/start", "/api/runner/stop", "/api/runner/save"}:
+        if path in {
+            "/api/runner/start",
+            "/api/runner/stop",
+            "/api/runner/save",
+            "/api/runner/quick_start_last",
+            "/api/runner/quick_flatten",
+        }:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -22828,7 +24409,11 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
                     return
             try:
-                if path.endswith("/start"):
+                if path.endswith("/quick_start_last"):
+                    result = _start_runner_from_last_config(payload.get("symbol"))
+                elif path.endswith("/quick_flatten"):
+                    result = _quick_flatten_runner_symbol(payload.get("symbol"))
+                elif path.endswith("/start"):
                     config = _resolve_runner_start_config(payload)
                     result = _start_runner_process(config)
                 elif path.endswith("/save"):
@@ -22839,6 +24424,7 @@ class _Handler(BaseHTTPRequestHandler):
                         cancel_open_orders=_safe_bool(payload.get("cancel_open_orders", False), "cancel_open_orders"),
                         close_all_positions=_safe_bool(payload.get("close_all_positions", False), "close_all_positions"),
                         clear_volatility_resume_state=True,
+                        clear_self_volume_resume_state=True,
                     )
                 self._send_json({"ok": True, **result}, status=200)
             except ValueError as exc:
@@ -23195,6 +24781,14 @@ def main() -> None:
         name="runner-volume-trigger",
     )
     volume_trigger_thread.start()
+    self_volume_trigger_stop_event = threading.Event()
+    self_volume_trigger_thread = threading.Thread(
+        target=_run_self_volume_trigger_loop,
+        args=(self_volume_trigger_stop_event,),
+        daemon=True,
+        name="runner-self-volume-trigger",
+    )
+    self_volume_trigger_thread.start()
     volatility_trigger_stop_event = threading.Event()
     volatility_trigger_thread = threading.Thread(
         target=_run_volatility_trigger_loop,
@@ -23234,6 +24828,7 @@ def main() -> None:
         pass
     finally:
         volume_trigger_stop_event.set()
+        self_volume_trigger_stop_event.set()
         volatility_trigger_stop_event.set()
         competition_refresh_stop_event.set()
         hourly_email_stop_event.set()

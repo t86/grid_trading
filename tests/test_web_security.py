@@ -20,15 +20,20 @@ from grid_optimizer.web import (
     _build_runner_command,
     _client_ip_allowed,
     _default_runtime_paths_for_symbol,
+    _execute_stop_actions,
     _get_custom_runner_preset,
+    _load_last_runner_control_config,
     _load_runner_control_config,
+    _normalize_runner_self_volume_trigger_config,
     _normalize_spot_runner_payload,
     _parse_allowed_networks,
     _resolve_runner_start_config,
+    _resolve_runner_self_volume_trigger_action,
     _render_monitor_page,
     _render_spot_runner_page,
     _render_spot_strategies_page,
     _render_strategies_page,
+    _runner_self_volume_trigger_start_allowed,
     _run_loop_monitor_query,
     _runner_service_name_for_symbol,
     _resolve_volatility_directional_flatten_filter,
@@ -38,7 +43,9 @@ from grid_optimizer.web import (
     _spot_runner_preset_payload,
     _spot_runner_preset_summaries,
     _save_runner_control_config,
+    _quick_flatten_runner_symbol,
     _start_runner_process,
+    _start_runner_from_last_config,
     _update_custom_grid_runner_preset,
     _uses_legacy_runner,
 )
@@ -68,6 +75,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="save_running_preset_description"', MONITOR_PAGE)
         self.assertIn('id="save_running_preset_btn"', MONITOR_PAGE)
         self.assertIn("/api/runner/presets/save_running", MONITOR_PAGE)
+
+    def test_monitor_page_contains_quick_runner_controls(self) -> None:
+        self.assertIn('id="quick_start_last_btn"', MONITOR_PAGE)
+        self.assertIn('id="quick_flatten_btn"', MONITOR_PAGE)
+        self.assertIn("/api/runner/quick_start_last", MONITOR_PAGE)
+        self.assertIn("/api/runner/quick_flatten", MONITOR_PAGE)
 
     def test_monitor_page_contains_xaut_adaptive_status_text(self) -> None:
         self.assertIn("XAUT 三态状态", MONITOR_PAGE)
@@ -198,6 +211,177 @@ class WebSecurityTests(unittest.TestCase):
     def test_client_ip_allowed_always_accepts_loopback(self) -> None:
         self.assertTrue(_client_ip_allowed("127.0.0.1", []))
         self.assertTrue(_client_ip_allowed("::1", []))
+
+    def test_normalize_self_volume_trigger_requires_start_above_stop(self) -> None:
+        with self.assertRaisesRegex(ValueError, "start threshold must exceed stop threshold"):
+            _normalize_runner_self_volume_trigger_config(
+                {
+                    "self_volume_trigger_enabled": True,
+                    "self_volume_trigger_window": "15m",
+                    "self_volume_trigger_start_threshold": 1000,
+                    "self_volume_trigger_stop_threshold": 1000,
+                }
+            )
+
+    def test_normalize_self_volume_trigger_allows_stop_only(self) -> None:
+        config = _normalize_runner_self_volume_trigger_config(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_window": "30m",
+                "self_volume_trigger_stop_threshold": 300,
+            }
+        )
+        self.assertTrue(config["self_volume_trigger_enabled"])
+        self.assertIsNone(config["self_volume_trigger_start_threshold"])
+        self.assertAlmostEqual(config["self_volume_trigger_stop_threshold"], 300.0)
+
+    def test_resolve_self_volume_trigger_stops_after_warmup_when_volume_low_and_risky(self) -> None:
+        decision = _resolve_runner_self_volume_trigger_action(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_stop_threshold": 300,
+                "self_volume_trigger_risk_actual_net_notional": 180,
+            },
+            current_gross_notional=120,
+            runner_running=True,
+            flatten_running=False,
+            paused_by_trigger=False,
+            warmup_complete=True,
+            actual_net_notional_abs=200,
+        )
+        self.assertEqual(decision["action"], "stop")
+        self.assertEqual(decision["reason"], "low_self_volume_with_risk")
+
+    def test_resolve_self_volume_trigger_does_not_stop_when_volume_low_without_risk(self) -> None:
+        decision = _resolve_runner_self_volume_trigger_action(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_stop_threshold": 300,
+                "self_volume_trigger_risk_actual_net_notional": 180,
+            },
+            current_gross_notional=120,
+            runner_running=True,
+            flatten_running=False,
+            paused_by_trigger=False,
+            warmup_complete=True,
+            actual_net_notional_abs=90,
+        )
+        self.assertIsNone(decision["action"])
+        self.assertEqual(decision["reason"], "low_self_volume_without_risk")
+
+    def test_resolve_self_volume_trigger_waits_during_warmup_when_volume_low(self) -> None:
+        decision = _resolve_runner_self_volume_trigger_action(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_stop_threshold": 300,
+                "self_volume_trigger_risk_actual_net_notional": 180,
+            },
+            current_gross_notional=0,
+            runner_running=True,
+            flatten_running=False,
+            paused_by_trigger=False,
+            warmup_complete=False,
+            actual_net_notional_abs=200,
+        )
+        self.assertIsNone(decision["action"])
+        self.assertEqual(decision["reason"], "warming_up_self_volume_window")
+
+    def test_resolve_self_volume_trigger_only_restarts_when_paused_by_trigger(self) -> None:
+        stopped_decision = _resolve_runner_self_volume_trigger_action(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_start_threshold": 1800,
+                "self_volume_trigger_stop_threshold": 1000,
+            },
+            current_gross_notional=2200,
+            runner_running=False,
+            flatten_running=False,
+            paused_by_trigger=False,
+        )
+        paused_decision = _resolve_runner_self_volume_trigger_action(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_start_threshold": 1800,
+                "self_volume_trigger_stop_threshold": 1000,
+            },
+            current_gross_notional=2200,
+            runner_running=False,
+            flatten_running=False,
+            paused_by_trigger=True,
+        )
+        self.assertIsNone(stopped_decision["action"])
+        self.assertEqual(stopped_decision["reason"], "runner_stopped")
+        self.assertEqual(paused_decision["action"], "start")
+        self.assertEqual(paused_decision["reason"], "self_volume_above_start_threshold")
+
+    def test_resolve_self_volume_trigger_respects_resume_gate(self) -> None:
+        blocked = _resolve_runner_self_volume_trigger_action(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_stop_threshold": 300,
+                "self_volume_trigger_resume_amplitude_ratio": 0.05,
+                "self_volume_trigger_resume_abs_return_ratio": 0.03,
+            },
+            current_gross_notional=0,
+            runner_running=False,
+            flatten_running=False,
+            paused_by_trigger=True,
+            resume_allowed=False,
+            resume_reason="waiting_for_self_volume_resume_volatility",
+        )
+        allowed = _resolve_runner_self_volume_trigger_action(
+            {
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_stop_threshold": 300,
+                "self_volume_trigger_resume_amplitude_ratio": 0.05,
+                "self_volume_trigger_resume_abs_return_ratio": 0.03,
+            },
+            current_gross_notional=0,
+            runner_running=False,
+            flatten_running=False,
+            paused_by_trigger=True,
+            resume_allowed=True,
+            resume_reason="self_volume_resume_volatility_within_threshold",
+        )
+        self.assertIsNone(blocked["action"])
+        self.assertEqual(blocked["reason"], "waiting_for_self_volume_resume_volatility")
+        self.assertEqual(allowed["action"], "start")
+        self.assertEqual(allowed["reason"], "self_volume_resume_volatility_within_threshold")
+
+    @patch("grid_optimizer.web._self_volume_trigger_live_exposure")
+    @patch("grid_optimizer.web.fetch_futures_window_price_stats")
+    @patch("grid_optimizer.web._read_flatten_process_for_symbol")
+    @patch("grid_optimizer.web._runner_self_volume_trigger_status")
+    def test_self_volume_trigger_start_allowed_uses_resume_volatility_gate(
+        self,
+        mock_status,
+        mock_flatten,
+        mock_window_stats,
+        mock_exposure,
+    ) -> None:
+        mock_status.return_value = {"paused_by_trigger": True}
+        mock_flatten.return_value = {"is_running": False}
+        mock_window_stats.return_value = {"amplitude_ratio": 0.04, "return_ratio": 0.02}
+        mock_exposure.return_value = {
+            "has_position": False,
+            "open_order_count": 0,
+            "has_open_orders": False,
+            "last_error": None,
+        }
+        gate = _runner_self_volume_trigger_start_allowed(
+            {
+                "symbol": "CHIPUSDT",
+                "self_volume_trigger_enabled": True,
+                "self_volume_trigger_stop_threshold": 300,
+                "self_volume_trigger_resume_window": "15m",
+                "self_volume_trigger_resume_amplitude_ratio": 0.05,
+                "self_volume_trigger_resume_abs_return_ratio": 0.03,
+            }
+        )
+        self.assertTrue(gate["allowed"])
+        self.assertEqual(gate["reason"], "self_volume_resume_volatility_within_threshold")
+        self.assertAlmostEqual(gate["resume_market_amplitude"], 0.04)
+        self.assertAlmostEqual(gate["resume_market_return"], 0.02)
 
     def test_runner_preset_payload_applies_quasi_neutral_profile(self) -> None:
         payload = _runner_preset_payload("defensive_quasi_neutral_v1", {"symbol": "NIGHTUSDT"})
@@ -331,6 +515,54 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["market_bias_enabled"])
         self.assertFalse(payload["synthetic_trend_follow_enabled"])
 
+    def test_runner_preset_payload_applies_chip_guarded_v2_profile(self) -> None:
+        payload = _runner_preset_payload("chip_short_bias_ping_pong_guarded_v2", {"symbol": "CHIPUSDT"})
+        self.assertEqual(payload["strategy_profile"], "chip_short_bias_ping_pong_guarded_v2")
+        self.assertEqual(payload["symbol"], "CHIPUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["max_short_position_notional"], 220.0)
+        self.assertAlmostEqual(payload["max_actual_net_notional"], 70.0)
+        self.assertTrue(payload["adverse_reduce_enabled"])
+        self.assertAlmostEqual(payload["adverse_reduce_short_trigger_ratio"], 0.010)
+        self.assertAlmostEqual(payload["adverse_reduce_target_ratio"], 0.50)
+        self.assertEqual(payload["threshold_reduce_target_ratio"], 0.0)
+        self.assertTrue(payload["self_volume_trigger_enabled"])
+        self.assertEqual(payload["self_volume_trigger_window"], "15m")
+        self.assertAlmostEqual(payload["self_volume_trigger_start_threshold"], 1800.0)
+        self.assertAlmostEqual(payload["self_volume_trigger_stop_threshold"], 1000.0)
+        self.assertTrue(payload["self_volume_trigger_stop_close_all_positions"])
+
+    def test_runner_preset_payload_applies_chip_guarded_v3_profile(self) -> None:
+        payload = _runner_preset_payload("chip_short_bias_ping_pong_guarded_v3", {"symbol": "CHIPUSDT"})
+        self.assertEqual(payload["strategy_profile"], "chip_short_bias_ping_pong_guarded_v3")
+        self.assertEqual(payload["symbol"], "CHIPUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["per_order_notional"], 40.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 120.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 300.0)
+        self.assertAlmostEqual(payload["max_actual_net_notional"], 180.0)
+        self.assertTrue(payload["self_volume_trigger_enabled"])
+        self.assertEqual(payload["self_volume_trigger_window"], "30m")
+        self.assertAlmostEqual(payload["self_volume_trigger_stop_threshold"], 300.0)
+        self.assertIsNone(payload["self_volume_trigger_start_threshold"])
+        self.assertEqual(payload["self_volume_trigger_resume_window"], "15m")
+        self.assertAlmostEqual(payload["self_volume_trigger_resume_amplitude_ratio"], 0.05)
+        self.assertAlmostEqual(payload["self_volume_trigger_resume_abs_return_ratio"], 0.03)
+        self.assertAlmostEqual(payload["self_volume_trigger_risk_actual_net_notional"], 180.0)
+        self.assertAlmostEqual(payload["self_volume_trigger_risk_short_adverse_ratio"], 0.04)
+
+    def test_runner_preset_payload_applies_soon_guarded_v2_profile(self) -> None:
+        payload = _runner_preset_payload("soon_volume_neutral_ping_pong_guarded_v2", {"symbol": "SOONUSDT"})
+        self.assertEqual(payload["strategy_profile"], "soon_volume_neutral_ping_pong_guarded_v2")
+        self.assertEqual(payload["symbol"], "SOONUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(payload["buy_levels"], 12)
+        self.assertEqual(payload["sell_levels"], 10)
+        self.assertTrue(payload["adverse_reduce_enabled"])
+        self.assertTrue(payload["self_volume_trigger_enabled"])
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 3.0)
+        self.assertAlmostEqual(payload["max_actual_net_notional"], 50.0)
+
     def test_runner_preset_payload_rejects_xaut_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
             _runner_preset_payload("xaut_long_adaptive_v1", {"symbol": "BTCUSDT"})
@@ -338,6 +570,18 @@ class WebSecurityTests(unittest.TestCase):
     def test_runner_preset_payload_rejects_chip_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=CHIPUSDT"):
             _runner_preset_payload("chip_short_bias_ping_pong_v1", {"symbol": "BTCUSDT"})
+
+    def test_runner_preset_payload_rejects_chip_guarded_v2_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=CHIPUSDT"):
+            _runner_preset_payload("chip_short_bias_ping_pong_guarded_v2", {"symbol": "BTCUSDT"})
+
+    def test_runner_preset_payload_rejects_chip_guarded_v3_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=CHIPUSDT"):
+            _runner_preset_payload("chip_short_bias_ping_pong_guarded_v3", {"symbol": "BTCUSDT"})
+
+    def test_runner_preset_payload_rejects_soon_guarded_v2_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=SOONUSDT"):
+            _runner_preset_payload("soon_volume_neutral_ping_pong_guarded_v2", {"symbol": "BTCUSDT"})
 
     def test_runner_preset_summaries_hide_xaut_volume_guarded_bard_v3_from_dropdown(self) -> None:
         xaut_keys = {item["key"] for item in _runner_preset_summaries("XAUTUSDT")}
@@ -1021,6 +1265,33 @@ class WebSecurityTests(unittest.TestCase):
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_resolve_runner_start_config_keeps_adverse_reduce_fields(self, mock_symbol_config, mock_book_tickers) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config(
+            {
+                "symbol": "ENSOUSDT",
+                "strategy_profile": "defensive_quasi_neutral_v1",
+                "adverse_reduce_enabled": True,
+                "adverse_reduce_short_trigger_ratio": 0.012,
+                "adverse_reduce_long_trigger_ratio": 0.009,
+                "adverse_reduce_target_ratio": 0.7,
+                "adverse_reduce_maker_timeout_seconds": 30.0,
+                "adverse_reduce_max_order_notional": 180.0,
+                "adverse_reduce_keep_probe_scale": 0.1,
+            }
+        )
+
+        self.assertTrue(config["adverse_reduce_enabled"])
+        self.assertEqual(config["adverse_reduce_short_trigger_ratio"], 0.012)
+        self.assertEqual(config["adverse_reduce_long_trigger_ratio"], 0.009)
+        self.assertEqual(config["adverse_reduce_target_ratio"], 0.7)
+        self.assertEqual(config["adverse_reduce_maker_timeout_seconds"], 30.0)
+        self.assertEqual(config["adverse_reduce_max_order_notional"], 180.0)
+        self.assertEqual(config["adverse_reduce_keep_probe_scale"], 0.1)
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
     def test_resolve_runner_start_config_keeps_runtime_guard_fields(self, mock_symbol_config, mock_book_tickers) -> None:
         mock_symbol_config.return_value = self._mock_symbol_config()
         mock_book_tickers.return_value = self._mock_book()
@@ -1081,6 +1352,52 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--max-cumulative-notional", command)
         self.assertIn("--max-cumulative-loss-limit", command)
         self.assertIn("800.0", command)
+
+    def test_build_runner_command_includes_adverse_reduce_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "SOONUSDT",
+                "strategy_profile": "volume_neutral_push_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0001,
+                "buy_levels": 6,
+                "sell_levels": 6,
+                "per_order_notional": 50.0,
+                "base_position_notional": 100.0,
+                "pause_short_position_notional": 800.0,
+                "adverse_reduce_enabled": True,
+                "adverse_reduce_short_trigger_ratio": 0.012,
+                "adverse_reduce_long_trigger_ratio": 0.01,
+                "adverse_reduce_target_ratio": 0.7,
+                "adverse_reduce_maker_timeout_seconds": 30.0,
+                "adverse_reduce_max_order_notional": 180.0,
+                "adverse_reduce_keep_probe_scale": 0.1,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 20,
+                "max_total_notional": 500.0,
+                "sleep_seconds": 15,
+                "state_path": "output/soonusdt_loop_state.json",
+                "plan_json": "output/soonusdt_loop_latest_plan.json",
+                "submit_report_json": "output/soonusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/soonusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+
+        self.assertIn("--adverse-reduce-enabled", command)
+        self.assertIn("--adverse-reduce-short-trigger-ratio", command)
+        self.assertIn("0.012", command)
+        self.assertIn("--adverse-reduce-long-trigger-ratio", command)
+        self.assertIn("--adverse-reduce-target-ratio", command)
+        self.assertIn("--adverse-reduce-maker-timeout-seconds", command)
+        self.assertIn("--adverse-reduce-max-order-notional", command)
+        self.assertIn("--adverse-reduce-keep-probe-scale", command)
 
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:
@@ -1359,12 +1676,23 @@ class WebSecurityTests(unittest.TestCase):
         chip_summaries = {item["key"]: item for item in _runner_preset_summaries("CHIPUSDT")}
         soon_summaries = {item["key"]: item for item in _runner_preset_summaries("SOONUSDT")}
         self.assertIn("chip_short_bias_ping_pong_v1", chip_summaries)
+        self.assertIn("chip_short_bias_ping_pong_guarded_v2", chip_summaries)
+        self.assertIn("chip_short_bias_ping_pong_guarded_v3", chip_summaries)
+        self.assertIn("soon_volume_neutral_ping_pong_guarded_v2", soon_summaries)
         self.assertNotIn("chip_short_bias_ping_pong_v1", soon_summaries)
+        self.assertNotIn("chip_short_bias_ping_pong_guarded_v2", soon_summaries)
+        self.assertNotIn("chip_short_bias_ping_pong_guarded_v3", soon_summaries)
         preset = chip_summaries["chip_short_bias_ping_pong_v1"]
         self.assertEqual(preset["label"], "CHIP 偏空护栏 v1")
         self.assertEqual(preset["config"]["symbol"], "CHIPUSDT")
         self.assertEqual(preset["config"]["strategy_mode"], "synthetic_neutral")
         self.assertAlmostEqual(preset["config"]["per_order_notional"], 20.0)
+        guarded = chip_summaries["chip_short_bias_ping_pong_guarded_v2"]
+        self.assertEqual(guarded["label"], "CHIP 偏空护栏 v2")
+        self.assertTrue(guarded["config"]["self_volume_trigger_enabled"])
+        guarded_v3 = chip_summaries["chip_short_bias_ping_pong_guarded_v3"]
+        self.assertEqual(guarded_v3["label"], "CHIP 偏空护栏 v3")
+        self.assertAlmostEqual(guarded_v3["config"]["per_order_notional"], 40.0)
 
     def test_runner_preset_summaries_hide_volume_neutral_push_v1_from_dropdown(self) -> None:
         based = {item["key"]: item for item in _runner_preset_summaries("BASEDUSDT")}
@@ -1631,6 +1959,16 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_monitor_page_contains_sprint_preset_labels_and_auto_selects_first_available(self) -> None:
         self.assertIn("CHIP 偏空护栏 v1", MONITOR_PAGE)
+        self.assertIn("CHIP 偏空护栏 v2", MONITOR_PAGE)
+        self.assertIn("CHIP 偏空护栏 v3", MONITOR_PAGE)
+        self.assertIn("SOON 中性护栏 v2", MONITOR_PAGE)
+        self.assertIn('id="monitor_self_volume_trigger_enabled"', MONITOR_PAGE)
+        self.assertIn('id="monitor_self_volume_trigger_resume_window"', MONITOR_PAGE)
+        self.assertIn('id="monitor_self_volume_trigger_resume_amplitude_ratio"', MONITOR_PAGE)
+        self.assertIn('id="monitor_self_volume_trigger_resume_abs_return_ratio"', MONITOR_PAGE)
+        self.assertIn('id="monitor_self_volume_trigger_risk_actual_net_notional"', MONITOR_PAGE)
+        self.assertIn('id="monitor_self_volume_trigger_risk_short_adverse_ratio"', MONITOR_PAGE)
+        self.assertIn("自成交量低量停机", MONITOR_PAGE)
         self.assertIn("UM 冲刺赛 BTCUSDC", MONITOR_PAGE)
         self.assertIn("黄金冲刺赛 XAUUSDT", MONITOR_PAGE)
         self.assertIn("TradFi 冲刺赛 CLUSDT", MONITOR_PAGE)
@@ -1760,6 +2098,119 @@ class WebSecurityTests(unittest.TestCase):
         mock_stop_runner.assert_called_once_with("OPNUSDT")
         self.assertTrue(result["started"])
         self.assertTrue(result["restarted"])
+
+    @patch("grid_optimizer.web.time.sleep")
+    @patch("grid_optimizer.web._start_flatten_process")
+    @patch("grid_optimizer.web.load_live_flatten_snapshot")
+    @patch("grid_optimizer.web._close_symbol_positions_at_top_of_book")
+    @patch("grid_optimizer.web._cancel_symbol_open_orders")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_execute_stop_actions_hard_close_then_allow_loss_flatten(
+        self,
+        mock_load_creds,
+        mock_cancel_orders,
+        mock_hard_close,
+        mock_live_snapshot,
+        mock_start_flatten,
+        _mock_sleep,
+    ) -> None:
+        mock_load_creds.return_value = ("key", "secret")
+        mock_cancel_orders.return_value = {"attempted": 2, "success": 2, "errors": []}
+        mock_hard_close.return_value = {
+            "attempted": 1,
+            "submitted": 1,
+            "orders": [{"side": "BUY", "quantity": 10}],
+            "errors": [],
+            "warnings": [],
+        }
+        mock_live_snapshot.return_value = {
+            "orders": [{"side": "BUY", "quantity": 5}],
+            "warnings": [],
+        }
+        mock_start_flatten.return_value = {"started": True, "already_running": False}
+        summary = _execute_stop_actions(
+            symbol="CHIPUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+            hard_close_all_positions=True,
+            flatten_allow_loss=True,
+        )
+        self.assertTrue(summary["cancel_open_orders_executed"])
+        self.assertTrue(summary["close_all_positions_executed"])
+        self.assertEqual(summary["hard_close_attempted_count"], 1)
+        self.assertEqual(summary["hard_close_submitted_count"], 1)
+        mock_live_snapshot.assert_called_once_with("CHIPUSDT", "key", "secret", allow_loss=True)
+        flatten_config = mock_start_flatten.call_args.args[0]
+        self.assertTrue(flatten_config["allow_loss"])
+        self.assertTrue(summary["flatten_started"])
+
+    @patch("grid_optimizer.web._autotune_runner_symbol_config", side_effect=lambda config: config)
+    @patch("grid_optimizer.web._normalize_runner_runtime_paths", side_effect=lambda config, _symbol: config)
+    @patch("grid_optimizer.web._normalize_runner_control_payload", side_effect=lambda payload: payload)
+    @patch("grid_optimizer.web._read_runner_process_for_symbol")
+    @patch("grid_optimizer.web._read_json_dict")
+    def test_load_last_runner_control_config_prefers_saved_control(
+        self,
+        mock_read_json,
+        mock_read_runner,
+        _mock_normalize_payload,
+        _mock_normalize_paths,
+        _mock_autotune,
+    ) -> None:
+        mock_read_json.return_value = {"symbol": "CHIPUSDT", "strategy_profile": "chip_last"}
+        mock_read_runner.return_value = {"config": {"symbol": "CHIPUSDT", "strategy_profile": "other"}}
+
+        config, source = _load_last_runner_control_config("chipusdt")
+
+        self.assertEqual(source, "saved_control")
+        self.assertEqual(config["symbol"], "CHIPUSDT")
+        self.assertEqual(config["strategy_profile"], "chip_last")
+
+    @patch("grid_optimizer.web._read_runner_process_for_symbol", return_value={"config": {}})
+    @patch("grid_optimizer.web._read_json_dict", return_value=None)
+    def test_load_last_runner_control_config_requires_real_config(
+        self,
+        _mock_read_json,
+        _mock_read_runner,
+    ) -> None:
+        with self.assertRaisesRegex(ValueError, "暂无最近运行策略配置"):
+            _load_last_runner_control_config("chipusdt")
+
+    @patch("grid_optimizer.web._start_runner_process")
+    @patch("grid_optimizer.web._load_last_runner_control_config")
+    def test_start_runner_from_last_config_uses_quick_start_path(
+        self,
+        mock_load_last,
+        mock_start_runner,
+    ) -> None:
+        mock_load_last.return_value = (
+            {"symbol": "CHIPUSDT", "strategy_profile": "chip_saved_v1"},
+            "saved_control",
+        )
+        mock_start_runner.return_value = {"started": True, "already_running": False, "runner": {"config": {"symbol": "CHIPUSDT"}}}
+
+        result = _start_runner_from_last_config("chipusdt")
+
+        mock_load_last.assert_called_once_with("CHIPUSDT")
+        mock_start_runner.assert_called_once()
+        self.assertEqual(result["config_source"], "saved_control")
+        self.assertTrue(result["started"])
+
+    @patch("grid_optimizer.web._stop_runner_process")
+    def test_quick_flatten_runner_symbol_enforces_cancel_and_allow_loss(self, mock_stop_runner) -> None:
+        mock_stop_runner.return_value = {"stopped": True, "post_stop_actions": {"flatten_started": True}}
+
+        result = _quick_flatten_runner_symbol("chipusdt")
+
+        mock_stop_runner.assert_called_once_with(
+            "CHIPUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+            flatten_allow_loss=True,
+            clear_volatility_resume_state=True,
+            clear_self_volume_resume_state=True,
+        )
+        self.assertTrue(result["flatten_allow_loss"])
 
     @patch.dict("os.environ", {"GRID_RUNNER_SERVICE_TEMPLATE": "grid-loop@{symbol}.service"})
     @patch("grid_optimizer.web._run_systemctl")
