@@ -12,6 +12,7 @@ from unittest.mock import patch
 
 from grid_optimizer import competition_board
 from grid_optimizer.competition_board import (
+    COMPETITION_SOURCES,
     COMPETITION_BOARD_PAGE,
     _entry_projection,
     _hinted_boards_for_source,
@@ -192,6 +193,56 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(boards[1]["tabLabel"], "交易量挑战赛 - 第二阶段")
         self.assertEqual(boards[1]["activityEndAt"], "2026-04-16T07:59:00+08:00")
 
+    def test_competition_sources_include_new_april_activity_pages(self) -> None:
+        slugs = {item.slug for item in COMPETITION_SOURCES}
+        self.assertTrue(
+            {
+                "futures_soon",
+                "futures_tradfi_week1",
+                "futures_altcoins_week1",
+                "futures_um_week1",
+                "futures_goldsilver_week1",
+            }.issubset(slugs)
+        )
+
+    def test_hinted_soon_two_stage_boards_include_real_resource_ids(self) -> None:
+        source = CompetitionSource(
+            slug="futures_soon",
+            symbol="SOON",
+            market="futures",
+            label="SOON 合约交易挑战赛",
+            url="https://www.binance.com/zh-CN/activity/trading-competition/futures-soon-challenge3?ref=YEK2JZJT",
+        )
+        hinted = _hinted_boards_for_source(source)
+        self.assertIsNotNone(hinted)
+        _, boards = hinted or ({}, [])
+        self.assertEqual(len(boards), 2)
+        self.assertEqual(boards[0].get("resourceId"), 50568)
+        self.assertEqual(boards[0]["tabLabel"], "交易量挑战赛 - 第一阶段")
+        self.assertEqual(boards[0]["activityEndAt"], "2026-04-27T07:59:00+08:00")
+        self.assertEqual(boards[1].get("resourceId"), 50570)
+        self.assertEqual(boards[1]["tabLabel"], "交易量挑战赛 - 第二阶段")
+        self.assertEqual(boards[1]["activityEndAt"], "2026-05-07T07:59:00+08:00")
+
+    def test_hinted_sprint_week1_boards_include_real_resource_ids(self) -> None:
+        expected = {
+            "futures_tradfi_week1": (50447, "USDT"),
+            "futures_altcoins_week1": (50459, "PUMP/BANK"),
+            "futures_um_week1": (50456, "BNB"),
+            "futures_goldsilver_week1": (50453, "USDT"),
+        }
+        for slug, (resource_id, reward_unit) in expected.items():
+            source = next(item for item in COMPETITION_SOURCES if item.slug == slug)
+            hinted = _hinted_boards_for_source(source)
+            self.assertIsNotNone(hinted)
+            _, boards = hinted or ({}, [])
+            self.assertEqual(len(boards), 1)
+            self.assertEqual(boards[0].get("resourceId"), resource_id)
+            self.assertEqual(boards[0]["tabLabel"], "交易量冲刺赛 - 第1周")
+            self.assertEqual(boards[0]["activityEndAt"], "2026-04-28T07:59:00+08:00")
+            self.assertEqual(boards[0]["rewardUnit"], reward_unit)
+            self.assertEqual(boards[0]["maxRows"], 500)
+
     def test_parse_activity_period_bounds_extracts_start_and_end(self) -> None:
         start_at, end_at = _parse_activity_period_bounds("2026/03/29 08:00 - 2026/04/08 07:59")
         self.assertEqual(start_at, "2026-03-29T08:00:00+08:00")
@@ -215,11 +266,63 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(len(set(session_values)), 1)
         self.assertLessEqual(len(session_values[0]), 12)
 
+    def test_run_playwright_extract_retries_after_navigation_destroyed_context(self) -> None:
+        calls: list[list[str]] = []
+        eval_attempts = 0
+
+        def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            nonlocal eval_attempts
+            calls.append(cmd)
+            if "eval" in cmd:
+                eval_attempts += 1
+                if eval_attempts == 1:
+                    raise subprocess.CalledProcessError(
+                        1,
+                        cmd,
+                        output="### Error\nExecution context was destroyed, most likely because of a navigation",
+                        stderr="",
+                    )
+                return subprocess.CompletedProcess(cmd, 0, stdout='### Result\n{"meta": {}, "boards": [{"tabLabel": "默认"}]}', stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(competition_board.subprocess, "run", side_effect=fake_run), patch.object(
+            competition_board.time, "sleep"
+        ):
+            payload = competition_board._run_playwright_extract("https://example.com")
+
+        self.assertEqual(payload, {"meta": {}, "boards": [{"tabLabel": "默认"}]})
+        self.assertEqual(eval_attempts, 2)
+        self.assertGreaterEqual(len([cmd for cmd in calls if "open" in cmd]), 2)
+
     def test_ended_analytics_ui_explains_missing_previous_day_snapshot(self) -> None:
         self.assertIn("缺少前一天本地快照", COMPETITION_BOARD_PAGE)
         self.assertIn("结束时间：", COMPETITION_BOARD_PAGE)
         self.assertIn("board.forecast_coefficients", COMPETITION_BOARD_PAGE)
         self.assertIn("Math.min(predicted, previousPredictedValue)", COMPETITION_BOARD_PAGE)
+
+    def test_fetch_leaderboard_rows_handles_missing_summary_list(self) -> None:
+        class FakeResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+            def json(self) -> object:
+                return {
+                    "code": "000000",
+                    "data": {
+                        "resourceSummaryList": None,
+                        "eligibleUserCount": 0,
+                        "eligibleTradingVolume": 0,
+                        "updatedTime": 0,
+                    },
+                }
+
+        with patch.object(competition_board.requests, "post", return_value=FakeResponse()):
+            rows = competition_board._fetch_leaderboard_rows(12345, "https://example.com", max_rows=5)
+
+        self.assertEqual(rows["resource_id"], 12345)
+        self.assertEqual(rows["eligible_user_count"], 0)
+        self.assertEqual(rows["rows"], [])
+        self.assertEqual(rows["last_rank_fetched"], 0)
 
     def test_fetch_symbol_close_price_usdt_falls_back_to_futures_archive(self) -> None:
         end_at = datetime.fromisoformat("2026-01-17T07:59:00+08:00")

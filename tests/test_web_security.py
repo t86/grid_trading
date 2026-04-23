@@ -309,9 +309,35 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["step_price"], 0.0001)
         self.assertAlmostEqual(payload["max_cumulative_notional"], 600000.0)
 
+    def test_runner_preset_payload_applies_chip_short_bias_ping_pong_profile(self) -> None:
+        payload = _runner_preset_payload("chip_short_bias_ping_pong_v1", {"symbol": "CHIPUSDT"})
+        self.assertEqual(payload["strategy_profile"], "chip_short_bias_ping_pong_v1")
+        self.assertEqual(payload["symbol"], "CHIPUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 0.0012)
+        self.assertEqual(payload["buy_levels"], 6)
+        self.assertEqual(payload["sell_levels"], 10)
+        self.assertAlmostEqual(payload["per_order_notional"], 20.0)
+        self.assertAlmostEqual(payload["startup_entry_multiplier"], 1.5)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 90.0)
+        self.assertAlmostEqual(payload["pause_short_position_notional"], 180.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 120.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 260.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 320.0)
+        self.assertAlmostEqual(payload["max_actual_net_notional"], 80.0)
+        self.assertAlmostEqual(payload["max_synthetic_drift_notional"], 35.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertFalse(payload["adaptive_step_enabled"])
+        self.assertFalse(payload["market_bias_enabled"])
+        self.assertFalse(payload["synthetic_trend_follow_enabled"])
+
     def test_runner_preset_payload_rejects_xaut_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUTUSDT"):
             _runner_preset_payload("xaut_long_adaptive_v1", {"symbol": "BTCUSDT"})
+
+    def test_runner_preset_payload_rejects_chip_profile_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=CHIPUSDT"):
+            _runner_preset_payload("chip_short_bias_ping_pong_v1", {"symbol": "BTCUSDT"})
 
     def test_runner_preset_summaries_hide_xaut_volume_guarded_bard_v3_from_dropdown(self) -> None:
         xaut_keys = {item["key"] for item in _runner_preset_summaries("XAUTUSDT")}
@@ -1329,6 +1355,17 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(preset["config"]["strategy_mode"], "synthetic_neutral")
         self.assertAlmostEqual(preset["config"]["per_order_notional"], 120.0)
 
+    def test_runner_preset_summaries_include_chip_profile_for_chip_only(self) -> None:
+        chip_summaries = {item["key"]: item for item in _runner_preset_summaries("CHIPUSDT")}
+        soon_summaries = {item["key"]: item for item in _runner_preset_summaries("SOONUSDT")}
+        self.assertIn("chip_short_bias_ping_pong_v1", chip_summaries)
+        self.assertNotIn("chip_short_bias_ping_pong_v1", soon_summaries)
+        preset = chip_summaries["chip_short_bias_ping_pong_v1"]
+        self.assertEqual(preset["label"], "CHIP 偏空护栏 v1")
+        self.assertEqual(preset["config"]["symbol"], "CHIPUSDT")
+        self.assertEqual(preset["config"]["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(preset["config"]["per_order_notional"], 20.0)
+
     def test_runner_preset_summaries_hide_volume_neutral_push_v1_from_dropdown(self) -> None:
         based = {item["key"]: item for item in _runner_preset_summaries("BASEDUSDT")}
         self.assertNotIn("volume_neutral_push_v1", based)
@@ -1572,7 +1609,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("硬上限", MONITOR_PAGE)
 
     def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', MONITOR_PAGE)
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', MONITOR_PAGE)
 
     def test_monitor_page_keeps_raw_json_in_advanced_panel(self) -> None:
         self.assertIn('id="runner_params_advanced_panel"', MONITOR_PAGE)
@@ -1593,6 +1630,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("GRID_BASED_RUNNER_MODES", MONITOR_PAGE)
 
     def test_monitor_page_contains_sprint_preset_labels_and_auto_selects_first_available(self) -> None:
+        self.assertIn("CHIP 偏空护栏 v1", MONITOR_PAGE)
         self.assertIn("UM 冲刺赛 BTCUSDC", MONITOR_PAGE)
         self.assertIn("黄金冲刺赛 XAUUSDT", MONITOR_PAGE)
         self.assertIn("TradFi 冲刺赛 CLUSDT", MONITOR_PAGE)
@@ -1607,7 +1645,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', STRATEGIES_PAGE)
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:

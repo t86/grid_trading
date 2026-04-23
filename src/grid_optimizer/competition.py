@@ -10,6 +10,7 @@ from .types import BacktestResult, Candle, FundingRate
 
 COMPETITION_SYMBOLS: tuple[str, ...] = (
     "SOONUSDT",
+    "CHIPUSDT",
     "BTCUSDC",
     "ETHUSDC",
     "XAUUSDT",

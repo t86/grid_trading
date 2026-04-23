@@ -1523,6 +1523,63 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "sleep_seconds": 5.0,
         },
     },
+    "chip_short_bias_ping_pong_v1": {
+        "label": "CHIP 偏空护栏 v1",
+        "description": "CHIPUSDT 专用保守偏空 ping-pong。零底仓、卖侧更近更多、长侧更轻更早停买，先验证库存护栏和回补节奏再考虑放量。",
+        "startable": True,
+        "kind": "synthetic",
+        "symbol": "CHIPUSDT",
+        "config": {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "step_price": 0.0012,
+            "buy_levels": 6,
+            "sell_levels": 10,
+            "per_order_notional": 20.0,
+            "startup_entry_multiplier": 1.5,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 90.0,
+            "pause_short_position_notional": 180.0,
+            "max_position_notional": 120.0,
+            "max_short_position_notional": 260.0,
+            "max_total_notional": 320.0,
+            "max_actual_net_notional": 80.0,
+            "max_synthetic_drift_notional": 35.0,
+            "static_buy_offset_steps": 1.2,
+            "static_sell_offset_steps": 0.6,
+            "near_market_entry_max_center_distance_steps": 3.0,
+            "grid_inventory_rebalance_min_center_distance_steps": 5.0,
+            "near_market_reentry_confirm_cycles": 4,
+            "take_profit_min_profit_ratio": 0.0008,
+            "threshold_position_notional": 0.0,
+            "max_new_orders": 20,
+            "buy_pause_amp_trigger_ratio": 0.018,
+            "buy_pause_down_return_trigger_ratio": -0.010,
+            "short_cover_pause_amp_trigger_ratio": 0.010,
+            "short_cover_pause_down_return_trigger_ratio": -0.006,
+            "freeze_shift_abs_return_trigger_ratio": 0.012,
+            "rolling_hourly_loss_limit": 6.0,
+            "max_cumulative_notional": 30000.0,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "1m",
+            "volatility_trigger_amplitude_ratio": 0.035,
+            "volatility_trigger_abs_return_ratio": 0.020,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": False,
+            "sleep_seconds": 3.0,
+            "leverage": 3,
+            "maker_retries": 2,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+            "market_bias_enabled": False,
+            "synthetic_trend_follow_enabled": False,
+        },
+    },
 }
 
 RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
@@ -1538,6 +1595,7 @@ RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
         "clusdt_competition_maker_neutral_v1",
         "bzusdt_competition_maker_neutral_v1",
         "ordiusdc_competition_maker_neutral_v1",
+        "chip_short_bias_ping_pong_v1",
         "volume_short_v1",
         "xaut_volume_guarded_bard_v2",
     }
@@ -1681,6 +1739,7 @@ RUNNER_AUTOTUNE_STEP_HINTS: dict[str, tuple[float, int]] = {
     "volume_neutral_push_v1": (0.00028, 1),
     "volume_neutral_push_guarded_v1": (0.00032, 2),
     "volume_neutral_ping_pong_v1": (0.00035, 2),
+    "chip_short_bias_ping_pong_v1": (0.009, 10),
     "xaut_guarded_ping_pong_v1": (0.00048, 180),
     "xaut_near_price_guarded_v1": (0.00012, 1),
     "xaut_volume_guarded_bard_v3": (0.00021, 100),
@@ -12886,7 +12945,7 @@ MONITOR_PAGE = """<!doctype html>
     const customGridStatusEl = document.getElementById("custom_grid_status");
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
-    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
+    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
     const VISIBLE_STRATEGY_PRESET_KEYS = new Set([
       "volume_long_v4",
       "based_volume_push_bard_v1",
@@ -14123,6 +14182,64 @@ MONITOR_PAGE = """<!doctype html>
           sleep_seconds: 5,
         },
       },
+      {
+        key: "chip_short_bias_ping_pong_v1",
+        label: "CHIP 偏空护栏 v1",
+        description: "CHIPUSDT 专用保守偏空 ping-pong。零底仓、卖侧更近更多、长侧更轻更早停买，先验证库存护栏和回补节奏再考虑放量。",
+        startable: true,
+        kind: "synthetic",
+        symbol: "CHIPUSDT",
+        config: {
+          symbol: "CHIPUSDT",
+          strategy_mode: "synthetic_neutral",
+          step_price: 0.0012,
+          buy_levels: 6,
+          sell_levels: 10,
+          per_order_notional: 20.0,
+          startup_entry_multiplier: 1.5,
+          base_position_notional: 0.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 90.0,
+          pause_short_position_notional: 180.0,
+          max_position_notional: 120.0,
+          max_short_position_notional: 260.0,
+          max_total_notional: 320.0,
+          max_actual_net_notional: 80.0,
+          max_synthetic_drift_notional: 35.0,
+          static_buy_offset_steps: 1.2,
+          static_sell_offset_steps: 0.6,
+          near_market_entry_max_center_distance_steps: 3.0,
+          grid_inventory_rebalance_min_center_distance_steps: 5.0,
+          near_market_reentry_confirm_cycles: 4,
+          take_profit_min_profit_ratio: 0.0008,
+          threshold_position_notional: 0.0,
+          max_new_orders: 20,
+          buy_pause_amp_trigger_ratio: 0.018,
+          buy_pause_down_return_trigger_ratio: -0.010,
+          short_cover_pause_amp_trigger_ratio: 0.010,
+          short_cover_pause_down_return_trigger_ratio: -0.006,
+          freeze_shift_abs_return_trigger_ratio: 0.012,
+          rolling_hourly_loss_limit: 6.0,
+          max_cumulative_notional: 30000.0,
+          volatility_trigger_enabled: true,
+          volatility_trigger_window: "1m",
+          volatility_trigger_amplitude_ratio: 0.035,
+          volatility_trigger_abs_return_ratio: 0.020,
+          volatility_trigger_stop_cancel_open_orders: true,
+          volatility_trigger_stop_close_all_positions: false,
+          sleep_seconds: 3.0,
+          leverage: 3,
+          maker_retries: 2,
+          autotune_symbol_enabled: false,
+          adaptive_step_enabled: false,
+          market_bias_enabled: false,
+          synthetic_trend_follow_enabled: false,
+        },
+      },
     ];
 
     let timer = null;
@@ -15092,6 +15209,13 @@ MONITOR_PAGE = """<!doctype html>
           "如果把 `startup_entry_multiplier` 设成 4，就相当于首轮大单成交后，用约四笔常规小单去拆回；再叠加 bias 三态换挡，就能少扛单边库存。",
         ],
       },
+      chip_short_bias_ping_pong_v1: {
+        summary: "CHIPUSDT 的保守偏空护栏回转。零底仓，但卖侧更近更多、长侧更轻更早停买，目标是先把库存和回补节奏跑稳。",
+        focus: [
+          "这套不是对称中性，而是明确允许净仓偏向空侧；真正的保护重点是实际净敞口、synthetic drift 和 1m 高波动停机线。",
+          "首版故意关闭 autotune、adaptive step、market bias 和 trend follow，先用静态护栏确认 CHIP 的真实盘口承受能力，再决定是否放量。",
+        ],
+      },
     };
     const AUTOTUNE_STEP_HINTS = {
       volume_long_v4: { stepRatio: 0.0004, minTicks: 2 },
@@ -15104,6 +15228,7 @@ MONITOR_PAGE = """<!doctype html>
       volume_neutral_push_v1: { stepRatio: 0.00028, minTicks: 1 },
       volume_neutral_push_guarded_v1: { stepRatio: 0.00032, minTicks: 2 },
       volume_neutral_ping_pong_v1: { stepRatio: 0.00035, minTicks: 2 },
+      chip_short_bias_ping_pong_v1: { stepRatio: 0.009, minTicks: 10 },
       xaut_guarded_ping_pong_v1: { stepRatio: 0.00048, minTicks: 180 },
       xaut_near_price_guarded_v1: { stepRatio: 0.00012, minTicks: 1 },
       xaut_volume_guarded_bard_v3: { stepRatio: 0.00021, minTicks: 100 },
@@ -18432,8 +18557,8 @@ STRATEGIES_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
-    const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
+    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
+    const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
     const cardsEl = document.getElementById("cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");

@@ -15,6 +15,7 @@ class CompetitionTests(unittest.TestCase):
     @patch("grid_optimizer.competition.get_symbol_list", return_value=list(COMPETITION_SYMBOLS))
     def test_supported_competition_symbols_include_current_sprint_symbols(self, mock_get_symbol_list) -> None:
         self.assertEqual(tuple(competition_symbols()), COMPETITION_SYMBOLS)
+        self.assertIn("CHIPUSDT", COMPETITION_SYMBOLS)
         self.assertIn("BTCUSDC", COMPETITION_SYMBOLS)
         self.assertIn("XAUUSDT", COMPETITION_SYMBOLS)
         self.assertIn("CLUSDT", COMPETITION_SYMBOLS)
