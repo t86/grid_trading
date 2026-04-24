@@ -4272,6 +4272,7 @@ def assess_adverse_inventory_reduce(
     pause_short_position_notional: float | None,
     long_trigger_ratio: float | None,
     short_trigger_ratio: float | None,
+    target_ratio: float | None = None,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "enabled": bool(enabled),
@@ -4288,7 +4289,9 @@ def assess_adverse_inventory_reduce(
         "short_adverse_ratio": None,
         "long_trigger_ratio": max(_safe_float(long_trigger_ratio), 0.0),
         "short_trigger_ratio": max(_safe_float(short_trigger_ratio), 0.0),
-        "target_ratio": 0.0,
+        "target_ratio": max(_safe_float(target_ratio), 0.0),
+        "long_activation_mode": None,
+        "short_activation_mode": None,
         "maker_timeout_seconds": 0.0,
         "long_elapsed_seconds": 0.0,
         "short_elapsed_seconds": 0.0,
@@ -4307,6 +4310,9 @@ def assess_adverse_inventory_reduce(
     safe_mid_price = max(_safe_float(mid_price), 0.0)
     long_pause = max(_safe_float(pause_long_position_notional), 0.0)
     short_pause = max(_safe_float(pause_short_position_notional), 0.0)
+    safe_target_ratio = min(max(_safe_float(target_ratio), 0.0), 0.999999)
+    long_probe_floor = long_pause * safe_target_ratio if long_pause > 0 and safe_target_ratio > 0 else 0.0
+    short_probe_floor = short_pause * safe_target_ratio if short_pause > 0 and safe_target_ratio > 0 else 0.0
     safe_long_cost = max(_safe_float(current_long_cost_price), 0.0)
     safe_short_cost = max(_safe_float(current_short_cost_price), 0.0)
     long_ratio = ((safe_long_cost - safe_mid_price) / safe_long_cost) if safe_long_cost > 0 and safe_mid_price > 0 else None
@@ -4318,7 +4324,9 @@ def assess_adverse_inventory_reduce(
     if (
         max(_safe_float(current_long_qty), 0.0) > 1e-12
         and long_pause > 0
-        and max(_safe_float(current_long_notional), 0.0) > long_pause
+        and max(_safe_float(current_long_notional), 0.0) > min(
+            value for value in (long_pause, long_probe_floor) if value > 0
+        )
     ):
         if safe_long_cost <= 0:
             blocked_reasons.append("long_cost_basis_missing")
@@ -4326,13 +4334,18 @@ def assess_adverse_inventory_reduce(
             blocked_reasons.append("long_trigger_ratio_disabled")
         elif long_ratio is not None and long_ratio >= report["long_trigger_ratio"]:
             report["long_active"] = True
+            report["long_activation_mode"] = (
+                "pause" if max(_safe_float(current_long_notional), 0.0) > long_pause else "below_pause_probe"
+            )
         else:
             blocked_reasons.append("long_adverse_ratio_below_trigger")
 
     if (
         max(_safe_float(current_short_qty), 0.0) > 1e-12
         and short_pause > 0
-        and max(_safe_float(current_short_notional), 0.0) > short_pause
+        and max(_safe_float(current_short_notional), 0.0) > min(
+            value for value in (short_pause, short_probe_floor) if value > 0
+        )
     ):
         if safe_short_cost <= 0:
             blocked_reasons.append("short_cost_basis_missing")
@@ -4340,6 +4353,9 @@ def assess_adverse_inventory_reduce(
             blocked_reasons.append("short_trigger_ratio_disabled")
         elif short_ratio is not None and short_ratio >= report["short_trigger_ratio"]:
             report["short_active"] = True
+            report["short_activation_mode"] = (
+                "pause" if max(_safe_float(current_short_notional), 0.0) > short_pause else "below_pause_probe"
+            )
         else:
             blocked_reasons.append("short_adverse_ratio_below_trigger")
 
@@ -4776,6 +4792,9 @@ def apply_active_delever_long(
     min_qty: float | None = None,
     min_notional: float | None = None,
     max_active_levels: int = 3,
+    force_release_active: bool = False,
+    force_release_target_notional: float | None = None,
+    force_release_trigger_mode: str = "force_release",
 ) -> dict[str, Any]:
     available_buffer = max(float(grid_buffer_realized_notional) - float(grid_buffer_spent_notional), 0.0)
     report = {
@@ -4792,10 +4811,16 @@ def apply_active_delever_long(
         "release_floor_price": None,
         "synthesized_release_source_order_count": 0,
         "pruned_flow_sleeve_order_count": 0,
+        "force_release_active": bool(force_release_active),
+        "force_release_target_notional": force_release_target_notional,
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
     pause_trigger_active = pause_notional > 0 and current_long_notional >= pause_notional - 1e-12
+    force_target_notional = max(_safe_float(force_release_target_notional), 0.0)
+    force_release_trigger_active = bool(force_release_active) and (
+        force_target_notional <= 0 or current_long_notional > force_target_notional + 1e-12
+    )
     threshold_enabled = threshold_notional > max(pause_notional, 0.0)
     if (
         max_active_levels <= 0
@@ -4803,12 +4828,12 @@ def apply_active_delever_long(
         or step_price <= 0
     ):
         return report
-    if not threshold_enabled and pause_notional <= 0:
+    if not threshold_enabled and pause_notional <= 0 and not force_release_trigger_active:
         return report
     if threshold_enabled:
-        if current_long_notional < threshold_notional and current_long_notional < pause_notional:
+        if current_long_notional < threshold_notional and current_long_notional < pause_notional and not force_release_trigger_active:
             return report
-    elif current_long_notional < pause_notional:
+    elif current_long_notional < pause_notional and not force_release_trigger_active:
         return report
 
     take_profit_orders = [
@@ -4816,7 +4841,7 @@ def apply_active_delever_long(
         for item in plan.get("sell_orders", [])
         if isinstance(item, dict) and _order_role(item) == "take_profit_long"
     ]
-    if not take_profit_orders and pause_trigger_active:
+    if not take_profit_orders and (pause_trigger_active or force_release_trigger_active):
         take_profit_orders = _build_near_market_release_seed_orders(
             side="SELL",
             role="take_profit_long",
@@ -4911,7 +4936,22 @@ def apply_active_delever_long(
         trigger_mode = "threshold"
     else:
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
-        if pause_trigger_active:
+        if force_release_trigger_active:
+            excess_notional = max(current_long_notional - force_target_notional, 0.0)
+            active_count = min(
+                len(take_profit_orders),
+                requested_levels,
+                max(1, int(math.ceil(max(excess_notional, safe_per_order_notional) / safe_per_order_notional))),
+            )
+            estimated_cost = _estimate_long_delever_cost(
+                current_long_lots=current_long_lots,
+                current_long_qty=current_long_qty,
+                current_long_avg_price=current_long_avg_price,
+                sell_orders=take_profit_orders[:active_count],
+                consume_mode="fifo",
+            )
+            trigger_mode = str(force_release_trigger_mode or "force_release").strip() or "force_release"
+        elif pause_trigger_active:
             excess_notional = max(current_long_notional - pause_notional, 0.0)
             active_count = min(
                 len(take_profit_orders),
@@ -4968,6 +5008,9 @@ def apply_active_delever_long(
         trigger_mode in {"threshold", "pause"}
         and pause_notional > 0
         and current_long_notional >= pause_notional - 1e-12
+    ) or (
+        force_release_trigger_active
+        and bool(trigger_mode)
     )
     release_floor_price: float | None = None
     release_order_count = 0
@@ -5048,6 +5091,9 @@ def apply_active_delever_short(
     max_active_levels: int = 3,
     threshold_timeout_active: bool = False,
     timeout_target_notional: float | None = None,
+    force_release_active: bool = False,
+    force_release_target_notional: float | None = None,
+    force_release_trigger_mode: str = "force_release",
 ) -> dict[str, Any]:
     available_buffer = max(float(grid_buffer_realized_notional) - float(grid_buffer_spent_notional), 0.0)
     report = {
@@ -5067,10 +5113,16 @@ def apply_active_delever_short(
         "release_ceiling_price": None,
         "synthesized_release_source_order_count": 0,
         "pruned_flow_sleeve_order_count": 0,
+        "force_release_active": bool(force_release_active),
+        "force_release_target_notional": force_release_target_notional,
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
     timeout_target = max(_safe_float(timeout_target_notional), 0.0)
+    force_target_notional = max(_safe_float(force_release_target_notional), 0.0)
+    force_release_trigger_active = bool(force_release_active) and (
+        force_target_notional <= 0 or current_short_notional > force_target_notional + 1e-12
+    )
     pause_trigger_active = pause_notional > 0 and current_short_notional >= pause_notional - 1e-12
     threshold_timeout_trigger_active = bool(threshold_timeout_active) and timeout_target > 0 and current_short_notional > timeout_target
     threshold_trigger_active = threshold_notional > max(pause_notional, 0.0) and current_short_notional >= threshold_notional
@@ -5081,12 +5133,12 @@ def apply_active_delever_short(
         or step_price <= 0
     ):
         return report
-    if not threshold_enabled and pause_notional <= 0:
+    if not threshold_enabled and pause_notional <= 0 and not force_release_trigger_active:
         return report
     if threshold_enabled:
-        if current_short_notional < threshold_notional and current_short_notional < pause_notional:
+        if current_short_notional < threshold_notional and current_short_notional < pause_notional and not force_release_trigger_active:
             return report
-    elif current_short_notional < pause_notional:
+    elif current_short_notional < pause_notional and not force_release_trigger_active:
         return report
 
     take_profit_orders = [
@@ -5094,7 +5146,12 @@ def apply_active_delever_short(
         for item in plan.get("buy_orders", [])
         if isinstance(item, dict) and _order_role(item) == "take_profit_short"
     ]
-    if not take_profit_orders and (pause_trigger_active or threshold_timeout_trigger_active or threshold_trigger_active):
+    if not take_profit_orders and (
+        pause_trigger_active
+        or threshold_timeout_trigger_active
+        or threshold_trigger_active
+        or force_release_trigger_active
+    ):
         take_profit_orders = _build_near_market_release_seed_orders(
             side="BUY",
             role="take_profit_short",
@@ -5128,7 +5185,23 @@ def apply_active_delever_short(
     estimated_cost = 0.0
     trigger_mode: str | None = None
     projected_exit_price = None
-    if threshold_timeout_trigger_active:
+    if force_release_trigger_active:
+        safe_per_order_notional = max(float(per_order_notional), 1e-12)
+        excess_notional = max(current_short_notional - force_target_notional, 0.0)
+        active_count = min(
+            len(take_profit_orders),
+            requested_levels,
+            max(1, int(math.ceil(max(excess_notional, safe_per_order_notional) / safe_per_order_notional))),
+        )
+        estimated_cost = _estimate_short_delever_cost(
+            current_short_lots=current_short_lots,
+            current_short_qty=current_short_qty,
+            current_short_avg_price=current_short_avg_price,
+            buy_orders=take_profit_orders[:active_count],
+            consume_mode="fifo",
+        )
+        trigger_mode = str(force_release_trigger_mode or "force_release").strip() or "force_release"
+    elif threshold_timeout_trigger_active:
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
         excess_notional = max(current_short_notional - timeout_target, 0.0)
         active_count = min(len(take_profit_orders), requested_levels, max(1, int(math.ceil(excess_notional / safe_per_order_notional))))
@@ -5249,6 +5322,9 @@ def apply_active_delever_short(
         trigger_mode in {"threshold", "pause"}
         and pause_notional > 0
         and current_short_notional >= pause_notional - 1e-12
+    ) or (
+        force_release_trigger_active
+        and bool(trigger_mode)
     )
     release_ceiling_price: float | None = None
     release_order_count = 0
@@ -8370,6 +8446,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+            force_release_active=bool(exposure_escalation.get("active")),
+            force_release_target_notional=exposure_escalation.get("target_notional"),
+            force_release_trigger_mode="exposure_escalation",
         )
         short_active_delever = apply_active_delever_short(
             plan=plan,
@@ -8435,6 +8514,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             + int(short_active_delever.get("synthesized_release_source_order_count") or 0),
             "pruned_flow_sleeve_order_count": int(long_active_delever.get("pruned_flow_sleeve_order_count") or 0)
             + int(short_active_delever.get("pruned_flow_sleeve_order_count") or 0),
+            "force_release_active": bool(long_active_delever.get("force_release_active"))
+            or bool(short_active_delever.get("force_release_active")),
+            "force_release_target_notional": long_active_delever.get("force_release_target_notional")
+            or short_active_delever.get("force_release_target_notional"),
             "pause_long_position_notional": long_active_delever.get("pause_long_position_notional"),
             "pause_short_position_notional": short_active_delever.get("pause_short_position_notional"),
             "threshold_timeout_active": bool(short_threshold_timeout.get("timeout_active")),
@@ -8906,8 +8989,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         short_position=short_position,
         synthetic_ledger_snapshot=synthetic_ledger_snapshot,
     )
+    adverse_reduce_enabled = bool(getattr(effective_args, "adverse_reduce_enabled", False)) and not bool(
+        (exposure_escalation or {}).get("active")
+    )
     adverse_inventory_reduce = assess_adverse_inventory_reduce(
-        enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
+        enabled=adverse_reduce_enabled,
         mid_price=mid_price,
         current_long_qty=current_long_qty,
         current_long_notional=controls.get("current_long_notional", current_long_notional),
@@ -8921,6 +9007,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         pause_short_position_notional=effective_args.pause_short_position_notional,
         long_trigger_ratio=getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
         short_trigger_ratio=getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
+        target_ratio=getattr(effective_args, "adverse_reduce_target_ratio", 0.75),
     )
     adverse_inventory_reduce = apply_adverse_inventory_reduce(
         plan=plan,
