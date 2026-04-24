@@ -26,7 +26,7 @@ from statistics import mean
 from typing import Any, Union
 from urllib.parse import parse_qs, urlparse
 
-from .audit import build_audit_paths
+from .audit import build_audit_paths, iter_jsonl
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -103,6 +103,7 @@ from .maker_flatten_runner import (
     is_flatten_order,
     load_live_flatten_snapshot,
 )
+from .notifications import alert_source_label, send_alert_email
 from .optimize import min_step_ratio_for_cost, objective_value, optimize_grid_count
 from .runtime_guards import (
     evaluate_runtime_guards,
@@ -146,6 +147,7 @@ GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
 STABLE_SPOT_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD")
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
+HOURLY_EMAIL_REPORT_STATE_PATH = Path("output/hourly_email_report_state.json")
 MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
 CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
 VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
@@ -1909,6 +1911,290 @@ def _read_json_dict(path: Path) -> dict[str, Any] | None:
     except (OSError, json.JSONDecodeError):
         return None
     return payload if isinstance(payload, dict) else None
+
+
+def _write_json_dict(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _email_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _format_email_number(value: Any, places: int = 4) -> str:
+    return f"{_email_float(value):.{places}f}"
+
+
+def _format_email_signed(value: Any, places: int = 4) -> str:
+    return f"{_email_float(value):+.{places}f}"
+
+
+def _read_last_jsonl_row(path: Path) -> dict[str, Any] | None:
+    latest: dict[str, Any] | None = None
+    for row in iter_jsonl(path):
+        latest = row
+    return latest
+
+
+def _normalize_email_report_now(now: datetime | None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        return current.replace(tzinfo=timezone.utc)
+    return current.astimezone(timezone.utc)
+
+
+def _summarize_symbol_trade_window(
+    summary_path: Path,
+    *,
+    window_minutes: int,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current = _normalize_email_report_now(now)
+    safe_window_minutes = max(int(window_minutes), 1)
+    window_start = current - timedelta(minutes=safe_window_minutes)
+    audit_paths = build_audit_paths(summary_path)
+    summary: dict[str, Any] = {
+        "window_start": window_start.isoformat(),
+        "window_end": current.isoformat(),
+        "gross_notional": 0.0,
+        "realized_pnl": 0.0,
+        "commission": 0.0,
+        "funding_fee": 0.0,
+        "trade_count": 0,
+        "commission_by_asset": {},
+    }
+
+    for row in iter_jsonl(audit_paths["trade_audit"]):
+        ts_ms = int(_email_float(row.get("time")))
+        if ts_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        if ts < window_start or ts > current:
+            continue
+        price = _email_float(row.get("price"))
+        qty = abs(_email_float(row.get("qty")))
+        commission = abs(_email_float(row.get("commission")))
+        commission_asset = str(row.get("commissionAsset") or row.get("commission_asset") or "USDT").upper().strip()
+        summary["gross_notional"] += price * qty
+        summary["realized_pnl"] += _email_float(row.get("realizedPnl"))
+        summary["commission"] += commission
+        summary["trade_count"] += 1
+        if commission_asset:
+            by_asset = summary["commission_by_asset"]
+            by_asset[commission_asset] = float(by_asset.get(commission_asset) or 0.0) + commission
+
+    for row in iter_jsonl(audit_paths["income_audit"]):
+        ts_ms = int(_email_float(row.get("time")))
+        if ts_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+        if ts < window_start or ts > current:
+            continue
+        income_type = str(row.get("incomeType") or row.get("income_type") or "").upper().strip()
+        if income_type == "FUNDING_FEE":
+            summary["funding_fee"] += _email_float(row.get("income"))
+
+    summary["net_after_fees_and_funding"] = (
+        float(summary["realized_pnl"]) + float(summary["funding_fee"]) - float(summary["commission"])
+    )
+    return summary
+
+
+def _build_hourly_email_monitor_snapshot(symbol: str, config: dict[str, Any]) -> dict[str, Any]:
+    normalized_config = _normalize_runner_runtime_paths(dict(config), symbol)
+    runtime_paths = _default_runtime_paths_for_symbol(symbol)
+    runner = read_symbol_runner_process(symbol)
+    return build_monitor_snapshot(
+        symbol=symbol,
+        events_path=str(normalized_config.get("summary_jsonl") or runtime_paths["summary_jsonl"]),
+        plan_path=str(normalized_config.get("plan_json") or runtime_paths["plan_json"]),
+        submit_report_path=str(normalized_config.get("submit_report_json") or runtime_paths["submit_report_json"]),
+        summary_limit=500,
+        runner_process=runner,
+    )
+
+
+def _first_email_float(row: dict[str, Any], keys: tuple[str, ...], default: float = 0.0) -> float:
+    for key in keys:
+        value = row.get(key)
+        if key in row and value is not None and value != "":
+            return _email_float(value, default)
+    return default
+
+
+def _format_email_asset_amount(info: dict[str, Any]) -> str:
+    available = _first_email_float(info, ("available_balance", "availableBalance", "free", "max_withdraw_amount"))
+    wallet = _first_email_float(info, ("wallet_balance", "walletBalance", "balance", "margin_balance"))
+    return f"可用 {_format_email_number(available)} · 钱包 {_format_email_number(wallet)}"
+
+
+def _format_hourly_email_asset_lines(snapshot: dict[str, Any]) -> list[str]:
+    assets = snapshot.get("account_assets")
+    asset_map = assets if isinstance(assets, dict) else {}
+    lines: list[str] = []
+
+    bnb_info = asset_map.get("BNB")
+    if isinstance(bnb_info, dict):
+        lines.append(f"剩余BNB: {_format_email_asset_amount(bnb_info)}")
+    else:
+        lines.append("剩余BNB: 无")
+
+    remaining_assets: list[str] = []
+    for asset, info in sorted(asset_map.items()):
+        normalized_asset = str(asset).upper().strip()
+        if normalized_asset == "BNB" or not isinstance(info, dict):
+            continue
+        remaining_assets.append(f"{normalized_asset} {_format_email_asset_amount(info)}")
+    if not remaining_assets:
+        position = snapshot.get("position")
+        if isinstance(position, dict):
+            remaining_assets.append(
+                "USDT "
+                f"可用 {_format_email_number(position.get('available_balance'))} · "
+                f"钱包 {_format_email_number(position.get('wallet_balance'))}"
+            )
+    lines.append("剩余资产: " + ("；".join(remaining_assets) if remaining_assets else "无"))
+    return lines
+
+
+def _format_hourly_email_open_order_lines(snapshot: dict[str, Any]) -> list[str]:
+    orders = snapshot.get("open_orders")
+    if not isinstance(orders, list) or not orders:
+        return ["当前委托单: 无"]
+    lines = ["当前委托单:"]
+    for order in orders[:10]:
+        if not isinstance(order, dict):
+            continue
+        side = str(order.get("side") or "--").upper().strip() or "--"
+        position_side = str(order.get("position_side") or order.get("positionSide") or "BOTH").upper().strip() or "BOTH"
+        orig_qty = _email_float(order.get("orig_qty", order.get("origQty")))
+        executed_qty = _email_float(order.get("executed_qty", order.get("executedQty")))
+        remaining_qty = max(orig_qty - executed_qty, 0.0)
+        reduce_only = "是" if bool(order.get("reduce_only", order.get("reduceOnly", False))) else "否"
+        order_id = str(order.get("order_id") or order.get("orderId") or "").strip()
+        suffix = f" · orderId {order_id}" if order_id else ""
+        lines.append(
+            "  - "
+            f"{side} {position_side} 价格 {_format_email_number(order.get('price'), 8)} · "
+            f"数量 {_format_email_number(orig_qty)} · 已成交 {_format_email_number(executed_qty)} · "
+            f"剩余 {_format_email_number(remaining_qty)} · 只减仓 {reduce_only}{suffix}"
+        )
+    if len(lines) == 1:
+        return ["当前委托单: 无"]
+    if len(orders) > 10:
+        lines.append(f"  - 其余 {len(orders) - 10} 笔未展开")
+    return lines
+
+
+def _hourly_email_inventory_value(latest: dict[str, Any], snapshot: dict[str, Any]) -> float:
+    if "actual_net_notional" in latest:
+        return _email_float(latest.get("actual_net_notional"))
+    position = snapshot.get("position") if isinstance(snapshot.get("position"), dict) else {}
+    market = snapshot.get("market") if isinstance(snapshot.get("market"), dict) else {}
+    return _email_float(position.get("position_amt")) * _email_float(market.get("mid_price"))
+
+
+def _build_hourly_symbol_report_email(
+    config: dict[str, Any],
+    *,
+    window_minutes: int = 60,
+    now: datetime | None = None,
+) -> dict[str, Any] | None:
+    symbol = str(config.get("symbol") or "").upper().strip()
+    if not symbol:
+        return None
+    normalized_config = _normalize_runner_runtime_paths(dict(config), symbol)
+    summary_text = str(normalized_config.get("summary_jsonl") or "").strip()
+    if not summary_text:
+        return None
+
+    current = _normalize_email_report_now(now)
+    summary_path = Path(summary_text)
+    latest = _read_last_jsonl_row(summary_path) or {}
+    window_stats = _summarize_symbol_trade_window(summary_path, window_minutes=window_minutes, now=current)
+    try:
+        snapshot = _build_hourly_email_monitor_snapshot(symbol, normalized_config)
+    except Exception as exc:  # pragma: no cover - defensive around live account reads
+        snapshot = {"warnings": [f"monitor_snapshot_failed: {type(exc).__name__}: {exc}"]}
+
+    position = snapshot.get("position") if isinstance(snapshot.get("position"), dict) else {}
+    realized_pnl = _email_float(window_stats.get("realized_pnl"))
+    unrealized_pnl = _email_float(position.get("unrealized_pnl"))
+    hourly_net = _email_float(window_stats.get("net_after_fees_and_funding"))
+    net_estimate = hourly_net + unrealized_pnl
+    inventory_value = _hourly_email_inventory_value(latest, snapshot)
+    window_label = "这一小时" if int(window_minutes) == 60 else f"最近{int(window_minutes)}分钟"
+    subject_label = "一小时" if int(window_minutes) == 60 else f"{int(window_minutes)}分钟"
+
+    body_lines = [
+        f"标的: {symbol}",
+        f"时间窗口: {window_stats['window_start']} 至 {window_stats['window_end']}",
+        f"运行状态: {latest.get('runtime_status') or '--'}",
+        f"{window_label}交易量: {_format_email_number(window_stats.get('gross_notional'))} USDT",
+        f"{window_label}成交笔数: {int(window_stats.get('trade_count') or 0)}",
+        f"损耗值: {_format_email_signed(hourly_net)} USDT",
+        f"手续费: {_format_email_number(window_stats.get('commission'))} USDT",
+        f"资金费: {_format_email_signed(window_stats.get('funding_fee'))} USDT",
+        f"当前库存: 净仓 {_format_email_number(position.get('position_amt'))} · "
+        f"多 {_format_email_number(position.get('long_qty'))} · 空 {_format_email_number(position.get('short_qty'))}",
+        f"库存价值: {_format_email_signed(inventory_value)} USDT",
+        f"净收益估算: {_format_email_signed(net_estimate)} USDT",
+        f"已实现: {_format_email_signed(realized_pnl)} · 浮盈: {_format_email_signed(unrealized_pnl)}",
+    ]
+    body_lines.extend(_format_hourly_email_asset_lines(snapshot))
+    body_lines.extend(_format_hourly_email_open_order_lines(snapshot))
+
+    warnings = snapshot.get("warnings")
+    if isinstance(warnings, list) and warnings:
+        body_lines.append("监控提示: " + "；".join(str(item) for item in warnings[:5]))
+
+    return {
+        "subject": f"[grid][{alert_source_label()}] {symbol} {subject_label}交易通知",
+        "body": "\n".join(body_lines),
+        "window_stats": window_stats,
+    }
+
+
+def _send_hourly_symbol_report(config: dict[str, Any]) -> dict[str, Any] | None:
+    payload = _build_hourly_symbol_report_email(config)
+    if payload is None:
+        return None
+    return send_alert_email(subject=str(payload["subject"]), body=str(payload["body"]))
+
+
+def _run_hourly_email_report_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        now = datetime.now(timezone.utc)
+        report_bucket = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%MZ")
+        state = _read_json_dict(HOURLY_EMAIL_REPORT_STATE_PATH) or {}
+        raw_sent_map = state.get("sent") if isinstance(state, dict) else {}
+        sent_map = dict(raw_sent_map) if isinstance(raw_sent_map, dict) else {}
+        changed = False
+        for config in _iter_saved_runner_control_configs():
+            symbol = str(config.get("symbol") or "").upper().strip()
+            if not symbol or sent_map.get(symbol) == report_bucket:
+                continue
+            process = read_symbol_runner_process(symbol)
+            if not bool(process.get("is_running")):
+                continue
+            try:
+                result = _send_hourly_symbol_report(config)
+            except Exception:
+                continue
+            if result is None:
+                continue
+            if bool(result.get("sent")) or str(result.get("error") or "") == "alert_email_disabled":
+                sent_map[symbol] = report_bucket
+                changed = True
+        if changed:
+            _write_json_dict(HOURLY_EMAIL_REPORT_STATE_PATH, {"sent": sent_map, "updated_at": now.isoformat()})
+        stop_event.wait(60.0)
 
 
 def _normalize_volume_trigger_window(value: Any) -> str:
@@ -22915,6 +23201,7 @@ def main() -> None:
     )
     volatility_trigger_thread.start()
     competition_refresh_stop_event = threading.Event()
+    hourly_email_stop_event = threading.Event()
     if _competition_board_auto_refresh_enabled():
         refresh_interval = _competition_board_auto_refresh_interval_seconds()
         competition_refresh_thread = threading.Thread(
@@ -22928,6 +23215,13 @@ def main() -> None:
             "[competition-board] auto refresh every "
             f"{refresh_interval / 60:.0f}m ({refresh_interval:.0f}s)"
         )
+    hourly_email_thread = threading.Thread(
+        target=_run_hourly_email_report_loop,
+        args=(hourly_email_stop_event,),
+        daemon=True,
+        name="hourly-email-report",
+    )
+    hourly_email_thread.start()
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(f"Grid Web UI running at http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop.")
@@ -22939,6 +23233,7 @@ def main() -> None:
         volume_trigger_stop_event.set()
         volatility_trigger_stop_event.set()
         competition_refresh_stop_event.set()
+        hourly_email_stop_event.set()
         server.server_close()
 
 
