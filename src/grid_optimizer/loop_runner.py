@@ -8880,22 +8880,34 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         if xaut_reduce_only_active:
             apply_xaut_reduce_only_pruning(plan=plan, strategy_mode=strategy_mode)
-        take_profit_guard = apply_take_profit_profit_guard(
-            plan=plan,
-            current_long_qty=current_long_qty,
-            current_short_qty=0.0,
-            current_long_avg_price=current_long_avg_price,
-            current_short_avg_price=0.0,
-            current_long_notional=current_long_notional,
-            current_short_notional=0.0,
-            pause_long_position_notional=effective_args.pause_buy_position_notional,
-            pause_short_position_notional=None,
-            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
-            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
-            tick_size=symbol_info.get("tick_size"),
-            bid_price=bid_price,
-            ask_price=ask_price,
-        )
+        if _is_best_quote_long_profile(effective_strategy_profile):
+            take_profit_guard = {
+                "enabled": False,
+                "long_active": False,
+                "short_active": False,
+                "adjusted_sell_orders": 0,
+                "adjusted_buy_orders": 0,
+                "dropped_sell_orders": 0,
+                "dropped_buy_orders": 0,
+                "reason": "best_quote_long_near_quote",
+            }
+        else:
+            take_profit_guard = apply_take_profit_profit_guard(
+                plan=plan,
+                current_long_qty=current_long_qty,
+                current_short_qty=0.0,
+                current_long_avg_price=current_long_avg_price,
+                current_short_avg_price=0.0,
+                current_long_notional=current_long_notional,
+                current_short_notional=0.0,
+                pause_long_position_notional=effective_args.pause_buy_position_notional,
+                pause_short_position_notional=None,
+                threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+                min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+                tick_size=symbol_info.get("tick_size"),
+                bid_price=bid_price,
+                ask_price=ask_price,
+            )
         controls = apply_position_controls(
             plan=plan,
             current_long_qty=current_long_qty,
