@@ -8835,6 +8835,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         bootstrap_qty = 0.0
     else:
         if _is_best_quote_long_profile(effective_strategy_profile):
+            protected_base_notional = max(_safe_float(getattr(effective_args, "base_position_notional", 0.0)), 0.0)
+            protected_base_qty = 0.0
+            if protected_base_notional > 0 and mid_price > 0:
+                protected_base_qty = protected_base_notional / mid_price
+            reduce_available_qty = max(current_long_qty - protected_base_qty, 0.0)
             plan = build_best_quote_long_flip_plan(
                 bid_price=bid_price,
                 ask_price=ask_price,
@@ -8844,6 +8849,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 max_exit_orders=effective_args.sell_levels,
                 current_long_qty=current_long_qty,
                 current_long_notional=current_long_notional,
+                reduce_available_qty=reduce_available_qty,
                 tick_size=symbol_info.get("tick_size"),
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
@@ -8858,7 +8864,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "effective_buy_levels": int(plan.get("active_buy_order_count", len(plan.get("buy_orders", []))) or 0),
                 "effective_sell_levels": int(plan.get("active_sell_order_count", len(plan.get("sell_orders", []))) or 0),
                 "effective_per_order_notional": effective_args.per_order_notional,
-                "effective_base_position_notional": 0.0,
+                "effective_base_position_notional": protected_base_notional,
+                "protected_base_qty": protected_base_qty,
+                "reduce_available_qty": reduce_available_qty,
             }
         else:
             inventory_tier = apply_inventory_tiering(

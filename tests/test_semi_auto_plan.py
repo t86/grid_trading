@@ -91,6 +91,28 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"], [])
         self.assertEqual(len(plan["buy_orders"]), 2)
 
+    def test_build_best_quote_long_flip_plan_respects_reduce_available_qty(self) -> None:
+        plan = build_best_quote_long_flip_plan(
+            bid_price=2329.99,
+            ask_price=2330.00,
+            per_order_notional=25.0,
+            max_position_notional=900.0,
+            max_entry_orders=3,
+            max_exit_orders=6,
+            current_long_qty=0.107,
+            current_long_notional=249.0,
+            reduce_available_qty=0.012,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=20.0,
+        )
+
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["side"], "SELL")
+        self.assertEqual(plan["sell_orders"][0]["qty"], 0.01)
+        self.assertEqual(len(plan["buy_orders"]), 3)
+
     def test_shift_center_price_moves_down_and_up_in_steps(self) -> None:
         new_center, moves = shift_center_price(
             center_price=0.05050,

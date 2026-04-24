@@ -841,6 +841,7 @@ def build_best_quote_long_flip_plan(
     max_exit_orders: int,
     current_long_qty: float,
     current_long_notional: float,
+    reduce_available_qty: float | None = None,
     tick_size: float | None,
     step_size: float | None,
     min_qty: float | None,
@@ -873,8 +874,12 @@ def build_best_quote_long_flip_plan(
 
     current_long_qty = max(float(current_long_qty), 0.0)
     current_long_notional = max(float(current_long_notional), 0.0)
+    if reduce_available_qty is None:
+        safe_reduce_available_qty = current_long_qty
+    else:
+        safe_reduce_available_qty = max(float(reduce_available_qty), 0.0)
 
-    remaining_reduce_qty = _round_order_qty(current_long_qty, step_size)
+    remaining_reduce_qty = _round_order_qty(min(current_long_qty, safe_reduce_available_qty), step_size)
     for level in range(1, max_exit_orders + 1):
         if remaining_reduce_qty <= 0:
             break
