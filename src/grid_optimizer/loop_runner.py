@@ -4169,6 +4169,72 @@ def _resolve_near_market_release_price(
     return max(_safe_float(price), 0.0)
 
 
+def _build_near_market_release_seed_orders(
+    *,
+    side: str,
+    role: str,
+    current_qty: float,
+    current_notional: float,
+    per_order_notional: float,
+    max_levels: int,
+    step_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+) -> list[dict[str, Any]]:
+    safe_qty = max(_safe_float(current_qty), 0.0)
+    safe_notional = max(_safe_float(current_notional), 0.0)
+    safe_per_order_notional = max(_safe_float(per_order_notional), 0.0)
+    safe_levels = max(int(max_levels or 0), 0)
+    if safe_qty <= 1e-12 or safe_notional <= 1e-12 or safe_per_order_notional <= 0 or safe_levels <= 0:
+        return []
+
+    orders: list[dict[str, Any]] = []
+    remaining_qty = safe_qty
+    remaining_notional = safe_notional
+    for level in range(1, safe_levels + 1):
+        price = _resolve_near_market_release_price(
+            side=side,
+            level_index=level,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            step_price=step_price,
+            tick_size=tick_size,
+        )
+        if price <= 0:
+            continue
+        notional_budget = min(safe_per_order_notional, remaining_notional)
+        qty = _round_order_qty(min(remaining_qty, notional_budget / price), step_size)
+        notional = price * qty
+        if qty <= 0:
+            continue
+        if min_qty is not None and qty < min_qty:
+            continue
+        if min_notional is not None and notional < min_notional:
+            continue
+        orders.append(
+            {
+                "side": side,
+                "price": price,
+                "qty": qty,
+                "notional": notional,
+                "level": level,
+                "role": role,
+                "position_side": "BOTH",
+                "force_reduce_only": True,
+                "synthetic_release_source": True,
+            }
+        )
+        remaining_qty = max(remaining_qty - qty, 0.0)
+        remaining_notional = max(remaining_notional - notional, 0.0)
+        if remaining_qty <= 1e-12 or remaining_notional <= 1e-12:
+            break
+    return orders
+
+
 def apply_active_delever_long(
     *,
     plan: dict[str, Any],
@@ -4187,6 +4253,9 @@ def apply_active_delever_long(
     market_guard_buy_pause_active: bool,
     grid_buffer_realized_notional: float,
     grid_buffer_spent_notional: float,
+    step_size: float | None = None,
+    min_qty: float | None = None,
+    min_notional: float | None = None,
     max_active_levels: int = 3,
 ) -> dict[str, Any]:
     available_buffer = max(float(grid_buffer_realized_notional) - float(grid_buffer_spent_notional), 0.0)
@@ -4202,9 +4271,12 @@ def apply_active_delever_long(
         "pause_short_position_notional": None,
         "release_sell_order_count": 0,
         "release_floor_price": None,
+        "synthesized_release_source_order_count": 0,
+        "pruned_flow_sleeve_order_count": 0,
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
+    pause_trigger_active = pause_notional > 0 and current_long_notional >= pause_notional - 1e-12
     threshold_enabled = threshold_notional > max(pause_notional, 0.0)
     if (
         max_active_levels <= 0
@@ -4225,6 +4297,23 @@ def apply_active_delever_long(
         for item in plan.get("sell_orders", [])
         if isinstance(item, dict) and _order_role(item) == "take_profit_long"
     ]
+    if not take_profit_orders and pause_trigger_active:
+        take_profit_orders = _build_near_market_release_seed_orders(
+            side="SELL",
+            role="take_profit_long",
+            current_qty=current_long_qty,
+            current_notional=current_long_notional,
+            per_order_notional=per_order_notional,
+            max_levels=max_active_levels,
+            step_price=step_price,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
+        report["synthesized_release_source_order_count"] = len(take_profit_orders)
     if not take_profit_orders:
         return report
     take_profit_orders.sort(key=lambda item: _safe_float(item.get("price")))
@@ -4301,18 +4390,9 @@ def apply_active_delever_long(
                 consume_mode=threshold_consume_mode,
             )
         trigger_mode = "threshold"
-    elif market_guard_buy_pause_active:
-        active_count = requested_levels
-        estimated_cost = _estimate_long_delever_cost(
-            current_long_lots=current_long_lots,
-            current_long_qty=current_long_qty,
-            current_long_avg_price=current_long_avg_price,
-            sell_orders=take_profit_orders[:active_count],
-        )
-        trigger_mode = "market_guard"
     else:
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
-        if pause_notional > 0 and current_long_notional >= pause_notional - 1e-12:
+        if pause_trigger_active:
             excess_notional = max(current_long_notional - pause_notional, 0.0)
             active_count = min(
                 len(take_profit_orders),
@@ -4327,6 +4407,15 @@ def apply_active_delever_long(
                 consume_mode="fifo",
             )
             trigger_mode = "pause"
+        elif market_guard_buy_pause_active:
+            active_count = requested_levels
+            estimated_cost = _estimate_long_delever_cost(
+                current_long_lots=current_long_lots,
+                current_long_qty=current_long_qty,
+                current_long_avg_price=current_long_avg_price,
+                sell_orders=take_profit_orders[:active_count],
+            )
+            trigger_mode = "market_guard"
         else:
             for level_count in range(1, requested_levels + 1):
                 level_cost = _estimate_long_delever_cost(
@@ -4346,7 +4435,8 @@ def apply_active_delever_long(
 
     shift_distance = float(step_price) * float(active_count)
     shifted_take_profit_orders: list[dict[str, Any]] = []
-    for index, order in enumerate(take_profit_orders, start=1):
+    shift_source_orders = [item for item in take_profit_orders if not bool(item.get("synthetic_release_source"))]
+    for index, order in enumerate(shift_source_orders, start=1):
         shifted = dict(order)
         shifted_price = _round_order_price(_safe_float(order.get("price")) + shift_distance, tick_size, "SELL")
         shifted["price"] = shifted_price
@@ -4362,6 +4452,7 @@ def apply_active_delever_long(
     )
     release_floor_price: float | None = None
     release_order_count = 0
+    pruned_flow_sleeve_count = 0
     for index, order in enumerate(take_profit_orders[:active_count], start=1):
         active = dict(order)
         active["role"] = "active_delever_long"
@@ -4392,6 +4483,11 @@ def apply_active_delever_long(
                 release_order_count += 1
         active_orders.append(active)
 
+    if release_active:
+        original_other_count = len(other_sell_orders)
+        other_sell_orders = [item for item in other_sell_orders if _order_role(item) != "flow_sleeve_long"]
+        pruned_flow_sleeve_count = original_other_count - len(other_sell_orders)
+
     plan["sell_orders"] = sorted(
         [*active_orders, *shifted_take_profit_orders, *other_sell_orders],
         key=lambda item: (_safe_float(item.get("price")), str(item.get("side", "")).upper().strip()),
@@ -4404,6 +4500,7 @@ def apply_active_delever_long(
             "active_sell_order_count": active_count,
             "release_sell_order_count": release_order_count,
             "release_floor_price": release_floor_price,
+            "pruned_flow_sleeve_order_count": pruned_flow_sleeve_count,
         }
     )
     return report
@@ -4426,6 +4523,9 @@ def apply_active_delever_short(
     min_profit_ratio: float | None,
     grid_buffer_realized_notional: float,
     grid_buffer_spent_notional: float,
+    step_size: float | None = None,
+    min_qty: float | None = None,
+    min_notional: float | None = None,
     max_active_levels: int = 3,
     threshold_timeout_active: bool = False,
     timeout_target_notional: float | None = None,
@@ -4446,10 +4546,15 @@ def apply_active_delever_short(
         "threshold_timeout_aggressive": False,
         "release_buy_order_count": 0,
         "release_ceiling_price": None,
+        "synthesized_release_source_order_count": 0,
+        "pruned_flow_sleeve_order_count": 0,
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
     timeout_target = max(_safe_float(timeout_target_notional), 0.0)
+    pause_trigger_active = pause_notional > 0 and current_short_notional >= pause_notional - 1e-12
+    threshold_timeout_trigger_active = bool(threshold_timeout_active) and timeout_target > 0 and current_short_notional > timeout_target
+    threshold_trigger_active = threshold_notional > max(pause_notional, 0.0) and current_short_notional >= threshold_notional
     threshold_enabled = threshold_notional > max(pause_notional, 0.0)
     if (
         max_active_levels <= 0
@@ -4470,6 +4575,23 @@ def apply_active_delever_short(
         for item in plan.get("buy_orders", [])
         if isinstance(item, dict) and _order_role(item) == "take_profit_short"
     ]
+    if not take_profit_orders and (pause_trigger_active or threshold_timeout_trigger_active or threshold_trigger_active):
+        take_profit_orders = _build_near_market_release_seed_orders(
+            side="BUY",
+            role="take_profit_short",
+            current_qty=current_short_qty,
+            current_notional=current_short_notional,
+            per_order_notional=per_order_notional,
+            max_levels=max_active_levels,
+            step_price=step_price,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            bid_price=bid_price,
+            ask_price=_safe_float(ask_price),
+        )
+        report["synthesized_release_source_order_count"] = len(take_profit_orders)
     if not take_profit_orders:
         return report
     take_profit_orders.sort(key=lambda item: _safe_float(item.get("price")), reverse=True)
@@ -4487,7 +4609,7 @@ def apply_active_delever_short(
     estimated_cost = 0.0
     trigger_mode: str | None = None
     projected_exit_price = None
-    if threshold_timeout_active and timeout_target > 0 and current_short_notional > timeout_target:
+    if threshold_timeout_trigger_active:
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
         excess_notional = max(current_short_notional - timeout_target, 0.0)
         active_count = min(len(take_profit_orders), requested_levels, max(1, int(math.ceil(excess_notional / safe_per_order_notional))))
@@ -4560,7 +4682,7 @@ def apply_active_delever_short(
         trigger_mode = "threshold"
     else:
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
-        if pause_notional > 0 and current_short_notional >= pause_notional - 1e-12:
+        if pause_trigger_active:
             excess_notional = max(current_short_notional - pause_notional, 0.0)
             active_count = min(
                 len(take_profit_orders),
@@ -4594,7 +4716,8 @@ def apply_active_delever_short(
 
     shift_distance = float(step_price) * float(active_count)
     shifted_take_profit_orders: list[dict[str, Any]] = []
-    for index, order in enumerate(take_profit_orders, start=1):
+    shift_source_orders = [item for item in take_profit_orders if not bool(item.get("synthetic_release_source"))]
+    for index, order in enumerate(shift_source_orders, start=1):
         shifted = dict(order)
         shifted_price = _round_order_price(_safe_float(order.get("price")) - shift_distance, tick_size, "BUY")
         shifted["price"] = shifted_price
@@ -4610,6 +4733,7 @@ def apply_active_delever_short(
     )
     release_ceiling_price: float | None = None
     release_order_count = 0
+    pruned_flow_sleeve_count = 0
     for index, order in enumerate(take_profit_orders[:active_count], start=1):
         active = dict(order)
         active["role"] = "active_delever_short"
@@ -4660,6 +4784,11 @@ def apply_active_delever_short(
                 release_order_count += 1
         active_orders.append(active)
 
+    if release_active or trigger_mode == "threshold_timeout":
+        original_other_count = len(other_buy_orders)
+        other_buy_orders = [item for item in other_buy_orders if _order_role(item) != "flow_sleeve_short"]
+        pruned_flow_sleeve_count = original_other_count - len(other_buy_orders)
+
     plan["buy_orders"] = sorted(
         [*active_orders, *shifted_take_profit_orders, *other_buy_orders],
         key=lambda item: (-_safe_float(item.get("price")), str(item.get("side", "")).upper().strip()),
@@ -4673,6 +4802,7 @@ def apply_active_delever_short(
             "threshold_timeout_aggressive": trigger_mode == "threshold_timeout",
             "release_buy_order_count": release_order_count,
             "release_ceiling_price": release_ceiling_price,
+            "pruned_flow_sleeve_order_count": pruned_flow_sleeve_count,
         }
     )
     return report
@@ -7614,6 +7744,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             market_guard_buy_pause_active=bool(market_guard["buy_pause_active"]),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
         )
         short_active_delever = apply_active_delever_short(
             plan=plan,
@@ -7631,6 +7764,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
             grid_buffer_realized_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_realized_notional")),
             grid_buffer_spent_notional=_safe_float(synthetic_ledger_snapshot.get("grid_buffer_spent_notional")),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
             threshold_timeout_active=bool(short_threshold_timeout.get("timeout_active")),
             timeout_target_notional=effective_args.pause_short_position_notional,
         )
@@ -7666,6 +7802,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "active_sell_order_count": int(long_active_delever.get("active_sell_order_count") or 0),
             "active_buy_order_count": int(short_active_delever.get("active_buy_order_count") or 0),
+            "release_sell_order_count": int(long_active_delever.get("release_sell_order_count") or 0),
+            "release_buy_order_count": int(short_active_delever.get("release_buy_order_count") or 0),
+            "release_floor_price": long_active_delever.get("release_floor_price"),
+            "release_ceiling_price": short_active_delever.get("release_ceiling_price"),
+            "synthesized_release_source_order_count": int(
+                long_active_delever.get("synthesized_release_source_order_count") or 0
+            )
+            + int(short_active_delever.get("synthesized_release_source_order_count") or 0),
+            "pruned_flow_sleeve_order_count": int(long_active_delever.get("pruned_flow_sleeve_order_count") or 0)
+            + int(short_active_delever.get("pruned_flow_sleeve_order_count") or 0),
             "pause_long_position_notional": long_active_delever.get("pause_long_position_notional"),
             "pause_short_position_notional": short_active_delever.get("pause_short_position_notional"),
             "threshold_timeout_active": bool(short_threshold_timeout.get("timeout_active")),
