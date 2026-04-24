@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from copy import deepcopy
 import csv
 import hashlib
 import hmac
@@ -71,9 +72,16 @@ COINM_MAX_KLINE_WINDOW_MS = 200 * 24 * 60 * 60 * 1000
 FUNDING_DEFAULT_STEP_MS = 8 * 60 * 60 * 1000
 FUNDING_MISSING_GAP_THRESHOLD_MS = 10 * 60 * 60 * 1000
 SECOND_INTERVAL_MAX_SPAN_MS = 31 * 24 * 60 * 60 * 1000
+FUTURES_POSITION_MODE_CACHE_TTL_SECONDS = 300.0
+FUTURES_ACCOUNT_INFO_CACHE_TTL_SECONDS = 0.5
+FUTURES_OPEN_ORDERS_CACHE_TTL_SECONDS = 0.5
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 _GETADDRINFO_PATCH_LOCK = threading.RLock()
 _GETADDRINFO_PATCH_DEPTH = 0
+_FUTURES_SIGNED_RESPONSE_CACHE_LOCK = threading.RLock()
+_FUTURES_POSITION_MODE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_FUTURES_ACCOUNT_INFO_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
+_FUTURES_OPEN_ORDERS_CACHE: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
 
 
 def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -296,6 +304,33 @@ def _http_signed_get_json(
     api_secret: str,
 ) -> Any:
     return _http_signed_request_json(url, params, api_key, api_secret, method="GET")
+
+
+def clear_futures_signed_response_caches() -> None:
+    with _FUTURES_SIGNED_RESPONSE_CACHE_LOCK:
+        _FUTURES_POSITION_MODE_CACHE.clear()
+        _FUTURES_ACCOUNT_INFO_CACHE.clear()
+        _FUTURES_OPEN_ORDERS_CACHE.clear()
+
+
+def _get_cached_signed_response(cache: dict[Any, tuple[float, Any]], key: Any, ttl_seconds: float) -> Any | None:
+    now = time.time()
+    with _FUTURES_SIGNED_RESPONSE_CACHE_LOCK:
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        loaded_at, payload = entry
+        if now - loaded_at > ttl_seconds:
+            cache.pop(key, None)
+            return None
+        return deepcopy(payload)
+
+
+def _store_cached_signed_response(cache: dict[Any, tuple[float, Any]], key: Any, payload: Any) -> Any:
+    cached_payload = deepcopy(payload)
+    with _FUTURES_SIGNED_RESPONSE_CACHE_LOCK:
+        cache[key] = (time.time(), cached_payload)
+    return deepcopy(cached_payload)
 
 
 def load_binance_api_credentials() -> tuple[str, str] | None:
@@ -1047,8 +1082,17 @@ def fetch_futures_account_info_v3(
     contract_type: str = "usdm",
     recv_window: int = 5000,
 ) -> dict[str, Any]:
+    normalized_contract_type = normalize_contract_type(contract_type)
+    cache_key = (api_key.strip(), normalized_contract_type)
+    cached = _get_cached_signed_response(
+        _FUTURES_ACCOUNT_INFO_CACHE,
+        cache_key,
+        FUTURES_ACCOUNT_INFO_CACHE_TTL_SECONDS,
+    )
+    if cached is not None:
+        return cached
     data = _http_signed_request_json(
-        f"{_futures_trade_base_url(contract_type)}/fapi/v3/account",
+        f"{_futures_trade_base_url(normalized_contract_type)}/fapi/v3/account",
         {"recvWindow": recv_window},
         api_key,
         api_secret,
@@ -1060,13 +1104,13 @@ def fetch_futures_account_info_v3(
         position_risk = fetch_futures_position_risk_v3(
             api_key,
             api_secret,
-            contract_type=contract_type,
+            contract_type=normalized_contract_type,
             recv_window=recv_window,
         )
     except Exception:
-        return data
+        return _store_cached_signed_response(_FUTURES_ACCOUNT_INFO_CACHE, cache_key, data)
     data = _merge_futures_position_risk_into_account_info(data, position_risk)
-    return data
+    return _store_cached_signed_response(_FUTURES_ACCOUNT_INFO_CACHE, cache_key, data)
 
 
 def fetch_futures_position_mode(
@@ -1075,8 +1119,17 @@ def fetch_futures_position_mode(
     contract_type: str = "usdm",
     recv_window: int = 5000,
 ) -> dict[str, Any]:
+    normalized_contract_type = normalize_contract_type(contract_type)
+    cache_key = (api_key.strip(), normalized_contract_type)
+    cached = _get_cached_signed_response(
+        _FUTURES_POSITION_MODE_CACHE,
+        cache_key,
+        FUTURES_POSITION_MODE_CACHE_TTL_SECONDS,
+    )
+    if cached is not None:
+        return cached
     data = _http_signed_request_json(
-        f"{_futures_trade_base_url(contract_type)}/fapi/v1/positionSide/dual",
+        f"{_futures_trade_base_url(normalized_contract_type)}/fapi/v1/positionSide/dual",
         {"recvWindow": recv_window},
         api_key,
         api_secret,
@@ -1084,7 +1137,7 @@ def fetch_futures_position_mode(
     )
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected futures position mode response")
-    return data
+    return _store_cached_signed_response(_FUTURES_POSITION_MODE_CACHE, cache_key, data)
 
 
 def fetch_futures_open_orders(
@@ -1094,14 +1147,28 @@ def fetch_futures_open_orders(
     contract_type: str = "usdm",
     recv_window: int = 5000,
 ) -> list[dict[str, Any]]:
+    normalized_contract_type = normalize_contract_type(contract_type)
+    normalized_symbol = symbol.upper().strip()
+    cache_key = (api_key.strip(), normalized_contract_type, normalized_symbol)
+    cached = _get_cached_signed_response(
+        _FUTURES_OPEN_ORDERS_CACHE,
+        cache_key,
+        FUTURES_OPEN_ORDERS_CACHE_TTL_SECONDS,
+    )
+    if cached is not None:
+        return cached
     data = _http_signed_request_json(
-        f"{_futures_trade_base_url(contract_type)}/fapi/v1/openOrders",
-        {"symbol": symbol.upper(), "recvWindow": recv_window},
+        f"{_futures_trade_base_url(normalized_contract_type)}/fapi/v1/openOrders",
+        {"symbol": normalized_symbol, "recvWindow": recv_window},
         api_key,
         api_secret,
         method="GET",
     )
-    return _as_list_payload(data, "futures openOrders")
+    return _store_cached_signed_response(
+        _FUTURES_OPEN_ORDERS_CACHE,
+        cache_key,
+        _as_list_payload(data, "futures openOrders"),
+    )
 
 
 def fetch_futures_user_trades(
