@@ -2818,6 +2818,7 @@ def _build_daily_strategy_analytics(
             continue
 
         previous_entry = daily_entries[-2][1] if len(daily_entries) >= 2 else None
+        previous_captured_dt = daily_entries[-2][2] if len(daily_entries) >= 2 else None
         latest_board = _load_history_board(latest_entry) or board
         previous_board = _load_history_board(previous_entry) if previous_entry is not None else None
         if not isinstance(latest_board, dict):
@@ -2850,9 +2851,9 @@ def _build_daily_strategy_analytics(
                 "strategy_date": latest_date,
                 "status": status,
                 "status_text": status_text,
-                "capture_label": str(latest_entry.get("capture_label") or _datetime_cst_label(latest_captured_dt)).strip(),
+                "capture_label": _datetime_cst_label(latest_captured_dt),
                 "captured_at_utc": latest_captured_dt.astimezone(timezone.utc).isoformat() if latest_captured_dt is not None else "",
-                "previous_capture_label": str(previous_entry.get("capture_label") if previous_entry else "").strip(),
+                "previous_capture_label": _datetime_cst_label(previous_captured_dt),
                 "official_updated_at_utc": official_dt.astimezone(timezone.utc).isoformat() if official_dt is not None else "",
                 "official_updated_label": _datetime_cst_label(official_dt),
                 "eligible_user_count": _safe_int(latest_board.get("eligible_user_count")),

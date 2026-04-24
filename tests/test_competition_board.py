@@ -490,10 +490,11 @@ class CompetitionBoardTests(unittest.TestCase):
                         {"rank": 500, "value": rank_100 / 10},
                     ],
                 }
+                official_label = f"{name[:10]} 07:00"
                 payload = {
                     "board_key": board_key,
-                    "capture_key": name,
-                    "capture_label": name,
+                    "capture_key": official_label,
+                    "capture_label": official_label,
                     "capture_date": name[:10],
                     "capture_granularity": "hourly",
                     "captured_at_utc": captured_at_utc,
