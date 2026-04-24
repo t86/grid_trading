@@ -37,13 +37,20 @@ class FuturesSignedResponseCacheTests(unittest.TestCase):
         self.assertEqual(third, {"dualSidePosition": True})
         self.assertEqual(mock_http.call_count, 2)
 
+    @patch("grid_optimizer.data.fetch_futures_position_risk_v3")
     @patch("grid_optimizer.data._http_signed_request_json")
     @patch("grid_optimizer.data.time.time")
-    def test_fetch_futures_account_info_uses_short_lived_cache(self, mock_time, mock_http) -> None:
+    def test_fetch_futures_account_info_uses_short_lived_cache(
+        self,
+        mock_time,
+        mock_http,
+        mock_position_risk,
+    ) -> None:
         mock_http.side_effect = [
             {"availableBalance": "12.5"},
             {"availableBalance": "18.0"},
         ]
+        mock_position_risk.return_value = []
 
         mock_time.return_value = 2000.0
         first = fetch_futures_account_info_v3("key", "secret")
@@ -54,9 +61,9 @@ class FuturesSignedResponseCacheTests(unittest.TestCase):
         mock_time.return_value = 2001.0
         third = fetch_futures_account_info_v3("key", "secret")
 
-        self.assertEqual(first, {"availableBalance": "12.5"})
-        self.assertEqual(second, {"availableBalance": "12.5"})
-        self.assertEqual(third, {"availableBalance": "18.0"})
+        self.assertEqual(first.get("availableBalance"), "12.5")
+        self.assertEqual(second.get("availableBalance"), "12.5")
+        self.assertEqual(third.get("availableBalance"), "18.0")
         self.assertEqual(mock_http.call_count, 2)
 
     @patch("grid_optimizer.data._http_signed_request_json")
