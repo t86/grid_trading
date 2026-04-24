@@ -8063,11 +8063,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 market_guard["buy_pause_active"]
                 or market_bias_entry_pause["buy_pause_active"]
                 or center_entry_guard["long_pause_active"]
+                or exposure_hard_long_pause
             ),
             external_pause_reasons=(
                 list(market_guard["buy_pause_reasons"])
                 + list(market_bias_entry_pause["buy_pause_reasons"])
                 + list(center_entry_guard["long_pause_reasons"])
+                + (["exposure_escalation: hard_unrealized_loss_limit"] if exposure_hard_long_pause else [])
             ),
             external_short_pause=bool(
                 market_bias_entry_pause["short_pause_active"] or center_entry_guard["short_pause_active"]
@@ -8169,6 +8171,41 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "effective_per_order_notional": effective_args.per_order_notional,
             "effective_base_position_notional": effective_args.base_position_notional,
         }
+        synthetic_flow_enabled = bool(getattr(effective_args, "synthetic_flow_sleeve_enabled", False))
+        synthetic_flow_trigger_notional = getattr(effective_args, "synthetic_flow_sleeve_trigger_notional", None)
+        synthetic_flow_sleeve_notional = getattr(effective_args, "synthetic_flow_sleeve_notional", 0.0)
+        synthetic_flow_max_loss_ratio = getattr(effective_args, "synthetic_flow_sleeve_max_loss_ratio", None)
+        exposure_escalation = resolve_exposure_escalation(
+            state=state,
+            enabled=bool(getattr(effective_args, "exposure_escalation_enabled", False)),
+            now=datetime.now(timezone.utc),
+            current_long_notional=current_long_notional,
+            current_long_qty=current_long_qty,
+            current_long_cost_basis_price=current_long_avg_price,
+            mid_price=mid_price,
+            trigger_notional=getattr(effective_args, "exposure_escalation_notional", None),
+            hold_seconds=getattr(effective_args, "exposure_escalation_hold_seconds", None),
+            target_notional=getattr(effective_args, "exposure_escalation_target_notional", None),
+            max_loss_ratio=getattr(effective_args, "exposure_escalation_max_loss_ratio", None),
+            hard_unrealized_loss_limit=getattr(
+                effective_args,
+                "exposure_escalation_hard_unrealized_loss_limit",
+                None,
+            ),
+        )
+        exposure_hard_long_pause = exposure_escalation.get("reason") == "hard_unrealized_loss_limit"
+        if exposure_escalation.get("active"):
+            synthetic_flow_enabled = True
+            synthetic_flow_trigger_notional = min(
+                max(_safe_float(synthetic_flow_trigger_notional), _safe_float(exposure_escalation.get("trigger_notional"))),
+                current_long_notional,
+            )
+            synthetic_flow_sleeve_notional = max(
+                _safe_float(synthetic_flow_sleeve_notional),
+                current_long_notional - _safe_float(exposure_escalation.get("target_notional")),
+                0.0,
+            )
+            synthetic_flow_max_loss_ratio = exposure_escalation.get("max_loss_ratio")
         hedge_plan = build_hedge_micro_grid_plan(
             center_price=center_price,
             step_price=effective_args.step_price,
@@ -8215,6 +8252,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 market_guard["buy_pause_active"]
                 or market_bias_entry_pause["buy_pause_active"]
                 or center_entry_guard["long_pause_active"]
+                or exposure_hard_long_pause
             ),
             entry_short_paused=bool(
                 market_bias_entry_pause["short_pause_active"]
@@ -8226,17 +8264,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         plan = _convert_plan_orders_to_one_way(hedge_plan)
         synthetic_flow_sleeve = apply_synthetic_flow_sleeve(
             plan=plan,
-            enabled=bool(getattr(effective_args, "synthetic_flow_sleeve_enabled", False)),
+            enabled=synthetic_flow_enabled,
             current_long_notional=current_long_notional,
             current_short_notional=current_short_notional,
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
-            trigger_notional=getattr(effective_args, "synthetic_flow_sleeve_trigger_notional", None),
-            sleeve_notional=getattr(effective_args, "synthetic_flow_sleeve_notional", 0.0),
+            trigger_notional=synthetic_flow_trigger_notional,
+            sleeve_notional=synthetic_flow_sleeve_notional,
             levels=int(getattr(effective_args, "synthetic_flow_sleeve_levels", 0) or 0),
             per_order_notional=inventory_tier["effective_per_order_notional"],
             order_notional=getattr(effective_args, "synthetic_flow_sleeve_order_notional", None),
-            max_loss_ratio=getattr(effective_args, "synthetic_flow_sleeve_max_loss_ratio", None),
+            max_loss_ratio=synthetic_flow_max_loss_ratio,
             step_price=effective_args.step_price,
             tick_size=symbol_info.get("tick_size"),
             step_size=symbol_info.get("step_size"),
