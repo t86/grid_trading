@@ -867,6 +867,25 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["max_synthetic_drift_notional"], 160.0)
         self.assertFalse(payload["autotune_symbol_enabled"])
 
+    def test_runner_preset_payload_applies_btcusdc_competition_aggressive_profile(self) -> None:
+        payload = _runner_preset_payload("btcusdc_competition_maker_neutral_aggressive_v1", {"symbol": "BTCUSDC"})
+        self.assertEqual(payload["strategy_profile"], "btcusdc_competition_maker_neutral_aggressive_v1")
+        self.assertEqual(payload["symbol"], "BTCUSDC")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 1.0)
+        self.assertEqual(payload["buy_levels"], 8)
+        self.assertEqual(payload["sell_levels"], 8)
+        self.assertAlmostEqual(payload["per_order_notional"], 180.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 540.0)
+        self.assertAlmostEqual(payload["pause_short_position_notional"], 540.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 675.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 675.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 2700.0)
+        self.assertAlmostEqual(payload["max_actual_net_notional"], 420.0)
+        self.assertAlmostEqual(payload["max_synthetic_drift_notional"], 220.0)
+        self.assertEqual(payload["max_new_orders"], 28)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+
     def test_runner_preset_payload_rejects_btcusdc_competition_profile_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
             _runner_preset_payload("btcusdc_competition_maker_neutral_v1", {"symbol": "ETHUSDC"})
@@ -2119,6 +2138,8 @@ class WebSecurityTests(unittest.TestCase):
         xau_summaries = {item["key"]: item for item in _runner_preset_summaries("XAUUSDT")}
         eth_summaries = {item["key"]: item for item in _runner_preset_summaries("ETHUSDC")}
         self.assertIn("btcusdc_competition_maker_neutral_v1", btc_summaries)
+        self.assertIn("btcusdc_competition_maker_neutral_conservative_v1", btc_summaries)
+        self.assertIn("btcusdc_competition_maker_neutral_aggressive_v1", btc_summaries)
         self.assertNotIn("btcusdc_competition_maker_neutral_v1", xau_summaries)
         self.assertNotIn("btcusdc_competition_maker_neutral_v1", eth_summaries)
         preset = btc_summaries["btcusdc_competition_maker_neutral_v1"]
@@ -2126,6 +2147,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(preset["config"]["symbol"], "BTCUSDC")
         self.assertEqual(preset["config"]["strategy_mode"], "synthetic_neutral")
         self.assertAlmostEqual(preset["config"]["per_order_notional"], 120.0)
+        conservative = btc_summaries["btcusdc_competition_maker_neutral_conservative_v1"]
+        aggressive = btc_summaries["btcusdc_competition_maker_neutral_aggressive_v1"]
+        self.assertEqual(conservative["label"], "UM 冲刺赛 BTCUSDC（保守）")
+        self.assertEqual(aggressive["label"], "UM 冲刺赛 BTCUSDC（激进）")
+        self.assertLess(conservative["config"]["per_order_notional"], preset["config"]["per_order_notional"])
+        self.assertGreater(aggressive["config"]["per_order_notional"], preset["config"]["per_order_notional"])
 
     def test_runner_preset_payload_for_bard_12h_push_neutral_v2(self) -> None:
         payload = _runner_preset_payload("bard_12h_push_neutral_v2", {"symbol": "BARDUSDT"})
@@ -2563,7 +2590,10 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_monitor_page_contains_sprint_preset_labels_and_auto_selects_first_available(self) -> None:
         self.assertIn("UM 冲刺赛 BTCUSDC", MONITOR_PAGE)
+        self.assertIn("UM 冲刺赛 BTCUSDC（保守）", MONITOR_PAGE)
+        self.assertIn("UM 冲刺赛 BTCUSDC（激进）", MONITOR_PAGE)
         self.assertIn("黄金冲刺赛 XAUUSDT", MONITOR_PAGE)
+        self.assertIn("黄金冲刺赛 XAUUSDT（激进）", MONITOR_PAGE)
         self.assertIn("TradFi 冲刺赛 CLUSDT", MONITOR_PAGE)
         self.assertIn("Alt 冲刺赛 ORDIUSDC", MONITOR_PAGE)
         self.assertIn("presets[0]?.key", MONITOR_PAGE)
