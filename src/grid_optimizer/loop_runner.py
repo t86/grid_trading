@@ -4932,6 +4932,7 @@ def apply_active_delever_long(
         "pause_short_position_notional": None,
         "release_sell_order_count": 0,
         "release_floor_price": None,
+        "release_blocked_reason": None,
         "synthesized_release_source_order_count": 0,
         "pruned_flow_sleeve_order_count": 0,
         "force_release_active": bool(force_release_active),
@@ -5127,14 +5128,20 @@ def apply_active_delever_long(
         shifted_take_profit_orders.append(shifted)
 
     active_orders: list[dict[str, Any]] = []
-    release_active = (
+    release_trigger_requested = (
         trigger_mode in {"threshold", "pause"}
         and pause_notional > 0
         and current_long_notional >= pause_notional - 1e-12
-    ) or (
-        force_release_trigger_active
-        and bool(trigger_mode)
     )
+    release_cost_covered = estimated_cost <= available_buffer + 1e-12
+    release_active = (
+        release_trigger_requested
+        and release_cost_covered
+    ) or (force_release_trigger_active and bool(trigger_mode))
+    if release_trigger_requested and not release_cost_covered:
+        report["release_blocked_reason"] = "insufficient_buffer"
+        if all(bool(item.get("synthetic_release_source")) for item in take_profit_orders[:active_count]):
+            return report
     release_floor_price: float | None = None
     release_order_count = 0
     pruned_flow_sleeve_count = 0
