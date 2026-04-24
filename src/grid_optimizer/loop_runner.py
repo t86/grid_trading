@@ -102,6 +102,7 @@ XAUT_ADAPTIVE_STATE_NORMAL = "normal"
 XAUT_ADAPTIVE_STATE_DEFENSIVE = "defensive"
 XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
+EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
         "buy_levels": 8,
@@ -760,6 +761,47 @@ def _shift_custom_grid_bounds(
 def _read_custom_grid_trade_count(summary_path: str | Path) -> int:
     trade_audit_path = build_audit_paths(summary_path)["trade_audit"]
     return count_jsonl_lines(trade_audit_path)
+
+
+def _normalize_live_book_snapshot(book_row: dict[str, Any] | None, *, symbol: str) -> dict[str, float]:
+    row = book_row if isinstance(book_row, dict) else {}
+    bid_price = _safe_float(row.get("bid_price", row.get("bidPrice")))
+    ask_price = _safe_float(row.get("ask_price", row.get("askPrice")))
+    if bid_price <= 0 or ask_price <= 0:
+        raise RuntimeError(f"no book ticker returned for {symbol}")
+    return {
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+    }
+
+
+def _build_execution_market_snapshot_fetcher(
+    *,
+    symbol: str,
+    initial_book: dict[str, Any] | None = None,
+    ttl_seconds: float = EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS,
+) -> Any:
+    cached_snapshot: dict[str, float] | None = None
+    cached_at = 0.0
+    safe_ttl = max(float(ttl_seconds), 0.0)
+
+    if initial_book is not None:
+        cached_snapshot = _normalize_live_book_snapshot(initial_book, symbol=symbol)
+        cached_at = time.monotonic()
+
+    def _fetch(*, force_refresh: bool = False) -> dict[str, float]:
+        nonlocal cached_snapshot, cached_at
+        now = time.monotonic()
+        if not force_refresh and cached_snapshot is not None and (now - cached_at) <= safe_ttl:
+            return dict(cached_snapshot)
+        live_book_rows = fetch_futures_book_tickers(symbol=symbol)
+        if not live_book_rows:
+            raise RuntimeError(f"no book ticker returned for {symbol}")
+        cached_snapshot = _normalize_live_book_snapshot(live_book_rows[0], symbol=symbol)
+        cached_at = time.monotonic()
+        return dict(cached_snapshot)
+
+    return _fetch
 
 
 def _resolve_custom_grid_roll(
@@ -8947,7 +8989,8 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     live_book_rows = fetch_futures_book_tickers(symbol=symbol)
     if not live_book_rows:
         raise RuntimeError(f"no book ticker returned for {symbol}")
-    live_book = live_book_rows[0]
+    market_fetcher = _build_execution_market_snapshot_fetcher(symbol=symbol, initial_book=live_book_rows[0])
+    live_book = market_fetcher()
     live_bid_price = _safe_float(live_book.get("bid_price"))
     live_ask_price = _safe_float(live_book.get("ask_price"))
     drift_steps = estimate_mid_drift_steps(
@@ -9195,7 +9238,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             reduce_only = bool(order.get("force_reduce_only"))
         last_exc: RuntimeError | None = None
         for attempt in range(args.maker_retries + 1):
-            current_book = fetch_futures_book_tickers(symbol=symbol)[0]
+            current_book = market_fetcher(force_refresh=attempt > 0)
             current_bid = _safe_float(current_book.get("bid_price"))
             current_ask = _safe_float(current_book.get("ask_price"))
             prepared_order, skip_reason = prepare_post_only_order_request(

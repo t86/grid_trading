@@ -4823,6 +4823,181 @@ class LoopRunnerTests(unittest.TestCase):
         mock_update_synthetic_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_reuses_initial_book_for_first_order_attempt(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        _mock_update_inventory_refs,
+        _mock_update_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "entry", "side": "BUY", "qty": 11.0, "price": 0.50},
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.49", "ask_price": "0.51"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 2}
+        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "cid-123"}
+
+        args = Namespace(
+            symbol="KATUSDT",
+            strategy_mode="one_way_long",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/katusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=2,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/katusdt_loop_state.json",
+        )
+        plan_report = {
+            "symbol": "KATUSDT",
+            "strategy_mode": "one_way_long",
+            "mid_price": 0.50,
+            "step_price": 0.01,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 0.0,
+            "actual_net_qty": 0.0,
+            "symbol_info": {
+                "tick_size": 0.01,
+                "min_qty": 0.1,
+                "min_notional": 5.0,
+            },
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["executed"])
+        self.assertEqual(len(report["placed_orders"]), 1)
+        self.assertEqual(mock_book_tickers.call_count, 1)
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_refreshes_book_only_when_retrying_post_only_reject(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        _mock_update_inventory_refs,
+        _mock_update_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "entry", "side": "BUY", "qty": 11.0, "price": 0.50},
+                ],
+            },
+        }
+        mock_book_tickers.side_effect = [
+            [{"bid_price": "0.49", "ask_price": "0.51"}],
+            [{"bid_price": "0.48", "ask_price": "0.50"}],
+            [{"bid_price": "0.48", "ask_price": "0.50"}],
+        ]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 2}
+        mock_post_order.side_effect = [
+            RuntimeError("Binance API error -5022: Post only order will be rejected."),
+            {"orderId": 124, "clientOrderId": "cid-124"},
+        ]
+
+        args = Namespace(
+            symbol="KATUSDT",
+            strategy_mode="one_way_long",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/katusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=2,
+            maker_retries=1,
+            recv_window=5000,
+            state_path="output/katusdt_loop_state.json",
+        )
+        plan_report = {
+            "symbol": "KATUSDT",
+            "strategy_mode": "one_way_long",
+            "mid_price": 0.50,
+            "step_price": 0.01,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 0.0,
+            "actual_net_qty": 0.0,
+            "symbol_info": {
+                "tick_size": 0.01,
+                "min_qty": 0.1,
+                "min_notional": 5.0,
+            },
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["executed"])
+        self.assertEqual(len(report["placed_orders"]), 1)
+        self.assertEqual(mock_book_tickers.call_count, 2)
+
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     def test_assess_market_guard_flags_extreme_down_candle(self, mock_fetch_futures_klines) -> None:
         now = datetime(2026, 3, 18, 10, 0, tzinfo=timezone.utc)
