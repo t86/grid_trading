@@ -3983,6 +3983,32 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
         self.assertEqual(plan["sell_orders"][1]["role"], "entry_short")
 
+    def test_apply_hedge_position_controls_can_keep_probe_long_on_inventory_pause_when_allowed(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"},
+                {"side": "BUY", "price": 1.17, "qty": 3, "notional": 3.51, "role": "entry_long", "position_side": "LONG"},
+            ],
+            "sell_orders": [{"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"}],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=150.0,
+            current_short_qty=0.0,
+            mid_price=1.0,
+            pause_long_position_notional=100.0,
+            pause_short_position_notional=None,
+            min_mid_price_for_buys=None,
+            preserve_long_entry_on_inventory_pause=True,
+        )
+
+        self.assertTrue(result["long_paused"])
+        self.assertEqual(len(plan["buy_orders"]), 2)
+        self.assertEqual(plan["buy_orders"][0]["role"], "take_profit_short")
+        self.assertEqual(plan["buy_orders"][1]["role"], "entry_long")
+
     def test_resolve_short_threshold_timeout_state_stays_active_until_pause(self) -> None:
         state: dict[str, object] = {}
         start = datetime(2026, 4, 14, 2, 0, 0, tzinfo=timezone.utc)

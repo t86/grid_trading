@@ -3055,6 +3055,8 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         max_position_notional=getattr(args, "max_position_notional", None),
         max_order_position_notional=getattr(args, "max_order_position_notional", None),
         max_short_position_notional=getattr(args, "max_short_position_notional", None),
+        inventory_pause_long_probe_scale=getattr(args, "inventory_pause_long_probe_scale", 0.0),
+        inventory_pause_short_probe_scale=getattr(args, "inventory_pause_short_probe_scale", 0.25),
         adaptive_step_enabled=getattr(args, "adaptive_step_enabled", False),
         adaptive_step_30s_abs_return_ratio=getattr(args, "adaptive_step_30s_abs_return_ratio", 0.0),
         adaptive_step_30s_amplitude_ratio=getattr(args, "adaptive_step_30s_amplitude_ratio", 0.0),
@@ -3695,6 +3697,7 @@ def apply_hedge_position_controls(
     external_pause_reasons: list[str] | None = None,
     external_short_pause: bool = False,
     external_short_pause_reasons: list[str] | None = None,
+    preserve_long_entry_on_inventory_pause: bool = False,
     preserve_short_entry_on_external_pause: bool = False,
     preserve_short_entry_on_inventory_pause: bool = False,
 ) -> dict[str, Any]:
@@ -3702,12 +3705,14 @@ def apply_hedge_position_controls(
     current_short_notional = max(current_short_qty, 0.0) * max(mid_price, 0.0)
     long_paused = bool(external_long_pause)
     short_paused = bool(external_short_pause)
+    inventory_long_paused = False
     inventory_short_paused = False
     long_reasons: list[str] = list(external_pause_reasons or [])
     short_reasons: list[str] = list(external_short_pause_reasons or [])
 
     if pause_long_position_notional is not None and current_long_notional >= pause_long_position_notional:
         long_paused = True
+        inventory_long_paused = True
         long_reasons.append(
             f"current_long_notional={_float(current_long_notional)} >= pause_long_position_notional={_float(pause_long_position_notional)}"
         )
@@ -3724,8 +3729,10 @@ def apply_hedge_position_controls(
         )
 
     if long_paused:
-        plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
-        plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
+        keep_long_probe = preserve_long_entry_on_inventory_pause if inventory_long_paused else False
+        if not keep_long_probe:
+            plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
+            plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
     if short_paused:
         plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
         keep_short_probe = (
@@ -8157,9 +8164,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             target_base_qty = 0.0
             bootstrap_qty = 0.0
     elif strategy_mode == "hedge_neutral":
+        inventory_long_pause_active = (
+            _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) > 0
+            and current_long_notional >= _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) - 1e-12
+        )
         inventory_short_pause_active = (
             _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
             and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
+        )
+        inventory_long_probe_scale = (
+            _clamp_ratio(float(getattr(effective_args, "inventory_pause_long_probe_scale", 0.0)))
+            if inventory_long_pause_active
+            else 0.0
         )
         adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
             enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
@@ -8248,6 +8264,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             entry_long_paused=bool(
                 market_guard["buy_pause_active"]
                 or market_bias_entry_pause["buy_pause_active"]
+                or inventory_long_pause_active
                 or center_entry_guard["long_pause_active"]
             ),
             entry_short_paused=bool(
@@ -8255,6 +8272,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 or inventory_short_pause_active
                 or center_entry_guard["short_pause_active"]
             ),
+            paused_entry_long_scale=inventory_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
         )
         controls = apply_hedge_position_controls(
@@ -8284,6 +8302,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            preserve_long_entry_on_inventory_pause=inventory_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
             preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
@@ -8327,9 +8346,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0)
         current_long_notional = current_long_qty * max(mid_price, 0.0)
         current_short_notional = current_short_qty * max(mid_price, 0.0)
+        inventory_long_pause_active = (
+            _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) > 0
+            and current_long_notional >= _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) - 1e-12
+        )
         inventory_short_pause_active = (
             _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
             and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
+        )
+        inventory_long_probe_scale = (
+            _clamp_ratio(float(getattr(effective_args, "inventory_pause_long_probe_scale", 0.0)))
+            if inventory_long_pause_active
+            else 0.0
         )
         adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
             enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
@@ -8457,6 +8485,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             entry_long_paused=bool(
                 market_guard["buy_pause_active"]
                 or market_bias_entry_pause["buy_pause_active"]
+                or inventory_long_pause_active
                 or center_entry_guard["long_pause_active"]
                 or exposure_hard_long_pause
             ),
@@ -8465,6 +8494,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 or inventory_short_pause_active
                 or center_entry_guard["short_pause_active"]
             ),
+            paused_entry_long_scale=inventory_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
@@ -8544,6 +8574,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            preserve_long_entry_on_inventory_pause=inventory_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
             preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
@@ -9379,6 +9410,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_base_position_notional": inventory_tier["effective_base_position_notional"],
         "effective_pause_buy_position_notional": getattr(effective_args, "pause_buy_position_notional", None),
         "effective_pause_short_position_notional": getattr(effective_args, "pause_short_position_notional", None),
+        "effective_inventory_pause_long_probe_scale": getattr(effective_args, "inventory_pause_long_probe_scale", None),
         "effective_inventory_pause_short_probe_scale": getattr(effective_args, "inventory_pause_short_probe_scale", None),
         "effective_adverse_reduce_enabled": bool(getattr(effective_args, "adverse_reduce_enabled", False)),
         "effective_adverse_reduce_long_trigger_ratio": getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
@@ -9967,6 +9999,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--shift-steps", type=int, default=4)
     parser.add_argument("--pause-buy-position-notional", type=float, default=180.0)
     parser.add_argument("--pause-short-position-notional", type=float, default=None)
+    parser.add_argument("--inventory-pause-long-probe-scale", type=float, default=0.0)
     parser.add_argument("--inventory-pause-short-probe-scale", type=float, default=0.25)
     parser.add_argument("--max-position-notional", type=float, default=None)
     parser.add_argument("--max-short-position-notional", type=float, default=None)
@@ -10426,6 +10459,8 @@ def main() -> None:
         raise SystemExit("--max-position-notional must be > 0")
     if args.pause_short_position_notional is not None and args.pause_short_position_notional <= 0:
         raise SystemExit("--pause-short-position-notional must be > 0")
+    if args.inventory_pause_long_probe_scale < 0 or args.inventory_pause_long_probe_scale > 1:
+        raise SystemExit("--inventory-pause-long-probe-scale must be within [0, 1]")
     if args.inventory_pause_short_probe_scale < 0 or args.inventory_pause_short_probe_scale > 1:
         raise SystemExit("--inventory-pause-short-probe-scale must be within [0, 1]")
     if args.max_short_position_notional is not None and args.max_short_position_notional <= 0:

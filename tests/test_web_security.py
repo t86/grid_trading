@@ -2111,6 +2111,8 @@ class WebSecurityTests(unittest.TestCase):
                 "adverse_reduce_maker_timeout_seconds": 20.0,
                 "adverse_reduce_max_order_notional": 240.0,
                 "adverse_reduce_keep_probe_scale": 0.08,
+                "inventory_pause_long_probe_scale": 0.2,
+                "inventory_pause_short_probe_scale": 0.25,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -2134,6 +2136,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adverse-reduce-maker-timeout-seconds", command)
         self.assertIn("--adverse-reduce-max-order-notional", command)
         self.assertIn("--adverse-reduce-keep-probe-scale", command)
+        self.assertIn("--inventory-pause-long-probe-scale", command)
+        self.assertIn("0.2", command)
+        self.assertIn("--inventory-pause-short-probe-scale", command)
 
     def test_build_runner_command_includes_exposure_escalation_arguments(self) -> None:
         command = _build_runner_command(

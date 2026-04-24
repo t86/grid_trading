@@ -2709,6 +2709,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "shift_steps": 4,
     "pause_buy_position_notional": 750.0,
     "pause_short_position_notional": None,
+    "inventory_pause_long_probe_scale": 0.0,
     "inventory_pause_short_probe_scale": 0.25,
     "max_position_notional": 900.0,
     "max_short_position_notional": None,
@@ -5610,6 +5611,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--pause-buy-position-notional", str(config["pause_buy_position_notional"])])
     if config.get("pause_short_position_notional") is not None:
         command.extend(["--pause-short-position-notional", str(config["pause_short_position_notional"])])
+    if config.get("inventory_pause_long_probe_scale") is not None:
+        command.extend(["--inventory-pause-long-probe-scale", str(config["inventory_pause_long_probe_scale"])])
     if config.get("inventory_pause_short_probe_scale") is not None:
         command.extend(["--inventory-pause-short-probe-scale", str(config["inventory_pause_short_probe_scale"])])
     if config.get("max_position_notional") is not None:
@@ -5919,6 +5922,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "pause_buy_position_notional",
             "pause_short_position_notional",
             "threshold_position_notional",
+            "inventory_pause_long_probe_scale",
             "inventory_pause_short_probe_scale",
             "short_threshold_timeout_seconds",
             "max_position_notional",
@@ -16311,6 +16315,7 @@ MONITOR_PAGE = """<!doctype html>
       shift_steps: "每次触发后中心移动多少格。越大越跟价，越小越稳。",
       pause_buy_position_notional: "做多模式下达到该持仓名义后暂停继续买入。",
       pause_short_position_notional: "做空模式下达到该空仓名义后暂停继续开空。",
+      inventory_pause_long_probe_scale: "多仓达到软停多后保留的 probe 买单缩量系数。设为 0 表示完全停多；0.20 表示只保留约五分之一单量的贴盘口探针单。",
       inventory_pause_short_probe_scale: "空仓达到软停空后保留的 probe 空单缩量系数。设为 0 表示完全停空；0.25 表示只保留约四分之一单量的贴盘口探针单。",
       max_position_notional: "做多模式总持仓上限。",
       max_short_position_notional: "做空模式总空仓上限。",

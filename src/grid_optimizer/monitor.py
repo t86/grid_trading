@@ -252,6 +252,8 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--base-position-notional",
             "--pause-buy-position-notional",
             "--pause-short-position-notional",
+            "--inventory-pause-long-probe-scale",
+            "--inventory-pause-short-probe-scale",
             "--max-position-notional",
             "--max-short-position-notional",
             "--min-mid-price-for-buys",

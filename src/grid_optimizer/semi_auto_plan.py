@@ -973,6 +973,7 @@ def build_hedge_micro_grid_plan(
     synthetic_tiny_short_residual_notional: float | None = None,
     entry_long_paused: bool = False,
     entry_short_paused: bool = False,
+    paused_entry_long_scale: float = 0.0,
     paused_entry_short_scale: float = 0.0,
 ) -> dict[str, Any]:
     if center_price <= 0 or step_price <= 0:
@@ -994,6 +995,7 @@ def build_hedge_micro_grid_plan(
     near_market_entry_max_center_distance_steps = max(float(near_market_entry_max_center_distance_steps), 0.0)
     buy_offset_steps = float(buy_offset_steps)
     sell_offset_steps = float(sell_offset_steps)
+    paused_entry_long_scale = min(max(float(paused_entry_long_scale), 0.0), 1.0)
     paused_entry_short_scale = min(max(float(paused_entry_short_scale), 0.0), 1.0)
     mid_price = (
         (float(bid_price) + float(ask_price)) / 2.0
@@ -1234,6 +1236,11 @@ def build_hedge_micro_grid_plan(
             price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
         return _round_order_price(price_raw, tick_size, "BUY")
 
+    def _paused_probe_buy_price(level: int) -> float:
+        distance_steps = max((float(level) - 1.0) + buy_offset_steps, 0.0)
+        price_raw = float(Decimal(str(bid_price)) - (Decimal(str(distance_steps)) * Decimal(str(step_price))))
+        return _round_order_price(price_raw, tick_size, "BUY")
+
     def _entry_sell_price(level: int) -> float:
         if not near_market_entries_allowed:
             distance_steps = max(float(level) + sell_offset_steps, 1.0)
@@ -1357,10 +1364,15 @@ def build_hedge_micro_grid_plan(
     take_profit_short_price_keys = {
         f"{order.side}:{order.price:.10f}" for order in buy_orders if order.role == "take_profit_short"
     }
-    if not bool(entry_long_paused) and (effective_short_qty <= 0 or dominant_long_with_tiny_short_residual):
+    allow_paused_long_probe = bool(entry_long_paused and paused_entry_long_scale > 0)
+    if (not bool(entry_long_paused) or allow_paused_long_probe) and (
+        effective_short_qty <= 0 or dominant_long_with_tiny_short_residual
+    ):
         entry_buy_max_level = buy_levels + (1 if effective_short_qty > 0 else 0)
+        if allow_paused_long_probe and effective_short_qty <= 0:
+            entry_buy_max_level = 1
         for level in range(1, entry_buy_max_level + 1):
-            price = _entry_buy_price(level)
+            price = _paused_probe_buy_price(level) if allow_paused_long_probe else _entry_buy_price(level)
             if effective_short_qty > 0 and f"BUY:{price:.10f}" in take_profit_short_price_keys:
                 continue
             if long_entry_cost_guard_active:
@@ -1375,7 +1387,10 @@ def build_hedge_micro_grid_plan(
             if short_exit_profit_guard_active:
                 if short_exit_reference_price is not None and price >= short_exit_reference_price:
                     continue
-            qty = _round_order_qty(_entry_notional(level=level, current_qty=effective_long_qty) / price, step_size)
+            entry_notional = _entry_notional(level=level, current_qty=effective_long_qty)
+            if allow_paused_long_probe:
+                entry_notional *= paused_entry_long_scale
+            qty = _round_order_qty(entry_notional / price, step_size)
             notional = price * qty
             if price >= ask_price:
                 continue
