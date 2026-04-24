@@ -34,6 +34,7 @@ from .audit import (
 )
 from .backtest import build_grid_levels
 from .data import (
+    FuturesMarketStream,
     delete_futures_order,
     fetch_futures_account_info_v3,
     fetch_futures_book_tickers,
@@ -48,6 +49,7 @@ from .data import (
     post_futures_change_initial_leverage,
     post_futures_change_margin_type,
     post_futures_order,
+    resolve_futures_market_snapshot,
 )
 from .live_check import extract_symbol_position
 from .maker_flatten_runner import (
@@ -103,6 +105,7 @@ XAUT_ADAPTIVE_STATE_DEFENSIVE = "defensive"
 XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
+RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
         "buy_levels": 8,
@@ -779,6 +782,7 @@ def _build_execution_market_snapshot_fetcher(
     *,
     symbol: str,
     initial_book: dict[str, Any] | None = None,
+    snapshot_loader: Any | None = None,
     ttl_seconds: float = EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS,
 ) -> Any:
     cached_snapshot: dict[str, float] | None = None
@@ -794,14 +798,47 @@ def _build_execution_market_snapshot_fetcher(
         now = time.monotonic()
         if not force_refresh and cached_snapshot is not None and (now - cached_at) <= safe_ttl:
             return dict(cached_snapshot)
-        live_book_rows = fetch_futures_book_tickers(symbol=symbol)
-        if not live_book_rows:
-            raise RuntimeError(f"no book ticker returned for {symbol}")
-        cached_snapshot = _normalize_live_book_snapshot(live_book_rows[0], symbol=symbol)
+        if snapshot_loader is not None:
+            live_snapshot = snapshot_loader()
+            cached_snapshot = _normalize_live_book_snapshot(live_snapshot, symbol=symbol)
+        else:
+            live_book_rows = fetch_futures_book_tickers(symbol=symbol)
+            if not live_book_rows:
+                raise RuntimeError(f"no book ticker returned for {symbol}")
+            cached_snapshot = _normalize_live_book_snapshot(live_book_rows[0], symbol=symbol)
         cached_at = time.monotonic()
         return dict(cached_snapshot)
 
     return _fetch
+
+
+def _resolve_runner_market_snapshot(args: argparse.Namespace, *, symbol: str) -> dict[str, Any]:
+    market_stream = getattr(args, "market_stream", None)
+    if market_stream is not None:
+        return resolve_futures_market_snapshot(
+            symbol,
+            stream=market_stream,
+            max_snapshot_age_seconds=RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS,
+        )
+    book_rows = fetch_futures_book_tickers(symbol=symbol)
+    premium_rows = fetch_futures_premium_index(symbol=symbol)
+    if not book_rows:
+        raise RuntimeError(f"No book ticker returned for {symbol}")
+    if not premium_rows:
+        raise RuntimeError(f"No premium index returned for {symbol}")
+    book = book_rows[0]
+    premium = premium_rows[0]
+    return {
+        "symbol": symbol,
+        "bid_price": _safe_float(book.get("bid_price")),
+        "ask_price": _safe_float(book.get("ask_price")),
+        "mark_price": _safe_float(premium.get("mark_price")),
+        "funding_rate": _safe_float(premium.get("funding_rate")),
+        "next_funding_time": premium.get("next_funding_time"),
+        "book_time": book.get("time"),
+        "mark_time": premium.get("time"),
+        "source": "rest",
+    }
 
 
 def _resolve_custom_grid_roll(
@@ -6967,16 +7004,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError(f"Unsupported strategy_mode: {requested_strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
     symbol_info = fetch_futures_symbol_config(symbol)
-    book_rows = fetch_futures_book_tickers(symbol=symbol)
-    premium_rows = fetch_futures_premium_index(symbol=symbol)
-    if not book_rows:
-        raise RuntimeError(f"No book ticker returned for {symbol}")
-    if not premium_rows:
-        raise RuntimeError(f"No premium index returned for {symbol}")
-    book = book_rows[0]
-    premium = premium_rows[0]
-    bid_price = float(book["bid_price"])
-    ask_price = float(book["ask_price"])
+    market_snapshot = _resolve_runner_market_snapshot(args, symbol=symbol)
+    premium = {
+        "funding_rate": market_snapshot.get("funding_rate"),
+        "mark_price": market_snapshot.get("mark_price"),
+        "next_funding_time": market_snapshot.get("next_funding_time"),
+        "time": market_snapshot.get("mark_time"),
+    }
+    bid_price = _safe_float(market_snapshot.get("bid_price"))
+    ask_price = _safe_float(market_snapshot.get("ask_price"))
+    if bid_price <= 0 or ask_price <= 0:
+        raise RuntimeError(f"No valid market snapshot returned for {symbol}")
     mid_price = (bid_price + ask_price) / 2.0
 
     state_path = Path(args.state_path)
@@ -8986,10 +9024,12 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
 
     symbol = str(plan_report.get("symbol", "")).upper().strip()
     step_price = _safe_float(plan_report.get("step_price"))
-    live_book_rows = fetch_futures_book_tickers(symbol=symbol)
-    if not live_book_rows:
-        raise RuntimeError(f"no book ticker returned for {symbol}")
-    market_fetcher = _build_execution_market_snapshot_fetcher(symbol=symbol, initial_book=live_book_rows[0])
+    initial_market_snapshot = _resolve_runner_market_snapshot(args, symbol=symbol)
+    market_fetcher = _build_execution_market_snapshot_fetcher(
+        symbol=symbol,
+        initial_book=initial_market_snapshot,
+        snapshot_loader=lambda: _resolve_runner_market_snapshot(args, symbol=symbol),
+    )
     live_book = market_fetcher()
     live_bid_price = _safe_float(live_book.get("bid_price"))
     live_ask_price = _safe_float(live_book.get("ask_price"))
@@ -10069,129 +10109,138 @@ def main() -> None:
     audit_paths = build_audit_paths(summary_path)
     consecutive_errors = 0
     cycle = 0
+    market_stream: FuturesMarketStream | None = None
+    try:
+        market_stream = FuturesMarketStream(args.symbol)
+        market_stream.start()
+        setattr(args, "market_stream", market_stream)
+    except Exception as exc:
+        setattr(args, "market_stream", None)
+        print(f"[market-stream] disabled for {args.symbol}: {exc}")
 
-    while True:
-        cycle += 1
-        cycle_started_at = datetime.now(timezone.utc)
-        try:
-            runtime_guard_summary = _maybe_handle_runtime_guard(
-                args=args,
-                cycle=cycle,
-                cycle_started_at=cycle_started_at,
-                summary_path=summary_path,
-            )
-            if runtime_guard_summary is not None:
-                _append_jsonl(summary_path, runtime_guard_summary)
-                _print_cycle_summary(runtime_guard_summary)
-                consecutive_errors = 0
-                if runtime_guard_summary.get("stop_triggered"):
-                    break
-                if args.iterations and cycle >= args.iterations:
-                    break
-                time.sleep(args.sleep_seconds)
-                continue
-            plan_report = generate_plan_report(args)
-            if args.reset_state:
-                args.reset_state = False
-            _write_json(plan_path, plan_report)
-            _append_jsonl(
-                audit_paths["plan_audit"],
-                {
-                    "ts": cycle_started_at.isoformat(),
-                    "cycle": cycle,
-                    "symbol": args.symbol.upper().strip(),
-                    "report": plan_report,
-                },
-            )
-
-            submit_report = execute_plan_report(args, plan_report)
-            _write_json(submit_report_path, submit_report)
-            _append_jsonl(
-                audit_paths["submit_audit"],
-                {
-                    "ts": cycle_started_at.isoformat(),
-                    "cycle": cycle,
-                    "symbol": args.symbol.upper().strip(),
-                    "report": submit_report,
-                },
-            )
-            for item in submit_report.get("canceled_orders", []):
-                _append_jsonl(
-                    audit_paths["order_audit"],
-                    {
-                        "ts": cycle_started_at.isoformat(),
-                        "cycle": cycle,
-                        "symbol": args.symbol.upper().strip(),
-                        "event_type": "cancel",
-                        "payload": item,
-                    },
-                )
-            for item in submit_report.get("placed_orders", []):
-                _append_jsonl(
-                    audit_paths["order_audit"],
-                    {
-                        "ts": cycle_started_at.isoformat(),
-                        "cycle": cycle,
-                        "symbol": args.symbol.upper().strip(),
-                        "event_type": "place",
-                        "payload": item,
-                    },
-                )
-            audit_sync = {
-                "trade_appended": 0,
-                "income_appended": 0,
-                "error": None,
-            }
+    try:
+        while True:
+            cycle += 1
+            cycle_started_at = datetime.now(timezone.utc)
             try:
-                audit_sync = _sync_account_audit(
-                    symbol=args.symbol,
+                runtime_guard_summary = _maybe_handle_runtime_guard(
+                    args=args,
                     cycle=cycle,
+                    cycle_started_at=cycle_started_at,
                     summary_path=summary_path,
-                    recv_window=args.recv_window,
                 )
-            except Exception as audit_exc:
-                audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
-            state_path = Path(str(plan_report.get("state_path", args.state_path)))
-            state = read_json(state_path) or {}
-            reconcile_credentials = load_binance_api_credentials()
-            if reconcile_credentials is None:
-                reconcile_snapshot = {
-                    "enabled": False,
-                    "checked": False,
-                    "cycle": cycle,
-                    "message": "missing_credentials",
-                }
-            else:
-                reconcile_api_key, reconcile_api_secret = reconcile_credentials
-                reconcile_snapshot = _run_periodic_reconcile(
-                    state=state,
-                    cycle=cycle,
-                    interval_cycles=int(getattr(args, "reconcile_interval_cycles", 5)),
-                    symbol=args.symbol.upper().strip(),
-                    strategy_mode=str(getattr(args, "strategy_mode", "one_way_long")),
-                    api_key=reconcile_api_key,
-                    api_secret=reconcile_api_secret,
-                    recv_window=args.recv_window,
-                    expected_open_order_count=len(plan_report.get("kept_orders", [])) + len(submit_report.get("placed_orders", [])),
-                    expected_actual_net_qty=_safe_float(plan_report.get("actual_net_qty")),
+                if runtime_guard_summary is not None:
+                    _append_jsonl(summary_path, runtime_guard_summary)
+                    _print_cycle_summary(runtime_guard_summary)
+                    consecutive_errors = 0
+                    if runtime_guard_summary.get("stop_triggered"):
+                        break
+                    if args.iterations and cycle >= args.iterations:
+                        break
+                    time.sleep(args.sleep_seconds)
+                    continue
+                plan_report = generate_plan_report(args)
+                if args.reset_state:
+                    args.reset_state = False
+                _write_json(plan_path, plan_report)
+                _append_jsonl(
+                    audit_paths["plan_audit"],
+                    {
+                        "ts": cycle_started_at.isoformat(),
+                        "cycle": cycle,
+                        "symbol": args.symbol.upper().strip(),
+                        "report": plan_report,
+                    },
                 )
-            state["last_reconcile"] = reconcile_snapshot
-            _write_json(state_path, state)
-            runtime_guard_config = normalize_runtime_guard_config(vars(args))
-            runtime_cumulative_gross_notional, runtime_pnl_events, runtime_stats_start_time = _load_futures_runtime_guard_inputs(
-                summary_path,
-                runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
-                symbol=args.symbol.upper().strip(),
-                now=cycle_started_at,
-            )
-            runtime_guard_result = evaluate_runtime_guards(
-                config=runtime_guard_config,
-                now=cycle_started_at,
-                cumulative_gross_notional=runtime_cumulative_gross_notional,
-                pnl_events=runtime_pnl_events,
-            )
 
-            summary = {
+                submit_report = execute_plan_report(args, plan_report)
+                _write_json(submit_report_path, submit_report)
+                _append_jsonl(
+                    audit_paths["submit_audit"],
+                    {
+                        "ts": cycle_started_at.isoformat(),
+                        "cycle": cycle,
+                        "symbol": args.symbol.upper().strip(),
+                        "report": submit_report,
+                    },
+                )
+                for item in submit_report.get("canceled_orders", []):
+                    _append_jsonl(
+                        audit_paths["order_audit"],
+                        {
+                            "ts": cycle_started_at.isoformat(),
+                            "cycle": cycle,
+                            "symbol": args.symbol.upper().strip(),
+                            "event_type": "cancel",
+                            "payload": item,
+                        },
+                    )
+                for item in submit_report.get("placed_orders", []):
+                    _append_jsonl(
+                        audit_paths["order_audit"],
+                        {
+                            "ts": cycle_started_at.isoformat(),
+                            "cycle": cycle,
+                            "symbol": args.symbol.upper().strip(),
+                            "event_type": "place",
+                            "payload": item,
+                        },
+                    )
+                audit_sync = {
+                    "trade_appended": 0,
+                    "income_appended": 0,
+                    "error": None,
+                }
+                try:
+                    audit_sync = _sync_account_audit(
+                        symbol=args.symbol,
+                        cycle=cycle,
+                        summary_path=summary_path,
+                        recv_window=args.recv_window,
+                    )
+                except Exception as audit_exc:
+                    audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
+                state_path = Path(str(plan_report.get("state_path", args.state_path)))
+                state = read_json(state_path) or {}
+                reconcile_credentials = load_binance_api_credentials()
+                if reconcile_credentials is None:
+                    reconcile_snapshot = {
+                        "enabled": False,
+                        "checked": False,
+                        "cycle": cycle,
+                        "message": "missing_credentials",
+                    }
+                else:
+                    reconcile_api_key, reconcile_api_secret = reconcile_credentials
+                    reconcile_snapshot = _run_periodic_reconcile(
+                        state=state,
+                        cycle=cycle,
+                        interval_cycles=int(getattr(args, "reconcile_interval_cycles", 5)),
+                        symbol=args.symbol.upper().strip(),
+                        strategy_mode=str(getattr(args, "strategy_mode", "one_way_long")),
+                        api_key=reconcile_api_key,
+                        api_secret=reconcile_api_secret,
+                        recv_window=args.recv_window,
+                        expected_open_order_count=len(plan_report.get("kept_orders", [])) + len(submit_report.get("placed_orders", [])),
+                        expected_actual_net_qty=_safe_float(plan_report.get("actual_net_qty")),
+                    )
+                state["last_reconcile"] = reconcile_snapshot
+                _write_json(state_path, state)
+                runtime_guard_config = normalize_runtime_guard_config(vars(args))
+                runtime_cumulative_gross_notional, runtime_pnl_events, runtime_stats_start_time = _load_futures_runtime_guard_inputs(
+                    summary_path,
+                    runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
+                    symbol=args.symbol.upper().strip(),
+                    now=cycle_started_at,
+                )
+                runtime_guard_result = evaluate_runtime_guards(
+                    config=runtime_guard_config,
+                    now=cycle_started_at,
+                    cumulative_gross_notional=runtime_cumulative_gross_notional,
+                    pnl_events=runtime_pnl_events,
+                )
+
+                summary = {
                 "ts": cycle_started_at.isoformat(),
                 "cycle": cycle,
                 "symbol": args.symbol.upper().strip(),
@@ -10451,13 +10500,26 @@ def main() -> None:
                 "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
                 "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
             }
-            _append_jsonl(summary_path, summary)
-            _print_cycle_summary(summary)
-            consecutive_errors = 0
-        except KeyboardInterrupt:
-            raise
-        except Exception as exc:
-            if isinstance(exc, StartupProtectionError):
+                _append_jsonl(summary_path, summary)
+                _print_cycle_summary(summary)
+                consecutive_errors = 0
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                if isinstance(exc, StartupProtectionError):
+                    error_report = {
+                        "ts": cycle_started_at.isoformat(),
+                        "cycle": cycle,
+                        "symbol": args.symbol.upper().strip(),
+                        "error_type": exc.__class__.__name__,
+                        "error_message": str(exc),
+                        "traceback": traceback.format_exc(),
+                        "consecutive_errors": consecutive_errors,
+                    }
+                    _append_jsonl(summary_path, error_report)
+                    print(f"[{cycle}] error: {exc}")
+                    raise SystemExit(str(exc)) from exc
+                consecutive_errors += 1
                 error_report = {
                     "ts": cycle_started_at.isoformat(),
                     "cycle": cycle,
@@ -10469,27 +10531,17 @@ def main() -> None:
                 }
                 _append_jsonl(summary_path, error_report)
                 print(f"[{cycle}] error: {exc}")
-                raise SystemExit(str(exc)) from exc
-            consecutive_errors += 1
-            error_report = {
-                "ts": cycle_started_at.isoformat(),
-                "cycle": cycle,
-                "symbol": args.symbol.upper().strip(),
-                "error_type": exc.__class__.__name__,
-                "error_message": str(exc),
-                "traceback": traceback.format_exc(),
-                "consecutive_errors": consecutive_errors,
-            }
-            _append_jsonl(summary_path, error_report)
-            print(f"[{cycle}] error: {exc}")
-            if consecutive_errors >= args.max_consecutive_errors:
-                raise SystemExit(
-                    f"Stopped after {consecutive_errors} consecutive errors. Inspect {summary_path} and {submit_report_path}."
-                ) from exc
+                if consecutive_errors >= args.max_consecutive_errors:
+                    raise SystemExit(
+                        f"Stopped after {consecutive_errors} consecutive errors. Inspect {summary_path} and {submit_report_path}."
+                    ) from exc
 
-        if args.iterations and cycle >= args.iterations:
-            break
-        time.sleep(args.sleep_seconds)
+            if args.iterations and cycle >= args.iterations:
+                break
+            time.sleep(args.sleep_seconds)
+    finally:
+        if market_stream is not None:
+            market_stream.stop()
 
 
 if __name__ == "__main__":

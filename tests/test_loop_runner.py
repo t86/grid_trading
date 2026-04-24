@@ -2479,6 +2479,76 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(report["current_short_qty"], 3200.0)
         self.assertIsNone(report["synthetic_ledger"])
 
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.resolve_futures_market_snapshot")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_uses_market_snapshot_resolver_when_stream_available(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_market_snapshot,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_market_snapshot.return_value = {
+            "symbol": "TESTUSDT",
+            "bid_price": 0.3120,
+            "ask_price": 0.3122,
+            "mark_price": 0.3121,
+            "funding_rate": 0.0001,
+            "next_funding_time": 1234567890,
+            "source": "websocket",
+        }
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "TESTUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_mode = "one_way_long"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 4
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+            args.market_stream = object()
+
+            report = generate_plan_report(args)
+
+        self.assertAlmostEqual(report["mid_price"], 0.3121, places=8)
+        self.assertEqual(mock_market_snapshot.call_count, 1)
+        mock_book_tickers.assert_not_called()
+        mock_premium_index.assert_not_called()
+
     def test_apply_synthetic_trade_fill_tracks_virtual_long_and_short_books(self) -> None:
         ledger = {
             "virtual_long_qty": 0.0,
@@ -4832,10 +4902,12 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.resolve_futures_market_snapshot")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
-    def test_execute_plan_report_reuses_initial_book_for_first_order_attempt(
+    def test_execute_plan_report_uses_market_snapshot_resolver_for_initial_quote_and_retry(
         self,
         mock_validate_plan_report,
+        mock_market_snapshot,
         mock_book_tickers,
         mock_load_credentials,
         mock_position_mode,
@@ -4858,6 +4930,26 @@ class LoopRunnerTests(unittest.TestCase):
                 ],
             },
         }
+        mock_market_snapshot.side_effect = [
+            {
+                "symbol": "KATUSDT",
+                "bid_price": 0.49,
+                "ask_price": 0.51,
+                "mark_price": 0.50,
+                "funding_rate": 0.0,
+                "next_funding_time": None,
+                "source": "websocket",
+            },
+            {
+                "symbol": "KATUSDT",
+                "bid_price": 0.48,
+                "ask_price": 0.50,
+                "mark_price": 0.49,
+                "funding_rate": 0.0,
+                "next_funding_time": None,
+                "source": "websocket",
+            },
+        ]
         mock_book_tickers.return_value = [{"bid_price": "0.49", "ask_price": "0.51"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
@@ -4867,7 +4959,10 @@ class LoopRunnerTests(unittest.TestCase):
         }
         mock_open_orders.return_value = []
         mock_change_leverage.return_value = {"leverage": 2}
-        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "cid-123"}
+        mock_post_order.side_effect = [
+            RuntimeError("Binance API error -5022: Post only order will be rejected."),
+            {"orderId": 124, "clientOrderId": "cid-124"},
+        ]
 
         args = Namespace(
             symbol="KATUSDT",
@@ -4881,9 +4976,10 @@ class LoopRunnerTests(unittest.TestCase):
             apply=True,
             margin_type="KEEP",
             leverage=2,
-            maker_retries=0,
+            maker_retries=1,
             recv_window=5000,
             state_path="output/katusdt_loop_state.json",
+            market_stream=object(),
         )
         plan_report = {
             "symbol": "KATUSDT",
@@ -4905,7 +5001,8 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(report["executed"])
         self.assertEqual(len(report["placed_orders"]), 1)
-        self.assertEqual(mock_book_tickers.call_count, 1)
+        self.assertEqual(mock_market_snapshot.call_count, 2)
+        mock_book_tickers.assert_not_called()
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
