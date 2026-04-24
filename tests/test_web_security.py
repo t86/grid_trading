@@ -25,6 +25,7 @@ from grid_optimizer.web import (
     _get_custom_runner_preset,
     _load_runner_control_config,
     _normalize_runner_control_payload,
+    _normalize_runner_volatility_trigger_config,
     _parse_allowed_networks,
     _resolve_runner_volume_trigger_action,
     _resolve_runner_volatility_trigger_action,
@@ -626,6 +627,17 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(decision["action"], "start")
         self.assertEqual(decision["reason"], "volatility_back_within_threshold")
+
+    def test_normalize_runner_volatility_trigger_accepts_fast_windows(self) -> None:
+        payload = _normalize_runner_volatility_trigger_config(
+            {
+                "volatility_trigger_enabled": True,
+                "volatility_trigger_window": "1m",
+                "volatility_trigger_amplitude_ratio": 0.0015,
+            }
+        )
+
+        self.assertEqual(payload["volatility_trigger_window"], "1m")
 
     def test_volatility_reduce_does_not_escalate_when_target_already_reached(self) -> None:
         reason = _volatility_reduce_escalation_reason(

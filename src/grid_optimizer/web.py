@@ -157,6 +157,12 @@ VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
     "4h": 240,
     "24h": 1440,
 }
+VOLATILITY_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
+    "1m": 1,
+    "3m": 3,
+    "5m": 5,
+    **VOLUME_TRIGGER_WINDOW_MINUTES,
+}
 DEFAULT_VOLUME_TRIGGER_WINDOW = "1h"
 VOLUME_TRIGGER_POLL_SECONDS = 20.0
 DEFAULT_VOLATILITY_TRIGGER_WINDOW = "1h"
@@ -3236,7 +3242,7 @@ def _normalize_volume_trigger_window(value: Any) -> str:
 
 def _normalize_volatility_trigger_window(value: Any) -> str:
     text = str(value or DEFAULT_VOLATILITY_TRIGGER_WINDOW).strip().lower()
-    return text if text in VOLUME_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLATILITY_TRIGGER_WINDOW
+    return text if text in VOLATILITY_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLATILITY_TRIGGER_WINDOW
 
 
 def _normalize_runner_volume_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
@@ -3755,7 +3761,7 @@ def _volatility_trigger_start_allowed(config: dict[str, Any]) -> dict[str, Any]:
     if not symbol:
         return {"allowed": True, "reason": "missing_symbol"}
     window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
-    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    window_minutes = VOLATILITY_TRIGGER_WINDOW_MINUTES[window_key]
     stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
     signal_summary = _evaluate_runner_volatility_trigger_signal(
         normalized_config,
@@ -3884,7 +3890,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     checked_at_dt = datetime.now(timezone.utc)
     checked_at = checked_at_dt.isoformat()
     window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
-    window_minutes = VOLUME_TRIGGER_WINDOW_MINUTES[window_key]
+    window_minutes = VOLATILITY_TRIGGER_WINDOW_MINUTES[window_key]
     price_stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
     current_amplitude_ratio = float(price_stats.get("amplitude_ratio") or 0.0)
     current_return_ratio = float(price_stats.get("return_ratio") or 0.0)
