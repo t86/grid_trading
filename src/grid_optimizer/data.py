@@ -911,6 +911,185 @@ def resolve_futures_market_snapshot(
     return build_futures_rest_market_snapshot(symbol, contract_type=contract_type)
 
 
+class FuturesMarketStream:
+    def __init__(self, symbol: str, *, contract_type: str = "usdm") -> None:
+        self.symbol = str(symbol).upper().strip()
+        if not self.symbol:
+            raise ValueError("symbol is required")
+        self.contract_type = normalize_contract_type(contract_type)
+        self._lock = threading.RLock()
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._ws_app: Any | None = None
+        self._latest_snapshot: dict[str, Any] | None = None
+        self._latest_snapshot_at = 0.0
+        self._last_message_at = 0.0
+        self._last_error: str | None = None
+        self._connection_state = "idle"
+        self._book_state: dict[str, Any] | None = None
+        self._mark_state: dict[str, Any] | None = None
+
+    def start(self) -> None:
+        thread = self._thread
+        if thread is not None and thread.is_alive():
+            return
+        self._stop_event.clear()
+        self._thread = threading.Thread(
+            target=self._run_forever,
+            name=f"{self.symbol}-market-stream",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        app = self._ws_app
+        if app is not None:
+            try:
+                app.close()
+            except Exception:
+                pass
+        thread = self._thread
+        if thread is not None:
+            thread.join(timeout=2.0)
+        self._thread = None
+        self._ws_app = None
+
+    def snapshot(self, *, max_age_seconds: float | None = None) -> dict[str, Any] | None:
+        with self._lock:
+            if self._latest_snapshot is None:
+                return None
+            now = time.monotonic()
+            if max_age_seconds is not None and max_age_seconds >= 0:
+                if now - self._latest_snapshot_at > max_age_seconds:
+                    return None
+            return deepcopy(self._latest_snapshot)
+
+    def _stream_url(self) -> str:
+        base_url = "wss://fstream.binance.com/stream"
+        if self.contract_type == "coinm":
+            base_url = "wss://dstream.binance.com/stream"
+        stream_names = f"{self.symbol.lower()}@bookTicker/{self.symbol.lower()}@markPrice"
+        return f"{base_url}?streams={stream_names}"
+
+    def _run_forever(self) -> None:
+        import websocket
+
+        backoff_seconds = 1.0
+        while not self._stop_event.is_set():
+            app = websocket.WebSocketApp(
+                self._stream_url(),
+                on_open=self._on_open,
+                on_message=self._on_message,
+                on_error=self._on_error,
+                on_close=self._on_close,
+            )
+            with self._lock:
+                self._ws_app = app
+                self._connection_state = "connecting"
+            try:
+                app.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as exc:
+                self._on_error(app, exc)
+            finally:
+                with self._lock:
+                    if self._ws_app is app:
+                        self._ws_app = None
+            if self._stop_event.is_set():
+                break
+            time.sleep(backoff_seconds)
+            backoff_seconds = min(backoff_seconds * 2.0, 15.0)
+
+    def _on_open(self, _ws: Any) -> None:
+        with self._lock:
+            self._connection_state = "connected"
+            self._last_error = None
+
+    def _on_message(self, _ws: Any, raw_message: str) -> None:
+        payload = json.loads(raw_message)
+        if not isinstance(payload, dict):
+            return
+        data = payload.get("data")
+        if not isinstance(data, dict):
+            data = payload
+        stream_name = str(payload.get("stream", "")).strip()
+        event_type = str(data.get("e", "")).strip()
+        if stream_name.endswith("@bookTicker") or event_type == "bookTicker":
+            self._handle_book_ticker_message(data)
+        elif stream_name.endswith("@markPrice") or event_type == "markPriceUpdate":
+            self._handle_mark_price_message(data)
+
+    def _on_error(self, _ws: Any, exc: Exception) -> None:
+        with self._lock:
+            self._last_error = str(exc)
+            self._connection_state = "error"
+
+    def _on_close(self, _ws: Any, _status_code: int | None, _msg: str | None) -> None:
+        with self._lock:
+            if not self._stop_event.is_set():
+                self._connection_state = "disconnected"
+
+    def _handle_book_ticker_message(self, payload: dict[str, Any]) -> None:
+        symbol = str(payload.get("s") or payload.get("symbol") or "").upper().strip()
+        if symbol and symbol != self.symbol:
+            return
+        bid_price = _safe_float(payload.get("b", payload.get("bidPrice")))
+        ask_price = _safe_float(payload.get("a", payload.get("askPrice")))
+        if bid_price <= 0 or ask_price <= 0:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._last_message_at = now
+            self._book_state = {
+                "symbol": self.symbol,
+                "bid_price": bid_price,
+                "ask_price": ask_price,
+                "book_time": int(payload["T"]) if str(payload.get("T", "")).strip() else None,
+            }
+            self._refresh_snapshot_locked(now)
+
+    def _handle_mark_price_message(self, payload: dict[str, Any]) -> None:
+        symbol = str(payload.get("s") or payload.get("symbol") or "").upper().strip()
+        if symbol and symbol != self.symbol:
+            return
+        now = time.monotonic()
+        with self._lock:
+            self._last_message_at = now
+            self._mark_state = {
+                "symbol": self.symbol,
+                "mark_price": _safe_float(payload.get("p", payload.get("markPrice"))),
+                "funding_rate": _safe_float(payload.get("r", payload.get("lastFundingRate"))),
+                "next_funding_time": (
+                    int(payload["n"])
+                    if str(payload.get("n", "")).strip()
+                    else (int(payload["T"]) if str(payload.get("T", "")).strip() else None)
+                ),
+                "mark_time": (
+                    int(payload["E"])
+                    if str(payload.get("E", "")).strip()
+                    else (int(payload["T"]) if str(payload.get("T", "")).strip() else None)
+                ),
+            }
+            self._refresh_snapshot_locked(now)
+
+    def _refresh_snapshot_locked(self, now: float) -> None:
+        if self._book_state is None or self._mark_state is None:
+            return
+        self._latest_snapshot = {
+            "symbol": self.symbol,
+            "bid_price": _safe_float(self._book_state.get("bid_price")),
+            "ask_price": _safe_float(self._book_state.get("ask_price")),
+            "mark_price": _safe_float(self._mark_state.get("mark_price")),
+            "funding_rate": _safe_float(self._mark_state.get("funding_rate")),
+            "next_funding_time": self._mark_state.get("next_funding_time"),
+            "book_time": self._book_state.get("book_time"),
+            "mark_time": self._mark_state.get("mark_time"),
+            "snapshot_at": now,
+            "source": "websocket",
+        }
+        self._latest_snapshot_at = now
+
+
 def _futures_trade_base_url(contract_type: str = "usdm") -> str:
     normalized = normalize_contract_type(contract_type)
     if normalized != "usdm":

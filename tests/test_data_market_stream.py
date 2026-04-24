@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from grid_optimizer.data import (
+    FuturesMarketStream,
     clear_futures_market_data_caches,
     fetch_futures_symbol_config,
     resolve_futures_market_snapshot,
@@ -96,6 +97,50 @@ class FuturesMarketSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot["source"], "rest")
         self.assertEqual(snapshot["mark_price"], 10.0)
         mock_rest.assert_called_once()
+
+
+class FuturesMarketStreamLifecycleTests(unittest.TestCase):
+    @patch("grid_optimizer.data.time.monotonic")
+    def test_market_stream_merges_book_and_mark_messages_into_one_snapshot(self, mock_monotonic) -> None:
+        mock_monotonic.side_effect = [10.0, 10.0, 10.0]
+        stream = FuturesMarketStream("BTCUSDT")
+
+        stream._handle_book_ticker_message(
+            {"s": "BTCUSDT", "b": "10.0", "a": "10.2", "T": 100}
+        )
+        stream._handle_mark_price_message(
+            {"s": "BTCUSDT", "p": "10.1", "r": "0.0001", "T": 101, "E": 102, "n": 1234567890}
+        )
+
+        snapshot = stream.snapshot(max_age_seconds=3.0)
+
+        self.assertIsNotNone(snapshot)
+        self.assertEqual(snapshot["symbol"], "BTCUSDT")
+        self.assertEqual(snapshot["bid_price"], 10.0)
+        self.assertEqual(snapshot["ask_price"], 10.2)
+        self.assertEqual(snapshot["mark_price"], 10.1)
+        self.assertEqual(snapshot["funding_rate"], 0.0001)
+
+    @patch("grid_optimizer.data.time.monotonic")
+    def test_market_stream_returns_none_when_snapshot_is_stale(self, mock_monotonic) -> None:
+        mock_monotonic.side_effect = [10.0, 10.0, 20.0]
+        stream = FuturesMarketStream("BTCUSDT")
+        stream._handle_book_ticker_message(
+            {"s": "BTCUSDT", "b": "10.0", "a": "10.2", "T": 100}
+        )
+        stream._handle_mark_price_message(
+            {"s": "BTCUSDT", "p": "10.1", "r": "0.0001", "T": 101, "E": 102, "n": 1234567890}
+        )
+
+        self.assertIsNone(stream.snapshot(max_age_seconds=3.0))
+
+    def test_market_stream_returns_none_for_partial_snapshot(self) -> None:
+        stream = FuturesMarketStream("BTCUSDT")
+        stream._handle_book_ticker_message(
+            {"s": "BTCUSDT", "b": "10.0", "a": "10.2", "T": 100}
+        )
+
+        self.assertIsNone(stream.snapshot(max_age_seconds=3.0))
 
 
 if __name__ == "__main__":
