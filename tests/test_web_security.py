@@ -890,6 +890,32 @@ class WebSecurityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
             _runner_preset_payload("btcusdc_competition_maker_neutral_v1", {"symbol": "ETHUSDC"})
 
+    def test_runner_preset_payload_applies_ethusdc_um_volume_long_profile(self) -> None:
+        payload = _runner_preset_payload("ethusdc_um_volume_long_v1", {"symbol": "ETHUSDC"})
+        self.assertEqual(payload["strategy_profile"], "ethusdc_um_volume_long_v1")
+        self.assertEqual(payload["symbol"], "ETHUSDC")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertAlmostEqual(payload["step_price"], 0.6)
+        self.assertEqual(payload["buy_levels"], 6)
+        self.assertEqual(payload["sell_levels"], 10)
+        self.assertAlmostEqual(payload["per_order_notional"], 100.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 250.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 700.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 900.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 1800.0)
+        self.assertEqual(payload["leverage"], 5)
+        self.assertAlmostEqual(payload["take_profit_min_profit_ratio"], 0.0)
+        self.assertFalse(payload["volatility_trigger_enabled"])
+        self.assertFalse(payload["volatility_trigger_stop_close_all_positions"])
+        self.assertFalse(payload["volume_trigger_enabled"])
+        self.assertFalse(payload["volume_trigger_stop_close_all_positions"])
+        self.assertFalse(payload["adverse_reduce_enabled"])
+        self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
+
+    def test_runner_preset_payload_rejects_ethusdc_um_volume_long_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=ETHUSDC"):
+            _runner_preset_payload("ethusdc_um_volume_long_v1", {"symbol": "BTCUSDC"})
+
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
         custom_path = Path("output/test_custom_runner_presets.json")
@@ -2142,11 +2168,18 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("btcusdc_competition_maker_neutral_aggressive_v1", btc_summaries)
         self.assertNotIn("btcusdc_competition_maker_neutral_v1", xau_summaries)
         self.assertNotIn("btcusdc_competition_maker_neutral_v1", eth_summaries)
+        self.assertIn("ethusdc_um_volume_long_v1", eth_summaries)
+        self.assertNotIn("ethusdc_um_volume_long_v1", btc_summaries)
         preset = btc_summaries["btcusdc_competition_maker_neutral_v1"]
         self.assertEqual(preset["label"], "UM 冲刺赛 BTCUSDC")
         self.assertEqual(preset["config"]["symbol"], "BTCUSDC")
         self.assertEqual(preset["config"]["strategy_mode"], "synthetic_neutral")
         self.assertAlmostEqual(preset["config"]["per_order_notional"], 120.0)
+        eth_long = eth_summaries["ethusdc_um_volume_long_v1"]
+        self.assertEqual(eth_long["label"], "UM 冲刺赛 ETHUSDC 做多冲量")
+        self.assertEqual(eth_long["config"]["symbol"], "ETHUSDC")
+        self.assertEqual(eth_long["config"]["strategy_mode"], "one_way_long")
+        self.assertAlmostEqual(eth_long["config"]["base_position_notional"], 250.0)
         conservative = btc_summaries["btcusdc_competition_maker_neutral_conservative_v1"]
         aggressive = btc_summaries["btcusdc_competition_maker_neutral_aggressive_v1"]
         self.assertEqual(conservative["label"], "UM 冲刺赛 BTCUSDC（保守）")
