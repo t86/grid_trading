@@ -60,6 +60,7 @@ RUNNER_CONTROL_PATH = Path("output/night_loop_runner_control.json")
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
 STABLE_QUOTE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 MONITOR_CACHE_TTL_SECONDS = 2.0
+LOCAL_RUNTIME_SNAPSHOT_MAX_AGE_SECONDS = 180.0
 _MONITOR_CACHE_LOCK = threading.Lock()
 _MONITOR_CACHE: dict[tuple[str, str, str, str, int], tuple[float, dict[str, Any]]] = {}
 _MONITOR_INFLIGHT: dict[tuple[str, str, str, str, int], "_InflightMonitorSnapshot"] = {}
@@ -1039,6 +1040,174 @@ def build_monitor_alerts(
     return alerts
 
 
+def _fresh_local_runtime_snapshot_available(
+    *,
+    runner: dict[str, Any],
+    loop_summary: dict[str, Any],
+    plan_report: dict[str, Any] | None,
+    submit_report: dict[str, Any] | None,
+) -> bool:
+    latest_runtime_ts = _max_dt(
+        _parse_iso_ts(((loop_summary.get("latest") or {}) if isinstance(loop_summary, dict) else {}).get("ts")),
+        _parse_iso_ts(str((plan_report or {}).get("generated_at", ""))),
+        _parse_iso_ts(str((submit_report or {}).get("generated_at", ""))),
+    )
+    if latest_runtime_ts is None:
+        return False
+    if not (bool(runner.get("is_running")) or bool((loop_summary or {}).get("is_alive"))):
+        return False
+    avg_interval = _safe_float((loop_summary or {}).get("avg_interval_seconds"))
+    heartbeat = max(90.0, (avg_interval or 20.0) * 3.0)
+    max_age_seconds = max(LOCAL_RUNTIME_SNAPSHOT_MAX_AGE_SECONDS, heartbeat)
+    age_seconds = (datetime.now(timezone.utc) - latest_runtime_ts).total_seconds()
+    return age_seconds <= max_age_seconds
+
+
+def _normalize_runtime_open_order(payload: dict[str, Any]) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    response = payload.get("response") if isinstance(payload.get("response"), dict) else None
+    request = payload.get("request") if isinstance(payload.get("request"), dict) else None
+    order = response if response is not None else payload
+
+    side = str(order.get("side") or (request or {}).get("side", "")).upper().strip()
+    price = _safe_float(order.get("price"))
+    if price <= 0:
+        price = _safe_float((request or {}).get("submitted_price"))
+    if price <= 0:
+        price = _safe_float((request or {}).get("desired_price"))
+    orig_qty = _safe_float(order.get("origQty", order.get("qty", order.get("quantity"))))
+    if orig_qty <= 0:
+        orig_qty = _safe_float((request or {}).get("qty"))
+    if side not in {"BUY", "SELL"} or price <= 0 or orig_qty <= 0:
+        return None
+
+    reduce_only = order.get("reduceOnly")
+    if reduce_only is None:
+        reduce_only = (request or {}).get("reduce_only")
+    position_side = str(
+        order.get("positionSide")
+        or (request or {}).get("position_side")
+        or payload.get("position_side")
+        or payload.get("positionSide")
+        or "BOTH"
+    ).upper().strip() or "BOTH"
+
+    return {
+        "order_id": order.get("orderId"),
+        "client_order_id": order.get("clientOrderId") or (request or {}).get("client_order_id"),
+        "side": side,
+        "price": price,
+        "orig_qty": orig_qty,
+        "executed_qty": _safe_float(order.get("executedQty")),
+        "reduce_only": _truthy(reduce_only),
+        "position_side": position_side,
+        "time": int(order.get("time") or order.get("updateTime") or 0),
+    }
+
+
+def _build_local_runtime_snapshot(
+    *,
+    runner: dict[str, Any],
+    loop_summary: dict[str, Any],
+    plan_report: dict[str, Any] | None,
+    submit_report: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if not _fresh_local_runtime_snapshot_available(
+        runner=runner,
+        loop_summary=loop_summary,
+        plan_report=plan_report,
+        submit_report=submit_report,
+    ):
+        return None
+
+    plan_report = plan_report if isinstance(plan_report, dict) else {}
+    submit_report = submit_report if isinstance(submit_report, dict) else {}
+    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
+    live_book = submit_report.get("live_book") if isinstance(submit_report.get("live_book"), dict) else {}
+
+    bid_price = _safe_float(plan_report.get("bid_price"))
+    if bid_price <= 0:
+        bid_price = _safe_float(live_book.get("bid_price"))
+    ask_price = _safe_float(plan_report.get("ask_price"))
+    if ask_price <= 0:
+        ask_price = _safe_float(live_book.get("ask_price"))
+    mid_price = _safe_float(plan_report.get("mid_price"))
+    if mid_price <= 0 and bid_price > 0 and ask_price > 0:
+        mid_price = (bid_price + ask_price) / 2.0
+    mark_price = _safe_float(plan_report.get("mark_price"))
+    if mark_price <= 0:
+        mark_price = mid_price
+
+    dual_side_position = _truthy(plan_report.get("dual_side_position"))
+    actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
+    long_qty = max(_safe_float(plan_report.get("current_long_qty")), 0.0)
+    short_qty = max(_safe_float(plan_report.get("current_short_qty")), 0.0)
+    if not dual_side_position:
+        long_qty = max(actual_net_qty, 0.0)
+        short_qty = max(-actual_net_qty, 0.0)
+    long_avg_price = _safe_float(plan_report.get("current_long_avg_price"))
+    short_avg_price = _safe_float(plan_report.get("current_short_avg_price"))
+    if dual_side_position:
+        entry_price = long_avg_price if long_qty >= short_qty else short_avg_price
+    elif actual_net_qty < -1e-12:
+        entry_price = short_avg_price
+    else:
+        entry_price = long_avg_price
+    break_even_price = entry_price
+
+    open_orders: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for item in list(plan_report.get("kept_orders") or []) + list(submit_report.get("placed_orders") or []):
+        normalized = _normalize_runtime_open_order(item)
+        if normalized is None:
+            continue
+        dedupe_key = (
+            normalized.get("order_id"),
+            normalized.get("client_order_id"),
+            normalized.get("side"),
+            normalized.get("price"),
+            normalized.get("orig_qty"),
+            normalized.get("position_side"),
+        )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        open_orders.append(normalized)
+
+    leverage_raw = runner_config.get("leverage")
+    try:
+        leverage = int(float(leverage_raw)) if str(leverage_raw).strip() else None
+    except (TypeError, ValueError):
+        leverage = None
+    account_mode = submit_report.get("account_mode") if isinstance(submit_report.get("account_mode"), dict) else {}
+
+    return {
+        "market": {
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "mid_price": mid_price,
+            "funding_rate": _safe_float(plan_report.get("funding_rate")),
+            "mark_price": mark_price,
+        },
+        "position": {
+            "position_amt": actual_net_qty,
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+            "entry_price": entry_price,
+            "break_even_price": break_even_price,
+            "unrealized_pnl": _safe_float(plan_report.get("unrealized_pnl")),
+            "isolated": str(runner_config.get("margin_type", "")).upper().strip() == "ISOLATED",
+            "leverage": leverage,
+            "one_way_mode": not dual_side_position,
+            "available_balance": _safe_float(plan_report.get("available_balance")),
+            "wallet_balance": _safe_float(plan_report.get("wallet_balance")),
+            "multi_assets_margin": _truthy(account_mode.get("multi_assets_margin")),
+        },
+        "open_orders": open_orders,
+    }
+
+
 def build_monitor_snapshot(
     *,
     symbol: str,
@@ -1176,22 +1345,33 @@ def _build_monitor_snapshot_uncached(
     if runner["configured"] and not runner["is_running"]:
         snapshot["warnings"].append("runner_pid_present_but_process_not_running")
 
-    try:
-        book_rows = fetch_futures_book_tickers(symbol=normalized_symbol)
-        premium_rows = fetch_futures_premium_index(symbol=normalized_symbol)
-        book = book_rows[0] if book_rows else {}
-        premium = premium_rows[0] if premium_rows else {}
-        bid = _safe_float(book.get("bid_price"))
-        ask = _safe_float(book.get("ask_price"))
-        snapshot["market"] = {
-            "bid_price": bid,
-            "ask_price": ask,
-            "mid_price": (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0,
-            "funding_rate": _safe_float(premium.get("funding_rate")),
-            "mark_price": _safe_float(premium.get("mark_price")),
-        }
-    except Exception as exc:
-        snapshot["warnings"].append(f"market_read_failed: {type(exc).__name__}: {exc}")
+    local_runtime_snapshot = _build_local_runtime_snapshot(
+        runner=runner,
+        loop_summary=loop_summary,
+        plan_report=plan_report if isinstance(plan_report, dict) else {},
+        submit_report=submit_report if isinstance(submit_report, dict) else {},
+    )
+    if local_runtime_snapshot is not None:
+        snapshot["market"] = local_runtime_snapshot["market"]
+        snapshot["position"] = local_runtime_snapshot["position"]
+        snapshot["open_orders"] = local_runtime_snapshot["open_orders"]
+    else:
+        try:
+            book_rows = fetch_futures_book_tickers(symbol=normalized_symbol)
+            premium_rows = fetch_futures_premium_index(symbol=normalized_symbol)
+            book = book_rows[0] if book_rows else {}
+            premium = premium_rows[0] if premium_rows else {}
+            bid = _safe_float(book.get("bid_price"))
+            ask = _safe_float(book.get("ask_price"))
+            snapshot["market"] = {
+                "bid_price": bid,
+                "ask_price": ask,
+                "mid_price": (bid + ask) / 2.0 if bid > 0 and ask > 0 else 0.0,
+                "funding_rate": _safe_float(premium.get("funding_rate")),
+                "mark_price": _safe_float(premium.get("mark_price")),
+            }
+        except Exception as exc:
+            snapshot["warnings"].append(f"market_read_failed: {type(exc).__name__}: {exc}")
 
     credentials = load_binance_api_credentials()
     if credentials is None:
@@ -1207,61 +1387,62 @@ def _build_monitor_snapshot_uncached(
     api_key, api_secret = credentials
     snapshot["account_connected"] = True
     try:
-        account_info = fetch_futures_account_info_v3(api_key, api_secret)
-        position_mode = fetch_futures_position_mode(api_key, api_secret)
-        open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
-        dual_side_position = _truthy(position_mode.get("dualSidePosition"))
-        if dual_side_position:
-            long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
-            short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
-            long_qty = abs(_safe_float(long_position.get("positionAmt")))
-            short_qty = abs(_safe_float(short_position.get("positionAmt")))
-            long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
-            short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
-            unrealized_pnl = long_unrealized + short_unrealized
-            position_amt = long_qty - short_qty
-            position = long_position if long_qty >= short_qty else short_position
-            entry_price = _safe_float(position.get("entryPrice"))
-            break_even_price = _safe_float(position.get("breakEvenPrice"))
-        else:
-            position = extract_symbol_position(account_info, normalized_symbol)
-            unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
-            entry_price = _safe_float(position.get("entryPrice"))
-            break_even_price = _safe_float(position.get("breakEvenPrice"))
-            position_amt = _safe_float(position.get("positionAmt"))
-        snapshot["position"] = {
-            "position_amt": position_amt,
-            "long_qty": long_qty if dual_side_position else max(position_amt, 0.0),
-            "short_qty": short_qty if dual_side_position else 0.0,
-            "entry_price": entry_price,
-            "break_even_price": break_even_price,
-            "unrealized_pnl": unrealized_pnl,
-            "isolated": _truthy(position.get("isolated")),
-            "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
-            "one_way_mode": not dual_side_position,
-            "available_balance": _safe_float(account_info.get("availableBalance")),
-            "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
-            "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
-        }
-        snapshot["account_assets"] = {
-            "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
-            "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
-        }
-        snapshot["open_orders"] = [
-            {
-                "order_id": item.get("orderId"),
-                "client_order_id": item.get("clientOrderId"),
-                "side": str(item.get("side", "")).upper().strip(),
-                "price": _safe_float(item.get("price")),
-                "orig_qty": _safe_float(item.get("origQty")),
-                "executed_qty": _safe_float(item.get("executedQty")),
-                "reduce_only": _truthy(item.get("reduceOnly")),
-                "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
-                "time": int(item.get("time", 0) or 0),
+        unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
+        if local_runtime_snapshot is None:
+            account_info = fetch_futures_account_info_v3(api_key, api_secret)
+            position_mode = fetch_futures_position_mode(api_key, api_secret)
+            open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
+            dual_side_position = _truthy(position_mode.get("dualSidePosition"))
+            if dual_side_position:
+                long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
+                short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
+                long_qty = abs(_safe_float(long_position.get("positionAmt")))
+                short_qty = abs(_safe_float(short_position.get("positionAmt")))
+                long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
+                short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
+                unrealized_pnl = long_unrealized + short_unrealized
+                position_amt = long_qty - short_qty
+                position = long_position if long_qty >= short_qty else short_position
+                entry_price = _safe_float(position.get("entryPrice"))
+                break_even_price = _safe_float(position.get("breakEvenPrice"))
+            else:
+                position = extract_symbol_position(account_info, normalized_symbol)
+                unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
+                entry_price = _safe_float(position.get("entryPrice"))
+                break_even_price = _safe_float(position.get("breakEvenPrice"))
+                position_amt = _safe_float(position.get("positionAmt"))
+            snapshot["position"] = {
+                "position_amt": position_amt,
+                "long_qty": long_qty if dual_side_position else max(position_amt, 0.0),
+                "short_qty": short_qty if dual_side_position else 0.0,
+                "entry_price": entry_price,
+                "break_even_price": break_even_price,
+                "unrealized_pnl": unrealized_pnl,
+                "isolated": _truthy(position.get("isolated")),
+                "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
+                "one_way_mode": not dual_side_position,
+                "available_balance": _safe_float(account_info.get("availableBalance")),
+                "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
+                "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
             }
-            for item in open_orders
-        ]
-
+            snapshot["account_assets"] = {
+                "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
+                "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
+            }
+            snapshot["open_orders"] = [
+                {
+                    "order_id": item.get("orderId"),
+                    "client_order_id": item.get("clientOrderId"),
+                    "side": str(item.get("side", "")).upper().strip(),
+                    "price": _safe_float(item.get("price")),
+                    "orig_qty": _safe_float(item.get("origQty")),
+                    "executed_qty": _safe_float(item.get("executedQty")),
+                    "reduce_only": _truthy(item.get("reduceOnly")),
+                    "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
+                    "time": int(item.get("time", 0) or 0),
+                }
+                for item in open_orders
+            ]
         user_trades, trade_meta = _load_or_fetch_trade_rows(
             audit_path=audit_paths["trade_audit"],
             symbol=normalized_symbol,

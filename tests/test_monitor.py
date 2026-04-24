@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import unittest
 from concurrent.futures import ThreadPoolExecutor
@@ -530,6 +531,146 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(call_count, 1)
         self.assertEqual(result1, result2)
+
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", side_effect=AssertionError("should not fetch open orders"))
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", side_effect=AssertionError("should not fetch position mode"))
+    @patch("grid_optimizer.monitor.fetch_futures_account_info_v3", side_effect=AssertionError("should not fetch account info"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", side_effect=AssertionError("should not fetch premium index"))
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", side_effect=AssertionError("should not fetch book ticker"))
+    def test_build_monitor_snapshot_prefers_local_runtime_snapshot_for_live_runner(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_credentials,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "test_events.jsonl"
+            plan_path = root / "test_plan.json"
+            submit_path = root / "test_submit.json"
+            events_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "ts": (now - timedelta(seconds=12)).isoformat(),
+                                "cycle": 101,
+                                "mid_price": 1.24,
+                                "error_message": None,
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "ts": (now - timedelta(seconds=4)).isoformat(),
+                                "cycle": 102,
+                                "mid_price": 1.245,
+                                "error_message": None,
+                            }
+                        ),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "strategy_mode": "one_way_long",
+                        "bid_price": 1.24,
+                        "ask_price": 1.25,
+                        "mid_price": 1.245,
+                        "funding_rate": 0.0003,
+                        "actual_net_qty": 9.0,
+                        "current_long_qty": 9.0,
+                        "current_short_qty": 0.0,
+                        "current_long_avg_price": 1.18,
+                        "current_short_avg_price": 0.0,
+                        "dual_side_position": False,
+                        "kept_orders": [
+                            {
+                                "orderId": 11,
+                                "clientOrderId": "keep-buy",
+                                "side": "BUY",
+                                "type": "LIMIT",
+                                "price": "1.20",
+                                "origQty": "4",
+                                "executedQty": "0",
+                                "reduceOnly": False,
+                                "positionSide": "BOTH",
+                                "time": 123456,
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            submit_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "executed": True,
+                        "placed_orders": [
+                            {
+                                "request": {
+                                    "role": "take_profit",
+                                    "side": "SELL",
+                                    "position_side": "BOTH",
+                                    "qty": 4.0,
+                                    "submitted_price": 1.31,
+                                },
+                                "response": {
+                                    "orderId": 22,
+                                    "clientOrderId": "new-sell",
+                                    "side": "SELL",
+                                    "price": "1.31",
+                                    "origQty": "4",
+                                    "executedQty": "0",
+                                    "reduceOnly": True,
+                                    "positionSide": "BOTH",
+                                    "time": 123999,
+                                },
+                            }
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = build_monitor_snapshot(
+                symbol="TESTUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": True,
+                    "config": {
+                        "symbol": "TESTUSDT",
+                        "strategy_profile": "test_profile",
+                        "strategy_mode": "one_way_long",
+                        "leverage": 3,
+                    },
+                },
+            )
+
+        self.assertEqual(snapshot["market"]["bid_price"], 1.24)
+        self.assertEqual(snapshot["market"]["ask_price"], 1.25)
+        self.assertEqual(snapshot["market"]["mid_price"], 1.245)
+        self.assertEqual(snapshot["market"]["funding_rate"], 0.0003)
+        self.assertEqual(snapshot["position"]["position_amt"], 9.0)
+        self.assertEqual(snapshot["position"]["long_qty"], 9.0)
+        self.assertEqual(snapshot["position"]["short_qty"], 0.0)
+        self.assertEqual(snapshot["position"]["entry_price"], 1.18)
+        self.assertEqual(snapshot["position"]["leverage"], 3)
+        self.assertEqual(len(snapshot["open_orders"]), 2)
+        self.assertEqual({item["client_order_id"] for item in snapshot["open_orders"]}, {"keep-buy", "new-sell"})
+        self.assertIn("missing_binance_api_credentials", snapshot["warnings"])
+        self.assertNotIn("market_read_failed: AssertionError: should not fetch book ticker", snapshot["warnings"])
 
 
 if __name__ == "__main__":
