@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -9,6 +10,7 @@ from unittest.mock import patch
 
 from grid_optimizer import competition_board
 from grid_optimizer.competition_board import (
+    COMPETITION_SOURCES,
     _entry_projection,
     _hinted_boards_for_source,
     _load_history_index,
@@ -189,6 +191,92 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(len(boards), 2)
         self.assertEqual(boards[1].get("resourceId"), 46951)
         self.assertEqual(boards[1]["tabLabel"], "交易量挑战赛 - 第二阶段")
+
+    def test_competition_sources_include_current_live_activity_pages(self) -> None:
+        slugs = {item.slug for item in COMPETITION_SOURCES}
+        self.assertTrue(
+            {
+                "spot_plume",
+                "spot_ton",
+                "spot_vana",
+                "futures_soon",
+                "futures_chip",
+                "futures_tradfi_week1",
+                "futures_altcoins_week1",
+                "futures_um_week1",
+                "futures_goldsilver_week1",
+            }.issubset(slugs)
+        )
+
+    def test_hinted_current_live_boards_include_real_resource_ids(self) -> None:
+        expected = {
+            "spot_plume": (50208, "PLUME", "2026-04-30T19:00:00+08:00"),
+            "spot_ton": (49996, "USDC", "2026-04-29T20:00:00+08:00"),
+            "spot_vana": (51242, "BNB", "2026-05-07T19:00:00+08:00"),
+            "futures_chip": (51201, "CHIP", "2026-05-13T07:59:00+08:00"),
+        }
+        for slug, (resource_id, reward_unit, end_at) in expected.items():
+            source = next(item for item in COMPETITION_SOURCES if item.slug == slug)
+            hinted = _hinted_boards_for_source(source)
+            self.assertIsNotNone(hinted)
+            _, boards = hinted or ({}, [])
+            self.assertEqual(len(boards), 1)
+            self.assertEqual(boards[0].get("resourceId"), resource_id)
+            self.assertEqual(boards[0]["rewardUnit"], reward_unit)
+            self.assertEqual(boards[0]["activityEndAt"], end_at)
+
+    def test_hinted_soon_two_stage_boards_include_real_resource_ids(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_soon")
+        hinted = _hinted_boards_for_source(source)
+        self.assertIsNotNone(hinted)
+        _, boards = hinted or ({}, [])
+        self.assertEqual(len(boards), 2)
+        self.assertEqual(boards[0].get("resourceId"), 50568)
+        self.assertEqual(boards[0]["tabLabel"], "交易量挑战赛 - 第一阶段")
+        self.assertEqual(boards[0]["activityEndAt"], "2026-04-27T07:59:00+08:00")
+        self.assertEqual(boards[1].get("resourceId"), 50570)
+        self.assertEqual(boards[1]["tabLabel"], "交易量挑战赛 - 第二阶段")
+        self.assertEqual(boards[1]["activityEndAt"], "2026-05-07T07:59:00+08:00")
+
+    def test_hinted_sprint_week1_boards_include_real_resource_ids(self) -> None:
+        expected = {
+            "futures_tradfi_week1": (50447, "USDT"),
+            "futures_altcoins_week1": (50459, "PUMP/BANK"),
+            "futures_um_week1": (50456, "BNB"),
+            "futures_goldsilver_week1": (50453, "USDT"),
+        }
+        for slug, (resource_id, reward_unit) in expected.items():
+            source = next(item for item in COMPETITION_SOURCES if item.slug == slug)
+            hinted = _hinted_boards_for_source(source)
+            self.assertIsNotNone(hinted)
+            _, boards = hinted or ({}, [])
+            self.assertEqual(len(boards), 1)
+            self.assertEqual(boards[0].get("resourceId"), resource_id)
+            self.assertEqual(boards[0]["tabLabel"], "交易量冲刺赛 - 第1周")
+            self.assertEqual(boards[0]["activityEndAt"], "2026-04-28T07:59:00+08:00")
+            self.assertEqual(boards[0]["rewardUnit"], reward_unit)
+            self.assertEqual(boards[0]["maxRows"], 500)
+
+    def test_run_playwright_extract_uses_short_session_name_and_ignores_close_timeout(self) -> None:
+        calls: list[list[str]] = []
+
+        def fake_run(cmd: list[str], **_: object) -> subprocess.CompletedProcess[str]:
+            calls.append(cmd)
+            if "close" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 10)
+            if "eval" in cmd:
+                return subprocess.CompletedProcess(cmd, 0, stdout='### Result\n{"meta": {}, "boards": []}', stderr="")
+            return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+
+        with patch.object(competition_board.subprocess, "run", side_effect=fake_run), patch.object(
+            competition_board.time, "sleep"
+        ):
+            payload = competition_board._run_playwright_extract("https://example.com")
+
+        self.assertEqual(payload, {"meta": {}, "boards": []})
+        session_values = [cmd[cmd.index("--session") + 1] for cmd in calls if "--session" in cmd]
+        self.assertEqual(len(set(session_values)), 1)
+        self.assertLessEqual(len(session_values[0]), 12)
 
     def test_parse_activity_period_bounds_extracts_start_and_end(self) -> None:
         start_at, end_at = _parse_activity_period_bounds("2026/03/29 08:00 - 2026/04/08 07:59")

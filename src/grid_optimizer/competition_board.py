@@ -225,6 +225,27 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.bmwweb.systems/zh-CN/activity/trading-competition/spot-altcoin-festival-wave-BARD?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="spot_plume",
+        symbol="PLUME",
+        market="spot",
+        label="PLUME 现货交易竞赛",
+        url="https://www.binance.com/en/activity/trading-competition/spot-altcoin-festival-wave-PLUME",
+    ),
+    CompetitionSource(
+        slug="spot_ton",
+        symbol="TON",
+        market="spot",
+        label="TON 现货交易竞赛",
+        url="https://www.binance.com/en/activity/trading-competition/spot-altcoin-festival-wave-TON1",
+    ),
+    CompetitionSource(
+        slug="spot_vana",
+        symbol="VANA",
+        market="spot",
+        label="VANA 现货交易竞赛",
+        url="https://www.binance.com/en/activity/trading-competition/spot-altcoin-festival-wave-VANA",
+    ),
+    CompetitionSource(
         slug="futures_opn",
         symbol="OPN",
         market="futures",
@@ -265,6 +286,48 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         market="futures",
         label="BASED 合约交易挑战赛",
         url="https://www.bmwweb.cloud/zh-CN/activity/trading-competition/futures-based-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_soon",
+        symbol="SOON",
+        market="futures",
+        label="SOON 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-soon-challenge3?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_chip",
+        symbol="CHIP",
+        market="futures",
+        label="CHIP 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-chip-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_tradfi_week1",
+        symbol="TRADFI",
+        market="futures",
+        label="TradFi合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/tradfisprint-2026wk1-new?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_altcoins_week1",
+        symbol="ALTCOINS",
+        market="futures",
+        label="Altcoins合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/altcoinsprint-2016wk1-new?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_um_week1",
+        symbol="UM",
+        market="futures",
+        label="UM合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/umsprint-2026wk1-new?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_goldsilver_week1",
+        symbol="GOLDSILVER",
+        market="futures",
+        label="黄金白银合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/goldsilversprint-2026wk1-new?ref=YEK2JZJT",
     ),
     CompetitionSource(
         slug="futures_enso",
@@ -478,6 +541,132 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分450,000 BARD奖池
 第1001名及之后
 平分900,000 BARD奖池，每位用户的奖励上限为25 BARD
+""",
+            }
+        ]
+    },
+    "spot_plume": {
+        "boards": [
+            {
+                "tabLabel": "Trading Leaderboard",
+                "resourceId": 50208,
+                "metricField": "tradingVolume",
+                "metricLabel": "Trading Volume (USD)",
+                "rewardUnit": "PLUME",
+                "leaderboardUnit": "USD",
+                "leaderboardUnitTitle": "Trading Volume",
+                "rankingType": "TRADING_VOLUME",
+                "competitionType": "SOLO",
+                "activityPeriodText": "2026/04/16 19:00 - 2026/04/30 19:00",
+                "activityEndAt": "2026-04-30T19:00:00+08:00",
+                "maxRows": 5000,
+                "bodyExcerpt": """
+活动时间：2026/04/16 19:00 - 2026/04/30 19:00
+在 PLUME/USDT、PLUME/USDC 任一符合条件的现货交易对累计交易量至少 500 USD，方可参与排行榜奖励。
+总奖池 20,000,000 PLUME
+单人奖励上限为 2,000 PLUME
+第 1 名
+1,000,000 PLUME
+第 2 名
+800,000 PLUME
+第 3 名
+600,000 PLUME
+第 4 名
+400,000 PLUME
+第 5 名
+200,000 PLUME
+第 6 - 20 名
+平分 1,800,000 PLUME
+第 21 - 50 名
+平分 1,600,000 PLUME
+第 51 - 200 名
+平分 2,800,000 PLUME
+第 201 - 1000 名
+平分 2,800,000 PLUME
+""",
+            }
+        ]
+    },
+    "spot_ton": {
+        "boards": [
+            {
+                "tabLabel": "Trading Leaderboard",
+                "resourceId": 49996,
+                "metricField": "tradingVolume",
+                "metricLabel": "Trading Volume (USD)",
+                "rewardUnit": "USDC",
+                "leaderboardUnit": "USD",
+                "leaderboardUnitTitle": "Trading Volume",
+                "rankingType": "TRADING_VOLUME",
+                "competitionType": "SOLO",
+                "activityPeriodText": "2026/04/15 20:00 - 2026/04/29 20:00",
+                "activityEndAt": "2026-04-29T20:00:00+08:00",
+                "maxRows": 5000,
+                "bodyExcerpt": """
+活动时间：2026/04/15 20:00 - 2026/04/29 20:00
+在 TON/USDT、TON/USDC 任一符合条件的现货交易对累计交易量至少 500 USD，方可参与排行榜奖励。
+总奖池 400,000 USDC
+单人奖励上限为 20 USDC
+第 1 名
+20,000 USDC
+第 2 名
+16,000 USDC
+第 3 名
+12,000 USDC
+第 4 名
+8,000 USDC
+第 5 名
+4,000 USDC
+第 6 - 20 名
+平分 36,000 USDC
+第 21 - 50 名
+平分 32,000 USDC
+第 51 - 200 名
+平分 56,000 USDC
+第 201 - 1000 名
+平分 56,000 USDC
+""",
+            }
+        ]
+    },
+    "spot_vana": {
+        "boards": [
+            {
+                "tabLabel": "Trading Leaderboard",
+                "resourceId": 51242,
+                "metricField": "tradingVolume",
+                "metricLabel": "Trading Volume (USD)",
+                "rewardUnit": "BNB",
+                "leaderboardUnit": "USD",
+                "leaderboardUnitTitle": "Trading Volume",
+                "rankingType": "TRADING_VOLUME",
+                "competitionType": "SOLO",
+                "activityPeriodText": "2026/04/23 19:00 - 2026/05/07 19:00",
+                "activityEndAt": "2026-05-07T19:00:00+08:00",
+                "maxRows": 5000,
+                "bodyExcerpt": """
+活动时间：2026/04/23 19:00 - 2026/05/07 19:00
+在 VANA/USDT、VANA/USDC 任一符合条件的现货交易对累计交易量至少 500 USD，方可参与排行榜奖励。
+总奖池 300 BNB
+单人奖励上限为 0.05 BNB
+第 1 名
+15 BNB
+第 2 名
+12 BNB
+第 3 名
+9 BNB
+第 4 名
+6 BNB
+第 5 名
+3 BNB
+第 6 - 20 名
+平分 27 BNB
+第 21 - 50 名
+平分 24 BNB
+第 51 - 200 名
+平分 42 BNB
+第 201 - 1000 名
+平分 42 BNB
 """,
             }
         ]
@@ -809,6 +998,221 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分 375,000 BASED
 """,
             },
+        ]
+    },
+    "futures_soon": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛 - 第一阶段",
+                "resourceId": 50568,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "SOON",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/17 21:00 - 2026/04/27 07:59",
+                "activityEndAt": "2026-04-27T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/17 21:00 - 2026/04/27 07:59
+累计 SOON U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+150,000 SOON
+第 2 名
+120,000 SOON
+第 3 名
+70,000 SOON
+第 4 名
+40,000 SOON
+第 5 名
+20,000 SOON
+第 6 - 20 名
+平分 150,000 SOON
+第 21 - 50 名
+平分 150,000 SOON
+第 51 - 200 名
+平分 300,000 SOON
+""",
+            },
+            {
+                "tabLabel": "交易量挑战赛 - 第二阶段",
+                "resourceId": 50570,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "SOON",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/27 08:00 - 2026/05/07 07:59",
+                "activityEndAt": "2026-05-07T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/27 08:00 - 2026/05/07 07:59
+累计 SOON U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+150,000 SOON
+第 2 名
+120,000 SOON
+第 3 名
+70,000 SOON
+第 4 名
+40,000 SOON
+第 5 名
+20,000 SOON
+第 6 - 20 名
+平分 150,000 SOON
+第 21 - 50 名
+平分 150,000 SOON
+第 51 - 200 名
+平分 300,000 SOON
+""",
+            },
+        ]
+    },
+    "futures_chip": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 51201,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "CHIP",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/22 18:00 - 2026/05/13 07:59",
+                "activityEndAt": "2026-05-13T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/22 18:00 - 2026/05/13 07:59
+累计 CHIP U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 6,000,000 CHIP
+第 1 名
+900,000 CHIP
+第 2 名
+720,000 CHIP
+第 3 名
+420,000 CHIP
+第 4 名
+240,000 CHIP
+第 5 名
+120,000 CHIP
+第 6 - 20 名
+平分 900,000 CHIP
+第 21 - 50 名
+平分 900,000 CHIP
+第 51 - 200 名
+平分 1,800,000 CHIP
+""",
+            }
+        ]
+    },
+    "futures_tradfi_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50447,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "USDT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量低于 70 亿 USDT 时，TradFi 周奖池为 120,000 USDT。
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿 USDT 时，TradFi 周奖池为 270,000 USDT。
+""",
+            }
+        ]
+    },
+    "futures_altcoins_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50459,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "PUMP/BANK",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+每周奖池为 50,000,000 PUMP 和 2,500,000 BANK 代币券。
+Altcoins 合约冲刺赛将持续 4 周。
+""",
+            }
+        ]
+    },
+    "futures_um_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50456,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BNB",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+每周奖池为 330 BNB 代币券。
+UM 合约冲刺赛将持续 4 周。
+""",
+            }
+        ]
+    },
+    "futures_goldsilver_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50453,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "USDT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量低于 70 亿 USDT 时，黄金白银周奖池为 60,000 USDT。
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿 USDT 时，黄金白银周奖池为 90,000 USDT。
+""",
+            }
         ]
     },
     "futures_enso": {
@@ -1447,10 +1851,14 @@ def _playwright_cli_command(*args: str) -> list[str]:
     return ["npx", "--yes", "--package", "@playwright/cli", "playwright-cli", *args]
 
 
+def _playwright_session_name() -> str:
+    return f"cb-{uuid.uuid4().hex[:8]}"
+
+
 def _run_playwright_extract(url: str) -> dict[str, Any]:
     last_error: Exception | None = None
     for attempt in range(3):
-        session = f"competition-board-{uuid.uuid4().hex[:10]}"
+        session = _playwright_session_name()
         try:
             subprocess.run(
                 _playwright_cli_command("--session", session, "open", url),
@@ -1460,6 +1868,7 @@ def _run_playwright_extract(url: str) -> dict[str, Any]:
                 timeout=90,
                 start_new_session=True,
             )
+            time.sleep(float(os.environ.get("GRID_COMPETITION_PLAYWRIGHT_SETTLE_SECONDS", "8")))
             eval_proc = subprocess.run(
                 _playwright_cli_command("--session", session, "eval", _PLAYWRIGHT_EXTRACT_SCRIPT),
                 check=True,
@@ -1468,11 +1877,24 @@ def _run_playwright_extract(url: str) -> dict[str, Any]:
                 timeout=180,
                 start_new_session=True,
             )
-            return _extract_playwright_result(eval_proc.stdout)
+            try:
+                return _extract_playwright_result(eval_proc.stdout)
+            except RuntimeError as exc:
+                stdout = str(eval_proc.stdout or "").strip()
+                stderr = str(eval_proc.stderr or "").strip()
+                details = f" stdout={stdout[-300:]} stderr={stderr[-300:]}"
+                last_error = RuntimeError(
+                    f"playwright extract failed for {url} on attempt {attempt + 1}: {type(exc).__name__}:{details}"
+                )
+                time.sleep(1.5 * (attempt + 1))
         except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as exc:
             details = ""
             if isinstance(exc, subprocess.CalledProcessError):
-                stdout = str(exc.stdout or "").strip()
+                stdout = str(
+                    (exc.stdout if hasattr(exc, "stdout") else None)
+                    or (exc.output if hasattr(exc, "output") else "")
+                    or ""
+                ).strip()
                 stderr = str(exc.stderr or "").strip()
                 details = f" stdout={stdout[-300:]} stderr={stderr[-300:]}"
             last_error = RuntimeError(
@@ -1480,14 +1902,17 @@ def _run_playwright_extract(url: str) -> dict[str, Any]:
             )
             time.sleep(1.5 * (attempt + 1))
         finally:
-            subprocess.run(
-                _playwright_cli_command("--session", session, "close"),
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-                start_new_session=True,
-            )
+            try:
+                subprocess.run(
+                    _playwright_cli_command("--session", session, "close"),
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                    start_new_session=True,
+                )
+            except (OSError, subprocess.TimeoutExpired):
+                pass
     if last_error is not None:
         raise last_error
     raise RuntimeError(f"playwright extract failed for {url}")
@@ -1536,7 +1961,11 @@ def _fetch_leaderboard_rows(resource_id: int, referer: str, *, max_rows: int | N
 
     first_payload = _request(1)
     data = first_payload.get("data", {}) if isinstance(first_payload, dict) else {}
-    summary_list = data.get("resourceSummaryList", {}) if isinstance(data, dict) else {}
+    if not isinstance(data, dict):
+        data = {}
+    summary_list = data.get("resourceSummaryList", {})
+    if not isinstance(summary_list, dict):
+        summary_list = {}
     total = int(summary_list.get("total", 0) or 0)
     row_limit = total
     if max_rows is not None and max_rows > 0:
@@ -1556,7 +1985,11 @@ def _fetch_leaderboard_rows(resource_id: int, referer: str, *, max_rows: int | N
     for page_index in range(1, pages + 1):
         payload = page_payloads[page_index]
         page_data = payload.get("data", {}) if isinstance(payload, dict) else {}
-        page_summary = page_data.get("resourceSummaryList", {}) if isinstance(page_data, dict) else {}
+        if not isinstance(page_data, dict):
+            page_data = {}
+        page_summary = page_data.get("resourceSummaryList", {})
+        if not isinstance(page_summary, dict):
+            page_summary = {}
         for item in page_summary.get("data", []) or []:
             if not isinstance(item, dict):
                 continue
