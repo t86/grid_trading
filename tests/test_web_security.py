@@ -2598,6 +2598,16 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("Alt 冲刺赛 ORDIUSDC", MONITOR_PAGE)
         self.assertIn("presets[0]?.key", MONITOR_PAGE)
 
+    def test_monitor_page_contains_dedicated_sprint_preset_zone(self) -> None:
+        self.assertIn("冲刺赛专区", MONITOR_PAGE)
+        self.assertIn('id="sprint_preset_zone"', MONITOR_PAGE)
+        self.assertIn('id="sprint_preset_zone_meta"', MONITOR_PAGE)
+        self.assertIn("UM 冲刺赛专区", MONITOR_PAGE)
+        self.assertIn("黄金 / 白银", MONITOR_PAGE)
+        self.assertIn("function renderSprintPresetZone()", MONITOR_PAGE)
+        self.assertIn("function ensureMonitorSymbolOption(symbol)", MONITOR_PAGE)
+        self.assertIn('data-sprint-preset-key="${escapeHtml(preset.key)}"', MONITOR_PAGE)
+
     def test_strategies_page_contains_manual_symbol_list_controls(self) -> None:
         self.assertIn('id="monitor_symbol_input"', STRATEGIES_PAGE)
         self.assertIn('id="competition_symbol_input"', STRATEGIES_PAGE)

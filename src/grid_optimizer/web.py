@@ -12613,6 +12613,131 @@ MONITOR_PAGE = """<!doctype html>
       line-height: 1.6;
       background: #fcfbf7;
     }
+    .sprint-zone {
+      display: grid;
+      gap: 14px;
+    }
+    .sprint-track-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .sprint-track {
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 14px;
+      background: linear-gradient(180deg, #fffefc 0%, #faf8f2 100%);
+      display: grid;
+      gap: 12px;
+    }
+    .sprint-track-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .sprint-track-head h3 {
+      margin: 0;
+      font-size: 15px;
+      color: #0f423f;
+    }
+    .sprint-track-head p {
+      margin: 4px 0 0;
+      font-size: 12px;
+      color: var(--muted);
+      line-height: 1.6;
+    }
+    .sprint-card-grid {
+      display: grid;
+      gap: 10px;
+    }
+    .sprint-card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      background: #fff;
+      padding: 12px;
+      display: grid;
+      gap: 10px;
+    }
+    .sprint-card.active {
+      border-color: rgba(11, 111, 104, 0.35);
+      box-shadow: inset 0 0 0 1px rgba(11, 111, 104, 0.18);
+      background: #f4fbfa;
+    }
+    .sprint-card-head {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .sprint-card-title {
+      display: grid;
+      gap: 4px;
+    }
+    .sprint-card-title strong {
+      font-size: 14px;
+      color: var(--text);
+    }
+    .sprint-card-title span {
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .sprint-tier-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 56px;
+      padding: 4px 10px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 700;
+      border: 1px solid rgba(11, 111, 104, 0.16);
+      background: rgba(11, 111, 104, 0.08);
+      color: var(--brand);
+      white-space: nowrap;
+    }
+    .sprint-metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px 10px;
+    }
+    .sprint-metric {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fcfbf7;
+      padding: 8px 10px;
+      display: grid;
+      gap: 4px;
+    }
+    .sprint-metric-label {
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .sprint-metric-value {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--text);
+    }
+    .sprint-card-actions {
+      display: flex;
+      justify-content: flex-end;
+    }
+    .sprint-card-load-btn {
+      appearance: none;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: var(--brand-soft);
+      color: #0f423f;
+      font-size: 12px;
+      font-weight: 700;
+      height: 34px;
+      padding: 0 12px;
+      cursor: pointer;
+    }
+    .sprint-card-load-btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.55;
+    }
     .status-row { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; }
     .metric {
       background: linear-gradient(180deg, #fffefc 0%, #faf8f2 100%);
@@ -12701,6 +12826,7 @@ MONITOR_PAGE = """<!doctype html>
     @media (max-width: 980px) {
       .status-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .grid-2 { grid-template-columns: 1fr; }
+      .sprint-track-grid { grid-template-columns: 1fr; }
       .editor-grid { grid-template-columns: 1fr; }
       .runner-form-grid,
       .runner-form-fields { grid-template-columns: 1fr; }
@@ -12708,6 +12834,7 @@ MONITOR_PAGE = """<!doctype html>
     @media (max-width: 640px) {
       .status-row { grid-template-columns: 1fr; }
       .toolbar label { min-width: 100%; }
+      .sprint-metrics { grid-template-columns: 1fr; }
     }
   </style>
 </head>
@@ -12759,6 +12886,15 @@ MONITOR_PAGE = """<!doctype html>
       <div id="alert_box" class="alert-stack">
         <div class="alert-empty">等待首轮数据，拿到 runner 状态后会在这里直接提示“保证金不足 / 频率超限 / 停买停空 / 进程退出”等关键问题。</div>
       </div>
+    </section>
+
+    <section class="card">
+      <div class="panel-title">
+        <h2>冲刺赛专区</h2>
+        <div class="tiny">不受上方交易对下拉限制。点“载入参数”会自动切换币种、选中对应预设，并把参数带到下面的中文表单。</div>
+      </div>
+      <div id="sprint_preset_zone_meta" class="meta">优先展示本次冲刺赛的保守 / 标准 / 激进三档，可直接带入参数继续调整。</div>
+      <div id="sprint_preset_zone" class="sprint-zone"></div>
     </section>
 
     <section class="card">
@@ -13535,6 +13671,8 @@ MONITOR_PAGE = """<!doctype html>
     const stopClosePositionsEl = document.getElementById("stop_close_positions");
     const strategyActionMetaEl = document.getElementById("strategy_action_meta");
     const strategyPresetMetaEl = document.getElementById("strategy_preset_meta");
+    const sprintPresetZoneEl = document.getElementById("sprint_preset_zone");
+    const sprintPresetZoneMetaEl = document.getElementById("sprint_preset_zone_meta");
     const loadRunningParamsBtn = document.getElementById("load_running_params_btn");
     const loadPresetParamsBtn = document.getElementById("load_preset_params_btn");
     const saveParamsBtn = document.getElementById("save_params_btn");
@@ -15243,6 +15381,59 @@ MONITOR_PAGE = """<!doctype html>
         },
       },
     ];
+    const FALLBACK_MONITOR_PRESETS = LOCAL_STRATEGY_PRESETS
+      .filter((item) => item.custom || VISIBLE_STRATEGY_PRESET_KEYS.has(String(item.key || "").trim()));
+    const SPRINT_PRESET_GROUPS = [
+      {
+        key: "um",
+        title: "UM 冲刺赛专区",
+        description: "USDC 主赛道，优先看 BTCUSDC / ETHUSDC 三档。",
+        presetKeys: [
+          "btcusdc_competition_maker_neutral_conservative_v1",
+          "btcusdc_competition_maker_neutral_v1",
+          "btcusdc_competition_maker_neutral_aggressive_v1",
+          "ethusdc_competition_maker_neutral_conservative_v1",
+          "ethusdc_competition_maker_neutral_v1",
+          "ethusdc_competition_maker_neutral_aggressive_v1",
+        ],
+      },
+      {
+        key: "metals",
+        title: "黄金 / 白银",
+        description: "贵金属赛道，适合独立看 XAUUSDT / XAGUSDT 的三档参数。",
+        presetKeys: [
+          "xauusdt_competition_maker_neutral_conservative_v1",
+          "xauusdt_competition_maker_neutral_v1",
+          "xauusdt_competition_maker_neutral_aggressive_v1",
+          "xagusdt_competition_maker_neutral_conservative_v1",
+          "xagusdt_competition_maker_neutral_v1",
+          "xagusdt_competition_maker_neutral_aggressive_v1",
+        ],
+      },
+      {
+        key: "tradfi",
+        title: "TradFi 冲刺赛",
+        description: "原油系赛道，分别给 CLUSDT / BZUSDT 的三档参数。",
+        presetKeys: [
+          "clusdt_competition_maker_neutral_conservative_v1",
+          "clusdt_competition_maker_neutral_v1",
+          "clusdt_competition_maker_neutral_aggressive_v1",
+          "bzusdt_competition_maker_neutral_conservative_v1",
+          "bzusdt_competition_maker_neutral_v1",
+          "bzusdt_competition_maker_neutral_aggressive_v1",
+        ],
+      },
+      {
+        key: "alt",
+        title: "Alt 冲刺赛",
+        description: "小币赛道，目前展示 ORDIUSDC 的三档参数。",
+        presetKeys: [
+          "ordiusdc_competition_maker_neutral_conservative_v1",
+          "ordiusdc_competition_maker_neutral_v1",
+          "ordiusdc_competition_maker_neutral_aggressive_v1",
+        ],
+      },
+    ];
 
     let timer = null;
     let paused = false;
@@ -15632,11 +15823,119 @@ MONITOR_PAGE = """<!doctype html>
       return (runnerPresets || []).find((item) => item.key === key) || null;
     }
 
+    function getLocalMonitorPresetByKey(key) {
+      return FALLBACK_MONITOR_PRESETS.find((item) => item.key === key) || null;
+    }
+
+    function ensureMonitorSymbolOption(symbol) {
+      const normalized = String(symbol || "").trim().toUpperCase();
+      if (!normalized) {
+        return;
+      }
+      if (!monitorSymbols.includes(normalized)) {
+        monitorSymbols.push(normalized);
+      }
+      const hasOption = Array.from(symbolEl.options || []).some((option) => String(option.value || "").trim().toUpperCase() === normalized);
+      if (hasOption) {
+        return;
+      }
+      const option = document.createElement("option");
+      option.value = normalized;
+      option.textContent = normalized;
+      symbolEl.appendChild(option);
+    }
+
     function getSelectedCustomPreset() {
       const preset = getPresetByKey(strategyPresetEl.value || "");
       return preset && preset.custom ? preset : null;
     }
 
+    function sprintTierLabelForPreset(preset) {
+      const label = String((preset && preset.label) || "");
+      if (label.includes("保守")) return "保守";
+      if (label.includes("激进")) return "激进";
+      return "标准";
+    }
+
+    function sprintMetricValue(value) {
+      return fmtNum(value, 2);
+    }
+
+    function renderSprintPresetZone() {
+      if (!sprintPresetZoneEl) {
+        return;
+      }
+      const selectedSymbol = String(symbolEl.value || "").trim().toUpperCase();
+      const selectedProfile = String(
+        strategyPresetEl.value
+          || ((((latestMonitorData || {}).runner || {}).config || {}).strategy_profile || "")
+      ).trim();
+      const tracksHtml = SPRINT_PRESET_GROUPS.map((group) => {
+        const cards = group.presetKeys
+          .map((key) => getLocalMonitorPresetByKey(key))
+          .filter(Boolean)
+          .map((preset) => {
+            const config = (preset && preset.config) || {};
+            const active = selectedSymbol === String(preset.symbol || "").trim().toUpperCase() && selectedProfile === preset.key;
+            return `
+              <article class="sprint-card${active ? " active" : ""}">
+                <div class="sprint-card-head">
+                  <div class="sprint-card-title">
+                    <strong>${escapeHtml(preset.label || preset.key)}</strong>
+                    <span>${escapeHtml(String(preset.symbol || "").trim().toUpperCase())}</span>
+                  </div>
+                  <span class="sprint-tier-badge">${escapeHtml(sprintTierLabelForPreset(preset))}</span>
+                </div>
+                <div class="sprint-metrics">
+                  <div class="sprint-metric">
+                    <div class="sprint-metric-label">单笔金额</div>
+                    <div class="sprint-metric-value">${sprintMetricValue(config.per_order_notional)}</div>
+                  </div>
+                  <div class="sprint-metric">
+                    <div class="sprint-metric-label">软停仓位</div>
+                    <div class="sprint-metric-value">${sprintMetricValue(config.pause_buy_position_notional ?? config.pause_short_position_notional)}</div>
+                  </div>
+                  <div class="sprint-metric">
+                    <div class="sprint-metric-label">硬停仓位</div>
+                    <div class="sprint-metric-value">${sprintMetricValue(config.max_position_notional ?? config.max_short_position_notional)}</div>
+                  </div>
+                  <div class="sprint-metric">
+                    <div class="sprint-metric-label">最大总名义</div>
+                    <div class="sprint-metric-value">${sprintMetricValue(config.max_total_notional)}</div>
+                  </div>
+                </div>
+                <div class="sprint-card-actions">
+                  <button
+                    type="button"
+                    class="sprint-card-load-btn"
+                    data-sprint-preset-key="${escapeHtml(preset.key)}"
+                  >载入参数</button>
+                </div>
+              </article>
+            `;
+          })
+          .join("");
+        return `
+          <section class="sprint-track" data-sprint-track="${escapeHtml(group.key)}">
+            <div class="sprint-track-head">
+              <div>
+                <h3>${escapeHtml(group.title)}</h3>
+                <p>${escapeHtml(group.description)}</p>
+              </div>
+            </div>
+            <div class="sprint-card-grid">
+              ${cards || '<div class="empty">当前没有可用的冲刺赛预设。</div>'}
+            </div>
+          </section>
+        `;
+      }).join("");
+      sprintPresetZoneEl.innerHTML = `<div class="sprint-track-grid">${tracksHtml}</div>`;
+    }
+
+    async function readJsonResponse(resp) {
+      const raw = await resp.text();
+      return raw ? JSON.parse(raw) : {};
+    }
     function normalizeRunnerEditorConfig(rawConfig, strategyProfile = "") {
       const source = (rawConfig && typeof rawConfig === "object") ? rawConfig : {};
       const config = {};
@@ -16898,7 +17197,7 @@ MONITOR_PAGE = """<!doctype html>
       const selectedSymbol = String(symbolEl.value || "").trim().toUpperCase();
       const presets = (((data && data.runner_presets) && data.runner_presets.length)
         ? data.runner_presets
-        : LOCAL_STRATEGY_PRESETS).filter((item) => {
+        : FALLBACK_MONITOR_PRESETS).filter((item) => {
           const presetSymbol = String((item && item.symbol) || "").trim().toUpperCase();
           return !selectedSymbol || !presetSymbol || presetSymbol === selectedSymbol;
         });
@@ -16931,7 +17230,46 @@ MONITOR_PAGE = """<!doctype html>
       const customText = selectedPreset && selectedPreset.custom ? " · 可载入/更新/删除" : "";
       strategyPresetMetaEl.textContent =
         `当前运行: ${currentText} · 已选择: ${selectedText} · ${selectedDesc}${startableText}${customText}`;
+      renderSprintPresetZone();
       syncCustomGridActionButtons();
+    }
+
+    async function loadSprintPresetToEditor(presetKey) {
+      const preset = getLocalMonitorPresetByKey(presetKey);
+      if (!preset) {
+        sprintPresetZoneMetaEl.textContent = "当前冲刺赛预设不存在，请刷新页面后重试。";
+        return;
+      }
+      const targetSymbol = String(preset.symbol || "").trim().toUpperCase();
+      sprintPresetZoneMetaEl.textContent = `正在载入 ${preset.label} ...`;
+      if (targetSymbol) {
+        ensureMonitorSymbolOption(targetSymbol);
+      }
+      const symbolChanged = Boolean(targetSymbol) && String(symbolEl.value || "").trim().toUpperCase() !== targetSymbol;
+      if (targetSymbol) {
+        symbolEl.value = targetSymbol;
+      }
+      if (symbolChanged) {
+        clearCustomGridPreview();
+      }
+      if (symbolChanged || !latestMonitorData || String((latestMonitorData || {}).symbol || "").trim().toUpperCase() !== targetSymbol) {
+        await loadMonitor();
+        restartTimer();
+      }
+      const effectivePreset = getPresetByKey(preset.key) || preset;
+      if (!Array.from(strategyPresetEl.options || []).some((option) => option.value === preset.key)) {
+        const option = document.createElement("option");
+        option.value = preset.key;
+        option.textContent = preset.label;
+        strategyPresetEl.appendChild(option);
+      }
+      strategyPresetEl.value = preset.key;
+      renderPresetMeta(latestMonitorData);
+      setRunnerEditorConfig(
+        { ...(((effectivePreset || {}).config) || {}), strategy_profile: preset.key },
+        `已载入预设 ${preset.label}，可按当前交易对继续修改。`
+      );
+      sprintPresetZoneMetaEl.textContent = `已载入 ${preset.label}，交易对已切到 ${targetSymbol || "当前币种"}。`;
     }
 
     function setCustomGridStatus(message, isError = false) {
@@ -17896,6 +18234,20 @@ MONITOR_PAGE = """<!doctype html>
     customGridLoadBtn.addEventListener("click", loadCustomGridPresetToForm);
     customGridUpdateBtn.addEventListener("click", updateCustomGridStrategy);
     customGridDeleteBtn.addEventListener("click", deleteCustomGridStrategy);
+    sprintPresetZoneEl.addEventListener("click", async (event) => {
+      const button = event.target.closest("[data-sprint-preset-key]");
+      if (!button) return;
+      const presetKey = String(button.getAttribute("data-sprint-preset-key") || "").trim();
+      if (!presetKey) return;
+      button.disabled = true;
+      try {
+        await loadSprintPresetToEditor(presetKey);
+      } catch (err) {
+        sprintPresetZoneMetaEl.textContent = `载入冲刺赛预设失败: ${err}`;
+      } finally {
+        button.disabled = false;
+      }
+    });
     symbolEl.addEventListener("change", () => {
       clearCustomGridPreview();
       loadMonitor();
@@ -17904,6 +18256,7 @@ MONITOR_PAGE = """<!doctype html>
 
     async function initMonitorPage() {
       await loadMonitorSymbols(symbolEl.value);
+      renderSprintPresetZone();
       clearCustomGridPreview();
       await loadMonitor();
       restartTimer();
