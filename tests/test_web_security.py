@@ -923,7 +923,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["strategy_mode"], "one_way_long")
         self.assertAlmostEqual(payload["step_price"], 0.01)
         self.assertEqual(payload["buy_levels"], 6)
-        self.assertEqual(payload["sell_levels"], 1)
+        self.assertEqual(payload["sell_levels"], 6)
         self.assertAlmostEqual(payload["per_order_notional"], 25.0)
         self.assertAlmostEqual(payload["base_position_notional"], 0.0)
         self.assertFalse(payload["flat_start_enabled"])

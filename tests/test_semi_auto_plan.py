@@ -47,6 +47,7 @@ class SemiAutoPlanTests(unittest.TestCase):
             per_order_notional=25.0,
             max_position_notional=900.0,
             max_entry_orders=3,
+            max_exit_orders=2,
             current_long_qty=0.107,
             current_long_notional=249.0,
             tick_size=0.01,
@@ -55,11 +56,12 @@ class SemiAutoPlanTests(unittest.TestCase):
             min_notional=20.0,
         )
 
-        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(len(plan["sell_orders"]), 2)
         self.assertEqual(plan["sell_orders"][0]["side"], "SELL")
         self.assertEqual(plan["sell_orders"][0]["price"], 2330.0)
-        self.assertEqual(plan["sell_orders"][0]["qty"], 0.107)
+        self.assertEqual(plan["sell_orders"][0]["qty"], 0.01)
         self.assertEqual(plan["sell_orders"][0]["role"], "take_profit")
+        self.assertEqual(plan["sell_orders"][1]["qty"], 0.01)
         self.assertEqual(len(plan["buy_orders"]), 3)
         for order in plan["buy_orders"]:
             self.assertEqual(order["side"], "BUY")
@@ -76,6 +78,7 @@ class SemiAutoPlanTests(unittest.TestCase):
             per_order_notional=25.0,
             max_position_notional=900.0,
             max_entry_orders=2,
+            max_exit_orders=2,
             current_long_qty=0.0,
             current_long_notional=0.0,
             tick_size=0.01,

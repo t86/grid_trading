@@ -838,6 +838,7 @@ def build_best_quote_long_flip_plan(
     per_order_notional: float,
     max_position_notional: float,
     max_entry_orders: int,
+    max_exit_orders: int,
     current_long_qty: float,
     current_long_notional: float,
     tick_size: float | None,
@@ -853,6 +854,8 @@ def build_best_quote_long_flip_plan(
         raise ValueError("max_position_notional must be > 0")
     if max_entry_orders < 0:
         raise ValueError("max_entry_orders must be >= 0")
+    if max_exit_orders < 0:
+        raise ValueError("max_exit_orders must be >= 0")
 
     buy_orders: list[PlanOrder] = []
     sell_orders: list[PlanOrder] = []
@@ -862,23 +865,30 @@ def build_best_quote_long_flip_plan(
     current_long_qty = max(float(current_long_qty), 0.0)
     current_long_notional = max(float(current_long_notional), 0.0)
 
-    reduce_qty = _round_order_qty(current_long_qty, step_size)
-    reduce_notional = sell_price * reduce_qty
-    if (
-        reduce_qty > 0
-        and sell_price > bid_price
-        and (min_qty is None or reduce_qty >= min_qty)
-        and (min_notional is None or reduce_notional >= min_notional)
-    ):
-        sell_orders.append(
-            _build_order(
-                side="SELL",
-                price=sell_price,
-                qty=reduce_qty,
-                level=1,
-                role="take_profit",
+    remaining_reduce_qty = _round_order_qty(current_long_qty, step_size)
+    reduce_order_qty = _round_order_qty(per_order_notional / sell_price, step_size)
+    for level in range(1, max_exit_orders + 1):
+        if remaining_reduce_qty <= 0:
+            break
+        reduce_qty = min(reduce_order_qty, remaining_reduce_qty)
+        reduce_qty = _round_order_qty(reduce_qty, step_size)
+        reduce_notional = sell_price * reduce_qty
+        if (
+            reduce_qty > 0
+            and sell_price > bid_price
+            and (min_qty is None or reduce_qty >= min_qty)
+            and (min_notional is None or reduce_notional >= min_notional)
+        ):
+            sell_orders.append(
+                _build_order(
+                    side="SELL",
+                    price=sell_price,
+                    qty=reduce_qty,
+                    level=level,
+                    role="take_profit",
+                )
             )
-        )
+            remaining_reduce_qty = max(remaining_reduce_qty - reduce_qty, 0.0)
 
     remaining_long_budget = max(max_position_notional - current_long_notional, 0.0)
     entry_slots = min(int((remaining_long_budget + 1e-9) / per_order_notional), max_entry_orders)

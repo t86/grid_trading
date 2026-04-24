@@ -8822,6 +8822,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 per_order_notional=effective_args.per_order_notional,
                 max_position_notional=effective_args.max_position_notional,
                 max_entry_orders=effective_args.buy_levels,
+                max_exit_orders=effective_args.sell_levels,
                 current_long_qty=current_long_qty,
                 current_long_notional=current_long_notional,
                 tick_size=symbol_info.get("tick_size"),
