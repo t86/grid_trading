@@ -317,6 +317,29 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(plan["buy_orders"][0]["notional"], 110.0)
         self.assertEqual(plan["buy_orders"][0]["price"], 0.0935)
 
+    def test_adverse_inventory_reduce_does_not_probe_long_below_pause(self) -> None:
+        report = assess_adverse_inventory_reduce(
+            enabled=True,
+            mid_price=0.1830,
+            current_long_qty=3219.0,
+            current_long_notional=589.0,
+            current_short_qty=0.0,
+            current_short_notional=0.0,
+            current_long_cost_price=0.2020,
+            current_short_cost_price=0.0,
+            current_long_cost_basis_source="synthetic_ledger",
+            current_short_cost_basis_source=None,
+            pause_long_position_notional=1200.0,
+            pause_short_position_notional=420.0,
+            long_trigger_ratio=0.006,
+            short_trigger_ratio=0.006,
+            target_ratio=0.30,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertFalse(report["long_active"])
+        self.assertIsNone(report["long_activation_mode"])
+
     def test_take_profit_guard_defaults_to_break_even_when_ratio_is_unset(self) -> None:
         plan = {
             "bootstrap_orders": [],

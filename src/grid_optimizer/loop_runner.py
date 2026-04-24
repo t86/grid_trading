@@ -4311,7 +4311,6 @@ def assess_adverse_inventory_reduce(
     long_pause = max(_safe_float(pause_long_position_notional), 0.0)
     short_pause = max(_safe_float(pause_short_position_notional), 0.0)
     safe_target_ratio = min(max(_safe_float(target_ratio), 0.0), 0.999999)
-    long_probe_floor = long_pause * safe_target_ratio if long_pause > 0 and safe_target_ratio > 0 else 0.0
     short_probe_floor = short_pause * safe_target_ratio if short_pause > 0 and safe_target_ratio > 0 else 0.0
     safe_long_cost = max(_safe_float(current_long_cost_price), 0.0)
     safe_short_cost = max(_safe_float(current_short_cost_price), 0.0)
@@ -4324,9 +4323,7 @@ def assess_adverse_inventory_reduce(
     if (
         max(_safe_float(current_long_qty), 0.0) > 1e-12
         and long_pause > 0
-        and max(_safe_float(current_long_notional), 0.0) > min(
-            value for value in (long_pause, long_probe_floor) if value > 0
-        )
+        and max(_safe_float(current_long_notional), 0.0) > long_pause
     ):
         if safe_long_cost <= 0:
             blocked_reasons.append("long_cost_basis_missing")
@@ -4334,9 +4331,7 @@ def assess_adverse_inventory_reduce(
             blocked_reasons.append("long_trigger_ratio_disabled")
         elif long_ratio is not None and long_ratio >= report["long_trigger_ratio"]:
             report["long_active"] = True
-            report["long_activation_mode"] = (
-                "pause" if max(_safe_float(current_long_notional), 0.0) > long_pause else "below_pause_probe"
-            )
+            report["long_activation_mode"] = "pause"
         else:
             blocked_reasons.append("long_adverse_ratio_below_trigger")
 
