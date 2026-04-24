@@ -72,13 +72,16 @@ COINM_MAX_KLINE_WINDOW_MS = 200 * 24 * 60 * 60 * 1000
 FUNDING_DEFAULT_STEP_MS = 8 * 60 * 60 * 1000
 FUNDING_MISSING_GAP_THRESHOLD_MS = 10 * 60 * 60 * 1000
 SECOND_INTERVAL_MAX_SPAN_MS = 31 * 24 * 60 * 60 * 1000
+FUTURES_SYMBOL_CONFIG_CACHE_TTL_SECONDS = 6 * 3600.0
 FUTURES_POSITION_MODE_CACHE_TTL_SECONDS = 300.0
 FUTURES_ACCOUNT_INFO_CACHE_TTL_SECONDS = 0.5
 FUTURES_OPEN_ORDERS_CACHE_TTL_SECONDS = 0.5
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 _GETADDRINFO_PATCH_LOCK = threading.RLock()
 _GETADDRINFO_PATCH_DEPTH = 0
+_FUTURES_MARKET_CACHE_LOCK = threading.RLock()
 _FUTURES_SIGNED_RESPONSE_CACHE_LOCK = threading.RLock()
+_FUTURES_SYMBOL_CONFIG_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _FUTURES_POSITION_MODE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _FUTURES_ACCOUNT_INFO_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _FUTURES_OPEN_ORDERS_CACHE: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
@@ -311,6 +314,31 @@ def clear_futures_signed_response_caches() -> None:
         _FUTURES_POSITION_MODE_CACHE.clear()
         _FUTURES_ACCOUNT_INFO_CACHE.clear()
         _FUTURES_OPEN_ORDERS_CACHE.clear()
+
+
+def clear_futures_market_data_caches() -> None:
+    with _FUTURES_MARKET_CACHE_LOCK:
+        _FUTURES_SYMBOL_CONFIG_CACHE.clear()
+
+
+def _get_cached_market_response(cache: dict[Any, tuple[float, Any]], key: Any, ttl_seconds: float) -> Any | None:
+    now = time.time()
+    with _FUTURES_MARKET_CACHE_LOCK:
+        entry = cache.get(key)
+        if entry is None:
+            return None
+        loaded_at, payload = entry
+        if now - loaded_at > ttl_seconds:
+            cache.pop(key, None)
+            return None
+        return deepcopy(payload)
+
+
+def _store_cached_market_response(cache: dict[Any, tuple[float, Any]], key: Any, payload: Any) -> Any:
+    cached_payload = deepcopy(payload)
+    with _FUTURES_MARKET_CACHE_LOCK:
+        cache[key] = (time.time(), cached_payload)
+    return deepcopy(cached_payload)
 
 
 def _get_cached_signed_response(cache: dict[Any, tuple[float, Any]], key: Any, ttl_seconds: float) -> Any | None:
@@ -705,7 +733,16 @@ def fetch_futures_symbol_config(symbol: str, contract_type: str = "usdm") -> dic
     normalized_symbol = str(symbol).upper().strip()
     if not normalized_symbol:
         raise ValueError("symbol is required")
-    data = _http_get_json(_market_api_urls(contract_type)["exchange_info"], {"symbol": normalized_symbol})
+    normalized_contract = normalize_contract_type(contract_type)
+    cache_key = (normalized_contract, normalized_symbol)
+    cached = _get_cached_market_response(
+        _FUTURES_SYMBOL_CONFIG_CACHE,
+        cache_key,
+        FUTURES_SYMBOL_CONFIG_CACHE_TTL_SECONDS,
+    )
+    if cached is not None:
+        return cached
+    data = _http_get_json(_market_api_urls(normalized_contract)["exchange_info"], {"symbol": normalized_symbol})
     if not isinstance(data, dict):
         raise RuntimeError("Unexpected exchangeInfo response")
     symbols_raw = data.get("symbols", [])
@@ -737,7 +774,7 @@ def fetch_futures_symbol_config(symbol: str, contract_type: str = "usdm") -> dic
     market_lot_size = filters.get("MARKET_LOT_SIZE", {})
     min_notional_filter = filters.get("MIN_NOTIONAL", {})
 
-    return {
+    payload = {
         "symbol": normalized_symbol,
         "status": str(item.get("status") or item.get("contractStatus") or "").upper().strip(),
         "contract_type": str(item.get("contractType", "")).upper().strip(),
@@ -756,6 +793,7 @@ def fetch_futures_symbol_config(symbol: str, contract_type: str = "usdm") -> dic
         "trigger_protect": _safe_float(item.get("triggerProtect")),
         "market_take_bound": _safe_float(item.get("marketTakeBound")),
     }
+    return _store_cached_market_response(_FUTURES_SYMBOL_CONFIG_CACHE, cache_key, payload)
 
 
 def fetch_futures_latest_price(symbol: str, contract_type: str = "usdm") -> float:
@@ -831,6 +869,46 @@ def fetch_futures_premium_index(
             }
         )
     return rows
+
+
+def build_futures_rest_market_snapshot(symbol: str, contract_type: str = "usdm") -> dict[str, Any]:
+    normalized_symbol = str(symbol).upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    book_rows = fetch_futures_book_tickers(contract_type=contract_type, symbol=normalized_symbol)
+    premium_rows = fetch_futures_premium_index(contract_type=contract_type, symbol=normalized_symbol)
+    if not book_rows:
+        raise RuntimeError(f"No book ticker returned for {normalized_symbol}")
+    if not premium_rows:
+        raise RuntimeError(f"No premium index returned for {normalized_symbol}")
+    book = book_rows[0]
+    premium = premium_rows[0]
+    return {
+        "symbol": normalized_symbol,
+        "bid_price": _safe_float(book.get("bid_price")),
+        "ask_price": _safe_float(book.get("ask_price")),
+        "mark_price": _safe_float(premium.get("mark_price")),
+        "funding_rate": _safe_float(premium.get("funding_rate")),
+        "next_funding_time": premium.get("next_funding_time"),
+        "book_time": book.get("time"),
+        "mark_time": premium.get("time"),
+        "snapshot_at": time.monotonic(),
+        "source": "rest",
+    }
+
+
+def resolve_futures_market_snapshot(
+    symbol: str,
+    *,
+    contract_type: str = "usdm",
+    stream: Any | None = None,
+    max_snapshot_age_seconds: float = 3.0,
+) -> dict[str, Any]:
+    if stream is not None and hasattr(stream, "snapshot"):
+        snapshot = stream.snapshot(max_age_seconds=max_snapshot_age_seconds)
+        if snapshot is not None:
+            return snapshot
+    return build_futures_rest_market_snapshot(symbol, contract_type=contract_type)
 
 
 def _futures_trade_base_url(contract_type: str = "usdm") -> str:
