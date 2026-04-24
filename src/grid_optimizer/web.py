@@ -2680,6 +2680,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "synthetic_residual_short_flat_notional": None,
     "threshold_position_notional": 0.0,
     "short_threshold_timeout_seconds": 60.0,
+    "inventory_pause_timeout_seconds": 0.0,
     "synthetic_tiny_long_residual_notional": None,
     "synthetic_tiny_short_residual_notional": None,
     "static_buy_offset_steps": 0.0,
@@ -4986,7 +4987,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_strong_threshold",
         "pause_buy_position_notional",
         "pause_short_position_notional",
+        "inventory_pause_long_probe_scale",
         "inventory_pause_short_probe_scale",
+        "inventory_pause_timeout_seconds",
         "max_position_notional",
         "max_short_position_notional",
         "threshold_position_notional",
@@ -5621,6 +5624,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--inventory-pause-long-probe-scale", str(config["inventory_pause_long_probe_scale"])])
     if config.get("inventory_pause_short_probe_scale") is not None:
         command.extend(["--inventory-pause-short-probe-scale", str(config["inventory_pause_short_probe_scale"])])
+    if config.get("inventory_pause_timeout_seconds") is not None:
+        command.extend(["--inventory-pause-timeout-seconds", str(config["inventory_pause_timeout_seconds"])])
     if config.get("max_position_notional") is not None:
         command.extend(["--max-position-notional", str(config["max_position_notional"])])
     if config.get("max_short_position_notional") is not None:

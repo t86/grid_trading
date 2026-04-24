@@ -62,6 +62,7 @@ from grid_optimizer.loop_runner import (
     resolve_market_bias_regime_switch,
     resolve_adaptive_step_price,
     resolve_interval_locked_center_price,
+    resolve_inventory_pause_timeout_state,
     resolve_short_threshold_timeout_state,
     resolve_synthetic_trend_follow,
     resolve_auto_regime_profile,
@@ -2415,6 +2416,47 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(all(item["time_in_force"] == "GTC" for item in active_buys))
         self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_buys))
 
+    def test_apply_active_delever_long_switches_to_aggressive_orders_after_inventory_pause_timeout(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.001, "qty": 30.0, "notional": 30.03, "role": "take_profit_long"},
+                {"side": "SELL", "price": 1.011, "qty": 30.0, "notional": 30.33, "role": "take_profit_long"},
+            ],
+        }
+
+        result = apply_active_delever_long(
+            plan=plan,
+            current_long_qty=240.0,
+            current_long_notional=240.0,
+            current_long_avg_price=1.0,
+            current_long_lots=[{"qty": 240.0, "price": 1.0}],
+            pause_long_position_notional=200.0,
+            threshold_position_notional=0.0,
+            per_order_notional=30.0,
+            step_price=0.01,
+            tick_size=0.001,
+            bid_price=0.999,
+            ask_price=1.001,
+            min_profit_ratio=0.0,
+            market_guard_buy_pause_active=False,
+            grid_buffer_realized_notional=0.0,
+            grid_buffer_spent_notional=0.0,
+            max_active_levels=2,
+            inventory_pause_timeout_active=True,
+            timeout_target_notional=200.0,
+        )
+
+        active_sells = [item for item in plan["sell_orders"] if item["role"] == "active_delever_long"]
+
+        self.assertTrue(result["active"])
+        self.assertEqual(result["trigger_mode"], "pause_timeout")
+        self.assertEqual(result["active_sell_order_count"], 2)
+        self.assertEqual([item["price"] for item in active_sells], [0.998, 0.999])
+        self.assertTrue(all(item["execution_type"] == "aggressive" for item in active_sells))
+        self.assertTrue(all(item["time_in_force"] == "GTC" for item in active_sells))
+        self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_sells))
+
     def test_apply_active_delever_short_pause_notional_creates_passive_release_orders(self) -> None:
         plan = {
             "buy_orders": [
@@ -4063,6 +4105,42 @@ class LoopRunnerTests(unittest.TestCase):
         )
         self.assertFalse(reset["timeout_active"])
         self.assertNotIn("short_threshold_timeout_state", state)
+
+    def test_resolve_inventory_pause_timeout_state_stays_active_until_pause(self) -> None:
+        state: dict[str, object] = {}
+        start = datetime(2026, 4, 14, 2, 0, 0, tzinfo=timezone.utc)
+
+        initial = resolve_inventory_pause_timeout_state(
+            state=state,
+            side="long",
+            current_notional=240.0,
+            pause_position_notional=200.0,
+            hold_seconds=60.0,
+            now=start,
+        )
+        self.assertFalse(initial["timeout_active"])
+        self.assertTrue(initial["armed"])
+
+        active = resolve_inventory_pause_timeout_state(
+            state=state,
+            side="long",
+            current_notional=235.0,
+            pause_position_notional=200.0,
+            hold_seconds=60.0,
+            now=start + timedelta(seconds=61),
+        )
+        self.assertTrue(active["timeout_active"])
+
+        reset = resolve_inventory_pause_timeout_state(
+            state=state,
+            side="long",
+            current_notional=199.0,
+            pause_position_notional=200.0,
+            hold_seconds=60.0,
+            now=start + timedelta(seconds=95),
+        )
+        self.assertFalse(reset["timeout_active"])
+        self.assertNotIn("long_inventory_pause_timeout_state", state)
 
     def test_apply_hedge_position_notional_caps_trim_long_and_short_entries(self) -> None:
         plan = {

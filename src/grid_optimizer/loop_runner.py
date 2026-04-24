@@ -4349,6 +4349,88 @@ def resolve_short_threshold_timeout_state(
     return report
 
 
+def resolve_inventory_pause_timeout_state(
+    *,
+    state: dict[str, Any],
+    side: str,
+    current_notional: float,
+    pause_position_notional: float | None,
+    hold_seconds: float | None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    normalized_side = "short" if str(side).strip().lower() == "short" else "long"
+    state_key = f"{normalized_side}_inventory_pause_timeout_state"
+    current_time = now or _utc_now()
+    safe_current_notional = max(_safe_float(current_notional), 0.0)
+    pause_notional = max(_safe_float(pause_position_notional), 0.0)
+    safe_hold_seconds = max(_safe_float(hold_seconds), 0.0)
+    report = {
+        "enabled": False,
+        "side": normalized_side,
+        "target_notional": pause_position_notional,
+        "hold_seconds": safe_hold_seconds,
+        "above_pause": False,
+        "armed": False,
+        "timeout_active": False,
+        "duration_seconds": 0.0,
+        "above_pause_started_at": None,
+        "timeout_active_since": None,
+    }
+    if pause_notional <= 0 or safe_hold_seconds <= 0:
+        state.pop(state_key, None)
+        return report
+
+    report["enabled"] = True
+
+    def _parse_state_ts(value: Any) -> datetime | None:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    timeout_state = dict(state.get(state_key) or {})
+    armed_at = _parse_state_ts(timeout_state.get("above_pause_started_at"))
+    active_since = _parse_state_ts(timeout_state.get("timeout_active_since"))
+    timeout_active = bool(timeout_state.get("timeout_active"))
+
+    if safe_current_notional <= pause_notional + 1e-12:
+        state.pop(state_key, None)
+        return report
+
+    if armed_at is None:
+        armed_at = current_time
+    duration_seconds = max((current_time - armed_at).total_seconds(), 0.0)
+    if timeout_active:
+        active_since = active_since or current_time
+    else:
+        timeout_active = duration_seconds >= safe_hold_seconds
+        if timeout_active and active_since is None:
+            active_since = current_time
+
+    report.update(
+        {
+            "above_pause": True,
+            "armed": True,
+            "timeout_active": timeout_active,
+            "duration_seconds": duration_seconds,
+            "above_pause_started_at": armed_at.isoformat(),
+            "timeout_active_since": active_since.isoformat() if active_since else None,
+        }
+    )
+    state[state_key] = {
+        "target_notional": pause_notional,
+        "hold_seconds": safe_hold_seconds,
+        "above_pause_started_at": armed_at.isoformat(),
+        "timeout_active_since": active_since.isoformat() if active_since else None,
+        "timeout_active": timeout_active,
+        "updated_at": current_time.isoformat(),
+    }
+    return report
+
+
 def _estimate_long_delever_cost(
     *,
     current_long_lots: list[dict[str, Any]],
@@ -4928,6 +5010,8 @@ def apply_active_delever_long(
     min_qty: float | None = None,
     min_notional: float | None = None,
     max_active_levels: int = 3,
+    inventory_pause_timeout_active: bool = False,
+    timeout_target_notional: float | None = None,
     force_release_active: bool = False,
     force_release_target_notional: float | None = None,
     force_release_trigger_mode: str = "force_release",
@@ -4945,6 +5029,9 @@ def apply_active_delever_long(
         "pause_short_position_notional": None,
         "release_sell_order_count": 0,
         "release_floor_price": None,
+        "inventory_pause_timeout_active": bool(inventory_pause_timeout_active),
+        "inventory_pause_timeout_target_notional": timeout_target_notional,
+        "inventory_pause_timeout_aggressive": False,
         "synthesized_release_source_order_count": 0,
         "pruned_flow_sleeve_order_count": 0,
         "force_release_active": bool(force_release_active),
@@ -4952,7 +5039,11 @@ def apply_active_delever_long(
     }
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
+    timeout_target = max(_safe_float(timeout_target_notional), 0.0)
     pause_trigger_active = pause_notional > 0 and current_long_notional >= pause_notional - 1e-12
+    inventory_pause_timeout_trigger_active = (
+        bool(inventory_pause_timeout_active) and timeout_target > 0 and current_long_notional > timeout_target
+    )
     force_target_notional = max(_safe_float(force_release_target_notional), 0.0)
     force_release_trigger_active = bool(force_release_active) and (
         force_target_notional <= 0 or current_long_notional > force_target_notional + 1e-12
@@ -4964,12 +5055,22 @@ def apply_active_delever_long(
         or step_price <= 0
     ):
         return report
-    if not threshold_enabled and pause_notional <= 0 and not force_release_trigger_active:
+    if (
+        not threshold_enabled
+        and pause_notional <= 0
+        and not inventory_pause_timeout_trigger_active
+        and not force_release_trigger_active
+    ):
         return report
     if threshold_enabled:
-        if current_long_notional < threshold_notional and current_long_notional < pause_notional and not force_release_trigger_active:
+        if (
+            current_long_notional < threshold_notional
+            and current_long_notional < pause_notional
+            and not inventory_pause_timeout_trigger_active
+            and not force_release_trigger_active
+        ):
             return report
-    elif current_long_notional < pause_notional and not force_release_trigger_active:
+    elif current_long_notional < pause_notional and not inventory_pause_timeout_trigger_active and not force_release_trigger_active:
         return report
 
     take_profit_orders = [
@@ -4977,7 +5078,11 @@ def apply_active_delever_long(
         for item in plan.get("sell_orders", [])
         if isinstance(item, dict) and _order_role(item) == "take_profit_long"
     ]
-    if not take_profit_orders and (pause_trigger_active or force_release_trigger_active):
+    if not take_profit_orders and (
+        pause_trigger_active
+        or inventory_pause_timeout_trigger_active
+        or force_release_trigger_active
+    ):
         take_profit_orders = _build_near_market_release_seed_orders(
             side="SELL",
             role="take_profit_long",
@@ -5087,6 +5192,21 @@ def apply_active_delever_long(
                 consume_mode="fifo",
             )
             trigger_mode = str(force_release_trigger_mode or "force_release").strip() or "force_release"
+        elif inventory_pause_timeout_trigger_active:
+            excess_notional = max(current_long_notional - timeout_target, 0.0)
+            active_count = min(
+                len(take_profit_orders),
+                requested_levels,
+                max(1, int(math.ceil(max(excess_notional, safe_per_order_notional) / safe_per_order_notional))),
+            )
+            estimated_cost = _estimate_long_delever_cost(
+                current_long_lots=current_long_lots,
+                current_long_qty=current_long_qty,
+                current_long_avg_price=current_long_avg_price,
+                sell_orders=take_profit_orders[:active_count],
+                consume_mode="fifo",
+            )
+            trigger_mode = "pause_timeout"
         elif pause_trigger_active:
             excess_notional = max(current_long_notional - pause_notional, 0.0)
             active_count = min(
@@ -5155,9 +5275,32 @@ def apply_active_delever_long(
         active = dict(order)
         active["role"] = "active_delever_long"
         active["level"] = index
-        if trigger_mode in {"threshold", "pause"}:
+        if trigger_mode in {"threshold", "pause_timeout", "pause"}:
             active["lot_consume_mode"] = "fifo"
-        if release_active:
+        if trigger_mode == "pause_timeout":
+            safe_bid_price = max(_safe_float(bid_price), 0.0)
+            safe_tick = max(_safe_float(tick_size), 0.0)
+            if safe_bid_price > 0:
+                if safe_tick > 0:
+                    aggressive_price = max(
+                        float(Decimal(str(safe_bid_price)) - (Decimal(str(safe_tick)) * Decimal(index - 1))),
+                        safe_tick,
+                    )
+                else:
+                    aggressive_price = safe_bid_price
+                active["price"] = aggressive_price
+                active["notional"] = _safe_float(active.get("price")) * _safe_float(active.get("qty"))
+                active["take_profit_guard_release_floor"] = aggressive_price
+            active["execution_type"] = "aggressive"
+            active["time_in_force"] = "GTC"
+            active["force_reduce_only"] = True
+            release_floor_price = (
+                _safe_float(active.get("price"))
+                if release_floor_price is None
+                else min(release_floor_price, _safe_float(active.get("price")))
+            )
+            release_order_count += 1
+        elif release_active:
             release_price = _resolve_near_market_release_price(
                 side="SELL",
                 level_index=index,
@@ -5181,7 +5324,7 @@ def apply_active_delever_long(
                 release_order_count += 1
         active_orders.append(active)
 
-    if release_active:
+    if release_active or trigger_mode == "pause_timeout":
         original_other_count = len(other_sell_orders)
         other_sell_orders = [item for item in other_sell_orders if _order_role(item) != "flow_sleeve_long"]
         pruned_flow_sleeve_count = original_other_count - len(other_sell_orders)
@@ -5198,6 +5341,7 @@ def apply_active_delever_long(
             "active_sell_order_count": active_count,
             "release_sell_order_count": release_order_count,
             "release_floor_price": release_floor_price,
+            "inventory_pause_timeout_aggressive": trigger_mode == "pause_timeout",
             "pruned_flow_sleeve_order_count": pruned_flow_sleeve_count,
         }
     )
@@ -5227,6 +5371,8 @@ def apply_active_delever_short(
     max_active_levels: int = 3,
     threshold_timeout_active: bool = False,
     timeout_target_notional: float | None = None,
+    inventory_pause_timeout_active: bool = False,
+    inventory_pause_timeout_target_notional: float | None = None,
     force_release_active: bool = False,
     force_release_target_notional: float | None = None,
     force_release_trigger_mode: str = "force_release",
@@ -5245,6 +5391,9 @@ def apply_active_delever_short(
         "threshold_timeout_active": bool(threshold_timeout_active),
         "threshold_timeout_target_notional": timeout_target_notional,
         "threshold_timeout_aggressive": False,
+        "inventory_pause_timeout_active": bool(inventory_pause_timeout_active),
+        "inventory_pause_timeout_target_notional": inventory_pause_timeout_target_notional,
+        "inventory_pause_timeout_aggressive": False,
         "release_buy_order_count": 0,
         "release_ceiling_price": None,
         "synthesized_release_source_order_count": 0,
@@ -5255,12 +5404,18 @@ def apply_active_delever_short(
     threshold_notional = max(_safe_float(threshold_position_notional), 0.0)
     pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
     timeout_target = max(_safe_float(timeout_target_notional), 0.0)
+    inventory_timeout_target = max(_safe_float(inventory_pause_timeout_target_notional), 0.0)
     force_target_notional = max(_safe_float(force_release_target_notional), 0.0)
     force_release_trigger_active = bool(force_release_active) and (
         force_target_notional <= 0 or current_short_notional > force_target_notional + 1e-12
     )
     pause_trigger_active = pause_notional > 0 and current_short_notional >= pause_notional - 1e-12
     threshold_timeout_trigger_active = bool(threshold_timeout_active) and timeout_target > 0 and current_short_notional > timeout_target
+    inventory_pause_timeout_trigger_active = (
+        bool(inventory_pause_timeout_active)
+        and inventory_timeout_target > 0
+        and current_short_notional > inventory_timeout_target
+    )
     threshold_trigger_active = threshold_notional > max(pause_notional, 0.0) and current_short_notional >= threshold_notional
     threshold_enabled = threshold_notional > max(pause_notional, 0.0)
     if (
@@ -5269,12 +5424,22 @@ def apply_active_delever_short(
         or step_price <= 0
     ):
         return report
-    if not threshold_enabled and pause_notional <= 0 and not force_release_trigger_active:
+    if (
+        not threshold_enabled
+        and pause_notional <= 0
+        and not inventory_pause_timeout_trigger_active
+        and not force_release_trigger_active
+    ):
         return report
     if threshold_enabled:
-        if current_short_notional < threshold_notional and current_short_notional < pause_notional and not force_release_trigger_active:
+        if (
+            current_short_notional < threshold_notional
+            and current_short_notional < pause_notional
+            and not inventory_pause_timeout_trigger_active
+            and not force_release_trigger_active
+        ):
             return report
-    elif current_short_notional < pause_notional and not force_release_trigger_active:
+    elif current_short_notional < pause_notional and not inventory_pause_timeout_trigger_active and not force_release_trigger_active:
         return report
 
     take_profit_orders = [
@@ -5286,6 +5451,7 @@ def apply_active_delever_short(
         pause_trigger_active
         or threshold_timeout_trigger_active
         or threshold_trigger_active
+        or inventory_pause_timeout_trigger_active
         or force_release_trigger_active
     ):
         take_profit_orders = _build_near_market_release_seed_orders(
@@ -5349,6 +5515,22 @@ def apply_active_delever_short(
             consume_mode="fifo",
         )
         trigger_mode = "threshold_timeout"
+    elif inventory_pause_timeout_trigger_active:
+        safe_per_order_notional = max(float(per_order_notional), 1e-12)
+        excess_notional = max(current_short_notional - inventory_timeout_target, 0.0)
+        active_count = min(
+            len(take_profit_orders),
+            requested_levels,
+            max(1, int(math.ceil(max(excess_notional, safe_per_order_notional) / safe_per_order_notional))),
+        )
+        estimated_cost = _estimate_short_delever_cost(
+            current_short_lots=current_short_lots,
+            current_short_qty=current_short_qty,
+            current_short_avg_price=current_short_avg_price,
+            buy_orders=take_profit_orders[:active_count],
+            consume_mode="fifo",
+        )
+        trigger_mode = "pause_timeout"
     elif threshold_enabled and current_short_notional >= threshold_notional:
         threshold_consume_mode = "fifo"
         safe_per_order_notional = max(float(per_order_notional), 1e-12)
@@ -5469,9 +5651,9 @@ def apply_active_delever_short(
         active = dict(order)
         active["role"] = "active_delever_short"
         active["level"] = index
-        if trigger_mode in {"threshold", "threshold_timeout", "pause"}:
+        if trigger_mode in {"threshold", "threshold_timeout", "pause_timeout", "pause"}:
             active["lot_consume_mode"] = "fifo"
-        if trigger_mode == "threshold_timeout":
+        if trigger_mode in {"threshold_timeout", "pause_timeout"}:
             safe_ask_price = max(_safe_float(ask_price), 0.0)
             safe_tick = max(_safe_float(tick_size), 0.0)
             if safe_ask_price > 0:
@@ -5515,7 +5697,7 @@ def apply_active_delever_short(
                 release_order_count += 1
         active_orders.append(active)
 
-    if release_active or trigger_mode == "threshold_timeout":
+    if release_active or trigger_mode in {"threshold_timeout", "pause_timeout"}:
         original_other_count = len(other_buy_orders)
         other_buy_orders = [item for item in other_buy_orders if _order_role(item) != "flow_sleeve_short"]
         pruned_flow_sleeve_count = original_other_count - len(other_buy_orders)
@@ -5531,6 +5713,7 @@ def apply_active_delever_short(
             "estimated_cost_notional": estimated_cost,
             "active_buy_order_count": active_count,
             "threshold_timeout_aggressive": trigger_mode == "threshold_timeout",
+            "inventory_pause_timeout_aggressive": trigger_mode == "pause_timeout",
             "release_buy_order_count": release_order_count,
             "release_ceiling_price": release_ceiling_price,
             "pruned_flow_sleeve_order_count": pruned_flow_sleeve_count,
@@ -7739,6 +7922,35 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "threshold_timeout_hold_seconds": _safe_float(getattr(args, "short_threshold_timeout_seconds", None)),
         "threshold_timeout_target_notional": getattr(args, "pause_short_position_notional", None),
         "threshold_timeout_aggressive": False,
+        "inventory_pause_timeout_active": False,
+        "inventory_pause_timeout_duration_seconds": 0.0,
+        "inventory_pause_timeout_hold_seconds": _safe_float(getattr(args, "inventory_pause_timeout_seconds", None)),
+        "inventory_pause_timeout_target_notional": None,
+        "inventory_pause_timeout_aggressive": False,
+    }
+    long_inventory_pause_timeout = {
+        "enabled": False,
+        "side": "long",
+        "target_notional": getattr(effective_args, "pause_buy_position_notional", None),
+        "hold_seconds": _safe_float(getattr(effective_args, "inventory_pause_timeout_seconds", None)),
+        "above_pause": False,
+        "armed": False,
+        "timeout_active": False,
+        "duration_seconds": 0.0,
+        "above_pause_started_at": None,
+        "timeout_active_since": None,
+    }
+    short_inventory_pause_timeout = {
+        "enabled": False,
+        "side": "short",
+        "target_notional": getattr(effective_args, "pause_short_position_notional", None),
+        "hold_seconds": _safe_float(getattr(effective_args, "inventory_pause_timeout_seconds", None)),
+        "above_pause": False,
+        "armed": False,
+        "timeout_active": False,
+        "duration_seconds": 0.0,
+        "above_pause_started_at": None,
+        "timeout_active_since": None,
     }
     short_threshold_timeout = {
         "enabled": False,
@@ -8211,6 +8423,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             hold_seconds=getattr(effective_args, "short_threshold_timeout_seconds", None),
             now=plan_now,
         )
+        long_inventory_pause_timeout = resolve_inventory_pause_timeout_state(
+            state=state,
+            side="long",
+            current_notional=current_long_notional,
+            pause_position_notional=effective_args.pause_buy_position_notional,
+            hold_seconds=getattr(effective_args, "inventory_pause_timeout_seconds", None),
+            now=plan_now,
+        )
+        short_inventory_pause_timeout = resolve_inventory_pause_timeout_state(
+            state=state,
+            side="short",
+            current_notional=current_short_notional,
+            pause_position_notional=effective_args.pause_short_position_notional,
+            hold_seconds=getattr(effective_args, "inventory_pause_timeout_seconds", None),
+            now=plan_now,
+        )
         inventory_tier = {
             "enabled": False,
             "active": False,
@@ -8391,6 +8619,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             pause_short_position_notional=effective_args.pause_short_position_notional,
             threshold_position_notional=getattr(args, "threshold_position_notional", None),
             hold_seconds=getattr(effective_args, "short_threshold_timeout_seconds", None),
+            now=plan_now,
+        )
+        long_inventory_pause_timeout = resolve_inventory_pause_timeout_state(
+            state=state,
+            side="long",
+            current_notional=current_long_notional,
+            pause_position_notional=effective_args.pause_buy_position_notional,
+            hold_seconds=getattr(effective_args, "inventory_pause_timeout_seconds", None),
+            now=plan_now,
+        )
+        short_inventory_pause_timeout = resolve_inventory_pause_timeout_state(
+            state=state,
+            side="short",
+            current_notional=current_short_notional,
+            pause_position_notional=effective_args.pause_short_position_notional,
+            hold_seconds=getattr(effective_args, "inventory_pause_timeout_seconds", None),
             now=plan_now,
         )
         inventory_tier = {
@@ -8608,6 +8852,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+            inventory_pause_timeout_active=bool(long_inventory_pause_timeout.get("timeout_active")),
+            timeout_target_notional=effective_args.pause_buy_position_notional,
             force_release_active=bool(exposure_escalation.get("active")),
             force_release_target_notional=exposure_escalation.get("target_notional"),
             force_release_trigger_mode="exposure_escalation",
@@ -8633,6 +8879,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             threshold_timeout_active=bool(short_threshold_timeout.get("timeout_active")),
             timeout_target_notional=effective_args.pause_short_position_notional,
+            inventory_pause_timeout_active=bool(short_inventory_pause_timeout.get("timeout_active")),
+            inventory_pause_timeout_target_notional=effective_args.pause_short_position_notional,
         )
         if _is_best_quote_neutral_profile(effective_strategy_profile):
             take_profit_guard = {
@@ -8699,6 +8947,28 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "threshold_timeout_hold_seconds": _safe_float(short_threshold_timeout.get("hold_seconds")),
             "threshold_timeout_target_notional": short_threshold_timeout.get("target_notional"),
             "threshold_timeout_aggressive": bool(short_active_delever.get("threshold_timeout_aggressive")),
+            "inventory_pause_timeout_active": bool(long_inventory_pause_timeout.get("timeout_active"))
+            or bool(short_inventory_pause_timeout.get("timeout_active")),
+            "inventory_pause_timeout_side": (
+                "long"
+                if bool(long_inventory_pause_timeout.get("timeout_active"))
+                else ("short" if bool(short_inventory_pause_timeout.get("timeout_active")) else None)
+            ),
+            "inventory_pause_timeout_duration_seconds": max(
+                _safe_float(long_inventory_pause_timeout.get("duration_seconds")),
+                _safe_float(short_inventory_pause_timeout.get("duration_seconds")),
+            ),
+            "inventory_pause_timeout_hold_seconds": _safe_float(
+                long_inventory_pause_timeout.get("hold_seconds")
+                or short_inventory_pause_timeout.get("hold_seconds")
+            ),
+            "inventory_pause_timeout_target_notional": (
+                long_inventory_pause_timeout.get("target_notional")
+                if bool(long_inventory_pause_timeout.get("timeout_active"))
+                else short_inventory_pause_timeout.get("target_notional")
+            ),
+            "inventory_pause_timeout_aggressive": bool(long_active_delever.get("inventory_pause_timeout_aggressive"))
+            or bool(short_active_delever.get("inventory_pause_timeout_aggressive")),
         }
         synthetic_inventory_exit_priority = apply_synthetic_inventory_exit_priority(
             plan=plan,
@@ -9383,6 +9653,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "volume_long_v4_flow_sleeve": volume_long_v4_flow_sleeve,
         "exposure_escalation": exposure_escalation,
         "active_delever": active_delever,
+        "long_inventory_pause_timeout": long_inventory_pause_timeout,
+        "short_inventory_pause_timeout": short_inventory_pause_timeout,
         "short_threshold_timeout": short_threshold_timeout,
         "position_cost_basis_source": "entryPrice" if prefer_entry_price_cost_basis else "breakEvenPrice",
         "auto_regime": auto_regime,
@@ -9411,6 +9683,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_pause_short_position_notional": getattr(effective_args, "pause_short_position_notional", None),
         "effective_inventory_pause_long_probe_scale": getattr(effective_args, "inventory_pause_long_probe_scale", None),
         "effective_inventory_pause_short_probe_scale": getattr(effective_args, "inventory_pause_short_probe_scale", None),
+        "effective_inventory_pause_timeout_seconds": getattr(effective_args, "inventory_pause_timeout_seconds", None),
         "effective_adverse_reduce_enabled": bool(getattr(effective_args, "adverse_reduce_enabled", False)),
         "effective_adverse_reduce_long_trigger_ratio": getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
         "effective_adverse_reduce_short_trigger_ratio": getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
@@ -9958,6 +10231,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--first-order-multiplier", type=float, default=4.0)
     parser.add_argument("--threshold-position-notional", type=float, default=0.0)
     parser.add_argument("--short-threshold-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--inventory-pause-timeout-seconds", type=float, default=0.0)
     parser.add_argument("--near-market-entry-max-center-distance-steps", type=float, default=2.0)
     parser.add_argument("--grid-inventory-rebalance-min-center-distance-steps", type=float, default=3.0)
     parser.add_argument("--near-market-reentry-confirm-cycles", type=int, default=2)
@@ -10440,6 +10714,8 @@ def main() -> None:
         raise SystemExit("--near-market-reentry-confirm-cycles must be > 0")
     if args.short_threshold_timeout_seconds < 0:
         raise SystemExit("--short-threshold-timeout-seconds must be >= 0")
+    if args.inventory_pause_timeout_seconds < 0:
+        raise SystemExit("--inventory-pause-timeout-seconds must be >= 0")
     if args.adverse_reduce_short_trigger_ratio < 0 or args.adverse_reduce_long_trigger_ratio < 0:
         raise SystemExit("--adverse-reduce-*-trigger-ratio must be >= 0")
     if args.adverse_reduce_target_ratio < 0 or args.adverse_reduce_target_ratio >= 1:

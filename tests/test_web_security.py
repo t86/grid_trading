@@ -2125,6 +2125,7 @@ class WebSecurityTests(unittest.TestCase):
                 "adverse_reduce_keep_probe_scale": 0.08,
                 "inventory_pause_long_probe_scale": 0.2,
                 "inventory_pause_short_probe_scale": 0.25,
+                "inventory_pause_timeout_seconds": 75.0,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -2151,6 +2152,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--inventory-pause-long-probe-scale", command)
         self.assertIn("0.2", command)
         self.assertIn("--inventory-pause-short-probe-scale", command)
+        self.assertIn("--inventory-pause-timeout-seconds", command)
+        self.assertIn("75.0", command)
 
     def test_build_runner_command_includes_exposure_escalation_arguments(self) -> None:
         command = _build_runner_command(
