@@ -32,6 +32,7 @@ from grid_optimizer.loop_runner import (
     apply_active_delever_long,
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
+    resolve_exposure_escalation,
     apply_synthetic_inventory_exit_priority,
     apply_adverse_inventory_reduce,
     apply_hedge_position_controls,
@@ -73,6 +74,111 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_resolve_exposure_escalation_waits_for_hold_time(self) -> None:
+        state: dict[str, object] = {}
+        now = datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc)
+
+        first = resolve_exposure_escalation(
+            state=state,
+            enabled=True,
+            now=now,
+            current_long_notional=1100.0,
+            current_long_qty=5500.0,
+            current_long_cost_basis_price=0.20,
+            mid_price=0.198,
+            trigger_notional=1000.0,
+            hold_seconds=600.0,
+            target_notional=650.0,
+            max_loss_ratio=0.012,
+            hard_unrealized_loss_limit=None,
+        )
+        later = resolve_exposure_escalation(
+            state=state,
+            enabled=True,
+            now=now + timedelta(seconds=599),
+            current_long_notional=1100.0,
+            current_long_qty=5500.0,
+            current_long_cost_basis_price=0.20,
+            mid_price=0.198,
+            trigger_notional=1000.0,
+            hold_seconds=600.0,
+            target_notional=650.0,
+            max_loss_ratio=0.012,
+            hard_unrealized_loss_limit=None,
+        )
+
+        self.assertTrue(first["enabled"])
+        self.assertFalse(first["active"])
+        self.assertEqual(first["blocked_reason"], "waiting_hold_time")
+        self.assertEqual(later["held_seconds"], 599.0)
+        self.assertFalse(later["active"])
+
+    def test_resolve_exposure_escalation_activates_after_hold_time(self) -> None:
+        now = datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc)
+        state = {"exposure_escalation": {"observed_since": now.isoformat()}}
+
+        report = resolve_exposure_escalation(
+            state=state,
+            enabled=True,
+            now=now + timedelta(seconds=600),
+            current_long_notional=1120.0,
+            current_long_qty=5600.0,
+            current_long_cost_basis_price=0.20,
+            mid_price=0.198,
+            trigger_notional=1000.0,
+            hold_seconds=600.0,
+            target_notional=650.0,
+            max_loss_ratio=0.012,
+            hard_unrealized_loss_limit=None,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["reason"], "hold_time_exceeded")
+        self.assertEqual(report["target_notional"], 650.0)
+        self.assertEqual(report["max_loss_ratio"], 0.012)
+
+    def test_resolve_exposure_escalation_hard_loss_activates_immediately(self) -> None:
+        report = resolve_exposure_escalation(
+            state={},
+            enabled=True,
+            now=datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc),
+            current_long_notional=900.0,
+            current_long_qty=5000.0,
+            current_long_cost_basis_price=0.20,
+            mid_price=0.188,
+            trigger_notional=1000.0,
+            hold_seconds=600.0,
+            target_notional=650.0,
+            max_loss_ratio=0.012,
+            hard_unrealized_loss_limit=60.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["reason"], "hard_unrealized_loss_limit")
+        self.assertAlmostEqual(report["unrealized_pnl"], -60.0)
+
+    def test_resolve_exposure_escalation_clears_timer_below_threshold(self) -> None:
+        state = {"exposure_escalation": {"observed_since": "2026-04-24T08:00:00+00:00"}}
+
+        report = resolve_exposure_escalation(
+            state=state,
+            enabled=True,
+            now=datetime(2026, 4, 24, 8, 10, tzinfo=timezone.utc),
+            current_long_notional=900.0,
+            current_long_qty=4500.0,
+            current_long_cost_basis_price=0.20,
+            mid_price=0.199,
+            trigger_notional=1000.0,
+            hold_seconds=600.0,
+            target_notional=650.0,
+            max_loss_ratio=0.012,
+            hard_unrealized_loss_limit=None,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "below_trigger")
+        self.assertIsNone(state["exposure_escalation"]["observed_since"])  # type: ignore[index]
+
     def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
         plan = {
             "bootstrap_orders": [],

@@ -2462,6 +2462,12 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volume_long_v4_flow_sleeve_levels": 2,
     "volume_long_v4_flow_sleeve_order_notional": None,
     "volume_long_v4_flow_sleeve_max_loss_ratio": 0.0025,
+    "exposure_escalation_enabled": False,
+    "exposure_escalation_notional": None,
+    "exposure_escalation_hold_seconds": 600.0,
+    "exposure_escalation_target_notional": None,
+    "exposure_escalation_max_loss_ratio": None,
+    "exposure_escalation_hard_unrealized_loss_limit": None,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -4726,6 +4732,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_long_v4_flow_sleeve_notional",
         "volume_long_v4_flow_sleeve_order_notional",
         "volume_long_v4_flow_sleeve_max_loss_ratio",
+        "exposure_escalation_notional",
+        "exposure_escalation_hold_seconds",
+        "exposure_escalation_target_notional",
+        "exposure_escalation_max_loss_ratio",
+        "exposure_escalation_hard_unrealized_loss_limit",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -4799,6 +4810,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_flow_sleeve_enabled",
         "adverse_reduce_enabled",
         "volume_long_v4_flow_sleeve_enabled",
+        "exposure_escalation_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
@@ -4866,6 +4878,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_long_v4_flow_sleeve_reduce_to_notional",
         "volume_long_v4_flow_sleeve_order_notional",
         "volume_long_v4_flow_sleeve_max_loss_ratio",
+        "exposure_escalation_notional",
+        "exposure_escalation_target_notional",
+        "exposure_escalation_max_loss_ratio",
+        "exposure_escalation_hard_unrealized_loss_limit",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -5442,6 +5458,24 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--volume-long-v4-flow-sleeve-max-loss-ratio",
             str(config["volume_long_v4_flow_sleeve_max_loss_ratio"]),
         ])
+    command.append(
+        "--exposure-escalation-enabled"
+        if config.get("exposure_escalation_enabled", False)
+        else "--no-exposure-escalation-enabled"
+    )
+    if config.get("exposure_escalation_notional") is not None:
+        command.extend(["--exposure-escalation-notional", str(config["exposure_escalation_notional"])])
+    if config.get("exposure_escalation_hold_seconds") is not None:
+        command.extend(["--exposure-escalation-hold-seconds", str(config["exposure_escalation_hold_seconds"])])
+    if config.get("exposure_escalation_target_notional") is not None:
+        command.extend(["--exposure-escalation-target-notional", str(config["exposure_escalation_target_notional"])])
+    if config.get("exposure_escalation_max_loss_ratio") is not None:
+        command.extend(["--exposure-escalation-max-loss-ratio", str(config["exposure_escalation_max_loss_ratio"])])
+    if config.get("exposure_escalation_hard_unrealized_loss_limit") is not None:
+        command.extend([
+            "--exposure-escalation-hard-unrealized-loss-limit",
+            str(config["exposure_escalation_hard_unrealized_loss_limit"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -5640,6 +5674,12 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "volume_long_v4_flow_sleeve_levels",
             "volume_long_v4_flow_sleeve_order_notional",
             "volume_long_v4_flow_sleeve_max_loss_ratio",
+            "exposure_escalation_enabled",
+            "exposure_escalation_notional",
+            "exposure_escalation_hold_seconds",
+            "exposure_escalation_target_notional",
+            "exposure_escalation_max_loss_ratio",
+            "exposure_escalation_hard_unrealized_loss_limit",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",

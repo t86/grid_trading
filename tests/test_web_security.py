@@ -2055,6 +2055,46 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adverse-reduce-max-order-notional", command)
         self.assertIn("--adverse-reduce-keep-probe-scale", command)
 
+    def test_build_runner_command_includes_exposure_escalation_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "SOONUSDT",
+                "strategy_profile": "volume_long_v4",
+                "strategy_mode": "one_way_long",
+                "step_price": 0.0003,
+                "buy_levels": 12,
+                "sell_levels": 12,
+                "per_order_notional": 100.0,
+                "base_position_notional": 0.0,
+                "exposure_escalation_enabled": True,
+                "exposure_escalation_notional": 1000.0,
+                "exposure_escalation_hold_seconds": 600.0,
+                "exposure_escalation_target_notional": 650.0,
+                "exposure_escalation_max_loss_ratio": 0.012,
+                "exposure_escalation_hard_unrealized_loss_limit": 60.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 40,
+                "max_total_notional": 1800.0,
+                "sleep_seconds": 4,
+                "state_path": "output/soonusdt_loop_state.json",
+                "plan_json": "output/soonusdt_loop_latest_plan.json",
+                "submit_report_json": "output/soonusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/soonusdt_loop_events.jsonl",
+            }
+        )
+
+        self.assertIn("--exposure-escalation-enabled", command)
+        self.assertIn("--exposure-escalation-notional", command)
+        self.assertIn("1000.0", command)
+        self.assertIn("--exposure-escalation-hold-seconds", command)
+        self.assertIn("--exposure-escalation-target-notional", command)
+        self.assertIn("--exposure-escalation-max-loss-ratio", command)
+        self.assertIn("--exposure-escalation-hard-unrealized-loss-limit", command)
+
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:
         mock_preview.return_value = {
