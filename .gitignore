@@ -18,7 +18,6 @@ venv/
 data/
 output/*
 !output/custom_runner_presets.json
-!output/symbol_lists.json
 
 # Temp files
 *.log
