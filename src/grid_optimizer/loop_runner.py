@@ -1064,6 +1064,7 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
     normalized_profile = str(strategy_profile or "").strip()
     return normalized_profile in {
         "volume_long_v4",
+        "chip_low_wear_guarded_v1",
         "soon_volume_neutral_ping_pong_v1",
         "soonusdt_competition_neutral_ping_pong_v1",
     } or normalized_profile.endswith("_competition_neutral_ping_pong_v1")

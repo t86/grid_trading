@@ -76,6 +76,7 @@ from grid_optimizer.types import Candle
 
 class LoopRunnerTests(unittest.TestCase):
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
+        self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("soon_volume_neutral_ping_pong_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("soonusdt_competition_neutral_ping_pong_v1"))
 
