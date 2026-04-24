@@ -1502,6 +1502,18 @@ def resolve_exposure_escalation(
         report["blocked_reason"] = "invalid_config"
         return report
 
+    if long_notional <= safe_target + 1e-12:
+        escalation_state["observed_since"] = None
+        report.update(
+            {
+                "blocked_reason": "below_target",
+                "target_notional": safe_target,
+                "max_loss_ratio": safe_max_loss,
+                "hard_unrealized_loss_limit": safe_hard_loss if safe_hard_loss > 0 else hard_unrealized_loss_limit,
+            }
+        )
+        return report
+
     hard_loss_active = safe_hard_loss > 0 and unrealized_pnl <= -safe_hard_loss
     if hard_loss_active:
         report.update(

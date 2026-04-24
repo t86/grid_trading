@@ -157,6 +157,28 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["reason"], "hard_unrealized_loss_limit")
         self.assertAlmostEqual(report["unrealized_pnl"], -60.0)
 
+    def test_resolve_exposure_escalation_exits_below_target_even_with_hard_loss(self) -> None:
+        state = {"exposure_escalation": {"observed_since": "2026-04-24T08:00:00+00:00"}}
+
+        report = resolve_exposure_escalation(
+            state=state,
+            enabled=True,
+            now=datetime(2026, 4, 24, 8, 2, tzinfo=timezone.utc),
+            current_long_notional=489.0,
+            current_long_qty=2676.0,
+            current_long_cost_basis_price=0.2055,
+            mid_price=0.1830,
+            trigger_notional=1000.0,
+            hold_seconds=600.0,
+            target_notional=650.0,
+            max_loss_ratio=0.012,
+            hard_unrealized_loss_limit=60.0,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "below_target")
+        self.assertIsNone(state["exposure_escalation"]["observed_since"])  # type: ignore[index]
+
     def test_resolve_exposure_escalation_clears_timer_below_threshold(self) -> None:
         state = {"exposure_escalation": {"observed_since": "2026-04-24T08:00:00+00:00"}}
 
