@@ -6715,6 +6715,18 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
     return command
 
 
+def _save_spot_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
+    config = _normalize_spot_runner_payload(payload)
+    symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
+    _save_spot_runner_control_config(config, symbol=symbol)
+    return {
+        "saved": True,
+        "symbol": symbol,
+        "config": config,
+        "runner": _read_spot_runner_process_for_symbol(symbol),
+    }
+
+
 def _cancel_spot_strategy_orders(config: dict[str, Any]) -> dict[str, Any]:
     creds = load_binance_api_credentials()
     if not creds:
@@ -18547,6 +18559,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         </label>
         <button id="preview_btn">预览静态网格</button>
         <button id="refresh_btn">刷新状态</button>
+        <button id="save_btn">保存参数不启动</button>
         <button id="start_btn" class="primary">启动策略</button>
         <button id="stop_btn">停止策略</button>
         <button id="toggle_btn">暂停自动刷新</button>
@@ -18776,6 +18789,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     const previewCardEl = document.getElementById("preview_card");
     const previewBtn = document.getElementById("preview_btn");
     const refreshBtn = document.getElementById("refresh_btn");
+    const saveBtn = document.getElementById("save_btn");
     const startBtn = document.getElementById("start_btn");
     const stopBtn = document.getElementById("stop_btn");
     const toggleBtn = document.getElementById("toggle_btn");
@@ -19030,6 +19044,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       ];
       riskSummaryEl.innerHTML = riskPills.map(([k, v]) => `<div class="pill"><div class="k">${escapeHtml(k)}</div><div class="v">${escapeHtml(v)}</div></div>`).join("");
       startBtn.textContent = runner.is_running ? "重启策略" : "启动策略";
+      saveBtn.disabled = actionPending;
       stopBtn.disabled = actionPending || !runner.is_running;
       startBtn.disabled = actionPending;
     }
@@ -19227,26 +19242,29 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     async function controlRunner(action) {
       if (actionPending) return;
       actionPending = true;
+      saveBtn.disabled = true;
       startBtn.disabled = true;
       stopBtn.disabled = true;
-      setStatus(action === "start" ? "正在启动现货策略..." : "正在停止现货策略...");
+      setStatus(action === "start" ? "正在启动现货策略..." : action === "save" ? "正在保存现货策略参数..." : "正在停止现货策略...");
       try {
         const resp = await fetch(`/api/spot_runner/${action}`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(action === "start" ? readForm() : { symbol: getSelectedSymbol() }),
+          body: JSON.stringify(action === "start" || action === "save" ? readForm() : { symbol: getSelectedSymbol() }),
         });
         const data = await resp.json();
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
         if (action === "start") {
           const cleanup = (data.cleanup && data.cleanup.canceled) ? `，启动前已清理 ${data.cleanup.canceled} 笔旧单` : "";
           setStatus(`现货策略已启动${data.restarted ? "（已重启）" : ""}${cleanup}`);
+        } else if (action === "save") {
+          setStatus(`现货策略参数已保存，未启动 · ${data.symbol || getSelectedSymbol()}`);
         } else {
           const cleanup = (data.cleanup && data.cleanup.canceled) ? `，并撤掉 ${data.cleanup.canceled} 笔策略挂单` : "";
           setStatus(`现货策略已停止${data.already_stopped ? "（原本就未运行）" : ""}${cleanup}`);
         }
       } catch (err) {
-        setStatus(`${action === "start" ? "启动" : "停止"}失败：${err}`, true);
+        setStatus(`${action === "start" ? "启动" : action === "save" ? "保存" : "停止"}失败：${err}`, true);
       } finally {
         actionPending = false;
         await loadStatus(true);
@@ -19266,6 +19284,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
       loadStatus();
       restartTimer();
     });
+    saveBtn.addEventListener("click", () => controlRunner("save"));
     startBtn.addEventListener("click", () => controlRunner("start"));
     stopBtn.addEventListener("click", () => controlRunner("stop"));
     toggleBtn.addEventListener("click", () => {
@@ -24214,6 +24233,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/grid_preview"
             or path == "/api/competition_board"
             or path == "/api/spot_runner/status"
+            or path == "/api/spot_runner/save"
         ):
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -24237,7 +24257,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if not self._authorize_request():
             return
-        if path in {"/api/spot_runner/start", "/api/spot_runner/stop"}:
+        if path in {"/api/spot_runner/start", "/api/spot_runner/stop", "/api/spot_runner/save"}:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -24261,6 +24281,8 @@ class _Handler(BaseHTTPRequestHandler):
                 if path.endswith("/start"):
                     config = _normalize_spot_runner_payload(payload)
                     result = _start_spot_runner_process(config)
+                elif path.endswith("/save"):
+                    result = _save_spot_runner_config_without_start(payload)
                 else:
                     result = _stop_spot_runner_process(payload.get("symbol"))
                 self._send_json({"ok": True, **result}, status=200)

@@ -12,6 +12,7 @@ from grid_optimizer.web import (
     _build_spot_runner_snapshot,
     _build_spot_runner_command,
     _normalize_spot_runner_payload,
+    _save_spot_runner_config_without_start,
     _start_spot_runner_process,
 )
 
@@ -21,7 +22,9 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("现货比赛执行台", SPOT_RUNNER_PAGE)
         self.assertIn('id="start_btn"', SPOT_RUNNER_PAGE)
         self.assertIn('id="stop_btn"', SPOT_RUNNER_PAGE)
+        self.assertIn('id="save_btn"', SPOT_RUNNER_PAGE)
         self.assertIn('id="strategy_mode"', SPOT_RUNNER_PAGE)
+        self.assertIn('controlRunner("save")', SPOT_RUNNER_PAGE)
         self.assertIn("Spot V1 单向做多静态网格", SPOT_RUNNER_PAGE)
         self.assertIn("现货竞赛库存网格", SPOT_RUNNER_PAGE)
         self.assertIn('id="competition_fields"', SPOT_RUNNER_PAGE)
@@ -135,6 +138,53 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(payload["threshold_position_notional"], 320.0)
         self.assertEqual(payload["max_order_position_notional"], 420.0)
         self.assertEqual(payload["max_position_notional"], 520.0)
+
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    @patch("grid_optimizer.web._save_spot_runner_control_config")
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_save_spot_runner_config_without_start_persists_config(
+        self,
+        _mock_validate_symbol,
+        mock_save_config,
+        mock_read_runner,
+    ) -> None:
+        mock_read_runner.return_value = {
+            "configured": True,
+            "pid": None,
+            "is_running": False,
+            "args": None,
+            "config": {"symbol": "VANAUSDT"},
+        }
+
+        result = _save_spot_runner_config_without_start(
+            {
+                "symbol": "vanausdt",
+                "strategy_mode": "spot_competition_inventory_grid",
+                "total_quote_budget": 300,
+                "step_price": 0.004,
+                "per_order_notional": 12,
+                "first_order_multiplier": 1.5,
+                "threshold_position_notional": 80,
+                "max_order_position_notional": 120,
+                "max_position_notional": 180,
+                "sleep_seconds": 12,
+                "rolling_hourly_loss_limit": 20,
+                "max_cumulative_notional": 30000,
+            }
+        )
+
+        self.assertTrue(result["saved"])
+        self.assertEqual(result["symbol"], "VANAUSDT")
+        self.assertFalse(result["runner"]["is_running"])
+        saved_config = mock_save_config.call_args.args[0]
+        self.assertEqual(saved_config["symbol"], "VANAUSDT")
+        self.assertEqual(saved_config["strategy_mode"], "spot_competition_inventory_grid")
+        self.assertEqual(saved_config["step_price"], 0.004)
+        self.assertEqual(saved_config["per_order_notional"], 12.0)
+        self.assertEqual(saved_config["max_position_notional"], 180.0)
+        self.assertEqual(saved_config["state_path"], "output/vanausdt_spot_state.json")
+        mock_save_config.assert_called_once()
+        self.assertEqual(mock_save_config.call_args.kwargs["symbol"], "VANAUSDT")
 
     def test_build_spot_runner_command_includes_competition_inventory_grid_arguments(self) -> None:
         config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
