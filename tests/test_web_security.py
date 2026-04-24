@@ -943,6 +943,59 @@ class WebSecurityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires symbol=ETHUSDC"):
             _runner_preset_payload("ethusdc_best_quote_long_ping_pong_v1", {"symbol": "BTCUSDC"})
 
+    def test_runner_preset_payload_applies_btcusdc_best_quote_long_profile(self) -> None:
+        payload = _runner_preset_payload("btcusdc_best_quote_long_ping_pong_v1", {"symbol": "BTCUSDC"})
+        self.assertEqual(payload["strategy_profile"], "btcusdc_best_quote_long_ping_pong_v1")
+        self.assertEqual(payload["symbol"], "BTCUSDC")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertAlmostEqual(payload["step_price"], 0.1)
+        self.assertEqual(payload["buy_levels"], 6)
+        self.assertEqual(payload["sell_levels"], 6)
+        self.assertAlmostEqual(payload["per_order_notional"], 120.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 0.0)
+        self.assertFalse(payload["flat_start_enabled"])
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 900.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 1200.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 2400.0)
+        self.assertFalse(payload["volatility_trigger_enabled"])
+        self.assertFalse(payload["volume_trigger_enabled"])
+        self.assertFalse(payload["adverse_reduce_enabled"])
+        self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
+
+    def test_runner_preset_payload_rejects_btcusdc_best_quote_long_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
+            _runner_preset_payload("btcusdc_best_quote_long_ping_pong_v1", {"symbol": "ETHUSDC"})
+
+    def test_runner_preset_payload_applies_competition_neutral_ping_pong_profiles(self) -> None:
+        cases = {
+            "soonusdt_competition_neutral_ping_pong_v1": ("SOONUSDT", 30.0, 8),
+            "btcusdc_competition_neutral_ping_pong_v1": ("BTCUSDC", 120.0, 6),
+            "ethusdc_competition_neutral_ping_pong_v1": ("ETHUSDC", 25.0, 6),
+            "xauusdt_competition_neutral_ping_pong_v1": ("XAUUSDT", 40.0, 6),
+            "xagusdt_competition_neutral_ping_pong_v1": ("XAGUSDT", 30.0, 6),
+            "clusdt_competition_neutral_ping_pong_v1": ("CLUSDT", 40.0, 6),
+            "bzusdt_competition_neutral_ping_pong_v1": ("BZUSDT", 40.0, 6),
+            "ordiusdc_competition_neutral_ping_pong_v1": ("ORDIUSDC", 25.0, 6),
+        }
+        for profile, (symbol, per_order, levels) in cases.items():
+            with self.subTest(profile=profile):
+                payload = _runner_preset_payload(profile, {"symbol": symbol})
+                self.assertEqual(payload["strategy_profile"], profile)
+                self.assertEqual(payload["symbol"], symbol)
+                self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+                self.assertEqual(payload["buy_levels"], levels)
+                self.assertEqual(payload["sell_levels"], levels)
+                self.assertAlmostEqual(payload["per_order_notional"], per_order)
+                self.assertFalse(payload["flat_start_enabled"])
+                self.assertFalse(payload["market_bias_enabled"])
+                self.assertFalse(payload["adaptive_step_enabled"])
+                self.assertAlmostEqual(payload["near_market_entry_max_center_distance_steps"], 999.0)
+                self.assertAlmostEqual(payload["take_profit_min_profit_ratio"], 0.0)
+
+    def test_runner_preset_payload_rejects_competition_neutral_ping_pong_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=XAUUSDT"):
+            _runner_preset_payload("xauusdt_competition_neutral_ping_pong_v1", {"symbol": "BTCUSDC"})
+
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
         custom_path = Path("output/test_custom_runner_presets.json")
@@ -2233,12 +2286,16 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("btcusdc_competition_maker_neutral_v1", btc_summaries)
         self.assertIn("btcusdc_competition_maker_neutral_conservative_v1", btc_summaries)
         self.assertIn("btcusdc_competition_maker_neutral_aggressive_v1", btc_summaries)
+        self.assertIn("btcusdc_competition_neutral_ping_pong_v1", btc_summaries)
+        self.assertIn("btcusdc_best_quote_long_ping_pong_v1", btc_summaries)
         self.assertNotIn("btcusdc_competition_maker_neutral_v1", xau_summaries)
         self.assertNotIn("btcusdc_competition_maker_neutral_v1", eth_summaries)
         self.assertIn("ethusdc_um_volume_long_v1", eth_summaries)
         self.assertNotIn("ethusdc_um_volume_long_v1", btc_summaries)
         self.assertIn("ethusdc_best_quote_long_ping_pong_v1", eth_summaries)
+        self.assertIn("ethusdc_competition_neutral_ping_pong_v1", eth_summaries)
         self.assertNotIn("ethusdc_best_quote_long_ping_pong_v1", btc_summaries)
+        self.assertNotIn("btcusdc_best_quote_long_ping_pong_v1", eth_summaries)
         preset = btc_summaries["btcusdc_competition_maker_neutral_v1"]
         self.assertEqual(preset["label"], "UM 冲刺赛 BTCUSDC")
         self.assertEqual(preset["config"]["symbol"], "BTCUSDC")
@@ -2254,6 +2311,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(eth_best_quote["config"]["symbol"], "ETHUSDC")
         self.assertEqual(eth_best_quote["config"]["strategy_mode"], "one_way_long")
         self.assertAlmostEqual(eth_best_quote["config"]["per_order_notional"], 25.0)
+        btc_best_quote = btc_summaries["btcusdc_best_quote_long_ping_pong_v1"]
+        self.assertEqual(btc_best_quote["config"]["symbol"], "BTCUSDC")
+        self.assertEqual(btc_best_quote["config"]["strategy_mode"], "one_way_long")
+        self.assertAlmostEqual(btc_best_quote["config"]["per_order_notional"], 120.0)
+        btc_ping_pong = btc_summaries["btcusdc_competition_neutral_ping_pong_v1"]
+        self.assertEqual(btc_ping_pong["config"]["strategy_mode"], "synthetic_neutral")
+        self.assertFalse(btc_ping_pong["config"]["flat_start_enabled"])
         conservative = btc_summaries["btcusdc_competition_maker_neutral_conservative_v1"]
         aggressive = btc_summaries["btcusdc_competition_maker_neutral_aggressive_v1"]
         self.assertEqual(conservative["label"], "UM 冲刺赛 BTCUSDC（保守）")

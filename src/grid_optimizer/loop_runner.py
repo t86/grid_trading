@@ -163,7 +163,10 @@ AUTO_REGIME_PROFILE_STEP_HINTS: dict[str, tuple[float, int]] = {
     AUTO_REGIME_DEFENSIVE_PROFILE: (0.0008, 4),
 }
 BEST_QUOTE_SHORT_PROFILE = "robo_best_quote_short_v1"
-BEST_QUOTE_LONG_PROFILE = "ethusdc_best_quote_long_ping_pong_v1"
+BEST_QUOTE_LONG_PROFILES = {
+    "ethusdc_best_quote_long_ping_pong_v1",
+    "btcusdc_best_quote_long_ping_pong_v1",
+}
 COMPETITION_RUNTIME_CACHE_KEY = "competition_inventory_grid_runtime_cache"
 COMPETITION_POSITION_QTY_EPSILON = 1e-9
 XAUT_ADAPTIVE_TRANSITION_CONFIRMATIONS = {
@@ -1897,7 +1900,11 @@ def _is_best_quote_short_profile(strategy_profile: str) -> bool:
 
 
 def _is_best_quote_long_profile(strategy_profile: str) -> bool:
-    return str(strategy_profile).strip() == BEST_QUOTE_LONG_PROFILE
+    return str(strategy_profile).strip() in BEST_QUOTE_LONG_PROFILES
+
+
+def _is_best_quote_neutral_profile(strategy_profile: str) -> bool:
+    return str(strategy_profile).strip().endswith("_competition_neutral_ping_pong_v1")
 
 
 def _startup_pending(state: dict[str, Any]) -> bool:
@@ -8485,25 +8492,37 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             threshold_timeout_active=bool(short_threshold_timeout.get("timeout_active")),
             timeout_target_notional=effective_args.pause_short_position_notional,
         )
-        take_profit_guard = apply_take_profit_profit_guard(
-            plan=plan,
-            current_long_qty=current_long_qty,
-            current_short_qty=current_short_qty,
-            current_long_avg_price=exchange_long_avg_price,
-            current_short_avg_price=exchange_short_avg_price,
-            synthetic_long_avg_price=current_long_avg_price,
-            synthetic_short_avg_price=current_short_avg_price,
-            current_long_notional=current_long_notional,
-            current_short_notional=current_short_notional,
-            pause_long_position_notional=effective_args.pause_buy_position_notional,
-            pause_short_position_notional=effective_args.pause_short_position_notional,
-            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
-            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
-            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
-            tick_size=symbol_info.get("tick_size"),
-            bid_price=bid_price,
-            ask_price=ask_price,
-        )
+        if _is_best_quote_neutral_profile(effective_strategy_profile):
+            take_profit_guard = {
+                "enabled": False,
+                "long_active": False,
+                "short_active": False,
+                "adjusted_sell_orders": 0,
+                "adjusted_buy_orders": 0,
+                "dropped_sell_orders": 0,
+                "dropped_buy_orders": 0,
+                "reason": "best_quote_neutral_near_quote",
+            }
+        else:
+            take_profit_guard = apply_take_profit_profit_guard(
+                plan=plan,
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                current_long_avg_price=exchange_long_avg_price,
+                current_short_avg_price=exchange_short_avg_price,
+                synthetic_long_avg_price=current_long_avg_price,
+                synthetic_short_avg_price=current_short_avg_price,
+                current_long_notional=current_long_notional,
+                current_short_notional=current_short_notional,
+                pause_long_position_notional=effective_args.pause_buy_position_notional,
+                pause_short_position_notional=effective_args.pause_short_position_notional,
+                threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+                threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
+                min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+                tick_size=symbol_info.get("tick_size"),
+                bid_price=bid_price,
+                ask_price=ask_price,
+            )
         active_delever = {
             "enabled": bool(long_active_delever.get("enabled")) or bool(short_active_delever.get("enabled")),
             "active": bool(long_active_delever.get("active")) or bool(short_active_delever.get("active")),
