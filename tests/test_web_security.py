@@ -925,7 +925,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["buy_levels"], 6)
         self.assertEqual(payload["sell_levels"], 6)
         self.assertAlmostEqual(payload["per_order_notional"], 25.0)
-        self.assertAlmostEqual(payload["base_position_notional"], 250.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 420.0)
         self.assertFalse(payload["flat_start_enabled"])
         self.assertAlmostEqual(payload["pause_buy_position_notional"], 900.0)
         self.assertAlmostEqual(payload["max_position_notional"], 900.0)
@@ -2311,7 +2311,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(eth_best_quote["config"]["symbol"], "ETHUSDC")
         self.assertEqual(eth_best_quote["config"]["strategy_mode"], "one_way_long")
         self.assertAlmostEqual(eth_best_quote["config"]["per_order_notional"], 25.0)
-        self.assertAlmostEqual(eth_best_quote["config"]["base_position_notional"], 250.0)
+        self.assertAlmostEqual(eth_best_quote["config"]["base_position_notional"], 420.0)
         btc_best_quote = btc_summaries["btcusdc_best_quote_long_ping_pong_v1"]
         self.assertEqual(btc_best_quote["config"]["symbol"], "BTCUSDC")
         self.assertEqual(btc_best_quote["config"]["strategy_mode"], "one_way_long")
