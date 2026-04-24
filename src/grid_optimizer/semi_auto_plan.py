@@ -831,6 +831,87 @@ def build_best_quote_short_flip_plan(
     }
 
 
+def build_best_quote_long_flip_plan(
+    *,
+    bid_price: float,
+    ask_price: float,
+    per_order_notional: float,
+    max_position_notional: float,
+    max_entry_orders: int,
+    current_long_qty: float,
+    current_long_notional: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    if bid_price <= 0 or ask_price <= 0:
+        raise ValueError("bid_price and ask_price must be > 0")
+    if per_order_notional <= 0:
+        raise ValueError("per_order_notional must be > 0")
+    if max_position_notional <= 0:
+        raise ValueError("max_position_notional must be > 0")
+    if max_entry_orders < 0:
+        raise ValueError("max_entry_orders must be >= 0")
+
+    buy_orders: list[PlanOrder] = []
+    sell_orders: list[PlanOrder] = []
+
+    buy_price = _round_order_price(bid_price, tick_size, "BUY")
+    sell_price = _round_order_price(ask_price, tick_size, "SELL")
+    current_long_qty = max(float(current_long_qty), 0.0)
+    current_long_notional = max(float(current_long_notional), 0.0)
+
+    reduce_qty = _round_order_qty(current_long_qty, step_size)
+    reduce_notional = sell_price * reduce_qty
+    if (
+        reduce_qty > 0
+        and sell_price > bid_price
+        and (min_qty is None or reduce_qty >= min_qty)
+        and (min_notional is None or reduce_notional >= min_notional)
+    ):
+        sell_orders.append(
+            _build_order(
+                side="SELL",
+                price=sell_price,
+                qty=reduce_qty,
+                level=1,
+                role="take_profit",
+            )
+        )
+
+    remaining_long_budget = max(max_position_notional - current_long_notional, 0.0)
+    entry_slots = min(int((remaining_long_budget + 1e-9) / per_order_notional), max_entry_orders)
+    entry_qty = _round_order_qty(per_order_notional / buy_price, step_size)
+    entry_notional = buy_price * entry_qty
+    if (
+        entry_qty > 0
+        and buy_price < ask_price
+        and (min_qty is None or entry_qty >= min_qty)
+        and (min_notional is None or entry_notional >= min_notional)
+    ):
+        for level in range(1, entry_slots + 1):
+            buy_orders.append(
+                _build_order(
+                    side="BUY",
+                    price=buy_price,
+                    qty=entry_qty,
+                    level=level,
+                    role="entry",
+                )
+            )
+
+    return {
+        "buy_orders": [order.__dict__ for order in buy_orders],
+        "sell_orders": [order.__dict__ for order in sell_orders],
+        "bootstrap_orders": [],
+        "target_base_qty": 0.0,
+        "bootstrap_qty": 0.0,
+        "active_buy_order_count": len(buy_orders),
+        "active_sell_order_count": len(sell_orders),
+    }
+
+
 def build_hedge_micro_grid_plan(
     *,
     center_price: float,

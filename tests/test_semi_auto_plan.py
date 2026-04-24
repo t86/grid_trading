@@ -4,6 +4,7 @@ import multiprocessing as mp
 import unittest
 
 from grid_optimizer.semi_auto_plan import (
+    build_best_quote_long_flip_plan,
     build_hedge_micro_grid_plan,
     build_inventory_target_neutral_plan,
     build_micro_grid_plan,
@@ -38,6 +39,53 @@ class SemiAutoPlanTests(unittest.TestCase):
         if status != "ok":
             self.fail(payload)
         return payload
+
+    def test_build_best_quote_long_flip_plan_places_near_quote_ping_pong(self) -> None:
+        plan = build_best_quote_long_flip_plan(
+            bid_price=2329.99,
+            ask_price=2330.00,
+            per_order_notional=25.0,
+            max_position_notional=900.0,
+            max_entry_orders=3,
+            current_long_qty=0.107,
+            current_long_notional=249.0,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=20.0,
+        )
+
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["side"], "SELL")
+        self.assertEqual(plan["sell_orders"][0]["price"], 2330.0)
+        self.assertEqual(plan["sell_orders"][0]["qty"], 0.107)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit")
+        self.assertEqual(len(plan["buy_orders"]), 3)
+        for order in plan["buy_orders"]:
+            self.assertEqual(order["side"], "BUY")
+            self.assertEqual(order["price"], 2329.99)
+            self.assertEqual(order["qty"], 0.01)
+            self.assertEqual(order["role"], "entry")
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["target_base_qty"], 0.0)
+
+    def test_build_best_quote_long_flip_plan_skips_sell_without_inventory(self) -> None:
+        plan = build_best_quote_long_flip_plan(
+            bid_price=2329.99,
+            ask_price=2330.00,
+            per_order_notional=25.0,
+            max_position_notional=900.0,
+            max_entry_orders=2,
+            current_long_qty=0.0,
+            current_long_notional=0.0,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=20.0,
+        )
+
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 2)
 
     def test_shift_center_price_moves_down_and_up_in_steps(self) -> None:
         new_center, moves = shift_center_price(
