@@ -61,11 +61,12 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["price"], 2330.0)
         self.assertEqual(plan["sell_orders"][0]["qty"], 0.01)
         self.assertEqual(plan["sell_orders"][0]["role"], "take_profit")
+        self.assertEqual(plan["sell_orders"][1]["price"], 2330.01)
         self.assertEqual(plan["sell_orders"][1]["qty"], 0.01)
         self.assertEqual(len(plan["buy_orders"]), 3)
-        for order in plan["buy_orders"]:
+        for index, order in enumerate(plan["buy_orders"]):
             self.assertEqual(order["side"], "BUY")
-            self.assertEqual(order["price"], 2329.99)
+            self.assertAlmostEqual(order["price"], 2329.99 - (index * 0.01))
             self.assertEqual(order["qty"], 0.01)
             self.assertEqual(order["role"], "entry")
         self.assertEqual(plan["bootstrap_orders"], [])

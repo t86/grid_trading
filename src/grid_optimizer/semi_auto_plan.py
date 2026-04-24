@@ -862,27 +862,37 @@ def build_best_quote_long_flip_plan(
 
     buy_price = _round_order_price(bid_price, tick_size, "BUY")
     sell_price = _round_order_price(ask_price, tick_size, "SELL")
+    quote_step = float(tick_size) if tick_size is not None and tick_size > 0 else 0.0
+
+    def _quote_price(base_price: float, *, level: int, side: str) -> float:
+        if quote_step <= 0:
+            return base_price
+        direction = -1 if side.upper() == "BUY" else 1
+        raw_price = Decimal(str(base_price)) + (Decimal(direction) * Decimal(level - 1) * Decimal(str(quote_step)))
+        return _round_order_price(float(raw_price), tick_size, side)
+
     current_long_qty = max(float(current_long_qty), 0.0)
     current_long_notional = max(float(current_long_notional), 0.0)
 
     remaining_reduce_qty = _round_order_qty(current_long_qty, step_size)
-    reduce_order_qty = _round_order_qty(per_order_notional / sell_price, step_size)
     for level in range(1, max_exit_orders + 1):
         if remaining_reduce_qty <= 0:
             break
+        level_sell_price = _quote_price(sell_price, level=level, side="SELL")
+        reduce_order_qty = _round_order_qty(per_order_notional / level_sell_price, step_size)
         reduce_qty = min(reduce_order_qty, remaining_reduce_qty)
         reduce_qty = _round_order_qty(reduce_qty, step_size)
-        reduce_notional = sell_price * reduce_qty
+        reduce_notional = level_sell_price * reduce_qty
         if (
             reduce_qty > 0
-            and sell_price > bid_price
+            and level_sell_price > bid_price
             and (min_qty is None or reduce_qty >= min_qty)
             and (min_notional is None or reduce_notional >= min_notional)
         ):
             sell_orders.append(
                 _build_order(
                     side="SELL",
-                    price=sell_price,
+                    price=level_sell_price,
                     qty=reduce_qty,
                     level=level,
                     role="take_profit",
@@ -892,19 +902,20 @@ def build_best_quote_long_flip_plan(
 
     remaining_long_budget = max(max_position_notional - current_long_notional, 0.0)
     entry_slots = min(int((remaining_long_budget + 1e-9) / per_order_notional), max_entry_orders)
-    entry_qty = _round_order_qty(per_order_notional / buy_price, step_size)
-    entry_notional = buy_price * entry_qty
-    if (
-        entry_qty > 0
-        and buy_price < ask_price
-        and (min_qty is None or entry_qty >= min_qty)
-        and (min_notional is None or entry_notional >= min_notional)
-    ):
-        for level in range(1, entry_slots + 1):
+    for level in range(1, entry_slots + 1):
+        level_buy_price = _quote_price(buy_price, level=level, side="BUY")
+        entry_qty = _round_order_qty(per_order_notional / level_buy_price, step_size)
+        entry_notional = level_buy_price * entry_qty
+        if (
+            entry_qty > 0
+            and level_buy_price < ask_price
+            and (min_qty is None or entry_qty >= min_qty)
+            and (min_notional is None or entry_notional >= min_notional)
+        ):
             buy_orders.append(
                 _build_order(
                     side="BUY",
-                    price=buy_price,
+                    price=level_buy_price,
                     qty=entry_qty,
                     level=level,
                     role="entry",
