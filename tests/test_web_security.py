@@ -1968,6 +1968,48 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--rolling-hourly-loss-limit", command)
         self.assertIn("--max-cumulative-notional", command)
 
+    def test_build_runner_command_includes_adverse_reduce_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "SOONUSDT",
+                "strategy_profile": "soon_volume_neutral_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0003,
+                "buy_levels": 12,
+                "sell_levels": 12,
+                "per_order_notional": 90.0,
+                "base_position_notional": 0.0,
+                "adverse_reduce_enabled": True,
+                "adverse_reduce_short_trigger_ratio": 0.008,
+                "adverse_reduce_long_trigger_ratio": 0.01,
+                "adverse_reduce_target_ratio": 0.65,
+                "adverse_reduce_maker_timeout_seconds": 20.0,
+                "adverse_reduce_max_order_notional": 240.0,
+                "adverse_reduce_keep_probe_scale": 0.08,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 40,
+                "max_total_notional": 1800.0,
+                "sleep_seconds": 4,
+                "state_path": "output/soonusdt_loop_state.json",
+                "plan_json": "output/soonusdt_loop_latest_plan.json",
+                "submit_report_json": "output/soonusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/soonusdt_loop_events.jsonl",
+            }
+        )
+
+        self.assertIn("--adverse-reduce-enabled", command)
+        self.assertIn("--adverse-reduce-short-trigger-ratio", command)
+        self.assertIn("0.008", command)
+        self.assertIn("--adverse-reduce-long-trigger-ratio", command)
+        self.assertIn("--adverse-reduce-target-ratio", command)
+        self.assertIn("--adverse-reduce-maker-timeout-seconds", command)
+        self.assertIn("--adverse-reduce-max-order-notional", command)
+        self.assertIn("--adverse-reduce-keep-probe-scale", command)
+
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:
         mock_preview.return_value = {

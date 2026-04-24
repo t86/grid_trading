@@ -993,6 +993,45 @@ def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: 
     return 0.0
 
 
+def _resolve_adverse_reduce_cost_basis(
+    *,
+    side: str,
+    requested_strategy_mode: str,
+    actual_net_qty: float,
+    actual_cost_basis_price: float,
+    long_position: dict[str, Any],
+    short_position: dict[str, Any],
+    synthetic_ledger_snapshot: dict[str, Any] | None,
+) -> tuple[float, str | None]:
+    normalized_side = str(side or "").strip().lower()
+    synthetic_snapshot = synthetic_ledger_snapshot or {}
+    normalized_mode = str(requested_strategy_mode or "").strip()
+    if normalized_side == "long":
+        if normalized_mode == "hedge_neutral":
+            actual_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
+            actual_long_price = _position_cost_basis_price(long_position)
+            if actual_long_qty > 1e-12 and actual_long_price > 0:
+                return actual_long_price, "actual_position_long"
+        elif actual_net_qty > 1e-12 and actual_cost_basis_price > 0:
+            return actual_cost_basis_price, "actual_position"
+        synthetic_long_price = max(_safe_float(synthetic_snapshot.get("virtual_long_avg_price")), 0.0)
+        if synthetic_long_price > 0:
+            return synthetic_long_price, "synthetic_ledger"
+        return 0.0, None
+
+    if normalized_mode == "hedge_neutral":
+        actual_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
+        actual_short_price = _position_cost_basis_price(short_position)
+        if actual_short_qty > 1e-12 and actual_short_price > 0:
+            return actual_short_price, "actual_position_short"
+    elif actual_net_qty < -1e-12 and actual_cost_basis_price > 0:
+        return actual_cost_basis_price, "actual_position"
+    synthetic_short_price = max(_safe_float(synthetic_snapshot.get("virtual_short_avg_price")), 0.0)
+    if synthetic_short_price > 0:
+        return synthetic_short_price, "synthetic_ledger"
+    return 0.0, None
+
+
 def _order_position_side(order: dict[str, Any]) -> str:
     return str(order.get("position_side", order.get("positionSide", "BOTH"))).upper().strip() or "BOTH"
 
@@ -4030,6 +4069,299 @@ def _estimate_short_delever_cost(
     return total_cost
 
 
+def assess_adverse_inventory_reduce(
+    *,
+    enabled: bool,
+    mid_price: float,
+    current_long_qty: float,
+    current_long_notional: float,
+    current_short_qty: float,
+    current_short_notional: float,
+    current_long_cost_price: float,
+    current_short_cost_price: float,
+    current_long_cost_basis_source: str | None,
+    current_short_cost_basis_source: str | None,
+    pause_long_position_notional: float | None,
+    pause_short_position_notional: float | None,
+    long_trigger_ratio: float | None,
+    short_trigger_ratio: float | None,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "active": False,
+        "direction": None,
+        "blocked_reason": None,
+        "long_active": False,
+        "short_active": False,
+        "long_cost_basis_source": current_long_cost_basis_source,
+        "short_cost_basis_source": current_short_cost_basis_source,
+        "long_cost_price": current_long_cost_price,
+        "short_cost_price": current_short_cost_price,
+        "long_adverse_ratio": None,
+        "short_adverse_ratio": None,
+        "long_trigger_ratio": max(_safe_float(long_trigger_ratio), 0.0),
+        "short_trigger_ratio": max(_safe_float(short_trigger_ratio), 0.0),
+        "target_ratio": 0.0,
+        "maker_timeout_seconds": 0.0,
+        "long_elapsed_seconds": 0.0,
+        "short_elapsed_seconds": 0.0,
+        "long_aggressive": False,
+        "short_aggressive": False,
+        "long_target_notional": None,
+        "short_target_notional": None,
+        "long_reduce_notional": 0.0,
+        "short_reduce_notional": 0.0,
+        "placed_reduce_orders": 0,
+        "forced_reduce_orders": [],
+    }
+    if not enabled:
+        return report
+
+    safe_mid_price = max(_safe_float(mid_price), 0.0)
+    long_pause = max(_safe_float(pause_long_position_notional), 0.0)
+    short_pause = max(_safe_float(pause_short_position_notional), 0.0)
+    safe_long_cost = max(_safe_float(current_long_cost_price), 0.0)
+    safe_short_cost = max(_safe_float(current_short_cost_price), 0.0)
+    long_ratio = ((safe_long_cost - safe_mid_price) / safe_long_cost) if safe_long_cost > 0 and safe_mid_price > 0 else None
+    short_ratio = ((safe_mid_price - safe_short_cost) / safe_short_cost) if safe_short_cost > 0 and safe_mid_price > 0 else None
+    report["long_adverse_ratio"] = long_ratio
+    report["short_adverse_ratio"] = short_ratio
+    blocked_reasons: list[str] = []
+
+    if (
+        max(_safe_float(current_long_qty), 0.0) > 1e-12
+        and long_pause > 0
+        and max(_safe_float(current_long_notional), 0.0) > long_pause
+    ):
+        if safe_long_cost <= 0:
+            blocked_reasons.append("long_cost_basis_missing")
+        elif report["long_trigger_ratio"] <= 0:
+            blocked_reasons.append("long_trigger_ratio_disabled")
+        elif long_ratio is not None and long_ratio >= report["long_trigger_ratio"]:
+            report["long_active"] = True
+        else:
+            blocked_reasons.append("long_adverse_ratio_below_trigger")
+
+    if (
+        max(_safe_float(current_short_qty), 0.0) > 1e-12
+        and short_pause > 0
+        and max(_safe_float(current_short_notional), 0.0) > short_pause
+    ):
+        if safe_short_cost <= 0:
+            blocked_reasons.append("short_cost_basis_missing")
+        elif report["short_trigger_ratio"] <= 0:
+            blocked_reasons.append("short_trigger_ratio_disabled")
+        elif short_ratio is not None and short_ratio >= report["short_trigger_ratio"]:
+            report["short_active"] = True
+        else:
+            blocked_reasons.append("short_adverse_ratio_below_trigger")
+
+    report["active"] = bool(report["long_active"] or report["short_active"])
+    if report["long_active"] and report["short_active"]:
+        report["direction"] = "both"
+    elif report["long_active"]:
+        report["direction"] = "long"
+    elif report["short_active"]:
+        report["direction"] = "short"
+    elif blocked_reasons:
+        report["blocked_reason"] = blocked_reasons[0]
+    return report
+
+
+def resolve_adverse_reduce_probe_scale_override(
+    *,
+    enabled: bool,
+    keep_probe_scale: float | None,
+    mid_price: float,
+    current_long_qty: float,
+    current_long_notional: float,
+    current_short_qty: float,
+    current_short_notional: float,
+    current_long_cost_price: float,
+    current_short_cost_price: float,
+    pause_long_position_notional: float | None,
+    pause_short_position_notional: float | None,
+    long_trigger_ratio: float | None,
+    short_trigger_ratio: float | None,
+) -> float | None:
+    if keep_probe_scale is None or not enabled:
+        return None
+    report = assess_adverse_inventory_reduce(
+        enabled=True,
+        mid_price=mid_price,
+        current_long_qty=current_long_qty,
+        current_long_notional=current_long_notional,
+        current_short_qty=current_short_qty,
+        current_short_notional=current_short_notional,
+        current_long_cost_price=current_long_cost_price,
+        current_short_cost_price=current_short_cost_price,
+        current_long_cost_basis_source="current_avg_price" if _safe_float(current_long_cost_price) > 0 else None,
+        current_short_cost_basis_source="current_avg_price" if _safe_float(current_short_cost_price) > 0 else None,
+        pause_long_position_notional=pause_long_position_notional,
+        pause_short_position_notional=pause_short_position_notional,
+        long_trigger_ratio=long_trigger_ratio,
+        short_trigger_ratio=short_trigger_ratio,
+    )
+    if not report.get("short_active"):
+        return None
+    return min(max(_safe_float(keep_probe_scale), 0.0), 1.0)
+
+
+def _parse_adverse_reduce_time(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _build_adverse_reduce_order(
+    *,
+    side: str,
+    price: float,
+    reduce_notional: float,
+    available_qty: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    aggressive: bool,
+) -> dict[str, Any] | None:
+    normalized_side = str(side or "").upper().strip()
+    rounded_price = _round_order_price(max(_safe_float(price), 0.0), tick_size, normalized_side)
+    if rounded_price is None or rounded_price <= 0:
+        return None
+    max_qty = max(_safe_float(available_qty), 0.0)
+    desired_qty = _round_order_qty(min(max_qty, max(_safe_float(reduce_notional), 0.0) / rounded_price), step_size)
+    if desired_qty <= 0 or desired_qty - max(_safe_float(min_qty), 0.0) < -1e-12:
+        return None
+    notional = desired_qty * rounded_price
+    if max(_safe_float(min_notional), 0.0) > 0 and notional + 1e-12 < max(_safe_float(min_notional), 0.0):
+        return None
+    return {
+        "side": normalized_side,
+        "price": rounded_price,
+        "qty": desired_qty,
+        "notional": notional,
+        "role": "adverse_reduce_long" if normalized_side == "SELL" else "adverse_reduce_short",
+        "position_side": "BOTH",
+        "force_reduce_only": True,
+        "execution_type": "aggressive" if aggressive else "maker",
+        "time_in_force": "GTC" if aggressive else "GTX",
+    }
+
+
+def apply_adverse_inventory_reduce(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    report: dict[str, Any],
+    now: datetime,
+    current_long_qty: float,
+    current_long_notional: float,
+    current_short_qty: float,
+    current_short_notional: float,
+    pause_long_position_notional: float | None,
+    pause_short_position_notional: float | None,
+    target_ratio: float,
+    max_order_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    maker_timeout_seconds: float = 60.0,
+) -> dict[str, Any]:
+    state_key = "adverse_inventory_reduce"
+    safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    timeout_seconds = max(_safe_float(maker_timeout_seconds), 0.0)
+    safe_target_ratio = max(_safe_float(target_ratio), 0.0)
+    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
+    adverse_report = dict(report or {})
+    adverse_report.setdefault("enabled", False)
+    adverse_report["target_ratio"] = safe_target_ratio
+    adverse_report["maker_timeout_seconds"] = timeout_seconds
+    adverse_report["placed_reduce_orders"] = 0
+    adverse_report["forced_reduce_orders"] = []
+    adverse_report["long_elapsed_seconds"] = 0.0
+    adverse_report["short_elapsed_seconds"] = 0.0
+    adverse_report["long_aggressive"] = False
+    adverse_report["short_aggressive"] = False
+    adverse_report["long_target_notional"] = None
+    adverse_report["short_target_notional"] = None
+    adverse_report["long_reduce_notional"] = 0.0
+    adverse_report["short_reduce_notional"] = 0.0
+    plan["forced_reduce_orders"] = []
+
+    if not adverse_report.get("enabled"):
+        state.pop(state_key, None)
+        return adverse_report
+
+    timeout_state = dict(state.get(state_key) or {})
+
+    def _apply_side(*, side_key: str, current_qty: float, current_notional: float, pause_notional: float | None) -> None:
+        normalized_key = side_key.strip().lower()
+        is_long = normalized_key == "long"
+        if not adverse_report.get(f"{normalized_key}_active"):
+            timeout_state[f"{normalized_key}_entered_at"] = None
+            return
+
+        entered_at = _parse_adverse_reduce_time(timeout_state.get(f"{normalized_key}_entered_at")) or safe_now
+        elapsed = max((safe_now - entered_at).total_seconds(), 0.0)
+        aggressive = timeout_seconds > 0 and elapsed >= timeout_seconds
+        timeout_state[f"{normalized_key}_entered_at"] = _isoformat(entered_at)
+        target_notional = max(_safe_float(pause_notional), 0.0) * safe_target_ratio
+        reduce_notional = max(_safe_float(current_notional) - target_notional, 0.0)
+        if safe_max_order_notional > 0:
+            reduce_notional = min(reduce_notional, safe_max_order_notional)
+        order = _build_adverse_reduce_order(
+            side="SELL" if is_long else "BUY",
+            price=(bid_price if aggressive else ask_price) if is_long else (ask_price if aggressive else bid_price),
+            reduce_notional=reduce_notional,
+            available_qty=current_qty,
+            tick_size=tick_size,
+            step_size=step_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            aggressive=aggressive,
+        )
+        adverse_report[f"{normalized_key}_elapsed_seconds"] = elapsed
+        adverse_report[f"{normalized_key}_aggressive"] = aggressive
+        adverse_report[f"{normalized_key}_target_notional"] = target_notional
+        adverse_report[f"{normalized_key}_reduce_notional"] = reduce_notional
+        if order is None:
+            adverse_report["blocked_reason"] = adverse_report.get("blocked_reason") or f"{normalized_key}_reduce_order_below_min_constraints"
+            return
+        target_key = "sell_orders" if is_long else "buy_orders"
+        plan[target_key] = [order, *list(plan.get(target_key, []))]
+        plan["forced_reduce_orders"].append(order)
+        adverse_report["forced_reduce_orders"].append(order)
+        adverse_report["placed_reduce_orders"] = int(adverse_report.get("placed_reduce_orders") or 0) + 1
+
+    _apply_side(
+        side_key="long",
+        current_qty=current_long_qty,
+        current_notional=current_long_notional,
+        pause_notional=pause_long_position_notional,
+    )
+    _apply_side(
+        side_key="short",
+        current_qty=current_short_qty,
+        current_notional=current_short_notional,
+        pause_notional=pause_short_position_notional,
+    )
+    if plan["forced_reduce_orders"]:
+        timeout_state["last_checked_at"] = _isoformat(safe_now)
+        state[state_key] = timeout_state
+    else:
+        state.pop(state_key, None)
+    return adverse_report
+
+
 def _project_nearest_long_non_loss_exit_price(
     *,
     current_long_lots: list[dict[str, Any]],
@@ -6651,6 +6983,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "placed_notional": 0.0,
         "blocked_reason": "not_evaluated",
     }
+    adverse_inventory_reduce: dict[str, Any] = {
+        "enabled": bool(getattr(args, "adverse_reduce_enabled", False)),
+        "active": False,
+        "direction": None,
+        "blocked_reason": "not_evaluated",
+        "placed_reduce_orders": 0,
+        "forced_reduce_orders": [],
+    }
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
@@ -7412,8 +7752,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
             and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
         )
+        adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
+            enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
+            keep_probe_scale=getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
+            mid_price=mid_price,
+            current_long_qty=current_long_qty,
+            current_long_notional=current_long_notional,
+            current_short_qty=current_short_qty,
+            current_short_notional=current_short_notional,
+            current_long_cost_price=current_long_avg_price,
+            current_short_cost_price=current_short_avg_price,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            long_trigger_ratio=getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
+            short_trigger_ratio=getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
+        )
         inventory_short_probe_scale = (
-            _clamp_ratio(float(getattr(effective_args, "inventory_pause_short_probe_scale", 0.25)))
+            _clamp_ratio(
+                float(
+                    adverse_short_probe_scale_override
+                    if adverse_short_probe_scale_override is not None
+                    else getattr(effective_args, "inventory_pause_short_probe_scale", 0.25)
+                )
+            )
             if inventory_short_pause_active
             else 0.0
         )
@@ -7559,8 +7920,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
             and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
         )
+        adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
+            enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
+            keep_probe_scale=getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
+            mid_price=mid_price,
+            current_long_qty=current_long_qty,
+            current_long_notional=current_long_notional,
+            current_short_qty=current_short_qty,
+            current_short_notional=current_short_notional,
+            current_long_cost_price=current_long_avg_price,
+            current_short_cost_price=current_short_avg_price,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            long_trigger_ratio=getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
+            short_trigger_ratio=getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
+        )
         inventory_short_probe_scale = (
-            _clamp_ratio(float(getattr(effective_args, "inventory_pause_short_probe_scale", 0.25)))
+            _clamp_ratio(
+                float(
+                    adverse_short_probe_scale_override
+                    if adverse_short_probe_scale_override is not None
+                    else getattr(effective_args, "inventory_pause_short_probe_scale", 0.25)
+                )
+            )
             if inventory_short_pause_active
             else 0.0
         )
@@ -8225,6 +8607,62 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         bootstrap_qty = _safe_float(plan.get("bootstrap_qty", bootstrap_qty))
 
+    adverse_long_cost_price, adverse_long_cost_basis_source = _resolve_adverse_reduce_cost_basis(
+        side="long",
+        requested_strategy_mode=requested_strategy_mode,
+        actual_net_qty=actual_net_qty,
+        actual_cost_basis_price=actual_cost_basis_price,
+        long_position=long_position,
+        short_position=short_position,
+        synthetic_ledger_snapshot=synthetic_ledger_snapshot,
+    )
+    adverse_short_cost_price, adverse_short_cost_basis_source = _resolve_adverse_reduce_cost_basis(
+        side="short",
+        requested_strategy_mode=requested_strategy_mode,
+        actual_net_qty=actual_net_qty,
+        actual_cost_basis_price=actual_cost_basis_price,
+        long_position=long_position,
+        short_position=short_position,
+        synthetic_ledger_snapshot=synthetic_ledger_snapshot,
+    )
+    adverse_inventory_reduce = assess_adverse_inventory_reduce(
+        enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
+        mid_price=mid_price,
+        current_long_qty=current_long_qty,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_qty=current_short_qty,
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        current_long_cost_price=adverse_long_cost_price,
+        current_short_cost_price=adverse_short_cost_price,
+        current_long_cost_basis_source=adverse_long_cost_basis_source,
+        current_short_cost_basis_source=adverse_short_cost_basis_source,
+        pause_long_position_notional=effective_args.pause_buy_position_notional,
+        pause_short_position_notional=effective_args.pause_short_position_notional,
+        long_trigger_ratio=getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
+        short_trigger_ratio=getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
+    )
+    adverse_inventory_reduce = apply_adverse_inventory_reduce(
+        plan=plan,
+        state=state,
+        report=adverse_inventory_reduce,
+        now=plan_now,
+        current_long_qty=current_long_qty,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_qty=current_short_qty,
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        pause_long_position_notional=effective_args.pause_buy_position_notional,
+        pause_short_position_notional=effective_args.pause_short_position_notional,
+        target_ratio=getattr(effective_args, "adverse_reduce_target_ratio", 0.75),
+        max_order_notional=getattr(effective_args, "adverse_reduce_max_order_notional", 0.0),
+        bid_price=bid_price,
+        ask_price=ask_price,
+        tick_size=symbol_info.get("tick_size"),
+        step_size=symbol_info.get("step_size"),
+        min_qty=symbol_info.get("min_qty"),
+        min_notional=symbol_info.get("min_notional"),
+        maker_timeout_seconds=getattr(effective_args, "adverse_reduce_maker_timeout_seconds", 45.0),
+    )
+
     volume_long_v4_open_orders = (
         _decorate_volume_long_v4_open_orders(open_orders)
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long"
@@ -8350,6 +8788,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "adaptive_step": adaptive_step,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
+        "adverse_inventory_reduce": adverse_inventory_reduce,
         "take_profit_guard": take_profit_guard,
         "volume_long_v4_delever": volume_long_v4_delever,
         "volume_long_v4_flow_sleeve": volume_long_v4_flow_sleeve,
@@ -8381,6 +8820,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_pause_buy_position_notional": getattr(effective_args, "pause_buy_position_notional", None),
         "effective_pause_short_position_notional": getattr(effective_args, "pause_short_position_notional", None),
         "effective_inventory_pause_short_probe_scale": getattr(effective_args, "inventory_pause_short_probe_scale", None),
+        "effective_adverse_reduce_enabled": bool(getattr(effective_args, "adverse_reduce_enabled", False)),
+        "effective_adverse_reduce_long_trigger_ratio": getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
+        "effective_adverse_reduce_short_trigger_ratio": getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
+        "effective_adverse_reduce_target_ratio": getattr(effective_args, "adverse_reduce_target_ratio", None),
+        "effective_adverse_reduce_maker_timeout_seconds": getattr(effective_args, "adverse_reduce_maker_timeout_seconds", None),
+        "effective_adverse_reduce_max_order_notional": getattr(effective_args, "adverse_reduce_max_order_notional", None),
+        "effective_adverse_reduce_keep_probe_scale": getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
         "effective_short_threshold_timeout_seconds": getattr(effective_args, "short_threshold_timeout_seconds", None),
         "effective_synthetic_residual_long_flat_notional": getattr(
             effective_args,
@@ -8923,6 +9369,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--near-market-reentry-confirm-cycles", type=int, default=2)
     parser.add_argument("--threshold-reduce-target-ratio", type=float, default=0.0)
     parser.add_argument("--threshold-reduce-taker-timeout-seconds", type=float, default=60.0)
+    parser.add_argument("--adverse-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--adverse-reduce-short-trigger-ratio", type=float, default=0.01)
+    parser.add_argument("--adverse-reduce-long-trigger-ratio", type=float, default=0.01)
+    parser.add_argument("--adverse-reduce-target-ratio", type=float, default=0.75)
+    parser.add_argument("--adverse-reduce-maker-timeout-seconds", type=float, default=45.0)
+    parser.add_argument("--adverse-reduce-max-order-notional", type=float, default=0.0)
+    parser.add_argument("--adverse-reduce-keep-probe-scale", type=float, default=None)
     parser.add_argument("--max-order-position-notional", type=float, default=80.0)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -9371,6 +9824,18 @@ def main() -> None:
         raise SystemExit("--near-market-reentry-confirm-cycles must be > 0")
     if args.short_threshold_timeout_seconds < 0:
         raise SystemExit("--short-threshold-timeout-seconds must be >= 0")
+    if args.adverse_reduce_short_trigger_ratio < 0 or args.adverse_reduce_long_trigger_ratio < 0:
+        raise SystemExit("--adverse-reduce-*-trigger-ratio must be >= 0")
+    if args.adverse_reduce_target_ratio < 0 or args.adverse_reduce_target_ratio >= 1:
+        raise SystemExit("--adverse-reduce-target-ratio must be >= 0 and < 1")
+    if args.adverse_reduce_maker_timeout_seconds < 0:
+        raise SystemExit("--adverse-reduce-maker-timeout-seconds must be >= 0")
+    if args.adverse_reduce_max_order_notional < 0:
+        raise SystemExit("--adverse-reduce-max-order-notional must be >= 0")
+    if args.adverse_reduce_keep_probe_scale is not None and (
+        args.adverse_reduce_keep_probe_scale < 0 or args.adverse_reduce_keep_probe_scale > 1
+    ):
+        raise SystemExit("--adverse-reduce-keep-probe-scale must be within [0, 1]")
     if args.max_order_position_notional < 0:
         raise SystemExit("--max-order-position-notional must be >= 0")
     if args.max_position_notional is not None and args.max_position_notional <= 0:
@@ -9771,6 +10236,20 @@ def main() -> None:
                 "take_profit_guard": dict(plan_report.get("take_profit_guard") or {}),
                 "volume_long_v4_delever": dict(plan_report.get("volume_long_v4_delever") or {}),
                 "volume_long_v4_flow_sleeve": dict(plan_report.get("volume_long_v4_flow_sleeve") or {}),
+                "adverse_reduce_enabled": bool((plan_report.get("adverse_inventory_reduce") or {}).get("enabled")),
+                "adverse_reduce_active": bool((plan_report.get("adverse_inventory_reduce") or {}).get("active")),
+                "adverse_reduce_direction": str(
+                    ((plan_report.get("adverse_inventory_reduce") or {}).get("direction", "") or "")
+                ),
+                "adverse_reduce_blocked_reason": (
+                    (plan_report.get("adverse_inventory_reduce") or {}).get("blocked_reason")
+                ),
+                "adverse_reduce_short_adverse_ratio": _safe_float(
+                    (plan_report.get("adverse_inventory_reduce") or {}).get("short_adverse_ratio")
+                ),
+                "adverse_reduce_placed_reduce_orders": int(
+                    ((plan_report.get("adverse_inventory_reduce") or {}).get("placed_reduce_orders", 0) or 0)
+                ),
                 "inventory_tier_active": bool((plan_report.get("inventory_tier") or {}).get("active")),
                 "inventory_tier_ratio": _safe_float((plan_report.get("inventory_tier") or {}).get("ratio")),
                 "volatility_buy_pause": bool((plan_report.get("market_guard") or {}).get("buy_pause_active")),

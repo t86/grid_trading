@@ -1721,6 +1721,13 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "synthetic_flow_sleeve_levels": 2,
     "synthetic_flow_sleeve_order_notional": None,
     "synthetic_flow_sleeve_max_loss_ratio": 0.0025,
+    "adverse_reduce_enabled": False,
+    "adverse_reduce_short_trigger_ratio": 0.01,
+    "adverse_reduce_long_trigger_ratio": 0.01,
+    "adverse_reduce_target_ratio": 0.75,
+    "adverse_reduce_maker_timeout_seconds": 45.0,
+    "adverse_reduce_max_order_notional": 0.0,
+    "adverse_reduce_keep_probe_scale": None,
     "volume_long_v4_flow_sleeve_enabled": False,
     "volume_long_v4_flow_sleeve_trigger_notional": None,
     "volume_long_v4_flow_sleeve_reduce_to_notional": None,
@@ -3981,6 +3988,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_flow_sleeve_notional",
         "synthetic_flow_sleeve_order_notional",
         "synthetic_flow_sleeve_max_loss_ratio",
+        "adverse_reduce_short_trigger_ratio",
+        "adverse_reduce_long_trigger_ratio",
+        "adverse_reduce_target_ratio",
+        "adverse_reduce_maker_timeout_seconds",
+        "adverse_reduce_max_order_notional",
+        "adverse_reduce_keep_probe_scale",
         "volume_long_v4_flow_sleeve_trigger_notional",
         "volume_long_v4_flow_sleeve_reduce_to_notional",
         "volume_long_v4_flow_sleeve_notional",
@@ -4057,6 +4070,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_enabled",
         "synthetic_trend_follow_enabled",
         "synthetic_flow_sleeve_enabled",
+        "adverse_reduce_enabled",
         "volume_long_v4_flow_sleeve_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
@@ -4120,6 +4134,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_flow_sleeve_trigger_notional",
         "synthetic_flow_sleeve_order_notional",
         "synthetic_flow_sleeve_max_loss_ratio",
+        "adverse_reduce_keep_probe_scale",
         "volume_long_v4_flow_sleeve_trigger_notional",
         "volume_long_v4_flow_sleeve_reduce_to_notional",
         "volume_long_v4_flow_sleeve_order_notional",
@@ -4456,6 +4471,19 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--threshold-position-notional", str(config["threshold_position_notional"])])
     if config.get("short_threshold_timeout_seconds") is not None:
         command.extend(["--short-threshold-timeout-seconds", str(config["short_threshold_timeout_seconds"])])
+    command.append("--adverse-reduce-enabled" if config.get("adverse_reduce_enabled", False) else "--no-adverse-reduce-enabled")
+    if config.get("adverse_reduce_short_trigger_ratio") is not None:
+        command.extend(["--adverse-reduce-short-trigger-ratio", str(config["adverse_reduce_short_trigger_ratio"])])
+    if config.get("adverse_reduce_long_trigger_ratio") is not None:
+        command.extend(["--adverse-reduce-long-trigger-ratio", str(config["adverse_reduce_long_trigger_ratio"])])
+    if config.get("adverse_reduce_target_ratio") is not None:
+        command.extend(["--adverse-reduce-target-ratio", str(config["adverse_reduce_target_ratio"])])
+    if config.get("adverse_reduce_maker_timeout_seconds") is not None:
+        command.extend(["--adverse-reduce-maker-timeout-seconds", str(config["adverse_reduce_maker_timeout_seconds"])])
+    if config.get("adverse_reduce_max_order_notional") is not None:
+        command.extend(["--adverse-reduce-max-order-notional", str(config["adverse_reduce_max_order_notional"])])
+    if config.get("adverse_reduce_keep_probe_scale") is not None:
+        command.extend(["--adverse-reduce-keep-probe-scale", str(config["adverse_reduce_keep_probe_scale"])])
     if str(config.get("strategy_mode", "")).strip() == "competition_inventory_grid":
         if config.get("first_order_multiplier") is not None:
             command.extend(["--first-order-multiplier", str(config["first_order_multiplier"])])

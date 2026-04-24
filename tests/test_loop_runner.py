@@ -33,6 +33,7 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
     apply_synthetic_inventory_exit_priority,
+    apply_adverse_inventory_reduce,
     apply_hedge_position_controls,
     apply_hedge_position_notional_caps,
     apply_inventory_tiering,
@@ -43,6 +44,7 @@ from grid_optimizer.loop_runner import (
     apply_short_cover_pause,
     apply_warm_start_bootstrap_guard,
     assess_synthetic_tp_only_watchdog,
+    assess_adverse_inventory_reduce,
     assess_flat_start_guard,
     apply_xaut_reduce_only_pruning,
     assess_auto_regime,
@@ -109,6 +111,55 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["dropped_buy_orders"], 2)
         self.assertEqual([item["role"] for item in plan["sell_orders"]], ["entry_short"])
         self.assertEqual([item["role"] for item in plan["buy_orders"]], ["entry_long"])
+
+    def test_apply_adverse_inventory_reduce_places_short_reduce_order(self) -> None:
+        report = assess_adverse_inventory_reduce(
+            enabled=True,
+            mid_price=0.196,
+            current_long_qty=0.0,
+            current_long_notional=0.0,
+            current_short_qty=2200.0,
+            current_short_notional=431.2,
+            current_long_cost_price=0.0,
+            current_short_cost_price=0.190,
+            current_long_cost_basis_source=None,
+            current_short_cost_basis_source="synthetic_ledger",
+            pause_long_position_notional=700.0,
+            pause_short_position_notional=420.0,
+            long_trigger_ratio=0.01,
+            short_trigger_ratio=0.008,
+        )
+
+        self.assertTrue(report["short_active"])
+        plan = {"bootstrap_orders": [], "buy_orders": [], "sell_orders": []}
+        updated = apply_adverse_inventory_reduce(
+            plan=plan,
+            state={},
+            report=report,
+            now=datetime(2026, 4, 24, 3, 0, tzinfo=timezone.utc),
+            current_long_qty=0.0,
+            current_long_notional=0.0,
+            current_short_qty=2200.0,
+            current_short_notional=431.2,
+            pause_long_position_notional=700.0,
+            pause_short_position_notional=420.0,
+            target_ratio=0.65,
+            max_order_notional=120.0,
+            bid_price=0.1959,
+            ask_price=0.1960,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            maker_timeout_seconds=30.0,
+        )
+
+        self.assertEqual(updated["direction"], "short")
+        self.assertEqual(updated["placed_reduce_orders"], 1)
+        self.assertEqual(plan["buy_orders"][0]["side"], "BUY")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["buy_orders"][0]["role"], "adverse_reduce_short")
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 120.0)
 
     def test_take_profit_guard_defaults_to_break_even_when_ratio_is_unset(self) -> None:
         plan = {
