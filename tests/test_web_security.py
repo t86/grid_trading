@@ -927,7 +927,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["per_order_notional"], 25.0)
         self.assertAlmostEqual(payload["base_position_notional"], 0.0)
         self.assertFalse(payload["flat_start_enabled"])
-        self.assertAlmostEqual(payload["pause_buy_position_notional"], 700.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 900.0)
         self.assertAlmostEqual(payload["max_position_notional"], 900.0)
         self.assertAlmostEqual(payload["max_total_notional"], 1800.0)
         self.assertEqual(payload["leverage"], 5)
