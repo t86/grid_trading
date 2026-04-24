@@ -587,6 +587,45 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["loss_guard_clamped_order_count"], 3)
         self.assertEqual([item["price"] for item in plan["sell_orders"]], [0.1695])
 
+    def test_synthetic_flow_sleeve_uses_recent_lots_for_near_market_long_flow(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
+
+        report = apply_synthetic_flow_sleeve(
+            plan=plan,
+            enabled=True,
+            current_long_notional=636.0,
+            current_short_notional=0,
+            current_long_avg_price=0.2004,
+            current_short_avg_price=0,
+            trigger_notional=100,
+            sleeve_notional=360,
+            levels=4,
+            per_order_notional=130,
+            order_notional=120,
+            max_loss_ratio=0.003,
+            step_price=0.0002,
+            tick_size=0.0001,
+            step_size=1,
+            min_qty=1,
+            min_notional=5,
+            bid_price=0.1839,
+            ask_price=0.1840,
+            current_long_lots=[
+                {"qty": 3385.0, "price": 0.2008},
+                {"qty": 8.0, "price": 0.1811},
+                {"qty": 63.0, "price": 0.1813},
+            ],
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["lot_cost_guard_active"])
+        self.assertEqual(report["placed_order_count"], 1)
+        self.assertEqual(report["lot_cost_guard_consumed_qty"], 71.0)
+        self.assertGreater(report["lot_cost_guard_blocked_order_count"], 0)
+        self.assertEqual(plan["sell_orders"][0]["price"], 0.184)
+        self.assertEqual(plan["sell_orders"][0]["qty"], 71.0)
+        self.assertAlmostEqual(plan["sell_orders"][0]["notional"], 13.064, places=8)
+
     def test_synthetic_flow_sleeve_adds_reduce_only_short_flow_exits_at_loss_ceiling(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}
 
