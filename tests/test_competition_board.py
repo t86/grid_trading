@@ -11,6 +11,7 @@ from unittest.mock import patch
 from grid_optimizer import competition_board
 from grid_optimizer.competition_board import (
     COMPETITION_SOURCES,
+    _build_daily_strategy_analytics,
     _entry_projection,
     _hinted_boards_for_source,
     _load_history_index,
@@ -457,6 +458,112 @@ class CompetitionBoardTests(unittest.TestCase):
             self.assertEqual(len(ended), 1)
             self.assertEqual(ended[0]["final_capture"], "2026-03-29 07:00")
             self.assertAlmostEqual(float(ended[0]["deltas"]["200"]), 170433.84, places=2)
+
+    def test_daily_strategy_uses_first_post_14_cst_snapshot_for_strategy_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            history_dir = base / "competition_board_history"
+            history_index_path = base / "competition_board_history_index.json"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            board_key = "futures_altcoins_week1:交易量冲刺赛_-_第1周"
+            current_board = {
+                "board_key": board_key,
+                "label": "ALTCOINS · 交易量冲刺赛 - 第1周",
+                "symbol": "ALTCOINS",
+                "market": "futures",
+                "activity_start_at": "2026-04-21T08:00:00+08:00",
+                "activity_end_at": "2026-04-28T07:59:00+08:00",
+                "rows": [],
+            }
+
+            def write_history(name: str, captured_at_utc: str, total: float, rank_100: float) -> None:
+                board = {
+                    **current_board,
+                    "updated_at_utc": "2026-04-23T23:59:59+00:00",
+                    "eligible_user_count": 15612,
+                    "eligible_metric_total": total,
+                    "rows": [
+                        {"rank": 20, "value": rank_100 * 7},
+                        {"rank": 50, "value": rank_100 * 3},
+                        {"rank": 100, "value": rank_100},
+                        {"rank": 200, "value": rank_100 / 2},
+                        {"rank": 500, "value": rank_100 / 10},
+                    ],
+                }
+                payload = {
+                    "board_key": board_key,
+                    "capture_key": name,
+                    "capture_label": name,
+                    "capture_date": name[:10],
+                    "capture_granularity": "hourly",
+                    "captured_at_utc": captured_at_utc,
+                    "snapshot_generated_at_utc": captured_at_utc,
+                    "board": board,
+                }
+                (history_dir / f"{name.replace(' ', '_').replace(':', '')}.json").write_text(
+                    json.dumps(payload, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+
+            write_history("2026-04-23 14:05", "2026-04-23T06:05:00+00:00", 700.0, 40.0)
+            write_history("2026-04-24 13:55", "2026-04-24T05:55:00+00:00", 900.0, 999.0)
+            write_history("2026-04-24 14:05", "2026-04-24T06:05:00+00:00", 1000.0, 50.0)
+
+            with patch.object(competition_board, "HISTORY_INDEX_PATH", history_index_path), patch.object(
+                competition_board, "HISTORY_DIR_PATH", history_dir
+            ):
+                analytics = _build_daily_strategy_analytics([current_board], arena_status={"ranking": {"published": False}})
+
+            self.assertEqual(analytics["sample_cutoff_cst"], "14:00")
+            self.assertEqual(len(analytics["board_rows"]), 1)
+            row = analytics["board_rows"][0]
+            self.assertEqual(row["strategy_date"], "2026-04-24")
+            self.assertEqual(row["capture_label"], "2026-04-24 14:05")
+            self.assertEqual(row["thresholds"]["100"]["value"], 50.0)
+            self.assertEqual(row["thresholds"]["100"]["delta"], 10.0)
+            self.assertEqual(row["eligible_metric_total_delta"], 300.0)
+
+    def test_attach_snapshot_adds_daily_strategy_section(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            base = Path(temp_dir)
+            history_dir = base / "competition_board_history"
+            history_index_path = base / "competition_board_history_index.json"
+            history_dir.mkdir(parents=True, exist_ok=True)
+            board = {
+                "board_key": "futures_um_week1:交易量冲刺赛_-_第1周",
+                "label": "UM · 交易量冲刺赛 - 第1周",
+                "symbol": "UM",
+                "market": "futures",
+                "activity_start_at": "2026-04-21T08:00:00+08:00",
+                "activity_end_at": "2026-04-28T07:59:00+08:00",
+                "updated_at_utc": "2026-04-23T23:59:59+00:00",
+                "rows": [{"rank": 100, "value": 2148900.71}],
+            }
+            payload = {
+                "board_key": board["board_key"],
+                "capture_key": "2026-04-24 14:10",
+                "capture_label": "2026-04-24 14:10",
+                "capture_date": "2026-04-24",
+                "capture_granularity": "hourly",
+                "captured_at_utc": "2026-04-24T06:10:00+00:00",
+                "board": board,
+            }
+            (history_dir / "2026-04-24_1410__futures_um.json").write_text(
+                json.dumps(payload, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            snapshot = {
+                "boards": [board],
+                "futures_master_arena": {"ranking": {"published": False, "total": 0}},
+            }
+            with patch.object(competition_board, "HISTORY_INDEX_PATH", history_index_path), patch.object(
+                competition_board, "HISTORY_DIR_PATH", history_dir
+            ):
+                enriched = competition_board._attach_snapshot_analytics(snapshot)
+
+            self.assertIn("daily_strategy", enriched)
+            self.assertEqual(enriched["daily_strategy"]["arena"]["ranking"]["total"], 0)
+            self.assertEqual(enriched["daily_strategy"]["board_rows"][0]["symbol"], "UM")
 
     def test_build_snapshot_reprojects_entries_from_cached_boards(self) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()

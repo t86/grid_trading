@@ -24,6 +24,9 @@ HISTORY_DIR_PATH = Path("output/competition_board_history")
 REWARD_PRICE_CACHE_PATH = Path("output/competition_reward_price_cache.json")
 CACHE_TTL_SECONDS = 1800
 UTC_PLUS_8 = timezone(timedelta(hours=8))
+DAILY_STRATEGY_SAMPLE_CUTOFF_HOUR_CST = 14
+DAILY_STRATEGY_TRACKED_RANKS = (20, 50, 100, 200, 500)
+FUTURES_MASTER_ARENA_BASE_URL = "https://www.binance.com"
 
 _CACHE_LOCK = threading.Lock()
 _REFRESH_LOCK = threading.Lock()
@@ -1825,6 +1828,22 @@ def _safe_int(value: Any) -> int | None:
     return int(number)
 
 
+def _format_number(value: float | int | None, digits: int = 2) -> str:
+    if value is None:
+        return ""
+    try:
+        return f"{float(value):,.{digits}f}"
+    except (TypeError, ValueError):
+        return ""
+
+
+def _ms_to_iso(value: Any) -> str:
+    number = _safe_float(value)
+    if number is None or number <= 0:
+        return ""
+    return datetime.fromtimestamp(float(number) / 1000.0, tz=timezone.utc).isoformat()
+
+
 def _sanitize_key(raw: str) -> str:
     text = re.sub(r"\s+", "_", str(raw or "").strip())
     text = re.sub(r"[^0-9A-Za-z_\u4e00-\u9fff-]+", "", text)
@@ -2007,6 +2026,163 @@ def _fetch_leaderboard_rows(resource_id: int, referer: str, *, max_rows: int | N
         "rows_truncated": row_limit < total,
         "last_rank_fetched": int(rows[-1].get("sequence", 0) or 0) if rows else 0,
         "rows": rows,
+    }
+
+
+def _binance_futures_arena_request(
+    path: str,
+    *,
+    method: str = "GET",
+    payload: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    endpoint = f"{FUTURES_MASTER_ARENA_BASE_URL}{path}"
+    headers = {
+        "Content-Type": "application/json",
+        "Origin": FUTURES_MASTER_ARENA_BASE_URL,
+        "Referer": f"{FUTURES_MASTER_ARENA_BASE_URL}/en/futures/activity/arena",
+        "User-Agent": os.environ.get(
+            "GRID_COMPETITION_BOARD_UA",
+            (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0 Safari/537.36"
+            ),
+        ),
+    }
+    if method.upper() == "POST":
+        response = requests.post(endpoint, headers=headers, json=payload or {}, timeout=20)
+    else:
+        response = requests.get(endpoint, headers=headers, timeout=20)
+    response.raise_for_status()
+    body = response.json()
+    if not isinstance(body, dict):
+        raise RuntimeError(f"arena response is not an object: {path}")
+    if str(body.get("code")) != "000000":
+        raise RuntimeError(f"arena fetch failed for {path}: {body.get('code')} {body.get('message')}")
+    return body
+
+
+def _arena_reward_pool(config: dict[str, Any]) -> tuple[float | None, str]:
+    rewards = config.get("airdropReward")
+    if isinstance(rewards, list) and rewards:
+        first = rewards[0]
+        if isinstance(first, dict):
+            reward_value = _safe_float(first.get("reward"))
+            reward_asset = str(first.get("asset") or config.get("masterPrizeAsset") or "").strip().upper()
+            if reward_value is not None and reward_asset:
+                return float(reward_value), reward_asset
+    master_prizes = config.get("masterPrizeList")
+    reward_value = _safe_float(master_prizes[0] if isinstance(master_prizes, list) and master_prizes else None)
+    reward_asset = str(config.get("masterPrizeAsset") or "").strip().upper()
+    return (float(reward_value), reward_asset) if reward_value is not None and reward_asset else (None, reward_asset)
+
+
+def _build_master_prize_tiers(
+    pool_value: float | None,
+    asset: str,
+    ratios: list[Any],
+) -> list[dict[str, Any]]:
+    brackets = ((1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 20), (21, 50), (51, 100))
+    tiers: list[dict[str, Any]] = []
+    for index, (start_rank, end_rank) in enumerate(brackets):
+        ratio = _safe_float(ratios[index]) if index < len(ratios) else None
+        total_reward = float(pool_value) * float(ratio) / 100.0 if pool_value is not None and ratio is not None else None
+        user_count = max(1, end_rank - start_rank + 1)
+        per_user_reward = total_reward / user_count if total_reward is not None else None
+        rank_label = f"第 {start_rank} 名" if start_rank == end_rank else f"第 {start_rank} - {end_rank} 名"
+        tiers.append(
+            {
+                "start_rank": start_rank,
+                "end_rank": end_rank,
+                "rank_label": rank_label,
+                "ratio": ratio,
+                "total_reward": total_reward,
+                "total_reward_text": f"{_format_number(total_reward, 8)} {asset}".strip() if total_reward is not None else "",
+                "per_user_reward": per_user_reward,
+                "per_user_reward_text": f"{_format_number(per_user_reward, 8)} {asset}".strip() if per_user_reward is not None else "",
+            }
+        )
+    return tiers
+
+
+def _normalize_arena_ranking_rows(raw_rows: Any) -> list[dict[str, Any]]:
+    if not isinstance(raw_rows, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for item in raw_rows:
+        if not isinstance(item, dict):
+            continue
+        rank = _safe_int(item.get("rank") or item.get("ranking") or item.get("sequence") or item.get("rankNo"))
+        score = _safe_float(item.get("score") or item.get("grade") or item.get("point") or item.get("points"))
+        rows.append(
+            {
+                "rank": rank,
+                "name": str(item.get("nickName") or item.get("nickname") or item.get("userName") or item.get("name") or "").strip(),
+                "score": score,
+                "raw": item,
+            }
+        )
+    rows.sort(key=lambda item: item["rank"] if item["rank"] is not None else 10**9)
+    return rows
+
+
+def _fetch_futures_master_arena_status() -> dict[str, Any]:
+    config_payload = _binance_futures_arena_request("/bapi/futures/v1/public/future/arena/common/latest-arena-config")
+    rounds_payload = _binance_futures_arena_request("/bapi/futures/v1/public/future/arena/common/get-master-round-config")
+    update_payload = _binance_futures_arena_request("/bapi/futures/v1/public/future/arena/prize/get-ranking-update-time")
+    ratio_payload = _binance_futures_arena_request("/bapi/futures/v1/public/future/arena/common/get-prize-ratio-config")
+    ranking_payload = _binance_futures_arena_request(
+        "/bapi/futures/v1/friendly/future/arena/prize/get-top100-master-ranking",
+        method="POST",
+        payload={"page": 1, "rows": 100},
+    )
+
+    config = config_payload.get("data") if isinstance(config_payload.get("data"), dict) else {}
+    rounds = rounds_payload.get("data") if isinstance(rounds_payload.get("data"), list) else []
+    update_data = update_payload.get("data") if isinstance(update_payload.get("data"), dict) else {}
+    ratios = ratio_payload.get("data") if isinstance(ratio_payload.get("data"), list) else []
+    ranking_rows = _normalize_arena_ranking_rows(ranking_payload.get("data"))
+    total = _safe_int(ranking_payload.get("total")) or len(ranking_rows)
+    pool_value, pool_asset = _arena_reward_pool(config)
+    prize_tiers = _build_master_prize_tiers(pool_value, pool_asset, ratios)
+    floor_tier = next((item for item in prize_tiers if item.get("start_rank") == 51 and item.get("end_rank") == 100), None)
+
+    master_id = _safe_int(config.get("masterId"))
+    current_round = None
+    for item in rounds:
+        if not isinstance(item, dict):
+            continue
+        if _safe_int(item.get("masterRoundId")) == master_id:
+            current_round = item
+            break
+
+    return {
+        "status": "ok",
+        "updated_at_utc": _now_iso(),
+        "round": {
+            "master_id": master_id,
+            "config_id": _safe_int(config.get("id")),
+            "begin_at_utc": _ms_to_iso(config.get("beginTime") or (current_round or {}).get("beginTime")),
+            "end_at_utc": _ms_to_iso(config.get("endTime") or (current_round or {}).get("endTime")),
+            "participant_num": _safe_int(config.get("participantNum")),
+            "participant_num_text": _format_number(_safe_float(config.get("participantNum")), 0),
+        },
+        "rewards": {
+            "pool_value": pool_value,
+            "asset": pool_asset,
+            "pool_text": f"{_format_number(pool_value, 8)} {pool_asset}".strip() if pool_value is not None else "",
+            "ratio_config": [_safe_float(item) for item in ratios],
+            "tiers": prize_tiers,
+            "top100_floor_reward": floor_tier,
+        },
+        "ranking": {
+            "published": bool(total and ranking_rows),
+            "total": total,
+            "rows": ranking_rows[:100],
+            "rank100": ranking_rows[99] if len(ranking_rows) >= 100 else None,
+            "master_ranking_update_at_utc": _ms_to_iso(update_data.get("masterRankingUpdateTime")),
+            "hall_of_fame_update_at_utc": _ms_to_iso(update_data.get("hallOfFameUpdateTime")),
+            "top_traders_update_at_utc": _ms_to_iso(update_data.get("topTradersUpdateTime")),
+        },
     }
 
 
@@ -2486,6 +2662,217 @@ def _select_previous_day_entry(entries: list[dict[str, Any]], final_dt: datetime
     return None
 
 
+def _history_entry_captured_datetime(entry: dict[str, Any]) -> datetime | None:
+    for key in ("captured_at_utc", "updated_at_utc"):
+        parsed = _parse_iso_datetime(entry.get(key))
+        if parsed is not None:
+            return parsed
+    capture_label = str(entry.get("capture_label") or entry.get("capture_key") or "").strip()
+    for fmt in ("%Y-%m-%d %H:%M", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return datetime.strptime(capture_label, fmt).replace(tzinfo=UTC_PLUS_8)
+        except ValueError:
+            continue
+    return None
+
+
+def _datetime_cst_label(value: datetime | None) -> str:
+    if value is None:
+        return ""
+    return value.astimezone(UTC_PLUS_8).strftime("%Y-%m-%d %H:%M")
+
+
+def _entry_sort_datetime(value: datetime | None) -> float:
+    if value is None:
+        return 0.0
+    return value.astimezone(timezone.utc).timestamp()
+
+
+def _daily_strategy_entry_sort_key(entry: dict[str, Any]) -> tuple[float, float]:
+    return (
+        _entry_sort_datetime(_parse_iso_datetime(entry.get("updated_at_utc"))),
+        _entry_sort_datetime(_history_entry_captured_datetime(entry)),
+    )
+
+
+def _daily_strategy_entries_by_date(entries: list[dict[str, Any]]) -> list[tuple[str, dict[str, Any], datetime]]:
+    selected: dict[str, tuple[dict[str, Any], datetime]] = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        captured_dt = _history_entry_captured_datetime(entry)
+        if captured_dt is None:
+            continue
+        captured_cst = captured_dt.astimezone(UTC_PLUS_8)
+        if (captured_cst.hour, captured_cst.minute) < (DAILY_STRATEGY_SAMPLE_CUTOFF_HOUR_CST, 0):
+            continue
+        strategy_date = captured_cst.strftime("%Y-%m-%d")
+        existing = selected.get(strategy_date)
+        if existing is None or _daily_strategy_entry_sort_key(entry) > _daily_strategy_entry_sort_key(existing[0]):
+            selected[strategy_date] = (entry, captured_dt)
+    return [
+        (strategy_date, entry, captured_dt)
+        for strategy_date, (entry, captured_dt) in sorted(selected.items(), key=lambda item: item[0])
+    ]
+
+
+def _daily_strategy_board_is_relevant(
+    board: dict[str, Any],
+    *,
+    captured_dt: datetime | None,
+    now: datetime,
+) -> bool:
+    if str(board.get("market", "")).strip().lower() != "futures":
+        return False
+    reference_dt = captured_dt.astimezone(timezone.utc) if captured_dt is not None else now
+    end_at = _parse_iso_datetime(board.get("activity_end_at"))
+    if end_at is not None and end_at.astimezone(timezone.utc) < reference_dt:
+        return False
+    start_at = _parse_iso_datetime(board.get("activity_start_at"))
+    if start_at is None:
+        start_raw, _ = _parse_activity_period_bounds(str(board.get("activity_period_text", "")).strip())
+        start_at = _parse_iso_datetime(start_raw)
+    if start_at is not None and start_at.astimezone(timezone.utc) > reference_dt:
+        return False
+    return True
+
+
+def _daily_threshold_summary(
+    current_board: dict[str, Any],
+    previous_board: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    current_values = _values_by_rank(current_board)
+    previous_values = _values_by_rank(previous_board) if isinstance(previous_board, dict) else {}
+    thresholds: dict[str, dict[str, Any]] = {}
+    for rank in DAILY_STRATEGY_TRACKED_RANKS:
+        value = current_values.get(rank)
+        previous_value = previous_values.get(rank)
+        delta = (
+            round(float(value) - float(previous_value), 8)
+            if value is not None and previous_value is not None
+            else None
+        )
+        thresholds[str(rank)] = {
+            "rank": rank,
+            "value": value,
+            "value_text": _format_number(value, 2),
+            "previous_value": previous_value,
+            "previous_value_text": _format_number(previous_value, 2),
+            "delta": delta,
+            "delta_text": _format_number(delta, 2),
+        }
+    return thresholds
+
+
+def _daily_strategy_empty_row(board: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "board_key": str(board.get("board_key", "")).strip(),
+        "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip(),
+        "symbol": str(board.get("symbol", "")).strip(),
+        "market": str(board.get("market", "")).strip(),
+        "metric_label": str(board.get("metric_label", "")).strip(),
+        "strategy_date": "",
+        "status": "waiting_snapshot",
+        "status_text": "等待北京时间 14:00 后历史快照",
+        "capture_label": "",
+        "captured_at_utc": "",
+        "previous_capture_label": "",
+        "official_updated_at_utc": str(board.get("updated_at_utc") or "").strip(),
+        "official_updated_label": _datetime_cst_label(_parse_iso_datetime(board.get("updated_at_utc"))),
+        "eligible_user_count": _safe_int(board.get("eligible_user_count")),
+        "eligible_metric_total": _safe_float(board.get("eligible_metric_total")),
+        "eligible_metric_total_text": _format_number(_safe_float(board.get("eligible_metric_total")), 2),
+        "eligible_metric_total_delta": None,
+        "eligible_metric_total_delta_text": "",
+        "thresholds": {
+            str(rank): {"rank": rank, "value": None, "value_text": "", "delta": None, "delta_text": ""}
+            for rank in DAILY_STRATEGY_TRACKED_RANKS
+        },
+    }
+
+
+def _build_daily_strategy_analytics(
+    boards: list[dict[str, Any]],
+    *,
+    arena_status: dict[str, Any] | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
+    history_index = _load_history_index()
+    rows: list[dict[str, Any]] = []
+
+    for board in boards:
+        if not isinstance(board, dict):
+            continue
+        board_key = str(board.get("board_key", "")).strip()
+        if not board_key:
+            continue
+        daily_entries = _daily_strategy_entries_by_date(history_index.get(board_key, []))
+        latest_date = daily_entries[-1][0] if daily_entries else ""
+        latest_entry = daily_entries[-1][1] if daily_entries else None
+        latest_captured_dt = daily_entries[-1][2] if daily_entries else None
+        if not _daily_strategy_board_is_relevant(board, captured_dt=latest_captured_dt, now=current_time):
+            continue
+        if latest_entry is None:
+            rows.append(_daily_strategy_empty_row(board))
+            continue
+
+        previous_entry = daily_entries[-2][1] if len(daily_entries) >= 2 else None
+        latest_board = _load_history_board(latest_entry) or board
+        previous_board = _load_history_board(previous_entry) if previous_entry is not None else None
+        if not isinstance(latest_board, dict):
+            latest_board = board
+        latest_total = _safe_float(latest_board.get("eligible_metric_total"))
+        previous_total = _safe_float(previous_board.get("eligible_metric_total")) if isinstance(previous_board, dict) else None
+        total_delta = (
+            round(float(latest_total) - float(previous_total), 8)
+            if latest_total is not None and previous_total is not None
+            else None
+        )
+        official_dt = _parse_iso_datetime(latest_entry.get("updated_at_utc")) or _parse_iso_datetime(latest_board.get("updated_at_utc"))
+        official_date = official_dt.astimezone(UTC_PLUS_8).strftime("%Y-%m-%d") if official_dt is not None else ""
+        if not official_date:
+            status = "unknown_official_update"
+            status_text = "未返回官方更新时间"
+        elif official_date < latest_date:
+            status = "waiting_official_update"
+            status_text = "官方更新时间早于采样日，需等下一次刷新"
+        else:
+            status = "ready"
+            status_text = "已采用 14:00 后官方快照"
+        rows.append(
+            {
+                "board_key": board_key,
+                "label": str(latest_board.get("label") or board.get("label") or board_key).strip(),
+                "symbol": str(latest_board.get("symbol") or board.get("symbol") or "").strip(),
+                "market": str(latest_board.get("market") or board.get("market") or "").strip(),
+                "metric_label": str(latest_board.get("metric_label") or board.get("metric_label") or "").strip(),
+                "strategy_date": latest_date,
+                "status": status,
+                "status_text": status_text,
+                "capture_label": str(latest_entry.get("capture_label") or _datetime_cst_label(latest_captured_dt)).strip(),
+                "captured_at_utc": latest_captured_dt.astimezone(timezone.utc).isoformat() if latest_captured_dt is not None else "",
+                "previous_capture_label": str(previous_entry.get("capture_label") if previous_entry else "").strip(),
+                "official_updated_at_utc": official_dt.astimezone(timezone.utc).isoformat() if official_dt is not None else "",
+                "official_updated_label": _datetime_cst_label(official_dt),
+                "eligible_user_count": _safe_int(latest_board.get("eligible_user_count")),
+                "eligible_metric_total": latest_total,
+                "eligible_metric_total_text": _format_number(latest_total, 2),
+                "eligible_metric_total_delta": total_delta,
+                "eligible_metric_total_delta_text": _format_number(total_delta, 2),
+                "thresholds": _daily_threshold_summary(latest_board, previous_board),
+            }
+        )
+
+    rows.sort(key=lambda item: (item.get("status") != "ready", str(item.get("symbol") or ""), str(item.get("label") or "")))
+    return {
+        "sample_cutoff_cst": f"{DAILY_STRATEGY_SAMPLE_CUTOFF_HOUR_CST:02d}:00",
+        "tracked_ranks": list(DAILY_STRATEGY_TRACKED_RANKS),
+        "arena": arena_status if isinstance(arena_status, dict) else {"status": "unavailable", "ranking": {"published": False, "total": 0}},
+        "board_rows": rows,
+    }
+
+
 def _load_reward_price_cache() -> dict[str, float]:
     payload = _read_json_file(REWARD_PRICE_CACHE_PATH, {})
     if not isinstance(payload, dict):
@@ -2931,8 +3318,10 @@ def _attach_snapshot_analytics(snapshot: dict[str, Any]) -> dict[str, Any]:
     boards = snapshot.get("boards", []) if isinstance(snapshot, dict) else []
     if not isinstance(boards, list):
         boards = []
+    arena_status = snapshot.get("futures_master_arena") if isinstance(snapshot.get("futures_master_arena"), dict) else None
     snapshot["ended_analytics"] = _build_ended_boards_analytics(boards)
     snapshot["ongoing_analytics"] = _build_ongoing_boards_analytics(boards)
+    snapshot["daily_strategy"] = _build_daily_strategy_analytics(boards, arena_status=arena_status)
     return snapshot
 
 
@@ -3180,12 +3569,23 @@ def _refresh_competition_data() -> dict[str, Any]:
     for market_rows in grouped.values():
         market_rows.sort(key=lambda item: (item["symbol"], item["tab_label"]))
 
+    try:
+        futures_master_arena = _fetch_futures_master_arena_status()
+    except Exception as exc:
+        futures_master_arena = {
+            "status": "error",
+            "error": f"{type(exc).__name__}: {exc}",
+            "ranking": {"published": False, "total": 0},
+        }
+        scrape_errors.append(f"futures_master_arena: {type(exc).__name__}: {exc}")
+
     payload = {
         "generated_at_utc": generated_at,
         "boards": boards,
         "markets": grouped,
         "entries": _project_entries_for_boards(boards),
         "errors": scrape_errors,
+        "futures_master_arena": futures_master_arena,
     }
     _persist_boards_to_history(boards, snapshot_generated_at_utc=generated_at)
     payload = _attach_snapshot_analytics(payload)
@@ -3665,6 +4065,13 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
+      <h2 style="margin:0 0 12px;">每日策略参考</h2>
+      <p class="meta">口径：只使用北京时间 14:00 后落盘的官方榜单快照，用于观察每日门槛变化和合约大师赛状态。</p>
+      <div class="kpi-grid" id="daily_strategy_summary"></div>
+      <div id="daily_strategy_cards" class="ended-grid" style="margin-top:12px;"></div>
+    </section>
+
+    <section class="card">
       <h2 style="margin:0 0 12px;">进行中比赛最终门槛预测</h2>
       <p class="meta">仅对合约交易赛展示。直接填你假定的“最后一天全市场成交量”，页面就把它当作收官日量来推算最终门槛。</p>
       <div id="ongoing_cards" class="ended-grid"></div>
@@ -3738,6 +4145,8 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     const entryNoteEl = document.getElementById("entry_note");
     const entrySaveBtn = document.getElementById("entry_save_btn");
     const entriesBody = document.getElementById("entries_body");
+    const dailyStrategySummaryEl = document.getElementById("daily_strategy_summary");
+    const dailyStrategyCardsEl = document.getElementById("daily_strategy_cards");
     const ongoingCardsEl = document.getElementById("ongoing_cards");
     const endedCardsEl = document.getElementById("ended_cards");
     const apiBase = `${window.location.protocol}//${window.location.host}`;
@@ -3769,6 +4178,13 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         minimumFractionDigits: digits,
         maximumFractionDigits: digits,
       });
+    }
+
+    function fmtDelta(value, digits = 0) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "-";
+      const number = Number(value);
+      const prefix = number > 0 ? "+" : "";
+      return `${prefix}${fmtNum(number, digits)}`;
     }
 
     function fmtDate(value) {
@@ -3999,6 +4415,122 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
       spotBoardsEl.innerHTML = spot.length ? spot.map(renderBoard).join("") : `<div class="empty">暂无现货榜单。</div>`;
       futuresBoardsEl.innerHTML = futures.length ? futures.map(renderBoard).join("") : `<div class="empty">暂无合约榜单。</div>`;
       updateCountdownPanels();
+    }
+
+    function renderDailyStrategy() {
+      const analytics = snapshot && snapshot.daily_strategy ? snapshot.daily_strategy : {};
+      const arena = analytics.arena && typeof analytics.arena === "object" ? analytics.arena : {};
+      const round = arena.round && typeof arena.round === "object" ? arena.round : {};
+      const ranking = arena.ranking && typeof arena.ranking === "object" ? arena.ranking : {};
+      const rewards = arena.rewards && typeof arena.rewards === "object" ? arena.rewards : {};
+      const floorReward = rewards.top100_floor_reward && typeof rewards.top100_floor_reward === "object"
+        ? rewards.top100_floor_reward
+        : {};
+      const cutoff = analytics.sample_cutoff_cst || "14:00";
+      const rows = Array.isArray(analytics.board_rows) ? analytics.board_rows : [];
+      const summaryRows = [
+        { label: "采样规则", value: `北京时间 ${cutoff} 后` },
+        { label: "大师赛参与人数", value: round.participant_num_text || fmtNum(round.participant_num, 0) },
+        { label: "大师赛榜单", value: ranking.published ? `已发布 ${fmtNum(ranking.total, 0)} 人` : `未发布 ${fmtNum(ranking.total || 0, 0)} 人` },
+        { label: "Top100 保底", value: floorReward.per_user_reward_text || "-" },
+      ];
+      dailyStrategySummaryEl.innerHTML = summaryRows.map((item) => `
+        <div class="kpi">
+          <div class="label">${escapeHtml(item.label)}</div>
+          <div class="value">${escapeHtml(item.value || "-")}</div>
+        </div>
+      `).join("");
+
+      const arenaError = arena.status === "error" && arena.error
+        ? `<div class="empty">合约大师赛状态抓取失败：${escapeHtml(arena.error)}</div>`
+        : "";
+      const arenaMeta = `
+        <article class="ended-card ongoing">
+          <div>
+            <h3>合约大师赛状态</h3>
+            <div class="meta-row">
+              <span>轮次：${escapeHtml(round.master_id || "-")}</span>
+              <span>周期：${escapeHtml(fmtDate(round.begin_at_utc))} - ${escapeHtml(fmtDate(round.end_at_utc))}</span>
+              <span>榜单更新时间：${escapeHtml(fmtDate(ranking.master_ranking_update_at_utc))}</span>
+            </div>
+          </div>
+          <div class="table-wrap">
+            <table class="analytics-table">
+              <thead>
+                <tr>
+                  <th>奖池</th>
+                  <th class="num">参与人数</th>
+                  <th class="num">Top100 保底/人</th>
+                  <th class="num">榜单人数</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td>${escapeHtml(rewards.pool_text || "-")}</td>
+                  <td class="num">${escapeHtml(round.participant_num_text || fmtNum(round.participant_num, 0))}</td>
+                  <td class="num">${escapeHtml(floorReward.per_user_reward_text || "-")}</td>
+                  <td class="num">${ranking.published ? fmtNum(ranking.total, 0) : "未发布"}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          ${arenaError}
+        </article>
+      `;
+
+      if (!rows.length) {
+        dailyStrategyCardsEl.innerHTML = `${arenaMeta}<div class="empty">还没有北京时间 ${escapeHtml(cutoff)} 后的历史快照；等待自动刷新落盘。</div>`;
+        return;
+      }
+
+      const trackedRanks = Array.isArray(analytics.tracked_ranks) && analytics.tracked_ranks.length
+        ? analytics.tracked_ranks
+        : [20, 50, 100, 200, 500];
+      dailyStrategyCardsEl.innerHTML = arenaMeta + rows.map((item) => {
+        const statusClass = item.status === "ready" ? "good" : (item.status === "waiting_snapshot" ? "warn" : "bad");
+        const thresholds = item.thresholds && typeof item.thresholds === "object" ? item.thresholds : {};
+        return `
+          <article class="ended-card ongoing">
+            <div class="board-head">
+              <div>
+                <h3>${escapeHtml(item.symbol || "-")} · ${escapeHtml(item.label || "-")}</h3>
+                <p>${escapeHtml(item.status_text || "-")}</p>
+              </div>
+              <span class="pill ${statusClass}">${escapeHtml(item.strategy_date || "等待采样")}</span>
+            </div>
+            <div class="meta-row">
+              <span>采样快照：${escapeHtml(item.capture_label || "-")}</span>
+              <span>上一样本：${escapeHtml(item.previous_capture_label || "-")}</span>
+              <span>官方更新时间：${escapeHtml(item.official_updated_label || fmtDate(item.official_updated_at_utc))}</span>
+              <span>合格人数：${item.eligible_user_count === null || item.eligible_user_count === undefined ? "-" : fmtNum(item.eligible_user_count, 0)}</span>
+            </div>
+            <div class="table-wrap">
+              <table class="analytics-table">
+                <thead>
+                  <tr>
+                    <th class="num">排名</th>
+                    <th class="num">当前门槛</th>
+                    <th class="num">日增量</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  ${trackedRanks.map((rank) => {
+                    const threshold = thresholds[String(rank)] || {};
+                    return `
+                      <tr>
+                        <td class="num">${escapeHtml(rank)}</td>
+                        <td class="num">${threshold.value === null || threshold.value === undefined ? "-" : fmtNum(threshold.value, 0)}</td>
+                        <td class="num">${fmtDelta(threshold.delta, 0)}</td>
+                      </tr>
+                    `;
+                  }).join("")}
+                </tbody>
+              </table>
+            </div>
+            <div class="meta">当前总量：${item.eligible_metric_total === null || item.eligible_metric_total === undefined ? "-" : fmtNum(item.eligible_metric_total, 0)} · 日增量：${fmtDelta(item.eligible_metric_total_delta, 0)}</div>
+          </article>
+        `;
+      }).join("");
     }
 
     function renderEntryBoardOptions() {
@@ -4303,6 +4835,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         }
         snapshot = data.snapshot;
         renderSummary(snapshot);
+        renderDailyStrategy();
         renderOngoingAnalytics();
         renderEndedAnalytics();
         renderBoards();
@@ -4331,6 +4864,7 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         if (data.snapshot) {
           snapshot = data.snapshot;
           renderSummary(snapshot);
+          renderDailyStrategy();
           renderEndedAnalytics();
           renderEntries();
           updateSnapshotMeta();
