@@ -15,6 +15,7 @@ from grid_optimizer.loop_runner import (
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _build_parser,
     _should_sync_account_audit,
+    _uses_entry_price_cost_basis,
     _apply_synthetic_trade_fill,
     _decorate_synthetic_open_orders,
     _load_synthetic_ledger,
@@ -74,6 +75,10 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
+        self.assertTrue(_uses_entry_price_cost_basis("soon_volume_neutral_ping_pong_v1"))
+        self.assertTrue(_uses_entry_price_cost_basis("soonusdt_competition_neutral_ping_pong_v1"))
+
     def test_resolve_exposure_escalation_waits_for_hold_time(self) -> None:
         state: dict[str, object] = {}
         now = datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc)

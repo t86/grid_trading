@@ -1061,7 +1061,12 @@ def _position_qty(position: dict[str, Any], *, position_side: str | None = None)
 
 
 def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
-    return str(strategy_profile or "").strip() == "volume_long_v4"
+    normalized_profile = str(strategy_profile or "").strip()
+    return normalized_profile in {
+        "volume_long_v4",
+        "soon_volume_neutral_ping_pong_v1",
+        "soonusdt_competition_neutral_ping_pong_v1",
+    } or normalized_profile.endswith("_competition_neutral_ping_pong_v1")
 
 
 def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
