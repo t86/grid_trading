@@ -25169,6 +25169,27 @@ def _status_float(value: Any) -> float:
         return 0.0
 
 
+def _status_commission_usdt(trade_summary: dict[str, Any]) -> float:
+    raw_by_asset = trade_summary.get("commission_raw_by_asset")
+    if not isinstance(raw_by_asset, dict):
+        return _status_float(trade_summary.get("commission"))
+    total = 0.0
+    for asset, raw_amount in raw_by_asset.items():
+        amount = _status_float(raw_amount)
+        if amount <= 0:
+            continue
+        normalized_asset = str(asset or "").upper().strip()
+        if normalized_asset in {"USDT", "USDC", "FDUSD", "BUSD"}:
+            total += amount
+            continue
+        try:
+            price = fetch_spot_latest_price(f"{normalized_asset}USDT")
+        except Exception:
+            price = 0.0
+        total += amount * price if price > 0 else amount
+    return total
+
+
 def _build_status_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -25247,7 +25268,7 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
     income = summarize_income(income_rows)
     position = runtime_snapshot.get("position") or {}
     trade_pnl = float(trade.get("realized_pnl") or 0.0)
-    fees = float(trade.get("commission") or 0.0)
+    fees = _status_commission_usdt(trade)
     funding_fee = float(income.get("funding_fee") or 0.0)
     unrealized_pnl = float(position.get("unrealized_pnl") or 0.0) if isinstance(position, dict) else 0.0
     total_pnl = trade_pnl + unrealized_pnl + funding_fee - fees
