@@ -4172,6 +4172,47 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                     max_loss_ratio=close_position_max_loss_ratio,
                 )
                 status["reduce_preflight"] = preflight
+                if preflight.get("target_reached"):
+                    status["prevented_action"] = decision.get("action")
+                    status["action"] = None
+                    status["reason"] = "reduce_target_reached_keep_runner"
+                    status["paused_by_trigger"] = False
+                    status["post_stop_pending"] = False
+                    status["phase"] = "reduce_to_notional"
+                    status["reduce_target_notional"] = target_notional
+                    status["reduce_max_loss_ratio"] = close_position_max_loss_ratio
+                    status["reduce_target_reached"] = True
+                    status["reduce_started_at"] = previous_status.get("reduce_started_at") or checked_at
+                    status["reduce_effective"] = False
+                    status["reduce_close_attempted_count"] = 0
+                    status["reduce_flatten_started"] = False
+                    status["reduce_blocked_keep_runner"] = False
+                    status["blocked_reduce_relaxation"] = active_relaxation
+                    status["full_flatten_started_at"] = None
+                    status["full_flatten_target_reached"] = False
+                    status["escalation_reason"] = None
+                    if not bool(runner.get("is_running")):
+                        resume_result = _start_runner_process(normalized_config)
+                        resumed_runner = _read_runner_process_for_symbol(symbol)
+                        status["action"] = "start"
+                        status["reason"] = "reduce_target_reached_resume_runner"
+                        status["runner_running"] = bool(resumed_runner.get("is_running"))
+                        status["result"] = {
+                            "runner_restarted_after_reduce_target_reached": {
+                                "started": bool(resume_result.get("started")),
+                                "already_running": bool(resume_result.get("already_running")),
+                                "restarted": bool(resume_result.get("restarted")),
+                            }
+                        }
+                    else:
+                        status["result"] = {"runner_kept_running_after_reduce_target_reached": True}
+                    print(
+                        f"[volatility-trigger] {symbol} keep runner window={window_key} "
+                        f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%} "
+                        f"target={target_notional:.4f} reason={status['reason']}"
+                    )
+                    _update_volatility_trigger_status(symbol, status)
+                    return
                 if preflight.get("blocked"):
                     status["prevented_action"] = decision.get("action")
                     status["action"] = None
