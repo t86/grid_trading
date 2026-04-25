@@ -1928,6 +1928,7 @@ def assess_flat_start_guard(
     actual_net_qty: float,
     open_orders: list[dict[str, Any]],
     enabled: bool,
+    block_open_orders: bool = True,
 ) -> dict[str, Any]:
     mode = str(strategy_mode or "").strip()
     open_order_count = len([item for item in open_orders if isinstance(item, dict)])
@@ -1936,6 +1937,7 @@ def assess_flat_start_guard(
         "blocked": False,
         "mode": mode,
         "open_order_count": open_order_count,
+        "block_open_orders": bool(block_open_orders),
         "reverse_qty": 0.0,
         "reason": None,
     }
@@ -1968,7 +1970,7 @@ def assess_flat_start_guard(
             }
         )
         return result
-    if open_order_count > 0:
+    if open_order_count > 0 and block_open_orders:
         result.update(
             {
                 "blocked": True,
@@ -1977,6 +1979,11 @@ def assess_flat_start_guard(
                     f"当前 open_order_count={open_order_count}"
                 ),
             }
+        )
+    elif open_order_count > 0:
+        result["reason"] = (
+            "flat-start 检测到遗留挂单，但 cancel_stale 已启用，"
+            f"允许启动后自动撤单；当前 open_order_count={open_order_count}"
         )
     return result
 
@@ -8097,6 +8104,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             actual_net_qty=actual_net_qty,
             open_orders=open_orders,
             enabled=bool(getattr(args, "flat_start_enabled", True)),
+            block_open_orders=not bool(getattr(args, "cancel_stale", True)),
         )
         if flat_start_guard["blocked"]:
             raise StartupProtectionError(str(flat_start_guard["reason"]))

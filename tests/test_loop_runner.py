@@ -2699,6 +2699,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmpdir:
             args = self._base_one_way_long_args(tmpdir)
+            args.cancel_stale = False
             with self.assertRaises(StartupProtectionError):
                 generate_plan_report(args)
 
@@ -4359,6 +4360,19 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(result["blocked"])
         self.assertIn("撤掉遗留挂单", str(result["reason"]))
+        self.assertEqual(result["open_order_count"], 2)
+
+    def test_assess_flat_start_guard_allows_lingering_open_orders_when_cancel_stale_will_cleanup(self) -> None:
+        result = assess_flat_start_guard(
+            strategy_mode="one_way_short",
+            actual_net_qty=0.0,
+            open_orders=[{"orderId": 1}, {"orderId": 2}],
+            enabled=True,
+            block_open_orders=False,
+        )
+
+        self.assertFalse(result["blocked"])
+        self.assertIn("自动撤单", str(result["reason"]))
         self.assertEqual(result["open_order_count"], 2)
 
     def test_apply_warm_start_bootstrap_guard_clears_long_bootstrap_when_inventory_exists(self) -> None:
