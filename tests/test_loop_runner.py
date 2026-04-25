@@ -2375,7 +2375,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(active_buys[0]["force_reduce_only"])
         self.assertAlmostEqual(report["take_profit_guard"]["short_ceiling_price"], 0.965, places=8)
 
-    def test_apply_active_delever_short_switches_to_aggressive_orders_after_threshold_timeout(self) -> None:
+    def test_apply_active_delever_short_switches_to_maker_orders_after_threshold_timeout(self) -> None:
         plan = {
             "buy_orders": [
                 {"side": "BUY", "price": 0.999, "qty": 25.0, "notional": 24.975, "role": "take_profit_short"},
@@ -2411,12 +2411,12 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(result["active"])
         self.assertEqual(result["trigger_mode"], "threshold_timeout")
         self.assertEqual(result["active_buy_order_count"], 3)
-        self.assertEqual([item["price"] for item in active_buys], [1.003, 1.002, 1.001])
-        self.assertTrue(all(item["execution_type"] == "aggressive" for item in active_buys))
-        self.assertTrue(all(item["time_in_force"] == "GTC" for item in active_buys))
+        self.assertEqual([item["price"] for item in active_buys], [0.999, 0.989, 0.979])
+        self.assertTrue(all(item["execution_type"] == "maker_timeout_release" for item in active_buys))
+        self.assertTrue(all(item["time_in_force"] == "GTX" for item in active_buys))
         self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_buys))
 
-    def test_apply_active_delever_long_switches_to_aggressive_orders_after_inventory_pause_timeout(self) -> None:
+    def test_apply_active_delever_long_switches_to_maker_orders_after_inventory_pause_timeout(self) -> None:
         plan = {
             "buy_orders": [],
             "sell_orders": [
@@ -2452,9 +2452,9 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(result["active"])
         self.assertEqual(result["trigger_mode"], "pause_timeout")
         self.assertEqual(result["active_sell_order_count"], 2)
-        self.assertEqual([item["price"] for item in active_sells], [0.998, 0.999])
-        self.assertTrue(all(item["execution_type"] == "aggressive" for item in active_sells))
-        self.assertTrue(all(item["time_in_force"] == "GTC" for item in active_sells))
+        self.assertEqual([item["price"] for item in active_sells], [1.001, 1.011])
+        self.assertTrue(all(item["execution_type"] == "maker_timeout_release" for item in active_sells))
+        self.assertTrue(all(item["time_in_force"] == "GTX" for item in active_sells))
         self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_sells))
 
     def test_apply_active_delever_short_pause_notional_creates_passive_release_orders(self) -> None:
@@ -3427,6 +3427,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["release_sell_order_count"], 2)
         self.assertEqual([item["price"] for item in active_sells], [1.001, 1.011])
         self.assertTrue(all(item["execution_type"] == "passive_release" for item in active_sells))
+        self.assertTrue(all(item["time_in_force"] == "GTX" for item in active_sells))
         self.assertTrue(all(bool(item["force_reduce_only"]) for item in active_sells))
 
     def test_apply_active_delever_long_synthesizes_release_orders_without_take_profit_orders(self) -> None:

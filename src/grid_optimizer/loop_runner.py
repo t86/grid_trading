@@ -5278,21 +5278,20 @@ def apply_active_delever_long(
         if trigger_mode in {"threshold", "pause_timeout", "pause"}:
             active["lot_consume_mode"] = "fifo"
         if trigger_mode == "pause_timeout":
-            safe_bid_price = max(_safe_float(bid_price), 0.0)
-            safe_tick = max(_safe_float(tick_size), 0.0)
-            if safe_bid_price > 0:
-                if safe_tick > 0:
-                    aggressive_price = max(
-                        float(Decimal(str(safe_bid_price)) - (Decimal(str(safe_tick)) * Decimal(index - 1))),
-                        safe_tick,
-                    )
-                else:
-                    aggressive_price = safe_bid_price
-                active["price"] = aggressive_price
-                active["notional"] = _safe_float(active.get("price")) * _safe_float(active.get("qty"))
-                active["take_profit_guard_release_floor"] = aggressive_price
-            active["execution_type"] = "aggressive"
-            active["time_in_force"] = "GTC"
+            release_price = _resolve_near_market_release_price(
+                side="SELL",
+                level_index=index,
+                bid_price=bid_price,
+                ask_price=ask_price,
+                step_price=step_price,
+                tick_size=tick_size,
+            )
+            if release_price > 0:
+                active["price"] = release_price
+                active["notional"] = release_price * _safe_float(active.get("qty"))
+                active["take_profit_guard_release_floor"] = release_price
+            active["execution_type"] = "maker_timeout_release"
+            active["time_in_force"] = "GTX"
             active["force_reduce_only"] = True
             release_floor_price = (
                 _safe_float(active.get("price"))
@@ -5313,7 +5312,7 @@ def apply_active_delever_long(
                 active["price"] = release_price
                 active["notional"] = release_price * _safe_float(active.get("qty"))
                 active["execution_type"] = "passive_release"
-                active["time_in_force"] = "GTC"
+                active["time_in_force"] = "GTX"
                 active["force_reduce_only"] = True
                 active["take_profit_guard_release_floor"] = release_price
                 release_floor_price = (
@@ -5654,18 +5653,20 @@ def apply_active_delever_short(
         if trigger_mode in {"threshold", "threshold_timeout", "pause_timeout", "pause"}:
             active["lot_consume_mode"] = "fifo"
         if trigger_mode in {"threshold_timeout", "pause_timeout"}:
-            safe_ask_price = max(_safe_float(ask_price), 0.0)
-            safe_tick = max(_safe_float(tick_size), 0.0)
-            if safe_ask_price > 0:
-                if safe_tick > 0:
-                    aggressive_price = float(Decimal(str(safe_ask_price)) + (Decimal(str(safe_tick)) * Decimal(index - 1)))
-                else:
-                    aggressive_price = safe_ask_price
-                active["price"] = aggressive_price
-                active["notional"] = _safe_float(active.get("price")) * _safe_float(active.get("qty"))
-                active["take_profit_guard_release_ceiling"] = aggressive_price
-            active["execution_type"] = "aggressive"
-            active["time_in_force"] = "GTC"
+            release_price = _resolve_near_market_release_price(
+                side="BUY",
+                level_index=index,
+                bid_price=bid_price,
+                ask_price=_safe_float(ask_price),
+                step_price=step_price,
+                tick_size=tick_size,
+            )
+            if release_price > 0:
+                active["price"] = release_price
+                active["notional"] = release_price * _safe_float(active.get("qty"))
+                active["take_profit_guard_release_ceiling"] = release_price
+            active["execution_type"] = "maker_timeout_release"
+            active["time_in_force"] = "GTX"
             active["force_reduce_only"] = True
             release_ceiling_price = (
                 _safe_float(active.get("price"))
@@ -5686,7 +5687,7 @@ def apply_active_delever_short(
                 active["price"] = release_price
                 active["notional"] = release_price * _safe_float(active.get("qty"))
                 active["execution_type"] = "passive_release"
-                active["time_in_force"] = "GTC"
+                active["time_in_force"] = "GTX"
                 active["force_reduce_only"] = True
                 active["take_profit_guard_release_ceiling"] = release_price
                 release_ceiling_price = (
