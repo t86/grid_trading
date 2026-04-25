@@ -16,7 +16,6 @@ import sys
 import threading
 import time
 import uuid
-from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -99,7 +98,7 @@ from .monitor import (
     RUNNER_CONTROL_PATH,
     RUNNER_LOG_PATH,
     RUNNER_PID_PATH,
-    _build_local_runtime_snapshot,
+    _normalize_runtime_open_order,
     _read_runner_process,
     build_monitor_snapshot,
     read_symbol_runner_process,
@@ -107,7 +106,6 @@ from .monitor import (
     runner_log_path_for_symbol,
     runner_pid_path_for_symbol,
     summarize_income,
-    summarize_loop_events,
     summarize_user_trades,
 )
 from .maker_flatten_runner import (
@@ -25129,13 +25127,6 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
     }
 
 
-def _read_recent_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
-    rows: deque[dict[str, Any]] = deque(maxlen=limit)
-    for item in iter_jsonl(path):
-        rows.append(item)
-    return list(rows)
-
-
 def _running_status_symbols() -> list[str]:
     symbols: list[str] = []
     seen: set[str] = set()
@@ -25171,6 +25162,69 @@ def _runner_status_runtime_paths(symbol: str, runner: dict[str, Any]) -> dict[st
     }
 
 
+def _status_float(value: Any) -> float:
+    try:
+        return float(value or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _build_status_runtime_snapshot(
+    *,
+    runner: dict[str, Any],
+    plan_report: dict[str, Any],
+    submit_report: dict[str, Any],
+) -> dict[str, Any]:
+    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
+    live_book = submit_report.get("live_book") if isinstance(submit_report.get("live_book"), dict) else {}
+    bid_price = _status_float(plan_report.get("bid_price")) or _status_float(live_book.get("bid_price"))
+    ask_price = _status_float(plan_report.get("ask_price")) or _status_float(live_book.get("ask_price"))
+    mid_price = _status_float(plan_report.get("mid_price"))
+    if mid_price <= 0 and bid_price > 0 and ask_price > 0:
+        mid_price = (bid_price + ask_price) / 2.0
+    mark_price = _status_float(plan_report.get("mark_price")) or mid_price
+    actual_net_qty = _status_float(plan_report.get("actual_net_qty"))
+    long_qty = max(_status_float(plan_report.get("current_long_qty")), 0.0)
+    short_qty = max(_status_float(plan_report.get("current_short_qty")), 0.0)
+    if not (long_qty or short_qty):
+        long_qty = max(actual_net_qty, 0.0)
+        short_qty = max(-actual_net_qty, 0.0)
+    open_orders: list[dict[str, Any]] = []
+    seen_keys: set[tuple[Any, ...]] = set()
+    for item in list(plan_report.get("kept_orders") or []) + list(submit_report.get("placed_orders") or []):
+        normalized = _normalize_runtime_open_order(item)
+        if normalized is None:
+            continue
+        dedupe_key = (
+            normalized.get("order_id"),
+            normalized.get("client_order_id"),
+            normalized.get("side"),
+            normalized.get("price"),
+            normalized.get("orig_qty"),
+            normalized.get("position_side"),
+        )
+        if dedupe_key in seen_keys:
+            continue
+        seen_keys.add(dedupe_key)
+        open_orders.append(normalized)
+    return {
+        "market": {
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "mid_price": mid_price,
+            "mark_price": mark_price,
+        },
+        "position": {
+            "position_amt": actual_net_qty,
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+            "unrealized_pnl": _status_float(plan_report.get("unrealized_pnl")),
+            "leverage": runner_config.get("leverage"),
+        },
+        "open_orders": open_orders,
+    }
+
+
 def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict[str, Any] | None:
     if not bool(runner.get("is_running")):
         return None
@@ -25178,14 +25232,11 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
     event_path = Path(paths["events_path"])
     plan_report = _read_json_dict(Path(paths["plan_path"])) or {}
     submit_report = _read_json_dict(Path(paths["submit_report_path"])) or {}
-    events = _read_recent_jsonl(event_path, 120)
-    loop_summary = summarize_loop_events(events)
-    runtime_snapshot = _build_local_runtime_snapshot(
+    runtime_snapshot = _build_status_runtime_snapshot(
         runner=runner,
-        loop_summary=loop_summary,
         plan_report=plan_report,
         submit_report=submit_report,
-    ) or {}
+    )
     audit_paths = build_audit_paths(event_path)
     trade_rows = read_jsonl_filtered(audit_paths["trade_audit"], limit=0)
     income_rows = read_jsonl_filtered(audit_paths["income_audit"], limit=0)
