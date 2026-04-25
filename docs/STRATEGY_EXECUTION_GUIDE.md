@@ -177,6 +177,28 @@
 - `max_short_position_notional`
   - 如果新增卖单会把总空仓推过上限，卖单会被裁剪。
 
+#### SOON 空网格成本口径硬规则
+
+`SOONUSDT` 的 `soon_high_vol_short_grid_v1` 是刷量用高波动空网格，止盈买单和保护性减仓必须按 Binance 持仓 `entryPrice` 计算成本，禁止用 `breakEvenPrice` 作为 `take_profit_short` 的成本依据。
+
+原因：
+
+- Binance `breakEvenPrice` 会被已实现盈亏、资金费、手续费等历史因素拉偏。
+- 对空网格来说，如果用偏低的 `breakEvenPrice` 计算 `short_ceiling_price`，系统会把本应正常落袋的 reduceOnly 买单压到很远的位置。
+- 典型异常是：当前空单已经盈利，`entryPrice` 在 `0.219~0.221` 附近，但 `take_profit_guard.short_ceiling_price` 被压到 `0.211~0.212`，导致买单全堆在远端，必须等价格大幅回落才平仓。
+
+排查 `114/150` 上 SOON 挂单异常时，必须先核对：
+
+- `output/soonusdt_loop_latest_plan.json` 里的 `position_cost_basis_source` 必须是 `entryPrice`。
+- `current_short_avg_price` 必须接近 Binance 持仓的 `entryPrice`，不能接近 `breakEvenPrice`。
+- `take_profit_guard.short_ceiling_price` 必须约等于 `entryPrice * (1 - take_profit_min_profit_ratio)`，而不是由 `breakEvenPrice` 推导。
+- 如果看到 `take_profit_guard.adjusted_buy_orders > 0` 且所有 `take_profit_short` 买单被压到远低于当前盈利区的位置，优先怀疑成本口径错误，不要先改网格层数、`excess_inventory_reduce_only` 或手工重挂。
+
+代码约束：
+
+- `soon_high_vol_short_grid_v1` 必须包含在 `loop_runner._uses_entry_price_cost_basis()` 的 entryPrice 白名单里。
+- 后续新增 SOON 刷量空网格 profile 时，默认也应使用 `entryPrice` 成本口径，除非有明确测试证明 `breakEvenPrice` 不会压歪止盈买单。
+
 实现注意：
 
 - `short_cover_pause_amp_trigger_ratio`
