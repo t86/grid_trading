@@ -25,6 +25,8 @@ from collections.abc import Callable
 from statistics import mean
 from typing import Any, Union
 from urllib.parse import parse_qs, urlparse
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from .audit import build_audit_paths, iter_jsonl
 from .backtest import (
@@ -12848,6 +12850,10 @@ MONITOR_PAGE = """<!doctype html>
       color: var(--text);
       background: radial-gradient(circle at top left, #fffef8 0%, var(--bg) 46%, #ece8de 100%);
     }
+    body.monitor-only .settings-section,
+    body.settings-only .monitor-section {
+      display: none;
+    }
     .wrap { max-width: 1380px; margin: 24px auto 48px; padding: 0 16px; display: grid; gap: 16px; }
     .card {
       background: var(--panel);
@@ -13492,7 +13498,7 @@ MONITOR_PAGE = """<!doctype html>
     }
   </style>
 </head>
-<body>
+<body class="monitor-only">
   <div class="wrap">
     <section class="card header">
       <h1>实盘网格监控台</h1>
@@ -13503,6 +13509,8 @@ MONITOR_PAGE = """<!doctype html>
         <a href="/spot_runner">打开现货执行台</a>
         <a href="/rankings">打开排行榜</a>
         <a href="/strategies">打开策略总览</a>
+        <a href="/runner_settings">打开策略设置</a>
+        <a href="/running_status">运行币种状态</a>
       </div>
       <div class="toolbar">
         <label>交易对
@@ -13542,7 +13550,7 @@ MONITOR_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="card">
+    <section class="card settings-section">
       <div class="panel-title">
         <h2>冲刺赛专区</h2>
         <div class="tiny">不受上方交易对下拉限制。点“载入参数”会自动切换币种、选中对应预设，并把参数带到下面的中文表单。</div>
@@ -13551,7 +13559,7 @@ MONITOR_PAGE = """<!doctype html>
       <div id="sprint_preset_zone" class="sprint-zone"></div>
     </section>
 
-    <section class="card">
+    <section class="card settings-section">
       <div class="panel-title">
         <h2>策略参数编辑</h2>
         <div class="tiny">载入当前运行参数或所选预设，直接修改 JSON 后应用到当前交易对</div>
@@ -14092,7 +14100,7 @@ MONITOR_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="card">
+    <section class="card settings-section">
       <div class="panel-title">
         <h2>自定义币安式网格策略</h2>
         <div class="tiny">按当前选中交易对预览，并保存成可直接启动的固定中心静态网格近似策略</div>
@@ -14173,9 +14181,9 @@ MONITOR_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="status-row" id="summary"></section>
+    <section class="status-row monitor-section" id="summary"></section>
 
-    <section class="grid-2">
+    <section class="grid-2 monitor-section">
       <div class="card">
         <div class="panel-title">
           <h2>成交额曲线</h2>
@@ -14192,7 +14200,7 @@ MONITOR_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="card">
+    <section class="card monitor-section">
       <div class="panel-title">
         <h2>小时损益拆解</h2>
         <div class="tiny" id="hourly_meta">最近 24 小时</div>
@@ -14218,7 +14226,7 @@ MONITOR_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="grid-2">
+    <section class="grid-2 monitor-section">
       <div class="card">
         <div class="panel-title">
           <h2>当前挂单</h2>
@@ -14250,7 +14258,7 @@ MONITOR_PAGE = """<!doctype html>
       </div>
     </section>
 
-    <section class="grid-2">
+    <section class="grid-2 monitor-section">
       <div class="card">
         <div class="panel-title">
           <h2>最近成交</h2>
@@ -18574,7 +18582,7 @@ MONITOR_PAGE = """<!doctype html>
         : fmtNum(payload.reward_price_usdt, 4);
       return {
         label: "奖励回本量",
-        value: "20 / 50 / 200",
+        value: "200 / 50 / 20",
         cls: "",
         sub: `按当前奖励折 USDT 估算 · 奖励币种 ${String(payload.reward_unit || "--").toUpperCase()} · 现价 ${rewardPriceText}`,
         bodyHtml: `<div class="metric-lines">${rows || `<div class="metric-line">${escapeHtml(message || "当前没有可用的奖励换手量目标。")}</div>`}</div>`,
@@ -18676,13 +18684,18 @@ MONITOR_PAGE = """<!doctype html>
         `间隔: ${fmtNum(runnerCfg.sleep_seconds, 0)}s`,
         `杠杆: ${runnerCfg.leverage ? `${runnerCfg.leverage}x` : "--"}`,
       ].join(" · ");
+      const competitionWindowStart = competitionWindow.activity_start_at || competitionWindow.stats_start_at || "";
+      const competitionWindowEnd = competitionWindow.activity_end_at || "";
       const statsWindowLabel = competitionWindow.label
-        ? `${competitionWindow.label} · 起点 ${fmtTs(competitionWindow.stats_start_at || competitionWindow.activity_start_at)}`
+        ? `${fmtTs(competitionWindowStart)} -> ${fmtTs(competitionWindowEnd)}`
         : `会话起点 ${fmtTs(data.session && data.session.start)}`;
+      const statsWindowSub = competitionWindow.label
+        ? `${competitionWindow.label} · 统计起点 ${fmtTs(competitionWindow.stats_start_at || competitionWindowStart)}`
+        : "未匹配到交易赛窗口，默认按当前会话统计";
       const cards = [
         { label: "策略状态", value: strategyRunning ? "运行中" : "未活跃", cls: strategyRunning ? "good" : "warn", sub: strategyDetail },
         { label: "执行进程", value: runnerLabel, cls: runner.is_running ? "good" : "warn", sub: runnerDetail },
-        { label: "统计区间", value: statsWindowLabel, cls: "", sub: competitionWindow.activity_end_at ? `结束时间: ${fmtTs(competitionWindow.activity_end_at)}` : "未匹配到交易赛窗口，默认按当前会话统计" },
+        { label: "交易赛窗口", value: statsWindowLabel, cls: "", sub: statsWindowSub },
         { label: "风控硬限制", value: riskValue, cls: riskStatusClass, sub: riskDetail },
         { label: "会话成交笔数", value: fmtNum(trade.trade_count || 0, 0), cls: "", sub: `Maker: ${fmtNum(trade.maker_count || 0, 0)} · 买/卖: ${fmtNum(trade.buy_count || 0, 0)} / ${fmtNum(trade.sell_count || 0, 0)}` },
         { label: "累计成交额", value: fmtNum(trade.gross_notional || 0, 4), cls: "", sub: `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}` },
@@ -19270,6 +19283,274 @@ MONITOR_PAGE = """<!doctype html>
     }
 
     initMonitorPage();
+  </script>
+</body>
+</html>
+"""
+
+RUNNER_SETTINGS_PAGE = (
+    MONITOR_PAGE.replace("<title>实盘网格监控</title>", "<title>合约大师赛策略设置</title>", 1)
+    .replace('<body class="monitor-only">', '<body class="settings-only">', 1)
+    .replace("<h1>实盘网格监控台</h1>", "<h1>合约大师赛策略设置</h1>", 1)
+    .replace(
+        "实时查看循环网格的交易笔数、累计成交额、收益估算、当前持仓与挂单，并同步展示最近的补单/撤单动作。",
+        "集中维护合约大师赛的冲刺赛预设、运行保护、量能启停、波动暂停、自定义网格和启动参数。",
+        1,
+    )
+)
+
+RUNNING_STATUS_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>运行币种状态</title>
+  <style>
+    :root {
+      --bg: #f6f4ef;
+      --panel: #fffefa;
+      --line: #ded8cb;
+      --text: #1f211f;
+      --muted: #696a64;
+      --brand: #0b6f68;
+      --good: #0f7b45;
+      --warn: #a15c00;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: linear-gradient(180deg, #fbfaf6 0%, var(--bg) 100%);
+      font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    }
+    .wrap { max-width: 1480px; margin: 0 auto; padding: 24px 16px 48px; display: grid; gap: 16px; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 16px;
+      box-shadow: 0 10px 26px rgba(31, 33, 31, 0.05);
+    }
+    h1 { margin: 0 0 8px; font-size: 28px; }
+    h2 { margin: 0; font-size: 18px; }
+    p, .meta { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.6; }
+    .links, .toolbar { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; margin-top: 12px; }
+    a, button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      padding: 8px 12px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #eef7f5;
+      color: #0d4d49;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    input {
+      width: 86px;
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 0 10px;
+      background: #fff;
+      color: var(--text);
+    }
+    label { display: inline-flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; font-weight: 700; }
+    .summary { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; padding: 12px; background: #fff; }
+    .metric .label { color: var(--muted); font-size: 12px; }
+    .metric .value { margin-top: 6px; font-size: 22px; font-weight: 800; }
+    .server { display: grid; gap: 12px; }
+    .server-head { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; }
+    .table-wrap { overflow: auto; }
+    table { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 1120px; }
+    th, td { padding: 9px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
+    th { color: var(--muted); font-size: 12px; white-space: nowrap; }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 2px 7px;
+      border-radius: 999px;
+      background: #edf6f1;
+      color: var(--brand);
+      font-size: 12px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+    .empty {
+      padding: 18px;
+      border: 1px dashed var(--line);
+      border-radius: 8px;
+      color: var(--muted);
+      text-align: center;
+      background: #fff;
+    }
+    @media (max-width: 900px) {
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 620px) {
+      .summary { grid-template-columns: 1fr; }
+      .server-head { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="card">
+      <h1>运行中币种状态</h1>
+      <p>按服务器汇总正在运行的合约策略，统一看成交额、最近一小时成交额、盈亏拆解、挂单和持仓。</p>
+      <div class="links">
+        <a href="/monitor">单币监控</a>
+        <a href="/runner_settings">策略设置</a>
+        <a href="/strategies">策略总览</a>
+        <a href="/">策略测算页</a>
+      </div>
+      <div class="toolbar">
+        <label>自动刷新秒数 <input id="refresh_sec" type="number" min="10" step="1" value="20" /></label>
+        <button id="refresh_btn" class="primary">立即刷新</button>
+        <button id="toggle_btn">暂停自动刷新</button>
+      </div>
+      <div id="meta" class="meta">等待首轮数据...</div>
+    </section>
+    <section id="summary" class="summary"></section>
+    <section id="servers" class="server"></section>
+  </main>
+  <script>
+    const summaryEl = document.getElementById("summary");
+    const serversEl = document.getElementById("servers");
+    const metaEl = document.getElementById("meta");
+    const refreshSecEl = document.getElementById("refresh_sec");
+    const refreshBtn = document.getElementById("refresh_btn");
+    const toggleBtn = document.getElementById("toggle_btn");
+    let timer = null;
+    let paused = false;
+    let loading = false;
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
+    }
+    function fmtNum(value, digits = 4) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+      return Number(value).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
+    }
+    function fmtMoney(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+      const num = Number(value);
+      return `${num > 0 ? "+" : ""}${fmtNum(num, 4)}`;
+    }
+    function fmtTs(value) {
+      if (!value) return "--";
+      const dt = new Date(value);
+      return Number.isNaN(dt.getTime()) ? String(value) : dt.toLocaleString("zh-CN", { hour12: false });
+    }
+    function moneyClass(value) {
+      const num = Number(value || 0);
+      if (num > 0) return "good";
+      if (num < 0) return "bad";
+      return "warn";
+    }
+    function renderSummary(payload) {
+      const summary = payload.summary || {};
+      const cards = [
+        ["运行币种", fmtNum(summary.running_symbol_count || 0, 0), `${fmtNum(summary.server_count || 0, 0)} 台服务器`],
+        ["总成交量", fmtNum(summary.total_volume || 0, 4), "按交易赛/会话统计窗口"],
+        ["最近一小时成交量", fmtNum(summary.recent_hour_volume || 0, 4), "取每个币种最新小时桶"],
+        ["总盈亏", fmtMoney(summary.total_pnl || 0), `交易 ${fmtMoney(summary.trade_pnl || 0)} · 未实现 ${fmtMoney(summary.unrealized_pnl || 0)}`],
+        ["手续费/资金费", fmtMoney(-(summary.fees || 0)), `资金费 ${fmtMoney(summary.funding_fee || 0)}`],
+      ];
+      summaryEl.innerHTML = cards.map(([label, value, sub], index) => `
+        <div class="metric">
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="value ${index >= 3 ? moneyClass(index === 3 ? summary.total_pnl : -summary.fees) : ""}">${escapeHtml(value)}</div>
+          <div class="meta">${escapeHtml(sub)}</div>
+        </div>
+      `).join("");
+    }
+    function renderServer(server) {
+      const rows = Array.isArray(server.symbols) ? server.symbols : [];
+      const body = rows.map((item) => `
+        <tr>
+          <td><span class="pill">${escapeHtml(item.symbol)}</span></td>
+          <td>${escapeHtml(fmtNum(item.total_volume, 4))}</td>
+          <td>${escapeHtml(fmtNum(item.recent_hour_volume, 4))}</td>
+          <td class="${moneyClass(item.total_pnl)}">${escapeHtml(fmtMoney(item.total_pnl))}</td>
+          <td class="${moneyClass(item.trade_pnl)}">${escapeHtml(fmtMoney(item.trade_pnl))}</td>
+          <td class="${moneyClass(item.unrealized_pnl)}">${escapeHtml(fmtMoney(item.unrealized_pnl))}</td>
+          <td class="${moneyClass(-item.fees)}">${escapeHtml(fmtMoney(-item.fees))}</td>
+          <td class="${moneyClass(item.funding_fee)}">${escapeHtml(fmtMoney(item.funding_fee))}</td>
+          <td>${escapeHtml(item.open_order_summary || "--")}</td>
+          <td>${escapeHtml(item.position_summary || "--")}</td>
+          <td>${escapeHtml(fmtTs(item.updated_at))}</td>
+        </tr>
+      `).join("");
+      const status = server.ok ? `${rows.length} 个运行中` : `读取失败：${server.error || "--"}`;
+      return `
+        <section class="card">
+          <div class="server-head">
+            <div>
+              <h2>${escapeHtml(server.label || server.url || "--")}</h2>
+              <p>${escapeHtml(server.url || "")}</p>
+            </div>
+            <div class="pill ${server.ok ? "good" : "bad"}">${escapeHtml(status)}</div>
+          </div>
+          ${rows.length ? `
+            <div class="table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>币种</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
+                  </tr>
+                </thead>
+                <tbody>${body}</tbody>
+              </table>
+            </div>
+          ` : '<div class="empty">当前没有检测到运行中的币种。</div>'}
+        </section>
+      `;
+    }
+    async function loadStatus() {
+      if (loading) return;
+      loading = true;
+      metaEl.textContent = "正在刷新跨服务器状态...";
+      try {
+        const resp = await fetch("/api/running_status?scope=cross");
+        const payload = await resp.json();
+        if (!resp.ok || !payload.ok) throw new Error(payload.error || `HTTP ${resp.status}`);
+        renderSummary(payload);
+        serversEl.innerHTML = (payload.servers || []).map(renderServer).join("");
+        metaEl.textContent = `最后刷新：${fmtTs(payload.ts)}`;
+      } catch (err) {
+        serversEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
+        metaEl.textContent = `刷新失败：${err}`;
+      } finally {
+        loading = false;
+      }
+    }
+    function restartTimer() {
+      if (timer) clearInterval(timer);
+      timer = null;
+      if (paused) return;
+      const sec = Math.max(10, Number(refreshSecEl.value || 20));
+      timer = setInterval(loadStatus, sec * 1000);
+    }
+    refreshBtn.addEventListener("click", () => { loadStatus(); restartTimer(); });
+    toggleBtn.addEventListener("click", () => {
+      paused = !paused;
+      toggleBtn.textContent = paused ? "恢复自动刷新" : "暂停自动刷新";
+      restartTimer();
+    });
+    refreshSecEl.addEventListener("change", restartTimer);
+    loadStatus();
+    restartTimer();
   </script>
 </body>
 </html>
@@ -24748,6 +25029,201 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
     return snapshot
 
 
+def _running_status_server_entries() -> list[dict[str, str]]:
+    raw = os.environ.get("GRID_RUNNING_STATUS_SERVERS", "").strip()
+    if raw:
+        entries: list[dict[str, str]] = []
+        for chunk in raw.split(","):
+            item = chunk.strip()
+            if not item:
+                continue
+            if "=" in item:
+                label, url = item.split("=", 1)
+            else:
+                label, url = item, item
+            normalized_url = url.strip().rstrip("/")
+            if normalized_url:
+                entries.append({"label": label.strip() or normalized_url, "url": normalized_url})
+        return entries
+    return [
+        {"label": "43.131.232.150", "url": "http://43.131.232.150:8789"},
+        {"label": "43.155.136.111", "url": "http://43.155.136.111:8787"},
+    ]
+
+
+def _latest_hour_volume(snapshot: dict[str, Any]) -> float:
+    rows = ((snapshot.get("hourly_summary") or {}).get("rows") or []) if isinstance(snapshot, dict) else []
+    if not rows:
+        return 0.0
+    latest = rows[0] if isinstance(rows[0], dict) else {}
+    return float(latest.get("gross_notional") or 0.0)
+
+
+def _summarize_open_orders_for_status(snapshot: dict[str, Any]) -> str:
+    rows = snapshot.get("open_orders") or []
+    if not isinstance(rows, list) or not rows:
+        return "无挂单"
+    buy_count = sum(1 for item in rows if str((item or {}).get("side", "")).upper() == "BUY")
+    sell_count = sum(1 for item in rows if str((item or {}).get("side", "")).upper() == "SELL")
+    notional = 0.0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        notional += float(item.get("price") or 0.0) * float(item.get("orig_qty") or 0.0)
+    return f"{len(rows)} 笔，买/卖 {buy_count}/{sell_count}，名义 {notional:.4f}U"
+
+
+def _summarize_position_for_status(snapshot: dict[str, Any]) -> str:
+    position = snapshot.get("position") or {}
+    market = snapshot.get("market") or {}
+    if not isinstance(position, dict):
+        return "--"
+    mid_price = float(market.get("mid_price") or market.get("mark_price") or 0.0) if isinstance(market, dict) else 0.0
+    net_qty = float(position.get("position_amt") or 0.0)
+    long_qty = float(position.get("long_qty") or max(net_qty, 0.0) or 0.0)
+    short_qty = float(position.get("short_qty") or max(-net_qty, 0.0) or 0.0)
+    notional = abs(net_qty) * mid_price if mid_price > 0 else 0.0
+    side = "净多" if net_qty > 0 else ("净空" if net_qty < 0 else "空仓")
+    return (
+        f"{side} {net_qty:.8g}，多/空 {long_qty:.8g}/{short_qty:.8g}，"
+        f"名义 {notional:.4f}U，未实现 {float(position.get('unrealized_pnl') or 0.0):+.4f}U"
+    )
+
+
+def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    runner = snapshot.get("runner") or {}
+    if not isinstance(runner, dict) or not bool(runner.get("is_running")):
+        return None
+    trade = snapshot.get("trade_summary") or {}
+    income = snapshot.get("income_summary") or {}
+    position = snapshot.get("position") or {}
+    trade_pnl = float(trade.get("realized_pnl") or 0.0) if isinstance(trade, dict) else 0.0
+    fees = float(trade.get("commission") or 0.0) if isinstance(trade, dict) else 0.0
+    funding_fee = float(income.get("funding_fee") or 0.0) if isinstance(income, dict) else 0.0
+    unrealized_pnl = float(position.get("unrealized_pnl") or 0.0) if isinstance(position, dict) else 0.0
+    total_pnl = trade_pnl + unrealized_pnl + funding_fee - fees
+    return {
+        "symbol": snapshot.get("symbol"),
+        "updated_at": snapshot.get("ts"),
+        "total_volume": float(trade.get("gross_notional") or 0.0) if isinstance(trade, dict) else 0.0,
+        "recent_hour_volume": _latest_hour_volume(snapshot),
+        "total_pnl": total_pnl,
+        "trade_pnl": trade_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "fees": fees,
+        "funding_fee": funding_fee,
+        "open_order_count": len(snapshot.get("open_orders") or []),
+        "open_order_summary": _summarize_open_orders_for_status(snapshot),
+        "position_summary": _summarize_position_for_status(snapshot),
+        "runner": {"pid": runner.get("pid"), "elapsed": runner.get("elapsed")},
+    }
+
+
+def _running_status_symbols() -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+
+    def add_symbol(value: Any) -> None:
+        symbol = str(value or "").upper().strip()
+        if not symbol or symbol in seen:
+            return
+        seen.add(symbol)
+        symbols.append(symbol)
+
+    for symbol in get_symbol_list("monitor"):
+        add_symbol(symbol)
+    for path in Path("output").glob("*_loop_runner_control.json"):
+        payload = _read_json_dict(path)
+        add_symbol((payload or {}).get("symbol"))
+    return symbols
+
+
+def _build_local_running_status() -> dict[str, Any]:
+    symbols = _running_status_symbols()
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    for symbol in symbols:
+        try:
+            item = _snapshot_to_running_status_item(_run_loop_monitor_query({"symbol": [symbol], "summary_limit": ["500"]}))
+        except Exception as exc:
+            errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        if item is not None:
+            rows.append(item)
+    return {
+        "ok": True,
+        "label": os.environ.get("GRID_RUNNING_STATUS_LOCAL_LABEL", "本机"),
+        "url": "",
+        "symbols": rows,
+        "errors": errors,
+    }
+
+
+def _running_status_summary(servers: list[dict[str, Any]]) -> dict[str, Any]:
+    rows = [
+        item
+        for server in servers
+        if server.get("ok")
+        for item in (server.get("symbols") or [])
+        if isinstance(item, dict)
+    ]
+    return {
+        "server_count": len(servers),
+        "running_symbol_count": len(rows),
+        "total_volume": sum(float(item.get("total_volume") or 0.0) for item in rows),
+        "recent_hour_volume": sum(float(item.get("recent_hour_volume") or 0.0) for item in rows),
+        "total_pnl": sum(float(item.get("total_pnl") or 0.0) for item in rows),
+        "trade_pnl": sum(float(item.get("trade_pnl") or 0.0) for item in rows),
+        "unrealized_pnl": sum(float(item.get("unrealized_pnl") or 0.0) for item in rows),
+        "fees": sum(float(item.get("fees") or 0.0) for item in rows),
+        "funding_fee": sum(float(item.get("funding_fee") or 0.0) for item in rows),
+    }
+
+
+def _fetch_remote_running_status(entry: dict[str, str], timeout: float = 8.0) -> dict[str, Any]:
+    url = f"{entry['url'].rstrip('/')}/api/running_status?scope=local"
+    headers = {"Accept": "application/json"}
+    credentials = _load_web_auth_credentials()
+    if credentials is not None:
+        token = base64.b64encode(f"{credentials[0]}:{credentials[1]}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+    request = Request(url, headers=headers)
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        return {"ok": False, "label": entry["label"], "url": entry["url"], "symbols": [], "error": f"{type(exc).__name__}: {exc}"}
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        return {"ok": False, "label": entry["label"], "url": entry["url"], "symbols": [], "error": str((payload or {}).get("error", "invalid response"))}
+    server = payload.get("server") if isinstance(payload.get("server"), dict) else payload
+    return {
+        "ok": True,
+        "label": str(server.get("label") or entry["label"]),
+        "url": entry["url"],
+        "symbols": list(server.get("symbols") or []),
+        "errors": list(server.get("errors") or []),
+    }
+
+
+def _build_running_status(scope: str = "cross") -> dict[str, Any]:
+    local = _build_local_running_status()
+    servers = [local]
+    if scope != "local":
+        entries = _running_status_server_entries()
+        with ThreadPoolExecutor(max_workers=min(max(len(entries), 1), 4)) as executor:
+            futures = [executor.submit(_fetch_remote_running_status, entry) for entry in entries]
+            for future in as_completed(futures):
+                servers.append(future.result())
+    return {
+        "ok": True,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scope": scope,
+        "server": local,
+        "servers": servers,
+        "summary": _running_status_summary(servers),
+    }
+
+
 class _Handler(BaseHTTPRequestHandler):
     server_version = "grid-web/0.1"
 
@@ -24841,6 +25317,12 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/monitor", "/monitor.html"}:
             self._send_html(MONITOR_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/runner_settings", "/runner_settings.html"}:
+            self._send_html(RUNNER_SETTINGS_PAGE, status=HTTPStatus.OK)
+            return
+        if path in {"/running_status", "/running_status.html"}:
+            self._send_html(RUNNING_STATUS_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/spot_runner", "/spot_runner.html"}:
             self._send_html(SPOT_RUNNER_PAGE, status=HTTPStatus.OK)
             return
@@ -24874,6 +25356,18 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/loop_monitor"):
             try:
                 payload = _run_loop_monitor_query(query)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
+            return
+        if path == "/api/running_status":
+            scope = str(query.get("scope", ["cross"])[0]).strip().lower() or "cross"
+            if scope not in {"local", "cross"}:
+                self._send_json({"ok": False, "error": "scope must be local or cross"}, status=400)
+                return
+            try:
+                payload = _build_running_status(scope=scope)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
@@ -25091,6 +25585,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/runner_settings", "/runner_settings.html"}:
+            body = RUNNER_SETTINGS_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
+        if path in {"/running_status", "/running_status.html"}:
+            body = RUNNING_STATUS_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/spot_runner", "/spot_runner.html"}:
             body = SPOT_RUNNER_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -25120,6 +25626,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path.startswith("/api/symbols")
             or path == "/api/price"
             or path.startswith("/api/loop_monitor")
+            or path == "/api/running_status"
             or path == "/api/grid_preview"
             or path == "/api/competition_board"
             or path == "/api/spot_runner/status"

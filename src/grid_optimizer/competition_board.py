@@ -284,6 +284,48 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.bmwweb.solutions/zh-CN/activity/trading-competition/futures-bard-challenge2?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="futures_xaut",
+        symbol="XAUT",
+        market="futures",
+        label="XAUT 合约交易挑战赛",
+        url="https://www.bmwweb.technology/zh-CN/activity/trading-competition/futures-xaut-challenge-n?ref=1118658029",
+    ),
+    CompetitionSource(
+        slug="futures_soon",
+        symbol="SOON",
+        market="futures",
+        label="SOON 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-soon-challenge3?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_tradfi_week1",
+        symbol="TRADFI",
+        market="futures",
+        label="TradFi合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/tradfisprint-2026wk1-new?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_altcoins_week1",
+        symbol="ALTCOINS",
+        market="futures",
+        label="Altcoins合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/altcoinsprint-2016wk1-new?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_um_week1",
+        symbol="UM",
+        market="futures",
+        label="UM合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/umsprint-2026wk1-new?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_goldsilver_week1",
+        symbol="GOLDSILVER",
+        market="futures",
+        label="黄金白银合约冲刺赛 - 第1周",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/goldsilversprint-2026wk1-new?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
         slug="futures_based",
         symbol="BASED",
         market="futures",
@@ -929,6 +971,254 @@ STATIC_BOARD_HINTS: dict[str, dict[str, Any]] = {
 平分 150,000 BARD
 """,
             },
+        ]
+    },
+    "futures_xaut": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛 - 第一阶段",
+                "resourceId": 47697,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "XAUT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/03/27 18:00 - 2026/04/06 07:59",
+                "activityEndAt": "2026-04-06T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/03/27 18:00 - 2026/04/06 07:59
+累计 XAUT U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+6.75 XAUT
+第 2 名
+5.4 XAUT
+第 3 名
+3.15 XAUT
+第 4 名
+1.8 XAUT
+第 5 名
+0.9 XAUT
+第 6 - 20 名
+平分 6.75 XAUT
+第 21 - 50 名
+平分 6.75 XAUT
+第 51 - 200 名
+平分 13.5 XAUT
+""",
+            },
+            {
+                "tabLabel": "交易量挑战赛 - 第二阶段",
+                "resourceId": 47699,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "XAUT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/06 08:00 - 2026/04/16 07:59",
+                "activityEndAt": "2026-04-16T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/06 08:00 - 2026/04/16 07:59
+累计 XAUT U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+6.75 XAUT
+第 2 名
+5.4 XAUT
+第 3 名
+3.15 XAUT
+第 4 名
+1.8 XAUT
+第 5 名
+0.9 XAUT
+第 6 - 20 名
+平分 6.75 XAUT
+第 21 - 50 名
+平分 6.75 XAUT
+第 51 - 200 名
+平分 13.5 XAUT
+""",
+            },
+        ]
+    },
+    "futures_soon": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛 - 第一阶段",
+                "resourceId": 50568,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "SOON",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/17 21:00 - 2026/04/27 07:59",
+                "activityEndAt": "2026-04-27T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/17 21:00 - 2026/04/27 07:59
+累计 SOON U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+150,000 SOON
+第 2 名
+120,000 SOON
+第 3 名
+70,000 SOON
+第 4 名
+40,000 SOON
+第 5 名
+20,000 SOON
+第 6 - 20 名
+平分 150,000 SOON
+第 21 - 50 名
+平分 150,000 SOON
+第 51 - 200 名
+平分 300,000 SOON
+""",
+            },
+            {
+                "tabLabel": "交易量挑战赛 - 第二阶段",
+                "resourceId": 50570,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "SOON",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/27 08:00 - 2026/05/07 07:59",
+                "activityEndAt": "2026-05-07T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/04/27 08:00 - 2026/05/07 07:59
+累计 SOON U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 名
+150,000 SOON
+第 2 名
+120,000 SOON
+第 3 名
+70,000 SOON
+第 4 名
+40,000 SOON
+第 5 名
+20,000 SOON
+第 6 - 20 名
+平分 150,000 SOON
+第 21 - 50 名
+平分 150,000 SOON
+第 51 - 200 名
+平分 300,000 SOON
+""",
+            },
+        ]
+    },
+    "futures_tradfi_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50447,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "USDT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量低于 70 亿 USDT 时，TradFi 周奖池为 120,000 USDT。
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿 USDT 时，TradFi 周奖池为 270,000 USDT。
+""",
+            }
+        ]
+    },
+    "futures_altcoins_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50459,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "PUMP/BANK",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+每周奖池为 50,000,000 PUMP 和 2,500,000 BANK 代币券。
+Altcoins 合约冲刺赛将持续 4 周。
+""",
+            }
+        ]
+    },
+    "futures_um_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50456,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BNB",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+每周奖池为 330 BNB 代币券。
+UM 合约冲刺赛将持续 4 周。
+""",
+            }
+        ]
+    },
+    "futures_goldsilver_week1": {
+        "boards": [
+            {
+                "tabLabel": "交易量冲刺赛 - 第1周",
+                "resourceId": 50453,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "USDT",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/04/21 08:00 - 2026/04/28 07:59",
+                "activityEndAt": "2026-04-28T07:59:00+08:00",
+                "maxRows": 500,
+                "bodyExcerpt": """
+活动时间：2026/04/21 08:00 - 2026/04/28 07:59
+累计合约交易量至少 500 USDT，方可参与排行榜奖励。
+第 1 - 500 名
+按交易量占比瓜分总奖池
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量低于 70 亿 USDT 时，黄金白银周奖池为 60,000 USDT。
+TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿 USDT 时，黄金白银周奖池为 90,000 USDT。
+""",
+            }
         ]
     },
     "futures_based": {
@@ -3061,6 +3351,8 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
                 "label": str(final_board.get("label") or board.get("label") or board_key),
                 "symbol": str(final_board.get("symbol") or board.get("symbol") or ""),
                 "market": str(final_board.get("market") or board.get("market") or ""),
+                "activity_start_at": str(final_board.get("activity_start_at") or board.get("activity_start_at") or "").strip(),
+                "activity_end_at": str(final_board.get("activity_end_at") or board.get("activity_end_at") or "").strip(),
                 "final_capture": str(final_entry.get("capture_label", "")),
                 "previous_capture": str(previous_entry.get("capture_label", "")),
                 "last_day_market_volume": ENDED_LAST_DAY_MARKET_VOLUME.get(board_key),
@@ -3089,6 +3381,8 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
                     "label": str(final_board.get("label") or board.get("label") or board_key),
                     "symbol": str(final_board.get("symbol") or board.get("symbol") or ""),
                     "market": str(final_board.get("market") or board.get("market") or ""),
+                    "activity_start_at": str(final_board.get("activity_start_at") or board.get("activity_start_at") or "").strip(),
+                    "activity_end_at": str(final_board.get("activity_end_at") or board.get("activity_end_at") or "").strip(),
                     "rank_label": str(segment.get("rank_label", "")).strip() or "-",
                     "reward_text": str(segment.get("per_user_reward_text") or segment.get("reward_text") or "").strip() or "-",
                     "reward_unit": reward_unit or str(final_board.get("reward_unit") or "").strip(),
@@ -3116,6 +3410,8 @@ def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any
                     "label": str(summary.get("label") or board_key),
                     "symbol": str(summary.get("symbol") or ""),
                     "market": "futures",
+                    "activity_start_at": "",
+                    "activity_end_at": "",
                     "rank_label": str(row.get("rank_label") or "-"),
                     "reward_text": "-",
                     "reward_unit": "",
@@ -3201,6 +3497,8 @@ def _build_ongoing_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, A
                 "board_key": board_key,
                 "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip(),
                 "symbol": str(board.get("symbol", "")).strip(),
+                "activity_start_at": start_at.isoformat() if start_at is not None else str(board.get("activity_start_at", "")).strip(),
+                "activity_end_at": end_at.isoformat() if end_at is not None else str(board.get("activity_end_at", "")).strip(),
                 "updated_at_utc": str(board.get("updated_at_utc", "")).strip(),
                 "latest_day_volume": latest_day_volume,
                 "latest_day_volume_text": f"{latest_day_volume:,.0f}" if latest_day_volume is not None else "",
@@ -4359,6 +4657,8 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
     }
 
     function renderBoard(board) {
+      const activityStartText = fmtDate(board.activity_start_at);
+      const activityEndText = fmtDate(board.activity_end_at);
       return `
         <article class="board-card">
           <div class="board-head">
@@ -4372,11 +4672,19 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
             <div class="event-panel">
               <div class="label">活动周期</div>
               <div class="value">${escapeHtml(board.activity_period_text || "未提供")}</div>
-              <div class="sub">结束时间会随卡片倒计时实时提示。</div>
+              <div class="sub">开始时间 ${escapeHtml(activityStartText || "-")} · 截止时间 ${escapeHtml(activityEndText || "-")}</div>
             </div>
             ${countdownMarkup(board)}
           </div>
           <div class="board-meta">
+            <div class="mini">
+              <div class="label">开始时间</div>
+              <div class="value">${escapeHtml(activityStartText || "-")}</div>
+            </div>
+            <div class="mini">
+              <div class="label">截止时间</div>
+              <div class="value">${escapeHtml(activityEndText || "-")}</div>
+            </div>
             <div class="mini">
               <div class="label">榜单更新时间</div>
               <div class="value">${escapeHtml(board.updated_text || fmtDate(board.updated_at_utc))}</div>
@@ -4567,13 +4875,16 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         const rewards = Array.isArray(group.rewards) ? group.rewards : [];
         const label = (delta && delta.label) || (rewards[0] && rewards[0].label) || "-";
         const symbol = (delta && delta.symbol) || (rewards[0] && rewards[0].symbol) || "-";
+        const activityStartAt = (delta && delta.activity_start_at) || (rewards[0] && rewards[0].activity_start_at) || "";
         const metaRow = delta ? `
           <div class="meta-row">
+            <span>开始时间：${escapeHtml(fmtDate(activityStartAt) || "-")}</span>
+            <span>结束时间：${escapeHtml(fmtDate(activityEndAt) || "-")}</span>
             <span>最终快照：${escapeHtml(delta.final_capture || "-")}</span>
             <span>对比快照：${escapeHtml(delta.previous_capture || "-")}</span>
             <span>最后一天全市场量：${delta.last_day_market_volume === null || delta.last_day_market_volume === undefined ? "-" : fmtNum(delta.last_day_market_volume, 0)}</span>
           </div>
-        ` : `<div class="meta-row"><span>未找到对应的历史增量快照。</span></div>`;
+        ` : `<div class="meta-row"><span>开始时间：${escapeHtml(fmtDate(activityStartAt) || "-")}</span><span>结束时间：${escapeHtml(fmtDate(activityEndAt) || "-")}</span><span>未找到对应的历史增量快照。</span></div>`;
         const deltas = delta && delta.deltas ? delta.deltas : {};
         const deltaTable = delta ? `
           <div>
@@ -4656,6 +4967,10 @@ COMPETITION_BOARD_PAGE = """<!doctype html>
         <article class="ended-card ongoing" data-ongoing-board="${escapeHtml(item.board_key || "")}">
           <div>
             <h3>${escapeHtml(item.symbol || "-")} · ${escapeHtml(item.label || "-")}</h3>
+            <div class="meta-row">
+              <span>开始时间：${escapeHtml(fmtDate(item.activity_start_at) || "-")}</span>
+              <span>结束时间：${escapeHtml(fmtDate(item.activity_end_at) || "-")}</span>
+            </div>
             <div class="meta-row">
               <span>当前快照：${escapeHtml(fmtDate(item.updated_at_utc) || "-")}</span>
               <span>最新一天交易量：${item.latest_day_volume === null || item.latest_day_volume === undefined ? "-" : fmtNum(item.latest_day_volume, 0)}</span>

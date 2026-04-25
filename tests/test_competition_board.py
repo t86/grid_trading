@@ -341,6 +341,19 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertAlmostEqual(rank_200["reward_value_usdt"], 120.0, places=8)
         self.assertIsNone(rank_200["cutoff_value"])
 
+    def test_resolve_active_competition_board_falls_back_to_hinted_soon_board_when_snapshot_missing(self) -> None:
+        board = resolve_active_competition_board(
+            "SOONUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 4, 23, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "SOON")
+        self.assertEqual(board["market"], "futures")
+        self.assertIn("第一阶段", board["label"])
+        self.assertEqual(board["resource_id"], 50568)
+
     def test_load_history_index_merges_disk_files_with_stale_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             base = Path(temp_dir)
