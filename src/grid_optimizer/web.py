@@ -3717,6 +3717,45 @@ def _volatility_trigger_orphan_recovery_action(
     return None
 
 
+def _volatility_reduce_preflight_summary(
+    *,
+    symbol: str,
+    target_notional: float,
+    allow_loss: bool,
+    max_loss_ratio: float | None,
+) -> dict[str, Any]:
+    creds = load_binance_api_credentials()
+    if not creds:
+        raise RuntimeError("未加载 Binance API 凭据，无法预检高波动减仓")
+    api_key, api_secret = creds
+    snapshot = load_live_flatten_snapshot(
+        symbol,
+        api_key,
+        api_secret,
+        target_position_notional=target_notional,
+        allow_loss=allow_loss,
+        max_loss_ratio=max_loss_ratio,
+    )
+    orders = snapshot.get("orders") if isinstance(snapshot.get("orders"), list) else []
+    warnings = snapshot.get("warnings") if isinstance(snapshot.get("warnings"), list) else []
+    target_reached = bool(snapshot.get("long_target_reached")) or bool(snapshot.get("short_target_reached"))
+    blocked = not orders and not target_reached
+    return {
+        "blocked": blocked,
+        "target_reached": target_reached,
+        "order_count": len(orders),
+        "warnings": [str(item) for item in warnings[:8]],
+        "bid_price": snapshot.get("bid_price"),
+        "ask_price": snapshot.get("ask_price"),
+        "target_position_notional": target_notional,
+        "allow_loss": bool(allow_loss),
+        "max_loss_ratio": max_loss_ratio,
+        "long_qty": snapshot.get("long_qty"),
+        "short_qty": snapshot.get("short_qty"),
+        "net_qty": snapshot.get("net_qty"),
+    }
+
+
 def _resolve_runner_volatility_trigger_action(
     config: dict[str, Any],
     *,
@@ -4030,6 +4069,54 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 target_notional = 0.0
                 close_positions = True
                 close_position_allow_loss = True
+            if target_notional > 0 and close_positions:
+                preflight = _volatility_reduce_preflight_summary(
+                    symbol=symbol,
+                    target_notional=target_notional,
+                    allow_loss=close_position_allow_loss,
+                    max_loss_ratio=close_position_max_loss_ratio,
+                )
+                status["reduce_preflight"] = preflight
+                if preflight.get("blocked"):
+                    status["prevented_action"] = decision.get("action")
+                    status["action"] = None
+                    status["reason"] = "reduce_to_notional_blocked_keep_runner"
+                    status["paused_by_trigger"] = False
+                    status["post_stop_pending"] = False
+                    status["phase"] = "reduce_to_notional"
+                    status["reduce_target_notional"] = target_notional
+                    status["reduce_max_loss_ratio"] = close_position_max_loss_ratio
+                    status["reduce_target_reached"] = False
+                    status["reduce_started_at"] = previous_status.get("reduce_started_at") or checked_at
+                    status["reduce_effective"] = False
+                    status["reduce_close_attempted_count"] = 0
+                    status["reduce_flatten_started"] = False
+                    status["reduce_blocked_keep_runner"] = True
+                    status["full_flatten_started_at"] = None
+                    status["full_flatten_target_reached"] = False
+                    status["escalation_reason"] = None
+                    if not bool(runner.get("is_running")):
+                        resume_result = _start_runner_process(normalized_config)
+                        resumed_runner = _read_runner_process_for_symbol(symbol)
+                        status["action"] = "start"
+                        status["reason"] = "reduce_to_notional_blocked_resume_runner"
+                        status["runner_running"] = bool(resumed_runner.get("is_running"))
+                        status["result"] = {
+                            "runner_restarted_after_blocked_reduce": {
+                                "started": bool(resume_result.get("started")),
+                                "already_running": bool(resume_result.get("already_running")),
+                                "restarted": bool(resume_result.get("restarted")),
+                            }
+                        }
+                    else:
+                        status["result"] = {"runner_kept_running_after_blocked_reduce": True}
+                    print(
+                        f"[volatility-trigger] {symbol} keep runner window={window_key} "
+                        f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%} "
+                        f"target={target_notional:.4f} reason=blocked_reduce"
+                    )
+                    _update_volatility_trigger_status(symbol, status)
+                    return
             status["paused_by_trigger"] = True
             status["post_stop_pending"] = True
             if target_notional > 0:
