@@ -25188,7 +25188,13 @@ def _running_status_summary(servers: list[dict[str, Any]]) -> dict[str, Any]:
 def _fetch_remote_running_status(entry: dict[str, str], timeout: float = 8.0) -> dict[str, Any]:
     url = f"{entry['url'].rstrip('/')}/api/running_status?scope=local"
     headers = {"Accept": "application/json"}
-    credentials = _load_web_auth_credentials()
+    remote_auth = os.environ.get("GRID_RUNNING_STATUS_AUTH", "")
+    remote_username, sep, remote_password = remote_auth.partition(":")
+    credentials = (
+        (remote_username.strip(), remote_password)
+        if sep and remote_username.strip() and remote_password
+        else _load_web_auth_credentials()
+    )
     if credentials is not None:
         token = base64.b64encode(f"{credentials[0]}:{credentials[1]}".encode("utf-8")).decode("ascii")
         headers["Authorization"] = f"Basic {token}"
