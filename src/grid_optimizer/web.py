@@ -16,6 +16,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -28,7 +29,12 @@ from urllib.parse import parse_qs, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from .audit import build_audit_paths, iter_jsonl
+from .audit import (
+    build_audit_paths,
+    iter_jsonl,
+    read_jsonl_filtered,
+    trade_row_time_ms,
+)
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -93,12 +99,16 @@ from .monitor import (
     RUNNER_CONTROL_PATH,
     RUNNER_LOG_PATH,
     RUNNER_PID_PATH,
+    _build_local_runtime_snapshot,
     _read_runner_process,
     build_monitor_snapshot,
     read_symbol_runner_process,
     runner_control_path_for_symbol,
     runner_log_path_for_symbol,
     runner_pid_path_for_symbol,
+    summarize_income,
+    summarize_loop_events,
+    summarize_user_trades,
 )
 from .maker_flatten_runner import (
     flatten_client_order_prefix,
@@ -25119,6 +25129,13 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
     }
 
 
+def _read_recent_jsonl(path: Path, limit: int) -> list[dict[str, Any]]:
+    rows: deque[dict[str, Any]] = deque(maxlen=limit)
+    for item in iter_jsonl(path):
+        rows.append(item)
+    return list(rows)
+
+
 def _running_status_symbols() -> list[str]:
     symbols: list[str] = []
     seen: set[str] = set()
@@ -25138,6 +25155,75 @@ def _running_status_symbols() -> list[str]:
     return symbols
 
 
+def _runner_status_runtime_paths(symbol: str, runner: dict[str, Any]) -> dict[str, str]:
+    runner_config = runner.get("config", {}) if isinstance(runner, dict) else {}
+    if isinstance(runner_config, dict) and str(runner_config.get("symbol", "")).upper().strip() == symbol:
+        return {
+            "events_path": str(runner_config.get("summary_jsonl", "")).strip(),
+            "plan_path": str(runner_config.get("plan_json", "")).strip(),
+            "submit_report_path": str(runner_config.get("submit_report_json", "")).strip(),
+        }
+    runtime_paths = _default_runtime_paths_for_symbol(symbol)
+    return {
+        "events_path": runtime_paths["summary_jsonl"],
+        "plan_path": runtime_paths["plan_json"],
+        "submit_report_path": runtime_paths["submit_report_json"],
+    }
+
+
+def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict[str, Any] | None:
+    if not bool(runner.get("is_running")):
+        return None
+    paths = _runner_status_runtime_paths(symbol, runner)
+    event_path = Path(paths["events_path"])
+    plan_report = _read_json_dict(Path(paths["plan_path"])) or {}
+    submit_report = _read_json_dict(Path(paths["submit_report_path"])) or {}
+    events = _read_recent_jsonl(event_path, 120)
+    loop_summary = summarize_loop_events(events)
+    runtime_snapshot = _build_local_runtime_snapshot(
+        runner=runner,
+        loop_summary=loop_summary,
+        plan_report=plan_report,
+        submit_report=submit_report,
+    ) or {}
+    audit_paths = build_audit_paths(event_path)
+    trade_rows = read_jsonl_filtered(audit_paths["trade_audit"], limit=0)
+    income_rows = read_jsonl_filtered(audit_paths["income_audit"], limit=0)
+    hour_floor_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
+    recent_hour_rows = [item for item in trade_rows if trade_row_time_ms(item) >= hour_floor_ms]
+    trade = summarize_user_trades(trade_rows)
+    recent_hour_trade = summarize_user_trades(recent_hour_rows)
+    income = summarize_income(income_rows)
+    position = runtime_snapshot.get("position") or {}
+    trade_pnl = float(trade.get("realized_pnl") or 0.0)
+    fees = float(trade.get("commission") or 0.0)
+    funding_fee = float(income.get("funding_fee") or 0.0)
+    unrealized_pnl = float(position.get("unrealized_pnl") or 0.0) if isinstance(position, dict) else 0.0
+    total_pnl = trade_pnl + unrealized_pnl + funding_fee - fees
+    snapshot = {
+        "symbol": symbol,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "runner": runner,
+        "trade_summary": {
+            "gross_notional": float(trade.get("gross_notional") or 0.0),
+            "realized_pnl": trade_pnl,
+            "commission": fees,
+        },
+        "income_summary": {"funding_fee": funding_fee},
+        "position": position,
+        "market": runtime_snapshot.get("market") or {},
+        "open_orders": runtime_snapshot.get("open_orders") or [],
+    }
+    item = _snapshot_to_running_status_item(snapshot)
+    if item is not None:
+        item["recent_hour_volume"] = float(recent_hour_trade.get("gross_notional") or 0.0)
+        item["total_pnl"] = total_pnl
+        item["trade_pnl"] = trade_pnl
+        item["fees"] = fees
+        item["funding_fee"] = funding_fee
+    return item
+
+
 def _build_local_running_status() -> dict[str, Any]:
     symbols = _running_status_symbols()
     running_symbols: list[str] = []
@@ -25154,9 +25240,8 @@ def _build_local_running_status() -> dict[str, Any]:
             continue
 
     def build_item(symbol: str) -> dict[str, Any] | None:
-        return _snapshot_to_running_status_item(
-            _run_loop_monitor_query({"symbol": [symbol], "summary_limit": ["500"]})
-        )
+        runner = read_symbol_runner_process(symbol)
+        return _build_fast_running_status_item(symbol, runner)
 
     with ThreadPoolExecutor(max_workers=min(max(len(running_symbols), 1), 4)) as executor:
         futures = {executor.submit(build_item, symbol): symbol for symbol in running_symbols}
