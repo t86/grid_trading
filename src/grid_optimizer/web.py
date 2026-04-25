@@ -25144,7 +25144,12 @@ def _build_local_running_status() -> dict[str, Any]:
     errors: list[dict[str, str]] = []
     for symbol in symbols:
         try:
-            item = _snapshot_to_running_status_item(_run_loop_monitor_query({"symbol": [symbol], "summary_limit": ["500"]}))
+            runner = read_symbol_runner_process(symbol)
+            if not bool(runner.get("is_running")):
+                continue
+            item = _snapshot_to_running_status_item(
+                _run_loop_monitor_query({"symbol": [symbol], "summary_limit": ["500"]})
+            )
         except Exception as exc:
             errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
             continue
