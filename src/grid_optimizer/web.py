@@ -2823,6 +2823,10 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volatility_trigger_reduce_max_loss_ratio": None,
     "volatility_trigger_reduce_escalate_after_seconds": None,
     "volatility_trigger_reduce_escalate_abs_return_ratio": None,
+    "volatility_trigger_blocked_reduce_relax_after_seconds": None,
+    "volatility_trigger_blocked_reduce_relax_abs_return_ratio": None,
+    "volatility_trigger_blocked_reduce_relax_target_notional": None,
+    "volatility_trigger_blocked_reduce_relax_max_loss_ratio": None,
     "sleep_seconds": 15.0,
     "cancel_stale": True,
     "apply": True,
@@ -3293,13 +3297,22 @@ def _normalize_runner_volatility_trigger_config(config: dict[str, Any]) -> dict[
         "volatility_trigger_reduce_max_loss_ratio",
         "volatility_trigger_reduce_escalate_after_seconds",
         "volatility_trigger_reduce_escalate_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_after_seconds",
+        "volatility_trigger_blocked_reduce_relax_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_target_notional",
+        "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
     }:
         value = normalized.get(key)
         if value in {"", None}:
             normalized[key] = None
             continue
         threshold = float(value)
-        if key in {"volatility_trigger_stop_reduce_to_notional", "volatility_trigger_reduce_max_loss_ratio"}:
+        if key in {
+            "volatility_trigger_stop_reduce_to_notional",
+            "volatility_trigger_reduce_max_loss_ratio",
+            "volatility_trigger_blocked_reduce_relax_target_notional",
+            "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
+        }:
             if threshold < 0:
                 raise ValueError(f"{key} must be >= 0")
             normalized[key] = threshold or None
@@ -3756,6 +3769,62 @@ def _volatility_reduce_preflight_summary(
     }
 
 
+def _optional_positive_float(value: Any) -> float | None:
+    try:
+        parsed = float(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _volatility_blocked_reduce_relaxation(
+    config: dict[str, Any],
+    previous_status: dict[str, Any],
+    *,
+    checked_at: datetime,
+    current_return_ratio: float,
+    default_target_notional: float,
+) -> dict[str, Any] | None:
+    if str(previous_status.get("phase") or "") != "reduce_to_notional":
+        return None
+    if bool(previous_status.get("reduce_target_reached", False)):
+        return None
+    if not bool(previous_status.get("reduce_blocked_keep_runner", False)):
+        return None
+    started_at = _parse_utc_datetime(previous_status.get("reduce_started_at"))
+    elapsed_seconds = (checked_at - started_at).total_seconds() if started_at is not None else 0.0
+
+    reasons: list[str] = []
+    after_seconds = _optional_positive_float(config.get("volatility_trigger_blocked_reduce_relax_after_seconds"))
+    if after_seconds is not None and started_at is not None and elapsed_seconds >= after_seconds:
+        reasons.append("blocked_reduce_relax_after_seconds")
+
+    abs_return_ratio = _optional_positive_float(config.get("volatility_trigger_blocked_reduce_relax_abs_return_ratio"))
+    if abs_return_ratio is not None and abs(float(current_return_ratio)) >= abs_return_ratio:
+        reasons.append("blocked_reduce_relax_abs_return_ratio")
+
+    if not reasons:
+        return None
+
+    target_notional = _optional_positive_float(config.get("volatility_trigger_blocked_reduce_relax_target_notional"))
+    if target_notional is None:
+        target_notional = default_target_notional
+    max_loss_ratio = _optional_positive_float(config.get("volatility_trigger_blocked_reduce_relax_max_loss_ratio"))
+    if max_loss_ratio is None:
+        max_loss_ratio = _optional_positive_float(config.get("volatility_trigger_reduce_max_loss_ratio"))
+    return {
+        "active": True,
+        "reasons": reasons,
+        "elapsed_seconds": max(elapsed_seconds, 0.0),
+        "after_seconds": after_seconds,
+        "abs_return_ratio": abs_return_ratio,
+        "target_notional": max(float(target_notional or 0.0), 0.0),
+        "max_loss_ratio": max_loss_ratio,
+    }
+
+
 def _resolve_runner_volatility_trigger_action(
     config: dict[str, Any],
     *,
@@ -3954,6 +4023,13 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         checked_at=checked_at_dt,
         current_return_ratio=current_return_ratio,
     )
+    blocked_reduce_relaxation = _volatility_blocked_reduce_relaxation(
+        normalized_config,
+        previous_status,
+        checked_at=checked_at_dt,
+        current_return_ratio=current_return_ratio,
+        default_target_notional=reduce_target_notional,
+    )
     if (
         decision.get("action") is None
     ):
@@ -3975,6 +4051,10 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     ):
         decision["action"] = "full_flatten"
         decision["reason"] = escalation_reason
+    if signal_hit and blocked_reduce_relaxation is not None:
+        decision["action"] = "reduce_to_notional"
+        decision["reason"] = str((blocked_reduce_relaxation.get("reasons") or ["blocked_reduce_relax"])[0])
+        decision["blocked_reduce_relaxation"] = blocked_reduce_relaxation
     status: dict[str, Any] = {
         "checked_at": checked_at,
         "symbol": symbol,
@@ -4000,6 +4080,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         "reduce_effective": bool(previous_status.get("reduce_effective", False)),
         "reduce_close_attempted_count": previous_status.get("reduce_close_attempted_count"),
         "reduce_flatten_started": previous_status.get("reduce_flatten_started"),
+        "reduce_blocked_keep_runner": bool(previous_status.get("reduce_blocked_keep_runner", False)),
+        "blocked_reduce_relaxation": blocked_reduce_relaxation,
         "full_flatten_started_at": previous_status.get("full_flatten_started_at"),
         "full_flatten_target_reached": bool(previous_status.get("full_flatten_target_reached", False)),
         "escalation_reason": previous_status.get("escalation_reason"),
@@ -4039,6 +4121,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             status["reduce_effective"] = False
             status["reduce_close_attempted_count"] = None
             status["reduce_flatten_started"] = None
+            status["reduce_blocked_keep_runner"] = False
+            status["blocked_reduce_relaxation"] = None
             status["full_flatten_started_at"] = None
             status["full_flatten_target_reached"] = False
             status["escalation_reason"] = None
@@ -4052,8 +4136,19 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             close_position_allow_loss = False
             close_position_max_loss_ratio = None
             reduce_max_loss_ratio = normalized_config.get("volatility_trigger_reduce_max_loss_ratio")
+            active_relaxation = (
+                decision.get("blocked_reduce_relaxation")
+                if isinstance(decision.get("blocked_reduce_relaxation"), dict)
+                else None
+            )
             if decision.get("action") == "reduce_to_notional":
-                target_notional = reduce_target_notional
+                target_notional = (
+                    float(active_relaxation.get("target_notional"))
+                    if active_relaxation and active_relaxation.get("target_notional") is not None
+                    else reduce_target_notional
+                )
+                if active_relaxation and active_relaxation.get("max_loss_ratio") is not None:
+                    reduce_max_loss_ratio = active_relaxation.get("max_loss_ratio")
                 close_positions = True
                 if reduce_max_loss_ratio is not None:
                     close_position_allow_loss = True
@@ -4080,7 +4175,11 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 if preflight.get("blocked"):
                     status["prevented_action"] = decision.get("action")
                     status["action"] = None
-                    status["reason"] = "reduce_to_notional_blocked_keep_runner"
+                    status["reason"] = (
+                        "blocked_reduce_relax_still_blocked_keep_runner"
+                        if active_relaxation
+                        else "reduce_to_notional_blocked_keep_runner"
+                    )
                     status["paused_by_trigger"] = False
                     status["post_stop_pending"] = False
                     status["phase"] = "reduce_to_notional"
@@ -4092,6 +4191,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                     status["reduce_close_attempted_count"] = 0
                     status["reduce_flatten_started"] = False
                     status["reduce_blocked_keep_runner"] = True
+                    status["blocked_reduce_relaxation"] = active_relaxation
                     status["full_flatten_started_at"] = None
                     status["full_flatten_target_reached"] = False
                     status["escalation_reason"] = None
@@ -4099,7 +4199,11 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                         resume_result = _start_runner_process(normalized_config)
                         resumed_runner = _read_runner_process_for_symbol(symbol)
                         status["action"] = "start"
-                        status["reason"] = "reduce_to_notional_blocked_resume_runner"
+                        status["reason"] = (
+                            "blocked_reduce_relax_still_blocked_resume_runner"
+                            if active_relaxation
+                            else "reduce_to_notional_blocked_resume_runner"
+                        )
                         status["runner_running"] = bool(resumed_runner.get("is_running"))
                         status["result"] = {
                             "runner_restarted_after_blocked_reduce": {
@@ -4113,7 +4217,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                     print(
                         f"[volatility-trigger] {symbol} keep runner window={window_key} "
                         f"amp={current_amplitude_ratio:.4%} ret={current_return_ratio:.4%} "
-                        f"target={target_notional:.4f} reason=blocked_reduce"
+                        f"target={target_notional:.4f} reason={status['reason']}"
                     )
                     _update_volatility_trigger_status(symbol, status)
                     return
@@ -4125,8 +4229,10 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 status["reduce_max_loss_ratio"] = close_position_max_loss_ratio
                 status["reduce_target_reached"] = False
                 status["reduce_started_at"] = previous_status.get("reduce_started_at") or checked_at
+                status["reduce_blocked_keep_runner"] = False
                 status["full_flatten_started_at"] = None
                 status["full_flatten_target_reached"] = False
+                status["blocked_reduce_relaxation"] = active_relaxation
             elif close_positions:
                 status["phase"] = "full_flatten"
                 status["reduce_target_notional"] = 0.0
@@ -4169,6 +4275,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 status["reduce_target_reached"] = any("已不高于" in str(item) for item in warnings)
                 status["full_flatten_started_at"] = None
                 status["full_flatten_target_reached"] = False
+                status["reduce_blocked_keep_runner"] = False
+                status["blocked_reduce_relaxation"] = active_relaxation
                 status["escalation_reason"] = None
             elif close_positions:
                 post_actions = result.get("post_stop_actions") if isinstance(result.get("post_stop_actions"), dict) else {}
@@ -4178,6 +4286,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
                 status["reduce_target_reached"] = False
                 status["full_flatten_started_at"] = previous_status.get("full_flatten_started_at") or checked_at
                 status["full_flatten_target_reached"] = any("当前无可平持仓" in str(item) for item in warnings)
+                status["reduce_blocked_keep_runner"] = False
+                status["blocked_reduce_relaxation"] = None
                 status["escalation_reason"] = escalation_reason
             print(
                 f"[volatility-trigger] {symbol} stop window={window_key} "
@@ -4195,6 +4305,8 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             status["reduce_effective"] = False
             status["reduce_close_attempted_count"] = None
             status["reduce_flatten_started"] = None
+            status["reduce_blocked_keep_runner"] = False
+            status["blocked_reduce_relaxation"] = None
             status["full_flatten_started_at"] = None
             status["full_flatten_target_reached"] = False
             status["escalation_reason"] = None
@@ -5162,6 +5274,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volatility_trigger_reduce_max_loss_ratio",
         "volatility_trigger_reduce_escalate_after_seconds",
         "volatility_trigger_reduce_escalate_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_after_seconds",
+        "volatility_trigger_blocked_reduce_relax_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_target_notional",
+        "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
         "sleep_seconds",
     }
     int_fields = {
@@ -5296,6 +5412,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volatility_trigger_reduce_max_loss_ratio",
         "volatility_trigger_reduce_escalate_after_seconds",
         "volatility_trigger_reduce_escalate_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_after_seconds",
+        "volatility_trigger_blocked_reduce_relax_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_target_notional",
+        "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
     }
 
     for key, value in payload.items():

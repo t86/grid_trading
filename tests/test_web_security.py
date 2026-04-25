@@ -407,6 +407,10 @@ class WebSecurityTests(unittest.TestCase):
                 "volatility_trigger_reduce_max_loss_ratio": 0.015,
                 "volatility_trigger_reduce_escalate_after_seconds": 900,
                 "volatility_trigger_reduce_escalate_abs_return_ratio": 0.03,
+                "volatility_trigger_blocked_reduce_relax_after_seconds": 120,
+                "volatility_trigger_blocked_reduce_relax_abs_return_ratio": 0.045,
+                "volatility_trigger_blocked_reduce_relax_target_notional": 900,
+                "volatility_trigger_blocked_reduce_relax_max_loss_ratio": 0.03,
                 "volatility_trigger_stop_cancel_open_orders": False,
                 "volatility_trigger_stop_close_all_positions": True,
             }
@@ -420,6 +424,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_reduce_max_loss_ratio"], 0.015)
         self.assertEqual(payload["volatility_trigger_reduce_escalate_after_seconds"], 900)
         self.assertEqual(payload["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.03)
+        self.assertEqual(payload["volatility_trigger_blocked_reduce_relax_after_seconds"], 120)
+        self.assertEqual(payload["volatility_trigger_blocked_reduce_relax_abs_return_ratio"], 0.045)
+        self.assertEqual(payload["volatility_trigger_blocked_reduce_relax_target_notional"], 900)
+        self.assertEqual(payload["volatility_trigger_blocked_reduce_relax_max_loss_ratio"], 0.03)
         self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
         self.assertTrue(payload["volatility_trigger_stop_cancel_open_orders"])
@@ -812,6 +820,125 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(status["reason"], "reduce_to_notional_blocked_resume_runner")
         self.assertFalse(status["paused_by_trigger"])
         self.assertTrue(status["runner_running"])
+
+    def test_volatility_trigger_relaxes_blocked_reduce_after_timeout(self) -> None:
+        config = {
+            "symbol": "SOONUSDT",
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "15m",
+            "volatility_trigger_amplitude_ratio": 0.06,
+            "volatility_trigger_abs_return_ratio": 0.03,
+            "volatility_trigger_stop_reduce_to_notional": 300.0,
+            "volatility_trigger_reduce_max_loss_ratio": 0.015,
+            "volatility_trigger_blocked_reduce_relax_after_seconds": 120.0,
+            "volatility_trigger_blocked_reduce_relax_target_notional": 900.0,
+            "volatility_trigger_blocked_reduce_relax_max_loss_ratio": 0.03,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": False,
+        }
+        with (
+            patch(
+                "grid_optimizer.web.fetch_futures_window_price_stats",
+                return_value={"amplitude_ratio": 0.07, "return_ratio": 0.04},
+            ),
+            patch("grid_optimizer.web._read_runner_process_for_symbol", return_value={"is_running": True}),
+            patch("grid_optimizer.web._read_flatten_process_for_symbol", return_value={"is_running": False}),
+            patch(
+                "grid_optimizer.web._runner_volatility_trigger_status",
+                return_value={
+                    "phase": "reduce_to_notional",
+                    "reduce_blocked_keep_runner": True,
+                    "reduce_target_reached": False,
+                    "reduce_started_at": "2000-01-01T00:00:00+00:00",
+                },
+            ),
+            patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret")),
+            patch(
+                "grid_optimizer.web.load_live_flatten_snapshot",
+                return_value={
+                    "orders": [{"side": "BUY", "price": 1.03, "quantity": 10.0}],
+                    "warnings": [],
+                    "short_target_reached": False,
+                },
+            ),
+            patch(
+                "grid_optimizer.web._stop_runner_process",
+                return_value={
+                    "stopped": True,
+                    "post_stop_actions": {"close_attempted_count": 1, "flatten_started": True, "warnings": []},
+                },
+            ) as mock_stop,
+            patch("grid_optimizer.web._update_volatility_trigger_status") as mock_update,
+        ):
+            _reconcile_runner_volatility_trigger(config)
+
+        mock_stop.assert_called_once()
+        kwargs = mock_stop.call_args.kwargs
+        self.assertEqual(kwargs["close_position_target_notional"], 900.0)
+        self.assertTrue(kwargs["close_position_allow_loss"])
+        self.assertEqual(kwargs["close_position_max_loss_ratio"], 0.03)
+        status = mock_update.call_args.args[1]
+        self.assertEqual(status["action"], "reduce_to_notional")
+        self.assertEqual(status["reason"], "blocked_reduce_relax_after_seconds")
+        self.assertEqual(status["reduce_target_notional"], 900.0)
+        self.assertEqual(status["reduce_max_loss_ratio"], 0.03)
+        self.assertFalse(status["reduce_blocked_keep_runner"])
+        self.assertEqual(status["blocked_reduce_relaxation"]["reasons"], ["blocked_reduce_relax_after_seconds"])
+
+    def test_volatility_trigger_keeps_runner_when_relaxed_reduce_still_blocked(self) -> None:
+        config = {
+            "symbol": "SOONUSDT",
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "15m",
+            "volatility_trigger_amplitude_ratio": 0.06,
+            "volatility_trigger_abs_return_ratio": 0.03,
+            "volatility_trigger_stop_reduce_to_notional": 300.0,
+            "volatility_trigger_reduce_max_loss_ratio": 0.015,
+            "volatility_trigger_blocked_reduce_relax_abs_return_ratio": 0.035,
+            "volatility_trigger_blocked_reduce_relax_target_notional": 900.0,
+            "volatility_trigger_blocked_reduce_relax_max_loss_ratio": 0.03,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": False,
+        }
+        with (
+            patch(
+                "grid_optimizer.web.fetch_futures_window_price_stats",
+                return_value={"amplitude_ratio": 0.07, "return_ratio": 0.04},
+            ),
+            patch("grid_optimizer.web._read_runner_process_for_symbol", return_value={"is_running": True}),
+            patch("grid_optimizer.web._read_flatten_process_for_symbol", return_value={"is_running": False}),
+            patch(
+                "grid_optimizer.web._runner_volatility_trigger_status",
+                return_value={
+                    "phase": "reduce_to_notional",
+                    "reduce_blocked_keep_runner": True,
+                    "reduce_target_reached": False,
+                    "reduce_started_at": "2026-04-25T00:42:45+00:00",
+                },
+            ),
+            patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret")),
+            patch(
+                "grid_optimizer.web.load_live_flatten_snapshot",
+                return_value={
+                    "orders": [],
+                    "warnings": ["SOONUSDT BOTH maker_flatten 价格 0.1892 高于最大亏损保护价 0.1846，已跳过"],
+                    "short_target_reached": False,
+                },
+            ),
+            patch("grid_optimizer.web._stop_runner_process") as mock_stop,
+            patch("grid_optimizer.web._start_runner_process") as mock_start,
+            patch("grid_optimizer.web._update_volatility_trigger_status") as mock_update,
+        ):
+            _reconcile_runner_volatility_trigger(config)
+
+        mock_stop.assert_not_called()
+        mock_start.assert_not_called()
+        status = mock_update.call_args.args[1]
+        self.assertEqual(status["reason"], "blocked_reduce_relax_still_blocked_keep_runner")
+        self.assertTrue(status["reduce_blocked_keep_runner"])
+        self.assertEqual(status["reduce_target_notional"], 900.0)
+        self.assertEqual(status["reduce_max_loss_ratio"], 0.03)
+        self.assertEqual(status["blocked_reduce_relaxation"]["reasons"], ["blocked_reduce_relax_abs_return_ratio"])
 
     def test_volatility_reduce_escalates_when_reduce_was_blocked(self) -> None:
         reason = _volatility_reduce_escalation_reason(
