@@ -25140,6 +25140,7 @@ def _running_status_symbols() -> list[str]:
 
 def _build_local_running_status() -> dict[str, Any]:
     symbols = _running_status_symbols()
+    running_symbols: list[str] = []
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for symbol in symbols:
@@ -25147,14 +25148,27 @@ def _build_local_running_status() -> dict[str, Any]:
             runner = read_symbol_runner_process(symbol)
             if not bool(runner.get("is_running")):
                 continue
-            item = _snapshot_to_running_status_item(
-                _run_loop_monitor_query({"symbol": [symbol], "summary_limit": ["500"]})
-            )
+            running_symbols.append(symbol)
         except Exception as exc:
             errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
             continue
-        if item is not None:
-            rows.append(item)
+
+    def build_item(symbol: str) -> dict[str, Any] | None:
+        return _snapshot_to_running_status_item(
+            _run_loop_monitor_query({"symbol": [symbol], "summary_limit": ["500"]})
+        )
+
+    with ThreadPoolExecutor(max_workers=min(max(len(running_symbols), 1), 4)) as executor:
+        futures = {executor.submit(build_item, symbol): symbol for symbol in running_symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                item = future.result()
+            except Exception as exc:
+                errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            if item is not None:
+                rows.append(item)
     return {
         "ok": True,
         "label": os.environ.get("GRID_RUNNING_STATUS_LOCAL_LABEL", "本机"),
