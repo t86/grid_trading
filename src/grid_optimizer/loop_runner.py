@@ -1788,10 +1788,10 @@ def apply_synthetic_inventory_exit_priority(
         )
         report["direction"] = "long"
         report["exit_ready"] = exit_ready
-        if not exit_ready:
-            return report
         pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
         pause_reached = pause_notional > 0 and current_long_notional >= pause_notional - 1e-12
+        if not exit_ready and not strict_exit_only:
+            return report
         if near_market_entries_allowed and not pause_reached and not strict_exit_only:
             report["reason"] = "near_market_below_pause"
             return report
@@ -1813,7 +1813,7 @@ def apply_synthetic_inventory_exit_priority(
     )
     report["direction"] = "short"
     report["exit_ready"] = exit_ready
-    if not exit_ready:
+    if not exit_ready and not strict_exit_only:
         return report
     pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
     pause_reached = pause_notional > 0 and current_short_notional >= pause_notional - 1e-12

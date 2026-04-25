@@ -1936,6 +1936,40 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["direction"], "long")
         self.assertEqual(plan["buy_orders"], [])
 
+    def test_apply_synthetic_inventory_exit_priority_strict_prunes_without_exit(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.99,
+                    "qty": 25.0,
+                    "notional": 24.75,
+                    "role": "entry_long",
+                    "position_side": "LONG",
+                }
+            ],
+            "sell_orders": [],
+        }
+
+        report = apply_synthetic_inventory_exit_priority(
+            plan=plan,
+            strategy_mode="synthetic_neutral",
+            current_long_qty=25.0,
+            current_short_qty=0.0,
+            current_long_notional=25.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=250.0,
+            pause_short_position_notional=250.0,
+            near_market_entries_allowed=True,
+            step_size=1.0,
+            strict_exit_only=True,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertFalse(report["exit_ready"])
+        self.assertEqual(plan["buy_orders"], [])
+
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
