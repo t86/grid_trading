@@ -1759,6 +1759,7 @@ def apply_synthetic_inventory_exit_priority(
     pause_short_position_notional: float | None,
     near_market_entries_allowed: bool,
     step_size: float | None,
+    strict_exit_only: bool = False,
 ) -> dict[str, Any]:
     qty_tolerance = max(_safe_float(step_size) * 0.5, 1e-9)
     report = {
@@ -1791,7 +1792,7 @@ def apply_synthetic_inventory_exit_priority(
             return report
         pause_notional = max(_safe_float(pause_long_position_notional), 0.0)
         pause_reached = pause_notional > 0 and current_long_notional >= pause_notional - 1e-12
-        if near_market_entries_allowed and not pause_reached:
+        if near_market_entries_allowed and not pause_reached and not strict_exit_only:
             report["reason"] = "near_market_below_pause"
             return report
         bootstrap_before = len(plan.get("bootstrap_orders", []))
@@ -1816,7 +1817,7 @@ def apply_synthetic_inventory_exit_priority(
         return report
     pause_notional = max(_safe_float(pause_short_position_notional), 0.0)
     pause_reached = pause_notional > 0 and current_short_notional >= pause_notional - 1e-12
-    if near_market_entries_allowed and not pause_reached:
+    if near_market_entries_allowed and not pause_reached and not strict_exit_only:
         report["reason"] = "near_market_below_pause"
         return report
     bootstrap_before = len(plan.get("bootstrap_orders", []))
@@ -1911,6 +1912,10 @@ def _is_best_quote_long_profile(strategy_profile: str) -> bool:
 
 def _is_best_quote_neutral_profile(strategy_profile: str) -> bool:
     return str(strategy_profile).strip().endswith("_competition_neutral_ping_pong_v1")
+
+
+def _is_strict_neutral_ping_pong_profile(strategy_profile: str) -> bool:
+    return str(strategy_profile).strip() == "ethusdc_strict_competition_neutral_ping_pong_v1"
 
 
 def _startup_pending(state: dict[str, Any]) -> bool:
@@ -8982,6 +8987,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             pause_short_position_notional=effective_args.pause_short_position_notional,
             near_market_entries_allowed=bool(near_market_entry_state.get("near_market_entries_allowed")),
             step_size=symbol_info.get("step_size"),
+            strict_exit_only=_is_strict_neutral_ping_pong_profile(effective_strategy_profile),
         )
         target_base_qty = hedge_plan["target_long_base_qty"]
         bootstrap_qty = hedge_plan["bootstrap_long_qty"]
