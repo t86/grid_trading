@@ -9407,6 +9407,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 tick_size=symbol_info.get("tick_size"),
                 bid_price=bid_price,
                 ask_price=ask_price,
+                soft_loss_steps=getattr(effective_args, "volume_long_v4_soft_loss_steps", 0.5),
+                hard_loss_steps=getattr(effective_args, "volume_long_v4_hard_loss_steps", 1.5),
             )
             flow_cost_basis_price = actual_break_even_price if actual_break_even_price > 0 else current_long_avg_price
             exposure_escalation = resolve_exposure_escalation(
@@ -10306,6 +10308,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--short-cover-pause-down-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--take-profit-min-profit-ratio", type=float, default=None)
     parser.add_argument("--freeze-shift-abs-return-trigger-ratio", type=float, default=None)
+    parser.add_argument("--volume-long-v4-soft-loss-steps", type=float, default=0.5)
+    parser.add_argument("--volume-long-v4-hard-loss-steps", type=float, default=1.5)
     parser.add_argument("--adaptive-step-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--adaptive-step-30s-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-30s-amplitude-ratio", type=float, default=0.0)
@@ -10824,6 +10828,10 @@ def main() -> None:
         raise SystemExit("synthetic trend follow requires at least one positive trigger threshold")
     if args.volume_long_v4_flow_sleeve_levels < 0:
         raise SystemExit("--volume-long-v4-flow-sleeve-levels must be >= 0")
+    if args.volume_long_v4_soft_loss_steps < 0:
+        raise SystemExit("--volume-long-v4-soft-loss-steps must be >= 0")
+    if args.volume_long_v4_hard_loss_steps < 0:
+        raise SystemExit("--volume-long-v4-hard-loss-steps must be >= 0")
     for value, label in (
         (args.volume_long_v4_flow_sleeve_trigger_notional, "--volume-long-v4-flow-sleeve-trigger-notional"),
         (args.volume_long_v4_flow_sleeve_reduce_to_notional, "--volume-long-v4-flow-sleeve-reduce-to-notional"),

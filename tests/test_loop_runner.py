@@ -520,6 +520,10 @@ class LoopRunnerTests(unittest.TestCase):
                 "60",
                 "--volume-long-v4-flow-sleeve-max-loss-ratio",
                 "0.012",
+                "--volume-long-v4-soft-loss-steps",
+                "10",
+                "--volume-long-v4-hard-loss-steps",
+                "18",
             ]
         )
 
@@ -530,6 +534,8 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.volume_long_v4_flow_sleeve_levels, 3)
         self.assertEqual(args.volume_long_v4_flow_sleeve_order_notional, 60)
         self.assertEqual(args.volume_long_v4_flow_sleeve_max_loss_ratio, 0.012)
+        self.assertEqual(args.volume_long_v4_soft_loss_steps, 10)
+        self.assertEqual(args.volume_long_v4_hard_loss_steps, 18)
 
     def test_synthetic_flow_sleeve_adds_reduce_only_long_flow_exits(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "bootstrap_orders": []}

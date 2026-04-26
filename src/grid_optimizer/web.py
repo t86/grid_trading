@@ -1324,12 +1324,21 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "inventory_tier_per_order_notional": 45.0,
             "inventory_tier_base_position_notional": 140.0,
             "take_profit_min_profit_ratio": 0.0,
+            "volume_long_v4_soft_loss_steps": 10.0,
+            "volume_long_v4_hard_loss_steps": 18.0,
             "excess_inventory_reduce_only_enabled": False,
             "adverse_reduce_enabled": False,
             "volume_trigger_enabled": False,
             "volume_trigger_stop_close_all_positions": False,
             "volatility_trigger_enabled": False,
             "volatility_trigger_stop_close_all_positions": False,
+            "volume_long_v4_flow_sleeve_enabled": True,
+            "volume_long_v4_flow_sleeve_trigger_notional": 500.0,
+            "volume_long_v4_flow_sleeve_reduce_to_notional": 430.0,
+            "volume_long_v4_flow_sleeve_notional": 180.0,
+            "volume_long_v4_flow_sleeve_levels": 4,
+            "volume_long_v4_flow_sleeve_order_notional": 45.0,
+            "volume_long_v4_flow_sleeve_max_loss_ratio": 0.008,
             "sleep_seconds": 4.0,
             "leverage": 3,
             "maker_retries": 2,
@@ -2782,6 +2791,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "buy_pause_down_return_trigger_ratio": -0.0035,
     "take_profit_min_profit_ratio": None,
     "freeze_shift_abs_return_trigger_ratio": 0.005,
+    "volume_long_v4_soft_loss_steps": 0.5,
+    "volume_long_v4_hard_loss_steps": 1.5,
     "adaptive_step_enabled": False,
     "adaptive_step_30s_abs_return_ratio": 0.0,
     "adaptive_step_30s_amplitude_ratio": 0.0,
@@ -5299,6 +5310,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "short_cover_pause_down_return_trigger_ratio",
         "take_profit_min_profit_ratio",
         "freeze_shift_abs_return_trigger_ratio",
+        "volume_long_v4_soft_loss_steps",
+        "volume_long_v4_hard_loss_steps",
         "adaptive_step_30s_abs_return_ratio",
         "adaptive_step_30s_amplitude_ratio",
         "adaptive_step_1m_abs_return_ratio",
@@ -5950,6 +5963,10 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--take-profit-min-profit-ratio", str(config["take_profit_min_profit_ratio"])])
     if config.get("freeze_shift_abs_return_trigger_ratio") is not None:
         command.extend(["--freeze-shift-abs-return-trigger-ratio", str(config["freeze_shift_abs_return_trigger_ratio"])])
+    if config.get("volume_long_v4_soft_loss_steps") is not None:
+        command.extend(["--volume-long-v4-soft-loss-steps", str(config["volume_long_v4_soft_loss_steps"])])
+    if config.get("volume_long_v4_hard_loss_steps") is not None:
+        command.extend(["--volume-long-v4-hard-loss-steps", str(config["volume_long_v4_hard_loss_steps"])])
     command.append("--adaptive-step-enabled" if config.get("adaptive_step_enabled", False) else "--no-adaptive-step-enabled")
     if config.get("adaptive_step_30s_abs_return_ratio") is not None:
         command.extend(["--adaptive-step-30s-abs-return-ratio", str(config["adaptive_step_30s_abs_return_ratio"])])
@@ -6256,6 +6273,8 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "short_cover_pause_down_return_trigger_ratio",
             "take_profit_min_profit_ratio",
             "freeze_shift_abs_return_trigger_ratio",
+            "volume_long_v4_soft_loss_steps",
+            "volume_long_v4_hard_loss_steps",
             "adaptive_step_enabled",
             "adaptive_step_30s_abs_return_ratio",
             "adaptive_step_30s_amplitude_ratio",
@@ -13861,6 +13880,12 @@ MONITOR_PAGE = """<!doctype html>
                 <label>冻结迁移绝对涨跌阈值
                   <input id="runner_field_freeze_shift_abs_return_trigger_ratio" type="number" step="0.000001" />
                 </label>
+                <label>v4 软减仓亏损格数
+                  <input id="runner_field_volume_long_v4_soft_loss_steps" type="number" min="0" step="0.1" />
+                </label>
+                <label>v4 硬减仓亏损格数
+                  <input id="runner_field_volume_long_v4_hard_loss_steps" type="number" min="0" step="0.1" />
+                </label>
               </div>
             </section>
             <section class="runner-form-section" data-runner-section="fixed_center">
@@ -15749,12 +15774,21 @@ MONITOR_PAGE = """<!doctype html>
           inventory_tier_per_order_notional: 45.0,
           inventory_tier_base_position_notional: 140.0,
           take_profit_min_profit_ratio: 0.0,
+          volume_long_v4_soft_loss_steps: 10.0,
+          volume_long_v4_hard_loss_steps: 18.0,
           excess_inventory_reduce_only_enabled: false,
           adverse_reduce_enabled: false,
           volume_trigger_enabled: false,
           volume_trigger_stop_close_all_positions: false,
           volatility_trigger_enabled: false,
           volatility_trigger_stop_close_all_positions: false,
+          volume_long_v4_flow_sleeve_enabled: true,
+          volume_long_v4_flow_sleeve_trigger_notional: 500.0,
+          volume_long_v4_flow_sleeve_reduce_to_notional: 430.0,
+          volume_long_v4_flow_sleeve_notional: 180.0,
+          volume_long_v4_flow_sleeve_levels: 4,
+          volume_long_v4_flow_sleeve_order_notional: 45.0,
+          volume_long_v4_flow_sleeve_max_loss_ratio: 0.008,
           sleep_seconds: 4.0,
           leverage: 3,
           maker_retries: 2,
@@ -16597,6 +16631,8 @@ MONITOR_PAGE = """<!doctype html>
       { key: "short_cover_pause_amp_trigger_ratio", id: "runner_field_short_cover_pause_amp_trigger_ratio", type: "number", allowNull: true, modes: SHORT_CAPABLE_RUNNER_MODE_LIST },
       { key: "short_cover_pause_down_return_trigger_ratio", id: "runner_field_short_cover_pause_down_return_trigger_ratio", type: "number", allowNull: true, modes: SHORT_CAPABLE_RUNNER_MODE_LIST },
       { key: "freeze_shift_abs_return_trigger_ratio", id: "runner_field_freeze_shift_abs_return_trigger_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volume_long_v4_soft_loss_steps", id: "runner_field_volume_long_v4_soft_loss_steps", type: "number", allowNull: true, modes: LONG_ONLY_RUNNER_MODE_LIST },
+      { key: "volume_long_v4_hard_loss_steps", id: "runner_field_volume_long_v4_hard_loss_steps", type: "number", allowNull: true, modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "fixed_center_enabled", id: "runner_field_fixed_center_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "fixed_center_roll_enabled", id: "runner_field_fixed_center_roll_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "static_buy_offset_steps", id: "runner_field_static_buy_offset_steps", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -16697,6 +16733,8 @@ MONITOR_PAGE = """<!doctype html>
       buy_pause_amp_trigger_ratio: "短时间振幅过大时，暂停做多开仓的阈值。",
       buy_pause_down_return_trigger_ratio: "短时间跌幅过大时，暂停做多开仓的阈值。",
       freeze_shift_abs_return_trigger_ratio: "短时波动过大时冻结中心位移，避免不停追价。",
+      volume_long_v4_soft_loss_steps: "v4 软减仓允许低于成本的最大 step 数。调大后 maker 减仓会更靠近盘口，更容易成交，但亏损容忍更高。",
+      volume_long_v4_hard_loss_steps: "v4 硬减仓允许低于成本的最大 step 数。达到硬上限后使用，比软减仓更激进。",
       short_cover_pause_amp_trigger_ratio: "做空模式下，振幅过大时暂停买回补空。",
       short_cover_pause_down_return_trigger_ratio: "做空模式下，快速下跌时暂停追着买回补空。",
       take_profit_min_profit_ratio: "轻库存时的保本回补门槛。未达到对应 pause 仓位阈值前，take_profit 单会按持仓均价抬底/压顶，避免亏着出手。",
