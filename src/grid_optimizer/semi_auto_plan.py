@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_DOWN, ROUND_HALF_UP, ROUND_UP
@@ -2104,8 +2105,15 @@ def load_or_initialize_state(
     if state_path.exists() and not reset_state:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if str(state.get("config_signature", "")).strip() != _config_signature(config):
-            raise SystemExit("State config does not match current CLI arguments. Use --reset-state to restart.")
-        return state
+            if os.environ.get("GRID_AUTO_RESET_ON_CONFIG_CHANGE") == "1":
+                print(
+                    "State config does not match current CLI arguments; "
+                    "auto-resetting state because GRID_AUTO_RESET_ON_CONFIG_CHANGE=1."
+                )
+            else:
+                raise SystemExit("State config does not match current CLI arguments. Use --reset-state to restart.")
+        else:
+            return state
 
     center_price = args.center_price if args.center_price is not None else mid_price
     center_price = _round_to_nearest_step(center_price, symbol_info.get("tick_size"))

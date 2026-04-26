@@ -41,6 +41,7 @@ class RunSavedRunnerTests(unittest.TestCase):
         mock_execvpe.assert_called_once()
         _, _, exec_env = mock_execvpe.call_args.args
         self.assertEqual(exec_env["GRID_RUNNER_SERVICE_TEMPLATE"], "grid-loop@{symbol}.service")
+        self.assertEqual(exec_env["GRID_AUTO_RESET_ON_CONFIG_CHANGE"], "1")
 
     @patch("grid_optimizer.run_saved_runner.os.chdir")
     @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")

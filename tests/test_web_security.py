@@ -3346,7 +3346,16 @@ class WebSecurityTests(unittest.TestCase):
 
         result = _start_runner_process(config)
 
-        mock_run_systemctl.assert_called_once_with(["start", "grid-loop@NIGHTUSDT.service"], check=True)
+        self.assertEqual(
+            mock_run_systemctl.call_args_list[0].args[0],
+            ["reset-failed", "grid-loop@NIGHTUSDT.service"],
+        )
+        self.assertEqual(mock_run_systemctl.call_args_list[0].kwargs, {"check": False})
+        self.assertEqual(
+            mock_run_systemctl.call_args_list[1].args[0],
+            ["start", "grid-loop@NIGHTUSDT.service"],
+        )
+        self.assertEqual(mock_run_systemctl.call_args_list[1].kwargs, {"check": True})
         self.assertTrue(result["started"])
         self.assertEqual(result["service"], "grid-loop@NIGHTUSDT.service")
 

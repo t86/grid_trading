@@ -73,7 +73,9 @@ def main() -> None:
     command = _anchor_relative_runtime_paths(command, runner_work_dir)
     if runner_work_dir:
         os.chdir(original_cwd)
-    os.execvpe(command[0], command, os.environ.copy())
+    exec_env = os.environ.copy()
+    exec_env.setdefault("GRID_AUTO_RESET_ON_CONFIG_CHANGE", "1")
+    os.execvpe(command[0], command, exec_env)
 
 
 if __name__ == "__main__":

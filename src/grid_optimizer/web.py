@@ -6460,6 +6460,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "symbol": symbol,
         }
     if service_name and _runner_service_available(symbol):
+        _run_systemctl(["reset-failed", service_name], check=False)
         _run_systemctl(["start", service_name], check=True)
         time.sleep(1.0)
         return {
