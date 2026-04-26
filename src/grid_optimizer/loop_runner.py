@@ -8523,6 +8523,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             paused_entry_long_scale=inventory_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
+            allow_opposite_entry_with_single_side_inventory=bool(
+                _is_best_quote_neutral_profile(effective_strategy_profile)
+                and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
+                and not inventory_long_pause_active
+                and not inventory_short_pause_active
+            ),
         )
         controls = apply_hedge_position_controls(
             plan=plan,
@@ -8761,6 +8767,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             paused_entry_long_scale=inventory_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
+            allow_opposite_entry_with_single_side_inventory=bool(
+                _is_best_quote_neutral_profile(effective_strategy_profile)
+                and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
+                and not inventory_long_pause_active
+                and not inventory_short_pause_active
+            ),
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
         synthetic_flow_sleeve = apply_synthetic_flow_sleeve(

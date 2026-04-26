@@ -976,6 +976,7 @@ def build_hedge_micro_grid_plan(
     entry_short_paused: bool = False,
     paused_entry_long_scale: float = 0.0,
     paused_entry_short_scale: float = 0.0,
+    allow_opposite_entry_with_single_side_inventory: bool = False,
 ) -> dict[str, Any]:
     if center_price <= 0 or step_price <= 0:
         raise ValueError("center_price and step_price must be > 0")
@@ -998,6 +999,7 @@ def build_hedge_micro_grid_plan(
     sell_offset_steps = float(sell_offset_steps)
     paused_entry_long_scale = min(max(float(paused_entry_long_scale), 0.0), 1.0)
     paused_entry_short_scale = min(max(float(paused_entry_short_scale), 0.0), 1.0)
+    allow_opposite_entry_with_single_side_inventory = bool(allow_opposite_entry_with_single_side_inventory)
     mid_price = (
         (float(bid_price) + float(ask_price)) / 2.0
         if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0
@@ -1367,7 +1369,9 @@ def build_hedge_micro_grid_plan(
     }
     allow_paused_long_probe = bool(entry_long_paused and paused_entry_long_scale > 0)
     if (not bool(entry_long_paused) or allow_paused_long_probe) and (
-        effective_short_qty <= 0 or dominant_long_with_tiny_short_residual
+        effective_short_qty <= 0
+        or dominant_long_with_tiny_short_residual
+        or (allow_opposite_entry_with_single_side_inventory and effective_long_qty <= 0)
     ):
         entry_buy_max_level = buy_levels + (1 if effective_short_qty > 0 else 0)
         if allow_paused_long_probe and effective_short_qty <= 0:
@@ -1469,7 +1473,9 @@ def build_hedge_micro_grid_plan(
     }
     allow_paused_short_probe = bool(entry_short_paused and paused_entry_short_scale > 0)
     if (not bool(entry_short_paused) or allow_paused_short_probe) and (
-        effective_long_qty <= 0 or dominant_short_with_tiny_long_residual
+        effective_long_qty <= 0
+        or dominant_short_with_tiny_long_residual
+        or (allow_opposite_entry_with_single_side_inventory and effective_short_qty <= 0)
     ):
         entry_sell_max_level = sell_levels + (1 if effective_long_qty > 0 else 0)
         if allow_paused_short_probe and effective_long_qty <= 0:

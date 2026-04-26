@@ -1327,6 +1327,32 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertTrue(any(item["role"] == "take_profit_long" for item in plan["sell_orders"]))
         self.assertFalse(any(item["role"] == "entry_short" for item in plan["sell_orders"]))
 
+    def test_build_hedge_micro_grid_plan_can_keep_opposite_entry_with_single_side_inventory(self) -> None:
+        plan = build_hedge_micro_grid_plan(
+            center_price=1.02,
+            step_price=0.01,
+            buy_levels=4,
+            sell_levels=4,
+            per_order_notional=25.0,
+            base_position_notional=0.0,
+            bid_price=1.019,
+            ask_price=1.021,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            current_long_qty=50.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.0,
+            current_long_lots=[{"qty": 50.0, "price": 1.0}],
+            entry_long_cost_guard_release_notional=100.0,
+            allow_opposite_entry_with_single_side_inventory=True,
+        )
+
+        sell_roles = {item["role"] for item in plan["sell_orders"]}
+        self.assertIn("take_profit_long", sell_roles)
+        self.assertIn("entry_short", sell_roles)
+
     def test_build_hedge_micro_grid_plan_dust_long_inventory_uses_flat_entry_spacing(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=1.02,

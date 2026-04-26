@@ -1863,6 +1863,98 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["synthetic_inventory_exit_priority"]["active"])
         self.assertEqual(report["synthetic_inventory_exit_priority"]["direction"], "short")
 
+    @patch("grid_optimizer.loop_runner.load_or_initialize_state")
+    @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_best_quote_neutral_keeps_opposite_entry_below_pause(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_sync_synthetic_ledger,
+        mock_load_state,
+    ) -> None:
+        mock_load_state.return_value = {
+            "center_price": 1.0,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "synthetic_ledger": {},
+        }
+        mock_symbol_config.return_value = {
+            "tick_size": 0.001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "1.001", "ask_price": "1.002"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "TESTUSDT", "positionAmt": "20", "entryPrice": "0.99"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "shift_freeze_reasons": [],
+        }
+        mock_sync_synthetic_ledger.return_value = {
+            "virtual_long_qty": 20.0,
+            "virtual_long_avg_price": 0.99,
+            "virtual_long_lots": [{"qty": 20.0, "price": 0.99}],
+            "virtual_short_qty": 0.0,
+            "virtual_short_avg_price": 0.0,
+            "virtual_short_lots": [],
+            "applied_trade_count": 0,
+            "unmatched_trade_count": 0,
+            "resynced_to_actual": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = _build_parser().parse_args([])
+            args.symbol = "TESTUSDT"
+            args.strategy_profile = "btcusdc_competition_neutral_ping_pong_v1"
+            args.strategy_mode = "synthetic_neutral"
+            args.step_price = 0.01
+            args.buy_levels = 4
+            args.sell_levels = 4
+            args.per_order_notional = 25.0
+            args.base_position_notional = 0.0
+            args.pause_buy_position_notional = 250.0
+            args.pause_short_position_notional = 250.0
+            args.max_position_notional = 500.0
+            args.max_short_position_notional = 500.0
+            args.take_profit_min_profit_ratio = 0.0
+            args.reset_state = True
+            args.state_path = str(Path(tmpdir) / "testusdt_state.json")
+            args.summary_jsonl = str(Path(tmpdir) / "testusdt_events.jsonl")
+
+            report = generate_plan_report(args)
+
+        sell_roles = {item["role"] for item in report["sell_orders"]}
+        self.assertIn("take_profit_long", sell_roles)
+        self.assertIn("entry_short", sell_roles)
+        self.assertFalse(report["active_delever"]["active"])
+
     def test_apply_synthetic_inventory_exit_priority_prunes_pure_short_inventory_after_pause_threshold(self) -> None:
         plan = {
             "bootstrap_orders": [],
