@@ -204,6 +204,7 @@ def fetch_time_paged(
     limit: int,
     row_time_ms: Callable[[dict[str, Any]], int],
     row_key: Callable[[dict[str, Any]], str],
+    max_window_ms: int | None = DEFAULT_AUDIT_LOOKBACK_DAYS * 24 * 60 * 60 * 1000 - 1,
     max_pages: int = 200,
 ) -> list[dict[str, Any]]:
     cursor = start_time_ms
@@ -211,8 +212,22 @@ def fetch_time_paged(
     seen: set[tuple[int, str]] = set()
 
     for _ in range(max_pages):
-        page = fetch_page(start_time_ms=cursor, end_time_ms=end_time_ms, limit=limit)
+        page_end_time_ms = end_time_ms
+        if cursor is not None and max_window_ms is not None and max_window_ms > 0:
+            window_end_time_ms = cursor + max_window_ms
+            page_end_time_ms = min(end_time_ms, window_end_time_ms) if end_time_ms is not None else window_end_time_ms
+
+        page = fetch_page(start_time_ms=cursor, end_time_ms=page_end_time_ms, limit=limit)
+        can_advance_window = (
+            cursor is not None
+            and page_end_time_ms is not None
+            and end_time_ms is not None
+            and page_end_time_ms < end_time_ms
+        )
         if not page:
+            if can_advance_window:
+                cursor = page_end_time_ms + 1
+                continue
             break
         normalized = [item for item in page if isinstance(item, dict)]
         normalized.sort(key=lambda item: (row_time_ms(item), row_key(item)))
@@ -230,6 +245,9 @@ def fetch_time_paged(
             if max_page_time is None or ts_ms > max_page_time:
                 max_page_time = ts_ms
         if len(normalized) < limit or max_page_time is None:
+            if can_advance_window:
+                cursor = page_end_time_ms + 1
+                continue
             break
         next_cursor = max_page_time + 1
         if cursor is not None and next_cursor <= cursor:

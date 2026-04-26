@@ -7,6 +7,7 @@ from tempfile import TemporaryDirectory
 from grid_optimizer.audit import (
     build_audit_paths,
     collect_new_rows,
+    fetch_time_paged,
     income_row_key,
     income_row_time_ms,
     parse_iso_ts,
@@ -104,6 +105,32 @@ class AuditTests(unittest.TestCase):
             rows = read_jsonl_filtered(path, limit=0, predicate=lambda item: int(item["time"]) >= 2000)
 
         self.assertEqual([row["id"] for row in rows], [2, 3])
+
+    def test_fetch_time_paged_splits_requests_by_max_window(self) -> None:
+        calls: list[tuple[int | None, int | None]] = []
+
+        def fetch_page(**params: int) -> list[dict[str, int]]:
+            start = params.get("start_time_ms")
+            end = params.get("end_time_ms")
+            calls.append((start, end))
+            if start == 1_001:
+                return [{"time": 1_500, "id": 1}]
+            if start == 2_002:
+                return [{"time": 2_500, "id": 2}]
+            return []
+
+        rows = fetch_time_paged(
+            fetch_page=fetch_page,
+            start_time_ms=0,
+            end_time_ms=3_000,
+            limit=1000,
+            row_time_ms=trade_row_time_ms,
+            row_key=trade_row_key,
+            max_window_ms=1_000,
+        )
+
+        self.assertEqual([row["id"] for row in rows], [1, 2])
+        self.assertEqual(calls, [(0, 1_000), (1_001, 2_001), (2_002, 3_000)])
 
     def test_scan_iso_bounds_streams_file(self) -> None:
         with TemporaryDirectory() as tmpdir:
