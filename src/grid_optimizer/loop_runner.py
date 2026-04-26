@@ -11122,6 +11122,66 @@ def main() -> None:
                 ),
                 "mid_price": _safe_float(plan_report.get("mid_price")),
                 "center_price": _safe_float(plan_report.get("center_price")),
+                "adaptive_step": dict(plan_report.get("adaptive_step") or {}),
+                "adaptive_step_enabled": bool((plan_report.get("adaptive_step") or {}).get("enabled")),
+                "adaptive_step_active": bool((plan_report.get("adaptive_step") or {}).get("active")),
+                "adaptive_step_controls_active": bool(
+                    (plan_report.get("adaptive_step") or {}).get("controls_active")
+                ),
+                "adaptive_step_base_step_price": _safe_float(
+                    (plan_report.get("adaptive_step") or {}).get("base_step_price")
+                ),
+                "adaptive_step_effective_step_price": _safe_float(
+                    (plan_report.get("adaptive_step") or {}).get("effective_step_price")
+                ),
+                "adaptive_step_scale": _safe_float((plan_report.get("adaptive_step") or {}).get("scale")),
+                "adaptive_step_raw_scale": _safe_float((plan_report.get("adaptive_step") or {}).get("raw_scale")),
+                "adaptive_step_per_order_scale": _safe_float(
+                    (plan_report.get("adaptive_step") or {}).get("per_order_scale")
+                ),
+                "adaptive_step_position_limit_scale": _safe_float(
+                    (plan_report.get("adaptive_step") or {}).get("position_limit_scale")
+                ),
+                "adaptive_step_dominant_window": (
+                    (plan_report.get("adaptive_step") or {}).get("dominant_window")
+                ),
+                "adaptive_step_dominant_metric": (
+                    (plan_report.get("adaptive_step") or {}).get("dominant_metric")
+                ),
+                "adaptive_step_dominant_value": _safe_float(
+                    (plan_report.get("adaptive_step") or {}).get("dominant_value")
+                ),
+                "adaptive_step_dominant_threshold": _safe_float(
+                    (plan_report.get("adaptive_step") or {}).get("dominant_threshold")
+                ),
+                "adaptive_step_reason": (plan_report.get("adaptive_step") or {}).get("reason"),
+                "adaptive_step_history_count": int(
+                    ((plan_report.get("adaptive_step") or {}).get("history_count", 0) or 0)
+                ),
+                "adaptive_step_window_30s_return_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_30s") or {}).get("return_ratio")
+                ),
+                "adaptive_step_window_30s_amplitude_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_30s") or {}).get("amplitude_ratio")
+                ),
+                "adaptive_step_window_1m_return_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_1m") or {}).get("return_ratio")
+                ),
+                "adaptive_step_window_1m_amplitude_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_1m") or {}).get("amplitude_ratio")
+                ),
+                "adaptive_step_window_3m_return_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_3m") or {}).get("return_ratio")
+                ),
+                "adaptive_step_window_3m_amplitude_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_3m") or {}).get("amplitude_ratio")
+                ),
+                "adaptive_step_window_5m_return_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("return_ratio")
+                ),
+                "adaptive_step_window_5m_amplitude_ratio": _safe_float(
+                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("amplitude_ratio")
+                ),
                 "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
                 "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
                 "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
