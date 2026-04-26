@@ -1349,6 +1349,18 @@ class WebSecurityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUUSDT"):
             _runner_preset_payload("xauusdt_competition_neutral_ping_pong_v1", {"symbol": "BTCUSDC"})
 
+    def test_runner_preset_payload_applies_trumpusdc_volume_long_v4(self) -> None:
+        payload = _runner_preset_payload("trumpusdc_volume_long_v4", {"symbol": "TRUMPUSDC"})
+        self.assertEqual(payload["strategy_profile"], "trumpusdc_volume_long_v4")
+        self.assertEqual(payload["symbol"], "TRUMPUSDC")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertAlmostEqual(payload["step_price"], 0.002)
+        self.assertAlmostEqual(payload["per_order_notional"], 45.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 180.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 600.0)
+        self.assertFalse(payload["autotune_symbol_enabled"])
+        self.assertFalse(payload["adaptive_step_enabled"])
+
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
         custom_path = Path("output/test_custom_runner_presets.json")
@@ -3101,7 +3113,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("硬上限", MONITOR_PAGE)
 
     def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', MONITOR_PAGE)
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', MONITOR_PAGE)
 
     def test_monitor_page_keeps_raw_json_in_advanced_panel(self) -> None:
         self.assertIn('id="runner_params_advanced_panel"', MONITOR_PAGE)
@@ -3129,6 +3141,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("黄金冲刺赛 XAUUSDT（激进）", MONITOR_PAGE)
         self.assertIn("TradFi 冲刺赛 CLUSDT", MONITOR_PAGE)
         self.assertIn("Alt 冲刺赛 ORDIUSDC", MONITOR_PAGE)
+        self.assertIn("Alt 冲刺赛 TRUMPUSDC 做多 v4", MONITOR_PAGE)
         self.assertIn("presets[0]?.key", MONITOR_PAGE)
 
     def test_monitor_page_contains_dedicated_sprint_preset_zone(self) -> None:
@@ -3149,7 +3162,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"]', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:

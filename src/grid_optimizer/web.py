@@ -1291,6 +1291,53 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "adaptive_step_enabled": False,
         },
     },
+    "trumpusdc_volume_long_v4": {
+        "label": "Alt 冲刺赛 TRUMPUSDC 做多 v4",
+        "description": "TRUMPUSDC 专用量优先做多 v4。按 0.002 步长跑轻仓偏多网格，其他风控参数匹配 Alt 盘口的中等容量。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "TRUMPUSDC",
+        "config": {
+            "symbol": "TRUMPUSDC",
+            "strategy_mode": "one_way_long",
+            "step_price": 0.002,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "per_order_notional": 45.0,
+            "startup_entry_multiplier": 1.0,
+            "base_position_notional": 180.0,
+            "flat_start_enabled": True,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 6,
+            "down_trigger_steps": 4,
+            "shift_steps": 4,
+            "pause_buy_position_notional": 500.0,
+            "max_position_notional": 600.0,
+            "max_total_notional": 900.0,
+            "buy_pause_amp_trigger_ratio": 0.0075,
+            "buy_pause_down_return_trigger_ratio": -0.0035,
+            "freeze_shift_abs_return_trigger_ratio": 0.005,
+            "inventory_tier_start_notional": 380.0,
+            "inventory_tier_end_notional": 500.0,
+            "inventory_tier_buy_levels": 3,
+            "inventory_tier_sell_levels": 12,
+            "inventory_tier_per_order_notional": 45.0,
+            "inventory_tier_base_position_notional": 140.0,
+            "take_profit_min_profit_ratio": 0.0,
+            "excess_inventory_reduce_only_enabled": False,
+            "adverse_reduce_enabled": False,
+            "volume_trigger_enabled": False,
+            "volume_trigger_stop_close_all_positions": False,
+            "volatility_trigger_enabled": False,
+            "volatility_trigger_stop_close_all_positions": False,
+            "sleep_seconds": 4.0,
+            "leverage": 3,
+            "maker_retries": 2,
+            "max_new_orders": 20,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+        },
+    },
     "xauusdt_competition_maker_neutral_v1": {
         "label": "黄金冲刺赛 XAUUSDT",
         "description": "XAUUSDT 专用的黄金白银冲刺赛 maker 草案。固定 1.25 步长、双边 8 档，适合把黄金赛道作为低滑点主刷。",
@@ -2667,6 +2714,7 @@ RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
         "ordiusdc_competition_maker_neutral_conservative_v1",
         "ordiusdc_competition_maker_neutral_aggressive_v1",
         "ordiusdc_competition_neutral_ping_pong_v1",
+        "trumpusdc_volume_long_v4",
         "chip_short_bias_ping_pong_v1",
         "chip_short_bias_ping_pong_guarded_v2",
         "chip_short_bias_ping_pong_guarded_v3",
@@ -14392,7 +14440,7 @@ MONITOR_PAGE = """<!doctype html>
     const customGridStatusEl = document.getElementById("custom_grid_status");
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
-    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
+    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const VISIBLE_STRATEGY_PRESET_KEYS = new Set([
       "volume_long_v4",
       "based_volume_push_bard_v1",
@@ -14430,6 +14478,7 @@ MONITOR_PAGE = """<!doctype html>
       "ordiusdc_competition_maker_neutral_conservative_v1",
       "ordiusdc_competition_maker_neutral_aggressive_v1",
       "ordiusdc_competition_neutral_ping_pong_v1",
+      "trumpusdc_volume_long_v4",
       "chip_short_bias_ping_pong_guarded_v3",
       "chip_short_bias_ping_pong_guarded_v2",
       "soon_volume_neutral_ping_pong_guarded_v2",
@@ -15666,6 +15715,54 @@ MONITOR_PAGE = """<!doctype html>
           adaptive_step_enabled: false,
         },
       },
+      {
+        key: "trumpusdc_volume_long_v4",
+        label: "Alt 冲刺赛 TRUMPUSDC 做多 v4",
+        description: "TRUMPUSDC 专用量优先做多 v4。按 0.002 步长跑轻仓偏多网格，其他风控参数匹配 Alt 盘口的中等容量。",
+        startable: true,
+        kind: "one_way",
+        symbol: "TRUMPUSDC",
+        config: {
+          symbol: "TRUMPUSDC",
+          strategy_mode: "one_way_long",
+          step_price: 0.002,
+          buy_levels: 8,
+          sell_levels: 8,
+          per_order_notional: 45.0,
+          startup_entry_multiplier: 1.0,
+          base_position_notional: 180.0,
+          flat_start_enabled: true,
+          warm_start_enabled: true,
+          up_trigger_steps: 6,
+          down_trigger_steps: 4,
+          shift_steps: 4,
+          pause_buy_position_notional: 500.0,
+          max_position_notional: 600.0,
+          max_total_notional: 900.0,
+          buy_pause_amp_trigger_ratio: 0.0075,
+          buy_pause_down_return_trigger_ratio: -0.0035,
+          freeze_shift_abs_return_trigger_ratio: 0.005,
+          inventory_tier_start_notional: 380.0,
+          inventory_tier_end_notional: 500.0,
+          inventory_tier_buy_levels: 3,
+          inventory_tier_sell_levels: 12,
+          inventory_tier_per_order_notional: 45.0,
+          inventory_tier_base_position_notional: 140.0,
+          take_profit_min_profit_ratio: 0.0,
+          excess_inventory_reduce_only_enabled: false,
+          adverse_reduce_enabled: false,
+          volume_trigger_enabled: false,
+          volume_trigger_stop_close_all_positions: false,
+          volatility_trigger_enabled: false,
+          volatility_trigger_stop_close_all_positions: false,
+          sleep_seconds: 4.0,
+          leverage: 3,
+          maker_retries: 2,
+          max_new_orders: 20,
+          autotune_symbol_enabled: false,
+          adaptive_step_enabled: false,
+        },
+      },
       competitionSprintPreset({
         key: "xauusdt_competition_maker_neutral_v1",
         label: "黄金冲刺赛 XAUUSDT",
@@ -16433,12 +16530,13 @@ MONITOR_PAGE = """<!doctype html>
       {
         key: "alt",
         title: "Alt 冲刺赛",
-        description: "小币赛道，目前展示 ORDIUSDC 的三档参数。",
+        description: "小币赛道，目前展示 ORDIUSDC 三档和 TRUMPUSDC 做多 v4。",
         presetKeys: [
           "ordiusdc_competition_maker_neutral_conservative_v1",
           "ordiusdc_competition_maker_neutral_v1",
           "ordiusdc_competition_maker_neutral_aggressive_v1",
           "ordiusdc_competition_neutral_ping_pong_v1",
+          "trumpusdc_volume_long_v4",
         ],
       },
     ];
@@ -17385,6 +17483,13 @@ MONITOR_PAGE = """<!doctype html>
         focus: [
           "这不是中性策略，会积累 ETHUSDC 多仓库存；跌势里主要靠停买阈值和库存分层减缓继续接仓。",
           "已关闭 volatility/volume close-all 和 adverse reduce，避免触发非 maker 平仓路径；平仓仍依赖挂在上方的 maker 卖单成交。"
+        ],
+      },
+      trumpusdc_volume_long_v4: {
+        summary: "TRUMPUSDC 的 Alt 冲刺赛做多 v4 档。one_way_long、step 0.002、轻仓库存分层，目标是在 TRUMPUSDC 上提高偏多 maker 成交密度。",
+        focus: [
+          "这不是中性策略，会积累 TRUMPUSDC 多仓库存；跌势里主要靠软停买、硬上限和库存分层减缓继续接仓。",
+          "已关闭 volume/volatility close-all 和 adverse reduce，避免触发非 maker 平仓路径；减仓依赖上方 maker 卖单和 v4 分阶段减仓逻辑。"
         ],
       },
       ethusdc_best_quote_long_ping_pong_v1: {
@@ -21250,8 +21355,8 @@ STRATEGIES_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
-    const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC"];
+    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
+    const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const cardsEl = document.getElementById("cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");

@@ -1064,6 +1064,7 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
     normalized_profile = str(strategy_profile or "").strip()
     return normalized_profile in {
         "volume_long_v4",
+        "trumpusdc_volume_long_v4",
         "chip_low_wear_guarded_v1",
         "soon_high_vol_short_grid_v1",
         "soon_volume_neutral_ping_pong_v1",
@@ -1072,7 +1073,7 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
 
 
 def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
-    return str(strategy_profile or "").strip() == "volume_long_v4"
+    return str(strategy_profile or "").strip() in {"volume_long_v4", "trumpusdc_volume_long_v4"}
 
 
 def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: bool = False) -> float:

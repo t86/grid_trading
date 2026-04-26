@@ -16,6 +16,7 @@ from grid_optimizer.loop_runner import (
     _build_parser,
     _should_sync_account_audit,
     _uses_entry_price_cost_basis,
+    _uses_volume_long_v4_staged_delever,
     _apply_synthetic_trade_fill,
     _decorate_synthetic_open_orders,
     _load_synthetic_ledger,
@@ -81,6 +82,10 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(_uses_entry_price_cost_basis("soon_high_vol_short_grid_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("soon_volume_neutral_ping_pong_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("soonusdt_competition_neutral_ping_pong_v1"))
+
+    def test_trumpusdc_volume_long_profile_uses_v4_cost_guards(self) -> None:
+        self.assertTrue(_uses_entry_price_cost_basis("trumpusdc_volume_long_v4"))
+        self.assertTrue(_uses_volume_long_v4_staged_delever("trumpusdc_volume_long_v4"))
 
     def test_resolve_exposure_escalation_waits_for_hold_time(self) -> None:
         state: dict[str, object] = {}
