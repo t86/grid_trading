@@ -1865,6 +1865,12 @@ def resolve_sticky_exit_mode(
 
     if bool(active_delever.get("active")):
         trigger_mode = str(active_delever.get("trigger_mode") or "active").strip() or "active"
+        release_sell_count = int(active_delever.get("release_sell_order_count") or 0)
+        release_buy_count = int(active_delever.get("release_buy_order_count") or 0)
+        # Release orders are intentionally repriced toward the live best quote.
+        # Keeping their old queue price can pin inventory to stale break-even exits.
+        if release_sell_count > 0 or release_buy_count > 0:
+            return {"key": None, "roles": []}
         if int(active_delever.get("active_sell_order_count") or 0) > 0:
             keys.append(f"active_delever_long:{trigger_mode}")
             roles.update({"take_profit_long", "active_delever_long"})
