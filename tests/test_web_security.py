@@ -417,7 +417,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["max_total_notional"], 2200.0)
         self.assertEqual(payload["max_new_orders"], 24)
         self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0001)
-        self.assertFalse(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertEqual(payload["adaptive_step_max_scale"], 2.5)
         self.assertFalse(payload["synthetic_trend_follow_enabled"])
         self.assertEqual(payload["leverage"], 10)
         self.assertFalse(payload["autotune_symbol_enabled"])
@@ -1390,9 +1391,30 @@ class WebSecurityTests(unittest.TestCase):
                 self.assertAlmostEqual(payload["per_order_notional"], per_order)
                 self.assertFalse(payload["flat_start_enabled"])
                 self.assertFalse(payload["market_bias_enabled"])
-                self.assertFalse(payload["adaptive_step_enabled"])
+                if profile == "ordiusdc_competition_neutral_ping_pong_v1":
+                    self.assertTrue(payload["adaptive_step_enabled"])
+                    self.assertEqual(payload["adaptive_step_max_scale"], 2.5)
+                else:
+                    self.assertFalse(payload["adaptive_step_enabled"])
                 self.assertAlmostEqual(payload["near_market_entry_max_center_distance_steps"], 999.0)
                 self.assertAlmostEqual(payload["take_profit_min_profit_ratio"], 0.0)
+
+    def test_runner_preset_payload_applies_chipusdt_competition_neutral_ping_pong_guards(self) -> None:
+        payload = _runner_preset_payload("chipusdt_competition_neutral_ping_pong_v1", {"symbol": "CHIPUSDT"})
+        self.assertEqual(payload["strategy_profile"], "chipusdt_competition_neutral_ping_pong_v1")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 0.00015)
+        self.assertEqual(payload["buy_levels"], 5)
+        self.assertEqual(payload["sell_levels"], 5)
+        self.assertAlmostEqual(payload["per_order_notional"], 60.0)
+        self.assertAlmostEqual(payload["sleep_seconds"], 7.0)
+        self.assertTrue(payload["flat_start_enabled"])
+        self.assertTrue(payload["adverse_reduce_enabled"])
+        self.assertAlmostEqual(payload["adverse_reduce_short_trigger_ratio"], 0.006)
+        self.assertTrue(payload["volatility_trigger_enabled"])
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+        self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 5.0)
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 12.0)
 
     def test_runner_preset_payload_rejects_competition_neutral_ping_pong_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUUSDT"):
@@ -1417,7 +1439,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["volume_long_v4_flow_sleeve_order_notional"], 45.0)
         self.assertAlmostEqual(payload["volume_long_v4_flow_sleeve_max_loss_ratio"], 0.008)
         self.assertFalse(payload["autotune_symbol_enabled"])
-        self.assertFalse(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertEqual(payload["adaptive_step_max_scale"], 2.5)
 
     @patch("grid_optimizer.web.CUSTOM_RUNNER_PRESETS_PATH", new=Path("output/test_custom_runner_presets.json"))
     def test_runner_preset_payload_normalizes_custom_grid_runtime(self) -> None:
