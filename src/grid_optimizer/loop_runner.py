@@ -8420,7 +8420,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_long_pause_active
             else 0.0
         )
-        combined_long_probe_scale = max(weak_buy_probe_scale, inventory_long_probe_scale)
+        combined_long_probe_scale = (
+            weak_buy_probe_scale
+            if bool(market_bias_entry_pause["buy_pause_active"])
+            else inventory_long_probe_scale
+        )
         adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
             enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
             keep_probe_scale=getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
@@ -8447,7 +8451,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_short_pause_active
             else 0.0
         )
-        combined_short_probe_scale = max(strong_short_probe_scale, inventory_short_probe_scale)
+        combined_short_probe_scale = (
+            strong_short_probe_scale
+            if bool(market_bias_entry_pause["short_pause_active"])
+            else inventory_short_probe_scale
+        )
         short_threshold_timeout = resolve_short_threshold_timeout_state(
             state=state,
             current_short_notional=current_short_notional,
@@ -8625,7 +8633,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_long_pause_active
             else 0.0
         )
-        combined_long_probe_scale = max(weak_buy_probe_scale, inventory_long_probe_scale)
+        combined_long_probe_scale = (
+            weak_buy_probe_scale
+            if bool(market_bias_entry_pause["buy_pause_active"])
+            else inventory_long_probe_scale
+        )
         adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
             enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
             keep_probe_scale=getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
@@ -8652,7 +8664,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_short_pause_active
             else 0.0
         )
-        combined_short_probe_scale = max(strong_short_probe_scale, inventory_short_probe_scale)
+        combined_short_probe_scale = (
+            strong_short_probe_scale
+            if bool(market_bias_entry_pause["short_pause_active"])
+            else inventory_short_probe_scale
+        )
         short_threshold_timeout = resolve_short_threshold_timeout_state(
             state=state,
             current_short_notional=current_short_notional,
