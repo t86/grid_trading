@@ -1396,6 +1396,16 @@ class WebSecurityTests(unittest.TestCase):
                     self.assertEqual(payload["adaptive_step_max_scale"], 2.5)
                 else:
                     self.assertFalse(payload["adaptive_step_enabled"])
+                if profile == "btcusdc_competition_neutral_ping_pong_v1":
+                    self.assertTrue(payload["adverse_reduce_enabled"])
+                    self.assertTrue(payload["hard_loss_forced_reduce_enabled"])
+                    self.assertTrue(payload["volatility_trigger_enabled"])
+                    self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 150.0)
+                if profile == "ordiusdc_competition_neutral_ping_pong_v1":
+                    self.assertTrue(payload["adverse_reduce_enabled"])
+                    self.assertTrue(payload["hard_loss_forced_reduce_enabled"])
+                    self.assertTrue(payload["volatility_trigger_enabled"])
+                    self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 20.0)
                 self.assertAlmostEqual(payload["near_market_entry_max_center_distance_steps"], 999.0)
                 self.assertAlmostEqual(payload["take_profit_min_profit_ratio"], 0.0)
 
@@ -1438,6 +1448,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volume_long_v4_flow_sleeve_levels"], 4)
         self.assertAlmostEqual(payload["volume_long_v4_flow_sleeve_order_notional"], 45.0)
         self.assertAlmostEqual(payload["volume_long_v4_flow_sleeve_max_loss_ratio"], 0.008)
+        self.assertTrue(payload["adverse_reduce_enabled"])
+        self.assertAlmostEqual(payload["adverse_reduce_long_trigger_ratio"], 0.006)
+        self.assertTrue(payload["hard_loss_forced_reduce_enabled"])
+        self.assertAlmostEqual(payload["hard_loss_forced_reduce_target_notional"], 300.0)
+        self.assertTrue(payload["volatility_trigger_enabled"])
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+        self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 120.0)
         self.assertFalse(payload["autotune_symbol_enabled"])
         self.assertTrue(payload["adaptive_step_enabled"])
         self.assertEqual(payload["adaptive_step_max_scale"], 2.5)
