@@ -1357,6 +1357,26 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "volatility_trigger_reduce_max_loss_ratio": 0.03,
             "volatility_trigger_reduce_escalate_after_seconds": 60.0,
             "volatility_trigger_reduce_escalate_abs_return_ratio": 0.03,
+            "volatility_trigger_fast_windows": [
+                {
+                    "window": "1m",
+                    "amplitude_ratio": 0.012,
+                    "abs_return_ratio": 0.008,
+                    "stop_reduce_to_notional": 300.0,
+                    "reduce_max_loss_ratio": 0.020,
+                    "reduce_escalate_after_seconds": 45.0,
+                    "reduce_escalate_abs_return_ratio": 0.012,
+                },
+                {
+                    "window": "3m",
+                    "amplitude_ratio": 0.020,
+                    "abs_return_ratio": 0.012,
+                    "stop_reduce_to_notional": 120.0,
+                    "reduce_max_loss_ratio": 0.030,
+                    "reduce_escalate_after_seconds": 60.0,
+                    "reduce_escalate_abs_return_ratio": 0.018,
+                },
+            ],
             "volume_long_v4_flow_sleeve_enabled": True,
             "volume_long_v4_flow_sleeve_trigger_notional": 500.0,
             "volume_long_v4_flow_sleeve_reduce_to_notional": 430.0,
@@ -1664,6 +1684,47 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "adaptive_step_max_scale": 2.5,
             "adaptive_step_min_per_order_scale": 0.65,
             "adaptive_step_min_position_limit_scale": 0.75,
+            "adverse_reduce_enabled": True,
+            "adverse_reduce_long_trigger_ratio": 0.010,
+            "adverse_reduce_short_trigger_ratio": 0.007,
+            "adverse_reduce_target_ratio": 0.50,
+            "adverse_reduce_maker_timeout_seconds": 30.0,
+            "adverse_reduce_max_order_notional": 40.0,
+            "adverse_reduce_keep_probe_scale": 0.0,
+            "hard_loss_forced_reduce_enabled": True,
+            "hard_loss_forced_reduce_target_notional": 110.0,
+            "hard_loss_forced_reduce_max_order_notional": 40.0,
+            "hard_loss_forced_reduce_unrealized_loss_limit": 10.0,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "15m",
+            "volatility_trigger_amplitude_ratio": 0.04,
+            "volatility_trigger_abs_return_ratio": 0.02,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": True,
+            "volatility_trigger_stop_reduce_to_notional": 40.0,
+            "volatility_trigger_reduce_max_loss_ratio": 0.025,
+            "volatility_trigger_reduce_escalate_after_seconds": 60.0,
+            "volatility_trigger_reduce_escalate_abs_return_ratio": 0.030,
+            "volatility_trigger_fast_windows": [
+                {
+                    "window": "1m",
+                    "amplitude_ratio": 0.015,
+                    "abs_return_ratio": 0.010,
+                    "stop_reduce_to_notional": 110.0,
+                    "reduce_max_loss_ratio": 0.020,
+                    "reduce_escalate_after_seconds": 45.0,
+                    "reduce_escalate_abs_return_ratio": 0.015,
+                },
+                {
+                    "window": "3m",
+                    "amplitude_ratio": 0.025,
+                    "abs_return_ratio": 0.015,
+                    "stop_reduce_to_notional": 40.0,
+                    "reduce_max_loss_ratio": 0.025,
+                    "reduce_escalate_after_seconds": 60.0,
+                    "reduce_escalate_abs_return_ratio": 0.025,
+                },
+            ],
         },
     },
     "btcusdc_competition_maker_neutral_aggressive_v1": {
@@ -2332,6 +2393,26 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "volatility_trigger_reduce_max_loss_ratio": 0.035,
             "volatility_trigger_reduce_escalate_after_seconds": 30.0,
             "volatility_trigger_reduce_escalate_abs_return_ratio": 0.03,
+            "volatility_trigger_fast_windows": [
+                {
+                    "window": "1m",
+                    "amplitude_ratio": 0.015,
+                    "abs_return_ratio": 0.009,
+                    "stop_reduce_to_notional": 120.0,
+                    "reduce_max_loss_ratio": 0.020,
+                    "reduce_escalate_after_seconds": 45.0,
+                    "reduce_escalate_abs_return_ratio": 0.014,
+                },
+                {
+                    "window": "3m",
+                    "amplitude_ratio": 0.025,
+                    "abs_return_ratio": 0.015,
+                    "stop_reduce_to_notional": 60.0,
+                    "reduce_max_loss_ratio": 0.025,
+                    "reduce_escalate_after_seconds": 60.0,
+                    "reduce_escalate_abs_return_ratio": 0.022,
+                },
+            ],
         },
     ),
     "btcusdc_competition_neutral_ping_pong_v1": _competition_neutral_ping_pong_preset(
@@ -2368,6 +2449,26 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "volatility_trigger_reduce_max_loss_ratio": 0.01,
             "volatility_trigger_reduce_escalate_after_seconds": 120.0,
             "volatility_trigger_reduce_escalate_abs_return_ratio": 0.016,
+            "volatility_trigger_fast_windows": [
+                {
+                    "window": "1m",
+                    "amplitude_ratio": 0.006,
+                    "abs_return_ratio": 0.004,
+                    "stop_reduce_to_notional": 300.0,
+                    "reduce_max_loss_ratio": 0.006,
+                    "reduce_escalate_after_seconds": 60.0,
+                    "reduce_escalate_abs_return_ratio": 0.008,
+                },
+                {
+                    "window": "3m",
+                    "amplitude_ratio": 0.010,
+                    "abs_return_ratio": 0.007,
+                    "stop_reduce_to_notional": 150.0,
+                    "reduce_max_loss_ratio": 0.010,
+                    "reduce_escalate_after_seconds": 90.0,
+                    "reduce_escalate_abs_return_ratio": 0.012,
+                },
+            ],
         },
     ),
     "ethusdc_competition_neutral_ping_pong_v1": _competition_neutral_ping_pong_preset(
@@ -2480,6 +2581,26 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "volatility_trigger_reduce_max_loss_ratio": 0.025,
             "volatility_trigger_reduce_escalate_after_seconds": 60.0,
             "volatility_trigger_reduce_escalate_abs_return_ratio": 0.03,
+            "volatility_trigger_fast_windows": [
+                {
+                    "window": "1m",
+                    "amplitude_ratio": 0.015,
+                    "abs_return_ratio": 0.010,
+                    "stop_reduce_to_notional": 60.0,
+                    "reduce_max_loss_ratio": 0.020,
+                    "reduce_escalate_after_seconds": 45.0,
+                    "reduce_escalate_abs_return_ratio": 0.015,
+                },
+                {
+                    "window": "3m",
+                    "amplitude_ratio": 0.025,
+                    "abs_return_ratio": 0.015,
+                    "stop_reduce_to_notional": 20.0,
+                    "reduce_max_loss_ratio": 0.025,
+                    "reduce_escalate_after_seconds": 60.0,
+                    "reduce_escalate_abs_return_ratio": 0.025,
+                },
+            ],
         },
     ),
     "defensive_quasi_neutral_v1": {
@@ -2791,6 +2912,36 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "inventory_tier_per_order_notional": 60.0,
             "inventory_tier_base_position_notional": 90.0,
             "rolling_hourly_loss_limit": 80.0,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_window": "15m",
+            "volatility_trigger_amplitude_ratio": 0.025,
+            "volatility_trigger_abs_return_ratio": 0.015,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_close_all_positions": True,
+            "volatility_trigger_stop_reduce_to_notional": 300.0,
+            "volatility_trigger_reduce_max_loss_ratio": 0.020,
+            "volatility_trigger_reduce_escalate_after_seconds": 90.0,
+            "volatility_trigger_reduce_escalate_abs_return_ratio": 0.020,
+            "volatility_trigger_fast_windows": [
+                {
+                    "window": "1m",
+                    "amplitude_ratio": 0.008,
+                    "abs_return_ratio": 0.006,
+                    "stop_reduce_to_notional": 700.0,
+                    "reduce_max_loss_ratio": 0.015,
+                    "reduce_escalate_after_seconds": 45.0,
+                    "reduce_escalate_abs_return_ratio": 0.010,
+                },
+                {
+                    "window": "3m",
+                    "amplitude_ratio": 0.012,
+                    "abs_return_ratio": 0.009,
+                    "stop_reduce_to_notional": 300.0,
+                    "reduce_max_loss_ratio": 0.020,
+                    "reduce_escalate_after_seconds": 60.0,
+                    "reduce_escalate_abs_return_ratio": 0.014,
+                },
+            ],
             "sleep_seconds": 6.0,
             "autotune_symbol_enabled": False,
             "autotune_min_order_notional_only": True,
@@ -3553,6 +3704,68 @@ def _normalize_volatility_trigger_window(value: Any) -> str:
     return text if text in VOLATILITY_TRIGGER_WINDOW_MINUTES else DEFAULT_VOLATILITY_TRIGGER_WINDOW
 
 
+def _volatility_trigger_numeric_keys() -> set[str]:
+    return {
+        "volatility_trigger_amplitude_ratio",
+        "volatility_trigger_abs_return_ratio",
+        "volatility_trigger_stop_reduce_to_notional",
+        "volatility_trigger_reduce_max_loss_ratio",
+        "volatility_trigger_reduce_escalate_after_seconds",
+        "volatility_trigger_reduce_escalate_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_after_seconds",
+        "volatility_trigger_blocked_reduce_relax_abs_return_ratio",
+        "volatility_trigger_blocked_reduce_relax_target_notional",
+        "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
+    }
+
+
+def _normalize_volatility_trigger_fast_windows(value: Any) -> list[dict[str, Any]]:
+    if value is None or value == "":
+        return []
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except json.JSONDecodeError as exc:
+            raise ValueError("volatility_trigger_fast_windows must be valid JSON") from exc
+    if not isinstance(value, list):
+        raise ValueError("volatility_trigger_fast_windows must be a list")
+
+    normalized_windows: list[dict[str, Any]] = []
+    numeric_keys = _volatility_trigger_numeric_keys()
+    for index, item in enumerate(value):
+        if not isinstance(item, dict):
+            raise ValueError(f"volatility_trigger_fast_windows[{index}] must be an object")
+        window = _normalize_volatility_trigger_window(item.get("window") or item.get("volatility_trigger_window"))
+        fast_config: dict[str, Any] = {"window": window}
+        for key in numeric_keys:
+            short_key = key.removeprefix("volatility_trigger_")
+            raw = item.get(key, item.get(short_key))
+            if raw in {"", None}:
+                fast_config[key] = None
+                continue
+            threshold = float(raw)
+            if key in {
+                "volatility_trigger_stop_reduce_to_notional",
+                "volatility_trigger_reduce_max_loss_ratio",
+                "volatility_trigger_blocked_reduce_relax_target_notional",
+                "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
+            }:
+                if threshold < 0:
+                    raise ValueError(f"volatility_trigger_fast_windows[{index}].{short_key} must be >= 0")
+                fast_config[key] = threshold or None
+                continue
+            if threshold <= 0:
+                raise ValueError(f"volatility_trigger_fast_windows[{index}].{short_key} must be > 0")
+            fast_config[key] = threshold
+        if (
+            fast_config.get("volatility_trigger_amplitude_ratio") is None
+            and fast_config.get("volatility_trigger_abs_return_ratio") is None
+        ):
+            raise ValueError(f"volatility_trigger_fast_windows[{index}] requires at least one threshold")
+        normalized_windows.append(fast_config)
+    return normalized_windows
+
+
 def _normalize_runner_volume_trigger_config(config: dict[str, Any]) -> dict[str, Any]:
     normalized = dict(config)
     normalized["volume_trigger_enabled"] = bool(normalized.get("volume_trigger_enabled", False))
@@ -3593,18 +3806,7 @@ def _normalize_runner_volatility_trigger_config(config: dict[str, Any]) -> dict[
     normalized["volatility_trigger_window"] = _normalize_volatility_trigger_window(
         normalized.get("volatility_trigger_window")
     )
-    for key in {
-        "volatility_trigger_amplitude_ratio",
-        "volatility_trigger_abs_return_ratio",
-        "volatility_trigger_stop_reduce_to_notional",
-        "volatility_trigger_reduce_max_loss_ratio",
-        "volatility_trigger_reduce_escalate_after_seconds",
-        "volatility_trigger_reduce_escalate_abs_return_ratio",
-        "volatility_trigger_blocked_reduce_relax_after_seconds",
-        "volatility_trigger_blocked_reduce_relax_abs_return_ratio",
-        "volatility_trigger_blocked_reduce_relax_target_notional",
-        "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
-    }:
+    for key in _volatility_trigger_numeric_keys():
         value = normalized.get(key)
         if value in {"", None}:
             normalized[key] = None
@@ -3637,6 +3839,9 @@ def _normalize_runner_volatility_trigger_config(config: dict[str, Any]) -> dict[
             and normalized.get("volatility_trigger_abs_return_ratio") is None
         ):
             raise ValueError("volatility trigger enabled requires at least one threshold")
+    normalized["volatility_trigger_fast_windows"] = _normalize_volatility_trigger_fast_windows(
+        normalized.get("volatility_trigger_fast_windows")
+    )
     return normalized
 
 
@@ -3934,6 +4139,82 @@ def _evaluate_runner_volatility_trigger_signal(
     }
 
 
+def _volatility_trigger_effective_config(
+    base_config: dict[str, Any],
+    trigger_profile: dict[str, Any] | None,
+) -> dict[str, Any]:
+    effective = dict(base_config)
+    if not trigger_profile:
+        return effective
+    for key, value in trigger_profile.items():
+        if key == "window":
+            effective["volatility_trigger_window"] = value
+        elif key.startswith("volatility_trigger_") and value is not None:
+            effective[key] = value
+    return effective
+
+
+def _select_runner_volatility_trigger_signal(
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_config = _normalize_runner_volatility_trigger_config(config)
+    base_window = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
+    candidates: list[dict[str, Any]] = [
+        {
+            "name": "base",
+            "window": base_window,
+            "volatility_trigger_amplitude_ratio": normalized_config.get("volatility_trigger_amplitude_ratio"),
+            "volatility_trigger_abs_return_ratio": normalized_config.get("volatility_trigger_abs_return_ratio"),
+        }
+    ]
+    for index, fast_window in enumerate(normalized_config.get("volatility_trigger_fast_windows") or []):
+        candidate = {"name": f"fast_{index + 1}", **fast_window}
+        candidates.append(candidate)
+
+    evaluated: list[dict[str, Any]] = []
+    hit_candidates: list[dict[str, Any]] = []
+    symbol = str(normalized_config.get("symbol", "")).upper().strip()
+    for candidate in candidates:
+        window_key = _normalize_volatility_trigger_window(candidate.get("window"))
+        window_minutes = VOLATILITY_TRIGGER_WINDOW_MINUTES[window_key]
+        stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
+        current_amplitude_ratio = float(stats.get("amplitude_ratio") or 0.0)
+        current_return_ratio = float(stats.get("return_ratio") or 0.0)
+        candidate_config = _volatility_trigger_effective_config(normalized_config, candidate)
+        signal = _evaluate_runner_volatility_trigger_signal(
+            candidate_config,
+            current_amplitude_ratio=current_amplitude_ratio,
+            current_return_ratio=current_return_ratio,
+        )
+        summary = {
+            "name": candidate.get("name"),
+            "window": window_key,
+            "window_minutes": window_minutes,
+            "current_amplitude_ratio": current_amplitude_ratio,
+            "current_return_ratio": current_return_ratio,
+            "hit": bool(signal.get("hit")),
+            "matched_reasons": signal.get("matched_reasons") or [],
+            "amplitude_threshold": signal.get("amplitude_threshold"),
+            "abs_return_threshold": signal.get("abs_return_threshold"),
+            "trigger_profile": candidate,
+            "effective_config": candidate_config,
+        }
+        evaluated.append(summary)
+        if summary["hit"]:
+            hit_candidates.append(summary)
+
+    selected = hit_candidates[0] if hit_candidates else evaluated[0]
+    public_candidates = [
+        {key: value for key, value in item.items() if key not in {"effective_config"}}
+        for item in evaluated
+    ]
+    return {
+        **selected,
+        "candidates": public_candidates,
+        "effective_config": selected["effective_config"],
+    }
+
+
 def _parse_utc_datetime(value: Any) -> datetime | None:
     if not value:
         return None
@@ -4172,31 +4453,28 @@ def _volatility_trigger_start_allowed(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(normalized_config.get("symbol", "")).upper().strip()
     if not symbol:
         return {"allowed": True, "reason": "missing_symbol"}
-    window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
-    window_minutes = VOLATILITY_TRIGGER_WINDOW_MINUTES[window_key]
-    stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
-    signal_summary = _evaluate_runner_volatility_trigger_signal(
-        normalized_config,
-        current_amplitude_ratio=float(stats.get("amplitude_ratio") or 0.0),
-        current_return_ratio=float(stats.get("return_ratio") or 0.0),
-    )
+    signal_summary = _select_runner_volatility_trigger_signal(normalized_config)
     if signal_summary["hit"]:
         return {
             "allowed": False,
             "reason": "volatility_above_threshold",
-            "window": window_key,
-            "window_minutes": window_minutes,
-            "current_amplitude_ratio": float(stats.get("amplitude_ratio") or 0.0),
-            "current_return_ratio": float(stats.get("return_ratio") or 0.0),
+            "window": signal_summary["window"],
+            "window_minutes": signal_summary["window_minutes"],
+            "current_amplitude_ratio": signal_summary["current_amplitude_ratio"],
+            "current_return_ratio": signal_summary["current_return_ratio"],
+            "trigger_profile": signal_summary.get("trigger_profile"),
+            "candidates": signal_summary.get("candidates"),
             **signal_summary,
         }
     return {
         "allowed": True,
         "reason": "volatility_within_threshold",
-        "window": window_key,
-        "window_minutes": window_minutes,
-        "current_amplitude_ratio": float(stats.get("amplitude_ratio") or 0.0),
-        "current_return_ratio": float(stats.get("return_ratio") or 0.0),
+        "window": signal_summary["window"],
+        "window_minutes": signal_summary["window_minutes"],
+        "current_amplitude_ratio": signal_summary["current_amplitude_ratio"],
+        "current_return_ratio": signal_summary["current_return_ratio"],
+        "trigger_profile": signal_summary.get("trigger_profile"),
+        "candidates": signal_summary.get("candidates"),
         **signal_summary,
     }
 
@@ -4301,18 +4579,21 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
 
     checked_at_dt = datetime.now(timezone.utc)
     checked_at = checked_at_dt.isoformat()
-    window_key = _normalize_volatility_trigger_window(normalized_config.get("volatility_trigger_window"))
+    signal_profile = _select_runner_volatility_trigger_signal(normalized_config)
+    effective_config = _normalize_runner_volatility_trigger_config(
+        signal_profile.get("effective_config") if isinstance(signal_profile.get("effective_config"), dict) else normalized_config
+    )
+    window_key = _normalize_volatility_trigger_window(signal_profile.get("window"))
     window_minutes = VOLATILITY_TRIGGER_WINDOW_MINUTES[window_key]
-    price_stats = fetch_futures_window_price_stats(symbol, window_minutes=window_minutes)
-    current_amplitude_ratio = float(price_stats.get("amplitude_ratio") or 0.0)
-    current_return_ratio = float(price_stats.get("return_ratio") or 0.0)
+    current_amplitude_ratio = float(signal_profile.get("current_amplitude_ratio") or 0.0)
+    current_return_ratio = float(signal_profile.get("current_return_ratio") or 0.0)
     runner = _read_runner_process_for_symbol(symbol)
     flatten = _read_flatten_process_for_symbol(symbol)
     previous_status = _runner_volatility_trigger_status(symbol) or {}
-    reduce_target_notional = _volatility_reduce_target_notional(normalized_config)
+    reduce_target_notional = _volatility_reduce_target_notional(effective_config)
     signal_hit = False
     decision = _resolve_runner_volatility_trigger_action(
-        normalized_config,
+        effective_config,
         current_amplitude_ratio=current_amplitude_ratio,
         current_return_ratio=current_return_ratio,
         runner_running=bool(runner.get("is_running")),
@@ -4321,13 +4602,13 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     )
     signal_hit = bool(decision.get("hit"))
     escalation_reason = _volatility_reduce_escalation_reason(
-        normalized_config,
+        effective_config,
         previous_status,
         checked_at=checked_at_dt,
         current_return_ratio=current_return_ratio,
     )
     blocked_reduce_relaxation = _volatility_blocked_reduce_relaxation(
-        normalized_config,
+        effective_config,
         previous_status,
         checked_at=checked_at_dt,
         current_return_ratio=current_return_ratio,
@@ -4350,7 +4631,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
     if (
         signal_hit
         and escalation_reason
-        and bool(normalized_config.get("volatility_trigger_stop_close_all_positions", True))
+        and bool(effective_config.get("volatility_trigger_stop_close_all_positions", True))
     ):
         decision["action"] = "full_flatten"
         decision["reason"] = escalation_reason
@@ -4365,8 +4646,10 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         "window_minutes": window_minutes,
         "current_amplitude_ratio": current_amplitude_ratio,
         "current_return_ratio": current_return_ratio,
-        "amplitude_ratio": normalized_config.get("volatility_trigger_amplitude_ratio"),
-        "abs_return_ratio": normalized_config.get("volatility_trigger_abs_return_ratio"),
+        "amplitude_ratio": effective_config.get("volatility_trigger_amplitude_ratio"),
+        "abs_return_ratio": effective_config.get("volatility_trigger_abs_return_ratio"),
+        "trigger_profile": signal_profile.get("trigger_profile"),
+        "trigger_candidates": signal_profile.get("candidates"),
         "runner_running": bool(runner.get("is_running")),
         "flatten_running": bool(flatten.get("is_running")),
         "action": decision.get("action"),
@@ -4377,7 +4660,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
         "post_stop_pending": bool(previous_status.get("post_stop_pending", False)),
         "phase": previous_status.get("phase"),
         "reduce_target_notional": previous_status.get("reduce_target_notional"),
-        "reduce_max_loss_ratio": normalized_config.get("volatility_trigger_reduce_max_loss_ratio"),
+        "reduce_max_loss_ratio": effective_config.get("volatility_trigger_reduce_max_loss_ratio"),
         "reduce_target_reached": bool(previous_status.get("reduce_target_reached", False)),
         "reduce_started_at": previous_status.get("reduce_started_at"),
         "reduce_effective": bool(previous_status.get("reduce_effective", False)),
@@ -4435,10 +4718,10 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             )
         elif decision.get("action") in {"stop", "reduce_to_notional", "full_flatten"}:
             target_notional = 0.0
-            close_positions = bool(normalized_config.get("volatility_trigger_stop_close_all_positions", True))
+            close_positions = bool(effective_config.get("volatility_trigger_stop_close_all_positions", True))
             close_position_allow_loss = False
             close_position_max_loss_ratio = None
-            reduce_max_loss_ratio = normalized_config.get("volatility_trigger_reduce_max_loss_ratio")
+            reduce_max_loss_ratio = effective_config.get("volatility_trigger_reduce_max_loss_ratio")
             active_relaxation = (
                 decision.get("blocked_reduce_relaxation")
                 if isinstance(decision.get("blocked_reduce_relaxation"), dict)
@@ -4586,7 +4869,7 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
             _update_volatility_trigger_status(symbol, status)
             result = _stop_runner_process(
                 symbol,
-                cancel_open_orders=bool(normalized_config.get("volatility_trigger_stop_cancel_open_orders", True)),
+                cancel_open_orders=bool(effective_config.get("volatility_trigger_stop_cancel_open_orders", True)),
                 close_all_positions=close_positions,
                 close_position_target_notional=target_notional,
                 close_position_allow_loss=close_position_allow_loss,
@@ -5708,6 +5991,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_trigger_window",
         "volatility_trigger_window",
     }
+    json_fields = {
+        "volatility_trigger_fast_windows",
+    }
     noneable_fields = {
         "center_price",
         "pause_buy_position_notional",
@@ -5787,7 +6073,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     }
 
     for key, value in payload.items():
-        if key not in float_fields | int_fields | bool_fields | str_fields:
+        if key not in float_fields | int_fields | bool_fields | str_fields | json_fields:
             continue
         if key in noneable_fields and value in {"", None}:
             config[key] = None
@@ -5805,6 +6091,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
             text = str(value).strip()
             if text:
                 config[key] = text
+        if key in json_fields:
+            config[key] = value
 
     config["symbol"] = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"

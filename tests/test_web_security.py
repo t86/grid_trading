@@ -30,6 +30,7 @@ from grid_optimizer.web import (
     _parse_allowed_networks,
     _resolve_runner_volume_trigger_action,
     _resolve_runner_volatility_trigger_action,
+    _select_runner_volatility_trigger_signal,
     _resolve_runner_start_config,
     _run_loop_monitor_query,
     _reconcile_runner_volatility_trigger,
@@ -693,10 +694,57 @@ class WebSecurityTests(unittest.TestCase):
                 "volatility_trigger_enabled": True,
                 "volatility_trigger_window": "1m",
                 "volatility_trigger_amplitude_ratio": 0.0015,
+                "volatility_trigger_fast_windows": [
+                    {
+                        "window": "1m",
+                        "amplitude_ratio": 0.008,
+                        "abs_return_ratio": 0.006,
+                        "stop_reduce_to_notional": 700,
+                    }
+                ],
             }
         )
 
         self.assertEqual(payload["volatility_trigger_window"], "1m")
+        self.assertEqual(payload["volatility_trigger_fast_windows"][0]["window"], "1m")
+        self.assertEqual(payload["volatility_trigger_fast_windows"][0]["volatility_trigger_stop_reduce_to_notional"], 700)
+
+    @patch("grid_optimizer.web.fetch_futures_window_price_stats")
+    def test_select_runner_volatility_trigger_signal_uses_fast_window_profile(self, mock_fetch_stats) -> None:
+        def fake_stats(symbol: str, *, window_minutes: int) -> dict[str, float]:
+            if window_minutes == 1:
+                return {"amplitude_ratio": 0.009, "return_ratio": 0.007}
+            return {"amplitude_ratio": 0.010, "return_ratio": 0.006}
+
+        mock_fetch_stats.side_effect = fake_stats
+
+        selected = _select_runner_volatility_trigger_signal(
+            {
+                "symbol": "SOONUSDT",
+                "volatility_trigger_enabled": True,
+                "volatility_trigger_window": "15m",
+                "volatility_trigger_amplitude_ratio": 0.025,
+                "volatility_trigger_abs_return_ratio": 0.015,
+                "volatility_trigger_stop_reduce_to_notional": 300.0,
+                "volatility_trigger_fast_windows": [
+                    {
+                        "window": "1m",
+                        "amplitude_ratio": 0.008,
+                        "abs_return_ratio": 0.006,
+                        "stop_reduce_to_notional": 700.0,
+                        "reduce_max_loss_ratio": 0.015,
+                    }
+                ],
+            }
+        )
+
+        self.assertTrue(selected["hit"])
+        self.assertEqual(selected["window"], "1m")
+        self.assertEqual(
+            selected["effective_config"]["volatility_trigger_stop_reduce_to_notional"],
+            700.0,
+        )
+        self.assertIn("abs_return_above_threshold", selected["matched_reasons"])
 
     def test_volatility_reduce_does_not_escalate_when_target_already_reached(self) -> None:
         reason = _volatility_reduce_escalation_reason(
