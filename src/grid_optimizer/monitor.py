@@ -1378,137 +1378,130 @@ def _build_monitor_snapshot_uncached(
     credentials = load_binance_api_credentials()
     if credentials is None:
         snapshot["warnings"].append("missing_binance_api_credentials")
-        snapshot["alerts"] = build_monitor_alerts(
-            loop_summary=loop_summary,
-            warnings=snapshot["warnings"],
-            risk_controls={},
-            runner=runner,
-        )
-        return snapshot
-
-    api_key, api_secret = credentials
-    snapshot["account_connected"] = True
-    try:
-        unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
-        if local_runtime_snapshot is None:
-            account_info = fetch_futures_account_info_v3(api_key, api_secret)
-            position_mode = fetch_futures_position_mode(api_key, api_secret)
-            open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
-            dual_side_position = _truthy(position_mode.get("dualSidePosition"))
-            if dual_side_position:
-                long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
-                short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
-                long_qty = abs(_safe_float(long_position.get("positionAmt")))
-                short_qty = abs(_safe_float(short_position.get("positionAmt")))
-                long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
-                short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
-                unrealized_pnl = long_unrealized + short_unrealized
-                position_amt = long_qty - short_qty
-                position = long_position if long_qty >= short_qty else short_position
-                entry_price = _safe_float(position.get("entryPrice"))
-                break_even_price = _safe_float(position.get("breakEvenPrice"))
-            else:
-                position = extract_symbol_position(account_info, normalized_symbol)
-                unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
-                entry_price = _safe_float(position.get("entryPrice"))
-                break_even_price = _safe_float(position.get("breakEvenPrice"))
-                position_amt = _safe_float(position.get("positionAmt"))
-            snapshot["position"] = {
-                "position_amt": position_amt,
-                "long_qty": long_qty if dual_side_position else max(position_amt, 0.0),
-                "short_qty": short_qty if dual_side_position else 0.0,
-                "entry_price": entry_price,
-                "break_even_price": break_even_price,
-                "unrealized_pnl": unrealized_pnl,
-                "isolated": _truthy(position.get("isolated")),
-                "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
-                "one_way_mode": not dual_side_position,
-                "available_balance": _safe_float(account_info.get("availableBalance")),
-                "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
-                "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
-            }
-            snapshot["account_assets"] = {
-                "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
-                "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
-            }
-            snapshot["open_orders"] = [
-                {
-                    "order_id": item.get("orderId"),
-                    "client_order_id": item.get("clientOrderId"),
-                    "side": str(item.get("side", "")).upper().strip(),
-                    "price": _safe_float(item.get("price")),
-                    "orig_qty": _safe_float(item.get("origQty")),
-                    "executed_qty": _safe_float(item.get("executedQty")),
-                    "reduce_only": _truthy(item.get("reduceOnly")),
-                    "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
-                    "time": int(item.get("time", 0) or 0),
-                }
-                for item in open_orders
-            ]
-        user_trades, trade_meta = _load_or_fetch_trade_rows(
-            audit_path=audit_paths["trade_audit"],
-            symbol=normalized_symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            session_start=stats_start,
-        )
-        income_rows, income_meta = _load_or_fetch_income_rows(
-            audit_path=audit_paths["income_audit"],
-            symbol=normalized_symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            session_start=stats_start,
-        )
-        trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
-        income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
-        session_start = _min_dt(stats_start, trade_start, income_start)
-        stats_start = competition_start or session_start
-        session_last = _max_dt(session_last, trade_last, income_last)
-        snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
-        snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
-        snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
-        commission_converter = _build_commission_converter(user_trades)
-        trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
-        income_summary = summarize_income(income_rows)
-        hourly_summary = None
+    else:
+        api_key, api_secret = credentials
+        snapshot["account_connected"] = True
         try:
-            hourly_window_start = max(
-                stats_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
-                datetime.now(timezone.utc) - timedelta(hours=48),
-            )
-            hourly_window_start = _floor_hour(hourly_window_start)
-            hourly_window_end = datetime.now(timezone.utc) + timedelta(minutes=1)
-            hourly_candles = fetch_futures_klines(
+            unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
+            if local_runtime_snapshot is None:
+                account_info = fetch_futures_account_info_v3(api_key, api_secret)
+                position_mode = fetch_futures_position_mode(api_key, api_secret)
+                open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
+                dual_side_position = _truthy(position_mode.get("dualSidePosition"))
+                if dual_side_position:
+                    long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
+                    short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
+                    long_qty = abs(_safe_float(long_position.get("positionAmt")))
+                    short_qty = abs(_safe_float(short_position.get("positionAmt")))
+                    long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
+                    short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
+                    unrealized_pnl = long_unrealized + short_unrealized
+                    position_amt = long_qty - short_qty
+                    position = long_position if long_qty >= short_qty else short_position
+                    entry_price = _safe_float(position.get("entryPrice"))
+                    break_even_price = _safe_float(position.get("breakEvenPrice"))
+                else:
+                    position = extract_symbol_position(account_info, normalized_symbol)
+                    unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
+                    entry_price = _safe_float(position.get("entryPrice"))
+                    break_even_price = _safe_float(position.get("breakEvenPrice"))
+                    position_amt = _safe_float(position.get("positionAmt"))
+                snapshot["position"] = {
+                    "position_amt": position_amt,
+                    "long_qty": long_qty if dual_side_position else max(position_amt, 0.0),
+                    "short_qty": short_qty if dual_side_position else 0.0,
+                    "entry_price": entry_price,
+                    "break_even_price": break_even_price,
+                    "unrealized_pnl": unrealized_pnl,
+                    "isolated": _truthy(position.get("isolated")),
+                    "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
+                    "one_way_mode": not dual_side_position,
+                    "available_balance": _safe_float(account_info.get("availableBalance")),
+                    "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
+                    "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
+                }
+                snapshot["account_assets"] = {
+                    "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
+                    "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
+                }
+                snapshot["open_orders"] = [
+                    {
+                        "order_id": item.get("orderId"),
+                        "client_order_id": item.get("clientOrderId"),
+                        "side": str(item.get("side", "")).upper().strip(),
+                        "price": _safe_float(item.get("price")),
+                        "orig_qty": _safe_float(item.get("origQty")),
+                        "executed_qty": _safe_float(item.get("executedQty")),
+                        "reduce_only": _truthy(item.get("reduceOnly")),
+                        "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
+                        "time": int(item.get("time", 0) or 0),
+                    }
+                    for item in open_orders
+                ]
+            user_trades, trade_meta = _load_or_fetch_trade_rows(
+                audit_path=audit_paths["trade_audit"],
                 symbol=normalized_symbol,
-                interval="1h",
-                start_ms=int(hourly_window_start.timestamp() * 1000),
-                end_ms=int(hourly_window_end.timestamp() * 1000),
+                api_key=api_key,
+                api_secret=api_secret,
+                session_start=stats_start,
             )
-            hourly_summary = summarize_hourly_metrics(
-                user_trades,
-                income_rows,
-                hourly_candles,
-                commission_converter=commission_converter,
-                limit=24,
+            income_rows, income_meta = _load_or_fetch_income_rows(
+                audit_path=audit_paths["income_audit"],
+                symbol=normalized_symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                session_start=stats_start,
             )
+            trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
+            income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
+            session_start = _min_dt(stats_start, trade_start, income_start)
+            stats_start = competition_start or session_start
+            session_last = _max_dt(session_last, trade_last, income_last)
+            snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
+            snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
+            snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
+            commission_converter = _build_commission_converter(user_trades)
+            trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
+            income_summary = summarize_income(income_rows)
+            hourly_summary = None
+            try:
+                hourly_window_start = max(
+                    stats_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
+                    datetime.now(timezone.utc) - timedelta(hours=48),
+                )
+                hourly_window_start = _floor_hour(hourly_window_start)
+                hourly_window_end = datetime.now(timezone.utc) + timedelta(minutes=1)
+                hourly_candles = fetch_futures_klines(
+                    symbol=normalized_symbol,
+                    interval="1h",
+                    start_ms=int(hourly_window_start.timestamp() * 1000),
+                    end_ms=int(hourly_window_end.timestamp() * 1000),
+                )
+                hourly_summary = summarize_hourly_metrics(
+                    user_trades,
+                    income_rows,
+                    hourly_candles,
+                    commission_converter=commission_converter,
+                    limit=24,
+                )
+            except Exception as exc:
+                snapshot["warnings"].append(f"hourly_summary_failed: {type(exc).__name__}: {exc}")
+            net_pnl_est = (
+                trade_summary["realized_pnl"]
+                + unrealized_pnl
+                + income_summary["funding_fee"]
+                - trade_summary["commission"]
+            )
+            trade_summary["net_pnl_estimate"] = net_pnl_est
+            snapshot["trade_summary"] = trade_summary
+            snapshot["income_summary"] = income_summary
+            snapshot["hourly_summary"] = hourly_summary
+            snapshot["audit"]["trade_source"] = trade_meta
+            snapshot["audit"]["income_source"] = income_meta
+            snapshot["audit"]["trade_row_count"] = len(user_trades)
+            snapshot["audit"]["income_row_count"] = len(income_rows)
         except Exception as exc:
-            snapshot["warnings"].append(f"hourly_summary_failed: {type(exc).__name__}: {exc}")
-        net_pnl_est = (
-            trade_summary["realized_pnl"]
-            + unrealized_pnl
-            + income_summary["funding_fee"]
-            - trade_summary["commission"]
-        )
-        trade_summary["net_pnl_estimate"] = net_pnl_est
-        snapshot["trade_summary"] = trade_summary
-        snapshot["income_summary"] = income_summary
-        snapshot["hourly_summary"] = hourly_summary
-        snapshot["audit"]["trade_source"] = trade_meta
-        snapshot["audit"]["income_source"] = income_meta
-        snapshot["audit"]["trade_row_count"] = len(user_trades)
-        snapshot["audit"]["income_row_count"] = len(income_rows)
-    except Exception as exc:
-        snapshot["warnings"].append(f"account_read_failed: {type(exc).__name__}: {exc}")
+            snapshot["warnings"].append(f"account_read_failed: {type(exc).__name__}: {exc}")
 
     runner_config = runner.get("config", {})
     latest_loop = (loop_summary.get("latest") or {}) if isinstance(loop_summary, dict) else {}
@@ -1839,6 +1832,15 @@ def _build_monitor_snapshot_uncached(
         if custom_grid_roll.get("last_new_max_price") is not None
         else latest_loop.get("custom_grid_roll_last_new_max_price")
     )
+    threshold_target_reduce = (plan_report or {}).get("threshold_target_reduce")
+    if not isinstance(threshold_target_reduce, dict):
+        threshold_target_reduce = {}
+    adverse_inventory_reduce = (plan_report or {}).get("adverse_inventory_reduce")
+    if not isinstance(adverse_inventory_reduce, dict):
+        adverse_inventory_reduce = {}
+    hard_loss_forced_reduce = (plan_report or {}).get("hard_loss_forced_reduce")
+    if not isinstance(hard_loss_forced_reduce, dict):
+        hard_loss_forced_reduce = {}
 
     if synthetic_mode:
         snapshot["position"]["virtual_long_qty"] = synthetic_long_qty
@@ -1901,6 +1903,85 @@ def _build_monitor_snapshot_uncached(
         "neutral_hourly_regime": str((((plan_report or {}).get("neutral_hourly_scale") or {}).get("regime", "") or "")),
         "neutral_hourly_reason": ((plan_report or {}).get("neutral_hourly_scale") or {}).get("reason"),
         "center_source": (plan_report or {}).get("center_source"),
+        "threshold_reduce_enabled": bool(
+            threshold_target_reduce.get("enabled") if threshold_target_reduce else latest_loop.get("threshold_reduce_enabled")
+        ),
+        "threshold_reduce_active": bool(
+            threshold_target_reduce.get("active") if threshold_target_reduce else latest_loop.get("threshold_reduce_active")
+        ),
+        "threshold_reduce_long_active": bool(
+            threshold_target_reduce.get("long_active") if threshold_target_reduce else latest_loop.get("threshold_reduce_long_active")
+        ),
+        "threshold_reduce_short_active": bool(
+            threshold_target_reduce.get("short_active") if threshold_target_reduce else latest_loop.get("threshold_reduce_short_active")
+        ),
+        "threshold_reduce_long_taker_timeout_active": bool(
+            threshold_target_reduce.get("long_taker_timeout_active")
+            if threshold_target_reduce
+            else latest_loop.get("threshold_reduce_long_taker_timeout_active")
+        ),
+        "threshold_reduce_short_taker_timeout_active": bool(
+            threshold_target_reduce.get("short_taker_timeout_active")
+            if threshold_target_reduce
+            else latest_loop.get("threshold_reduce_short_taker_timeout_active")
+        ),
+        "adverse_reduce_enabled": bool(
+            adverse_inventory_reduce.get("enabled") if adverse_inventory_reduce else latest_loop.get("adverse_reduce_enabled")
+        ),
+        "adverse_reduce_active": bool(
+            adverse_inventory_reduce.get("active") if adverse_inventory_reduce else latest_loop.get("adverse_reduce_active")
+        ),
+        "adverse_reduce_direction": str(
+            (
+                adverse_inventory_reduce.get("direction")
+                if adverse_inventory_reduce
+                else latest_loop.get("adverse_reduce_direction", "")
+            )
+            or ""
+        ),
+        "adverse_reduce_long_aggressive": bool(
+            adverse_inventory_reduce.get("long_aggressive")
+            if adverse_inventory_reduce
+            else latest_loop.get("adverse_reduce_long_aggressive")
+        ),
+        "adverse_reduce_short_aggressive": bool(
+            adverse_inventory_reduce.get("short_aggressive")
+            if adverse_inventory_reduce
+            else latest_loop.get("adverse_reduce_short_aggressive")
+        ),
+        "hard_loss_forced_reduce_enabled": bool(
+            hard_loss_forced_reduce.get("enabled")
+            if hard_loss_forced_reduce
+            else latest_loop.get("hard_loss_forced_reduce_enabled")
+        ),
+        "hard_loss_forced_reduce_active": bool(
+            hard_loss_forced_reduce.get("active")
+            if hard_loss_forced_reduce
+            else latest_loop.get("hard_loss_forced_reduce_active")
+        ),
+        "hard_loss_forced_reduce_reason": (
+            hard_loss_forced_reduce.get("reason")
+            if hard_loss_forced_reduce
+            else latest_loop.get("hard_loss_forced_reduce_reason")
+        ),
+        "hard_loss_forced_reduce_blocked_reason": (
+            hard_loss_forced_reduce.get("blocked_reason")
+            if hard_loss_forced_reduce
+            else latest_loop.get("hard_loss_forced_reduce_blocked_reason")
+        ),
+        "hard_loss_forced_reduce_side": str(
+            (
+                hard_loss_forced_reduce.get("side")
+                if hard_loss_forced_reduce
+                else latest_loop.get("hard_loss_forced_reduce_side", "")
+            )
+            or ""
+        ),
+        "hard_loss_forced_reduce_unrealized_pnl": _safe_float(
+            hard_loss_forced_reduce.get("unrealized_pnl")
+            if hard_loss_forced_reduce
+            else latest_loop.get("hard_loss_forced_reduce_unrealized_pnl")
+        ),
         "effective_buy_levels": int((plan_report or {}).get("effective_buy_levels", 0) or 0),
         "effective_sell_levels": int((plan_report or {}).get("effective_sell_levels", 0) or 0),
         "effective_per_order_notional": _safe_float((plan_report or {}).get("effective_per_order_notional")),

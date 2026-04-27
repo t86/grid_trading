@@ -139,6 +139,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="monitor_volatility_trigger_reduce_max_loss_ratio"', MONITOR_PAGE)
         self.assertIn('id="save_params_btn"', MONITOR_PAGE)
 
+    def test_monitor_page_contains_reduce_state_panel(self) -> None:
+        self.assertIn('id="reduce_state_box"', MONITOR_PAGE)
+        self.assertIn("减仓风控", MONITOR_PAGE)
+        self.assertIn("硬损强减", MONITOR_PAGE)
+
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
         if "getSelectedSymbol(" in MONITOR_PAGE:
             self.assertIn("function getSelectedSymbol()", MONITOR_PAGE)

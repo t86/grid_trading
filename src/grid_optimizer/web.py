@@ -13750,6 +13750,7 @@ MONITOR_PAGE = """<!doctype html>
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
     .grid-2 { display: grid; grid-template-columns: 1.3fr 1fr; gap: 16px; }
+    .card-stack { display: grid; gap: 16px; }
     .panel-title {
       display: flex;
       justify-content: space-between;
@@ -14564,12 +14565,21 @@ MONITOR_PAGE = """<!doctype html>
           </table>
         </div>
       </div>
-      <div class="card">
-        <div class="panel-title">
-          <h2>当前持仓</h2>
-          <div class="tiny">账户实时读取</div>
+      <div class="card-stack">
+        <div class="card">
+          <div class="panel-title">
+            <h2>当前持仓</h2>
+            <div class="tiny">账户实时读取</div>
+          </div>
+          <div id="position_box"></div>
         </div>
-        <div id="position_box"></div>
+        <div class="card">
+          <div class="panel-title">
+            <h2>减仓风控</h2>
+            <div class="tiny">threshold / adverse / hard loss</div>
+          </div>
+          <div id="reduce_state_box"></div>
+        </div>
       </div>
     </section>
 
@@ -14628,6 +14638,7 @@ MONITOR_PAGE = """<!doctype html>
     const loopChartEl = document.getElementById("loop_chart");
     const openOrdersBody = document.getElementById("open_orders_body");
     const positionBox = document.getElementById("position_box");
+    const reduceStateBox = document.getElementById("reduce_state_box");
     const tradesBody = document.getElementById("trades_body");
     const eventsBody = document.getElementById("events_body");
     const hourlyBody = document.getElementById("hourly_body");
@@ -19343,6 +19354,39 @@ MONITOR_PAGE = """<!doctype html>
       positionBox.innerHTML = `<table><tbody>${items.map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(v)}</td></tr>`).join("")}</tbody></table>`;
     }
 
+    function renderReduceState(data) {
+      const risk = data.risk_controls || {};
+      const thresholdStatus = risk.threshold_reduce_enabled ? (risk.threshold_reduce_active ? "激活" : "待命") : "关闭";
+      const thresholdTimeout = (risk.threshold_reduce_long_taker_timeout_active || risk.threshold_reduce_short_taker_timeout_active)
+        ? "是"
+        : "否";
+      const thresholdDirection = risk.threshold_reduce_long_active
+        ? "卖出减多"
+        : (risk.threshold_reduce_short_active ? "买回减空" : "--");
+      const adverseStatus = risk.adverse_reduce_enabled ? (risk.adverse_reduce_active ? "激活" : "待命") : "关闭";
+      const adverseAggressive = (risk.adverse_reduce_long_aggressive || risk.adverse_reduce_short_aggressive) ? "是" : "否";
+      const adverseDirection = risk.adverse_reduce_direction || "--";
+      const hardLossStatus = risk.hard_loss_forced_reduce_enabled
+        ? (risk.hard_loss_forced_reduce_active ? "激活" : "待命")
+        : "关闭";
+      const hardLossSide = risk.hard_loss_forced_reduce_side === "SELL"
+        ? "卖出减多"
+        : (risk.hard_loss_forced_reduce_side === "BUY" ? "买回减空" : "--");
+      const items = [
+        ["阈值减仓", thresholdStatus],
+        ["阈值减仓方向", thresholdDirection],
+        ["阈值减仓超时追价", thresholdTimeout],
+        ["逆向减仓", adverseStatus],
+        ["逆向减仓方向", adverseDirection],
+        ["逆向减仓追价", adverseAggressive],
+        ["硬损强减", hardLossStatus],
+        ["硬损强减方向", hardLossSide],
+        ["硬损原因", risk.hard_loss_forced_reduce_reason || risk.hard_loss_forced_reduce_blocked_reason || "--"],
+        ["硬损浮亏", fmtMoney(risk.hard_loss_forced_reduce_unrealized_pnl || 0)],
+      ];
+      reduceStateBox.innerHTML = `<table><tbody>${items.map(([k, v]) => `<tr><th>${escapeHtml(k)}</th><td>${escapeHtml(v)}</td></tr>`).join("")}</tbody></table>`;
+    }
+
     function renderOpenOrders(data) {
       const rows = (data.open_orders || []).slice().sort((a, b) => Number(b.price || 0) - Number(a.price || 0));
       openOrderMetaEl.textContent = `当前 ${rows.length} 笔未成交委托`;
@@ -19520,6 +19564,7 @@ MONITOR_PAGE = """<!doctype html>
           renderCards(data);
           renderAlerts(data);
           renderPosition(data);
+          renderReduceState(data);
           renderOpenOrders(data);
           renderHourlyStats(data);
           renderTrades(data);

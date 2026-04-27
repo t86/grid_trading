@@ -538,6 +538,93 @@ class MonitorTests(unittest.TestCase):
     @patch("grid_optimizer.monitor.fetch_futures_account_info_v3", side_effect=AssertionError("should not fetch account info"))
     @patch("grid_optimizer.monitor.fetch_futures_premium_index", side_effect=AssertionError("should not fetch premium index"))
     @patch("grid_optimizer.monitor.fetch_futures_book_tickers", side_effect=AssertionError("should not fetch book ticker"))
+    def test_build_monitor_snapshot_exposes_reduce_state_from_local_runtime(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_credentials,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "reduce_events.jsonl"
+            plan_path = root / "reduce_plan.json"
+            submit_path = root / "reduce_submit.json"
+            events_path.write_text(
+                json.dumps(
+                    {
+                        "ts": now.isoformat(),
+                        "cycle": 88,
+                        "strategy_mode": "synthetic_neutral",
+                        "threshold_reduce_enabled": True,
+                        "threshold_reduce_active": True,
+                        "threshold_reduce_short_taker_timeout_active": True,
+                        "adverse_reduce_enabled": True,
+                        "adverse_reduce_active": False,
+                        "adverse_reduce_short_aggressive": False,
+                        "hard_loss_forced_reduce_enabled": True,
+                        "hard_loss_forced_reduce_active": True,
+                        "hard_loss_forced_reduce_reason": "hard_unrealized_loss_limit",
+                        "hard_loss_forced_reduce_unrealized_pnl": -12.5,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "strategy_mode": "synthetic_neutral",
+                        "bid_price": 1.24,
+                        "ask_price": 1.25,
+                        "mid_price": 1.245,
+                        "actual_net_qty": -5.0,
+                        "current_long_qty": 0.0,
+                        "current_short_qty": 5.0,
+                        "current_long_avg_price": 0.0,
+                        "current_short_avg_price": 1.30,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="CLUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": True,
+                    "config": {
+                        "symbol": "CLUSDT",
+                        "strategy_profile": "clusdt_competition_maker_neutral_conservative_v1",
+                        "strategy_mode": "synthetic_neutral",
+                    },
+                },
+            )
+
+        risk = snapshot["risk_controls"]
+        self.assertTrue(risk["threshold_reduce_enabled"])
+        self.assertTrue(risk["threshold_reduce_active"])
+        self.assertTrue(risk["threshold_reduce_short_taker_timeout_active"])
+        self.assertTrue(risk["adverse_reduce_enabled"])
+        self.assertFalse(risk["adverse_reduce_active"])
+        self.assertTrue(risk["hard_loss_forced_reduce_enabled"])
+        self.assertTrue(risk["hard_loss_forced_reduce_active"])
+        self.assertEqual(risk["hard_loss_forced_reduce_reason"], "hard_unrealized_loss_limit")
+        self.assertAlmostEqual(risk["hard_loss_forced_reduce_unrealized_pnl"], -12.5)
+
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", side_effect=AssertionError("should not fetch open orders"))
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", side_effect=AssertionError("should not fetch position mode"))
+    @patch("grid_optimizer.monitor.fetch_futures_account_info_v3", side_effect=AssertionError("should not fetch account info"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", side_effect=AssertionError("should not fetch premium index"))
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", side_effect=AssertionError("should not fetch book ticker"))
     def test_build_monitor_snapshot_prefers_local_runtime_snapshot_for_live_runner(
         self,
         _mock_book,
