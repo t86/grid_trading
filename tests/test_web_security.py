@@ -17,6 +17,7 @@ from grid_optimizer.web import (
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
     _build_flatten_command,
+    _build_fast_running_status_item,
     _delete_custom_grid_runner_preset,
     _build_runner_command,
     _client_ip_allowed,
@@ -2383,6 +2384,82 @@ class WebSecurityTests(unittest.TestCase):
             self.assertAlmostEqual(gross, 100.0, places=8)
             self.assertEqual(len(pnl_events), 2)
             self.assertEqual(stats_start_time, phase_start)
+
+    @patch("grid_optimizer.web._running_status_stats_start_time")
+    def test_fast_running_status_filters_volume_from_stats_start_time(self, mock_stats_start) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "soonusdt_loop_events.jsonl"
+            plan_path = root / "soonusdt_loop_latest_plan.json"
+            submit_path = root / "soonusdt_loop_latest_submit.json"
+            before_phase_ms = int(datetime(2026, 4, 27, 7, 30, tzinfo=timezone.utc).timestamp() * 1000)
+            phase_start = datetime(2026, 4, 27, 8, 0, tzinfo=timezone.utc)
+            after_phase_ms = int(datetime(2026, 4, 27, 8, 30, tzinfo=timezone.utc).timestamp() * 1000)
+            (root / "soonusdt_loop_trade_audit.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "price": "10",
+                                "qty": "10",
+                                "time": before_phase_ms,
+                                "realizedPnl": "1",
+                                "commission": "0.1",
+                                "commissionAsset": "USDT",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "price": "20",
+                                "qty": "5",
+                                "time": after_phase_ms,
+                                "realizedPnl": "2",
+                                "commission": "0.2",
+                                "commissionAsset": "USDT",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (root / "soonusdt_loop_income_audit.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"time": before_phase_ms, "income": "0.4", "incomeType": "FUNDING_FEE"}),
+                        json.dumps({"time": after_phase_ms, "income": "0.8", "incomeType": "FUNDING_FEE"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            events_path.write_text("", encoding="utf-8")
+            plan_path.write_text(json.dumps({"actual_net_qty": 0, "unrealized_pnl": 0}), encoding="utf-8")
+            submit_path.write_text(json.dumps({}), encoding="utf-8")
+            mock_stats_start.return_value = phase_start
+
+            item = _build_fast_running_status_item(
+                "SOONUSDT",
+                {
+                    "is_running": True,
+                    "pid": 123,
+                    "elapsed": "1h",
+                    "config": {
+                        "symbol": "SOONUSDT",
+                        "summary_jsonl": str(events_path),
+                        "plan_json": str(plan_path),
+                        "submit_report_json": str(submit_path),
+                    },
+                },
+            )
+
+            self.assertIsNotNone(item)
+            assert item is not None
+            self.assertAlmostEqual(item["total_volume"], 100.0, places=8)
+            self.assertAlmostEqual(item["trade_pnl"], 2.0, places=8)
+            self.assertAlmostEqual(item["fees"], 0.2, places=8)
+            self.assertAlmostEqual(item["funding_fee"], 0.8, places=8)
+            self.assertEqual(item["stats_start_time"], phase_start.isoformat())
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")

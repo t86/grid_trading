@@ -30,6 +30,7 @@ from urllib.request import Request, urlopen
 
 from .audit import (
     build_audit_paths,
+    income_row_time_ms,
     iter_jsonl,
     read_jsonl_filtered,
     trade_row_time_ms,
@@ -119,6 +120,7 @@ from .runtime_guards import (
     evaluate_runtime_guards,
     normalize_runtime_guard_config,
     normalize_runtime_guard_payload,
+    resolve_runtime_guard_stats_start_time,
     summarize_futures_runtime_guard_inputs,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
@@ -25543,6 +25545,19 @@ def _build_status_runtime_snapshot(
     }
 
 
+def _running_status_stats_start_time(symbol: str, runner: dict[str, Any]) -> datetime | None:
+    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
+    try:
+        return resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time=runner_config.get("runtime_guard_stats_start_time"),
+            symbol=symbol,
+            market="futures",
+            now=datetime.now(timezone.utc),
+        )
+    except Exception:
+        return None
+
+
 def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict[str, Any] | None:
     if not bool(runner.get("is_running")):
         return None
@@ -25558,6 +25573,11 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
     audit_paths = build_audit_paths(event_path)
     trade_rows = read_jsonl_filtered(audit_paths["trade_audit"], limit=0)
     income_rows = read_jsonl_filtered(audit_paths["income_audit"], limit=0)
+    stats_start_time = _running_status_stats_start_time(symbol, runner)
+    if stats_start_time is not None:
+        stats_start_ms = int(stats_start_time.timestamp() * 1000)
+        trade_rows = [item for item in trade_rows if trade_row_time_ms(item) >= stats_start_ms]
+        income_rows = [item for item in income_rows if income_row_time_ms(item) >= stats_start_ms]
     hour_floor_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
     recent_hour_rows = [item for item in trade_rows if trade_row_time_ms(item) >= hour_floor_ms]
     trade = summarize_user_trades(trade_rows)
@@ -25590,6 +25610,7 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         item["trade_pnl"] = trade_pnl
         item["fees"] = fees
         item["funding_fee"] = funding_fee
+        item["stats_start_time"] = stats_start_time.isoformat() if stats_start_time else None
     return item
 
 
