@@ -9818,6 +9818,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         maker_timeout_seconds=getattr(effective_args, "adverse_reduce_maker_timeout_seconds", 45.0),
     )
 
+    if bool(controls.get("buy_paused")):
+        plan["bootstrap_orders"] = []
+        plan["buy_orders"] = [
+            dict(item)
+            for item in plan.get("buy_orders", [])
+            if isinstance(item, dict) and _is_short_exit_order(item)
+        ]
+    if bool(controls.get("short_paused")):
+        plan["sell_orders"] = [
+            dict(item)
+            for item in plan.get("sell_orders", [])
+            if isinstance(item, dict) and _is_long_exit_order(item)
+        ]
+
     volume_long_v4_open_orders = (
         _decorate_volume_long_v4_open_orders(open_orders)
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long"
