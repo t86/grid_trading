@@ -5772,6 +5772,110 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
     )
 
 
+def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
+    strategy_mode = str(config.get("strategy_mode", "one_way_long")).strip().lower() or "one_way_long"
+    errors: list[str] = []
+
+    def number(field: str) -> float | None:
+        value = config.get(field)
+        if value in {"", None}:
+            return None
+        try:
+            return _safe_float(value, field)
+        except ValueError:
+            return None
+
+    def positive(field: str) -> bool:
+        value = number(field)
+        return value is not None and value > 0
+
+    def enabled(field: str) -> bool:
+        try:
+            return _safe_bool(config.get(field, False), field)
+        except ValueError:
+            return False
+
+    def require_positive(field: str, label: str | None = None) -> None:
+        if not positive(field):
+            errors.append(f"{label or field} 必须设置为 > 0")
+
+    def require_enabled(field: str, label: str | None = None) -> None:
+        if not enabled(field):
+            errors.append(f"{label or field} 必须开启")
+
+    def require_hard_loss() -> None:
+        require_enabled("hard_loss_forced_reduce_enabled")
+        require_positive("hard_loss_forced_reduce_target_notional")
+        require_positive("hard_loss_forced_reduce_max_order_notional")
+        require_positive("hard_loss_forced_reduce_unrealized_loss_limit")
+
+    def require_exposure_escalation() -> None:
+        require_enabled("exposure_escalation_enabled")
+        require_positive("exposure_escalation_notional")
+        require_positive("exposure_escalation_hold_seconds")
+        require_positive("exposure_escalation_target_notional")
+        require_positive("exposure_escalation_max_loss_ratio")
+        require_positive("exposure_escalation_buy_pause_cooldown_seconds")
+
+    def require_adverse_reduce(*, long: bool, short: bool) -> None:
+        require_enabled("adverse_reduce_enabled")
+        if long:
+            require_positive("adverse_reduce_long_trigger_ratio")
+        if short:
+            require_positive("adverse_reduce_short_trigger_ratio")
+        require_positive("adverse_reduce_target_ratio")
+        require_positive("adverse_reduce_maker_timeout_seconds")
+        require_positive("adverse_reduce_max_order_notional")
+
+    if strategy_mode == "one_way_long":
+        require_positive("pause_buy_position_notional", "多仓软阈值 pause_buy_position_notional")
+        require_exposure_escalation()
+        require_hard_loss()
+        pause = number("pause_buy_position_notional")
+        if pause is not None:
+            for field in {"exposure_escalation_target_notional", "hard_loss_forced_reduce_target_notional"}:
+                target = number(field)
+                if target is not None and target >= pause:
+                    errors.append(f"{field} 必须低于 pause_buy_position_notional，确保能减到软阈值以下")
+    elif strategy_mode == "one_way_short":
+        require_positive("pause_short_position_notional", "空仓软阈值 pause_short_position_notional")
+        require_positive("threshold_position_notional", "空仓超时阈值 threshold_position_notional")
+        require_positive("short_threshold_timeout_seconds")
+        require_adverse_reduce(long=False, short=True)
+        require_hard_loss()
+        pause = number("pause_short_position_notional")
+        threshold = number("threshold_position_notional")
+        target = number("hard_loss_forced_reduce_target_notional")
+        if pause is not None and threshold is not None and threshold <= pause:
+            errors.append("threshold_position_notional 必须高于 pause_short_position_notional，确保空仓超时强平会被启用")
+        if pause is not None and target is not None and target >= pause:
+            errors.append("hard_loss_forced_reduce_target_notional 必须低于 pause_short_position_notional，确保能减到软阈值以下")
+    elif strategy_mode in {"synthetic_neutral", "hedge_neutral", "inventory_target_neutral"}:
+        require_positive("pause_buy_position_notional", "多仓软阈值 pause_buy_position_notional")
+        require_positive("pause_short_position_notional", "空仓软阈值 pause_short_position_notional")
+        require_adverse_reduce(long=True, short=True)
+        require_hard_loss()
+        target = number("hard_loss_forced_reduce_target_notional")
+        pauses = [
+            value
+            for value in (number("pause_buy_position_notional"), number("pause_short_position_notional"))
+            if value is not None
+        ]
+        if target is not None and pauses and target >= min(pauses):
+            errors.append("hard_loss_forced_reduce_target_notional 必须低于两侧软阈值，确保能减到软阈值以下")
+    else:
+        require_positive("threshold_position_notional", "软阈值 threshold_position_notional")
+        require_hard_loss()
+
+    if errors:
+        symbol = str(config.get("symbol", "")).upper().strip() or "UNKNOWN"
+        raise ValueError(
+            f"{symbol} 策略启动前必备风控未配置完整："
+            + "；".join(errors)
+            + "。必须先配置 soft threshold、超时/主动减仓、hard loss 强制减仓后才能启动。"
+        )
+
+
 def _save_runner_config_without_start(payload: dict[str, Any]) -> dict[str, Any]:
     config = _resolve_runner_start_config(payload)
     symbol = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
@@ -6330,6 +6434,7 @@ def _launchctl_loaded(label: str) -> bool:
 
 def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip() or "NIGHTUSDT"
+    _validate_runner_required_risk_guards(config)
     _stop_flatten_process(symbol, cancel_orders=True)
     runner = _read_runner_process_for_symbol(symbol)
     _preflight_runner_runtime_guards(config)

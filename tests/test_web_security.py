@@ -42,6 +42,7 @@ from grid_optimizer.web import (
     _start_runner_process,
     _update_custom_grid_runner_preset,
     _uses_legacy_runner,
+    _validate_runner_required_risk_guards,
     _volatility_reduce_escalation_reason,
     _volatility_trigger_orphan_recovery_action,
 )
@@ -58,6 +59,47 @@ class WebSecurityTests(unittest.TestCase):
 
     def _mock_book(self) -> list[dict[str, str]]:
         return [{"bid_price": "1.2345", "ask_price": "1.2347"}]
+
+    def _required_long_risk_guards(self, *, pause: float = 750.0, target: float = 430.0) -> dict[str, float | bool]:
+        return {
+            "pause_buy_position_notional": pause,
+            "exposure_escalation_enabled": True,
+            "exposure_escalation_notional": pause,
+            "exposure_escalation_hold_seconds": 120.0,
+            "exposure_escalation_target_notional": target,
+            "exposure_escalation_max_loss_ratio": 0.05,
+            "exposure_escalation_buy_pause_cooldown_seconds": 180.0,
+            "hard_loss_forced_reduce_enabled": True,
+            "hard_loss_forced_reduce_target_notional": target,
+            "hard_loss_forced_reduce_max_order_notional": 400.0,
+            "hard_loss_forced_reduce_unrealized_loss_limit": 45.0,
+        }
+
+    def _required_short_risk_guards(self, *, pause: float = 750.0, target: float = 430.0) -> dict[str, float | bool]:
+        return {
+            "pause_short_position_notional": pause,
+            "threshold_position_notional": pause + 100.0,
+            "short_threshold_timeout_seconds": 30.0,
+            "adverse_reduce_enabled": True,
+            "adverse_reduce_short_trigger_ratio": 0.002,
+            "adverse_reduce_target_ratio": 0.5,
+            "adverse_reduce_maker_timeout_seconds": 5.0,
+            "adverse_reduce_max_order_notional": 400.0,
+            "hard_loss_forced_reduce_enabled": True,
+            "hard_loss_forced_reduce_target_notional": target,
+            "hard_loss_forced_reduce_max_order_notional": 400.0,
+            "hard_loss_forced_reduce_unrealized_loss_limit": 45.0,
+        }
+
+    def _required_neutral_risk_guards(self, *, pause: float = 450.0, target: float = 225.0) -> dict[str, float | bool]:
+        guards = self._required_short_risk_guards(pause=pause, target=target)
+        guards.update(
+            {
+                "pause_buy_position_notional": pause,
+                "adverse_reduce_long_trigger_ratio": 0.002,
+            }
+        )
+        return guards
 
     def test_basic_auth_header_matches_expected_credentials(self) -> None:
         token = base64.b64encode(b"grid:secret-pass").decode("ascii")
@@ -2534,11 +2576,47 @@ class WebSecurityTests(unittest.TestCase):
                     "symbol": "BARDUSDT",
                     "summary_jsonl": str(events_path),
                     "max_cumulative_notional": 150.0,
+                    **self._required_neutral_risk_guards(),
                 }
             )
 
             with self.assertRaisesRegex(ValueError, "启动前风控预检已拦截"):
                 _start_runner_process(config)
+
+    def test_validate_runner_required_risk_guards_blocks_missing_long_hard_loss(self) -> None:
+        config = {
+            "symbol": "SOONUSDT",
+            "strategy_mode": "one_way_long",
+            **self._required_long_risk_guards(),
+            "hard_loss_forced_reduce_unrealized_loss_limit": None,
+        }
+
+        with self.assertRaisesRegex(ValueError, "hard_loss_forced_reduce_unrealized_loss_limit"):
+            _validate_runner_required_risk_guards(config)
+
+    def test_validate_runner_required_risk_guards_blocks_missing_short_timeout(self) -> None:
+        config = {
+            "symbol": "SOONUSDT",
+            "strategy_mode": "one_way_short",
+            **self._required_short_risk_guards(),
+            "short_threshold_timeout_seconds": 0.0,
+        }
+
+        with self.assertRaisesRegex(ValueError, "short_threshold_timeout_seconds"):
+            _validate_runner_required_risk_guards(config)
+
+    @patch("grid_optimizer.web._stop_flatten_process")
+    def test_start_runner_process_validates_risk_guards_before_stopping_flatten(self, mock_stop_flatten) -> None:
+        config = {
+            "symbol": "SOONUSDT",
+            "strategy_mode": "one_way_long",
+            "pause_buy_position_notional": 780.0,
+        }
+
+        with self.assertRaisesRegex(ValueError, "策略启动前必备风控未配置完整"):
+            _start_runner_process(config)
+
+        mock_stop_flatten.assert_not_called()
 
     def test_build_runner_command_includes_runtime_guard_arguments(self) -> None:
         command = _build_runner_command(
@@ -3337,6 +3415,7 @@ class WebSecurityTests(unittest.TestCase):
             "plan_json": "output/opnusdt_loop_latest_plan.json",
             "submit_report_json": "output/opnusdt_loop_latest_submit.json",
             "summary_jsonl": "output/opnusdt_loop_events.jsonl",
+            **self._required_long_risk_guards(pause=750.0, target=430.0),
         }
         mock_read_runner.return_value = {"is_running": True, "config": dict(config)}
         result = _start_runner_process(config)
@@ -3393,6 +3472,7 @@ class WebSecurityTests(unittest.TestCase):
             "plan_json": "output/opnusdt_loop_latest_plan.json",
             "submit_report_json": "output/opnusdt_loop_latest_submit.json",
             "summary_jsonl": "output/opnusdt_loop_events.jsonl",
+            **self._required_long_risk_guards(pause=750.0, target=430.0),
         }
         desired = dict(current)
         desired["strategy_profile"] = "volatility_defensive_v1"
@@ -3401,6 +3481,7 @@ class WebSecurityTests(unittest.TestCase):
         desired["sell_levels"] = 12
         desired["pause_buy_position_notional"] = 300.0
         desired["max_position_notional"] = 420.0
+        desired.update(self._required_long_risk_guards(pause=300.0, target=180.0))
         mock_read_runner.side_effect = [
             {"is_running": True, "config": dict(current)},
             {"is_running": True, "config": dict(desired)},
@@ -3461,6 +3542,7 @@ class WebSecurityTests(unittest.TestCase):
             "plan_json": "output/nightusdt_loop_latest_plan.json",
             "submit_report_json": "output/nightusdt_loop_latest_submit.json",
             "summary_jsonl": "output/nightusdt_loop_events.jsonl",
+            **self._required_long_risk_guards(pause=700.0, target=420.0),
         }
         mock_read_runner.side_effect = [
             {"is_running": False, "config": {}},
