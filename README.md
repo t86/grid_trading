@@ -125,6 +125,7 @@ You can input parameters in browser and run optimization directly.
 
 Competition guide:
 - [TRADE_COMPETITION_GUIDE.md](TRADE_COMPETITION_GUIDE.md): Chinese guide for competition-oriented settings, smart range suggestions, and result interpretation.
+- [docs/ADAPTIVE_STEP_SCALE_RUNBOOK.md](docs/ADAPTIVE_STEP_SCALE_RUNBOOK.md): BTCUSDC/ETHUSDC production runbook for adaptive step/scale tuning, diagnostics, logging fields, and 114 server commands.
 - [docs/ENDED_FUTURES_COMPETITION_SUMMARY.md](docs/ENDED_FUTURES_COMPETITION_SUMMARY.md): Fixed summary of ended futures competitions, including reward-in-USDT, final cutoffs, and reward-to-cutoff ratios.
 
 ## Dry Run Executor
