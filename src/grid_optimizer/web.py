@@ -46,6 +46,7 @@ from .competition_board import (
     COMPETITION_BOARD_PAGE,
     build_competition_board_snapshot,
     delete_competition_entry,
+    resolve_active_competition_board,
     upsert_competition_entry,
 )
 from .data import (
@@ -25548,11 +25549,15 @@ def _build_status_runtime_snapshot(
 def _running_status_stats_start_time(symbol: str, runner: dict[str, Any]) -> datetime | None:
     runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
     try:
+        board = resolve_active_competition_board(symbol, "futures", now=datetime.now(timezone.utc))
+        board_start_time = _parse_utc_datetime((board or {}).get("activity_start_at"))
+        if board_start_time is not None:
+            return board_start_time
+    except Exception:
+        pass
+    try:
         return resolve_runtime_guard_stats_start_time(
             runtime_guard_stats_start_time=runner_config.get("runtime_guard_stats_start_time"),
-            symbol=symbol,
-            market="futures",
-            now=datetime.now(timezone.utc),
         )
     except Exception:
         return None

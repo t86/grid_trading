@@ -34,6 +34,7 @@ from grid_optimizer.web import (
     _run_loop_monitor_query,
     _reconcile_runner_volatility_trigger,
     _runtime_guard_input_summary,
+    _running_status_stats_start_time,
     _runner_service_name_for_symbol,
     _runner_preset_payload,
     _runner_preset_summaries,
@@ -2460,6 +2461,42 @@ class WebSecurityTests(unittest.TestCase):
             self.assertAlmostEqual(item["fees"], 0.2, places=8)
             self.assertAlmostEqual(item["funding_fee"], 0.8, places=8)
             self.assertEqual(item["stats_start_time"], phase_start.isoformat())
+
+    @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")
+    @patch("grid_optimizer.web.resolve_active_competition_board")
+    def test_running_status_stats_start_time_prefers_competition_start(
+        self,
+        mock_board,
+        mock_guard_start,
+    ) -> None:
+        mock_board.return_value = {"activity_start_at": "2026-04-22T18:00:00+08:00"}
+        mock_guard_start.return_value = datetime(2026, 4, 25, 3, 30, tzinfo=timezone.utc)
+
+        resolved = _running_status_stats_start_time(
+            "CHIPUSDT",
+            {"config": {"runtime_guard_stats_start_time": "2026-04-25T11:30:00+08:00"}},
+        )
+
+        self.assertEqual(resolved, datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc))
+        mock_guard_start.assert_not_called()
+
+    @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")
+    @patch("grid_optimizer.web.resolve_active_competition_board")
+    def test_running_status_stats_start_time_falls_back_to_guard_start(
+        self,
+        mock_board,
+        mock_guard_start,
+    ) -> None:
+        guard_start = datetime(2026, 4, 25, 3, 30, tzinfo=timezone.utc)
+        mock_board.return_value = None
+        mock_guard_start.return_value = guard_start
+
+        resolved = _running_status_stats_start_time(
+            "CHIPUSDT",
+            {"config": {"runtime_guard_stats_start_time": "2026-04-25T11:30:00+08:00"}},
+        )
+
+        self.assertEqual(resolved, guard_start)
 
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
