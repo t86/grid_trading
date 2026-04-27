@@ -1577,6 +1577,72 @@ def resolve_exposure_escalation(
     return report
 
 
+def prime_exposure_escalation_on_market_guard(
+    *,
+    state: dict[str, Any],
+    market_guard: dict[str, Any] | None,
+    enabled: bool,
+    now: datetime,
+    current_long_notional: float,
+    trigger_notional: float | None,
+    hold_seconds: float | None,
+) -> bool:
+    if not enabled or not bool((market_guard or {}).get("buy_pause_active")):
+        return False
+    safe_trigger = max(_safe_float(trigger_notional), 0.0)
+    if safe_trigger <= 0 or _safe_float(current_long_notional) < safe_trigger:
+        return False
+    escalation_state = state.setdefault("exposure_escalation", {})
+    if not isinstance(escalation_state, dict):
+        escalation_state = {}
+        state["exposure_escalation"] = escalation_state
+    hold_delta = timedelta(seconds=max(_safe_float(hold_seconds), 0.0))
+    escalation_state["observed_since"] = (now.astimezone(timezone.utc) - hold_delta).isoformat()
+    return True
+
+
+def resolve_exposure_escalation_buy_pause(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    now: datetime,
+    current_long_notional: float,
+    trigger_notional: float | None,
+    cooldown_seconds: float | None,
+) -> dict[str, Any]:
+    report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "reason": None,
+        "cooldown_seconds": cooldown_seconds,
+        "remaining_seconds": 0.0,
+    }
+    if not enabled:
+        return report
+    safe_trigger = max(_safe_float(trigger_notional), 0.0)
+    safe_cooldown = max(_safe_float(cooldown_seconds), 0.0)
+    escalation_state = state.get("exposure_escalation")
+    if not isinstance(escalation_state, dict):
+        return report
+    last_active_at = _parse_state_datetime(escalation_state.get("last_active_at"))
+    if last_active_at is None:
+        return report
+    current_time = now.astimezone(timezone.utc)
+    elapsed = max((current_time - last_active_at).total_seconds(), 0.0)
+    if safe_cooldown > 0 and elapsed < safe_cooldown:
+        report.update(
+            {
+                "active": True,
+                "reason": "cooldown",
+                "remaining_seconds": safe_cooldown - elapsed,
+            }
+        )
+        return report
+    if safe_trigger > 0 and _safe_float(current_long_notional) >= safe_trigger:
+        report.update({"active": True, "reason": "above_soft_threshold"})
+    return report
+
+
 def _is_long_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
     position_side = _order_position_side(order)
@@ -7597,10 +7663,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "target_notional": getattr(args, "exposure_escalation_target_notional", None),
         "max_loss_ratio": getattr(args, "exposure_escalation_max_loss_ratio", None),
         "hard_unrealized_loss_limit": getattr(args, "exposure_escalation_hard_unrealized_loss_limit", None),
+        "buy_pause_cooldown_seconds": getattr(args, "exposure_escalation_buy_pause_cooldown_seconds", 0.0),
         "observed_since": None,
         "held_seconds": 0.0,
         "current_long_notional": 0.0,
         "unrealized_pnl": 0.0,
+    }
+    exposure_escalation_buy_pause: dict[str, Any] = {
+        "enabled": bool(getattr(args, "exposure_escalation_enabled", False)),
+        "active": False,
+        "reason": None,
+        "cooldown_seconds": getattr(args, "exposure_escalation_buy_pause_cooldown_seconds", 0.0),
+        "remaining_seconds": 0.0,
     }
     adverse_inventory_reduce: dict[str, Any] = {
         "enabled": bool(getattr(args, "adverse_reduce_enabled", False)),
@@ -9451,16 +9525,28 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 hard_loss_steps=getattr(effective_args, "volume_long_v4_hard_loss_steps", 1.5),
             )
             flow_cost_basis_price = actual_break_even_price if actual_break_even_price > 0 else current_long_avg_price
+            exposure_now = datetime.now(timezone.utc)
+            exposure_trigger_notional = getattr(effective_args, "exposure_escalation_notional", None)
+            exposure_hold_seconds = getattr(effective_args, "exposure_escalation_hold_seconds", None)
+            prime_exposure_escalation_on_market_guard(
+                state=state,
+                market_guard=market_guard,
+                enabled=bool(getattr(effective_args, "exposure_escalation_enabled", False)),
+                now=exposure_now,
+                current_long_notional=controls["current_long_notional"],
+                trigger_notional=exposure_trigger_notional,
+                hold_seconds=exposure_hold_seconds,
+            )
             exposure_escalation = resolve_exposure_escalation(
                 state=state,
                 enabled=bool(getattr(effective_args, "exposure_escalation_enabled", False)),
-                now=datetime.now(timezone.utc),
+                now=exposure_now,
                 current_long_notional=controls["current_long_notional"],
                 current_long_qty=current_long_qty,
                 current_long_cost_basis_price=flow_cost_basis_price,
                 mid_price=mid_price,
-                trigger_notional=getattr(effective_args, "exposure_escalation_notional", None),
-                hold_seconds=getattr(effective_args, "exposure_escalation_hold_seconds", None),
+                trigger_notional=exposure_trigger_notional,
+                hold_seconds=exposure_hold_seconds,
                 target_notional=getattr(effective_args, "exposure_escalation_target_notional", None),
                 max_loss_ratio=getattr(effective_args, "exposure_escalation_max_loss_ratio", None),
                 hard_unrealized_loss_limit=getattr(
@@ -9475,6 +9561,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             flow_sleeve_notional = getattr(effective_args, "volume_long_v4_flow_sleeve_notional", 0.0)
             flow_max_loss_ratio = getattr(effective_args, "volume_long_v4_flow_sleeve_max_loss_ratio", None)
             if exposure_escalation.get("active"):
+                controls["buy_paused"] = True
+                controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+                controls["pause_reasons"].append(
+                    f"exposure_escalation: {exposure_escalation.get('reason') or 'active'}"
+                )
                 flow_enabled = True
                 flow_trigger_notional = min(
                     max(_safe_float(flow_trigger_notional), _safe_float(exposure_escalation.get("trigger_notional"))),
@@ -9488,9 +9579,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 )
                 flow_max_loss_ratio = exposure_escalation.get("max_loss_ratio")
                 if exposure_escalation.get("reason") == "hard_unrealized_loss_limit":
-                    controls["buy_paused"] = True
-                    controls["pause_reasons"] = list(controls.get("pause_reasons", []))
                     controls["pause_reasons"].append("exposure_escalation: hard_unrealized_loss_limit")
+            exposure_escalation_buy_pause = resolve_exposure_escalation_buy_pause(
+                state=state,
+                enabled=bool(getattr(effective_args, "exposure_escalation_enabled", False)),
+                now=exposure_now,
+                current_long_notional=controls["current_long_notional"],
+                trigger_notional=exposure_trigger_notional,
+                cooldown_seconds=getattr(effective_args, "exposure_escalation_buy_pause_cooldown_seconds", 0.0),
+            )
+            if exposure_escalation_buy_pause.get("active"):
+                controls["buy_paused"] = True
+                controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+                controls["pause_reasons"].append(
+                    f"exposure_escalation_buy_pause: {exposure_escalation_buy_pause.get('reason') or 'active'}"
+                )
             volume_long_v4_flow_sleeve = apply_volume_long_v4_flow_sleeve(
                 plan=plan,
                 enabled=flow_enabled,
@@ -9717,6 +9820,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "volume_long_v4_delever": volume_long_v4_delever,
         "volume_long_v4_flow_sleeve": volume_long_v4_flow_sleeve,
         "exposure_escalation": exposure_escalation,
+        "exposure_escalation_buy_pause": exposure_escalation_buy_pause,
         "active_delever": active_delever,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
@@ -10388,6 +10492,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exposure-escalation-target-notional", type=float, default=None)
     parser.add_argument("--exposure-escalation-max-loss-ratio", type=float, default=None)
     parser.add_argument("--exposure-escalation-hard-unrealized-loss-limit", type=float, default=None)
+    parser.add_argument("--exposure-escalation-buy-pause-cooldown-seconds", type=float, default=0.0)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -10890,6 +10995,8 @@ def main() -> None:
         raise SystemExit("--volume-long-v4-flow-sleeve-notional must be >= 0")
     if args.exposure_escalation_hold_seconds < 0:
         raise SystemExit("--exposure-escalation-hold-seconds must be >= 0")
+    if args.exposure_escalation_buy_pause_cooldown_seconds < 0:
+        raise SystemExit("--exposure-escalation-buy-pause-cooldown-seconds must be >= 0")
     for value, label in (
         (args.exposure_escalation_notional, "--exposure-escalation-notional"),
         (args.exposure_escalation_target_notional, "--exposure-escalation-target-notional"),

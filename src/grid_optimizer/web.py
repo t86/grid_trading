@@ -2912,6 +2912,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "exposure_escalation_target_notional": None,
     "exposure_escalation_max_loss_ratio": None,
     "exposure_escalation_hard_unrealized_loss_limit": None,
+    "exposure_escalation_buy_pause_cooldown_seconds": 0.0,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -5427,6 +5428,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "exposure_escalation_target_notional",
         "exposure_escalation_max_loss_ratio",
         "exposure_escalation_hard_unrealized_loss_limit",
+        "exposure_escalation_buy_pause_cooldown_seconds",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -5576,6 +5578,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "exposure_escalation_target_notional",
         "exposure_escalation_max_loss_ratio",
         "exposure_escalation_hard_unrealized_loss_limit",
+        "exposure_escalation_buy_pause_cooldown_seconds",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -6186,6 +6189,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--exposure-escalation-hard-unrealized-loss-limit",
             str(config["exposure_escalation_hard_unrealized_loss_limit"]),
         ])
+    if config.get("exposure_escalation_buy_pause_cooldown_seconds") is not None:
+        command.extend([
+            "--exposure-escalation-buy-pause-cooldown-seconds",
+            str(config["exposure_escalation_buy_pause_cooldown_seconds"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -6395,6 +6403,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "exposure_escalation_target_notional",
             "exposure_escalation_max_loss_ratio",
             "exposure_escalation_hard_unrealized_loss_limit",
+            "exposure_escalation_buy_pause_cooldown_seconds",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",

@@ -34,6 +34,8 @@ from grid_optimizer.loop_runner import (
     apply_active_delever_long,
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
+    prime_exposure_escalation_on_market_guard,
+    resolve_exposure_escalation_buy_pause,
     resolve_exposure_escalation,
     apply_synthetic_inventory_exit_priority,
     apply_adverse_inventory_reduce,
@@ -213,6 +215,89 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["active"])
         self.assertEqual(report["blocked_reason"], "below_trigger")
         self.assertIsNone(state["exposure_escalation"]["observed_since"])  # type: ignore[index]
+
+    def test_prime_exposure_escalation_on_market_guard_marks_hold_elapsed(self) -> None:
+        state: dict[str, object] = {}
+        now = datetime(2026, 4, 24, 8, 10, tzinfo=timezone.utc)
+
+        primed = prime_exposure_escalation_on_market_guard(
+            state=state,
+            market_guard={"buy_pause_active": True},
+            enabled=True,
+            now=now,
+            current_long_notional=1300.0,
+            trigger_notional=1250.0,
+            hold_seconds=120.0,
+        )
+
+        self.assertTrue(primed)
+        report = resolve_exposure_escalation(
+            state=state,
+            enabled=True,
+            now=now,
+            current_long_notional=1300.0,
+            current_long_qty=6500.0,
+            current_long_cost_basis_price=0.20,
+            mid_price=0.197,
+            trigger_notional=1250.0,
+            hold_seconds=120.0,
+            target_notional=780.0,
+            max_loss_ratio=0.05,
+            hard_unrealized_loss_limit=None,
+        )
+        self.assertTrue(report["active"])
+        self.assertEqual(report["reason"], "hold_time_exceeded")
+        self.assertAlmostEqual(report["held_seconds"], 120.0)
+
+    def test_prime_exposure_escalation_on_market_guard_ignores_calm_market(self) -> None:
+        state: dict[str, object] = {}
+        now = datetime(2026, 4, 24, 8, 10, tzinfo=timezone.utc)
+
+        primed = prime_exposure_escalation_on_market_guard(
+            state=state,
+            market_guard={"buy_pause_active": False},
+            enabled=True,
+            now=now,
+            current_long_notional=1300.0,
+            trigger_notional=1250.0,
+            hold_seconds=120.0,
+        )
+
+        self.assertFalse(primed)
+        self.assertEqual(state, {})
+
+    def test_resolve_exposure_escalation_buy_pause_holds_during_cooldown(self) -> None:
+        now = datetime(2026, 4, 24, 8, 10, tzinfo=timezone.utc)
+        state = {"exposure_escalation": {"last_active_at": (now - timedelta(seconds=60)).isoformat()}}
+
+        report = resolve_exposure_escalation_buy_pause(
+            state=state,
+            enabled=True,
+            now=now,
+            current_long_notional=900.0,
+            trigger_notional=1250.0,
+            cooldown_seconds=180.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["reason"], "cooldown")
+        self.assertAlmostEqual(report["remaining_seconds"], 120.0)
+
+    def test_resolve_exposure_escalation_buy_pause_holds_above_soft_threshold_after_cooldown(self) -> None:
+        now = datetime(2026, 4, 24, 8, 10, tzinfo=timezone.utc)
+        state = {"exposure_escalation": {"last_active_at": (now - timedelta(seconds=300)).isoformat()}}
+
+        report = resolve_exposure_escalation_buy_pause(
+            state=state,
+            enabled=True,
+            now=now,
+            current_long_notional=1300.0,
+            trigger_notional=1250.0,
+            cooldown_seconds=180.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["reason"], "above_soft_threshold")
 
     def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
         plan = {
