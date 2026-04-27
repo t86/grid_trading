@@ -72,7 +72,7 @@ class WebSecurityTests(unittest.TestCase):
             "hard_loss_forced_reduce_enabled": True,
             "hard_loss_forced_reduce_target_notional": target,
             "hard_loss_forced_reduce_max_order_notional": 400.0,
-            "hard_loss_forced_reduce_unrealized_loss_limit": 45.0,
+            "hard_loss_forced_reduce_unrealized_loss_limit": 10.0,
         }
 
     def _required_short_risk_guards(self, *, pause: float = 750.0, target: float = 430.0) -> dict[str, float | bool]:
@@ -88,7 +88,7 @@ class WebSecurityTests(unittest.TestCase):
             "hard_loss_forced_reduce_enabled": True,
             "hard_loss_forced_reduce_target_notional": target,
             "hard_loss_forced_reduce_max_order_notional": 400.0,
-            "hard_loss_forced_reduce_unrealized_loss_limit": 45.0,
+            "hard_loss_forced_reduce_unrealized_loss_limit": 10.0,
         }
 
     def _required_neutral_risk_guards(self, *, pause: float = 450.0, target: float = 225.0) -> dict[str, float | bool]:
@@ -2604,6 +2604,12 @@ class WebSecurityTests(unittest.TestCase):
 
         with self.assertRaisesRegex(ValueError, "short_threshold_timeout_seconds"):
             _validate_runner_required_risk_guards(config)
+
+    def test_runner_default_hard_loss_unrealized_limits_are_10u(self) -> None:
+        payload = _normalize_runner_control_payload({})
+
+        self.assertEqual(payload["exposure_escalation_hard_unrealized_loss_limit"], 10.0)
+        self.assertEqual(payload["hard_loss_forced_reduce_unrealized_loss_limit"], 10.0)
 
     @patch("grid_optimizer.web._stop_flatten_process")
     def test_start_runner_process_validates_risk_guards_before_stopping_flatten(self, mock_stop_flatten) -> None:
