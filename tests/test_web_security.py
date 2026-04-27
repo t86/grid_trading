@@ -2482,7 +2482,18 @@ class WebSecurityTests(unittest.TestCase):
                 encoding="utf-8",
             )
             events_path.write_text("", encoding="utf-8")
-            plan_path.write_text(json.dumps({"actual_net_qty": 0, "unrealized_pnl": 0}), encoding="utf-8")
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "actual_net_qty": 0,
+                        "unrealized_pnl": 0,
+                        "effective_strategy_profile": "volatility_defensive_v1",
+                        "effective_strategy_label": "高波动防守 v1",
+                        "strategy_mode": "one_way_long",
+                    }
+                ),
+                encoding="utf-8",
+            )
             submit_path.write_text(json.dumps({}), encoding="utf-8")
             mock_stats_start.return_value = phase_start
 
@@ -2494,6 +2505,8 @@ class WebSecurityTests(unittest.TestCase):
                     "elapsed": "1h",
                     "config": {
                         "symbol": "SOONUSDT",
+                        "strategy_profile": "volume_long_v4",
+                        "strategy_mode": "one_way_long",
                         "summary_jsonl": str(events_path),
                         "plan_json": str(plan_path),
                         "submit_report_json": str(submit_path),
@@ -2507,6 +2520,10 @@ class WebSecurityTests(unittest.TestCase):
             self.assertAlmostEqual(item["trade_pnl"], 2.0, places=8)
             self.assertAlmostEqual(item["fees"], 0.2, places=8)
             self.assertAlmostEqual(item["funding_fee"], 0.8, places=8)
+            self.assertEqual(item["strategy_name"], "量优先做多 v4 → 高波动防守 v1")
+            self.assertEqual(item["strategy_profile"], "volatility_defensive_v1")
+            self.assertEqual(item["requested_strategy_profile"], "volume_long_v4")
+            self.assertEqual(item["strategy_mode"], "one_way_long")
             self.assertEqual(item["stats_start_time"], phase_start.isoformat())
 
     @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")

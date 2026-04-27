@@ -4957,6 +4957,17 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
     return config
 
 
+def _runner_strategy_label(profile: str, symbol: str | None = None) -> str:
+    normalized = str(profile or "").strip()
+    if not normalized:
+        return ""
+    preset = _runner_preset_map(symbol).get(normalized)
+    if preset is None:
+        preset = _runner_preset_map().get(normalized)
+    label = str((preset or {}).get("label") or "").strip()
+    return label or normalized
+
+
 def _runner_preset_summaries(symbol: str | None = None) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for key, item in _runner_preset_map(symbol).items():
@@ -19982,6 +19993,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       const body = rows.map((item) => `
         <tr>
           <td><span class="pill">${escapeHtml(item.symbol)}</span></td>
+          <td>${escapeHtml(item.strategy_name || item.strategy_profile || "--")}</td>
           <td>${escapeHtml(fmtNum(item.total_volume, 4))}</td>
           <td>${escapeHtml(fmtNum(item.recent_hour_volume, 4))}</td>
           <td class="${moneyClass(item.total_pnl)}">${escapeHtml(fmtMoney(item.total_pnl))}</td>
@@ -20009,7 +20021,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
               <table>
                 <thead>
                   <tr>
-                    <th>币种</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
+                    <th>币种</th><th>策略名称</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
                   </tr>
                 </thead>
                 <tbody>${body}</tbody>
@@ -25596,6 +25608,17 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
     runner = snapshot.get("runner") or {}
     if not isinstance(runner, dict) or not bool(runner.get("is_running")):
         return None
+    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
+    symbol = str(snapshot.get("symbol") or runner_config.get("symbol") or "").upper().strip()
+    requested_profile = str(runner_config.get("strategy_profile") or "").strip()
+    effective_profile = str(
+        snapshot.get("effective_strategy_profile") or snapshot.get("strategy_profile") or requested_profile
+    ).strip()
+    effective_label = str(snapshot.get("effective_strategy_label") or "").strip()
+    strategy_name = effective_label or _runner_strategy_label(effective_profile, symbol)
+    requested_label = _runner_strategy_label(requested_profile, symbol)
+    if requested_profile and effective_profile and requested_profile != effective_profile and requested_label:
+        strategy_name = f"{requested_label} → {strategy_name or effective_profile}"
     trade = snapshot.get("trade_summary") or {}
     income = snapshot.get("income_summary") or {}
     position = snapshot.get("position") or {}
@@ -25606,6 +25629,10 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
     total_pnl = trade_pnl + unrealized_pnl + funding_fee - fees
     return {
         "symbol": snapshot.get("symbol"),
+        "strategy_name": strategy_name or effective_profile or requested_profile or "--",
+        "strategy_profile": effective_profile or requested_profile,
+        "requested_strategy_profile": requested_profile,
+        "strategy_mode": str(snapshot.get("strategy_mode") or runner_config.get("strategy_mode") or "").strip(),
         "updated_at": snapshot.get("ts"),
         "total_volume": float(trade.get("gross_notional") or 0.0) if isinstance(trade, dict) else 0.0,
         "recent_hour_volume": _latest_hour_volume(snapshot),
@@ -25792,6 +25819,14 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         "symbol": symbol,
         "ts": datetime.now(timezone.utc).isoformat(),
         "runner": runner,
+        "strategy_profile": str(
+            plan_report.get("effective_strategy_profile") or runner.get("config", {}).get("strategy_profile") or ""
+        ).strip(),
+        "effective_strategy_profile": str(plan_report.get("effective_strategy_profile") or "").strip(),
+        "effective_strategy_label": str(plan_report.get("effective_strategy_label") or "").strip(),
+        "strategy_mode": str(
+            plan_report.get("strategy_mode") or runner.get("config", {}).get("strategy_mode") or ""
+        ).strip(),
         "trade_summary": {
             "gross_notional": float(trade.get("gross_notional") or 0.0),
             "realized_pnl": trade_pnl,
