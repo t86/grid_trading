@@ -1842,6 +1842,8 @@ def _build_monitor_snapshot_uncached(
     if not isinstance(hard_loss_forced_reduce, dict):
         hard_loss_forced_reduce = {}
 
+    if not isinstance(snapshot.get("position"), dict):
+        snapshot["position"] = {}
     if synthetic_mode:
         snapshot["position"]["virtual_long_qty"] = synthetic_long_qty
         snapshot["position"]["virtual_short_qty"] = synthetic_short_qty

@@ -759,6 +759,64 @@ class MonitorTests(unittest.TestCase):
         self.assertIn("missing_binance_api_credentials", snapshot["warnings"])
         self.assertNotIn("market_read_failed: AssertionError: should not fetch book ticker", snapshot["warnings"])
 
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "96.1", "ask_price": "96.3"}])
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0.0002", "mark_price": "96.2"}])
+    def test_build_monitor_snapshot_handles_missing_creds_without_local_position_snapshot_for_synthetic_mode(
+        self,
+        _mock_premium,
+        _mock_book,
+        _mock_credentials,
+    ) -> None:
+        stale = datetime.now(timezone.utc) - timedelta(minutes=10)
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "stale_events.jsonl"
+            plan_path = root / "stale_plan.json"
+            submit_path = root / "stale_submit.json"
+            events_path.write_text(
+                json.dumps(
+                    {
+                        "ts": stale.isoformat(),
+                        "cycle": 1,
+                        "strategy_mode": "synthetic_neutral",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": stale.isoformat(),
+                        "strategy_mode": "synthetic_neutral",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="CLUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": True,
+                    "config": {
+                        "symbol": "CLUSDT",
+                        "strategy_profile": "clusdt_competition_maker_neutral_conservative_v1",
+                        "strategy_mode": "synthetic_neutral",
+                    },
+                },
+            )
+
+        self.assertAlmostEqual(snapshot["market"]["mid_price"], 96.2)
+        self.assertEqual(snapshot["position"]["virtual_long_qty"], 0.0)
+        self.assertEqual(snapshot["position"]["virtual_short_qty"], 0.0)
+        self.assertEqual(snapshot["position"]["virtual_net_qty"], 0.0)
+        self.assertIn("missing_binance_api_credentials", snapshot["warnings"])
+
 
 if __name__ == "__main__":
     unittest.main()
