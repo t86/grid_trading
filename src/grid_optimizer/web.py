@@ -2916,6 +2916,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "hard_loss_forced_reduce_enabled": False,
     "hard_loss_forced_reduce_target_notional": None,
     "hard_loss_forced_reduce_max_order_notional": None,
+    "hard_loss_forced_reduce_unrealized_loss_limit": None,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -5434,6 +5435,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "exposure_escalation_buy_pause_cooldown_seconds",
         "hard_loss_forced_reduce_target_notional",
         "hard_loss_forced_reduce_max_order_notional",
+        "hard_loss_forced_reduce_unrealized_loss_limit",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -5587,6 +5589,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "exposure_escalation_buy_pause_cooldown_seconds",
         "hard_loss_forced_reduce_target_notional",
         "hard_loss_forced_reduce_max_order_notional",
+        "hard_loss_forced_reduce_unrealized_loss_limit",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -6217,6 +6220,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--hard-loss-forced-reduce-max-order-notional",
             str(config["hard_loss_forced_reduce_max_order_notional"]),
         ])
+    if config.get("hard_loss_forced_reduce_unrealized_loss_limit") is not None:
+        command.extend([
+            "--hard-loss-forced-reduce-unrealized-loss-limit",
+            str(config["hard_loss_forced_reduce_unrealized_loss_limit"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -6430,6 +6438,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "hard_loss_forced_reduce_enabled",
             "hard_loss_forced_reduce_target_notional",
             "hard_loss_forced_reduce_max_order_notional",
+            "hard_loss_forced_reduce_unrealized_loss_limit",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",

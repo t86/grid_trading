@@ -4854,7 +4854,7 @@ def _build_adverse_reduce_order(
         "position_side": "BOTH",
         "force_reduce_only": True,
         "execution_type": "aggressive" if aggressive else "maker",
-        "time_in_force": "GTC" if aggressive else "GTX",
+        "time_in_force": "IOC" if aggressive else "GTX",
     }
 
 
@@ -7780,6 +7780,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "blocked_reason": "not_evaluated",
         "target_notional": getattr(args, "hard_loss_forced_reduce_target_notional", None),
         "max_order_notional": getattr(args, "hard_loss_forced_reduce_max_order_notional", None),
+        "hard_unrealized_loss_limit": getattr(args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
         "placed_order_count": 0,
         "placed_notional": 0.0,
     }
@@ -9817,6 +9818,45 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         min_notional=symbol_info.get("min_notional"),
         maker_timeout_seconds=getattr(effective_args, "adverse_reduce_maker_timeout_seconds", 45.0),
     )
+    if not hard_loss_forced_reduce.get("active") and bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)):
+        hard_loss_limit = max(_safe_float(getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None)), 0.0)
+        hard_side = None
+        hard_qty = 0.0
+        hard_notional = 0.0
+        hard_unrealized = 0.0
+        hard_cost_basis = 0.0
+        if current_short_qty > 1e-12:
+            hard_side = "BUY"
+            hard_qty = current_short_qty
+            hard_notional = controls.get("current_short_notional", current_short_notional)
+            hard_cost_basis = adverse_short_cost_price
+            hard_unrealized = (hard_cost_basis - mid_price) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
+        elif current_long_qty > 1e-12:
+            hard_side = "SELL"
+            hard_qty = current_long_qty
+            hard_notional = controls.get("current_long_notional", current_long_notional)
+            hard_cost_basis = adverse_long_cost_price
+            hard_unrealized = (mid_price - hard_cost_basis) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
+        hard_loss_active = hard_loss_limit > 0 and hard_unrealized <= -hard_loss_limit
+        hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=bool(hard_side) and hard_loss_active,
+            side=hard_side or "SELL",
+            current_qty=hard_qty,
+            current_notional=hard_notional,
+            target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+            max_order_notional=getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            reason="hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered",
+        )
+        hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
+        hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
 
     if bool(controls.get("buy_paused")):
         plan["bootstrap_orders"] = []
@@ -10639,6 +10679,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-loss-forced-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--hard-loss-forced-reduce-target-notional", type=float, default=None)
     parser.add_argument("--hard-loss-forced-reduce-max-order-notional", type=float, default=None)
+    parser.add_argument("--hard-loss-forced-reduce-unrealized-loss-limit", type=float, default=None)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -11157,6 +11198,7 @@ def main() -> None:
     for value, label in (
         (args.hard_loss_forced_reduce_target_notional, "--hard-loss-forced-reduce-target-notional"),
         (args.hard_loss_forced_reduce_max_order_notional, "--hard-loss-forced-reduce-max-order-notional"),
+        (args.hard_loss_forced_reduce_unrealized_loss_limit, "--hard-loss-forced-reduce-unrealized-loss-limit"),
     ):
         if value is not None and value < 0:
             raise SystemExit(f"{label} must be >= 0")
