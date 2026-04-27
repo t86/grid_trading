@@ -1643,6 +1643,101 @@ def resolve_exposure_escalation_buy_pause(
     return report
 
 
+def apply_hard_loss_forced_reduce(
+    *,
+    plan: dict[str, Any],
+    enabled: bool,
+    active: bool,
+    side: str,
+    current_qty: float,
+    current_notional: float,
+    target_notional: float | None,
+    max_order_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    reason: str | None = None,
+) -> dict[str, Any]:
+    normalized_side = str(side or "").upper().strip()
+    report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "reason": reason,
+        "blocked_reason": None,
+        "side": normalized_side,
+        "target_notional": target_notional,
+        "max_order_notional": max_order_notional,
+        "placed_order_count": 0,
+        "placed_notional": 0.0,
+    }
+    if not enabled:
+        report["blocked_reason"] = "disabled"
+        return report
+    if not active:
+        report["blocked_reason"] = "inactive"
+        return report
+    if normalized_side not in {"BUY", "SELL"}:
+        report["blocked_reason"] = "invalid_side"
+        return report
+
+    safe_current_qty = max(_safe_float(current_qty), 0.0)
+    safe_current_notional = max(_safe_float(current_notional), 0.0)
+    safe_target_notional = max(_safe_float(target_notional), 0.0)
+    if safe_current_qty <= 1e-12 or safe_current_notional <= safe_target_notional + 1e-12:
+        report["blocked_reason"] = "at_or_below_target"
+        return report
+
+    raw_reduce_notional = safe_current_notional - safe_target_notional
+    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
+    reduce_notional = min(raw_reduce_notional, safe_max_order_notional) if safe_max_order_notional > 0 else raw_reduce_notional
+    price_source = bid_price if normalized_side == "SELL" else ask_price
+    price = _round_order_price(max(_safe_float(price_source), 0.0), tick_size, normalized_side)
+    if price <= 0:
+        report["blocked_reason"] = "invalid_price"
+        return report
+    qty = _round_order_qty(min(safe_current_qty, reduce_notional / price), step_size)
+    notional = qty * price
+    if qty <= 0:
+        report["blocked_reason"] = "non_positive_qty"
+        return report
+    if min_qty is not None and qty < _safe_float(min_qty):
+        report["blocked_reason"] = "qty_below_min_qty"
+        return report
+    if min_notional is not None and notional < _safe_float(min_notional):
+        report["blocked_reason"] = "notional_below_min_notional"
+        return report
+
+    order = {
+        "side": normalized_side,
+        "price": price,
+        "qty": qty,
+        "notional": notional,
+        "role": "hard_loss_forced_reduce_long" if normalized_side == "SELL" else "hard_loss_forced_reduce_short",
+        "position_side": "BOTH",
+        "force_reduce_only": True,
+        "execution_type": "aggressive",
+        "time_in_force": "IOC",
+    }
+    target_key = "sell_orders" if normalized_side == "SELL" else "buy_orders"
+    plan[target_key] = [order, *list(plan.get(target_key, []))]
+    forced_reduce_orders = list(plan.get("forced_reduce_orders") or [])
+    forced_reduce_orders.append(order)
+    plan["forced_reduce_orders"] = forced_reduce_orders
+    report.update(
+        {
+            "active": True,
+            "blocked_reason": None,
+            "placed_order_count": 1,
+            "placed_notional": notional,
+            "order": order,
+        }
+    )
+    return report
+
+
 def _is_long_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
     position_side = _order_position_side(order)
@@ -1691,12 +1786,14 @@ def _resolve_reduce_only_flag(
         "soft_delever_long",
         "hard_delever_long",
         "flow_sleeve_long",
+        "hard_loss_forced_reduce_long",
     }:
         return True
     if normalized_side == "BUY" and normalized_role in {
         "take_profit_short",
         "active_delever_short",
         "flow_sleeve_short",
+        "hard_loss_forced_reduce_short",
     }:
         return True
     return None
@@ -7676,6 +7773,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "cooldown_seconds": getattr(args, "exposure_escalation_buy_pause_cooldown_seconds", 0.0),
         "remaining_seconds": 0.0,
     }
+    hard_loss_forced_reduce: dict[str, Any] = {
+        "enabled": bool(getattr(args, "hard_loss_forced_reduce_enabled", False)),
+        "active": False,
+        "reason": None,
+        "blocked_reason": "not_evaluated",
+        "target_notional": getattr(args, "hard_loss_forced_reduce_target_notional", None),
+        "max_order_notional": getattr(args, "hard_loss_forced_reduce_max_order_notional", None),
+        "placed_order_count": 0,
+        "placed_notional": 0.0,
+    }
     adverse_inventory_reduce: dict[str, Any] = {
         "enabled": bool(getattr(args, "adverse_reduce_enabled", False)),
         "active": False,
@@ -9616,6 +9723,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ask_price=ask_price,
                 sell_offset_steps=getattr(effective_args, "static_sell_offset_steps", 0.0),
             )
+            hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
+                plan=plan,
+                enabled=bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
+                active=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
+                side="SELL",
+                current_qty=current_long_qty,
+                current_notional=controls["current_long_notional"],
+                target_notional=(
+                    getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
+                    if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
+                    else exposure_escalation.get("target_notional")
+                ),
+                max_order_notional=getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None),
+                bid_price=bid_price,
+                ask_price=ask_price,
+                tick_size=symbol_info.get("tick_size"),
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+                reason=exposure_escalation.get("reason"),
+            )
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
@@ -9821,6 +9949,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "volume_long_v4_flow_sleeve": volume_long_v4_flow_sleeve,
         "exposure_escalation": exposure_escalation,
         "exposure_escalation_buy_pause": exposure_escalation_buy_pause,
+        "hard_loss_forced_reduce": hard_loss_forced_reduce,
         "active_delever": active_delever,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
@@ -10493,6 +10622,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--exposure-escalation-max-loss-ratio", type=float, default=None)
     parser.add_argument("--exposure-escalation-hard-unrealized-loss-limit", type=float, default=None)
     parser.add_argument("--exposure-escalation-buy-pause-cooldown-seconds", type=float, default=0.0)
+    parser.add_argument("--hard-loss-forced-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--hard-loss-forced-reduce-target-notional", type=float, default=None)
+    parser.add_argument("--hard-loss-forced-reduce-max-order-notional", type=float, default=None)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -11005,6 +11137,12 @@ def main() -> None:
             args.exposure_escalation_hard_unrealized_loss_limit,
             "--exposure-escalation-hard-unrealized-loss-limit",
         ),
+    ):
+        if value is not None and value < 0:
+            raise SystemExit(f"{label} must be >= 0")
+    for value, label in (
+        (args.hard_loss_forced_reduce_target_notional, "--hard-loss-forced-reduce-target-notional"),
+        (args.hard_loss_forced_reduce_max_order_notional, "--hard-loss-forced-reduce-max-order-notional"),
     ):
         if value is not None and value < 0:
             raise SystemExit(f"{label} must be >= 0")

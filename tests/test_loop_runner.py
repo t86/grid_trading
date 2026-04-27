@@ -34,6 +34,7 @@ from grid_optimizer.loop_runner import (
     apply_active_delever_long,
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
+    apply_hard_loss_forced_reduce,
     prime_exposure_escalation_on_market_guard,
     resolve_exposure_escalation_buy_pause,
     resolve_exposure_escalation,
@@ -298,6 +299,38 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(report["active"])
         self.assertEqual(report["reason"], "above_soft_threshold")
+
+    def test_apply_hard_loss_forced_reduce_adds_ioc_reduce_only_order(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="SELL",
+            current_qty=10000.0,
+            current_notional=1800.0,
+            target_notional=780.0,
+            max_order_notional=400.0,
+            bid_price=0.1778,
+            ask_price=0.1779,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["placed_order_count"], 1)
+        order = plan["sell_orders"][0]
+        self.assertEqual(order["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(order["execution_type"], "aggressive")
+        self.assertEqual(order["time_in_force"], "IOC")
+        self.assertTrue(order["force_reduce_only"])
+        self.assertAlmostEqual(order["price"], 0.1778)
+        self.assertLessEqual(order["notional"], 400.0)
+        self.assertEqual(plan["forced_reduce_orders"], [order])
 
     def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
         plan = {

@@ -2649,6 +2649,9 @@ class WebSecurityTests(unittest.TestCase):
                 "exposure_escalation_max_loss_ratio": 0.012,
                 "exposure_escalation_hard_unrealized_loss_limit": 60.0,
                 "exposure_escalation_buy_pause_cooldown_seconds": 180.0,
+                "hard_loss_forced_reduce_enabled": True,
+                "hard_loss_forced_reduce_target_notional": 650.0,
+                "hard_loss_forced_reduce_max_order_notional": 400.0,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -2673,6 +2676,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--exposure-escalation-hard-unrealized-loss-limit", command)
         self.assertIn("--exposure-escalation-buy-pause-cooldown-seconds", command)
         self.assertIn("180.0", command)
+        self.assertIn("--hard-loss-forced-reduce-enabled", command)
+        self.assertIn("--hard-loss-forced-reduce-target-notional", command)
+        self.assertIn("--hard-loss-forced-reduce-max-order-notional", command)
+        self.assertIn("400.0", command)
 
     @patch("grid_optimizer.web._run_grid_preview")
     def test_build_custom_grid_runner_preset_creates_symbol_bound_preset(self, mock_preview) -> None:

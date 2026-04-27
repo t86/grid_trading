@@ -2913,6 +2913,9 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "exposure_escalation_max_loss_ratio": None,
     "exposure_escalation_hard_unrealized_loss_limit": None,
     "exposure_escalation_buy_pause_cooldown_seconds": 0.0,
+    "hard_loss_forced_reduce_enabled": False,
+    "hard_loss_forced_reduce_target_notional": None,
+    "hard_loss_forced_reduce_max_order_notional": None,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -5429,6 +5432,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "exposure_escalation_max_loss_ratio",
         "exposure_escalation_hard_unrealized_loss_limit",
         "exposure_escalation_buy_pause_cooldown_seconds",
+        "hard_loss_forced_reduce_target_notional",
+        "hard_loss_forced_reduce_max_order_notional",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -5507,6 +5512,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adverse_reduce_enabled",
         "volume_long_v4_flow_sleeve_enabled",
         "exposure_escalation_enabled",
+        "hard_loss_forced_reduce_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
@@ -5579,6 +5585,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "exposure_escalation_max_loss_ratio",
         "exposure_escalation_hard_unrealized_loss_limit",
         "exposure_escalation_buy_pause_cooldown_seconds",
+        "hard_loss_forced_reduce_target_notional",
+        "hard_loss_forced_reduce_max_order_notional",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -6194,6 +6202,21 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--exposure-escalation-buy-pause-cooldown-seconds",
             str(config["exposure_escalation_buy_pause_cooldown_seconds"]),
         ])
+    command.append(
+        "--hard-loss-forced-reduce-enabled"
+        if config.get("hard_loss_forced_reduce_enabled", False)
+        else "--no-hard-loss-forced-reduce-enabled"
+    )
+    if config.get("hard_loss_forced_reduce_target_notional") is not None:
+        command.extend([
+            "--hard-loss-forced-reduce-target-notional",
+            str(config["hard_loss_forced_reduce_target_notional"]),
+        ])
+    if config.get("hard_loss_forced_reduce_max_order_notional") is not None:
+        command.extend([
+            "--hard-loss-forced-reduce-max-order-notional",
+            str(config["hard_loss_forced_reduce_max_order_notional"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -6404,6 +6427,9 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "exposure_escalation_max_loss_ratio",
             "exposure_escalation_hard_unrealized_loss_limit",
             "exposure_escalation_buy_pause_cooldown_seconds",
+            "hard_loss_forced_reduce_enabled",
+            "hard_loss_forced_reduce_target_notional",
+            "hard_loss_forced_reduce_max_order_notional",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",
