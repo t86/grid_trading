@@ -2830,8 +2830,10 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "market_bias_return_weight": 0.35,
     "market_bias_weak_buy_pause_enabled": False,
     "market_bias_weak_buy_pause_threshold": 0.15,
+    "market_bias_weak_buy_probe_scale": 0.0,
     "market_bias_strong_short_pause_enabled": False,
     "market_bias_strong_short_pause_threshold": 0.15,
+    "market_bias_strong_short_probe_scale": 0.25,
     "market_bias_regime_switch_enabled": False,
     "market_bias_regime_switch_confirm_cycles": 2,
     "market_bias_regime_switch_weak_threshold": 0.15,
@@ -5362,7 +5364,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_drift_weight",
         "market_bias_return_weight",
         "market_bias_weak_buy_pause_threshold",
+        "market_bias_weak_buy_probe_scale",
         "market_bias_strong_short_pause_threshold",
+        "market_bias_strong_short_probe_scale",
         "market_bias_regime_switch_weak_threshold",
         "market_bias_regime_switch_strong_threshold",
         "pause_buy_position_notional",
@@ -5939,6 +5943,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
     )
     if config.get("market_bias_weak_buy_pause_threshold") is not None:
         command.extend(["--market-bias-weak-buy-pause-threshold", str(config["market_bias_weak_buy_pause_threshold"])])
+    if config.get("market_bias_weak_buy_probe_scale") is not None:
+        command.extend(["--market-bias-weak-buy-probe-scale", str(config["market_bias_weak_buy_probe_scale"])])
     command.append(
         "--market-bias-strong-short-pause-enabled"
         if config.get("market_bias_strong_short_pause_enabled", False)
@@ -5946,6 +5952,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
     )
     if config.get("market_bias_strong_short_pause_threshold") is not None:
         command.extend(["--market-bias-strong-short-pause-threshold", str(config["market_bias_strong_short_pause_threshold"])])
+    if config.get("market_bias_strong_short_probe_scale") is not None:
+        command.extend(["--market-bias-strong-short-probe-scale", str(config["market_bias_strong_short_probe_scale"])])
     command.append(
         "--market-bias-regime-switch-enabled"
         if config.get("market_bias_regime_switch_enabled", False)
@@ -6315,8 +6323,10 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "market_bias_return_weight",
             "market_bias_weak_buy_pause_enabled",
             "market_bias_weak_buy_pause_threshold",
+            "market_bias_weak_buy_probe_scale",
             "market_bias_strong_short_pause_enabled",
             "market_bias_strong_short_pause_threshold",
+            "market_bias_strong_short_probe_scale",
             "market_bias_regime_switch_enabled",
             "market_bias_regime_switch_confirm_cycles",
             "market_bias_regime_switch_weak_threshold",

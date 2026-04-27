@@ -8020,10 +8020,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "weak_buy_pause_enabled": False,
         "weak_buy_pause_active": False,
         "weak_buy_pause_threshold": 0.0,
+        "weak_buy_probe_scale": 0.0,
         "weak_buy_pause_reasons": [],
         "strong_short_pause_enabled": False,
         "strong_short_pause_active": False,
         "strong_short_pause_threshold": 0.0,
+        "strong_short_probe_scale": 0.0,
         "strong_short_pause_reasons": [],
     }
     market_bias_entry_pause = {
@@ -8037,6 +8039,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "regime": "disabled",
         "bias_score": 0.0,
     }
+    weak_buy_probe_scale = 0.0
+    strong_short_probe_scale = 0.0
     market_bias_regime_switch = {
         "enabled": False,
         "supported": False,
@@ -8136,6 +8140,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             weak_buy_pause_threshold=float(getattr(effective_args, "market_bias_weak_buy_pause_threshold", 0.15)),
             strong_short_pause_threshold=float(getattr(effective_args, "market_bias_strong_short_pause_threshold", 0.15)),
         )
+        weak_buy_probe_scale = (
+            _clamp_ratio(float(getattr(effective_args, "market_bias_weak_buy_probe_scale", 0.0)))
+            if bool(market_bias_entry_pause["buy_pause_active"])
+            else 0.0
+        )
         strong_short_probe_scale = (
             _clamp_ratio(float(getattr(effective_args, "market_bias_strong_short_probe_scale", 0.25)))
             if bool(market_bias_entry_pause["short_pause_active"])
@@ -8146,6 +8155,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "weak_buy_pause_enabled": bool(getattr(effective_args, "market_bias_weak_buy_pause_enabled", False)),
                 "weak_buy_pause_active": bool(market_bias_entry_pause["buy_pause_active"]),
                 "weak_buy_pause_threshold": float(market_bias_entry_pause["buy_pause_threshold"]),
+                "weak_buy_probe_scale": float(weak_buy_probe_scale),
                 "weak_buy_pause_reasons": list(market_bias_entry_pause["buy_pause_reasons"]),
                 "strong_short_pause_enabled": bool(getattr(effective_args, "market_bias_strong_short_pause_enabled", False)),
                 "strong_short_pause_active": bool(market_bias_entry_pause["short_pause_active"]),
@@ -8410,6 +8420,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_long_pause_active
             else 0.0
         )
+        combined_long_probe_scale = max(weak_buy_probe_scale, inventory_long_probe_scale)
         adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
             enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
             keep_probe_scale=getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
@@ -8521,7 +8532,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 or inventory_short_pause_active
                 or center_entry_guard["short_pause_active"]
             ),
-            paused_entry_long_scale=inventory_long_probe_scale,
+            paused_entry_long_scale=combined_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
             allow_opposite_entry_with_single_side_inventory=bool(
                 _is_best_quote_neutral_profile(effective_strategy_profile)
@@ -8557,7 +8568,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
-            preserve_long_entry_on_inventory_pause=inventory_long_probe_scale > 0,
+            preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
             preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
@@ -8614,6 +8625,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_long_pause_active
             else 0.0
         )
+        combined_long_probe_scale = max(weak_buy_probe_scale, inventory_long_probe_scale)
         adverse_short_probe_scale_override = resolve_adverse_reduce_probe_scale_override(
             enabled=bool(getattr(effective_args, "adverse_reduce_enabled", False)),
             keep_probe_scale=getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
@@ -8765,7 +8777,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 or inventory_short_pause_active
                 or center_entry_guard["short_pause_active"]
             ),
-            paused_entry_long_scale=inventory_long_probe_scale,
+            paused_entry_long_scale=combined_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
             allow_opposite_entry_with_single_side_inventory=bool(
                 _is_best_quote_neutral_profile(effective_strategy_profile)
@@ -8851,7 +8863,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
-            preserve_long_entry_on_inventory_pause=inventory_long_probe_scale > 0,
+            preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
             preserve_short_entry_on_inventory_pause=inventory_short_probe_scale > 0,
@@ -10259,8 +10271,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--market-bias-return-weight", type=float, default=0.35)
     parser.add_argument("--market-bias-weak-buy-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--market-bias-weak-buy-pause-threshold", type=float, default=0.15)
+    parser.add_argument("--market-bias-weak-buy-probe-scale", type=float, default=0.0)
     parser.add_argument("--market-bias-strong-short-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--market-bias-strong-short-pause-threshold", type=float, default=0.15)
+    parser.add_argument("--market-bias-strong-short-probe-scale", type=float, default=0.25)
     parser.add_argument("--market-bias-regime-switch-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--market-bias-regime-switch-confirm-cycles", type=int, default=2)
     parser.add_argument("--market-bias-regime-switch-weak-threshold", type=float, default=0.15)
@@ -10725,10 +10739,14 @@ def main() -> None:
         raise SystemExit("--market-bias-enabled requires at least one positive weight")
     if args.market_bias_weak_buy_pause_threshold < 0:
         raise SystemExit("--market-bias-weak-buy-pause-threshold must be >= 0")
+    if args.market_bias_weak_buy_probe_scale < 0 or args.market_bias_weak_buy_probe_scale > 1.0:
+        raise SystemExit("--market-bias-weak-buy-probe-scale must be within [0, 1]")
     if args.market_bias_weak_buy_pause_enabled and not args.market_bias_enabled:
         raise SystemExit("--market-bias-weak-buy-pause-enabled requires --market-bias-enabled")
     if args.market_bias_strong_short_pause_threshold < 0:
         raise SystemExit("--market-bias-strong-short-pause-threshold must be >= 0")
+    if args.market_bias_strong_short_probe_scale < 0 or args.market_bias_strong_short_probe_scale > 1.0:
+        raise SystemExit("--market-bias-strong-short-probe-scale must be within [0, 1]")
     if args.market_bias_strong_short_pause_enabled and not args.market_bias_enabled:
         raise SystemExit("--market-bias-strong-short-pause-enabled requires --market-bias-enabled")
     if args.market_bias_regime_switch_confirm_cycles <= 0:
@@ -11304,9 +11322,11 @@ def main() -> None:
                 "market_bias_weak_buy_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_enabled"))),
                 "market_bias_weak_buy_pause_active": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_active"))),
                 "market_bias_weak_buy_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("weak_buy_pause_threshold")),
+                "market_bias_weak_buy_probe_scale": _safe_float((plan_report.get("market_bias") or {}).get("weak_buy_probe_scale")),
                 "market_bias_strong_short_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_enabled"))),
                 "market_bias_strong_short_pause_active": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_active"))),
                 "market_bias_strong_short_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("strong_short_pause_threshold")),
+                "market_bias_strong_short_probe_scale": _safe_float((plan_report.get("market_bias") or {}).get("strong_short_probe_scale")),
                 "market_bias_regime_switch_enabled": bool(((plan_report.get("market_bias_regime_switch") or {}).get("enabled"))),
                 "market_bias_switch_active_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("active_mode", "") or "")),
                 "market_bias_switch_candidate_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("candidate_mode", "") or "")),
