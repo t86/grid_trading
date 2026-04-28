@@ -4132,6 +4132,61 @@ def _running_status_card_from_snapshot(
     }
 
 
+def _running_status_snapshot_from_config(
+    symbol: str,
+    config: dict[str, Any],
+    runner: dict[str, Any],
+    *,
+    fast_status: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    runner_copy = dict(runner or {})
+    merged_config = dict(config or {})
+    runner_config = runner_copy.get("config")
+    if isinstance(runner_config, dict):
+        for key, value in runner_config.items():
+            if value is None:
+                continue
+            if isinstance(value, str) and not value.strip():
+                continue
+            merged_config[key] = value
+    merged_config["symbol"] = normalized_symbol
+    runner_copy["config"] = merged_config
+
+    fast = dict(fast_status or {})
+    recent_hour_volume = float(fast.get("recent_hour_volume") or 0.0)
+    open_order_count = max(int(fast.get("open_order_count") or 0), 0)
+    updated_at = str(fast.get("updated_at") or "").strip() or datetime.now(timezone.utc).isoformat()
+    hourly_rows = [{"gross_notional": recent_hour_volume}] if recent_hour_volume > 0 else []
+    unrealized_pnl = float(fast.get("unrealized_pnl") or 0.0)
+    trade_pnl = float(fast.get("trade_pnl") or 0.0)
+    fees = float(fast.get("fees") or 0.0)
+    funding_fee = float(fast.get("funding_fee") or 0.0)
+    total_pnl = float(fast.get("total_pnl") or 0.0)
+
+    return {
+        "symbol": normalized_symbol,
+        "ts": updated_at,
+        "runner": runner_copy,
+        "risk_controls": merged_config,
+        "trade_summary": {
+            "gross_notional": float(fast.get("total_volume") or 0.0),
+            "realized_pnl": trade_pnl,
+            "net_pnl_estimate": total_pnl,
+            "commission": fees,
+        },
+        "income_summary": {"funding_fee": funding_fee},
+        "hourly_summary": {"rows": hourly_rows},
+        "position": {
+            "position_amt": float(fast.get("position_amt") or 0.0),
+            "long_qty": float(fast.get("long_qty") or 0.0),
+            "short_qty": float(fast.get("short_qty") or 0.0),
+            "unrealized_pnl": unrealized_pnl,
+        },
+        "open_orders": [{} for _ in range(open_order_count)],
+    }
+
+
 def _build_running_status_local_payload(
     symbol: str | None = None,
     *,
@@ -4145,12 +4200,18 @@ def _build_running_status_local_payload(
         card_symbol = str(config.get("symbol", "")).upper().strip()
         if not card_symbol:
             continue
-        snapshot = build_monitor_snapshot(
-            symbol=card_symbol,
-            events_path=str(_default_runtime_paths_for_symbol(card_symbol)["summary_jsonl"]),
-            plan_path=str(_default_runtime_paths_for_symbol(card_symbol)["plan_json"]),
-            submit_report_path=str(_default_runtime_paths_for_symbol(card_symbol)["submit_report_json"]),
-            runner_process=_read_runner_process_for_symbol(card_symbol),
+        runner = _read_runner_process_for_symbol(card_symbol)
+        fast_status: dict[str, Any] | None = None
+        if bool(runner.get("is_running")):
+            try:
+                fast_status = _build_fast_running_status_item(card_symbol, runner)
+            except Exception:
+                fast_status = None
+        snapshot = _running_status_snapshot_from_config(
+            card_symbol,
+            config,
+            runner,
+            fast_status=fast_status,
         )
         cards.append(
             _running_status_card_from_snapshot(

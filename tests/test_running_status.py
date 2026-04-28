@@ -108,6 +108,57 @@ class RunningStatusTests(unittest.TestCase):
         self.assertTrue(payload["groups"]["saved_idle"][0]["focused"])
         self.assertEqual(payload["groups"]["saved_idle"][0]["target_url"], "/running_status?symbol=CHIPUSDT")
 
+    def test_build_running_status_local_payload_avoids_full_monitor_snapshot(self) -> None:
+        from grid_optimizer.web import _build_running_status_local_payload
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            (output_dir / "soonusdt_loop_runner_control.json").write_text(
+                '{"symbol":"SOONUSDT","strategy_profile":"soon_profile","strategy_mode":"synthetic_neutral"}',
+                encoding="utf-8",
+            )
+            (output_dir / "chipusdt_loop_runner_control.json").write_text(
+                '{"symbol":"CHIPUSDT","strategy_profile":"chip_profile","strategy_mode":"synthetic_neutral"}',
+                encoding="utf-8",
+            )
+
+            def fake_runner(symbol: str) -> dict[str, object]:
+                normalized = str(symbol).upper().strip()
+                return {
+                    "configured": True,
+                    "is_running": normalized == "SOONUSDT",
+                    "pid": 11 if normalized == "SOONUSDT" else None,
+                    "config": {
+                        "symbol": normalized,
+                        "strategy_profile": "soon_profile" if normalized == "SOONUSDT" else "chip_profile",
+                        "strategy_mode": "synthetic_neutral",
+                    },
+                }
+
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                with patch("grid_optimizer.web._read_runner_process_for_symbol", side_effect=fake_runner):
+                    with patch(
+                        "grid_optimizer.web.build_monitor_snapshot",
+                        side_effect=AssertionError("should not build full monitor snapshot"),
+                    ):
+                        with patch(
+                            "grid_optimizer.web._build_fast_running_status_item",
+                            return_value={"recent_hour_volume": 12.0, "open_order_count": 2, "total_pnl": 3.5},
+                        ):
+                            payload = _build_running_status_local_payload()
+            finally:
+                os.chdir(previous_cwd)
+
+        self.assertEqual([item["symbol"] for item in payload["groups"]["running"]], ["SOONUSDT"])
+        self.assertEqual([item["symbol"] for item in payload["groups"]["saved_idle"]], ["CHIPUSDT"])
+        self.assertEqual(payload["groups"]["running"][0]["recent_hour_volume"], 12.0)
+        self.assertEqual(payload["groups"]["running"][0]["open_order_count"], 2)
+        self.assertEqual(payload["groups"]["running"][0]["total_pnl"], 3.5)
+
     def test_build_running_status_cross_payload_aggregates_servers(self) -> None:
         from grid_optimizer.web import _build_running_status_cross_payload
 
