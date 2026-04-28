@@ -50,6 +50,15 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _runtime_jsonl_limit() -> int:
+    raw = str(os.environ.get("GRID_RUNNING_STATUS_JSONL_LIMIT") or "5000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 5000
+    return max(200, value)
+
+
 def _runner_status_runtime_paths(symbol: str, runner: dict[str, Any]) -> dict[str, str]:
     runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
     runtime_paths = _default_runtime_paths_for_symbol(symbol)
@@ -61,7 +70,7 @@ def _runner_status_runtime_paths(symbol: str, runner: dict[str, Any]) -> dict[st
 
 
 def _read_runtime_rows(path: Path) -> list[dict[str, Any]]:
-    return [item for item in read_jsonl(path, limit=0) if isinstance(item, dict)]
+    return [item for item in read_jsonl(path, limit=_runtime_jsonl_limit()) if isinstance(item, dict)]
 
 
 def _parse_iso_datetime(value: Any) -> datetime | None:
