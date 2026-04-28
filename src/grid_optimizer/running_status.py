@@ -145,13 +145,16 @@ def _resolve_last_run_start(
     submit_report: dict[str, Any],
     runner: dict[str, Any],
 ) -> datetime | None:
+    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
+    stats_start = _parse_iso_datetime(runner_config.get("runtime_guard_stats_start_time"))
+    if stats_start is not None:
+        return stats_start
     for item in reversed(events):
         run_start = _parse_iso_datetime(
             item.get("run_start_time") or item.get("runtime_guard_stats_start_time")
         )
         if run_start is not None:
             return run_start
-    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
     runner_start = _parse_iso_datetime(runner_config.get("run_start_time"))
     if runner_start is not None:
         return runner_start
