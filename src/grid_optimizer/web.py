@@ -4468,7 +4468,7 @@ def _render_running_status_form_groups_html() -> str:
 
 def _render_running_status_page(symbol: str | None = None) -> str:
     initial_symbol = str(symbol or "").upper().strip()
-    initial_view_mode = "local" if initial_symbol else "cross"
+    initial_view_mode = "local"
     form_groups = _running_status_form_groups_with_ids()
     page = """
 <!doctype html>

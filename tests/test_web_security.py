@@ -170,6 +170,7 @@ class WebSecurityTests(unittest.TestCase):
     def test_running_status_page_contains_card_console_sections(self) -> None:
         page = _render_running_status_page()
 
+        self.assertIn('const INITIAL_VIEW_MODE = "local";', page)
         self.assertIn("运行中", page)
         self.assertIn("已保存未启动", page)
         self.assertIn("上次运行", page)
