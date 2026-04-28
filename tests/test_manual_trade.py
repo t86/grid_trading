@@ -9,13 +9,21 @@ from grid_optimizer.web import (
     _is_manual_trade_order,
     _manual_trade_client_order_prefix,
     _manual_trade_chase_leg,
+    _manual_trade_cancel,
+    _manual_trade_current_task,
     _manual_trade_ensure_isolated,
     _manual_trade_maker_worker,
+    _manual_trade_set_task,
     _manual_trade_prepare_plan,
 )
 
 
 class ManualTradeTests(unittest.TestCase):
+    def tearDown(self) -> None:
+        from grid_optimizer.web import MANUAL_TRADE_TASKS
+
+        MANUAL_TRADE_TASKS.clear()
+
     def _symbol_info(self) -> dict[str, float]:
         return {
             "tick_size": 0.0001,
@@ -196,6 +204,46 @@ class ManualTradeTests(unittest.TestCase):
         mock_post_order.assert_called_once()
         mock_delete_order.assert_not_called()
 
+    @patch("grid_optimizer.web._manual_trade_set_task")
+    @patch("grid_optimizer.web.fetch_futures_order")
+    @patch("grid_optimizer.web.post_futures_order")
+    @patch("grid_optimizer.web._manual_trade_book_prices")
+    @patch("grid_optimizer.web._manual_trade_cancel_requested")
+    @patch("grid_optimizer.web.delete_futures_order")
+    @patch("grid_optimizer.web.time.monotonic")
+    @patch("grid_optimizer.web.time.sleep")
+    def test_maker_chase_does_not_reprice_before_min_interval(
+        self,
+        mock_sleep,
+        mock_monotonic,
+        mock_delete_order,
+        mock_cancel_requested,
+        mock_book_prices,
+        mock_post_order,
+        mock_fetch_order,
+        mock_set_task,
+    ) -> None:
+        mock_cancel_requested.side_effect = [False, False, False]
+        mock_book_prices.side_effect = [(1.0, 1.01), (1.0, 1.02), (1.0, 1.02)]
+        mock_monotonic.side_effect = [100.0, 101.0, 107.0]
+        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "mt_bardusdt_open_short_sell_1"}
+        mock_fetch_order.side_effect = [
+            {"status": "NEW", "executedQty": "0", "price": "1.01"},
+            {"status": "FILLED", "executedQty": "10", "price": "1.01", "avgPrice": "1.01"},
+        ]
+
+        result = _manual_trade_chase_leg(
+            symbol="BARDUSDT",
+            api_key="key",
+            api_secret="secret",
+            prefix=_manual_trade_client_order_prefix("BARDUSDT"),
+            leg={"role": "open_short", "side": "SELL", "quantity": 10.0, "reduce_only": False},
+        )
+
+        self.assertEqual(result["executed_qty"], 10.0)
+        mock_post_order.assert_called_once()
+        mock_delete_order.assert_not_called()
+
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web._manual_trade_chase_leg")
     @patch("grid_optimizer.web._manual_trade_prepare_plan")
@@ -238,6 +286,65 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(final_patch["last_fill_price"], 76784.1)
         self.assertEqual(final_patch["remaining_qty"], 0.0)
         self.assertEqual(final_patch["attempts"], 2)
+
+    def test_starting_new_task_resets_previous_fill_fields(self) -> None:
+        _manual_trade_set_task(
+            "BTCUSDC",
+            {
+                "status": "filled",
+                "avg_fill_price": 76784.1,
+                "last_fill_price": 76784.1,
+                "executed_qty": 0.001,
+                "remaining_qty": 0.0,
+                "attempts": 5,
+                "current_order": {"orderId": 1},
+                "current_leg": {"role": "open_long"},
+                "legs_done": [{"last_order": {"status": "FILLED"}}],
+                "error": None,
+            },
+        )
+
+        from grid_optimizer.web import _manual_trade_initialize_task
+
+        _manual_trade_initialize_task(
+            "BTCUSDC",
+            {
+                "id": "next-task",
+                "status": "pending",
+                "side": "SELL",
+                "notional": 100.0,
+                "cancel_requested": False,
+                "message": "manual maker task queued",
+            },
+        )
+
+        task = _manual_trade_current_task("BTCUSDC")
+        self.assertEqual(task["avg_fill_price"], 0.0)
+        self.assertEqual(task["last_fill_price"], 0.0)
+        self.assertEqual(task["executed_qty"], 0.0)
+        self.assertEqual(task["remaining_qty"], 0.0)
+        self.assertEqual(task["attempts"], 0)
+        self.assertIsNone(task["current_order"])
+        self.assertIsNone(task["current_leg"])
+        self.assertEqual(task["legs_done"], [])
+
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    @patch("grid_optimizer.web._manual_trade_cancel_open_orders")
+    def test_cancel_clears_current_order_after_cleanup(self, mock_cancel_orders, mock_credentials) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_cancel_orders.return_value = {"attempted": 1, "success": 1, "errors": []}
+        _manual_trade_set_task(
+            "BTCUSDC",
+            {"status": "running", "current_order": {"orderId": 1}, "current_leg": {"role": "close_long"}},
+        )
+
+        result = _manual_trade_cancel({"symbol": "BTCUSDC"})
+
+        task = result["task"]
+        self.assertEqual(task["status"], "canceled")
+        self.assertIsNone(task["current_order"])
+        self.assertIsNone(task["current_leg"])
+        self.assertEqual(task["remaining_qty"], 0.0)
 
     def test_monitor_page_links_to_manual_trade_page(self) -> None:
         from grid_optimizer.web import MONITOR_PAGE

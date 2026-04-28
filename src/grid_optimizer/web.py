@@ -9060,6 +9060,7 @@ def _safe_numeric(value: Any) -> float:
 MANUAL_TRADE_TASKS: dict[str, dict[str, Any]] = {}
 MANUAL_TRADE_TASKS_LOCK = threading.Lock()
 MANUAL_TRADE_SLEEP_SECONDS = 1.0
+MANUAL_TRADE_MIN_REPRICE_SECONDS = 5.0
 
 
 def _manual_trade_client_order_prefix(symbol: str) -> str:
@@ -9198,6 +9199,28 @@ def _manual_trade_set_task(symbol: str, patch: dict[str, Any]) -> dict[str, Any]
         current["updated_at"] = datetime.now(timezone.utc).isoformat()
         MANUAL_TRADE_TASKS[key] = current
         return dict(current)
+
+
+def _manual_trade_initialize_task(symbol: str, patch: dict[str, Any]) -> dict[str, Any]:
+    clean = {
+        "legs_done": [],
+        "current_leg": None,
+        "current_order": None,
+        "executed_qty": 0.0,
+        "remaining_qty": 0.0,
+        "avg_fill_price": 0.0,
+        "last_fill_price": 0.0,
+        "attempts": 0,
+        "error": None,
+        "snapshot": None,
+    }
+    clean.update(patch)
+    key = _manual_trade_task_key(symbol)
+    with MANUAL_TRADE_TASKS_LOCK:
+        clean["symbol"] = key
+        clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+        MANUAL_TRADE_TASKS[key] = dict(clean)
+        return dict(clean)
 
 
 def _manual_trade_current_task(symbol: str) -> dict[str, Any] | None:
@@ -9403,6 +9426,7 @@ def _manual_trade_chase_leg(
     current_client_order_id: str | None = None
     current_order_price = 0.0
     current_order_executed_qty = 0.0
+    current_order_submitted_at = 0.0
     last_order: dict[str, Any] | None = None
     while remaining_qty > 0:
         if _manual_trade_cancel_requested(symbol):
@@ -9439,11 +9463,19 @@ def _manual_trade_chase_leg(
                 current_client_order_id = None
                 current_order_price = 0.0
                 current_order_executed_qty = 0.0
+                current_order_submitted_at = 0.0
                 break
             bid_price, ask_price = _manual_trade_book_prices(symbol)
             target_price = bid_price if str(leg["side"]).upper() == "BUY" else ask_price
             order_price = _safe_numeric(order.get("price")) or current_order_price
-            if abs(order_price - target_price) <= 1e-12:
+            order_age_seconds = max(time.monotonic() - current_order_submitted_at, 0.0) if current_order_submitted_at > 0 else MANUAL_TRADE_MIN_REPRICE_SECONDS
+            if abs(order_price - target_price) <= 1e-12 or order_age_seconds < MANUAL_TRADE_MIN_REPRICE_SECONDS:
+                message = f"{leg['role']} resting at {order_price}"
+                if abs(order_price - target_price) > 1e-12:
+                    message = (
+                        f"{leg['role']} keeping {order_price}; target {target_price}, "
+                        f"age {order_age_seconds:.1f}s < {MANUAL_TRADE_MIN_REPRICE_SECONDS:.1f}s"
+                    )
                 _manual_trade_set_task(
                     symbol,
                     {
@@ -9453,7 +9485,7 @@ def _manual_trade_chase_leg(
                         "attempts": attempts,
                         "executed_qty": executed_qty,
                         "remaining_qty": remaining_qty,
-                        "message": f"{leg['role']} resting at {order_price}",
+                        "message": message,
                     },
                 )
                 time.sleep(MANUAL_TRADE_SLEEP_SECONDS)
@@ -9472,6 +9504,7 @@ def _manual_trade_chase_leg(
             current_client_order_id = None
             current_order_price = 0.0
             current_order_executed_qty = 0.0
+            current_order_submitted_at = 0.0
         bid_price, ask_price = _manual_trade_book_prices(symbol)
         price = bid_price if str(leg["side"]).upper() == "BUY" else ask_price
         client_order_id = _manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"]))
@@ -9491,6 +9524,7 @@ def _manual_trade_chase_leg(
         current_client_order_id = str(response.get("clientOrderId") or client_order_id)
         current_order_price = price
         current_order_executed_qty = _safe_numeric(response.get("executedQty"))
+        current_order_submitted_at = time.monotonic()
         _manual_trade_set_task(
             symbol,
             {
@@ -9597,7 +9631,7 @@ def _manual_trade_start_maker(payload: dict[str, Any]) -> dict[str, Any]:
     if existing and str(existing.get("status", "")).lower() in {"pending", "running"}:
         raise ValueError(f"{symbol} manual maker task is already running")
     task_id = uuid.uuid4().hex
-    _manual_trade_set_task(
+    _manual_trade_initialize_task(
         symbol,
         {
             "id": task_id,
@@ -9623,6 +9657,17 @@ def _manual_trade_cancel(payload: dict[str, Any]) -> dict[str, Any]:
     creds = load_binance_api_credentials()
     if creds is not None:
         cleanup = _manual_trade_cancel_open_orders(symbol, creds[0], creds[1], prefix)
+    if not cleanup.get("errors"):
+        _manual_trade_set_task(
+            symbol,
+            {
+                "status": "canceled",
+                "current_order": None,
+                "current_leg": None,
+                "remaining_qty": 0.0,
+                "message": "manual maker task canceled",
+            },
+        )
     return {"symbol": symbol, "cleanup": cleanup, "task": _manual_trade_public_task(_manual_trade_current_task(symbol))}
 
 
