@@ -9117,6 +9117,20 @@ def _build_manual_trade_plan(
     if target_qty <= 0:
         raise ValueError("quantity rounds to zero")
 
+    def _leg_estimated_price(leg_side: str) -> float:
+        return bid_price if str(leg_side).upper() == "BUY" else ask_price
+
+    def _build_leg(role: str, leg_side: str, quantity: float, *, reduce_only: bool) -> dict[str, Any]:
+        estimated_price = _leg_estimated_price(leg_side)
+        return {
+            "role": role,
+            "side": leg_side,
+            "quantity": quantity,
+            "reduce_only": reduce_only,
+            "estimated_price": estimated_price,
+            "estimated_notional": quantity * estimated_price,
+        }
+
     def _validate_leg_qty(qty: float, price: float) -> float:
         rounded_qty = _round_order_qty(qty, step_size)
         if rounded_qty <= 0:
@@ -9134,45 +9148,33 @@ def _build_manual_trade_plan(
     if normalized_side == "BUY" and position_amt < 0:
         close_qty = _validate_leg_qty(min(abs(position_amt), remaining_qty), ask_price)
         if close_qty > 0:
-            legs.append(
-                {
-                    "role": "close_short",
-                    "side": "BUY",
-                    "quantity": close_qty,
-                    "reduce_only": True,
-                }
-            )
+            legs.append(_build_leg("close_short", "BUY", close_qty, reduce_only=True))
             remaining_qty = max(remaining_qty - close_qty, 0.0)
     elif normalized_side == "SELL" and position_amt > 0:
         close_qty = _validate_leg_qty(min(position_amt, remaining_qty), bid_price)
         if close_qty > 0:
-            legs.append(
-                {
-                    "role": "close_long",
-                    "side": "SELL",
-                    "quantity": close_qty,
-                    "reduce_only": True,
-                }
-            )
+            legs.append(_build_leg("close_long", "SELL", close_qty, reduce_only=True))
             remaining_qty = max(remaining_qty - close_qty, 0.0)
 
     open_qty = _validate_leg_qty(remaining_qty, reference_price)
     if open_qty > 0:
         legs.append(
-            {
-                "role": "open_long" if normalized_side == "BUY" else "open_short",
-                "side": normalized_side,
-                "quantity": open_qty,
-                "reduce_only": False,
-            }
+            _build_leg(
+                "open_long" if normalized_side == "BUY" else "open_short",
+                normalized_side,
+                open_qty,
+                reduce_only=False,
+            )
         )
     if not legs:
         raise ValueError("order notional is below minimum notional")
+    planned_notional = sum(float(leg.get("estimated_notional") or 0.0) for leg in legs)
     return {
         "symbol": normalized_symbol,
         "side": normalized_side,
         "notional": safe_notional,
         "target_quantity": target_qty,
+        "planned_notional": planned_notional,
         "position_amt": float(position_amt),
         "legs": legs,
     }
@@ -15885,8 +15887,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       <h2>追盘任务</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>状态</th><th>方向</th><th>目标</th><th>当前腿</th><th>成交均价</th><th>最后价格</th><th>已成交数量</th><th>剩余数量</th><th>尝试次数</th><th>消息</th></tr></thead>
-          <tbody id="task_body"><tr><td colspan="10">暂无任务</td></tr></tbody>
+          <thead><tr><th>状态</th><th>方向</th><th>目标</th><th>预计挂单</th><th>当前腿</th><th>成交均价</th><th>最后价格</th><th>已成交数量</th><th>剩余数量</th><th>尝试次数</th><th>消息</th></tr></thead>
+          <tbody id="task_body"><tr><td colspan="11">暂无任务</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -15945,7 +15947,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     function renderTask(task) {
       const body = document.getElementById("task_body");
       if (!task) {
-        body.innerHTML = '<tr><td colspan="10">暂无任务</td></tr>';
+        body.innerHTML = '<tr><td colspan="11">暂无任务</td></tr>';
         return;
       }
       const lastDone = Array.isArray(task.legs_done) && task.legs_done.length ? task.legs_done[task.legs_done.length - 1] : null;
@@ -15954,10 +15956,17 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const message = task.error || task.message || (lastOrder ? `${lastOrder.status || "--"} ${lastOrder.clientOrderId || ""}` : "--");
       const avgFillPrice = Number(task.avg_fill_price) || (lastOrder ? Number(lastOrder.avgPrice || lastOrder.price) : NaN);
       const lastFillPrice = Number(task.last_fill_price) || (lastOrder ? Number(lastOrder.avgPrice || lastOrder.price) : NaN);
+      const plan = task.plan || {};
+      const plannedQty = Number(plan.target_quantity);
+      const plannedNotional = Number(plan.planned_notional);
+      const plannedText = Number.isFinite(plannedQty) && Number.isFinite(plannedNotional)
+        ? `${fmt(plannedQty, 8)} / ${fmt(plannedNotional, 4)} USDT`
+        : "--";
       body.innerHTML = `<tr>
         <td>${escapeHtml(task.status || "--")}</td>
         <td>${escapeHtml(task.side || "--")}</td>
         <td>${fmt(task.notional, 2)} USDT</td>
+        <td>${escapeHtml(plannedText)}</td>
         <td>${escapeHtml(leg.role || "--")}</td>
         <td>${fmt(avgFillPrice, 8)}</td>
         <td>${fmt(lastFillPrice, 8)}</td>

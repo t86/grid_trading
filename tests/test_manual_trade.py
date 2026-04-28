@@ -60,6 +60,9 @@ class ManualTradeTests(unittest.TestCase):
         self.assertAlmostEqual(plan["legs"][0]["quantity"], 40.0)
         self.assertFalse(plan["legs"][1]["reduce_only"])
         self.assertAlmostEqual(plan["legs"][1]["quantity"], 59.0)
+        self.assertAlmostEqual(plan["planned_notional"], 99.0)
+        self.assertAlmostEqual(plan["legs"][0]["estimated_notional"], 40.0)
+        self.assertAlmostEqual(plan["legs"][1]["estimated_notional"], 59.0)
 
     def test_sell_plan_closes_long_before_opening_short(self) -> None:
         plan = _build_manual_trade_plan(
@@ -78,6 +81,9 @@ class ManualTradeTests(unittest.TestCase):
         self.assertAlmostEqual(plan["legs"][0]["quantity"], 12.0)
         self.assertFalse(plan["legs"][1]["reduce_only"])
         self.assertAlmostEqual(plan["legs"][1]["quantity"], 28.0)
+        self.assertAlmostEqual(plan["planned_notional"], 80.8)
+        self.assertAlmostEqual(plan["legs"][0]["estimated_notional"], 24.24)
+        self.assertAlmostEqual(plan["legs"][1]["estimated_notional"], 56.56)
 
     def test_plan_rejects_too_small_notional_after_rounding(self) -> None:
         with self.assertRaisesRegex(ValueError, "below minimum notional"):
