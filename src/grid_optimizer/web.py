@@ -15952,6 +15952,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     const riskBoxEl = document.getElementById("risk_box");
     let symbols = [];
     let refreshTimer = null;
+    let refreshInFlight = false;
+    let refreshAbortController = null;
 
     function escapeHtml(value) {
       return String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
@@ -15966,6 +15968,27 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const data = raw ? JSON.parse(raw) : {};
       if (!resp.ok || data.ok === false) throw new Error(data.error || `请求失败(${resp.status})`);
       return data;
+    }
+    async function fetchJsonWithTimeout(url, options = {}, timeoutMs = 6000) {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+      try {
+        const resp = await fetch(url, { ...options, signal: controller.signal });
+        return await readJson(resp);
+      } catch (err) {
+        if (err && err.name === "AbortError") {
+          throw new Error("请求超时，请刷新确认任务状态；不要连续重复点击。");
+        }
+        throw err;
+      } finally {
+        clearTimeout(timeoutId);
+      }
+    }
+    function cancelStatusRefresh() {
+      if (refreshAbortController) {
+        refreshAbortController.abort();
+        refreshAbortController = null;
+      }
     }
     async function loadSymbols() {
       const resp = await fetch("/api/symbols?market_type=futures&contract_type=usdm");
@@ -16026,28 +16049,42 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <td>${escapeHtml(message)}</td>
       </tr>`;
     }
-    async function refreshStatus() {
+    async function refreshStatus({ force = false } = {}) {
+      if (refreshInFlight) {
+        if (!force) return;
+        cancelStatusRefresh();
+      }
+      refreshInFlight = true;
+      const controller = new AbortController();
+      refreshAbortController = controller;
+      const timeoutId = setTimeout(() => controller.abort(), 5000);
       const symbol = symbolEl.value || "BTCUSDT";
-      const resp = await fetch(`/api/manual_trade/status?symbol=${encodeURIComponent(symbol)}`);
-      const data = await readJson(resp);
-      renderSnapshot(data.snapshot);
-      topMetaEl.textContent = `状态已刷新：${new Date().toLocaleString()}`;
+      try {
+        const resp = await fetch(`/api/manual_trade/status?symbol=${encodeURIComponent(symbol)}`, { signal: controller.signal });
+        const data = await readJson(resp);
+        renderSnapshot(data.snapshot);
+        topMetaEl.textContent = `状态已刷新：${new Date().toLocaleString()}`;
+      } finally {
+        clearTimeout(timeoutId);
+        if (refreshAbortController === controller) refreshAbortController = null;
+        refreshInFlight = false;
+      }
     }
     async function submitAction(endpoint, side) {
+      cancelStatusRefresh();
       actionMetaEl.textContent = "提交中...";
-      const resp = await fetch(endpoint, {
+      const data = await fetchJsonWithTimeout(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ symbol: symbolEl.value, side, notional: Number(notionalEl.value || 0), margin_mode: marginModeEl.value || "KEEP" }),
-      });
-      const data = await readJson(resp);
+      }, 5000);
       actionMetaEl.textContent = endpoint.includes("take") ? "Take 市价单已提交。" : "Maker 追盘任务已启动。";
       if (data.snapshot) renderSnapshot(data.snapshot);
       if (data.task) renderTask(data.task);
       if (endpoint.includes("take")) {
-        await refreshStatus();
+        await refreshStatus({ force: true });
       } else {
-        setTimeout(() => refreshStatus().catch(() => {}), 500);
+        setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500);
       }
     }
     async function cancelTask() {
@@ -16060,7 +16097,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const data = await readJson(resp);
       actionMetaEl.textContent = `已请求取消，撤单 ${data.cleanup ? data.cleanup.success : 0}/${data.cleanup ? data.cleanup.attempted : 0}`;
       if (data.task) renderTask(data.task);
-      await refreshStatus();
+      await refreshStatus({ force: true });
     }
     document.getElementById("refresh_btn").addEventListener("click", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "BUY").catch((err) => actionMetaEl.textContent = err.message));
@@ -16068,7 +16105,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
-    symbolEl.addEventListener("change", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
+    symbolEl.addEventListener("change", () => refreshStatus({ force: true }).catch((err) => actionMetaEl.textContent = err.message));
     loadSymbols()
       .then(refreshStatus)
       .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 3000); })
