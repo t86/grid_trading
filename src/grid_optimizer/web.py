@@ -9550,6 +9550,16 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
             _manual_trade_set_task(symbol, {"legs_done": legs_done})
         executed_total = sum(float(item.get("executed_qty", 0) or 0) for item in legs_done)
         attempts_total = sum(int(item.get("attempts", 0) or 0) for item in legs_done)
+        fill_notional = 0.0
+        last_fill_price = 0.0
+        for item in legs_done:
+            item_qty = float(item.get("executed_qty", 0) or 0)
+            last_order = item.get("last_order") if isinstance(item.get("last_order"), dict) else {}
+            fill_price = _safe_numeric(last_order.get("avgPrice")) or _safe_numeric(last_order.get("price"))
+            if item_qty > 0 and fill_price > 0:
+                fill_notional += item_qty * fill_price
+                last_fill_price = fill_price
+        avg_fill_price = fill_notional / executed_total if executed_total > 0 and fill_notional > 0 else 0.0
         _manual_trade_set_task(
             symbol,
             {
@@ -9558,6 +9568,8 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
                 "current_leg": None,
                 "current_order": None,
                 "executed_qty": executed_total,
+                "avg_fill_price": avg_fill_price,
+                "last_fill_price": last_fill_price,
                 "remaining_qty": 0.0,
                 "attempts": attempts_total,
                 "message": "all manual maker legs filled",
@@ -15828,8 +15840,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       <h2>追盘任务</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>状态</th><th>方向</th><th>目标</th><th>当前腿</th><th>已成交数量</th><th>剩余数量</th><th>尝试次数</th><th>消息</th></tr></thead>
-          <tbody id="task_body"><tr><td colspan="8">暂无任务</td></tr></tbody>
+          <thead><tr><th>状态</th><th>方向</th><th>目标</th><th>当前腿</th><th>成交均价</th><th>最后价格</th><th>已成交数量</th><th>剩余数量</th><th>尝试次数</th><th>消息</th></tr></thead>
+          <tbody id="task_body"><tr><td colspan="10">暂无任务</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -15888,18 +15900,22 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     function renderTask(task) {
       const body = document.getElementById("task_body");
       if (!task) {
-        body.innerHTML = '<tr><td colspan="8">暂无任务</td></tr>';
+        body.innerHTML = '<tr><td colspan="10">暂无任务</td></tr>';
         return;
       }
       const lastDone = Array.isArray(task.legs_done) && task.legs_done.length ? task.legs_done[task.legs_done.length - 1] : null;
       const leg = task.current_leg || (lastDone && lastDone.leg) || {};
       const lastOrder = lastDone && lastDone.last_order ? lastDone.last_order : null;
       const message = task.error || task.message || (lastOrder ? `${lastOrder.status || "--"} ${lastOrder.clientOrderId || ""}` : "--");
+      const avgFillPrice = Number(task.avg_fill_price) || (lastOrder ? Number(lastOrder.avgPrice || lastOrder.price) : NaN);
+      const lastFillPrice = Number(task.last_fill_price) || (lastOrder ? Number(lastOrder.avgPrice || lastOrder.price) : NaN);
       body.innerHTML = `<tr>
         <td>${escapeHtml(task.status || "--")}</td>
         <td>${escapeHtml(task.side || "--")}</td>
         <td>${fmt(task.notional, 2)} USDT</td>
         <td>${escapeHtml(leg.role || "--")}</td>
+        <td>${fmt(avgFillPrice, 8)}</td>
+        <td>${fmt(lastFillPrice, 8)}</td>
         <td>${fmt(task.executed_qty, 8)}</td>
         <td>${fmt(task.remaining_qty, 8)}</td>
         <td>${escapeHtml(task.attempts || 0)}</td>

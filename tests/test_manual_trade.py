@@ -218,7 +218,12 @@ class ManualTradeTests(unittest.TestCase):
             "leg": plan["legs"][0],
             "attempts": 2,
             "executed_qty": 0.001,
-            "last_order": {"status": "FILLED", "clientOrderId": "mt_btcusdc_close_b_1"},
+            "last_order": {
+                "status": "FILLED",
+                "clientOrderId": "mt_btcusdc_close_b_1",
+                "avgPrice": "76784.1000",
+                "price": "76784.1",
+            },
         }
         mock_snapshot.return_value = {"symbol": "BTCUSDC"}
 
@@ -229,6 +234,8 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIsNone(final_patch["current_order"])
         self.assertIsNone(final_patch["current_leg"])
         self.assertEqual(final_patch["executed_qty"], 0.001)
+        self.assertEqual(final_patch["avg_fill_price"], 76784.1)
+        self.assertEqual(final_patch["last_fill_price"], 76784.1)
         self.assertEqual(final_patch["remaining_qty"], 0.0)
         self.assertEqual(final_patch["attempts"], 2)
 
