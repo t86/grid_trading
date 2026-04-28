@@ -9548,11 +9548,18 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
                 )
             )
             _manual_trade_set_task(symbol, {"legs_done": legs_done})
+        executed_total = sum(float(item.get("executed_qty", 0) or 0) for item in legs_done)
+        attempts_total = sum(int(item.get("attempts", 0) or 0) for item in legs_done)
         _manual_trade_set_task(
             symbol,
             {
                 "status": "filled",
                 "legs_done": legs_done,
+                "current_leg": None,
+                "current_order": None,
+                "executed_qty": executed_total,
+                "remaining_qty": 0.0,
+                "attempts": attempts_total,
                 "message": "all manual maker legs filled",
                 "snapshot": _manual_trade_snapshot(symbol),
             },
@@ -15884,7 +15891,10 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         body.innerHTML = '<tr><td colspan="8">暂无任务</td></tr>';
         return;
       }
-      const leg = task.current_leg || {};
+      const lastDone = Array.isArray(task.legs_done) && task.legs_done.length ? task.legs_done[task.legs_done.length - 1] : null;
+      const leg = task.current_leg || (lastDone && lastDone.leg) || {};
+      const lastOrder = lastDone && lastDone.last_order ? lastDone.last_order : null;
+      const message = task.error || task.message || (lastOrder ? `${lastOrder.status || "--"} ${lastOrder.clientOrderId || ""}` : "--");
       body.innerHTML = `<tr>
         <td>${escapeHtml(task.status || "--")}</td>
         <td>${escapeHtml(task.side || "--")}</td>
@@ -15893,7 +15903,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <td>${fmt(task.executed_qty, 8)}</td>
         <td>${fmt(task.remaining_qty, 8)}</td>
         <td>${escapeHtml(task.attempts || 0)}</td>
-        <td>${escapeHtml(task.error || task.message || "--")}</td>
+        <td>${escapeHtml(message)}</td>
       </tr>`;
     }
     async function refreshStatus() {

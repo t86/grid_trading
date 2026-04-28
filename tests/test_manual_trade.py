@@ -10,6 +10,7 @@ from grid_optimizer.web import (
     _manual_trade_client_order_prefix,
     _manual_trade_chase_leg,
     _manual_trade_ensure_isolated,
+    _manual_trade_maker_worker,
     _manual_trade_prepare_plan,
 )
 
@@ -194,6 +195,42 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(result["executed_qty"], 10.0)
         mock_post_order.assert_called_once()
         mock_delete_order.assert_not_called()
+
+    @patch("grid_optimizer.web._manual_trade_snapshot")
+    @patch("grid_optimizer.web._manual_trade_chase_leg")
+    @patch("grid_optimizer.web._manual_trade_prepare_plan")
+    @patch("grid_optimizer.web._manual_trade_set_task")
+    def test_maker_worker_clears_current_order_after_fill(
+        self,
+        mock_set_task,
+        mock_prepare_plan,
+        mock_chase_leg,
+        mock_snapshot,
+    ) -> None:
+        plan = {
+            "symbol": "BTCUSDC",
+            "side": "BUY",
+            "notional": 100.0,
+            "legs": [{"role": "close_short", "side": "BUY", "quantity": 0.001, "reduce_only": True}],
+        }
+        mock_prepare_plan.return_value = ("BTCUSDC", "key", "secret", plan, 0.1, 0.001)
+        mock_chase_leg.return_value = {
+            "leg": plan["legs"][0],
+            "attempts": 2,
+            "executed_qty": 0.001,
+            "last_order": {"status": "FILLED", "clientOrderId": "mt_btcusdc_close_b_1"},
+        }
+        mock_snapshot.return_value = {"symbol": "BTCUSDC"}
+
+        _manual_trade_maker_worker("task-1", {"symbol": "BTCUSDC", "side": "BUY", "notional": 100.0})
+
+        final_patch = mock_set_task.call_args_list[-1].args[1]
+        self.assertEqual(final_patch["status"], "filled")
+        self.assertIsNone(final_patch["current_order"])
+        self.assertIsNone(final_patch["current_leg"])
+        self.assertEqual(final_patch["executed_qty"], 0.001)
+        self.assertEqual(final_patch["remaining_qty"], 0.0)
+        self.assertEqual(final_patch["attempts"], 2)
 
     def test_monitor_page_links_to_manual_trade_page(self) -> None:
         from grid_optimizer.web import MONITOR_PAGE
