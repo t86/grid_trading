@@ -1073,7 +1073,11 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
 
 
 def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
-    return str(strategy_profile or "").strip() in {"volume_long_v4", "trumpusdc_volume_long_v4"}
+    return str(strategy_profile or "").strip() in {
+        "volume_long_v4",
+        "trumpusdc_volume_long_v4",
+        "ethusdc_um_volume_long_v1",
+    }
 
 
 def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: bool = False) -> float:

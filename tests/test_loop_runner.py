@@ -91,6 +91,9 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(_uses_entry_price_cost_basis("trumpusdc_volume_long_v4"))
         self.assertTrue(_uses_volume_long_v4_staged_delever("trumpusdc_volume_long_v4"))
 
+    def test_ethusdc_volume_long_profile_uses_v4_delever_guards(self) -> None:
+        self.assertTrue(_uses_volume_long_v4_staged_delever("ethusdc_um_volume_long_v1"))
+
     def test_resolve_exposure_escalation_waits_for_hold_time(self) -> None:
         state: dict[str, object] = {}
         now = datetime(2026, 4, 24, 8, 0, tzinfo=timezone.utc)
