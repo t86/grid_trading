@@ -394,6 +394,8 @@ def build_running_status_card(
         "is_running": bool(runner_payload.get("is_running")),
         "pid": runner_payload.get("pid"),
         "updated_at": stats.get("updated_at"),
+        "session_start": stats.get("session_start"),
+        "session_trade_start": stats.get("session_trade_start"),
         "strategy_name": str(merged_config.get("strategy_profile") or normalized_symbol).strip(),
         "strategy_profile": merged_config.get("strategy_profile"),
         "strategy_mode": stats.get("strategy_mode") or merged_config.get("strategy_mode"),
