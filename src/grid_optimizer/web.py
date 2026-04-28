@@ -165,6 +165,8 @@ VOLUME_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
 VOLUME_TRIGGER_STATUS_LOCK = threading.Lock()
 VOLATILITY_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
 VOLATILITY_TRIGGER_STATUS_LOCK = threading.Lock()
+RUNNING_STATUS_OVERVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+RUNNING_STATUS_OVERVIEW_CACHE_LOCK = threading.Lock()
 FUNDING_MARGIN_RATIO = 0.5
 GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
@@ -28730,6 +28732,20 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
 
 def _running_status_server_entries() -> list[dict[str, str]]:
     raw = os.environ.get("GRID_RUNNING_STATUS_SERVERS", "").strip()
+    local_urls = {
+        item.strip().rstrip("/")
+        for item in str(os.environ.get("GRID_RUNNING_STATUS_LOCAL_URLS", "")).split(",")
+        if item.strip()
+    }
+    local_urls.update(
+        item.strip().rstrip("/")
+        for item in str(os.environ.get("GRID_RUNNING_STATUS_LOCAL_URL", "")).split(",")
+        if item.strip()
+    )
+
+    def should_include(url: str) -> bool:
+        return not local_urls or url.strip().rstrip("/") not in local_urls
+
     if raw:
         entries: list[dict[str, str]] = []
         for chunk in raw.split(","):
@@ -28741,12 +28757,17 @@ def _running_status_server_entries() -> list[dict[str, str]]:
             else:
                 label, url = item, item
             normalized_url = url.strip().rstrip("/")
-            if normalized_url:
+            if normalized_url and should_include(normalized_url):
                 entries.append({"label": label.strip() or normalized_url, "url": normalized_url})
         return entries
     return [
-        {"label": "43.131.232.150", "url": "http://43.131.232.150:8789"},
-        {"label": "43.155.136.111", "url": "http://43.155.136.111:8787"},
+        entry
+        for entry in [
+            {"label": "43.155.163.114", "url": "http://43.155.163.114:8788"},
+            {"label": "43.131.232.150", "url": "http://43.131.232.150:8789"},
+            {"label": "43.155.136.111", "url": "http://43.155.136.111:8787"},
+        ]
+        if should_include(entry["url"])
     ]
 
 
@@ -29172,7 +29193,58 @@ def _legacy_running_status_server_from_payload(
     }
 
 
-def _fetch_remote_running_status(entry: dict[str, str], timeout: float = 8.0) -> dict[str, Any]:
+def _running_status_remote_timeout_seconds() -> float:
+    raw = str(os.environ.get("GRID_RUNNING_STATUS_REMOTE_TIMEOUT_SECONDS") or "4").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 4.0
+    return max(0.5, value)
+
+
+def _running_status_overview_cache_seconds(scope: str) -> float:
+    raw = str(
+        os.environ.get(f"GRID_RUNNING_STATUS_OVERVIEW_{scope.upper()}_CACHE_SECONDS")
+        or os.environ.get("GRID_RUNNING_STATUS_OVERVIEW_CACHE_SECONDS")
+        or os.environ.get(f"GRID_RUNNING_STATUS_{scope.upper()}_CACHE_SECONDS")
+        or os.environ.get("GRID_RUNNING_STATUS_CACHE_SECONDS")
+        or "10"
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    return max(0.0, value)
+
+
+def _copy_running_status_overview_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(payload, ensure_ascii=False))
+
+
+def _get_cached_running_status_overview_payload(key: str, ttl_seconds: float) -> dict[str, Any] | None:
+    if ttl_seconds <= 0:
+        return None
+    now = time.monotonic()
+    with RUNNING_STATUS_OVERVIEW_CACHE_LOCK:
+        cached = RUNNING_STATUS_OVERVIEW_CACHE.get(key)
+        if cached is None:
+            return None
+        cached_at, payload = cached
+        if now - cached_at > ttl_seconds:
+            RUNNING_STATUS_OVERVIEW_CACHE.pop(key, None)
+            return None
+        return _copy_running_status_overview_payload(payload)
+
+
+def _set_cached_running_status_overview_payload(key: str, payload: dict[str, Any]) -> None:
+    with RUNNING_STATUS_OVERVIEW_CACHE_LOCK:
+        RUNNING_STATUS_OVERVIEW_CACHE[key] = (
+            time.monotonic(),
+            _copy_running_status_overview_payload(payload),
+        )
+
+
+def _fetch_remote_running_status(entry: dict[str, str], timeout: float | None = None) -> dict[str, Any]:
     url = f"{entry['url'].rstrip('/')}/api/running_status?scope=local"
     headers = {"Accept": "application/json"}
     remote_auth = os.environ.get("GRID_RUNNING_STATUS_AUTH", "")
@@ -29187,7 +29259,7 @@ def _fetch_remote_running_status(entry: dict[str, str], timeout: float = 8.0) ->
         headers["Authorization"] = f"Basic {token}"
     request = Request(url, headers=headers)
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with urlopen(request, timeout=timeout or _running_status_remote_timeout_seconds()) as response:
             payload = json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         return {"ok": False, "label": entry["label"], "url": entry["url"], "symbols": [], "error": f"{type(exc).__name__}: {exc}"}
@@ -29199,6 +29271,14 @@ def _fetch_remote_running_status(entry: dict[str, str], timeout: float = 8.0) ->
 
 
 def _build_running_status(scope: str = "cross") -> dict[str, Any]:
+    normalized_scope = "local" if scope == "local" else "cross"
+    cached = _get_cached_running_status_overview_payload(
+        normalized_scope,
+        _running_status_overview_cache_seconds(normalized_scope),
+    )
+    if cached is not None:
+        return cached
+
     local = _build_local_running_status()
     servers = [local]
     if scope != "local":
@@ -29207,7 +29287,7 @@ def _build_running_status(scope: str = "cross") -> dict[str, Any]:
             futures = [executor.submit(_fetch_remote_running_status, entry) for entry in entries]
             for future in as_completed(futures):
                 servers.append(future.result())
-    return {
+    payload = {
         "ok": True,
         "ts": datetime.now(timezone.utc).isoformat(),
         "scope": scope,
@@ -29215,6 +29295,8 @@ def _build_running_status(scope: str = "cross") -> dict[str, Any]:
         "servers": servers,
         "summary": _running_status_summary(servers),
     }
+    _set_cached_running_status_overview_payload(normalized_scope, payload)
+    return payload
 
 
 class _Handler(BaseHTTPRequestHandler):

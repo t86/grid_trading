@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -21,6 +23,47 @@ from .monitor import (
     summarize_user_trades,
 )
 from .notifications import alert_source_label
+
+
+RUNNING_STATUS_PAYLOAD_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+RUNNING_STATUS_PAYLOAD_CACHE_LOCK = threading.Lock()
+
+
+def _running_status_cache_seconds(scope: str) -> float:
+    raw = str(
+        os.environ.get(f"GRID_RUNNING_STATUS_{scope.upper()}_CACHE_SECONDS")
+        or os.environ.get("GRID_RUNNING_STATUS_CACHE_SECONDS")
+        or "10"
+    ).strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 10.0
+    return max(0.0, value)
+
+
+def _copy_status_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(payload, ensure_ascii=False))
+
+
+def _get_cached_status_payload(key: str, ttl_seconds: float) -> dict[str, Any] | None:
+    if ttl_seconds <= 0:
+        return None
+    now = time.monotonic()
+    with RUNNING_STATUS_PAYLOAD_CACHE_LOCK:
+        cached = RUNNING_STATUS_PAYLOAD_CACHE.get(key)
+        if cached is None:
+            return None
+        cached_at, payload = cached
+        if now - cached_at > ttl_seconds:
+            RUNNING_STATUS_PAYLOAD_CACHE.pop(key, None)
+            return None
+        return _copy_status_payload(payload)
+
+
+def _set_cached_status_payload(key: str, payload: dict[str, Any]) -> None:
+    with RUNNING_STATUS_PAYLOAD_CACHE_LOCK:
+        RUNNING_STATUS_PAYLOAD_CACHE[key] = (time.monotonic(), _copy_status_payload(payload))
 
 
 def _read_json_dict(path: Path) -> dict[str, Any] | None:
@@ -597,6 +640,18 @@ def build_running_status_cross_payload() -> dict[str, Any]:
     registry = load_console_registry()
     servers = [server for server in list(registry.get("servers") or []) if bool(server.get("enabled", True))]
     local_server_id = local_running_status_server_id(registry)
+    server_key = ",".join(
+        f"{str(server.get('id') or '').strip()}={str(server.get('base_url') or '').strip().rstrip('/')}"
+        for server in servers
+    )
+    cache_key = (
+        f"cross:{local_server_id or ''}:{server_key}:"
+        f"{id(build_running_status_local_payload)}:{id(fetch_remote_running_status_payload)}"
+    )
+    cached = _get_cached_status_payload(cache_key, _running_status_cache_seconds("cross"))
+    if cached is not None:
+        return cached
+
     server_payloads: list[dict[str, Any]] = []
     warnings: list[str] = []
 
@@ -632,7 +687,7 @@ def build_running_status_cross_payload() -> dict[str, Any]:
         server_payloads.append(payload)
 
     running_rows = _running_cards(server_payloads)
-    return {
+    payload = {
         "ok": True,
         "ts": datetime.now(timezone.utc).isoformat(),
         "scope": "cross",
@@ -652,6 +707,8 @@ def build_running_status_cross_payload() -> dict[str, Any]:
         },
         "warnings": warnings,
     }
+    _set_cached_status_payload(cache_key, payload)
+    return payload
 
 
 def run_running_status_query(query: dict[str, list[str]]) -> dict[str, Any]:
@@ -661,4 +718,12 @@ def run_running_status_query(query: dict[str, list[str]]) -> dict[str, Any]:
         return build_running_status_cross_payload()
     if scope not in {"", "local", "cross"}:
         raise ValueError("scope must be local or cross")
-    return build_running_status_local_payload(symbol=normalized_symbol or None)
+    if not normalized_symbol:
+        cache_key = "local"
+        cached = _get_cached_status_payload(cache_key, _running_status_cache_seconds("local"))
+        if cached is not None:
+            return cached
+        payload = build_running_status_local_payload(symbol=None)
+        _set_cached_status_payload(cache_key, payload)
+        return payload
+    return build_running_status_local_payload(symbol=normalized_symbol)
