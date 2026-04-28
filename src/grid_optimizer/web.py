@@ -9067,6 +9067,15 @@ def _manual_trade_client_order_prefix(symbol: str) -> str:
     return f"mt_{(normalized or 'symbol')[:18]}"
 
 
+def _strategy_client_order_prefix(symbol: str) -> str:
+    return f"gx-{str(symbol or '').lower().replace('usdt', 'u')}-"
+
+
+def _is_strategy_order(order: dict[str, Any], symbol: str) -> bool:
+    client_order_id = str(order.get("clientOrderId", "") or "")
+    return client_order_id.startswith(_strategy_client_order_prefix(symbol))
+
+
 def _is_manual_trade_order(order: dict[str, Any], prefix: str) -> bool:
     client_order_id = str(order.get("clientOrderId", "") or "")
     return client_order_id.startswith(str(prefix or ""))
@@ -9392,6 +9401,8 @@ def _manual_trade_chase_leg(
     attempts = 0
     current_order_id: int | None = None
     current_client_order_id: str | None = None
+    current_order_price = 0.0
+    current_order_executed_qty = 0.0
     last_order: dict[str, Any] | None = None
     while remaining_qty > 0:
         if _manual_trade_cancel_requested(symbol):
@@ -9408,6 +9419,45 @@ def _manual_trade_chase_leg(
                     pass
             raise RuntimeError("manual trade canceled")
         if current_order_id is not None or current_client_order_id:
+            order = fetch_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=current_order_id,
+                orig_client_order_id=current_client_order_id,
+            )
+            last_order = order
+            order_executed = _safe_numeric(order.get("executedQty"))
+            executed_delta = max(order_executed - current_order_executed_qty, 0.0)
+            if executed_delta > 0:
+                executed_qty += min(executed_delta, remaining_qty)
+                remaining_qty = max(float(leg["quantity"]) - executed_qty, 0.0)
+                current_order_executed_qty = order_executed
+            status = str(order.get("status", "")).upper()
+            if status == "FILLED" or remaining_qty <= 0:
+                current_order_id = None
+                current_client_order_id = None
+                current_order_price = 0.0
+                current_order_executed_qty = 0.0
+                break
+            bid_price, ask_price = _manual_trade_book_prices(symbol)
+            target_price = bid_price if str(leg["side"]).upper() == "BUY" else ask_price
+            order_price = _safe_numeric(order.get("price")) or current_order_price
+            if abs(order_price - target_price) <= 1e-12:
+                _manual_trade_set_task(
+                    symbol,
+                    {
+                        "status": "running",
+                        "current_leg": leg,
+                        "current_order": order,
+                        "attempts": attempts,
+                        "executed_qty": executed_qty,
+                        "remaining_qty": remaining_qty,
+                        "message": f"{leg['role']} resting at {order_price}",
+                    },
+                )
+                time.sleep(MANUAL_TRADE_SLEEP_SECONDS)
+                continue
             try:
                 delete_futures_order(
                     symbol=symbol,
@@ -9418,6 +9468,10 @@ def _manual_trade_chase_leg(
                 )
             except Exception:
                 pass
+            current_order_id = None
+            current_client_order_id = None
+            current_order_price = 0.0
+            current_order_executed_qty = 0.0
         bid_price, ask_price = _manual_trade_book_prices(symbol)
         price = bid_price if str(leg["side"]).upper() == "BUY" else ask_price
         client_order_id = _manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"]))
@@ -9435,6 +9489,8 @@ def _manual_trade_chase_leg(
         attempts += 1
         current_order_id = int(response["orderId"]) if response.get("orderId") is not None else None
         current_client_order_id = str(response.get("clientOrderId") or client_order_id)
+        current_order_price = price
+        current_order_executed_qty = _safe_numeric(response.get("executedQty"))
         _manual_trade_set_task(
             symbol,
             {
@@ -9448,23 +9504,6 @@ def _manual_trade_chase_leg(
             },
         )
         time.sleep(MANUAL_TRADE_SLEEP_SECONDS)
-        order = fetch_futures_order(
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            order_id=current_order_id,
-            orig_client_order_id=current_client_order_id,
-        )
-        last_order = order
-        order_executed = _safe_numeric(order.get("executedQty"))
-        status = str(order.get("status", "")).upper()
-        if order_executed > 0:
-            executed_qty += min(order_executed, remaining_qty)
-            remaining_qty = max(float(leg["quantity"]) - executed_qty, 0.0)
-        if status == "FILLED" or remaining_qty <= 0:
-            current_order_id = None
-            current_client_order_id = None
-            break
     return {
         "leg": leg,
         "attempts": attempts,
@@ -9627,8 +9666,10 @@ def _build_stop_execution_summary(
 def _cancel_symbol_open_orders(*, symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
     result = {"attempted": 0, "success": 0, "errors": []}
     open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
-    result["attempted"] = len(open_orders)
-    for order in open_orders:
+    strategy_orders = [order for order in open_orders if isinstance(order, dict) and _is_strategy_order(order, symbol)]
+    result["attempted"] = len(strategy_orders)
+    result["total_open_orders"] = len(open_orders)
+    for order in strategy_orders:
         order_id = order.get("orderId")
         try:
             delete_futures_order(

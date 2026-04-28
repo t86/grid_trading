@@ -7,7 +7,7 @@ import traceback
 from datetime import datetime, timezone
 from decimal import Decimal, ROUND_UP
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .data import (
     delete_futures_order,
@@ -191,6 +191,19 @@ def _build_client_order_id(*, symbol: str, role: str, index: int) -> str:
     compact_role = role.lower().replace("_", "")[:8]
     suffix = str(int(time.time() * 1000))[-8:]
     return f"gx-{compact_symbol}-{compact_role}-{index}-{suffix}"[:36]
+
+
+def _strategy_client_order_prefix(symbol: str) -> str:
+    return f"gx-{str(symbol or '').lower().replace('usdt', 'u')}-"
+
+
+def filter_strategy_open_orders(open_orders: Iterable[Any], symbol: str) -> list[dict[str, Any]]:
+    prefix = _strategy_client_order_prefix(symbol)
+    return [
+        order
+        for order in open_orders
+        if isinstance(order, dict) and str(order.get("clientOrderId", "") or "").startswith(prefix)
+    ]
 
 
 def adjust_post_only_price(
@@ -831,12 +844,13 @@ def main() -> None:
                 "请先关闭 Multi-Assets Mode，或改用 --margin-type CROSSED。"
             )
         current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
+        current_strategy_open_orders = filter_strategy_open_orders(current_open_orders, symbol)
         current_position = extract_symbol_position(account_info, symbol)
         current_actual_net_qty = _safe_float(current_position.get("positionAmt"))
         current_long_qty = max(current_actual_net_qty, 0.0)
         expected_open_order_count = int(plan_report.get("open_order_count", 0) or 0)
         expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
-        if len(current_open_orders) != expected_open_order_count:
+        if len(current_strategy_open_orders) != expected_open_order_count:
             raise SystemExit("当前未成交委托数量与计划生成时不一致，请先重新生成计划")
         if abs(current_long_qty - expected_long_qty) > 1e-9:
             raise SystemExit("当前持仓与计划生成时不一致，请先重新生成计划")
@@ -845,7 +859,7 @@ def main() -> None:
             actions=validation["actions"],
             strategy_mode=str(plan_report.get("strategy_mode", "")).strip() or "one_way_long",
             current_actual_net_qty=current_actual_net_qty,
-            current_open_orders=current_open_orders,
+            current_open_orders=current_strategy_open_orders,
         )
         report["reduce_only_position_cap"] = validation["actions"].get("reduce_only_position_cap")
         if validation["actions"]["place_count"] <= 0 and validation["actions"]["cancel_count"] <= 0:

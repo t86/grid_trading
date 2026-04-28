@@ -8,6 +8,7 @@ from grid_optimizer.web import (
     _build_manual_trade_plan,
     _is_manual_trade_order,
     _manual_trade_client_order_prefix,
+    _manual_trade_chase_leg,
     _manual_trade_ensure_isolated,
     _manual_trade_prepare_plan,
 )
@@ -156,6 +157,43 @@ class ManualTradeTests(unittest.TestCase):
         _manual_trade_prepare_plan("BARDUSDT", "BUY", 100.0)
 
         mock_change_margin.assert_not_called()
+
+    @patch("grid_optimizer.web._manual_trade_set_task")
+    @patch("grid_optimizer.web.fetch_futures_order")
+    @patch("grid_optimizer.web.post_futures_order")
+    @patch("grid_optimizer.web._manual_trade_book_prices")
+    @patch("grid_optimizer.web._manual_trade_cancel_requested")
+    @patch("grid_optimizer.web.delete_futures_order")
+    @patch("grid_optimizer.web.time.sleep")
+    def test_maker_chase_keeps_resting_order_when_best_price_is_unchanged(
+        self,
+        mock_sleep,
+        mock_delete_order,
+        mock_cancel_requested,
+        mock_book_prices,
+        mock_post_order,
+        mock_fetch_order,
+        mock_set_task,
+    ) -> None:
+        mock_cancel_requested.return_value = False
+        mock_book_prices.return_value = (1.0, 1.01)
+        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "mt_bardusdt_open_long_buy_1"}
+        mock_fetch_order.side_effect = [
+            {"status": "NEW", "executedQty": "0", "price": "1.0"},
+            {"status": "FILLED", "executedQty": "10", "price": "1.0"},
+        ]
+
+        result = _manual_trade_chase_leg(
+            symbol="BARDUSDT",
+            api_key="key",
+            api_secret="secret",
+            prefix=_manual_trade_client_order_prefix("BARDUSDT"),
+            leg={"role": "open_long", "side": "BUY", "quantity": 10.0, "reduce_only": False},
+        )
+
+        self.assertEqual(result["executed_qty"], 10.0)
+        mock_post_order.assert_called_once()
+        mock_delete_order.assert_not_called()
 
     def test_monitor_page_links_to_manual_trade_page(self) -> None:
         from grid_optimizer.web import MONITOR_PAGE

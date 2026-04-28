@@ -22,6 +22,7 @@ from grid_optimizer.web import (
     _build_runner_command,
     _client_ip_allowed,
     _default_runtime_paths_for_symbol,
+    _cancel_symbol_open_orders,
     _execute_stop_actions,
     _get_custom_runner_preset,
     _load_runner_control_config,
@@ -61,6 +62,26 @@ class WebSecurityTests(unittest.TestCase):
 
     def _mock_book(self) -> list[dict[str, str]]:
         return [{"bid_price": "1.2345", "ask_price": "1.2347"}]
+
+    @patch("grid_optimizer.web.delete_futures_order")
+    @patch("grid_optimizer.web.fetch_futures_open_orders")
+    def test_cancel_symbol_open_orders_only_cancels_strategy_orders(
+        self,
+        mock_open_orders,
+        mock_delete_order,
+    ) -> None:
+        mock_open_orders.return_value = [
+            {"orderId": 1, "clientOrderId": "gx-btcusdc-entry-1"},
+            {"orderId": 2, "clientOrderId": "mt_btcusdc_buy_1"},
+            {"orderId": 3, "clientOrderId": ""},
+        ]
+
+        result = _cancel_symbol_open_orders(symbol="BTCUSDC", api_key="key", api_secret="secret")
+
+        self.assertEqual(result["attempted"], 1)
+        self.assertEqual(result["success"], 1)
+        mock_delete_order.assert_called_once()
+        self.assertEqual(mock_delete_order.call_args.kwargs["orig_client_order_id"], "gx-btcusdc-entry-1")
 
     def _required_long_risk_guards(self, *, pause: float = 750.0, target: float = 430.0) -> dict[str, float | bool]:
         return {

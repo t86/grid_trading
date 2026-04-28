@@ -8,6 +8,7 @@ from grid_optimizer.submit_plan import (
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
+    filter_strategy_open_orders,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     validate_plan_report,
@@ -15,6 +16,18 @@ from grid_optimizer.submit_plan import (
 
 
 class SubmitPlanTests(unittest.TestCase):
+    def test_filter_strategy_open_orders_excludes_manual_orders(self) -> None:
+        result = filter_strategy_open_orders(
+            [
+                {"clientOrderId": "gx-btcusdc-entry-1", "orderId": 1},
+                {"clientOrderId": "mt_btcusdc_buy_1", "orderId": 2},
+                {"clientOrderId": "", "orderId": 3},
+            ],
+            "BTCUSDC",
+        )
+
+        self.assertEqual(result, [{"clientOrderId": "gx-btcusdc-entry-1", "orderId": 1}])
+
     def test_build_execution_actions_combines_bootstrap_and_missing_orders(self) -> None:
         report = {
             "bootstrap_orders": [
