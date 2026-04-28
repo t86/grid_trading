@@ -173,6 +173,7 @@ RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
 HOURLY_EMAIL_REPORT_STATE_PATH = Path("output/hourly_email_report_state.json")
 MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
 CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
+MANUAL_TRADE_HISTORY_PATH = Path("output/manual_trade_history.json")
 VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
     "15m": 15,
     "30m": 30,
@@ -9103,6 +9104,7 @@ def _env_float(name: str, default: float, *, minimum: float = 0.2) -> float:
 
 MANUAL_TRADE_TASKS: dict[str, dict[str, Any]] = {}
 MANUAL_TRADE_TASKS_LOCK = threading.Lock()
+MANUAL_TRADE_HISTORY_LOCK = threading.Lock()
 MANUAL_TRADE_SLEEP_SECONDS = _env_float("GRID_MANUAL_TRADE_SLEEP_SECONDS", 1.0)
 MANUAL_TRADE_MIN_REPRICE_SECONDS = _env_float("GRID_MANUAL_TRADE_MIN_REPRICE_SECONDS", 1.0)
 
@@ -9236,6 +9238,100 @@ def _manual_trade_public_task(task: dict[str, Any] | None) -> dict[str, Any] | N
     return public
 
 
+def _manual_trade_history_items() -> list[dict[str, Any]]:
+    payload = _read_json_dict(MANUAL_TRADE_HISTORY_PATH) or {}
+    raw_items = payload.get("items")
+    if not isinstance(raw_items, list):
+        return []
+    return [dict(item) for item in raw_items if isinstance(item, dict)]
+
+
+def _manual_trade_history_for_symbol(symbol: str) -> list[dict[str, Any]]:
+    key = _manual_trade_task_key(symbol)
+    with MANUAL_TRADE_HISTORY_LOCK:
+        items = _manual_trade_history_items()
+    return [item for item in items if str(item.get("symbol", "")).upper().strip() == key]
+
+
+def _manual_trade_append_history(item: dict[str, Any]) -> dict[str, Any]:
+    record = dict(item)
+    record["symbol"] = _manual_trade_task_key(str(record.get("symbol", "")))
+    record.setdefault("id", uuid.uuid4().hex)
+    record.setdefault("completed_at", datetime.now(timezone.utc).isoformat())
+    with MANUAL_TRADE_HISTORY_LOCK:
+        items = _manual_trade_history_items()
+        items.append(record)
+        _write_json_dict(
+            MANUAL_TRADE_HISTORY_PATH,
+            {"items": items, "updated_at": datetime.now(timezone.utc).isoformat()},
+        )
+    return dict(record)
+
+
+def _manual_trade_fill_price_from_order(order: dict[str, Any], executed_qty: float) -> float:
+    avg_price = _safe_numeric(order.get("avgPrice"))
+    if avg_price > 0:
+        return avg_price
+    cum_quote = _safe_numeric(order.get("cumQuote"))
+    if cum_quote > 0 and executed_qty > 0:
+        return cum_quote / executed_qty
+    return _safe_numeric(order.get("price"))
+
+
+def _manual_trade_history_from_filled_task(task: dict[str, Any]) -> dict[str, Any]:
+    executed_qty = float(task.get("executed_qty", 0) or 0)
+    avg_fill_price = float(task.get("avg_fill_price", 0) or 0)
+    plan = task.get("plan") if isinstance(task.get("plan"), dict) else {}
+    return {
+        "id": str(task.get("id") or uuid.uuid4().hex),
+        "source": "maker",
+        "symbol": str(task.get("symbol", "")),
+        "side": str(task.get("side", "")),
+        "status": str(task.get("status", "")),
+        "target_notional": float(task.get("notional", 0) or 0),
+        "planned_notional": float(plan.get("planned_notional", 0) or 0),
+        "executed_qty": executed_qty,
+        "avg_fill_price": avg_fill_price,
+        "last_fill_price": float(task.get("last_fill_price", 0) or 0),
+        "fill_notional": executed_qty * avg_fill_price if executed_qty > 0 and avg_fill_price > 0 else 0.0,
+        "attempts": int(task.get("attempts", 0) or 0),
+        "legs_done": list(task.get("legs_done") or []),
+        "started_at": str(task.get("created_at") or ""),
+        "completed_at": str(task.get("updated_at") or datetime.now(timezone.utc).isoformat()),
+    }
+
+
+def _manual_trade_history_from_take_orders(symbol: str, plan: dict[str, Any], orders: list[dict[str, Any]]) -> dict[str, Any]:
+    executed_total = 0.0
+    fill_notional = 0.0
+    last_fill_price = 0.0
+    for order in orders:
+        executed_qty = _safe_numeric(order.get("executedQty"))
+        fill_price = _manual_trade_fill_price_from_order(order, executed_qty)
+        if executed_qty > 0 and fill_price > 0:
+            executed_total += executed_qty
+            fill_notional += executed_qty * fill_price
+            last_fill_price = fill_price
+    avg_fill_price = fill_notional / executed_total if executed_total > 0 and fill_notional > 0 else 0.0
+    return {
+        "id": uuid.uuid4().hex,
+        "source": "take",
+        "symbol": symbol,
+        "side": str(plan.get("side", "")),
+        "status": "filled",
+        "target_notional": float(plan.get("notional", 0) or 0),
+        "planned_notional": float(plan.get("planned_notional", 0) or 0),
+        "executed_qty": executed_total,
+        "avg_fill_price": avg_fill_price,
+        "last_fill_price": last_fill_price,
+        "fill_notional": fill_notional,
+        "attempts": len(orders),
+        "orders": list(orders),
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _manual_trade_set_task(symbol: str, patch: dict[str, Any]) -> dict[str, Any]:
     key = _manual_trade_task_key(symbol)
     with MANUAL_TRADE_TASKS_LOCK:
@@ -9264,7 +9360,9 @@ def _manual_trade_initialize_task(symbol: str, patch: dict[str, Any]) -> dict[st
     key = _manual_trade_task_key(symbol)
     with MANUAL_TRADE_TASKS_LOCK:
         clean["symbol"] = key
-        clean["updated_at"] = datetime.now(timezone.utc).isoformat()
+        now = datetime.now(timezone.utc).isoformat()
+        clean.setdefault("created_at", now)
+        clean["updated_at"] = now
         MANUAL_TRADE_TASKS[key] = dict(clean)
         return dict(clean)
 
@@ -9391,6 +9489,7 @@ def _manual_trade_snapshot(symbol: str) -> dict[str, Any]:
         "manual_prefix": prefix,
         "runner": runner,
         "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol)),
+        "history": _manual_trade_history_for_symbol(normalized_symbol),
     }
 
 
@@ -9460,7 +9559,8 @@ def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
                 new_client_order_id=_manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"])),
             )
         )
-    return {"symbol": symbol, "plan": plan, "orders": responses, "snapshot": _manual_trade_snapshot(symbol)}
+    history = _manual_trade_append_history(_manual_trade_history_from_take_orders(symbol, plan, responses))
+    return {"symbol": symbol, "plan": plan, "orders": responses, "history": history, "snapshot": _manual_trade_snapshot(symbol)}
 
 
 def _manual_trade_chase_leg(
@@ -9646,10 +9746,13 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
                 fill_notional += item_qty * fill_price
                 last_fill_price = fill_price
         avg_fill_price = fill_notional / executed_total if executed_total > 0 and fill_notional > 0 else 0.0
-        _manual_trade_set_task(
+        final_task = _manual_trade_set_task(
             symbol,
             {
                 "status": "filled",
+                "side": plan["side"],
+                "notional": plan["notional"],
+                "plan": plan,
                 "legs_done": legs_done,
                 "current_leg": None,
                 "current_order": None,
@@ -9662,6 +9765,7 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
                 "snapshot": _manual_trade_snapshot(symbol),
             },
         )
+        _manual_trade_append_history(_manual_trade_history_from_filled_task(final_task))
     except Exception as exc:
         status = "canceled" if "canceled" in str(exc).lower() else "error"
         if symbol:
@@ -15942,6 +16046,16 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         </table>
       </div>
     </section>
+
+    <section class="card">
+      <h2>成交历史</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>时间</th><th>类型</th><th>方向</th><th>目标</th><th>预计挂单</th><th>成交额</th><th>成交均价</th><th>最后价格</th><th>成交数量</th><th>尝试次数</th></tr></thead>
+          <tbody id="history_body"><tr><td colspan="10">暂无成交历史</td></tr></tbody>
+        </table>
+      </div>
+    </section>
   </div>
   <script>
     const symbolEl = document.getElementById("manual_symbol");
@@ -16016,6 +16130,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       riskBoxEl.style.display = risks.length ? "block" : "none";
       riskBoxEl.innerHTML = risks.map(escapeHtml).join("<br>");
       renderTask(snapshot.task);
+      renderHistory(snapshot.history || []);
     }
     function renderTask(task) {
       const body = document.getElementById("task_body");
@@ -16048,6 +16163,32 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <td>${escapeHtml(task.attempts || 0)}</td>
         <td>${escapeHtml(message)}</td>
       </tr>`;
+    }
+    function fmtTime(value) {
+      if (!value) return "--";
+      const date = new Date(value);
+      if (Number.isNaN(date.getTime())) return String(value);
+      return date.toLocaleString();
+    }
+    function renderHistory(history) {
+      const body = document.getElementById("history_body");
+      const rows = Array.isArray(history) ? [...history].reverse() : [];
+      if (!rows.length) {
+        body.innerHTML = '<tr><td colspan="10">暂无成交历史</td></tr>';
+        return;
+      }
+      body.innerHTML = rows.map((item) => `<tr>
+        <td>${escapeHtml(fmtTime(item.completed_at))}</td>
+        <td>${escapeHtml((item.source || "--").toUpperCase())}</td>
+        <td>${escapeHtml(item.side || "--")}</td>
+        <td>${fmt(item.target_notional, 2)} USDT</td>
+        <td>${fmt(item.planned_notional, 4)} USDT</td>
+        <td>${fmt(item.fill_notional, 4)} USDT</td>
+        <td>${fmt(item.avg_fill_price, 8)}</td>
+        <td>${fmt(item.last_fill_price, 8)}</td>
+        <td>${fmt(item.executed_qty, 8)}</td>
+        <td>${escapeHtml(item.attempts || 0)}</td>
+      </tr>`).join("");
     }
     async function refreshStatus({ force = false } = {}) {
       if (refreshInFlight) {

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.web import (
@@ -12,6 +14,7 @@ from grid_optimizer.web import (
     _manual_trade_cancel,
     _manual_trade_current_task,
     _manual_trade_ensure_isolated,
+    _manual_trade_history_for_symbol,
     _manual_trade_maker_worker,
     MANUAL_TRADE_SLEEP_SECONDS,
     _manual_trade_set_task,
@@ -20,9 +23,22 @@ from grid_optimizer.web import (
 
 
 class ManualTradeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        import grid_optimizer.web as web
+
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._history_patch = patch.object(
+            web,
+            "MANUAL_TRADE_HISTORY_PATH",
+            Path(self._tmpdir.name) / "manual_trade_history.json",
+        )
+        self._history_patch.start()
+
     def tearDown(self) -> None:
         from grid_optimizer.web import MANUAL_TRADE_TASKS
 
+        self._history_patch.stop()
+        self._tmpdir.cleanup()
         MANUAL_TRADE_TASKS.clear()
 
     def _symbol_info(self) -> dict[str, float]:
@@ -154,6 +170,8 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("fetchJsonWithTimeout", MANUAL_TRADE_PAGE)
         self.assertIn("cancelStatusRefresh()", MANUAL_TRADE_PAGE)
         self.assertIn('setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500)', MANUAL_TRADE_PAGE)
+        self.assertIn('id="history_body"', MANUAL_TRADE_PAGE)
+        self.assertIn("renderHistory(snapshot.history || [])", MANUAL_TRADE_PAGE)
 
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     @patch("grid_optimizer.web.fetch_futures_account_info_v3")
@@ -287,6 +305,12 @@ class ManualTradeTests(unittest.TestCase):
             },
         }
         mock_snapshot.return_value = {"symbol": "BTCUSDC"}
+        mock_set_task.side_effect = lambda symbol, patch: {
+            "id": "task-1",
+            "symbol": symbol,
+            "updated_at": "2026-04-28T12:00:00+00:00",
+            **patch,
+        }
 
         _manual_trade_maker_worker("task-1", {"symbol": "BTCUSDC", "side": "BUY", "notional": 100.0})
 
@@ -299,6 +323,12 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(final_patch["last_fill_price"], 76784.1)
         self.assertEqual(final_patch["remaining_qty"], 0.0)
         self.assertEqual(final_patch["attempts"], 2)
+        history = _manual_trade_history_for_symbol("BTCUSDC")
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["source"], "maker")
+        self.assertEqual(history[0]["side"], "BUY")
+        self.assertAlmostEqual(history[0]["avg_fill_price"], 76784.1)
+        self.assertAlmostEqual(history[0]["fill_notional"], 76.7841)
 
     def test_starting_new_task_resets_previous_fill_fields(self) -> None:
         _manual_trade_set_task(
