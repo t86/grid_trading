@@ -4201,17 +4201,10 @@ def _build_running_status_local_payload(
         if not card_symbol:
             continue
         runner = _read_runner_process_for_symbol(card_symbol)
-        fast_status: dict[str, Any] | None = None
-        if bool(runner.get("is_running")):
-            try:
-                fast_status = _build_fast_running_status_item(card_symbol, runner)
-            except Exception:
-                fast_status = None
         snapshot = _running_status_snapshot_from_config(
             card_symbol,
             config,
             runner,
-            fast_status=fast_status,
         )
         cards.append(
             _running_status_card_from_snapshot(

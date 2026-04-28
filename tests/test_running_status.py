@@ -147,7 +147,7 @@ class RunningStatusTests(unittest.TestCase):
                     ):
                         with patch(
                             "grid_optimizer.web._build_fast_running_status_item",
-                            return_value={"recent_hour_volume": 12.0, "open_order_count": 2, "total_pnl": 3.5},
+                            side_effect=AssertionError("should not build fast status item"),
                         ):
                             payload = _build_running_status_local_payload()
             finally:
@@ -155,9 +155,9 @@ class RunningStatusTests(unittest.TestCase):
 
         self.assertEqual([item["symbol"] for item in payload["groups"]["running"]], ["SOONUSDT"])
         self.assertEqual([item["symbol"] for item in payload["groups"]["saved_idle"]], ["CHIPUSDT"])
-        self.assertEqual(payload["groups"]["running"][0]["recent_hour_volume"], 12.0)
-        self.assertEqual(payload["groups"]["running"][0]["open_order_count"], 2)
-        self.assertEqual(payload["groups"]["running"][0]["total_pnl"], 3.5)
+        self.assertEqual(payload["groups"]["running"][0]["recent_hour_volume"], 0.0)
+        self.assertEqual(payload["groups"]["running"][0]["open_order_count"], 0)
+        self.assertEqual(payload["groups"]["running"][0]["total_pnl"], 0.0)
 
     def test_build_running_status_cross_payload_aggregates_servers(self) -> None:
         from grid_optimizer.web import _build_running_status_cross_payload
