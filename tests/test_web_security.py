@@ -26,6 +26,7 @@ from grid_optimizer.web import (
     _execute_stop_actions,
     _get_custom_runner_preset,
     _load_runner_control_config,
+    _legacy_running_status_server_from_payload,
     _normalize_runner_control_payload,
     _normalize_runner_volatility_trigger_config,
     _parse_allowed_networks,
@@ -33,8 +34,10 @@ from grid_optimizer.web import (
     _resolve_runner_volatility_trigger_action,
     _select_runner_volatility_trigger_signal,
     _resolve_runner_start_config,
+    _render_running_status_overview_page,
     _render_running_status_page,
     _run_loop_monitor_query,
+    _run_running_status_overview_query,
     _reconcile_runner_volatility_trigger,
     _runtime_guard_input_summary,
     _running_status_stats_start_time,
@@ -190,6 +193,62 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("停止", page)
         self.assertIn("高级 JSON", page)
         self.assertIn("strategy_mode", page)
+
+    def test_running_status_overview_page_restores_cross_server_table(self) -> None:
+        page = _render_running_status_overview_page()
+
+        self.assertIn("运行中币种状态", page)
+        self.assertIn("按服务器汇总正在运行的合约策略", page)
+        self.assertIn("/api/running_status_overview?scope=cross", page)
+        self.assertIn("总成交量", page)
+        self.assertIn("持仓状态", page)
+        self.assertNotIn('const INITIAL_VIEW_MODE = "local";', page)
+
+    @patch("grid_optimizer.web._build_running_status")
+    def test_run_running_status_overview_query_uses_legacy_cross_payload(self, mock_build) -> None:
+        mock_build.return_value = {"ok": True, "scope": "cross", "servers": []}
+
+        payload = _run_running_status_overview_query({"scope": ["cross"]})
+
+        self.assertEqual(payload, {"ok": True, "scope": "cross", "servers": []})
+        mock_build.assert_called_once_with(scope="cross")
+
+    def test_legacy_running_status_server_from_new_local_payload_uses_running_cards(self) -> None:
+        server = _legacy_running_status_server_from_payload(
+            {
+                "ok": True,
+                "server_label": "114",
+                "groups": {
+                    "running": [
+                        {
+                            "symbol": "SOONUSDT",
+                            "strategy_name": "soon-profile",
+                            "total_volume": 123.4,
+                            "recent_hour_volume": 12.3,
+                            "total_pnl": 4.5,
+                            "trade_pnl": 6.0,
+                            "unrealized_pnl": 1.0,
+                            "total_fees": 2.0,
+                            "funding_fee": -0.5,
+                            "open_order_count": 7,
+                            "current_position_display": "净 1 · 多 1 / 空 0",
+                            "updated_at": "2026-04-28T01:02:03+00:00",
+                        }
+                    ],
+                    "saved_idle": [{"symbol": "IDLEUSDT"}],
+                },
+            },
+            fallback_label="fallback",
+            fallback_url="http://server",
+        )
+
+        self.assertTrue(server["ok"])
+        self.assertEqual(server["label"], "114")
+        self.assertEqual(len(server["symbols"]), 1)
+        self.assertEqual(server["symbols"][0]["symbol"], "SOONUSDT")
+        self.assertEqual(server["symbols"][0]["fees"], 2.0)
+        self.assertEqual(server["symbols"][0]["open_order_summary"], "7 笔")
+        self.assertEqual(server["symbols"][0]["position_summary"], "净 1 · 多 1 / 空 0")
 
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
         if "getSelectedSymbol(" in MONITOR_PAGE:

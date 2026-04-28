@@ -4541,6 +4541,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     .rs-toolbar input,
     .rs-toolbar select,
     .rs-toolbar button,
+    .rs-toolbar a,
     .rs-form-fields input,
     .rs-form-fields select,
     .rs-json-panel textarea {
@@ -4558,9 +4559,13 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       color: var(--text);
     }
     .rs-toolbar button,
+    .rs-toolbar a,
     .rs-card-action,
     .rs-drawer-actions button,
     .rs-close-btn {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       min-height: 40px;
       border: 1px solid var(--line);
       border-radius: 8px;
@@ -4569,6 +4574,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       padding: 0 14px;
       cursor: pointer;
       font-weight: 700;
+      text-decoration: none;
     }
     .rs-toolbar button.primary,
     .rs-card-action.primary,
@@ -4886,6 +4892,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         </label>
         <button id="refresh_btn" class="primary">立即刷新</button>
         <button id="toggle_refresh_btn">暂停自动刷新</button>
+        <a href="/running_status_overview">跨服表格总览</a>
         <div id="page_meta" class="rs-muted">等待首轮数据...</div>
       </div>
     </section>
@@ -16688,6 +16695,7 @@ MONITOR_PAGE = """<!doctype html>
         <a href="/strategies">打开策略总览</a>
         <a href="/runner_settings">打开策略设置</a>
         <a href="/running_status">运行币种状态</a>
+        <a href="/running_status_overview">跨服运行总览</a>
       </div>
       <div class="toolbar">
         <label>交易对
@@ -22780,6 +22788,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       <p>按服务器汇总正在运行的合约策略，统一看成交额、最近一小时成交额、盈亏拆解、挂单和持仓。</p>
       <div class="links">
         <a href="/monitor">单币监控</a>
+        <a href="/running_status">运行控制台</a>
         <a href="/runner_settings">策略设置</a>
         <a href="/strategies">策略总览</a>
         <a href="/">策略测算页</a>
@@ -22926,6 +22935,20 @@ RUNNING_STATUS_PAGE = """<!doctype html>
 </body>
 </html>
 """
+
+
+def _render_running_status_overview_page() -> str:
+    return RUNNING_STATUS_PAGE.replace(
+        "/api/running_status?scope=cross",
+        "/api/running_status_overview?scope=cross",
+    )
+
+
+def _run_running_status_overview_query(query: dict[str, list[str]]) -> dict[str, Any]:
+    scope = str((query.get("scope") or ["cross"])[0] or "cross").strip().lower()
+    if scope not in {"local", "cross"}:
+        raise ValueError("scope must be local or cross")
+    return _build_running_status(scope=scope)
 
 
 SPOT_RUNNER_PAGE = """<!doctype html>
@@ -28765,6 +28788,70 @@ def _running_status_summary(servers: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _legacy_running_status_item_from_card(card: dict[str, Any]) -> dict[str, Any]:
+    open_order_count = int(_status_float(card.get("open_order_count")))
+    return {
+        "symbol": str(card.get("symbol") or "").upper().strip(),
+        "strategy_name": card.get("strategy_name") or card.get("strategy_profile") or "--",
+        "strategy_profile": card.get("strategy_profile"),
+        "requested_strategy_profile": card.get("requested_strategy_profile") or card.get("strategy_profile"),
+        "strategy_mode": str(card.get("strategy_mode") or "").strip(),
+        "updated_at": card.get("updated_at"),
+        "total_volume": _status_float(card.get("total_volume")),
+        "recent_hour_volume": _status_float(card.get("recent_hour_volume")),
+        "total_pnl": _status_float(card.get("total_pnl")),
+        "trade_pnl": _status_float(card.get("trade_pnl")),
+        "unrealized_pnl": _status_float(card.get("unrealized_pnl")),
+        "fees": _status_float(card.get("fees") if card.get("fees") is not None else card.get("total_fees")),
+        "funding_fee": _status_float(card.get("funding_fee")),
+        "open_order_count": open_order_count,
+        "open_order_summary": card.get("open_order_summary") or f"{open_order_count} 笔",
+        "position_summary": card.get("position_summary") or card.get("current_position_display") or "--",
+        "runner": {"pid": card.get("pid"), "elapsed": card.get("elapsed")},
+    }
+
+
+def _legacy_running_status_server_from_payload(
+    payload: dict[str, Any],
+    *,
+    fallback_label: str,
+    fallback_url: str,
+) -> dict[str, Any]:
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = payload.get("error", "invalid response") if isinstance(payload, dict) else "invalid response"
+        return {
+            "ok": False,
+            "label": fallback_label,
+            "url": fallback_url,
+            "symbols": [],
+            "error": str(error),
+        }
+    server = payload.get("server") if isinstance(payload.get("server"), dict) else payload
+    if not isinstance(server, dict):
+        return {
+            "ok": False,
+            "label": fallback_label,
+            "url": fallback_url,
+            "symbols": [],
+            "error": "invalid response",
+        }
+    symbols = list(server.get("symbols") or [])
+    if not symbols:
+        groups = server.get("groups") if isinstance(server.get("groups"), dict) else {}
+        symbols = [
+            _legacy_running_status_item_from_card(item)
+            for item in list(groups.get("running") or [])
+            if isinstance(item, dict)
+        ]
+    return {
+        "ok": True,
+        "label": str(server.get("label") or server.get("server_label") or fallback_label),
+        "url": fallback_url,
+        "symbols": symbols,
+        "errors": list(server.get("errors") or []),
+    }
+
+
 def _fetch_remote_running_status(entry: dict[str, str], timeout: float = 8.0) -> dict[str, Any]:
     url = f"{entry['url'].rstrip('/')}/api/running_status?scope=local"
     headers = {"Accept": "application/json"}
@@ -28784,16 +28871,11 @@ def _fetch_remote_running_status(entry: dict[str, str], timeout: float = 8.0) ->
             payload = json.loads(response.read().decode("utf-8"))
     except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
         return {"ok": False, "label": entry["label"], "url": entry["url"], "symbols": [], "error": f"{type(exc).__name__}: {exc}"}
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        return {"ok": False, "label": entry["label"], "url": entry["url"], "symbols": [], "error": str((payload or {}).get("error", "invalid response"))}
-    server = payload.get("server") if isinstance(payload.get("server"), dict) else payload
-    return {
-        "ok": True,
-        "label": str(server.get("label") or entry["label"]),
-        "url": entry["url"],
-        "symbols": list(server.get("symbols") or []),
-        "errors": list(server.get("errors") or []),
-    }
+    return _legacy_running_status_server_from_payload(
+        payload,
+        fallback_label=entry["label"],
+        fallback_url=entry["url"],
+    )
 
 
 def _build_running_status(scope: str = "cross") -> dict[str, Any]:
@@ -28909,6 +28991,9 @@ class _Handler(BaseHTTPRequestHandler):
             symbol = str(query.get("symbol", [""])[0]).upper().strip() or None
             self._send_html(_render_running_status_page(symbol=symbol), status=HTTPStatus.OK)
             return
+        if path in {"/running_status_overview", "/running_status_overview.html"}:
+            self._send_html(_render_running_status_overview_page(), status=HTTPStatus.OK)
+            return
         if path in {"/monitor", "/monitor.html"}:
             self._send_html(MONITOR_PAGE, status=HTTPStatus.OK)
             return
@@ -28933,6 +29018,17 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/running_status":
             try:
                 payload = _run_running_status_query(query)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
+            return
+        if path == "/api/running_status_overview":
+            try:
+                payload = _run_running_status_overview_query(query)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
@@ -29153,6 +29249,7 @@ class _Handler(BaseHTTPRequestHandler):
     def do_HEAD(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
+        query = parse_qs(parsed.query)
         if not self._authorize_request():
             return
         if path in {"/hub", "/hub.html", "/portal", "/portal.html"}:
@@ -29189,6 +29286,12 @@ class _Handler(BaseHTTPRequestHandler):
             body = _render_running_status_page(
                 symbol=str(query.get("symbol", [""])[0]).upper().strip() or None
             ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
+        if path in {"/running_status_overview", "/running_status_overview.html"}:
+            body = _render_running_status_overview_page().encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
@@ -29240,6 +29343,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path.startswith("/api/symbols")
             or path == "/api/price"
             or path == "/api/running_status"
+            or path == "/api/running_status_overview"
             or path.startswith("/api/loop_monitor")
             or path == "/api/running_status"
             or path == "/api/grid_preview"
