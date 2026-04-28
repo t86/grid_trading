@@ -33,8 +33,8 @@ class ManualTradeTests(unittest.TestCase):
             "min_notional": 5.0,
         }
 
-    def test_manual_maker_chase_checks_every_five_seconds(self) -> None:
-        self.assertEqual(MANUAL_TRADE_SLEEP_SECONDS, 5.0)
+    def test_manual_maker_chase_checks_every_ten_seconds(self) -> None:
+        self.assertEqual(MANUAL_TRADE_SLEEP_SECONDS, 10.0)
 
     def test_manual_trade_prefix_is_symbol_scoped(self) -> None:
         prefix = _manual_trade_client_order_prefix("BARDUSDT")
