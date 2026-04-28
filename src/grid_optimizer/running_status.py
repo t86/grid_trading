@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from .audit import build_audit_paths, income_row_time_ms, read_jsonl, trade_row_time_ms
+from .audit import build_audit_paths, income_row_time_ms, trade_row_time_ms
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
 from .monitor import (
@@ -59,6 +59,38 @@ def _runtime_jsonl_limit() -> int:
     return max(200, value)
 
 
+def _read_jsonl_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    chunk_size = 64 * 1024
+    max_bytes = max(1, limit // 1000) * 1024 * 1024
+    data = bytearray()
+    try:
+        with path.open("rb") as fh:
+            fh.seek(0, 2)
+            pos = fh.tell()
+            while pos > 0 and data.count(b"\n") <= limit and len(data) < max_bytes:
+                read_size = min(chunk_size, pos)
+                pos -= read_size
+                fh.seek(pos)
+                data[:0] = fh.read(read_size)
+    except OSError:
+        return []
+
+    rows: list[dict[str, Any]] = []
+    for raw_line in data.splitlines()[-limit:]:
+        raw_line = raw_line.strip()
+        if not raw_line:
+            continue
+        try:
+            item = json.loads(raw_line.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            continue
+        if isinstance(item, dict):
+            rows.append(item)
+    return rows
+
+
 def _runner_status_runtime_paths(symbol: str, runner: dict[str, Any]) -> dict[str, str]:
     runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
     runtime_paths = _default_runtime_paths_for_symbol(symbol)
@@ -70,7 +102,7 @@ def _runner_status_runtime_paths(symbol: str, runner: dict[str, Any]) -> dict[st
 
 
 def _read_runtime_rows(path: Path) -> list[dict[str, Any]]:
-    return [item for item in read_jsonl(path, limit=_runtime_jsonl_limit()) if isinstance(item, dict)]
+    return _read_jsonl_tail(path, limit=_runtime_jsonl_limit())
 
 
 def _parse_iso_datetime(value: Any) -> datetime | None:
