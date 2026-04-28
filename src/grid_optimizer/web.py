@@ -9366,17 +9366,23 @@ def _manual_trade_prepare_plan(
     if creds is None:
         raise RuntimeError("Binance API credentials are not configured")
     api_key, api_secret = creds
-    position_mode = fetch_futures_position_mode(api_key, api_secret)
-    if _truthy(position_mode.get("dualSidePosition")):
-        raise ValueError("manual trade requires one-way position mode")
-    account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        position_mode_future = executor.submit(fetch_futures_position_mode, api_key, api_secret)
+        account_info_future = executor.submit(fetch_futures_account_info_v3, api_key, api_secret)
+        book_future = executor.submit(_manual_trade_book_prices, normalized_symbol)
+        symbol_info_future = executor.submit(fetch_futures_symbol_config, normalized_symbol)
+
+        position_mode = position_mode_future.result()
+        if _truthy(position_mode.get("dualSidePosition")):
+            raise ValueError("manual trade requires one-way position mode")
+        account_info = account_info_future.result()
+        bid_price, ask_price = book_future.result()
+        symbol_info = symbol_info_future.result()
     normalized_margin_mode = str(margin_mode or "KEEP").upper().strip()
     if normalized_margin_mode not in {"KEEP", "ISOLATED"}:
         raise ValueError("margin_mode must be KEEP or ISOLATED")
     if normalized_margin_mode == "ISOLATED":
         _manual_trade_ensure_isolated(normalized_symbol, api_key, api_secret, account_info=account_info)
-    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
-    symbol_info = fetch_futures_symbol_config(normalized_symbol)
     plan = _build_manual_trade_plan(
         symbol=normalized_symbol,
         side=normalized_side,
