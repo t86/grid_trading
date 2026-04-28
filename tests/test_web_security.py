@@ -172,6 +172,13 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertIn("运行中", page)
         self.assertIn("已保存未启动", page)
+        self.assertIn("上次运行", page)
+        self.assertIn("当前持仓", page)
+        self.assertIn("当前总量", page)
+        self.assertIn("最近一小时交易量", page)
+        self.assertIn("盈亏总额", page)
+        self.assertIn("最近一小时盈亏", page)
+        self.assertIn("手续费总额", page)
         self.assertIn("/api/running_status", page)
         self.assertIn('id="status_drawer"', page)
 

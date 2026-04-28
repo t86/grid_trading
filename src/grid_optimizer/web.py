@@ -129,6 +129,10 @@ from .runtime_guards import (
     resolve_runtime_guard_stats_start_time,
     summarize_futures_runtime_guard_inputs,
 )
+from .running_status import (
+    build_running_status_cross_payload as _build_cross_running_status_payload,
+    build_running_status_local_payload as _build_local_running_status_payload,
+)
 from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
@@ -4194,53 +4198,12 @@ def _build_running_status_local_payload(
     server_label: str | None = None,
     server_base_url: str = "",
 ) -> dict[str, Any]:
-    normalized_focused_symbol = str(symbol or "").upper().strip() or None
-    cards: list[dict[str, Any]] = []
-    for config in _iter_running_status_saved_control_configs():
-        card_symbol = str(config.get("symbol", "")).upper().strip()
-        if not card_symbol:
-            continue
-        runner = _read_runner_process_for_symbol(card_symbol)
-        snapshot = _running_status_snapshot_from_config(
-            card_symbol,
-            config,
-            runner,
-        )
-        cards.append(
-            _running_status_card_from_snapshot(
-                snapshot,
-                server_id=server_id,
-                server_label=server_label,
-                server_base_url=server_base_url,
-                focused_symbol=normalized_focused_symbol,
-            )
-        )
-
-    cards.sort(key=lambda item: str(item.get("symbol") or ""))
-    running = [item for item in cards if item.get("is_running")]
-    saved_idle = [item for item in cards if not item.get("is_running")]
-
-    return {
-        "ok": True,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "scope": "local",
-        "view_mode": "local",
-        "server_id": str(server_id or "").strip() or None,
-        "server_label": str(server_label or "").strip() or None,
-        "server_base_url": str(server_base_url or "").strip(),
-        "focused_symbol": normalized_focused_symbol,
-        "groups": {
-            "running": running,
-            "saved_idle": saved_idle,
-        },
-        "summary": {
-            "running_symbol_count": len(running),
-            "saved_idle_symbol_count": len(saved_idle),
-            "running_total_volume": sum(float(item.get("total_volume") or 0.0) for item in running),
-            "recent_hour_volume": sum(float(item.get("recent_hour_volume") or 0.0) for item in running),
-            "total_pnl": sum(float(item.get("total_pnl") or 0.0) for item in running),
-        },
-    }
+    return _build_local_running_status_payload(
+        symbol=symbol,
+        server_id=server_id,
+        server_label=server_label,
+        server_base_url=server_base_url,
+    )
 
 
 def _local_running_status_server_id(registry: dict[str, Any] | None = None) -> str | None:
@@ -4309,58 +4272,7 @@ def _fetch_remote_running_status_payload(server: dict[str, Any]) -> dict[str, An
 
 
 def _build_running_status_cross_payload() -> dict[str, Any]:
-    registry = load_console_registry()
-    servers = [server for server in list(registry.get("servers") or []) if bool(server.get("enabled", True))]
-    local_server_id = _local_running_status_server_id(registry)
-    server_payloads: list[dict[str, Any]] = []
-    warnings: list[str] = []
-
-    for server in servers:
-        server_id = str(server.get("id") or "").strip()
-        try:
-            if local_server_id and server_id == local_server_id:
-                payload = _build_running_status_local_payload(
-                    server_id=server_id,
-                    server_label=str(server.get("label") or "").strip() or None,
-                    server_base_url="",
-                )
-                payload = _normalize_running_status_server_payload(payload, server=server)
-            else:
-                payload = _fetch_remote_running_status_payload(server)
-        except Exception as exc:
-            warnings.append(f"{server_id or 'unknown'} unavailable: {type(exc).__name__}: {exc}")
-            payload = {
-                "ok": False,
-                "scope": "local",
-                "view_mode": "local",
-                "server_id": server_id or None,
-                "server_label": str(server.get("label") or "").strip() or None,
-                "server_base_url": str(server.get("base_url") or "").strip().rstrip("/"),
-                "groups": {"running": [], "saved_idle": []},
-                "summary": {"running_symbol_count": 0, "saved_idle_symbol_count": 0},
-                "error": f"{type(exc).__name__}: {exc}",
-            }
-        server_payloads.append(payload)
-
-    return {
-        "ok": True,
-        "ts": datetime.now(timezone.utc).isoformat(),
-        "scope": "cross",
-        "view_mode": "cross",
-        "servers": server_payloads,
-        "summary": {
-            "server_count": len(server_payloads),
-            "running_symbol_count": sum(
-                int(((item.get("summary") or {}).get("running_symbol_count") or 0))
-                for item in server_payloads
-            ),
-            "saved_idle_symbol_count": sum(
-                int(((item.get("summary") or {}).get("saved_idle_symbol_count") or 0))
-                for item in server_payloads
-            ),
-        },
-        "warnings": warnings,
-    }
+    return _build_cross_running_status_payload()
 
 
 def _run_running_status_query(query: dict[str, list[str]]) -> dict[str, Any]:
@@ -4716,7 +4628,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     }
     .rs-card-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(520px, 1fr));
       gap: 12px;
     }
     .rs-card {
@@ -4768,32 +4680,66 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     .rs-badge.good { background: rgba(21, 128, 61, 0.10); color: var(--good); }
     .rs-badge.warn { background: rgba(180, 83, 9, 0.10); color: var(--warn); }
     .rs-badge.bad { background: rgba(185, 28, 28, 0.10); color: var(--bad); }
-    .rs-card-metrics {
+    .rs-card-body {
+      display: grid;
+      grid-template-columns: minmax(0, 1.15fr) minmax(220px, 0.85fr);
+      gap: 12px;
+      align-items: start;
+    }
+    .rs-parameter-grid {
       display: grid;
       grid-template-columns: repeat(2, minmax(0, 1fr));
-      gap: 10px;
+      gap: 8px 14px;
+      align-content: start;
     }
-    .rs-metric {
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      padding: 10px;
-      background: #fffefb;
-      min-height: 78px;
+    .rs-param-row,
+    .rs-stat-row {
+      min-width: 0;
+      display: grid;
+      gap: 3px;
     }
-    .rs-metric .label {
+    .rs-param-row span,
+    .rs-stat-row span {
       font-size: 12px;
       color: var(--muted);
-      margin-bottom: 6px;
+      line-height: 1.25;
     }
-    .rs-metric .value {
-      font-size: 15px;
-      font-weight: 700;
-      line-height: 1.45;
+    .rs-param-row strong,
+    .rs-stat-row strong {
+      color: var(--text);
+      font-size: 14px;
+      line-height: 1.35;
       word-break: break-word;
+    }
+    .rs-stat-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fffefb;
+      padding: 10px 12px;
+    }
+    .rs-stat-list {
+      display: grid;
+      gap: 8px;
+    }
+    .rs-stat-row {
+      grid-template-columns: minmax(92px, 1fr) minmax(0, 1.1fr);
+      align-items: center;
+      gap: 10px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid rgba(217, 210, 195, 0.70);
+    }
+    .rs-stat-row:last-child {
+      padding-bottom: 0;
+      border-bottom: 0;
+    }
+    .rs-stat-row strong {
+      text-align: right;
+      font-size: 15px;
+      font-weight: 800;
     }
     .rs-card-footer {
       display: flex;
-      justify-content: space-between;
+      justify-content: flex-end;
       align-items: center;
       gap: 12px;
     }
@@ -4910,8 +4856,14 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       .rs-page { padding: 18px 14px 32px; }
       .rs-summary,
       .rs-card-grid,
-      .rs-card-metrics,
+      .rs-card-body,
+      .rs-parameter-grid,
       .rs-form-fields { grid-template-columns: 1fr; }
+      .rs-stat-row {
+        grid-template-columns: minmax(0, 1fr);
+        gap: 3px;
+      }
+      .rs-stat-row strong { text-align: left; }
       .rs-hero h1 { font-size: 30px; }
       .rs-drawer { width: 100vw; }
     }
@@ -5246,6 +5198,12 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       return "warn";
     }
 
+    function statusLabel(card) {
+      if (card.is_running) return "运行中";
+      if (card.last_run_state === "last_run") return "上次运行";
+      return "已保存";
+    }
+
     function renderSummary(payload) {
       const summary = payload.summary || {};
       const cards = [
@@ -5288,24 +5246,34 @@ def _render_running_status_page(symbol: str | None = None) -> str:
                 <span>${escapeHtml(card.strategy_profile || card.strategy_name || "--")} · ${escapeHtml(card.strategy_mode || "--")}</span>
               </div>
               <div class="rs-badge-row">
-                <span class="rs-badge ${badgeClass(card)}">${card.is_running ? "运行中" : "已保存"}</span>
+                <span class="rs-badge ${badgeClass(card)}">${escapeHtml(statusLabel(card))}</span>
                 <span class="rs-badge">${escapeHtml(card.server_label || card.server_id || "本机")}</span>
               </div>
             </div>
-            <div class="rs-card-metrics">
-              <div class="rs-metric"><div class="label">step</div><div class="value">${fmtNum(card.step_price, 6)}</div></div>
-              <div class="rs-metric"><div class="label">level</div><div class="value">${escapeHtml(formatLevels(card))}</div></div>
-              <div class="rs-metric"><div class="label">基础仓</div><div class="value">${fmtNum(card.base_position_notional)}</div></div>
-              <div class="rs-metric"><div class="label">软阈值</div><div class="value">${escapeHtml(formatSoftThreshold(card))}</div></div>
-              <div class="rs-metric"><div class="label">硬阈值</div><div class="value">${escapeHtml(formatHardThreshold(card))}</div></div>
-              <div class="rs-metric"><div class="label">最大持仓</div><div class="value">${escapeHtml(formatMaxPosition(card))}</div></div>
-              <div class="rs-metric"><div class="label">软减仓策略</div><div class="value">${escapeHtml(formatSoftReduce(card))}</div></div>
-              <div class="rs-metric"><div class="label">硬减仓策略</div><div class="value">${escapeHtml(formatHardReduce(card))}</div></div>
-              <div class="rs-metric"><div class="label">超时减仓机制</div><div class="value">${escapeHtml(formatTimeoutReduce(card))}</div></div>
-              <div class="rs-metric"><div class="label">近一小时成交额</div><div class="value">${fmtNum(card.recent_hour_volume)}</div></div>
+            <div class="rs-card-body">
+              <div class="rs-parameter-grid">
+                <div class="rs-param-row"><span>step</span><strong>${fmtNum(card.step_price, 6)}</strong></div>
+                <div class="rs-param-row"><span>level</span><strong>${escapeHtml(formatLevels(card))}</strong></div>
+                <div class="rs-param-row"><span>基础仓</span><strong>${fmtNum(card.base_position_notional)}</strong></div>
+                <div class="rs-param-row"><span>软阈值</span><strong>${escapeHtml(formatSoftThreshold(card))}</strong></div>
+                <div class="rs-param-row"><span>硬阈值</span><strong>${escapeHtml(formatHardThreshold(card))}</strong></div>
+                <div class="rs-param-row"><span>最大持仓</span><strong>${escapeHtml(formatMaxPosition(card))}</strong></div>
+                <div class="rs-param-row"><span>软减仓策略</span><strong>${escapeHtml(formatSoftReduce(card))}</strong></div>
+                <div class="rs-param-row"><span>硬减仓策略</span><strong>${escapeHtml(formatHardReduce(card))}</strong></div>
+                <div class="rs-param-row"><span>超时减仓机制</span><strong>${escapeHtml(formatTimeoutReduce(card))}</strong></div>
+              </div>
+              <div class="rs-stat-panel">
+                <div class="rs-stat-list">
+                  <div class="rs-stat-row"><span>当前持仓</span><strong>${escapeHtml(card.current_position_display || "--")}</strong></div>
+                  <div class="rs-stat-row"><span>当前总量</span><strong>${fmtNum(card.total_volume)}</strong></div>
+                  <div class="rs-stat-row"><span>最近一小时交易量</span><strong>${fmtNum(card.recent_hour_volume)}</strong></div>
+                  <div class="rs-stat-row"><span>盈亏总额</span><strong>${fmtSigned(card.total_pnl, 4)}</strong></div>
+                  <div class="rs-stat-row"><span>最近一小时盈亏</span><strong>${fmtSigned(card.recent_hour_pnl, 4)}</strong></div>
+                  <div class="rs-stat-row"><span>手续费总额</span><strong>${fmtSigned(card.total_fees, 4)}</strong></div>
+                </div>
+              </div>
             </div>
             <div class="rs-card-footer">
-              <div class="rs-status-line">PnL ${fmtSigned(card.total_pnl, 4)} · 挂单 ${fmtNum(card.open_order_count, 0)} · 未实现 ${fmtSigned(card.unrealized_pnl, 4)}</div>
               <button class="rs-card-action${localEditable ? " primary" : ""}" type="button" data-card-action="${localEditable ? "open" : "go"}" data-card-key="${escapeHtml(cardKey)}">${actionLabel}</button>
             </div>
           </article>
