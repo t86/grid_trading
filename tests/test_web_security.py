@@ -46,6 +46,7 @@ from grid_optimizer.web import (
     _runner_preset_summaries,
     _save_runner_control_config,
     _start_runner_process,
+    _status_commission_usdt,
     _update_custom_grid_runner_preset,
     _uses_legacy_runner,
     _validate_runner_required_risk_guards,
@@ -2767,6 +2768,21 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIsNotNone(item)
         self.assertTrue(mock_read_jsonl.call_args_list)
         self.assertTrue(all((call.kwargs.get("limit") or 0) > 0 for call in mock_read_jsonl.call_args_list))
+
+    @patch("grid_optimizer.web.fetch_spot_latest_price", side_effect=AssertionError("status page must not fetch prices"))
+    def test_status_commission_usdt_does_not_fetch_non_stable_fee_prices(self, mock_price) -> None:
+        value = _status_commission_usdt(
+            {
+                "commission": 9.0,
+                "commission_raw_by_asset": {
+                    "USDT": 1.0,
+                    "BNB": 0.25,
+                },
+            }
+        )
+
+        self.assertAlmostEqual(value, 1.25, places=8)
+        mock_price.assert_not_called()
 
     @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")
     @patch("grid_optimizer.web.resolve_active_competition_board")

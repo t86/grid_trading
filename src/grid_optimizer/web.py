@@ -28633,19 +28633,11 @@ def _status_commission_usdt(trade_summary: dict[str, Any]) -> float:
     if not isinstance(raw_by_asset, dict):
         return _status_float(trade_summary.get("commission"))
     total = 0.0
-    for asset, raw_amount in raw_by_asset.items():
+    for _asset, raw_amount in raw_by_asset.items():
         amount = _status_float(raw_amount)
         if amount <= 0:
             continue
-        normalized_asset = str(asset or "").upper().strip()
-        if normalized_asset in {"USDT", "USDC", "FDUSD", "BUSD"}:
-            total += amount
-            continue
-        try:
-            price = fetch_spot_latest_price(f"{normalized_asset}USDT")
-        except Exception:
-            price = 0.0
-        total += amount * price if price > 0 else amount
+        total += amount
     return total
 
 
