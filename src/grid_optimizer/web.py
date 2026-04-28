@@ -9059,7 +9059,7 @@ def _safe_numeric(value: Any) -> float:
 
 MANUAL_TRADE_TASKS: dict[str, dict[str, Any]] = {}
 MANUAL_TRADE_TASKS_LOCK = threading.Lock()
-MANUAL_TRADE_SLEEP_SECONDS = 1.0
+MANUAL_TRADE_SLEEP_SECONDS = 5.0
 MANUAL_TRADE_MIN_REPRICE_SECONDS = 5.0
 
 
