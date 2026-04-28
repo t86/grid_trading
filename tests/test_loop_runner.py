@@ -137,6 +137,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(_uses_volume_long_v4_staged_delever("trumpusdc_volume_long_v4"))
 
     def test_ethusdc_volume_long_profile_uses_v4_delever_guards(self) -> None:
+        self.assertTrue(_uses_entry_price_cost_basis("ethusdc_um_volume_long_v1"))
         self.assertTrue(_uses_volume_long_v4_staged_delever("ethusdc_um_volume_long_v1"))
 
     def test_resolve_exposure_escalation_waits_for_hold_time(self) -> None:
