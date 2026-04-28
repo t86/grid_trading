@@ -132,6 +132,7 @@ from .runtime_guards import (
 from .running_status import (
     build_running_status_cross_payload as _build_cross_running_status_payload,
     build_running_status_local_payload as _build_local_running_status_payload,
+    _read_jsonl_tail as _read_running_status_jsonl_tail,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
@@ -28650,6 +28651,10 @@ def _running_status_audit_limit() -> int:
     return max(1000, value)
 
 
+def _read_running_status_audit_rows(path: Path) -> list[dict[str, Any]]:
+    return _read_running_status_jsonl_tail(path, limit=_running_status_audit_limit())
+
+
 def _build_status_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -28736,9 +28741,8 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         submit_report=submit_report,
     )
     audit_paths = build_audit_paths(event_path)
-    audit_limit = _running_status_audit_limit()
-    trade_rows = read_jsonl_filtered(audit_paths["trade_audit"], limit=audit_limit)
-    income_rows = read_jsonl_filtered(audit_paths["income_audit"], limit=audit_limit)
+    trade_rows = _read_running_status_audit_rows(audit_paths["trade_audit"])
+    income_rows = _read_running_status_audit_rows(audit_paths["income_audit"])
     stats_start_time = _running_status_stats_start_time(symbol, runner)
     if stats_start_time is not None:
         stats_start_ms = int(stats_start_time.timestamp() * 1000)

@@ -2748,8 +2748,14 @@ class WebSecurityTests(unittest.TestCase):
 
     @patch("grid_optimizer.web._running_status_stats_start_time", return_value=None)
     @patch("grid_optimizer.web.read_jsonl_filtered")
-    def test_fast_running_status_reads_bounded_audit_rows(self, mock_read_jsonl, _mock_stats_start) -> None:
-        mock_read_jsonl.return_value = []
+    @patch("grid_optimizer.web._read_running_status_jsonl_tail")
+    def test_fast_running_status_reads_bounded_audit_rows(
+        self,
+        mock_tail,
+        mock_read_jsonl,
+        _mock_stats_start,
+    ) -> None:
+        mock_tail.return_value = []
 
         item = _build_fast_running_status_item(
             "SOONUSDT",
@@ -2766,8 +2772,9 @@ class WebSecurityTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(item)
-        self.assertTrue(mock_read_jsonl.call_args_list)
-        self.assertTrue(all((call.kwargs.get("limit") or 0) > 0 for call in mock_read_jsonl.call_args_list))
+        self.assertEqual(mock_tail.call_count, 2)
+        self.assertTrue(all((call.kwargs.get("limit") or 0) > 0 for call in mock_tail.call_args_list))
+        mock_read_jsonl.assert_not_called()
 
     @patch("grid_optimizer.web.fetch_spot_latest_price", side_effect=AssertionError("status page must not fetch prices"))
     def test_status_commission_usdt_does_not_fetch_non_stable_fee_prices(self, mock_price) -> None:
