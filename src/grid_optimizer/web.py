@@ -9238,19 +9238,46 @@ def _manual_trade_public_task(task: dict[str, Any] | None) -> dict[str, Any] | N
     return public
 
 
-def _manual_trade_history_items() -> list[dict[str, Any]]:
+def _manual_trade_history_map() -> dict[str, list[dict[str, Any]]]:
     payload = _read_json_dict(MANUAL_TRADE_HISTORY_PATH) or {}
-    raw_items = payload.get("items")
-    if not isinstance(raw_items, list):
-        return []
-    return [dict(item) for item in raw_items if isinstance(item, dict)]
+    result: dict[str, list[dict[str, Any]]] = {}
+    raw_symbols = payload.get("symbols")
+    if isinstance(raw_symbols, dict):
+        for raw_symbol, raw_items in raw_symbols.items():
+            key = _manual_trade_task_key(str(raw_symbol))
+            if not key or not isinstance(raw_items, list):
+                continue
+            result[key] = [dict(item) for item in raw_items if isinstance(item, dict)]
+    legacy_items = payload.get("items")
+    if isinstance(legacy_items, list):
+        for item in legacy_items:
+            if not isinstance(item, dict):
+                continue
+            key = _manual_trade_task_key(str(item.get("symbol", "")))
+            if not key:
+                continue
+            result.setdefault(key, []).append(dict(item))
+    return result
+
+
+def _write_manual_trade_history_map(symbols: dict[str, list[dict[str, Any]]]) -> None:
+    clean_symbols: dict[str, list[dict[str, Any]]] = {}
+    for raw_symbol, raw_items in symbols.items():
+        key = _manual_trade_task_key(raw_symbol)
+        if not key:
+            continue
+        clean_symbols[key] = [dict(item) for item in raw_items if isinstance(item, dict)]
+    _write_json_dict(
+        MANUAL_TRADE_HISTORY_PATH,
+        {"symbols": clean_symbols, "updated_at": datetime.now(timezone.utc).isoformat()},
+    )
 
 
 def _manual_trade_history_for_symbol(symbol: str) -> list[dict[str, Any]]:
     key = _manual_trade_task_key(symbol)
     with MANUAL_TRADE_HISTORY_LOCK:
-        items = _manual_trade_history_items()
-    return [item for item in items if str(item.get("symbol", "")).upper().strip() == key]
+        symbols = _manual_trade_history_map()
+    return [dict(item) for item in symbols.get(key, [])]
 
 
 def _manual_trade_append_history(item: dict[str, Any]) -> dict[str, Any]:
@@ -9259,12 +9286,9 @@ def _manual_trade_append_history(item: dict[str, Any]) -> dict[str, Any]:
     record.setdefault("id", uuid.uuid4().hex)
     record.setdefault("completed_at", datetime.now(timezone.utc).isoformat())
     with MANUAL_TRADE_HISTORY_LOCK:
-        items = _manual_trade_history_items()
-        items.append(record)
-        _write_json_dict(
-            MANUAL_TRADE_HISTORY_PATH,
-            {"items": items, "updated_at": datetime.now(timezone.utc).isoformat()},
-        )
+        symbols = _manual_trade_history_map()
+        symbols.setdefault(record["symbol"], []).append(record)
+        _write_manual_trade_history_map(symbols)
     return dict(record)
 
 

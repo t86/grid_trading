@@ -9,6 +9,7 @@ from grid_optimizer.web import (
     MANUAL_TRADE_PAGE,
     _build_manual_trade_plan,
     _is_manual_trade_order,
+    _manual_trade_append_history,
     _manual_trade_client_order_prefix,
     _manual_trade_chase_leg,
     _manual_trade_cancel,
@@ -27,10 +28,11 @@ class ManualTradeTests(unittest.TestCase):
         import grid_optimizer.web as web
 
         self._tmpdir = tempfile.TemporaryDirectory()
+        self.history_path = Path(self._tmpdir.name) / "manual_trade_history.json"
         self._history_patch = patch.object(
             web,
             "MANUAL_TRADE_HISTORY_PATH",
-            Path(self._tmpdir.name) / "manual_trade_history.json",
+            self.history_path,
         )
         self._history_patch.start()
 
@@ -172,6 +174,35 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn('setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500)', MANUAL_TRADE_PAGE)
         self.assertIn('id="history_body"', MANUAL_TRADE_PAGE)
         self.assertIn("renderHistory(snapshot.history || [])", MANUAL_TRADE_PAGE)
+
+    def test_manual_trade_history_is_symbol_scoped(self) -> None:
+        _manual_trade_append_history(
+            {
+                "source": "maker",
+                "symbol": "BTCUSDC",
+                "side": "BUY",
+                "executed_qty": 0.01,
+                "avg_fill_price": 100.0,
+            }
+        )
+        _manual_trade_append_history(
+            {
+                "source": "maker",
+                "symbol": "ETHUSDC",
+                "side": "SELL",
+                "executed_qty": 0.1,
+                "avg_fill_price": 10.0,
+            }
+        )
+
+        btc_history = _manual_trade_history_for_symbol("BTCUSDC")
+        eth_history = _manual_trade_history_for_symbol("ETHUSDC")
+        self.assertEqual(len(btc_history), 1)
+        self.assertEqual(len(eth_history), 1)
+        self.assertEqual(btc_history[0]["symbol"], "BTCUSDC")
+        self.assertEqual(eth_history[0]["symbol"], "ETHUSDC")
+        self.assertIn('"BTCUSDC"', self.history_path.read_text(encoding="utf-8"))
+        self.assertIn('"ETHUSDC"', self.history_path.read_text(encoding="utf-8"))
 
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     @patch("grid_optimizer.web.fetch_futures_account_info_v3")
