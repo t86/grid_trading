@@ -33,8 +33,8 @@ class ManualTradeTests(unittest.TestCase):
             "min_notional": 5.0,
         }
 
-    def test_manual_maker_chase_checks_every_ten_seconds(self) -> None:
-        self.assertEqual(MANUAL_TRADE_SLEEP_SECONDS, 10.0)
+    def test_manual_maker_chase_checks_every_second(self) -> None:
+        self.assertEqual(MANUAL_TRADE_SLEEP_SECONDS, 1.0)
 
     def test_manual_trade_prefix_is_symbol_scoped(self) -> None:
         prefix = _manual_trade_client_order_prefix("BARDUSDT")
@@ -151,6 +151,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("/api/manual_trade/maker", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
+        self.assertIn('setTimeout(() => refreshStatus().catch(() => {}), 500)', MANUAL_TRADE_PAGE)
 
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     @patch("grid_optimizer.web.fetch_futures_account_info_v3")
@@ -235,7 +236,7 @@ class ManualTradeTests(unittest.TestCase):
     ) -> None:
         mock_cancel_requested.side_effect = [False, False, False]
         mock_book_prices.side_effect = [(1.0, 1.01), (1.0, 1.02), (1.0, 1.02)]
-        mock_monotonic.side_effect = [100.0, 101.0, 107.0]
+        mock_monotonic.side_effect = [100.0, 100.5, 107.0]
         mock_post_order.return_value = {"orderId": 123, "clientOrderId": "mt_bardusdt_open_short_sell_1"}
         mock_fetch_order.side_effect = [
             {"status": "NEW", "executedQty": "0", "price": "1.01"},

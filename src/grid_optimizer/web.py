@@ -9091,10 +9091,20 @@ def _safe_numeric(value: Any) -> float:
         return 0.0
 
 
+def _env_float(name: str, default: float, *, minimum: float = 0.2) -> float:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return max(float(raw), minimum)
+    except ValueError:
+        return default
+
+
 MANUAL_TRADE_TASKS: dict[str, dict[str, Any]] = {}
 MANUAL_TRADE_TASKS_LOCK = threading.Lock()
-MANUAL_TRADE_SLEEP_SECONDS = 10.0
-MANUAL_TRADE_MIN_REPRICE_SECONDS = 10.0
+MANUAL_TRADE_SLEEP_SECONDS = _env_float("GRID_MANUAL_TRADE_SLEEP_SECONDS", 1.0)
+MANUAL_TRADE_MIN_REPRICE_SECONDS = _env_float("GRID_MANUAL_TRADE_MIN_REPRICE_SECONDS", 1.0)
 
 
 def _manual_trade_client_order_prefix(symbol: str) -> str:
@@ -16034,7 +16044,11 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       actionMetaEl.textContent = endpoint.includes("take") ? "Take 市价单已提交。" : "Maker 追盘任务已启动。";
       if (data.snapshot) renderSnapshot(data.snapshot);
       if (data.task) renderTask(data.task);
-      await refreshStatus();
+      if (endpoint.includes("take")) {
+        await refreshStatus();
+      } else {
+        setTimeout(() => refreshStatus().catch(() => {}), 500);
+      }
     }
     async function cancelTask() {
       actionMetaEl.textContent = "取消中...";
