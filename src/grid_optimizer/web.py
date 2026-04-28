@@ -28728,6 +28728,16 @@ def _running_status_stats_start_time(symbol: str, runner: dict[str, Any]) -> dat
         return None
 
 
+def _fast_running_status_stats_start_time(runner: dict[str, Any]) -> datetime | None:
+    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
+    try:
+        return resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time=runner_config.get("runtime_guard_stats_start_time"),
+        )
+    except Exception:
+        return None
+
+
 def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict[str, Any] | None:
     if not bool(runner.get("is_running")):
         return None
@@ -28743,7 +28753,7 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
     audit_paths = build_audit_paths(event_path)
     trade_rows = _read_running_status_audit_rows(audit_paths["trade_audit"])
     income_rows = _read_running_status_audit_rows(audit_paths["income_audit"])
-    stats_start_time = _running_status_stats_start_time(symbol, runner)
+    stats_start_time = _fast_running_status_stats_start_time(runner)
     if stats_start_time is not None:
         stats_start_ms = int(stats_start_time.timestamp() * 1000)
         trade_rows = [item for item in trade_rows if trade_row_time_ms(item) >= stats_start_ms]

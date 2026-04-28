@@ -2653,8 +2653,7 @@ class WebSecurityTests(unittest.TestCase):
             self.assertEqual(len(pnl_events), 2)
             self.assertEqual(stats_start_time, phase_start)
 
-    @patch("grid_optimizer.web._running_status_stats_start_time")
-    def test_fast_running_status_filters_volume_from_stats_start_time(self, mock_stats_start) -> None:
+    def test_fast_running_status_filters_volume_from_stats_start_time(self) -> None:
         with TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
             events_path = root / "soonusdt_loop_events.jsonl"
@@ -2715,8 +2714,6 @@ class WebSecurityTests(unittest.TestCase):
                 encoding="utf-8",
             )
             submit_path.write_text(json.dumps({}), encoding="utf-8")
-            mock_stats_start.return_value = phase_start
-
             item = _build_fast_running_status_item(
                 "SOONUSDT",
                 {
@@ -2727,6 +2724,7 @@ class WebSecurityTests(unittest.TestCase):
                         "symbol": "SOONUSDT",
                         "strategy_profile": "volume_long_v4",
                         "strategy_mode": "one_way_long",
+                        "runtime_guard_stats_start_time": phase_start.isoformat(),
                         "summary_jsonl": str(events_path),
                         "plan_json": str(plan_path),
                         "submit_report_json": str(submit_path),
@@ -2790,6 +2788,28 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertAlmostEqual(value, 1.25, places=8)
         mock_price.assert_not_called()
+
+    @patch("grid_optimizer.web.resolve_active_competition_board", side_effect=AssertionError("overview must stay fast"))
+    def test_fast_running_status_stats_start_does_not_query_competition_board(self, mock_board) -> None:
+        item = _build_fast_running_status_item(
+            "SOONUSDT",
+            {
+                "is_running": True,
+                "pid": 123,
+                "config": {
+                    "symbol": "SOONUSDT",
+                    "runtime_guard_stats_start_time": "2026-04-28T08:00:00+08:00",
+                    "summary_jsonl": "output/soonusdt_loop_events.jsonl",
+                    "plan_json": "output/soonusdt_loop_latest_plan.json",
+                    "submit_report_json": "output/soonusdt_loop_latest_submit.json",
+                },
+            },
+        )
+
+        self.assertIsNotNone(item)
+        assert item is not None
+        self.assertEqual(item["stats_start_time"], "2026-04-28T00:00:00+00:00")
+        mock_board.assert_not_called()
 
     @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")
     @patch("grid_optimizer.web.resolve_active_competition_board")
