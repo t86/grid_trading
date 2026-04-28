@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import unittest
+from unittest.mock import patch
 
 from grid_optimizer.web import (
     MANUAL_TRADE_PAGE,
     _build_manual_trade_plan,
     _is_manual_trade_order,
     _manual_trade_client_order_prefix,
+    _manual_trade_ensure_isolated,
 )
 
 
@@ -73,6 +75,51 @@ class ManualTradeTests(unittest.TestCase):
                 position_amt=0.0,
                 symbol_info=self._symbol_info(),
             )
+
+    @patch("grid_optimizer.web.post_futures_change_margin_type")
+    def test_ensure_isolated_skips_api_call_when_position_already_isolated(self, mock_change_margin) -> None:
+        result = _manual_trade_ensure_isolated(
+            "BARDUSDT",
+            "key",
+            "secret",
+            account_info={
+                "positions": [
+                    {
+                        "symbol": "BARDUSDT",
+                        "positionSide": "BOTH",
+                        "isolated": True,
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(result["already_isolated"], True)
+        mock_change_margin.assert_not_called()
+
+    @patch("grid_optimizer.web.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.web.post_futures_change_margin_type")
+    def test_ensure_isolated_allows_open_order_rejection_when_refreshed_position_is_isolated(
+        self,
+        mock_change_margin,
+        mock_account_info,
+    ) -> None:
+        mock_change_margin.side_effect = RuntimeError(
+            "Binance API error -4047: Margin type cannot be changed if there exists open orders."
+        )
+        mock_account_info.return_value = {
+            "positions": [
+                {
+                    "symbol": "BARDUSDT",
+                    "positionSide": "BOTH",
+                    "isolated": True,
+                }
+            ]
+        }
+
+        result = _manual_trade_ensure_isolated("BARDUSDT", "key", "secret")
+
+        self.assertEqual(result["already_isolated"], True)
+        self.assertIn("open orders", result["warning"])
 
     def test_manual_trade_page_contains_required_controls(self) -> None:
         self.assertIn('id="manual_symbol"', MANUAL_TRADE_PAGE)

@@ -7642,7 +7642,20 @@ def _manual_trade_position_amt(account_info: dict[str, Any], symbol: str) -> flo
     return _safe_numeric(_extract_futures_position(account_info, symbol).get("positionAmt"))
 
 
-def _manual_trade_ensure_isolated(symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+def _manual_trade_position_is_isolated(account_info: dict[str, Any], symbol: str) -> bool:
+    position = _extract_futures_position(account_info, symbol)
+    return bool(position.get("isolated") or str(position.get("marginType", "")).lower() == "isolated")
+
+
+def _manual_trade_ensure_isolated(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    *,
+    account_info: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    if account_info is not None and _manual_trade_position_is_isolated(account_info, symbol):
+        return {"attempted": False, "changed": False, "already_isolated": True}
     try:
         response = post_futures_change_margin_type(
             symbol=symbol,
@@ -7655,6 +7668,15 @@ def _manual_trade_ensure_isolated(symbol: str, api_key: str, api_secret: str) ->
         message = str(exc)
         if "-4046" in message or "No need to change margin type" in message:
             return {"attempted": True, "changed": False, "already_isolated": True}
+        if "-4047" in message:
+            refreshed_account = fetch_futures_account_info_v3(api_key, api_secret)
+            if _manual_trade_position_is_isolated(refreshed_account, symbol):
+                return {
+                    "attempted": True,
+                    "changed": False,
+                    "already_isolated": True,
+                    "warning": "margin change rejected because open orders exist, but current position is already isolated",
+                }
         raise
 
 
@@ -7732,9 +7754,9 @@ def _manual_trade_prepare_plan(symbol: str, side: str, notional: float) -> tuple
     position_mode = fetch_futures_position_mode(api_key, api_secret)
     if _truthy(position_mode.get("dualSidePosition")):
         raise ValueError("manual trade requires one-way position mode")
-    _manual_trade_ensure_isolated(normalized_symbol, api_key, api_secret)
-    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
     account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    _manual_trade_ensure_isolated(normalized_symbol, api_key, api_secret, account_info=account_info)
+    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
     symbol_info = fetch_futures_symbol_config(normalized_symbol)
     plan = _build_manual_trade_plan(
         symbol=normalized_symbol,
