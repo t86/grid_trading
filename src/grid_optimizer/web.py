@@ -56,6 +56,7 @@ from .data import (
     fetch_futures_account_info_v3,
     fetch_futures_quote_volume_sum,
     fetch_futures_window_price_stats,
+    fetch_futures_order,
     fetch_futures_open_orders,
     fetch_futures_position_mode,
     fetch_spot_account_info,
@@ -76,6 +77,8 @@ from .data import (
     fetch_futures_latest_price,
     fetch_futures_premium_index,
     fetch_futures_symbol_config,
+    post_futures_change_margin_type,
+    post_futures_market_order,
     post_futures_order,
     fetch_recent_funding_records,
     fetch_spot_book_tickers,
@@ -7478,6 +7481,484 @@ def _safe_numeric(value: Any) -> float:
         return 0.0
 
 
+MANUAL_TRADE_TASKS: dict[str, dict[str, Any]] = {}
+MANUAL_TRADE_TASKS_LOCK = threading.Lock()
+MANUAL_TRADE_SLEEP_SECONDS = 1.0
+
+
+def _manual_trade_client_order_prefix(symbol: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9]+", "_", str(symbol or "").strip().lower()).strip("_")
+    return f"mt_{(normalized or 'symbol')[:18]}"
+
+
+def _is_manual_trade_order(order: dict[str, Any], prefix: str) -> bool:
+    client_order_id = str(order.get("clientOrderId", "") or "")
+    return client_order_id.startswith(str(prefix or ""))
+
+
+def _manual_trade_order_id(prefix: str, role: str, side: str) -> str:
+    nonce = int(time.time() * 1000) % 1_000_000_000
+    side_text = "b" if str(side).upper().strip() == "BUY" else "s"
+    clean_role = re.sub(r"[^A-Za-z0-9]+", "", str(role or "leg").lower())[:12] or "leg"
+    return f"{prefix}_{clean_role}_{side_text}_{nonce}"
+
+
+def _build_manual_trade_plan(
+    *,
+    symbol: str,
+    side: str,
+    notional: float,
+    bid_price: float,
+    ask_price: float,
+    position_amt: float,
+    symbol_info: dict[str, Any],
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_side = str(side or "").upper().strip()
+    if normalized_side not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    safe_notional = float(notional)
+    if safe_notional <= 0:
+        raise ValueError("notional must be > 0")
+    reference_price = ask_price if normalized_side == "BUY" else bid_price
+    if reference_price <= 0:
+        raise ValueError("bid_price and ask_price must be > 0")
+
+    step_size = symbol_info.get("step_size")
+    min_qty = symbol_info.get("min_qty")
+    min_notional = symbol_info.get("min_notional")
+    target_qty = _round_order_qty(safe_notional / reference_price, step_size)
+    if target_qty <= 0:
+        raise ValueError("quantity rounds to zero")
+
+    def _validate_leg_qty(qty: float, price: float) -> float:
+        rounded_qty = _round_order_qty(qty, step_size)
+        if rounded_qty <= 0:
+            return 0.0
+        if min_qty is not None and rounded_qty < float(min_qty):
+            return 0.0
+        if min_notional is not None and rounded_qty * price < float(min_notional):
+            if abs(qty - target_qty) <= 1e-12:
+                raise ValueError("order notional is below minimum notional")
+            return 0.0
+        return rounded_qty
+
+    legs: list[dict[str, Any]] = []
+    remaining_qty = target_qty
+    if normalized_side == "BUY" and position_amt < 0:
+        close_qty = _validate_leg_qty(min(abs(position_amt), remaining_qty), ask_price)
+        if close_qty > 0:
+            legs.append(
+                {
+                    "role": "close_short",
+                    "side": "BUY",
+                    "quantity": close_qty,
+                    "reduce_only": True,
+                }
+            )
+            remaining_qty = max(remaining_qty - close_qty, 0.0)
+    elif normalized_side == "SELL" and position_amt > 0:
+        close_qty = _validate_leg_qty(min(position_amt, remaining_qty), bid_price)
+        if close_qty > 0:
+            legs.append(
+                {
+                    "role": "close_long",
+                    "side": "SELL",
+                    "quantity": close_qty,
+                    "reduce_only": True,
+                }
+            )
+            remaining_qty = max(remaining_qty - close_qty, 0.0)
+
+    open_qty = _validate_leg_qty(remaining_qty, reference_price)
+    if open_qty > 0:
+        legs.append(
+            {
+                "role": "open_long" if normalized_side == "BUY" else "open_short",
+                "side": normalized_side,
+                "quantity": open_qty,
+                "reduce_only": False,
+            }
+        )
+    if not legs:
+        raise ValueError("order notional is below minimum notional")
+    return {
+        "symbol": normalized_symbol,
+        "side": normalized_side,
+        "notional": safe_notional,
+        "target_quantity": target_qty,
+        "position_amt": float(position_amt),
+        "legs": legs,
+    }
+
+
+def _manual_trade_task_key(symbol: str) -> str:
+    return str(symbol or "").upper().strip()
+
+
+def _manual_trade_public_task(task: dict[str, Any] | None) -> dict[str, Any] | None:
+    if not task:
+        return None
+    public = dict(task)
+    public.pop("cancel_requested", None)
+    return public
+
+
+def _manual_trade_set_task(symbol: str, patch: dict[str, Any]) -> dict[str, Any]:
+    key = _manual_trade_task_key(symbol)
+    with MANUAL_TRADE_TASKS_LOCK:
+        current = dict(MANUAL_TRADE_TASKS.get(key) or {})
+        current.update(patch)
+        current["symbol"] = key
+        current["updated_at"] = datetime.now(timezone.utc).isoformat()
+        MANUAL_TRADE_TASKS[key] = current
+        return dict(current)
+
+
+def _manual_trade_current_task(symbol: str) -> dict[str, Any] | None:
+    key = _manual_trade_task_key(symbol)
+    with MANUAL_TRADE_TASKS_LOCK:
+        task = MANUAL_TRADE_TASKS.get(key)
+        return dict(task) if task else None
+
+
+def _manual_trade_cancel_requested(symbol: str) -> bool:
+    task = _manual_trade_current_task(symbol)
+    return bool(task and task.get("cancel_requested"))
+
+
+def _manual_trade_book_prices(symbol: str) -> tuple[float, float]:
+    book = fetch_futures_book_tickers(symbol=symbol)
+    if not book:
+        raise RuntimeError(f"{symbol} missing book ticker")
+    bid_price = _safe_numeric(book[0].get("bid_price"))
+    ask_price = _safe_numeric(book[0].get("ask_price"))
+    if bid_price <= 0 or ask_price <= 0:
+        raise RuntimeError(f"{symbol} invalid book ticker")
+    return bid_price, ask_price
+
+
+def _manual_trade_position_amt(account_info: dict[str, Any], symbol: str) -> float:
+    return _safe_numeric(_extract_futures_position(account_info, symbol).get("positionAmt"))
+
+
+def _manual_trade_ensure_isolated(symbol: str, api_key: str, api_secret: str) -> dict[str, Any]:
+    try:
+        response = post_futures_change_margin_type(
+            symbol=symbol,
+            margin_type="ISOLATED",
+            api_key=api_key,
+            api_secret=api_secret,
+        )
+        return {"attempted": True, "changed": True, "response": response}
+    except Exception as exc:
+        message = str(exc)
+        if "-4046" in message or "No need to change margin type" in message:
+            return {"attempted": True, "changed": False, "already_isolated": True}
+        raise
+
+
+def _manual_trade_cancel_open_orders(symbol: str, api_key: str, api_secret: str, prefix: str) -> dict[str, Any]:
+    result = {"attempted": 0, "success": 0, "errors": []}
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
+    ours = [order for order in open_orders if isinstance(order, dict) and _is_manual_trade_order(order, prefix)]
+    result["attempted"] = len(ours)
+    for order in ours:
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order["orderId"]) if order.get("orderId") is not None else None,
+                orig_client_order_id=str(order.get("clientOrderId", "")).strip() or None,
+            )
+            result["success"] += 1
+        except Exception as exc:
+            result["errors"].append(
+                {
+                    "order_id": order.get("orderId"),
+                    "client_order_id": order.get("clientOrderId"),
+                    "message": f"{type(exc).__name__}: {exc}",
+                }
+            )
+    return result
+
+
+def _manual_trade_snapshot(symbol: str) -> dict[str, Any]:
+    normalized_symbol = str(symbol or "BTCUSDT").upper().strip() or "BTCUSDT"
+    creds = load_binance_api_credentials()
+    if creds is None:
+        raise RuntimeError("Binance API credentials are not configured")
+    api_key, api_secret = creds
+    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
+    account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    position = _extract_futures_position(account_info, normalized_symbol)
+    open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
+    prefix = _manual_trade_client_order_prefix(normalized_symbol)
+    manual_orders = [order for order in open_orders if isinstance(order, dict) and _is_manual_trade_order(order, prefix)]
+    dual_side = _truthy(position_mode.get("dualSidePosition"))
+    runner = _read_runner_process_for_symbol(normalized_symbol)
+    return {
+        "symbol": normalized_symbol,
+        "bid_price": bid_price,
+        "ask_price": ask_price,
+        "position": position,
+        "position_amt": _safe_numeric(position.get("positionAmt")),
+        "entry_price": _safe_numeric(position.get("entryPrice")),
+        "break_even_price": _safe_numeric(position.get("breakEvenPrice")),
+        "isolated": bool(position.get("isolated") or str(position.get("marginType", "")).lower() == "isolated"),
+        "dual_side_position": dual_side,
+        "one_way_position": not dual_side,
+        "open_order_count": len(open_orders),
+        "manual_open_order_count": len(manual_orders),
+        "manual_prefix": prefix,
+        "runner": runner,
+        "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol)),
+    }
+
+
+def _manual_trade_prepare_plan(symbol: str, side: str, notional: float) -> tuple[str, str, str, dict[str, Any], str, str]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    normalized_side = str(side or "").upper().strip()
+    if normalized_side not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    creds = load_binance_api_credentials()
+    if creds is None:
+        raise RuntimeError("Binance API credentials are not configured")
+    api_key, api_secret = creds
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    if _truthy(position_mode.get("dualSidePosition")):
+        raise ValueError("manual trade requires one-way position mode")
+    _manual_trade_ensure_isolated(normalized_symbol, api_key, api_secret)
+    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
+    account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    symbol_info = fetch_futures_symbol_config(normalized_symbol)
+    plan = _build_manual_trade_plan(
+        symbol=normalized_symbol,
+        side=normalized_side,
+        notional=float(notional),
+        bid_price=bid_price,
+        ask_price=ask_price,
+        position_amt=_manual_trade_position_amt(account_info, normalized_symbol),
+        symbol_info=symbol_info,
+    )
+    return normalized_symbol, api_key, api_secret, plan, str(symbol_info.get("tick_size")), str(symbol_info.get("step_size"))
+
+
+def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol, api_key, api_secret, plan, _tick_size, _step_size = _manual_trade_prepare_plan(
+        str(payload.get("symbol", "")),
+        str(payload.get("side", "")),
+        float(payload.get("notional", 0) or 0),
+    )
+    prefix = _manual_trade_client_order_prefix(symbol)
+    responses = []
+    for leg in plan["legs"]:
+        responses.append(
+            post_futures_market_order(
+                symbol=symbol,
+                side=str(leg["side"]),
+                quantity=float(leg["quantity"]),
+                api_key=api_key,
+                api_secret=api_secret,
+                reduce_only=bool(leg.get("reduce_only")),
+                new_client_order_id=_manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"])),
+            )
+        )
+    return {"symbol": symbol, "plan": plan, "orders": responses, "snapshot": _manual_trade_snapshot(symbol)}
+
+
+def _manual_trade_chase_leg(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    prefix: str,
+    leg: dict[str, Any],
+) -> dict[str, Any]:
+    remaining_qty = float(leg["quantity"])
+    executed_qty = 0.0
+    attempts = 0
+    current_order_id: int | None = None
+    current_client_order_id: str | None = None
+    last_order: dict[str, Any] | None = None
+    while remaining_qty > 0:
+        if _manual_trade_cancel_requested(symbol):
+            if current_order_id is not None or current_client_order_id:
+                try:
+                    delete_futures_order(
+                        symbol=symbol,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        order_id=current_order_id,
+                        orig_client_order_id=current_client_order_id,
+                    )
+                except Exception:
+                    pass
+            raise RuntimeError("manual trade canceled")
+        if current_order_id is not None or current_client_order_id:
+            try:
+                delete_futures_order(
+                    symbol=symbol,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    order_id=current_order_id,
+                    orig_client_order_id=current_client_order_id,
+                )
+            except Exception:
+                pass
+        bid_price, ask_price = _manual_trade_book_prices(symbol)
+        price = bid_price if str(leg["side"]).upper() == "BUY" else ask_price
+        client_order_id = _manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"]))
+        response = post_futures_order(
+            symbol=symbol,
+            side=str(leg["side"]),
+            quantity=remaining_qty,
+            price=price,
+            api_key=api_key,
+            api_secret=api_secret,
+            time_in_force="GTX",
+            reduce_only=bool(leg.get("reduce_only")),
+            new_client_order_id=client_order_id,
+        )
+        attempts += 1
+        current_order_id = int(response["orderId"]) if response.get("orderId") is not None else None
+        current_client_order_id = str(response.get("clientOrderId") or client_order_id)
+        _manual_trade_set_task(
+            symbol,
+            {
+                "status": "running",
+                "current_leg": leg,
+                "current_order": response,
+                "attempts": attempts,
+                "executed_qty": executed_qty,
+                "remaining_qty": remaining_qty,
+                "message": f"{leg['role']} chasing at {price}",
+            },
+        )
+        time.sleep(MANUAL_TRADE_SLEEP_SECONDS)
+        order = fetch_futures_order(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            order_id=current_order_id,
+            orig_client_order_id=current_client_order_id,
+        )
+        last_order = order
+        order_executed = _safe_numeric(order.get("executedQty"))
+        status = str(order.get("status", "")).upper()
+        if order_executed > 0:
+            executed_qty += min(order_executed, remaining_qty)
+            remaining_qty = max(float(leg["quantity"]) - executed_qty, 0.0)
+        if status == "FILLED" or remaining_qty <= 0:
+            current_order_id = None
+            current_client_order_id = None
+            break
+    return {
+        "leg": leg,
+        "attempts": attempts,
+        "executed_qty": executed_qty,
+        "last_order": last_order,
+    }
+
+
+def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    try:
+        symbol, api_key, api_secret, plan, _tick_size, _step_size = _manual_trade_prepare_plan(
+            symbol,
+            str(payload.get("side", "")),
+            float(payload.get("notional", 0) or 0),
+        )
+        prefix = _manual_trade_client_order_prefix(symbol)
+        _manual_trade_set_task(
+            symbol,
+            {
+                "id": task_id,
+                "status": "running",
+                "side": plan["side"],
+                "notional": plan["notional"],
+                "plan": plan,
+                "prefix": prefix,
+                "cancel_requested": False,
+                "legs_done": [],
+                "error": None,
+            },
+        )
+        legs_done = []
+        for leg in plan["legs"]:
+            legs_done.append(
+                _manual_trade_chase_leg(
+                    symbol=symbol,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    prefix=prefix,
+                    leg=leg,
+                )
+            )
+            _manual_trade_set_task(symbol, {"legs_done": legs_done})
+        _manual_trade_set_task(
+            symbol,
+            {
+                "status": "filled",
+                "legs_done": legs_done,
+                "message": "all manual maker legs filled",
+                "snapshot": _manual_trade_snapshot(symbol),
+            },
+        )
+    except Exception as exc:
+        status = "canceled" if "canceled" in str(exc).lower() else "error"
+        if symbol:
+            _manual_trade_set_task(
+                symbol,
+                {
+                    "status": status,
+                    "error": f"{type(exc).__name__}: {exc}",
+                    "message": str(exc),
+                },
+            )
+
+
+def _manual_trade_start_maker(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    existing = _manual_trade_current_task(symbol)
+    if existing and str(existing.get("status", "")).lower() in {"pending", "running"}:
+        raise ValueError(f"{symbol} manual maker task is already running")
+    task_id = uuid.uuid4().hex
+    _manual_trade_set_task(
+        symbol,
+        {
+            "id": task_id,
+            "status": "pending",
+            "side": str(payload.get("side", "")).upper().strip(),
+            "notional": float(payload.get("notional", 0) or 0),
+            "cancel_requested": False,
+            "message": "manual maker task queued",
+        },
+    )
+    thread = threading.Thread(target=_manual_trade_maker_worker, args=(task_id, dict(payload)), daemon=True)
+    thread.start()
+    return {"symbol": symbol, "task": _manual_trade_public_task(_manual_trade_current_task(symbol))}
+
+
+def _manual_trade_cancel(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    prefix = _manual_trade_client_order_prefix(symbol)
+    _manual_trade_set_task(symbol, {"cancel_requested": True, "status": "canceling", "message": "cancel requested"})
+    cleanup = {"attempted": 0, "success": 0, "errors": []}
+    creds = load_binance_api_credentials()
+    if creds is not None:
+        cleanup = _manual_trade_cancel_open_orders(symbol, creds[0], creds[1], prefix)
+    return {"symbol": symbol, "cleanup": cleanup, "task": _manual_trade_public_task(_manual_trade_current_task(symbol))}
+
+
 def _extract_futures_position(
     account_info: dict[str, Any],
     symbol: str,
@@ -13585,6 +14066,228 @@ BASIS_PAGE = """<!doctype html>
 """
 
 
+MANUAL_TRADE_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>手动追盘交易</title>
+  <style>
+    :root { --bg:#f5f3ee; --panel:#fff; --line:#e2ddd2; --text:#171717; --muted:#6c685f; --good:#0f7b45; --bad:#b42318; --brand:#0b6f68; --warn:#b76e00; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:"Avenir Next","PingFang SC","Microsoft YaHei",sans-serif; color:var(--text); background:linear-gradient(180deg,#fffef8 0%,var(--bg) 100%); }
+    .wrap { max-width:1180px; margin:24px auto 48px; padding:0 16px; display:grid; gap:16px; }
+    .card { background:var(--panel); border:1px solid var(--line); border-radius:14px; padding:16px; box-shadow:0 10px 30px rgba(16,24,40,.05); }
+    h1 { margin:0 0 6px; font-size:28px; }
+    h2 { margin:0 0 12px; font-size:18px; }
+    p, .meta { margin:0; color:var(--muted); font-size:13px; line-height:1.6; }
+    a, button { font:inherit; }
+    .links { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
+    .links a, button { min-height:38px; padding:0 14px; border-radius:10px; border:1px solid var(--line); background:#f7f5ef; color:#0f423f; text-decoration:none; font-weight:700; cursor:pointer; }
+    button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
+    button.buy { background:var(--good); border-color:var(--good); color:#fff; }
+    button.sell { background:var(--bad); border-color:var(--bad); color:#fff; }
+    button.danger { color:var(--bad); background:#fff; border-color:rgba(180,35,24,.35); }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .grid { display:grid; grid-template-columns:1.05fr .95fr; gap:16px; align-items:start; }
+    .fields { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+    label { display:grid; gap:6px; color:var(--muted); font-size:12px; }
+    input, select { height:38px; border:1px solid var(--line); border-radius:10px; padding:0 10px; background:#fff; color:var(--text); font-size:14px; }
+    .actions { display:grid; grid-template-columns:1fr 1fr; gap:10px; margin-top:14px; }
+    .stats { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:10px; }
+    .stat { border:1px solid var(--line); border-radius:12px; background:#fcfbf7; padding:12px; min-height:74px; }
+    .stat span { display:block; color:var(--muted); font-size:12px; margin-bottom:6px; }
+    .stat strong { display:block; font-size:18px; word-break:break-word; }
+    .warnbox { margin-top:12px; border:1px solid rgba(183,110,0,.24); border-radius:12px; background:#fff9ef; color:#9a5b00; padding:12px; font-size:13px; line-height:1.6; }
+    .badbox { margin-top:12px; border:1px solid rgba(180,35,24,.24); border-radius:12px; background:#fff4f2; color:var(--bad); padding:12px; font-size:13px; line-height:1.6; }
+    table { width:100%; border-collapse:collapse; font-size:13px; }
+    th, td { padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-size:12px; }
+    code { font-family:"SFMono-Regular","Consolas",monospace; font-size:12px; }
+    @media (max-width: 860px) { .grid,.fields { grid-template-columns:1fr; } .actions,.stats { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <section class="card">
+      <h1>手动追盘交易</h1>
+      <p>本页面只操作当前服务器配置的 Binance U 本位合约账户。Maker 按买一/卖一撤旧重挂直到全部成交、取消或报错；Take 使用 MARKET 市价单。</p>
+      <div class="links">
+        <a href="/console">返回控制台</a>
+        <a href="/monitor">打开监控页</a>
+        <a href="/strategies">打开策略总览</a>
+        <button id="refresh_btn" class="primary">刷新状态</button>
+      </div>
+      <div id="top_meta" class="meta">等待状态...</div>
+    </section>
+
+    <div class="grid">
+      <section class="card">
+        <h2>下单</h2>
+        <div class="fields">
+          <label>合约币种
+            <select id="manual_symbol"></select>
+          </label>
+          <label>USDT 名义额
+            <input id="manual_notional" type="number" min="0" step="0.01" value="100" />
+          </label>
+        </div>
+        <div class="actions">
+          <button id="maker_buy_btn" class="buy">Maker 买入追盘</button>
+          <button id="maker_sell_btn" class="sell">Maker 卖出追盘</button>
+          <button id="take_buy_btn">Take 买入市价</button>
+          <button id="take_sell_btn">Take 卖出市价</button>
+        </div>
+        <div class="actions">
+          <button id="cancel_btn" class="danger">取消当前 Maker 任务</button>
+        </div>
+        <div class="warnbox">下单前会自动尝试切换该合约为逐仓；如果账户是双向持仓模式会拒绝下单。允许和已有委托共存，本页面只撤换 <code id="prefix_code">mt_</code> 前缀订单。</div>
+        <div id="action_meta" class="meta"></div>
+      </section>
+
+      <section class="card">
+        <h2>当前币种状态</h2>
+        <div class="stats">
+          <div class="stat"><span>持仓模式</span><strong id="position_mode_value">--</strong></div>
+          <div class="stat"><span>保证金</span><strong id="margin_value">--</strong></div>
+          <div class="stat"><span>positionAmt</span><strong id="position_amt_value">--</strong></div>
+          <div class="stat"><span>开仓 / 保本</span><strong id="entry_value">--</strong></div>
+          <div class="stat"><span>买一</span><strong id="bid_value">--</strong></div>
+          <div class="stat"><span>卖一</span><strong id="ask_value">--</strong></div>
+          <div class="stat"><span>未成交委托</span><strong id="orders_value">--</strong></div>
+          <div class="stat"><span>同币种 runner</span><strong id="runner_value">--</strong></div>
+        </div>
+        <div id="risk_box" class="badbox" style="display:none"></div>
+      </section>
+    </div>
+
+    <section class="card">
+      <h2>追盘任务</h2>
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th>状态</th><th>方向</th><th>目标</th><th>当前腿</th><th>已成交数量</th><th>剩余数量</th><th>尝试次数</th><th>消息</th></tr></thead>
+          <tbody id="task_body"><tr><td colspan="8">暂无任务</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+  <script>
+    const symbolEl = document.getElementById("manual_symbol");
+    const notionalEl = document.getElementById("manual_notional");
+    const actionMetaEl = document.getElementById("action_meta");
+    const topMetaEl = document.getElementById("top_meta");
+    const riskBoxEl = document.getElementById("risk_box");
+    let symbols = [];
+    let refreshTimer = null;
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/[&<>"']/g, (ch) => ({ "&":"&amp;", "<":"&lt;", ">":"&gt;", '"':"&quot;", "'":"&#39;" }[ch]));
+    }
+    function fmt(value, digits = 6) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "--";
+      return num.toLocaleString(undefined, { maximumFractionDigits: digits });
+    }
+    async function readJson(resp) {
+      const raw = await resp.text();
+      const data = raw ? JSON.parse(raw) : {};
+      if (!resp.ok || data.ok === false) throw new Error(data.error || `请求失败(${resp.status})`);
+      return data;
+    }
+    async function loadSymbols() {
+      const resp = await fetch("/api/symbols?market_type=futures&contract_type=usdm");
+      const data = await readJson(resp);
+      symbols = Array.isArray(data.symbols) ? data.symbols : [];
+      const previous = symbolEl.value;
+      symbolEl.innerHTML = symbols.map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)}</option>`).join("");
+      symbolEl.value = symbols.includes(previous) ? previous : (symbols.includes("BARDUSDT") ? "BARDUSDT" : symbols[0] || "BTCUSDT");
+    }
+    function renderSnapshot(snapshot) {
+      document.getElementById("prefix_code").textContent = snapshot.manual_prefix || "mt_";
+      document.getElementById("position_mode_value").textContent = snapshot.one_way_position ? "单向" : "双向";
+      document.getElementById("margin_value").textContent = snapshot.isolated ? "逐仓" : "非逐仓";
+      document.getElementById("position_amt_value").textContent = fmt(snapshot.position_amt, 8);
+      document.getElementById("entry_value").textContent = `${fmt(snapshot.entry_price, 8)} / ${fmt(snapshot.break_even_price, 8)}`;
+      document.getElementById("bid_value").textContent = fmt(snapshot.bid_price, 8);
+      document.getElementById("ask_value").textContent = fmt(snapshot.ask_price, 8);
+      document.getElementById("orders_value").textContent = `${snapshot.open_order_count || 0} 总 / ${snapshot.manual_open_order_count || 0} 手动`;
+      document.getElementById("runner_value").textContent = snapshot.runner && snapshot.runner.is_running ? "运行中" : "未运行";
+      const risks = [];
+      if (!snapshot.one_way_position) risks.push("当前账户是双向持仓模式，手动下单会被拒绝。");
+      if (!snapshot.isolated) risks.push("当前币种状态显示非逐仓；下单前会尝试自动切逐仓。");
+      if (snapshot.runner && snapshot.runner.is_running) risks.push("同币种 runner 正在运行，可能与手动订单互相影响。");
+      if ((snapshot.open_order_count || 0) > (snapshot.manual_open_order_count || 0)) risks.push("当前存在非手动未成交委托，本页面不会主动撤销它们。");
+      riskBoxEl.style.display = risks.length ? "block" : "none";
+      riskBoxEl.innerHTML = risks.map(escapeHtml).join("<br>");
+      renderTask(snapshot.task);
+    }
+    function renderTask(task) {
+      const body = document.getElementById("task_body");
+      if (!task) {
+        body.innerHTML = '<tr><td colspan="8">暂无任务</td></tr>';
+        return;
+      }
+      const leg = task.current_leg || {};
+      body.innerHTML = `<tr>
+        <td>${escapeHtml(task.status || "--")}</td>
+        <td>${escapeHtml(task.side || "--")}</td>
+        <td>${fmt(task.notional, 2)} USDT</td>
+        <td>${escapeHtml(leg.role || "--")}</td>
+        <td>${fmt(task.executed_qty, 8)}</td>
+        <td>${fmt(task.remaining_qty, 8)}</td>
+        <td>${escapeHtml(task.attempts || 0)}</td>
+        <td>${escapeHtml(task.error || task.message || "--")}</td>
+      </tr>`;
+    }
+    async function refreshStatus() {
+      const symbol = symbolEl.value || "BTCUSDT";
+      const resp = await fetch(`/api/manual_trade/status?symbol=${encodeURIComponent(symbol)}`);
+      const data = await readJson(resp);
+      renderSnapshot(data.snapshot);
+      topMetaEl.textContent = `状态已刷新：${new Date().toLocaleString()}`;
+    }
+    async function submitAction(endpoint, side) {
+      actionMetaEl.textContent = "提交中...";
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: symbolEl.value, side, notional: Number(notionalEl.value || 0) }),
+      });
+      const data = await readJson(resp);
+      actionMetaEl.textContent = endpoint.includes("take") ? "Take 市价单已提交。" : "Maker 追盘任务已启动。";
+      if (data.snapshot) renderSnapshot(data.snapshot);
+      if (data.task) renderTask(data.task);
+      await refreshStatus();
+    }
+    async function cancelTask() {
+      actionMetaEl.textContent = "取消中...";
+      const resp = await fetch("/api/manual_trade/cancel", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: symbolEl.value }),
+      });
+      const data = await readJson(resp);
+      actionMetaEl.textContent = `已请求取消，撤单 ${data.cleanup ? data.cleanup.success : 0}/${data.cleanup ? data.cleanup.attempted : 0}`;
+      if (data.task) renderTask(data.task);
+      await refreshStatus();
+    }
+    document.getElementById("refresh_btn").addEventListener("click", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("maker_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "BUY").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("maker_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "SELL").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
+    symbolEl.addEventListener("change", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
+    loadSymbols()
+      .then(refreshStatus)
+      .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 3000); })
+      .catch((err) => { actionMetaEl.textContent = err.message; });
+  </script>
+</body>
+</html>
+"""
+
+
 MONITOR_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -14268,6 +14971,7 @@ MONITOR_PAGE = """<!doctype html>
       <div class="header-links">
         <a href="/">返回策略测算页</a>
         <a href="/basis">打开现货/合约价差监控</a>
+        <a href="/manual_trade">打开手动追盘交易</a>
         <a href="/spot_runner">打开现货执行台</a>
         <a href="/rankings">打开排行榜</a>
         <a href="/strategies">打开策略总览</a>
@@ -26499,6 +27203,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/running_status", "/running_status.html"}:
             self._send_html(RUNNING_STATUS_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/manual_trade", "/manual_trade.html"}:
+            self._send_html(MANUAL_TRADE_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/spot_runner", "/spot_runner.html"}:
             self._send_html(SPOT_RUNNER_PAGE, status=HTTPStatus.OK)
             return
@@ -26524,6 +27231,18 @@ class _Handler(BaseHTTPRequestHandler):
             symbol = str(query.get("symbol", [SPOT_RUNNER_DEFAULT_CONFIG["symbol"]])[0]).upper().strip()
             try:
                 snapshot = _build_spot_runner_snapshot(symbol or None)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
+            return
+        if path == "/api/manual_trade/status":
+            symbol = str(query.get("symbol", ["BTCUSDT"])[0]).upper().strip() or "BTCUSDT"
+            try:
+                snapshot = _manual_trade_snapshot(symbol)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
@@ -26773,6 +27492,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/manual_trade", "/manual_trade.html"}:
+            body = MANUAL_TRADE_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/spot_runner", "/spot_runner.html"}:
             body = SPOT_RUNNER_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -26807,6 +27532,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/competition_board"
             or path == "/api/spot_runner/status"
             or path == "/api/spot_runner/save"
+            or path == "/api/manual_trade/status"
         ):
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -26829,6 +27555,39 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if not self._authorize_request():
+            return
+        if path in {"/api/manual_trade/maker", "/api/manual_trade/take", "/api/manual_trade/cancel"}:
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 1024 * 1024:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            raw = self.rfile.read(content_len)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            if not isinstance(payload, dict):
+                self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
+                return
+            try:
+                if path.endswith("/maker"):
+                    result = _manual_trade_start_maker(payload)
+                    self._send_json({"ok": True, **result}, status=202)
+                elif path.endswith("/take"):
+                    result = _manual_trade_execute_take(payload)
+                    self._send_json({"ok": True, **result}, status=200)
+                else:
+                    result = _manual_trade_cancel(payload)
+                    self._send_json({"ok": True, **result}, status=200)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
         if path in {"/api/spot_runner/start", "/api/spot_runner/stop", "/api/spot_runner/save"}:
             try:

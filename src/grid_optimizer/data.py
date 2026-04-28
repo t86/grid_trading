@@ -1706,6 +1706,76 @@ def post_futures_order(
     return data
 
 
+def post_futures_market_order(
+    *,
+    symbol: str,
+    side: str,
+    quantity: float,
+    api_key: str,
+    api_secret: str,
+    contract_type: str = "usdm",
+    recv_window: int = 5000,
+    new_client_order_id: str | None = None,
+    reduce_only: bool | None = None,
+    position_side: str | None = None,
+) -> dict[str, Any]:
+    params: dict[str, str | int] = {
+        "symbol": symbol.upper(),
+        "side": side.upper(),
+        "type": "MARKET",
+        "quantity": _format_request_number(quantity),
+        "recvWindow": recv_window,
+    }
+    if new_client_order_id:
+        params["newClientOrderId"] = str(new_client_order_id).strip()
+    if position_side:
+        params["positionSide"] = str(position_side).upper().strip()
+    if reduce_only is not None:
+        params["reduceOnly"] = "true" if reduce_only else "false"
+    data = _http_signed_request_json(
+        f"{_futures_trade_base_url(contract_type)}/fapi/v1/order",
+        params,
+        api_key,
+        api_secret,
+        method="POST",
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected futures market order response")
+    return data
+
+
+def fetch_futures_order(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    order_id: int | None = None,
+    orig_client_order_id: str | None = None,
+    contract_type: str = "usdm",
+    recv_window: int = 5000,
+) -> dict[str, Any]:
+    if order_id is None and not str(orig_client_order_id or "").strip():
+        raise ValueError("order_id or orig_client_order_id is required")
+    params: dict[str, str | int] = {
+        "symbol": symbol.upper(),
+        "recvWindow": recv_window,
+    }
+    if order_id is not None:
+        params["orderId"] = int(order_id)
+    if orig_client_order_id:
+        params["origClientOrderId"] = str(orig_client_order_id).strip()
+    data = _http_signed_request_json(
+        f"{_futures_trade_base_url(contract_type)}/fapi/v1/order",
+        params,
+        api_key,
+        api_secret,
+        method="GET",
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected futures order response")
+    return data
+
+
 def delete_futures_order(
     *,
     symbol: str,
