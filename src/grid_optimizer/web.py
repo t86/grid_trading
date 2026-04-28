@@ -7740,7 +7740,12 @@ def _manual_trade_snapshot(symbol: str) -> dict[str, Any]:
     }
 
 
-def _manual_trade_prepare_plan(symbol: str, side: str, notional: float) -> tuple[str, str, str, dict[str, Any], str, str]:
+def _manual_trade_prepare_plan(
+    symbol: str,
+    side: str,
+    notional: float,
+    margin_mode: str = "KEEP",
+) -> tuple[str, str, str, dict[str, Any], str, str]:
     normalized_symbol = str(symbol or "").upper().strip()
     if not normalized_symbol:
         raise ValueError("symbol is required")
@@ -7755,7 +7760,11 @@ def _manual_trade_prepare_plan(symbol: str, side: str, notional: float) -> tuple
     if _truthy(position_mode.get("dualSidePosition")):
         raise ValueError("manual trade requires one-way position mode")
     account_info = fetch_futures_account_info_v3(api_key, api_secret)
-    _manual_trade_ensure_isolated(normalized_symbol, api_key, api_secret, account_info=account_info)
+    normalized_margin_mode = str(margin_mode or "KEEP").upper().strip()
+    if normalized_margin_mode not in {"KEEP", "ISOLATED"}:
+        raise ValueError("margin_mode must be KEEP or ISOLATED")
+    if normalized_margin_mode == "ISOLATED":
+        _manual_trade_ensure_isolated(normalized_symbol, api_key, api_secret, account_info=account_info)
     bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
     symbol_info = fetch_futures_symbol_config(normalized_symbol)
     plan = _build_manual_trade_plan(
@@ -7775,6 +7784,7 @@ def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
         str(payload.get("symbol", "")),
         str(payload.get("side", "")),
         float(payload.get("notional", 0) or 0),
+        str(payload.get("margin_mode", "KEEP")),
     )
     prefix = _manual_trade_client_order_prefix(symbol)
     responses = []
@@ -7894,6 +7904,7 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
             symbol,
             str(payload.get("side", "")),
             float(payload.get("notional", 0) or 0),
+            str(payload.get("margin_mode", "KEEP")),
         )
         prefix = _manual_trade_client_order_prefix(symbol)
         _manual_trade_set_task(
@@ -14153,6 +14164,12 @@ MANUAL_TRADE_PAGE = """<!doctype html>
           <label>USDT 名义额
             <input id="manual_notional" type="number" min="0" step="0.01" value="100" />
           </label>
+          <label>保证金模式
+            <select id="manual_margin_mode">
+              <option value="KEEP" selected>保持当前保证金模式</option>
+              <option value="ISOLATED">尝试切逐仓</option>
+            </select>
+          </label>
         </div>
         <div class="actions">
           <button id="maker_buy_btn" class="buy">Maker 买入追盘</button>
@@ -14163,7 +14180,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <div class="actions">
           <button id="cancel_btn" class="danger">取消当前 Maker 任务</button>
         </div>
-        <div class="warnbox">下单前会自动尝试切换该合约为逐仓；如果账户是双向持仓模式会拒绝下单。允许和已有委托共存，本页面只撤换 <code id="prefix_code">mt_</code> 前缀订单。</div>
+        <div class="warnbox">默认保持当前保证金模式，适合和全仓策略共存；只有选择“尝试切逐仓”时才会调用切换接口。如果账户是双向持仓模式会拒绝下单。允许和已有委托共存，本页面只撤换 <code id="prefix_code">mt_</code> 前缀订单。</div>
         <div id="action_meta" class="meta"></div>
       </section>
 
@@ -14196,6 +14213,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
   <script>
     const symbolEl = document.getElementById("manual_symbol");
     const notionalEl = document.getElementById("manual_notional");
+    const marginModeEl = document.getElementById("manual_margin_mode");
     const actionMetaEl = document.getElementById("action_meta");
     const topMetaEl = document.getElementById("top_meta");
     const riskBoxEl = document.getElementById("risk_box");
@@ -14236,7 +14254,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       document.getElementById("runner_value").textContent = snapshot.runner && snapshot.runner.is_running ? "运行中" : "未运行";
       const risks = [];
       if (!snapshot.one_way_position) risks.push("当前账户是双向持仓模式，手动下单会被拒绝。");
-      if (!snapshot.isolated) risks.push("当前币种状态显示非逐仓；下单前会尝试自动切逐仓。");
+      if (!snapshot.isolated && marginModeEl.value === "ISOLATED") risks.push("当前币种状态显示非逐仓；选择尝试切逐仓时，如果已有未成交委托，币安可能拒绝切换。");
       if (snapshot.runner && snapshot.runner.is_running) risks.push("同币种 runner 正在运行，可能与手动订单互相影响。");
       if ((snapshot.open_order_count || 0) > (snapshot.manual_open_order_count || 0)) risks.push("当前存在非手动未成交委托，本页面不会主动撤销它们。");
       riskBoxEl.style.display = risks.length ? "block" : "none";
@@ -14273,7 +14291,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const resp = await fetch(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: symbolEl.value, side, notional: Number(notionalEl.value || 0) }),
+        body: JSON.stringify({ symbol: symbolEl.value, side, notional: Number(notionalEl.value || 0), margin_mode: marginModeEl.value || "KEEP" }),
       });
       const data = await readJson(resp);
       actionMetaEl.textContent = endpoint.includes("take") ? "Take 市价单已提交。" : "Maker 追盘任务已启动。";

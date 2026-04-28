@@ -9,6 +9,7 @@ from grid_optimizer.web import (
     _is_manual_trade_order,
     _manual_trade_client_order_prefix,
     _manual_trade_ensure_isolated,
+    _manual_trade_prepare_plan,
 )
 
 
@@ -124,10 +125,37 @@ class ManualTradeTests(unittest.TestCase):
     def test_manual_trade_page_contains_required_controls(self) -> None:
         self.assertIn('id="manual_symbol"', MANUAL_TRADE_PAGE)
         self.assertIn('id="manual_notional"', MANUAL_TRADE_PAGE)
+        self.assertIn('id="manual_margin_mode"', MANUAL_TRADE_PAGE)
+        self.assertIn('<option value="KEEP" selected>保持当前保证金模式</option>', MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/status", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/maker", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
+
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    @patch("grid_optimizer.web.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    @patch("grid_optimizer.web.post_futures_change_margin_type")
+    def test_prepare_plan_keeps_current_margin_mode_by_default(
+        self,
+        mock_change_margin,
+        mock_credentials,
+        mock_position_mode,
+        mock_book,
+        mock_account_info,
+        mock_symbol_config,
+    ) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_book.return_value = [{"bid_price": "1.0", "ask_price": "1.01"}]
+        mock_account_info.return_value = {"positions": [{"symbol": "BARDUSDT", "positionAmt": "0"}]}
+        mock_symbol_config.return_value = self._symbol_info()
+
+        _manual_trade_prepare_plan("BARDUSDT", "BUY", 100.0)
+
+        mock_change_margin.assert_not_called()
 
     def test_monitor_page_links_to_manual_trade_page(self) -> None:
         from grid_optimizer.web import MONITOR_PAGE
