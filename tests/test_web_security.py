@@ -32,6 +32,7 @@ from grid_optimizer.web import (
     _resolve_runner_volatility_trigger_action,
     _select_runner_volatility_trigger_signal,
     _resolve_runner_start_config,
+    _render_running_status_page,
     _run_loop_monitor_query,
     _reconcile_runner_volatility_trigger,
     _runtime_guard_input_summary,
@@ -144,6 +145,22 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="reduce_state_box"', MONITOR_PAGE)
         self.assertIn("减仓风控", MONITOR_PAGE)
         self.assertIn("硬损强减", MONITOR_PAGE)
+
+    def test_running_status_page_contains_card_console_sections(self) -> None:
+        page = _render_running_status_page()
+
+        self.assertIn("运行中", page)
+        self.assertIn("已保存未启动", page)
+        self.assertIn("/api/running_status", page)
+        self.assertIn('id="status_drawer"', page)
+
+    def test_running_status_page_contains_local_control_actions(self) -> None:
+        page = _render_running_status_page(symbol="CHIPUSDT")
+
+        self.assertIn("保存并重启", page)
+        self.assertIn("停止", page)
+        self.assertIn("高级 JSON", page)
+        self.assertIn("strategy_mode", page)
 
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
         if "getSelectedSymbol(" in MONITOR_PAGE:

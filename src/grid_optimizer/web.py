@@ -24,7 +24,7 @@ from pathlib import Path
 from collections.abc import Callable
 from statistics import mean
 from typing import Any, Union
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -49,6 +49,8 @@ from .competition_board import (
     resolve_active_competition_board,
     upsert_competition_entry,
 )
+from .console_overview import _fetch_remote_json
+from .console_registry import load_console_registry
 from .data import (
     cache_file_path,
     delete_futures_order,
@@ -4001,6 +4003,1526 @@ def _iter_saved_runner_control_configs() -> list[dict[str, Any]]:
             continue
         seen_symbols.add(symbol)
     return configs
+
+
+def _iter_running_status_saved_control_configs(output_dir: Path | None = None) -> list[dict[str, Any]]:
+    base_output_dir = Path(output_dir) if output_dir is not None else Path("output")
+    paths: list[Path] = []
+    if base_output_dir.exists():
+        paths.extend(sorted(base_output_dir.glob("*_loop_runner_control.json")))
+    legacy_control_path = base_output_dir / RUNNER_CONTROL_PATH.name
+    if legacy_control_path.exists() and legacy_control_path not in paths:
+        paths.append(legacy_control_path)
+
+    seen_symbols: set[str] = set()
+    configs: list[dict[str, Any]] = []
+    for path in paths:
+        stored = _read_json_dict(path)
+        if not stored:
+            continue
+        symbol = str(stored.get("symbol", "")).upper().strip()
+        if not symbol or symbol in seen_symbols:
+            continue
+        candidate = dict(stored)
+        candidate["symbol"] = symbol
+        configs.append(candidate)
+        seen_symbols.add(symbol)
+    return configs
+
+
+def _running_status_target_url(symbol: str, base_url: str = "") -> str:
+    normalized_symbol = str(symbol or "").upper().strip()
+    query = quote(normalized_symbol) if normalized_symbol else ""
+    if not query:
+        return f"{str(base_url or '').rstrip('/')}/running_status" if base_url else "/running_status"
+    suffix = f"/running_status?symbol={query}"
+    normalized_base_url = str(base_url or "").strip().rstrip("/")
+    return f"{normalized_base_url}{suffix}" if normalized_base_url else suffix
+
+
+def _running_status_card_from_snapshot(
+    snapshot: dict[str, Any],
+    *,
+    server_id: str | None = None,
+    server_label: str | None = None,
+    server_base_url: str = "",
+    focused_symbol: str | None = None,
+) -> dict[str, Any]:
+    symbol = str(snapshot.get("symbol", "")).upper().strip()
+    runner = snapshot.get("runner") or {}
+    config = dict(runner.get("config") or {})
+    risk = snapshot.get("risk_controls") or {}
+    trade = snapshot.get("trade_summary") or {}
+    income = snapshot.get("income_summary") or {}
+    hourly = snapshot.get("hourly_summary") or {}
+    position = snapshot.get("position") or {}
+    open_orders = snapshot.get("open_orders") or []
+    normalized_focused_symbol = str(focused_symbol or "").upper().strip()
+    effective_buy_levels = risk.get("effective_buy_levels", config.get("buy_levels"))
+    effective_sell_levels = risk.get("effective_sell_levels", config.get("sell_levels"))
+    effective_step_price = risk.get("adaptive_step_effective_step_price", config.get("step_price"))
+    effective_base_position = risk.get("effective_base_position_notional", config.get("base_position_notional"))
+    recent_hour_rows = hourly.get("rows") if isinstance(hourly, dict) else None
+    recent_hour_volume = 0.0
+    if isinstance(recent_hour_rows, list) and recent_hour_rows:
+        recent_hour_volume = float((recent_hour_rows[0] or {}).get("gross_notional") or 0.0)
+    max_position_notional = risk.get("max_position_notional", config.get("max_position_notional"))
+    max_short_position_notional = risk.get("max_short_position_notional", config.get("max_short_position_notional"))
+    pause_buy_position_notional = risk.get("pause_buy_position_notional", config.get("pause_buy_position_notional"))
+    pause_short_position_notional = risk.get("pause_short_position_notional", config.get("pause_short_position_notional"))
+    threshold_position_notional = config.get("threshold_position_notional")
+    strategy_name = str(
+        risk.get("effective_strategy_label")
+        or config.get("strategy_profile")
+        or symbol
+    ).strip()
+    return {
+        "symbol": symbol,
+        "server_id": str(server_id or "").strip() or None,
+        "server_label": str(server_label or "").strip() or None,
+        "server_base_url": str(server_base_url or "").strip(),
+        "target_url": _running_status_target_url(symbol, server_base_url),
+        "focused": bool(normalized_focused_symbol and symbol == normalized_focused_symbol),
+        "configured": bool(runner.get("configured")),
+        "is_running": bool(runner.get("is_running")),
+        "pid": runner.get("pid"),
+        "updated_at": snapshot.get("ts"),
+        "strategy_name": strategy_name,
+        "strategy_profile": config.get("strategy_profile"),
+        "strategy_mode": risk.get("strategy_mode", config.get("strategy_mode")),
+        "step_price": effective_step_price,
+        "buy_levels": effective_buy_levels,
+        "sell_levels": effective_sell_levels,
+        "base_position_notional": effective_base_position,
+        "pause_buy_position_notional": pause_buy_position_notional,
+        "pause_short_position_notional": pause_short_position_notional,
+        "threshold_position_notional": threshold_position_notional,
+        "max_position_notional": max_position_notional,
+        "max_short_position_notional": max_short_position_notional,
+        "max_total_notional": config.get("max_total_notional"),
+        "soft_reduce_summary": {
+            "adverse_reduce_enabled": bool(config.get("adverse_reduce_enabled", False)),
+            "adverse_reduce_target_ratio": config.get("adverse_reduce_target_ratio"),
+            "adverse_reduce_max_order_notional": config.get("adverse_reduce_max_order_notional"),
+        },
+        "hard_reduce_summary": {
+            "hard_loss_forced_reduce_enabled": bool(config.get("hard_loss_forced_reduce_enabled", False)),
+            "hard_loss_forced_reduce_target_notional": config.get("hard_loss_forced_reduce_target_notional"),
+            "hard_loss_forced_reduce_max_order_notional": config.get("hard_loss_forced_reduce_max_order_notional"),
+        },
+        "timeout_reduce_summary": {
+            "threshold_reduce_target_ratio": config.get("threshold_reduce_target_ratio"),
+            "threshold_reduce_taker_timeout_seconds": config.get("threshold_reduce_taker_timeout_seconds"),
+            "short_threshold_timeout_seconds": config.get("short_threshold_timeout_seconds"),
+            "adverse_reduce_maker_timeout_seconds": config.get("adverse_reduce_maker_timeout_seconds"),
+        },
+        "open_order_count": len(open_orders) if isinstance(open_orders, list) else 0,
+        "position_amt": float(position.get("position_amt") or 0.0),
+        "long_qty": float(position.get("long_qty") or 0.0),
+        "short_qty": float(position.get("short_qty") or 0.0),
+        "unrealized_pnl": float(position.get("unrealized_pnl") or 0.0),
+        "total_volume": float(trade.get("gross_notional") or 0.0),
+        "recent_hour_volume": recent_hour_volume,
+        "total_pnl": float(trade.get("net_pnl_estimate") or 0.0),
+        "trade_pnl": float(trade.get("realized_pnl") or 0.0),
+        "fees": float(trade.get("commission") or 0.0),
+        "funding_fee": float(income.get("funding_fee") or 0.0),
+        "config": config,
+        "snapshot": snapshot,
+    }
+
+
+def _build_running_status_local_payload(
+    symbol: str | None = None,
+    *,
+    server_id: str | None = None,
+    server_label: str | None = None,
+    server_base_url: str = "",
+) -> dict[str, Any]:
+    normalized_focused_symbol = str(symbol or "").upper().strip() or None
+    cards: list[dict[str, Any]] = []
+    for config in _iter_running_status_saved_control_configs():
+        card_symbol = str(config.get("symbol", "")).upper().strip()
+        if not card_symbol:
+            continue
+        snapshot = build_monitor_snapshot(
+            symbol=card_symbol,
+            events_path=str(_default_runtime_paths_for_symbol(card_symbol)["summary_jsonl"]),
+            plan_path=str(_default_runtime_paths_for_symbol(card_symbol)["plan_json"]),
+            submit_report_path=str(_default_runtime_paths_for_symbol(card_symbol)["submit_report_json"]),
+            runner_process=_read_runner_process_for_symbol(card_symbol),
+        )
+        cards.append(
+            _running_status_card_from_snapshot(
+                snapshot,
+                server_id=server_id,
+                server_label=server_label,
+                server_base_url=server_base_url,
+                focused_symbol=normalized_focused_symbol,
+            )
+        )
+
+    cards.sort(key=lambda item: str(item.get("symbol") or ""))
+    running = [item for item in cards if item.get("is_running")]
+    saved_idle = [item for item in cards if not item.get("is_running")]
+
+    return {
+        "ok": True,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scope": "local",
+        "view_mode": "local",
+        "server_id": str(server_id or "").strip() or None,
+        "server_label": str(server_label or "").strip() or None,
+        "server_base_url": str(server_base_url or "").strip(),
+        "focused_symbol": normalized_focused_symbol,
+        "groups": {
+            "running": running,
+            "saved_idle": saved_idle,
+        },
+        "summary": {
+            "running_symbol_count": len(running),
+            "saved_idle_symbol_count": len(saved_idle),
+            "running_total_volume": sum(float(item.get("total_volume") or 0.0) for item in running),
+            "recent_hour_volume": sum(float(item.get("recent_hour_volume") or 0.0) for item in running),
+            "total_pnl": sum(float(item.get("total_pnl") or 0.0) for item in running),
+        },
+    }
+
+
+def _local_running_status_server_id(registry: dict[str, Any] | None = None) -> str | None:
+    explicit = str(os.environ.get("GRID_CONSOLE_SERVER_ID") or os.environ.get("GRID_SERVER_ID") or "").strip()
+    if explicit:
+        return explicit
+
+    try:
+        registry_data = registry or load_console_registry()
+    except Exception:
+        return None
+
+    normalized_source_label = str(alert_source_label() or "").strip().lower()
+    if not normalized_source_label:
+        return None
+
+    for server in list(registry_data.get("servers") or []):
+        server_id = str(server.get("id") or "").strip()
+        server_label = str(server.get("label") or "").strip().lower()
+        base_url = str(server.get("base_url") or "").strip().rstrip("/")
+        hostname = (urlparse(base_url).hostname or "").strip().lower()
+        if normalized_source_label == server_id.lower():
+            return server_id
+        if normalized_source_label == server_label:
+            return server_id
+        if hostname and (
+            hostname == normalized_source_label
+            or hostname.endswith(f".{normalized_source_label}")
+            or hostname.endswith(normalized_source_label)
+        ):
+            return server_id
+    return None
+
+
+def _normalize_running_status_server_payload(payload: dict[str, Any], *, server: dict[str, Any]) -> dict[str, Any]:
+    normalized = dict(payload or {})
+    groups = normalized.get("groups") if isinstance(normalized.get("groups"), dict) else {}
+    running = list(groups.get("running") or [])
+    saved_idle = list(groups.get("saved_idle") or [])
+    summary = normalized.get("summary") if isinstance(normalized.get("summary"), dict) else {}
+    raw_server_base_url = normalized["server_base_url"] if "server_base_url" in normalized else None
+    normalized["ok"] = bool(normalized.get("ok", True))
+    normalized["scope"] = "local"
+    normalized["view_mode"] = "local"
+    normalized["server_id"] = str(normalized.get("server_id") or server.get("id") or "").strip() or None
+    normalized["server_label"] = str(normalized.get("server_label") or server.get("label") or "").strip() or None
+    normalized["server_base_url"] = (
+        str(raw_server_base_url).strip().rstrip("/")
+        if raw_server_base_url is not None
+        else str(server.get("base_url") or "").strip().rstrip("/")
+    )
+    normalized["groups"] = {
+        "running": running,
+        "saved_idle": saved_idle,
+    }
+    normalized["summary"] = {
+        "running_symbol_count": int(summary.get("running_symbol_count") or len(running)),
+        "saved_idle_symbol_count": int(summary.get("saved_idle_symbol_count") or len(saved_idle)),
+    }
+    return normalized
+
+
+def _fetch_remote_running_status_payload(server: dict[str, Any]) -> dict[str, Any]:
+    payload = _fetch_remote_json(server, "/api/running_status", params={"scope": "local"})
+    return _normalize_running_status_server_payload(payload, server=server)
+
+
+def _build_running_status_cross_payload() -> dict[str, Any]:
+    registry = load_console_registry()
+    servers = [server for server in list(registry.get("servers") or []) if bool(server.get("enabled", True))]
+    local_server_id = _local_running_status_server_id(registry)
+    server_payloads: list[dict[str, Any]] = []
+    warnings: list[str] = []
+
+    for server in servers:
+        server_id = str(server.get("id") or "").strip()
+        try:
+            if local_server_id and server_id == local_server_id:
+                payload = _build_running_status_local_payload(
+                    server_id=server_id,
+                    server_label=str(server.get("label") or "").strip() or None,
+                    server_base_url="",
+                )
+                payload = _normalize_running_status_server_payload(payload, server=server)
+            else:
+                payload = _fetch_remote_running_status_payload(server)
+        except Exception as exc:
+            warnings.append(f"{server_id or 'unknown'} unavailable: {type(exc).__name__}: {exc}")
+            payload = {
+                "ok": False,
+                "scope": "local",
+                "view_mode": "local",
+                "server_id": server_id or None,
+                "server_label": str(server.get("label") or "").strip() or None,
+                "server_base_url": str(server.get("base_url") or "").strip().rstrip("/"),
+                "groups": {"running": [], "saved_idle": []},
+                "summary": {"running_symbol_count": 0, "saved_idle_symbol_count": 0},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        server_payloads.append(payload)
+
+    return {
+        "ok": True,
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "scope": "cross",
+        "view_mode": "cross",
+        "servers": server_payloads,
+        "summary": {
+            "server_count": len(server_payloads),
+            "running_symbol_count": sum(
+                int(((item.get("summary") or {}).get("running_symbol_count") or 0))
+                for item in server_payloads
+            ),
+            "saved_idle_symbol_count": sum(
+                int(((item.get("summary") or {}).get("saved_idle_symbol_count") or 0))
+                for item in server_payloads
+            ),
+        },
+        "warnings": warnings,
+    }
+
+
+def _run_running_status_query(query: dict[str, list[str]]) -> dict[str, Any]:
+    scope = str((query.get("scope") or [""])[0] or "").strip().lower()
+    normalized_symbol = str((query.get("symbol") or [""])[0] or "").upper().strip()
+    if scope == "cross" and not normalized_symbol:
+        return _build_running_status_cross_payload()
+    if scope not in {"", "local", "cross"}:
+        raise ValueError("scope must be local or cross")
+    return _build_running_status_local_payload(symbol=normalized_symbol or None)
+
+
+RUNNING_STATUS_GRID_MODE_LIST = [
+    "one_way_long",
+    "one_way_short",
+    "synthetic_neutral",
+    "hedge_neutral",
+    "inventory_target_neutral",
+]
+RUNNING_STATUS_LONG_CAPABLE_MODE_LIST = [
+    "one_way_long",
+    "synthetic_neutral",
+    "hedge_neutral",
+    "inventory_target_neutral",
+]
+RUNNING_STATUS_SHORT_CAPABLE_MODE_LIST = [
+    "one_way_short",
+    "synthetic_neutral",
+    "hedge_neutral",
+    "inventory_target_neutral",
+]
+RUNNING_STATUS_NEUTRAL_MODE_LIST = [
+    "synthetic_neutral",
+    "hedge_neutral",
+    "inventory_target_neutral",
+]
+RUNNING_STATUS_SYNTHETIC_MODE_LIST = ["synthetic_neutral"]
+RUNNING_STATUS_MODE_OPTIONS = [
+    {"value": "one_way_long", "label": "单向做多"},
+    {"value": "one_way_short", "label": "单向做空"},
+    {"value": "synthetic_neutral", "label": "单向合成中性"},
+    {"value": "hedge_neutral", "label": "双向中性"},
+    {"value": "inventory_target_neutral", "label": "目标仓位中性"},
+]
+RUNNING_STATUS_FORM_GROUPS: list[dict[str, Any]] = [
+    {
+        "key": "base",
+        "title": "基础下单",
+        "fields": [
+            {
+                "key": "strategy_mode",
+                "label": "策略模式",
+                "type": "select",
+                "options": RUNNING_STATUS_MODE_OPTIONS,
+                "defaultValue": "one_way_long",
+            },
+            {"key": "step_price", "label": "步长", "type": "number", "step": "0.0000001", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "buy_levels", "label": "买格数", "type": "integer", "step": "1", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "sell_levels", "label": "卖格数", "type": "integer", "step": "1", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "per_order_notional", "label": "单笔金额", "type": "number", "step": "0.01", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "base_position_notional", "label": "基础仓", "type": "number", "step": "0.01", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "sleep_seconds", "label": "循环秒数", "type": "number", "step": "0.1"},
+            {"key": "leverage", "label": "杠杆", "type": "integer", "step": "1"},
+            {"key": "maker_retries", "label": "Post-only 重试", "type": "integer", "step": "1"},
+            {"key": "max_new_orders", "label": "单轮最大新单数", "type": "integer", "step": "1"},
+        ],
+    },
+    {
+        "key": "position",
+        "title": "阈值与仓位",
+        "fields": [
+            {"key": "pause_buy_position_notional", "label": "软阈值-多", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_LONG_CAPABLE_MODE_LIST},
+            {"key": "pause_short_position_notional", "label": "软阈值-空", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_SHORT_CAPABLE_MODE_LIST},
+            {"key": "threshold_position_notional", "label": "硬阈值", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "max_position_notional", "label": "最大持仓-多", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_LONG_CAPABLE_MODE_LIST},
+            {"key": "max_short_position_notional", "label": "最大持仓-空", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_SHORT_CAPABLE_MODE_LIST},
+            {"key": "max_total_notional", "label": "最大总名义", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "max_actual_net_notional", "label": "最大净敞口", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_NEUTRAL_MODE_LIST},
+            {"key": "max_synthetic_drift_notional", "label": "账本漂移上限", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_SYNTHETIC_MODE_LIST},
+        ],
+    },
+    {
+        "key": "center",
+        "title": "中心与偏移",
+        "fields": [
+            {"key": "center_price", "label": "固定中心价", "type": "number", "step": "0.0000001", "allowNull": True, "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "up_trigger_steps", "label": "上移触发格数", "type": "integer", "step": "1", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "down_trigger_steps", "label": "下移触发格数", "type": "integer", "step": "1", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "shift_steps", "label": "每次移动格数", "type": "integer", "step": "1", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "fixed_center_enabled", "label": "启用固定中心价", "type": "boolean", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "fixed_center_roll_enabled", "label": "固定中心允许滚动", "type": "boolean", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "static_buy_offset_steps", "label": "买单静态偏移格数", "type": "number", "step": "0.1", "allowNull": True, "modes": RUNNING_STATUS_GRID_MODE_LIST},
+            {"key": "static_sell_offset_steps", "label": "卖单静态偏移格数", "type": "number", "step": "0.1", "allowNull": True, "modes": RUNNING_STATUS_GRID_MODE_LIST},
+        ],
+    },
+    {
+        "key": "reduce",
+        "title": "减仓风控",
+        "fields": [
+            {"key": "threshold_reduce_target_ratio", "label": "阈值减仓目标比例", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "threshold_reduce_taker_timeout_seconds", "label": "阈值减仓追价超时(秒)", "type": "number", "step": "0.1", "allowNull": True},
+            {"key": "short_threshold_timeout_seconds", "label": "超阈值持仓超时(秒)", "type": "number", "step": "0.1", "allowNull": True, "modes": RUNNING_STATUS_SHORT_CAPABLE_MODE_LIST},
+            {"key": "adverse_reduce_enabled", "label": "启用软减仓", "type": "boolean"},
+            {"key": "adverse_reduce_short_trigger_ratio", "label": "空侧逆向触发比例", "type": "number", "step": "0.0001", "allowNull": True, "modes": RUNNING_STATUS_SHORT_CAPABLE_MODE_LIST},
+            {"key": "adverse_reduce_long_trigger_ratio", "label": "多侧逆向触发比例", "type": "number", "step": "0.0001", "allowNull": True, "modes": RUNNING_STATUS_LONG_CAPABLE_MODE_LIST},
+            {"key": "adverse_reduce_target_ratio", "label": "软减仓目标比例", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "adverse_reduce_maker_timeout_seconds", "label": "软减仓 maker 超时(秒)", "type": "number", "step": "0.1", "allowNull": True},
+            {"key": "adverse_reduce_max_order_notional", "label": "软减仓单笔上限", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "hard_loss_forced_reduce_enabled", "label": "启用硬损强减", "type": "boolean"},
+            {"key": "hard_loss_forced_reduce_target_notional", "label": "硬损目标仓位", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "hard_loss_forced_reduce_max_order_notional", "label": "硬损单笔上限", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "hard_loss_forced_reduce_unrealized_loss_limit", "label": "硬损浮亏阈值", "type": "number", "step": "0.01", "allowNull": True},
+        ],
+    },
+    {
+        "key": "runtime",
+        "title": "执行选项",
+        "fields": [
+            {"key": "flat_start_enabled", "label": "启用 flat start", "type": "boolean"},
+            {"key": "warm_start_enabled", "label": "启用 warm start", "type": "boolean"},
+            {"key": "cancel_stale", "label": "自动撤旧单", "type": "boolean"},
+            {"key": "apply", "label": "允许真实下单", "type": "boolean"},
+            {"key": "reset_state", "label": "启动时重置状态", "type": "boolean"},
+            {"key": "autotune_symbol_enabled", "label": "允许币种自动调参", "type": "boolean"},
+            {"key": "excess_inventory_reduce_only_enabled", "label": "超库存仅减仓", "type": "boolean", "modes": RUNNING_STATUS_GRID_MODE_LIST},
+        ],
+    },
+]
+
+
+def _running_status_form_groups_with_ids() -> list[dict[str, Any]]:
+    groups: list[dict[str, Any]] = []
+    for group in RUNNING_STATUS_FORM_GROUPS:
+        normalized_group = {
+            "key": group["key"],
+            "title": group["title"],
+            "fields": [],
+        }
+        for field in group["fields"]:
+            normalized_field = dict(field)
+            normalized_field["id"] = f"rs_field_{field['key']}"
+            normalized_group["fields"].append(normalized_field)
+        groups.append(normalized_group)
+    return groups
+
+
+def _render_running_status_form_field(field: dict[str, Any]) -> str:
+    field_id = str(field["id"])
+    label = str(field["label"])
+    modes = ",".join(field.get("modes") or [])
+    mode_attr = f' data-field-modes="{modes}"' if modes else ""
+    if field.get("type") == "boolean":
+        return (
+            f'<label class="rs-inline-check" data-field-key="{field["key"]}"{mode_attr}>'
+            '<span class="rs-check-row">'
+            f'<input id="{field_id}" type="checkbox" />'
+            f"<span>{label}</span>"
+            "</span>"
+            "</label>"
+        )
+    if field.get("type") == "select":
+        options_html = "".join(
+            f'<option value="{option["value"]}">{option["label"]}</option>'
+            for option in (field.get("options") or [])
+        )
+        return (
+            f'<label data-field-key="{field["key"]}"{mode_attr}>{label}'
+            f'<select id="{field_id}">{options_html}</select>'
+            "</label>"
+        )
+    step = str(field.get("step") or "0.01")
+    input_type = "number" if field.get("type") in {"number", "integer"} else "text"
+    min_attr = ' min="0"' if input_type == "number" else ""
+    return (
+        f'<label data-field-key="{field["key"]}"{mode_attr}>{label}'
+        f'<input id="{field_id}" type="{input_type}" step="{step}"{min_attr} />'
+        "</label>"
+    )
+
+
+def _render_running_status_form_groups_html() -> str:
+    sections: list[str] = []
+    for group in _running_status_form_groups_with_ids():
+        fields_html = "".join(_render_running_status_form_field(field) for field in group["fields"])
+        sections.append(
+            '<section class="rs-form-section">'
+            f"<h3>{group['title']}</h3>"
+            f'<div class="rs-form-fields">{fields_html}</div>'
+            "</section>"
+        )
+    return "".join(sections)
+
+
+def _render_running_status_page(symbol: str | None = None) -> str:
+    initial_symbol = str(symbol or "").upper().strip()
+    initial_view_mode = "local" if initial_symbol else "cross"
+    form_groups = _running_status_form_groups_with_ids()
+    page = """
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>运行状态控制台</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f3ec;
+      --surface: #fffdf9;
+      --surface-2: #f4efe4;
+      --line: #d9d2c3;
+      --text: #1f2937;
+      --muted: #6b7280;
+      --brand: #0f766e;
+      --brand-soft: rgba(15, 118, 110, 0.10);
+      --good: #15803d;
+      --warn: #b45309;
+      --bad: #b91c1c;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #fbfaf7 0%, var(--bg) 100%);
+      color: var(--text);
+    }
+    .rs-page {
+      max-width: 1440px;
+      margin: 0 auto;
+      padding: 24px 20px 48px;
+      display: grid;
+      gap: 18px;
+    }
+    .rs-hero,
+    .rs-band {
+      background: var(--surface);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 18px;
+    }
+    .rs-hero h1 {
+      margin: 0 0 8px;
+      font-size: 38px;
+      line-height: 1.1;
+    }
+    .rs-hero p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
+    .rs-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: end;
+      gap: 12px;
+      margin-top: 18px;
+    }
+    .rs-toolbar label {
+      display: grid;
+      gap: 6px;
+      min-width: 140px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .rs-toolbar input,
+    .rs-toolbar select,
+    .rs-toolbar button,
+    .rs-form-fields input,
+    .rs-form-fields select,
+    .rs-json-panel textarea {
+      font: inherit;
+    }
+    .rs-toolbar input,
+    .rs-toolbar select,
+    .rs-form-fields input,
+    .rs-form-fields select {
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 0 12px;
+      color: var(--text);
+    }
+    .rs-toolbar button,
+    .rs-card-action,
+    .rs-drawer-actions button,
+    .rs-close-btn {
+      min-height: 40px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 14px;
+      cursor: pointer;
+      font-weight: 700;
+    }
+    .rs-toolbar button.primary,
+    .rs-card-action.primary,
+    .rs-drawer-actions button.primary {
+      background: var(--brand);
+      border-color: var(--brand);
+      color: #fff;
+    }
+    .rs-summary {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+    }
+    .rs-summary-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: linear-gradient(180deg, #fffefc 0%, #f7f2e8 100%);
+    }
+    .rs-summary-card .label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    .rs-summary-card .value {
+      font-size: 26px;
+      font-weight: 800;
+    }
+    .rs-server-stack,
+    .rs-group-stack {
+      display: grid;
+      gap: 16px;
+    }
+    .rs-server-head,
+    .rs-group-head,
+    .rs-drawer-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 12px;
+    }
+    .rs-server-head h2,
+    .rs-group-head h3,
+    .rs-drawer-head h2,
+    .rs-form-section h3 {
+      margin: 0;
+    }
+    .rs-server-meta,
+    .rs-group-meta,
+    .rs-status-line,
+    .rs-drawer-meta,
+    .rs-empty,
+    .rs-muted {
+      color: var(--muted);
+      font-size: 13px;
+      line-height: 1.6;
+    }
+    .rs-card-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(290px, 1fr));
+      gap: 12px;
+    }
+    .rs-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px;
+      display: grid;
+      gap: 12px;
+    }
+    .rs-card.focused {
+      border-color: var(--brand);
+      box-shadow: 0 0 0 1px var(--brand-soft);
+    }
+    .rs-card-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 12px;
+    }
+    .rs-card-title strong {
+      display: block;
+      font-size: 22px;
+      line-height: 1.1;
+    }
+    .rs-card-title span {
+      display: block;
+      margin-top: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .rs-badge-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+      justify-content: flex-end;
+    }
+    .rs-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      padding: 0 8px;
+      border-radius: 999px;
+      background: var(--surface-2);
+      color: #54452c;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .rs-badge.good { background: rgba(21, 128, 61, 0.10); color: var(--good); }
+    .rs-badge.warn { background: rgba(180, 83, 9, 0.10); color: var(--warn); }
+    .rs-badge.bad { background: rgba(185, 28, 28, 0.10); color: var(--bad); }
+    .rs-card-metrics {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+    .rs-metric {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #fffefb;
+      min-height: 78px;
+    }
+    .rs-metric .label {
+      font-size: 12px;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+    .rs-metric .value {
+      font-size: 15px;
+      font-weight: 700;
+      line-height: 1.45;
+      word-break: break-word;
+    }
+    .rs-card-footer {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .rs-drawer-shell {
+      position: fixed;
+      inset: 0;
+      display: none;
+      z-index: 30;
+    }
+    .rs-drawer-shell.open {
+      display: block;
+    }
+    .rs-drawer-backdrop {
+      position: absolute;
+      inset: 0;
+      background: rgba(15, 23, 42, 0.36);
+    }
+    .rs-drawer {
+      position: absolute;
+      right: 0;
+      top: 0;
+      height: 100%;
+      width: min(1180px, 96vw);
+      background: #fff;
+      border-left: 1px solid var(--line);
+      display: grid;
+      grid-template-rows: auto 1fr auto;
+    }
+    .rs-drawer-head {
+      padding: 18px 20px 14px;
+      border-bottom: 1px solid var(--line);
+    }
+    .rs-drawer-body {
+      overflow: auto;
+      padding: 18px 20px;
+    }
+    .rs-drawer-grid {
+      display: grid;
+      grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr);
+      gap: 18px;
+      align-items: start;
+    }
+    .rs-form-stack,
+    .rs-json-panel {
+      display: grid;
+      gap: 14px;
+    }
+    .rs-form-section,
+    .rs-json-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+      background: #fffefb;
+    }
+    .rs-form-fields {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+    .rs-form-fields > label,
+    .rs-inline-check {
+      display: grid;
+      gap: 6px;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    .rs-check-row {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 40px;
+    }
+    .rs-json-panel textarea {
+      width: 100%;
+      min-height: 680px;
+      resize: vertical;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #0f172a;
+      color: #e2e8f0;
+      padding: 14px;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.6;
+    }
+    .rs-drawer-actions {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      padding: 14px 20px;
+      border-top: 1px solid var(--line);
+      background: #fffdf8;
+    }
+    .rs-drawer-action-group {
+      display: flex;
+      gap: 10px;
+      flex-wrap: wrap;
+    }
+    .rs-status {
+      min-height: 20px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+    .rs-status.error { color: var(--bad); }
+    .rs-hidden { display: none !important; }
+    @media (max-width: 1180px) {
+      .rs-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .rs-drawer-grid { grid-template-columns: 1fr; }
+      .rs-json-panel textarea { min-height: 340px; }
+    }
+    @media (max-width: 720px) {
+      .rs-page { padding: 18px 14px 32px; }
+      .rs-summary,
+      .rs-card-grid,
+      .rs-card-metrics,
+      .rs-form-fields { grid-template-columns: 1fr; }
+      .rs-hero h1 { font-size: 30px; }
+      .rs-drawer { width: 100vw; }
+    }
+  </style>
+</head>
+<body>
+  <div class="rs-page">
+    <section class="rs-hero">
+      <h1>运行状态控制台</h1>
+      <p>跨服务器总览运行中与已保存未启动的合约策略。本机卡片可直接展开抽屉修改参数、保存、启动、重启或停止；远端卡片会跳到目标服务器自己的控制页。</p>
+      <div class="rs-toolbar">
+        <label>视图模式
+          <select id="view_mode">
+            <option value="cross">跨服务器总览</option>
+            <option value="local">本机控制视图</option>
+          </select>
+        </label>
+        <label>刷新秒数
+          <input id="refresh_seconds" type="number" min="3" step="1" value="20" />
+        </label>
+        <button id="refresh_btn" class="primary">立即刷新</button>
+        <button id="toggle_refresh_btn">暂停自动刷新</button>
+        <div id="page_meta" class="rs-muted">等待首轮数据...</div>
+      </div>
+    </section>
+
+    <section class="rs-band">
+      <div class="rs-summary" id="summary_cards"></div>
+    </section>
+
+    <section class="rs-band">
+      <div id="status_groups" class="rs-server-stack"></div>
+    </section>
+  </div>
+
+  <div id="status_drawer_shell" class="rs-drawer-shell" aria-hidden="true">
+    <div class="rs-drawer-backdrop" id="status_drawer_backdrop"></div>
+    <aside id="status_drawer" class="rs-drawer" aria-label="策略编辑抽屉">
+      <div class="rs-drawer-head">
+        <div>
+          <h2 id="drawer_title">策略编辑</h2>
+          <div id="drawer_meta" class="rs-drawer-meta">选择一个本机卡片后在这里编辑。</div>
+        </div>
+        <button id="drawer_close_btn" class="rs-close-btn" type="button">关闭</button>
+      </div>
+      <div class="rs-drawer-body">
+        <div class="rs-drawer-grid">
+          <div class="rs-form-stack">
+            __RUNNING_STATUS_FORM_HTML__
+          </div>
+          <section class="rs-json-panel">
+            <div class="rs-group-head">
+              <div>
+                <h3>高级 JSON</h3>
+                <div class="rs-group-meta">左侧中文字段表单与这里实时同步。JSON 非法时会禁止保存与启动。</div>
+              </div>
+            </div>
+            <textarea id="runner_json_editor" spellcheck="false"></textarea>
+          </section>
+        </div>
+      </div>
+      <div class="rs-drawer-actions">
+        <div id="drawer_status" class="rs-status">未选择策略。</div>
+        <div class="rs-drawer-action-group">
+          <button id="drawer_save_btn" type="button">保存</button>
+          <button id="drawer_apply_btn" type="button" class="primary">保存并重启</button>
+          <button id="drawer_stop_btn" type="button">停止</button>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <script>
+    const INITIAL_SYMBOL = __RUNNING_STATUS_INITIAL_SYMBOL__;
+    const INITIAL_VIEW_MODE = __RUNNING_STATUS_INITIAL_VIEW_MODE__;
+    const FORM_GROUPS = __RUNNING_STATUS_FORM_GROUPS__;
+    const FORM_FIELDS = FORM_GROUPS.flatMap((group) => group.fields);
+    const viewModeEl = document.getElementById("view_mode");
+    const refreshSecondsEl = document.getElementById("refresh_seconds");
+    const refreshBtn = document.getElementById("refresh_btn");
+    const toggleRefreshBtn = document.getElementById("toggle_refresh_btn");
+    const pageMetaEl = document.getElementById("page_meta");
+    const summaryCardsEl = document.getElementById("summary_cards");
+    const statusGroupsEl = document.getElementById("status_groups");
+    const drawerShellEl = document.getElementById("status_drawer_shell");
+    const drawerBackdropEl = document.getElementById("status_drawer_backdrop");
+    const drawerCloseBtn = document.getElementById("drawer_close_btn");
+    const drawerTitleEl = document.getElementById("drawer_title");
+    const drawerMetaEl = document.getElementById("drawer_meta");
+    const drawerStatusEl = document.getElementById("drawer_status");
+    const drawerSaveBtn = document.getElementById("drawer_save_btn");
+    const drawerApplyBtn = document.getElementById("drawer_apply_btn");
+    const drawerStopBtn = document.getElementById("drawer_stop_btn");
+    const runnerJsonEditorEl = document.getElementById("runner_json_editor");
+
+    const state = {
+      payload: null,
+      cardIndex: new Map(),
+      drawerCardKey: "",
+      drawerCard: null,
+      currentConfig: null,
+      jsonValid: true,
+      paused: false,
+      timer: null,
+      jsonSyncTimer: null,
+    };
+
+    viewModeEl.value = INITIAL_VIEW_MODE;
+
+    function escapeHtml(value) {
+      return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;");
+    }
+
+    function fmtNum(value, digits = 2) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "--";
+      return num.toLocaleString("zh-CN", { minimumFractionDigits: 0, maximumFractionDigits: digits });
+    }
+
+    function fmtSigned(value, digits = 2) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "--";
+      const sign = num > 0 ? "+" : "";
+      return `${sign}${fmtNum(num, digits)}`;
+    }
+
+    function readJsonResponse(resp) {
+      return resp.text().then((raw) => raw ? JSON.parse(raw) : {});
+    }
+
+    function statusKeyForCard(card) {
+      return `${card.server_id || "local"}:${card.symbol || ""}`;
+    }
+
+    function defaultRuntimePathsForSymbol(symbol) {
+      const normalized = String(symbol || "NIGHTUSDT").trim().toUpperCase() || "NIGHTUSDT";
+      const slug = normalized.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "symbol";
+      return {
+        state_path: `output/${slug}_loop_state.json`,
+        plan_json: `output/${slug}_loop_latest_plan.json`,
+        submit_report_json: `output/${slug}_loop_latest_submit.json`,
+        summary_jsonl: `output/${slug}_loop_events.jsonl`,
+      };
+    }
+
+    function normalizeConfig(rawConfig, symbol) {
+      const normalizedSymbol = String(symbol || (rawConfig && rawConfig.symbol) || "NIGHTUSDT").trim().toUpperCase() || "NIGHTUSDT";
+      const nextConfig = { ...((rawConfig && typeof rawConfig === "object" && !Array.isArray(rawConfig)) ? rawConfig : {}) };
+      nextConfig.symbol = normalizedSymbol;
+      const runtimePaths = defaultRuntimePathsForSymbol(normalizedSymbol);
+      Object.entries(runtimePaths).forEach(([key, value]) => {
+        nextConfig[key] = value;
+      });
+      return nextConfig;
+    }
+
+    function formFieldEl(field) {
+      return document.getElementById(field.id);
+    }
+
+    function formFieldContainer(field) {
+      const el = formFieldEl(field);
+      return el ? el.closest("label") : null;
+    }
+
+    function fieldMatchesMode(field, mode) {
+      if (!Array.isArray(field.modes) || !field.modes.length) return true;
+      return field.modes.includes(mode);
+    }
+
+    function applyModeVisibility(mode) {
+      const normalizedMode = String(mode || "one_way_long").trim() || "one_way_long";
+      FORM_FIELDS.forEach((field) => {
+        const container = formFieldContainer(field);
+        if (!container) return;
+        container.classList.toggle("rs-hidden", !fieldMatchesMode(field, normalizedMode));
+      });
+      document.querySelectorAll(".rs-form-section").forEach((section) => {
+        const visibleChildren = Array.from(section.querySelectorAll(".rs-form-fields > label")).some((label) => !label.classList.contains("rs-hidden"));
+        section.classList.toggle("rs-hidden", !visibleChildren);
+      });
+    }
+
+    function syncFormFromConfig(config) {
+      const source = (config && typeof config === "object" && !Array.isArray(config)) ? config : {};
+      FORM_FIELDS.forEach((field) => {
+        const el = formFieldEl(field);
+        if (!el) return;
+        if (field.type === "boolean") {
+          el.checked = Boolean(source[field.key]);
+          return;
+        }
+        const value = source[field.key];
+        if (value === null || value === undefined || value === "") {
+          el.value = field.defaultValue ?? "";
+          return;
+        }
+        el.value = String(value);
+      });
+      applyModeVisibility(source.strategy_mode || "one_way_long");
+    }
+
+    function readConfigFromForm(baseConfig = {}) {
+      const nextConfig = { ...baseConfig };
+      FORM_FIELDS.forEach((field) => {
+        const el = formFieldEl(field);
+        if (!el) return;
+        if (field.type === "boolean") {
+          nextConfig[field.key] = Boolean(el.checked);
+          return;
+        }
+        const raw = String(el.value || "").trim();
+        if (!raw) {
+          if (field.allowNull) {
+            nextConfig[field.key] = null;
+          } else if (field.defaultValue !== undefined) {
+            nextConfig[field.key] = field.defaultValue;
+          }
+          return;
+        }
+        if (field.type === "integer") {
+          const value = Number(raw);
+          if (Number.isFinite(value)) nextConfig[field.key] = Math.round(value);
+          return;
+        }
+        if (field.type === "number") {
+          const value = Number(raw);
+          if (Number.isFinite(value)) nextConfig[field.key] = value;
+          return;
+        }
+        nextConfig[field.key] = raw;
+      });
+      return nextConfig;
+    }
+
+    function setDrawerStatus(message, isError = false) {
+      drawerStatusEl.textContent = message || "";
+      drawerStatusEl.classList.toggle("error", Boolean(isError));
+    }
+
+    function syncJsonFromForm() {
+      const card = state.drawerCard;
+      if (!card) return;
+      const nextConfig = normalizeConfig(readConfigFromForm(state.currentConfig || {}), card.symbol);
+      state.currentConfig = nextConfig;
+      runnerJsonEditorEl.value = JSON.stringify(nextConfig, null, 2);
+      state.jsonValid = true;
+      setDrawerStatus("字段表单已同步到 JSON。");
+      applyModeVisibility(nextConfig.strategy_mode || "one_way_long");
+    }
+
+    function syncFromJsonEditor() {
+      try {
+        const payload = JSON.parse(runnerJsonEditorEl.value || "{}");
+        if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+          throw new Error("JSON 必须是对象");
+        }
+        const normalized = normalizeConfig(payload, (state.drawerCard && state.drawerCard.symbol) || INITIAL_SYMBOL || "NIGHTUSDT");
+        state.currentConfig = normalized;
+        state.jsonValid = true;
+        syncFormFromConfig(normalized);
+        setDrawerStatus("高级 JSON 已同步到左侧字段。");
+      } catch (err) {
+        state.jsonValid = false;
+        setDrawerStatus(`JSON 解析失败: ${String(err)}`, true);
+      }
+      syncDrawerActions();
+    }
+
+    function syncDrawerActions() {
+      const card = state.drawerCard;
+      const editable = Boolean(card && !card.server_base_url);
+      drawerSaveBtn.disabled = !editable || !state.jsonValid;
+      drawerApplyBtn.disabled = !editable || !state.jsonValid;
+      drawerStopBtn.disabled = !editable || !card || !card.is_running;
+      drawerApplyBtn.textContent = card && card.is_running ? "保存并重启" : "启动";
+    }
+
+    function formatSoftThreshold(card) {
+      return `多 ${fmtNum(card.pause_buy_position_notional)} / 空 ${fmtNum(card.pause_short_position_notional)}`;
+    }
+
+    function formatHardThreshold(card) {
+      return fmtNum(card.threshold_position_notional);
+    }
+
+    function formatMaxPosition(card) {
+      return `多 ${fmtNum(card.max_position_notional)} / 空 ${fmtNum(card.max_short_position_notional)}`;
+    }
+
+    function formatLevels(card) {
+      return `${fmtNum(card.buy_levels, 0)} / ${fmtNum(card.sell_levels, 0)}`;
+    }
+
+    function formatSoftReduce(card) {
+      const summary = card.soft_reduce_summary || {};
+      if (!summary.adverse_reduce_enabled) return "关闭";
+      return `开 · 比例 ${fmtNum(summary.adverse_reduce_target_ratio)} · 单笔 ${fmtNum(summary.adverse_reduce_max_order_notional)}`;
+    }
+
+    function formatHardReduce(card) {
+      const summary = card.hard_reduce_summary || {};
+      if (!summary.hard_loss_forced_reduce_enabled) return "关闭";
+      return `开 · 目标 ${fmtNum(summary.hard_loss_forced_reduce_target_notional)} · 单笔 ${fmtNum(summary.hard_loss_forced_reduce_max_order_notional)}`;
+    }
+
+    function formatTimeoutReduce(card) {
+      const summary = card.timeout_reduce_summary || {};
+      const parts = [];
+      if (summary.threshold_reduce_target_ratio !== null && summary.threshold_reduce_target_ratio !== undefined) {
+        parts.push(`阈值减仓 ${fmtNum(summary.threshold_reduce_target_ratio)}`);
+      }
+      if (summary.threshold_reduce_taker_timeout_seconds !== null && summary.threshold_reduce_taker_timeout_seconds !== undefined) {
+        parts.push(`追价 ${fmtNum(summary.threshold_reduce_taker_timeout_seconds)}s`);
+      }
+      if (summary.short_threshold_timeout_seconds !== null && summary.short_threshold_timeout_seconds !== undefined) {
+        parts.push(`超阈值 ${fmtNum(summary.short_threshold_timeout_seconds)}s`);
+      }
+      if (summary.adverse_reduce_maker_timeout_seconds !== null && summary.adverse_reduce_maker_timeout_seconds !== undefined) {
+        parts.push(`soft maker ${fmtNum(summary.adverse_reduce_maker_timeout_seconds)}s`);
+      }
+      return parts.length ? parts.join(" · ") : "未配置";
+    }
+
+    function badgeClass(card) {
+      if (card.is_running) return "good";
+      return "warn";
+    }
+
+    function renderSummary(payload) {
+      const summary = payload.summary || {};
+      const cards = [
+        { label: "视图", value: payload.view_mode === "cross" ? "跨服" : "本机" },
+        { label: "服务器数", value: fmtNum(summary.server_count ?? 1, 0) },
+        { label: "运行中", value: fmtNum(summary.running_symbol_count, 0) },
+        { label: "已保存未启动", value: fmtNum(summary.saved_idle_symbol_count, 0) },
+      ];
+      summaryCardsEl.innerHTML = cards.map((item) => `
+        <article class="rs-summary-card">
+          <div class="label">${escapeHtml(item.label)}</div>
+          <div class="value">${escapeHtml(item.value)}</div>
+        </article>
+      `).join("");
+    }
+
+    function renderGroupCards(groupTitle, items, localEditable) {
+      if (!Array.isArray(items) || !items.length) {
+        return `
+          <section class="rs-group-stack">
+            <div class="rs-group-head">
+              <div>
+                <h3>${escapeHtml(groupTitle)}</h3>
+                <div class="rs-group-meta">当前没有策略。</div>
+              </div>
+            </div>
+            <div class="rs-empty">暂无条目</div>
+          </section>
+        `;
+      }
+      const cardsHtml = items.map((card) => {
+        const cardKey = statusKeyForCard(card);
+        state.cardIndex.set(cardKey, card);
+        const actionLabel = localEditable ? "编辑" : "前往服务器";
+        return `
+          <article class="rs-card${card.focused ? " focused" : ""}" data-card-key="${escapeHtml(cardKey)}">
+            <div class="rs-card-head">
+              <div class="rs-card-title">
+                <strong>${escapeHtml(card.symbol || "--")}</strong>
+                <span>${escapeHtml(card.strategy_profile || card.strategy_name || "--")} · ${escapeHtml(card.strategy_mode || "--")}</span>
+              </div>
+              <div class="rs-badge-row">
+                <span class="rs-badge ${badgeClass(card)}">${card.is_running ? "运行中" : "已保存"}</span>
+                <span class="rs-badge">${escapeHtml(card.server_label || card.server_id || "本机")}</span>
+              </div>
+            </div>
+            <div class="rs-card-metrics">
+              <div class="rs-metric"><div class="label">step</div><div class="value">${fmtNum(card.step_price, 6)}</div></div>
+              <div class="rs-metric"><div class="label">level</div><div class="value">${escapeHtml(formatLevels(card))}</div></div>
+              <div class="rs-metric"><div class="label">基础仓</div><div class="value">${fmtNum(card.base_position_notional)}</div></div>
+              <div class="rs-metric"><div class="label">软阈值</div><div class="value">${escapeHtml(formatSoftThreshold(card))}</div></div>
+              <div class="rs-metric"><div class="label">硬阈值</div><div class="value">${escapeHtml(formatHardThreshold(card))}</div></div>
+              <div class="rs-metric"><div class="label">最大持仓</div><div class="value">${escapeHtml(formatMaxPosition(card))}</div></div>
+              <div class="rs-metric"><div class="label">软减仓策略</div><div class="value">${escapeHtml(formatSoftReduce(card))}</div></div>
+              <div class="rs-metric"><div class="label">硬减仓策略</div><div class="value">${escapeHtml(formatHardReduce(card))}</div></div>
+              <div class="rs-metric"><div class="label">超时减仓机制</div><div class="value">${escapeHtml(formatTimeoutReduce(card))}</div></div>
+              <div class="rs-metric"><div class="label">近一小时成交额</div><div class="value">${fmtNum(card.recent_hour_volume)}</div></div>
+            </div>
+            <div class="rs-card-footer">
+              <div class="rs-status-line">PnL ${fmtSigned(card.total_pnl, 4)} · 挂单 ${fmtNum(card.open_order_count, 0)} · 未实现 ${fmtSigned(card.unrealized_pnl, 4)}</div>
+              <button class="rs-card-action${localEditable ? " primary" : ""}" type="button" data-card-action="${localEditable ? "open" : "go"}" data-card-key="${escapeHtml(cardKey)}">${actionLabel}</button>
+            </div>
+          </article>
+        `;
+      }).join("");
+      return `
+        <section class="rs-group-stack">
+          <div class="rs-group-head">
+            <div>
+              <h3>${escapeHtml(groupTitle)}</h3>
+              <div class="rs-group-meta">共 ${items.length} 个。</div>
+            </div>
+          </div>
+          <div class="rs-card-grid">${cardsHtml}</div>
+        </section>
+      `;
+    }
+
+    function renderLocalPayload(payload) {
+      const running = (payload.groups && payload.groups.running) || [];
+      const savedIdle = (payload.groups && payload.groups.saved_idle) || [];
+      statusGroupsEl.innerHTML = `
+        <section class="rs-server-stack">
+          <div class="rs-server-head">
+            <div>
+              <h2>${escapeHtml(payload.server_label || payload.server_id || "本机")}</h2>
+              <div class="rs-server-meta">symbol query 会直接落在本机控制视图，并自动展开对应卡片。</div>
+            </div>
+          </div>
+          ${renderGroupCards("运行中", running, true)}
+          ${renderGroupCards("已保存未启动", savedIdle, true)}
+        </section>
+      `;
+    }
+
+    function renderCrossPayload(payload) {
+      const servers = Array.isArray(payload.servers) ? payload.servers : [];
+      statusGroupsEl.innerHTML = servers.map((serverPayload) => {
+        const isLocalServer = !serverPayload.server_base_url;
+        const running = (serverPayload.groups && serverPayload.groups.running) || [];
+        const savedIdle = (serverPayload.groups && serverPayload.groups.saved_idle) || [];
+        const errorText = serverPayload.error ? `<div class="rs-empty">${escapeHtml(serverPayload.error)}</div>` : "";
+        return `
+          <section class="rs-server-stack">
+            <div class="rs-server-head">
+              <div>
+                <h2>${escapeHtml(serverPayload.server_label || serverPayload.server_id || "--")}</h2>
+                <div class="rs-server-meta">
+                  ${escapeHtml(serverPayload.server_id || "--")}
+                  ${serverPayload.server_base_url ? ` · ${escapeHtml(serverPayload.server_base_url)}` : " · 本机可直接编辑"}
+                </div>
+              </div>
+            </div>
+            ${errorText}
+            ${renderGroupCards("运行中", running, isLocalServer)}
+            ${renderGroupCards("已保存未启动", savedIdle, isLocalServer)}
+          </section>
+        `;
+      }).join("");
+    }
+
+    function renderPayload(payload) {
+      state.cardIndex = new Map();
+      renderSummary(payload);
+      if (payload.view_mode === "local") {
+        renderLocalPayload(payload);
+      } else {
+        renderCrossPayload(payload);
+      }
+      bindCardActions();
+    }
+
+    function bindCardActions() {
+      document.querySelectorAll("[data-card-action]").forEach((button) => {
+        button.addEventListener("click", () => {
+          const cardKey = String(button.getAttribute("data-card-key") || "");
+          const card = state.cardIndex.get(cardKey);
+          if (!card) return;
+          if (button.getAttribute("data-card-action") === "go") {
+            window.location.href = card.target_url || "/running_status";
+            return;
+          }
+          openDrawer(card);
+        });
+      });
+    }
+
+    function openDrawer(card) {
+      state.drawerCard = card;
+      state.drawerCardKey = statusKeyForCard(card);
+      state.currentConfig = normalizeConfig(card.config || {}, card.symbol);
+      drawerTitleEl.textContent = `${card.symbol} 参数编辑`;
+      drawerMetaEl.textContent = `${card.server_label || card.server_id || "本机"} · ${card.strategy_profile || card.strategy_name || "--"} · ${card.is_running ? "运行中" : "已保存未启动"}`;
+      runnerJsonEditorEl.value = JSON.stringify(state.currentConfig, null, 2);
+      syncFormFromConfig(state.currentConfig);
+      state.jsonValid = true;
+      setDrawerStatus("参数已载入。");
+      syncDrawerActions();
+      drawerShellEl.classList.add("open");
+      drawerShellEl.setAttribute("aria-hidden", "false");
+    }
+
+    function closeDrawer() {
+      state.drawerCard = null;
+      state.drawerCardKey = "";
+      state.currentConfig = null;
+      drawerShellEl.classList.remove("open");
+      drawerShellEl.setAttribute("aria-hidden", "true");
+    }
+
+    async function fetchRunningStatus() {
+      const params = new URLSearchParams();
+      if (viewModeEl.value === "local" || INITIAL_SYMBOL) {
+        if (INITIAL_SYMBOL) {
+          params.set("symbol", INITIAL_SYMBOL);
+        } else {
+          params.set("scope", "local");
+        }
+      } else {
+        params.set("scope", "cross");
+      }
+      const query = params.toString();
+      const resp = await fetch(`/api/running_status${query ? `?${query}` : ""}`);
+      const data = await readJsonResponse(resp);
+      if (!resp.ok || !data.ok) {
+        throw new Error(data.error || `HTTP ${resp.status}`);
+      }
+      return data;
+    }
+
+    async function loadPage({ preserveDrawer = true } = {}) {
+      const reopenCardKey = preserveDrawer ? state.drawerCardKey : "";
+      pageMetaEl.textContent = "正在刷新运行状态...";
+      try {
+        const payload = await fetchRunningStatus();
+        state.payload = payload;
+        renderPayload(payload);
+        pageMetaEl.textContent = `已更新 ${new Date().toLocaleString("zh-CN")} · ${payload.view_mode === "cross" ? "跨服务器总览" : "本机控制视图"}`;
+        if (reopenCardKey && state.cardIndex.has(reopenCardKey)) {
+          openDrawer(state.cardIndex.get(reopenCardKey));
+        } else if (INITIAL_SYMBOL && payload.view_mode === "local") {
+          const focused = Array.from(state.cardIndex.values()).find((card) => card.focused);
+          if (focused) openDrawer(focused);
+        } else if (!reopenCardKey) {
+          closeDrawer();
+        }
+      } catch (err) {
+        pageMetaEl.textContent = `刷新失败: ${String(err)}`;
+      }
+    }
+
+    async function saveCurrentConfig(applyAfterSave = false) {
+      if (!state.drawerCard) return;
+      if (!state.jsonValid) {
+        setDrawerStatus("JSON 非法，不能提交。", true);
+        return;
+      }
+      let payload;
+      try {
+        payload = normalizeConfig(JSON.parse(runnerJsonEditorEl.value || "{}"), state.drawerCard.symbol);
+      } catch (err) {
+        setDrawerStatus(`JSON 解析失败: ${String(err)}`, true);
+        return;
+      }
+      const url = applyAfterSave ? "/api/runner/start" : "/api/runner/save";
+      const actionText = applyAfterSave ? (state.drawerCard.is_running ? "保存并重启" : "启动") : "保存";
+      setDrawerStatus(`正在${actionText} ${state.drawerCard.symbol}...`);
+      drawerSaveBtn.disabled = true;
+      drawerApplyBtn.disabled = true;
+      drawerStopBtn.disabled = true;
+      try {
+        const resp = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await readJsonResponse(resp);
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        setDrawerStatus(`${state.drawerCard.symbol} 已${applyAfterSave ? "应用" : "保存"}。`);
+        await loadPage({ preserveDrawer: true });
+      } catch (err) {
+        setDrawerStatus(`${actionText}失败: ${String(err)}`, true);
+      } finally {
+        syncDrawerActions();
+      }
+    }
+
+    async function stopCurrentRunner() {
+      if (!state.drawerCard) return;
+      setDrawerStatus(`正在停止 ${state.drawerCard.symbol}...`);
+      drawerSaveBtn.disabled = true;
+      drawerApplyBtn.disabled = true;
+      drawerStopBtn.disabled = true;
+      try {
+        const resp = await fetch("/api/runner/stop", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: state.drawerCard.symbol }),
+        });
+        const data = await readJsonResponse(resp);
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        setDrawerStatus(`${state.drawerCard.symbol} 已停止。`);
+        await loadPage({ preserveDrawer: true });
+      } catch (err) {
+        setDrawerStatus(`停止失败: ${String(err)}`, true);
+      } finally {
+        syncDrawerActions();
+      }
+    }
+
+    function scheduleAutoRefresh() {
+      if (state.timer) {
+        clearInterval(state.timer);
+        state.timer = null;
+      }
+      if (state.paused) return;
+      const seconds = Math.max(3, Number(refreshSecondsEl.value || 20));
+      state.timer = setInterval(() => {
+        if (drawerShellEl.classList.contains("open")) return;
+        loadPage({ preserveDrawer: false });
+      }, seconds * 1000);
+    }
+
+    FORM_FIELDS.forEach((field) => {
+      const el = formFieldEl(field);
+      if (!el) return;
+      const eventName = field.type === "boolean" || field.type === "select" ? "change" : "input";
+      el.addEventListener(eventName, syncJsonFromForm);
+      if (field.key === "strategy_mode") {
+        el.addEventListener("change", () => applyModeVisibility(el.value));
+      }
+    });
+
+    runnerJsonEditorEl.addEventListener("input", () => {
+      if (state.jsonSyncTimer) clearTimeout(state.jsonSyncTimer);
+      state.jsonSyncTimer = setTimeout(syncFromJsonEditor, 180);
+    });
+    drawerBackdropEl.addEventListener("click", closeDrawer);
+    drawerCloseBtn.addEventListener("click", closeDrawer);
+    drawerSaveBtn.addEventListener("click", () => saveCurrentConfig(false));
+    drawerApplyBtn.addEventListener("click", () => saveCurrentConfig(true));
+    drawerStopBtn.addEventListener("click", stopCurrentRunner);
+    refreshBtn.addEventListener("click", () => loadPage({ preserveDrawer: true }));
+    toggleRefreshBtn.addEventListener("click", () => {
+      state.paused = !state.paused;
+      toggleRefreshBtn.textContent = state.paused ? "恢复自动刷新" : "暂停自动刷新";
+      scheduleAutoRefresh();
+    });
+    refreshSecondsEl.addEventListener("change", scheduleAutoRefresh);
+    viewModeEl.addEventListener("change", async () => {
+      if (INITIAL_SYMBOL) {
+        viewModeEl.value = "local";
+        return;
+      }
+      closeDrawer();
+      await loadPage({ preserveDrawer: false });
+      scheduleAutoRefresh();
+    });
+
+    loadPage({ preserveDrawer: true });
+    scheduleAutoRefresh();
+  </script>
+</body>
+</html>
+    """
+    return (
+        page.replace("__RUNNING_STATUS_FORM_HTML__", _render_running_status_form_groups_html())
+        .replace("__RUNNING_STATUS_INITIAL_SYMBOL__", json.dumps(initial_symbol, ensure_ascii=False))
+        .replace("__RUNNING_STATUS_INITIAL_VIEW_MODE__", json.dumps(initial_view_mode, ensure_ascii=False))
+        .replace("__RUNNING_STATUS_FORM_GROUPS__", json.dumps(form_groups, ensure_ascii=False))
+    )
 
 
 def _volatility_trigger_status_path(symbol: str) -> Path:
@@ -27234,14 +28756,15 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/basis", "/basis.html"}:
             self._send_html(BASIS_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/running_status", "/running_status.html"}:
+            symbol = str(query.get("symbol", [""])[0]).upper().strip() or None
+            self._send_html(_render_running_status_page(symbol=symbol), status=HTTPStatus.OK)
+            return
         if path in {"/monitor", "/monitor.html"}:
             self._send_html(MONITOR_PAGE, status=HTTPStatus.OK)
             return
         if path in {"/runner_settings", "/runner_settings.html"}:
             self._send_html(RUNNER_SETTINGS_PAGE, status=HTTPStatus.OK)
-            return
-        if path in {"/running_status", "/running_status.html"}:
-            self._send_html(RUNNING_STATUS_PAGE, status=HTTPStatus.OK)
             return
         if path in {"/manual_trade", "/manual_trade.html"}:
             self._send_html(MANUAL_TRADE_PAGE, status=HTTPStatus.OK)
@@ -27257,6 +28780,17 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
+            return
+        if path == "/api/running_status":
+            try:
+                payload = _run_running_status_query(query)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
             return
         if path == "/api/competition_board":
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"
@@ -27291,18 +28825,6 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/loop_monitor"):
             try:
                 payload = _run_loop_monitor_query(query)
-            except Exception as exc:
-                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
-                return
-            self._send_json(payload, status=HTTPStatus.OK)
-            return
-        if path == "/api/running_status":
-            scope = str(query.get("scope", ["cross"])[0]).strip().lower() or "cross"
-            if scope not in {"local", "cross"}:
-                self._send_json({"ok": False, "error": "scope must be local or cross"}, status=400)
-                return
-            try:
-                payload = _build_running_status(scope=scope)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
@@ -27514,6 +29036,14 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/running_status", "/running_status.html"}:
+            body = _render_running_status_page(
+                symbol=str(query.get("symbol", [""])[0]).upper().strip() or None
+            ).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/monitor", "/monitor.html"}:
             body = MONITOR_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -27522,12 +29052,6 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {"/runner_settings", "/runner_settings.html"}:
             body = RUNNER_SETTINGS_PAGE.encode("utf-8")
-            self.send_response(HTTPStatus.OK)
-            self._send_common_headers("text/html; charset=utf-8", len(body))
-            self.end_headers()
-            return
-        if path in {"/running_status", "/running_status.html"}:
-            body = RUNNING_STATUS_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
@@ -27566,6 +29090,7 @@ class _Handler(BaseHTTPRequestHandler):
             path == "/api/symbol_lists"
             or path.startswith("/api/symbols")
             or path == "/api/price"
+            or path == "/api/running_status"
             or path.startswith("/api/loop_monitor")
             or path == "/api/running_status"
             or path == "/api/grid_preview"
