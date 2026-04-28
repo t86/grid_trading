@@ -29245,7 +29245,7 @@ def _set_cached_running_status_overview_payload(key: str, payload: dict[str, Any
 
 
 def _fetch_remote_running_status(entry: dict[str, str], timeout: float | None = None) -> dict[str, Any]:
-    url = f"{entry['url'].rstrip('/')}/api/running_status?scope=local"
+    url = f"{entry['url'].rstrip('/')}/api/running_status_overview?scope=local"
     headers = {"Accept": "application/json"}
     remote_auth = os.environ.get("GRID_RUNNING_STATUS_AUTH", "")
     remote_username, sep, remote_password = remote_auth.partition(":")
