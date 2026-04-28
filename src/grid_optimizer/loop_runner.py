@@ -9652,7 +9652,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 soft_loss_steps=getattr(effective_args, "volume_long_v4_soft_loss_steps", 0.5),
                 hard_loss_steps=getattr(effective_args, "volume_long_v4_hard_loss_steps", 1.5),
             )
-            flow_cost_basis_price = actual_break_even_price if actual_break_even_price > 0 else current_long_avg_price
+            flow_cost_basis_price = (
+                current_long_avg_price
+                if prefer_entry_price_cost_basis and current_long_avg_price > 0
+                else actual_break_even_price if actual_break_even_price > 0 else current_long_avg_price
+            )
             exposure_now = datetime.now(timezone.utc)
             exposure_trigger_notional = getattr(effective_args, "exposure_escalation_notional", None)
             exposure_hold_seconds = getattr(effective_args, "exposure_escalation_hold_seconds", None)

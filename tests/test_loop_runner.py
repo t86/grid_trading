@@ -1628,6 +1628,9 @@ class LoopRunnerTests(unittest.TestCase):
             args.take_profit_min_profit_ratio = None
             args.pause_buy_position_notional = 750.0
             args.max_position_notional = 900.0
+            args.exposure_escalation_enabled = True
+            args.exposure_escalation_target_notional = 600.0
+            args.exposure_escalation_max_loss_ratio = 0.05
             args.reset_state = True
             args.state_path = str(Path(tmpdir) / "soonusdt_state.json")
             args.summary_jsonl = str(Path(tmpdir) / "soonusdt_events.jsonl")
@@ -1639,6 +1642,11 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["position_cost_basis_source"], "entryPrice")
         self.assertAlmostEqual(report["current_long_avg_price"], 0.1618043182344, places=12)
         self.assertAlmostEqual(report["take_profit_guard"]["long_floor_price"], 0.1619, places=8)
+        self.assertAlmostEqual(
+            report["exposure_escalation"]["unrealized_pnl"],
+            (0.16305 - 0.1618043182344) * 4340,
+            places=8,
+        )
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
