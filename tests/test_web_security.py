@@ -191,8 +191,34 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertIn("保存并重启", page)
         self.assertIn("停止", page)
+        self.assertIn("停止清仓", page)
+        self.assertIn("stopAndFlattenCurrentRunner", page)
+        self.assertIn("cancel_open_orders: true", page)
+        self.assertIn("close_all_positions: true", page)
         self.assertIn("高级 JSON", page)
         self.assertIn("strategy_mode", page)
+
+    @patch("grid_optimizer.web._stop_runner_process")
+    def test_handler_routes_runner_stop_with_flatten_flags(self, mock_stop_runner) -> None:
+        mock_stop_runner.return_value = {"symbol": "SOONUSDT", "post_stop_actions": {}}
+        payload = b'{"symbol":"SOONUSDT","cancel_open_orders":true,"close_all_positions":true}'
+        handler = object.__new__(_Handler)
+        handler.path = "/api/runner/stop"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        handler._authorize_request = lambda: True
+        handler._send_json = Mock()
+
+        _Handler.do_POST(handler)
+
+        mock_stop_runner.assert_called_once_with(
+            "SOONUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+            clear_volatility_resume_state=True,
+        )
+        handler._send_json.assert_called_once()
+        self.assertTrue(handler._send_json.call_args.args[0]["ok"])
 
     def test_running_status_overview_page_restores_cross_server_table(self) -> None:
         page = _render_running_status_overview_page()
@@ -2718,6 +2744,29 @@ class WebSecurityTests(unittest.TestCase):
             self.assertEqual(item["requested_strategy_profile"], "volume_long_v4")
             self.assertEqual(item["strategy_mode"], "one_way_long")
             self.assertEqual(item["stats_start_time"], phase_start.isoformat())
+
+    @patch("grid_optimizer.web._running_status_stats_start_time", return_value=None)
+    @patch("grid_optimizer.web.read_jsonl_filtered")
+    def test_fast_running_status_reads_bounded_audit_rows(self, mock_read_jsonl, _mock_stats_start) -> None:
+        mock_read_jsonl.return_value = []
+
+        item = _build_fast_running_status_item(
+            "SOONUSDT",
+            {
+                "is_running": True,
+                "pid": 123,
+                "config": {
+                    "symbol": "SOONUSDT",
+                    "summary_jsonl": "output/soonusdt_loop_events.jsonl",
+                    "plan_json": "output/soonusdt_loop_latest_plan.json",
+                    "submit_report_json": "output/soonusdt_loop_latest_submit.json",
+                },
+            },
+        )
+
+        self.assertIsNotNone(item)
+        self.assertTrue(mock_read_jsonl.call_args_list)
+        self.assertTrue(all((call.kwargs.get("limit") or 0) > 0 for call in mock_read_jsonl.call_args_list))
 
     @patch("grid_optimizer.web.resolve_runtime_guard_stats_start_time")
     @patch("grid_optimizer.web.resolve_active_competition_board")

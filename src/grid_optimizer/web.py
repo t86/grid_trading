@@ -4583,6 +4583,12 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       border-color: var(--brand);
       color: #fff;
     }
+    .rs-card-action.danger,
+    .rs-drawer-actions button.danger {
+      background: var(--bad);
+      border-color: var(--bad);
+      color: #fff;
+    }
     .rs-summary {
       display: grid;
       grid-template-columns: repeat(4, minmax(0, 1fr));
@@ -4937,7 +4943,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         <div class="rs-drawer-action-group">
           <button id="drawer_save_btn" type="button">保存</button>
           <button id="drawer_apply_btn" type="button" class="primary">保存并重启</button>
-          <button id="drawer_stop_btn" type="button">停止</button>
+          <button id="drawer_stop_btn" type="button" class="danger">停止清仓</button>
         </div>
       </div>
     </aside>
@@ -5154,6 +5160,32 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       drawerApplyBtn.textContent = card && card.is_running ? "保存并重启" : "启动";
     }
 
+    function formatStopActionSummary(summary) {
+      if (!summary) return "";
+      const parts = [];
+      if (summary.cancel_open_orders_requested) {
+        parts.push(`撤单 ${fmtNum(summary.cancel_success_count || 0, 0)} / ${fmtNum(summary.cancel_attempted_count || 0, 0)}`);
+      }
+      if (summary.close_all_positions_requested) {
+        parts.push(`待平仓方向 ${fmtNum(summary.close_attempted_count || 0, 0)}`);
+        if (summary.flatten_started) {
+          parts.push("跟价清仓已启动");
+        } else if (summary.flatten_already_running) {
+          parts.push("跟价清仓已在运行");
+        }
+      }
+      if (summary.warnings && summary.warnings.length) {
+        parts.push(`提示: ${summary.warnings.join("；")}`);
+      }
+      if (summary.cancel_errors && summary.cancel_errors.length) {
+        parts.push(`撤单错误 ${summary.cancel_errors.length}`);
+      }
+      if (summary.close_errors && summary.close_errors.length) {
+        parts.push(`平仓错误 ${summary.close_errors.length}`);
+      }
+      return parts.join(" · ");
+    }
+
     function formatSoftThreshold(card) {
       return `多 ${fmtNum(card.pause_buy_position_notional)} / 空 ${fmtNum(card.pause_short_position_notional)}`;
     }
@@ -5245,6 +5277,9 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         const cardKey = statusKeyForCard(card);
         state.cardIndex.set(cardKey, card);
         const actionLabel = localEditable ? "编辑" : "前往服务器";
+        const stopButton = localEditable && card.is_running
+          ? `<button class="rs-card-action danger" type="button" data-card-action="stop_flatten" data-card-key="${escapeHtml(cardKey)}">停止清仓</button>`
+          : "";
         return `
           <article class="rs-card${card.focused ? " focused" : ""}" data-card-key="${escapeHtml(cardKey)}">
             <div class="rs-card-head">
@@ -5281,6 +5316,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
               </div>
             </div>
             <div class="rs-card-footer">
+              ${stopButton}
               <button class="rs-card-action${localEditable ? " primary" : ""}" type="button" data-card-action="${localEditable ? "open" : "go"}" data-card-key="${escapeHtml(cardKey)}">${actionLabel}</button>
             </div>
           </article>
@@ -5361,6 +5397,12 @@ def _render_running_status_page(symbol: str | None = None) -> str:
           if (!card) return;
           if (button.getAttribute("data-card-action") === "go") {
             window.location.href = card.target_url || "/running_status";
+            return;
+          }
+          if (button.getAttribute("data-card-action") === "stop_flatten") {
+            stopAndFlattenCurrentRunner(card).catch((err) => {
+              pageMetaEl.textContent = `停止清仓失败: ${String(err)}`;
+            });
             return;
           }
           openDrawer(card);
@@ -5468,24 +5510,40 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       }
     }
 
-    async function stopCurrentRunner() {
-      if (!state.drawerCard) return;
-      setDrawerStatus(`正在停止 ${state.drawerCard.symbol}...`);
-      drawerSaveBtn.disabled = true;
-      drawerApplyBtn.disabled = true;
-      drawerStopBtn.disabled = true;
+    async function stopAndFlattenCurrentRunner(cardOverride = null) {
+      const card = cardOverride || state.drawerCard;
+      if (!card) return;
+      const openedInDrawer = state.drawerCard && statusKeyForCard(state.drawerCard) === statusKeyForCard(card);
+      const setStatus = (message, isError = false) => {
+        if (openedInDrawer) {
+          setDrawerStatus(message, isError);
+        } else {
+          pageMetaEl.textContent = message;
+        }
+      };
+      setStatus(`正在停止 ${card.symbol}，撤单并启动买一/卖一 maker 跟价清仓...`);
+      if (openedInDrawer) {
+        drawerSaveBtn.disabled = true;
+        drawerApplyBtn.disabled = true;
+        drawerStopBtn.disabled = true;
+      }
       try {
         const resp = await fetch("/api/runner/stop", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ symbol: state.drawerCard.symbol }),
+          body: JSON.stringify({
+            symbol: card.symbol,
+            cancel_open_orders: true,
+            close_all_positions: true,
+          }),
         });
         const data = await readJsonResponse(resp);
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        setDrawerStatus(`${state.drawerCard.symbol} 已停止。`);
+        const actionSummary = formatStopActionSummary(data.post_stop_actions);
+        setStatus(`${card.symbol} 已停止并进入清仓流程${actionSummary ? ` · ${actionSummary}` : ""}。`);
         await loadPage({ preserveDrawer: true });
       } catch (err) {
-        setDrawerStatus(`停止失败: ${String(err)}`, true);
+        setStatus(`停止清仓失败: ${String(err)}`, true);
       } finally {
         syncDrawerActions();
       }
@@ -5522,7 +5580,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     drawerCloseBtn.addEventListener("click", closeDrawer);
     drawerSaveBtn.addEventListener("click", () => saveCurrentConfig(false));
     drawerApplyBtn.addEventListener("click", () => saveCurrentConfig(true));
-    drawerStopBtn.addEventListener("click", stopCurrentRunner);
+    drawerStopBtn.addEventListener("click", () => stopAndFlattenCurrentRunner());
     refreshBtn.addEventListener("click", () => loadPage({ preserveDrawer: true }));
     toggleRefreshBtn.addEventListener("click", () => {
       state.paused = !state.paused;
@@ -28591,6 +28649,15 @@ def _status_commission_usdt(trade_summary: dict[str, Any]) -> float:
     return total
 
 
+def _running_status_audit_limit() -> int:
+    raw = str(os.environ.get("GRID_RUNNING_STATUS_AUDIT_LIMIT") or "20000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 20000
+    return max(1000, value)
+
+
 def _build_status_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -28677,8 +28744,9 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         submit_report=submit_report,
     )
     audit_paths = build_audit_paths(event_path)
-    trade_rows = read_jsonl_filtered(audit_paths["trade_audit"], limit=0)
-    income_rows = read_jsonl_filtered(audit_paths["income_audit"], limit=0)
+    audit_limit = _running_status_audit_limit()
+    trade_rows = read_jsonl_filtered(audit_paths["trade_audit"], limit=audit_limit)
+    income_rows = read_jsonl_filtered(audit_paths["income_audit"], limit=audit_limit)
     stats_start_time = _running_status_stats_start_time(symbol, runner)
     if stats_start_time is not None:
         stats_start_ms = int(stats_start_time.timestamp() * 1000)
