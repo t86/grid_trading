@@ -16,7 +16,7 @@ import sys
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeoutError, as_completed
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -9107,6 +9107,7 @@ MANUAL_TRADE_TASKS_LOCK = threading.Lock()
 MANUAL_TRADE_HISTORY_LOCK = threading.Lock()
 MANUAL_TRADE_SLEEP_SECONDS = _env_float("GRID_MANUAL_TRADE_SLEEP_SECONDS", 1.0)
 MANUAL_TRADE_MIN_REPRICE_SECONDS = _env_float("GRID_MANUAL_TRADE_MIN_REPRICE_SECONDS", 1.0)
+MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS = _env_float("GRID_MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS", 12.0, minimum=3.0)
 
 
 def _manual_trade_client_order_prefix(symbol: str) -> str:
@@ -9533,18 +9534,35 @@ def _manual_trade_prepare_plan(
     if creds is None:
         raise RuntimeError("Binance API credentials are not configured")
     api_key, api_secret = creds
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        position_mode_future = executor.submit(fetch_futures_position_mode, api_key, api_secret)
-        account_info_future = executor.submit(fetch_futures_account_info_v3, api_key, api_secret)
-        book_future = executor.submit(_manual_trade_book_prices, normalized_symbol)
-        symbol_info_future = executor.submit(fetch_futures_symbol_config, normalized_symbol)
+    executor = ThreadPoolExecutor(max_workers=4)
+    started_at = time.monotonic()
+    futures = {
+        "position mode": executor.submit(fetch_futures_position_mode, api_key, api_secret),
+        "account info": executor.submit(fetch_futures_account_info_v3, api_key, api_secret),
+        "book ticker": executor.submit(_manual_trade_book_prices, normalized_symbol),
+        "symbol config": executor.submit(fetch_futures_symbol_config, normalized_symbol),
+    }
 
-        position_mode = position_mode_future.result()
+    def _prepare_result(name: str) -> Any:
+        elapsed = time.monotonic() - started_at
+        remaining = max(MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS - elapsed, 0.1)
+        try:
+            return futures[name].result(timeout=remaining)
+        except FuturesTimeoutError as exc:
+            raise TimeoutError(
+                f"manual trade prepare timeout while waiting for {name} "
+                f"after {MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS:.1f}s"
+            ) from exc
+
+    try:
+        position_mode = _prepare_result("position mode")
         if _truthy(position_mode.get("dualSidePosition")):
             raise ValueError("manual trade requires one-way position mode")
-        account_info = account_info_future.result()
-        bid_price, ask_price = book_future.result()
-        symbol_info = symbol_info_future.result()
+        account_info = _prepare_result("account info")
+        bid_price, ask_price = _prepare_result("book ticker")
+        symbol_info = _prepare_result("symbol config")
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
     normalized_margin_mode = str(margin_mode or "KEEP").upper().strip()
     if normalized_margin_mode not in {"KEEP", "ISOLATED"}:
         raise ValueError("margin_mode must be KEEP or ISOLATED")
@@ -9725,6 +9743,18 @@ def _manual_trade_chase_leg(
 def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
     symbol = str(payload.get("symbol", "")).upper().strip()
     try:
+        if symbol:
+            _manual_trade_set_task(
+                symbol,
+                {
+                    "id": task_id,
+                    "status": "preparing",
+                    "side": str(payload.get("side", "")).upper().strip(),
+                    "notional": float(payload.get("notional", 0) or 0),
+                    "message": "preparing manual maker order",
+                    "error": None,
+                },
+            )
         symbol, api_key, api_secret, plan, _tick_size, _step_size = _manual_trade_prepare_plan(
             symbol,
             str(payload.get("side", "")),

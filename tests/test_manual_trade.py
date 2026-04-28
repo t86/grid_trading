@@ -17,6 +17,7 @@ from grid_optimizer.web import (
     _manual_trade_ensure_isolated,
     _manual_trade_history_for_symbol,
     _manual_trade_maker_worker,
+    MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS,
     MANUAL_TRADE_SLEEP_SECONDS,
     _manual_trade_set_task,
     _manual_trade_prepare_plan,
@@ -53,6 +54,7 @@ class ManualTradeTests(unittest.TestCase):
 
     def test_manual_maker_chase_checks_every_second(self) -> None:
         self.assertEqual(MANUAL_TRADE_SLEEP_SECONDS, 1.0)
+        self.assertEqual(MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS, 12.0)
 
     def test_manual_trade_prefix_is_symbol_scoped(self) -> None:
         prefix = _manual_trade_client_order_prefix("BARDUSDT")
