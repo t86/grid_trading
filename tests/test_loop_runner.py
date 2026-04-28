@@ -23,10 +23,12 @@ from grid_optimizer.loop_runner import (
     _current_check_bucket,
     _custom_grid_levels_above_current,
     _generate_competition_inventory_grid_plan,
+    _filter_futures_strategy_orders,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_synthetic_resync_price,
     _shift_custom_grid_bounds,
+    _run_periodic_reconcile,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
     apply_excess_inventory_reduce_only,
@@ -80,6 +82,49 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_filter_futures_strategy_orders_ignores_manual_and_flatten_orders(self) -> None:
+        open_orders = [
+            {"clientOrderId": "gx-btcusdc-001", "orderId": 1},
+            {"clientOrderId": "mt_btcusdc_buy_001", "orderId": 2},
+            {"clientOrderId": "mf_btcusdc_001", "orderId": 3},
+            {"clientOrderId": "", "orderId": 4},
+            "not-an-order",
+        ]
+
+        result = _filter_futures_strategy_orders(open_orders, "BTCUSDC")
+
+        self.assertEqual(result, [{"clientOrderId": "gx-btcusdc-001", "orderId": 1}])
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_periodic_reconcile_ignores_manual_open_orders(
+        self,
+        mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        mock_open_orders.return_value = [
+            {"clientOrderId": "gx-btcusdc-001", "orderId": 1},
+            {"clientOrderId": "mt_btcusdc_buy_001", "orderId": 2},
+        ]
+        mock_account_info.return_value = {"positions": [{"symbol": "BTCUSDC", "positionAmt": "0"}]}
+
+        snapshot = _run_periodic_reconcile(
+            state={},
+            cycle=5,
+            interval_cycles=5,
+            symbol="BTCUSDC",
+            strategy_mode="one_way_long",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=1,
+            expected_actual_net_qty=0.0,
+        )
+
+        self.assertTrue(snapshot["ok"])
+        self.assertEqual(snapshot["actual_open_order_count"], 1)
+        self.assertEqual(snapshot["total_open_order_count"], 2)
+
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("chipusdt_competition_neutral_ping_pong_v1"))
@@ -5190,7 +5235,7 @@ class LoopRunnerTests(unittest.TestCase):
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {"multiAssetsMargin": False, "positions": [{"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"}]}
-        mock_open_orders.return_value = []
+        mock_open_orders.return_value = [{"clientOrderId": "mt_katusdt_buy_001", "orderId": 42}]
         mock_change_leverage.return_value = {"leverage": 2}
 
         args = Namespace(

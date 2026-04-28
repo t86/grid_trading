@@ -13,7 +13,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from .audit import (
     DEFAULT_AUDIT_LOOKBACK_DAYS,
@@ -1021,10 +1021,11 @@ def _run_periodic_reconcile(
         return snapshot
 
     current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
+    current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
     account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
     current_position = extract_symbol_position(account_info, symbol)
     actual_net_qty = _safe_float(current_position.get("positionAmt"))
-    open_order_diff = len(current_open_orders) - int(expected_open_order_count or 0)
+    open_order_diff = len(current_strategy_open_orders) - int(expected_open_order_count or 0)
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
     ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9
     message_parts: list[str] = []
@@ -1041,7 +1042,8 @@ def _run_periodic_reconcile(
         "cycle": cycle,
         "strategy_mode": strategy_mode,
         "expected_open_order_count": int(expected_open_order_count or 0),
-        "actual_open_order_count": len(current_open_orders),
+        "actual_open_order_count": len(current_strategy_open_orders),
+        "total_open_order_count": len(current_open_orders),
         "expected_actual_net_qty": float(expected_actual_net_qty or 0.0),
         "actual_actual_net_qty": actual_net_qty,
         "open_order_diff": open_order_diff,
@@ -3453,6 +3455,19 @@ def _sync_account_audit(
 
 def _strategy_client_order_prefix(symbol: str) -> str:
     return f"gx-{symbol.lower().replace('usdt', 'u')}-"
+
+
+def _is_futures_strategy_order(order: dict[str, Any], symbol: str) -> bool:
+    client_order_id = str(order.get("clientOrderId", "") or "")
+    return client_order_id.startswith(_strategy_client_order_prefix(symbol))
+
+
+def _filter_futures_strategy_orders(open_orders: Iterable[Any], symbol: str) -> list[dict[str, Any]]:
+    return [
+        order
+        for order in open_orders
+        if isinstance(order, dict) and _is_futures_strategy_order(order, symbol)
+    ]
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -9901,7 +9916,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             for item in desired_orders
             if str(item.get("side", "")).upper().strip() == "SELL"
         ]
-    open_orders_for_diff = open_orders
+    strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
+    open_orders_for_diff = strategy_open_orders
     sticky_exit_mode = {"key": None, "roles": []}
     previous_sticky_exit_mode_key = str(state.get("sticky_exit_mode_key") or "").strip() or None
     if _is_synthetic_neutral_mode(strategy_mode):
@@ -10122,7 +10138,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "recovery_mode": plan.get("recovery_mode"),
         "inventory_grid_risk_state": plan.get("risk_state"),
         "tail_cleanup_active": bool(plan.get("tail_cleanup_active")),
-        "open_order_count": len(open_orders),
+        "open_order_count": len(strategy_open_orders),
+        "total_open_order_count": len(open_orders),
         "kept_orders": diff["kept_orders"],
         "missing_orders": diff["missing_orders"],
         "stale_orders": diff["stale_orders"],
@@ -10295,6 +10312,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         )
 
     current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
+    current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
     expected_open_order_count = int(plan_report.get("open_order_count", 0) or 0)
     expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
     expected_short_qty = _safe_float(plan_report.get("current_short_qty"))
@@ -10323,7 +10341,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         else:
             current_long_qty = max(current_actual_net_qty, 0.0)
             current_short_qty = 0.0
-    if len(current_open_orders) != expected_open_order_count:
+    if len(current_strategy_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
     if _is_synthetic_neutral_mode(strategy_mode):
         if abs(current_actual_net_qty - expected_actual_net_qty) > 1e-9:
@@ -10343,7 +10361,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         actions=validation["actions"],
         strategy_mode=strategy_mode,
         current_actual_net_qty=current_actual_net_qty,
-        current_open_orders=current_open_orders,
+        current_open_orders=current_strategy_open_orders,
     )
     report["reduce_only_position_cap"] = validation["actions"].get("reduce_only_position_cap")
     if validation["actions"]["place_count"] <= 0 and validation["actions"]["cancel_count"] <= 0:
