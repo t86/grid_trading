@@ -97,6 +97,15 @@ def _order_position_side(order: dict[str, Any]) -> str:
     return raw or "BOTH"
 
 
+def _strategy_client_order_prefix(symbol: str) -> str:
+    return f"gx-{str(symbol or '').lower().replace('usdt', 'u')}-"
+
+
+def _is_strategy_order(order: dict[str, Any], symbol: str) -> bool:
+    client_order_id = str(order.get("clientOrderId", "") or "")
+    return client_order_id.startswith(_strategy_client_order_prefix(symbol))
+
+
 def _order_bucket_key(side: str, price: float, position_side: str | None = None) -> str:
     normalized_position_side = str(position_side or "BOTH").upper().strip() or "BOTH"
     return f"{side.upper()}:{normalized_position_side}:{price:.10f}"
@@ -419,6 +428,7 @@ def cap_reduce_only_place_orders_to_position(
 
 
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(plan_report.get("symbol", "")).upper().strip()
     bootstrap_orders = [
         item for item in plan_report.get("bootstrap_orders", []) if isinstance(item, dict)
     ]
@@ -428,6 +438,8 @@ def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     stale_orders = [
         item for item in plan_report.get("stale_orders", []) if isinstance(item, dict)
     ]
+    if symbol:
+        stale_orders = [item for item in stale_orders if _is_strategy_order(item, symbol)]
     place_orders = [*bootstrap_orders, *missing_orders]
     place_notional = sum(_safe_float(item.get("notional")) for item in place_orders)
     return {

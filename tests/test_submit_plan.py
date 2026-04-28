@@ -30,6 +30,7 @@ class SubmitPlanTests(unittest.TestCase):
 
     def test_build_execution_actions_combines_bootstrap_and_missing_orders(self) -> None:
         report = {
+            "symbol": "BARDUSDT",
             "bootstrap_orders": [
                 {"side": "BUY", "price": 0.05043, "qty": 3011.0, "notional": 151.84473, "role": "bootstrap"}
             ],
@@ -37,7 +38,9 @@ class SubmitPlanTests(unittest.TestCase):
                 {"side": "BUY", "price": 0.05029, "qty": 502.0, "notional": 25.24558, "role": "entry"},
                 {"side": "SELL", "price": 0.05047, "qty": 500.0, "notional": 25.23500, "role": "take_profit"},
             ],
-            "stale_orders": [{"orderId": 1, "side": "BUY", "price": "0.05001", "origQty": "500"}],
+            "stale_orders": [
+                {"orderId": 1, "clientOrderId": "gx-bardu-entry-1", "side": "BUY", "price": "0.05001", "origQty": "500"}
+            ],
         }
 
         actions = build_execution_actions(report)
@@ -45,6 +48,22 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(actions["place_count"], 3)
         self.assertEqual(actions["cancel_count"], 1)
         self.assertAlmostEqual(actions["place_notional"], 202.32531, places=8)
+
+    def test_build_execution_actions_excludes_manual_stale_orders(self) -> None:
+        report = {
+            "symbol": "BTCUSDC",
+            "bootstrap_orders": [],
+            "missing_orders": [],
+            "stale_orders": [
+                {"orderId": 1, "clientOrderId": "gx-btcusdc-entry-1", "side": "BUY", "price": "1", "origQty": "1"},
+                {"orderId": 2, "clientOrderId": "mt_btcusdc_openlong_b_1", "side": "BUY", "price": "1", "origQty": "1"},
+            ],
+        }
+
+        actions = build_execution_actions(report)
+
+        self.assertEqual(actions["cancel_orders"], [report["stale_orders"][0]])
+        self.assertEqual(actions["cancel_count"], 1)
 
     def test_reduce_only_cap_counts_orders_pending_cancel_until_exchange_releases_qty(self) -> None:
         actions = {
@@ -232,7 +251,9 @@ class SubmitPlanTests(unittest.TestCase):
             "dual_side_position": False,
             "bootstrap_orders": [],
             "missing_orders": [{"side": "BUY", "price": 0.05029, "qty": 502.0, "notional": 25.24558}],
-            "stale_orders": [{"orderId": 1, "side": "BUY", "price": "0.05001", "origQty": "500"}],
+            "stale_orders": [
+                {"orderId": 1, "clientOrderId": "gx-nightu-entry-1", "side": "BUY", "price": "0.05001", "origQty": "500"}
+            ],
         }
 
         validation = validate_plan_report(
