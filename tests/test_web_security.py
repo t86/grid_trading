@@ -231,6 +231,14 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("持仓状态", page)
         self.assertNotIn('const INITIAL_VIEW_MODE = "local";', page)
 
+    def test_running_status_overview_page_formats_fee_column_without_negative_zero(self) -> None:
+        page = _render_running_status_overview_page()
+
+        self.assertIn("function fmtFeeMoney(value)", page)
+        self.assertIn("fmtFeeMoney(item.fees)", page)
+        self.assertIn("fmtFeeMoney(summary.fees || 0)", page)
+        self.assertNotIn("fmtMoney(-item.fees)", page)
+
     @patch("grid_optimizer.web._build_running_status")
     def test_run_running_status_overview_query_uses_legacy_cross_payload(self, mock_build) -> None:
         mock_build.return_value = {"ok": True, "scope": "cross", "servers": []}

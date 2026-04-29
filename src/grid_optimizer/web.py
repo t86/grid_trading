@@ -23128,10 +23128,23 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
       return Number(value).toLocaleString("zh-CN", { minimumFractionDigits: digits, maximumFractionDigits: digits });
     }
-    function fmtMoney(value) {
+    function fmtMoney(value, digits = 4) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
-      const num = Number(value);
-      return `${num > 0 ? "+" : ""}${fmtNum(num, 4)}`;
+      let num = Number(value);
+      const zeroThreshold = 0.5 * Math.pow(10, -digits);
+      if (Math.abs(num) < zeroThreshold) num = 0;
+      return `${num > 0 ? "+" : ""}${fmtNum(num, digits)}`;
+    }
+    function feeDigits(value) {
+      const absValue = Math.abs(Number(value || 0));
+      if (absValue > 0 && absValue < 0.0001) return 8;
+      if (absValue > 0 && absValue < 0.01) return 6;
+      return 4;
+    }
+    function fmtFeeMoney(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
+      const feeCost = -Number(value);
+      return fmtMoney(feeCost, feeDigits(feeCost));
     }
     function fmtTs(value) {
       if (!value) return "--";
@@ -23151,7 +23164,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
         ["总成交量", fmtNum(summary.total_volume || 0, 4), "按交易赛/会话统计窗口"],
         ["最近一小时成交量", fmtNum(summary.recent_hour_volume || 0, 4), "取每个币种最新小时桶"],
         ["总盈亏", fmtMoney(summary.total_pnl || 0), `交易 ${fmtMoney(summary.trade_pnl || 0)} · 未实现 ${fmtMoney(summary.unrealized_pnl || 0)}`],
-        ["手续费/资金费", fmtMoney(-(summary.fees || 0)), `资金费 ${fmtMoney(summary.funding_fee || 0)}`],
+        ["手续费/资金费", fmtFeeMoney(summary.fees || 0), `资金费 ${fmtMoney(summary.funding_fee || 0)}`],
       ];
       summaryEl.innerHTML = cards.map(([label, value, sub], index) => `
         <div class="metric">
@@ -23172,7 +23185,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
           <td class="${moneyClass(item.total_pnl)}">${escapeHtml(fmtMoney(item.total_pnl))}</td>
           <td class="${moneyClass(item.trade_pnl)}">${escapeHtml(fmtMoney(item.trade_pnl))}</td>
           <td class="${moneyClass(item.unrealized_pnl)}">${escapeHtml(fmtMoney(item.unrealized_pnl))}</td>
-          <td class="${moneyClass(-item.fees)}">${escapeHtml(fmtMoney(-item.fees))}</td>
+          <td class="${moneyClass(-item.fees)}">${escapeHtml(fmtFeeMoney(item.fees))}</td>
           <td class="${moneyClass(item.funding_fee)}">${escapeHtml(fmtMoney(item.funding_fee))}</td>
           <td>${escapeHtml(item.open_order_summary || "--")}</td>
           <td>${escapeHtml(item.position_summary || "--")}</td>
