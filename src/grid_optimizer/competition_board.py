@@ -3625,6 +3625,11 @@ def _attach_snapshot_analytics(snapshot: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(boards, list):
         boards = []
     arena_status = snapshot.get("futures_master_arena") if isinstance(snapshot.get("futures_master_arena"), dict) else None
+    if os.environ.get("GRID_COMPETITION_BOARD_ANALYTICS", "").strip().lower() in {"0", "false", "no", "off"}:
+        snapshot["ended_analytics"] = {"delta_rows": [], "reward_rows": []}
+        snapshot["ongoing_analytics"] = {"board_rows": []}
+        snapshot["daily_strategy"] = {"arena": arena_status or {}, "board_rows": [], "tracked_ranks": []}
+        return snapshot
     snapshot["ended_analytics"] = _build_ended_boards_analytics(boards)
     snapshot["ongoing_analytics"] = _build_ongoing_boards_analytics(boards)
     snapshot["daily_strategy"] = _build_daily_strategy_analytics(boards, arena_status=arena_status)
