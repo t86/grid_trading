@@ -221,6 +221,189 @@ def _build_order(
     )
 
 
+def build_maker_volatility_inventory_plan(
+    *,
+    bid_price: float,
+    ask_price: float,
+    current_net_qty: float,
+    window_open: float,
+    window_high: float,
+    window_low: float,
+    window_close: float,
+    base_spread_bps: float,
+    wide_spread_bps: float,
+    order_notional: float,
+    max_long_notional: float,
+    max_short_notional: float,
+    inventory_soft_ratio: float,
+    volatility_wide_threshold: float,
+    extreme_volatility_threshold: float,
+    directional_move_threshold: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    buy_orders: list[PlanOrder] = []
+    sell_orders: list[PlanOrder] = []
+
+    safe_bid = _safe_float(bid_price)
+    safe_ask = _safe_float(ask_price)
+    safe_notional = max(_safe_float(order_notional), 0.0)
+    if safe_bid <= 0 or safe_ask <= 0 or safe_bid >= safe_ask or safe_notional <= 0:
+        return {
+            "buy_orders": [],
+            "sell_orders": [],
+            "bootstrap_orders": [],
+            "target_base_qty": 0.0,
+            "bootstrap_qty": 0.0,
+            "maker_state": {
+                "regime": "blocked",
+                "blocked_reason": "invalid_market_data",
+                "reasons": ["invalid_market_data"],
+            },
+        }
+
+    mid_price = (safe_bid + safe_ask) / 2.0
+    safe_open = _safe_float(window_open)
+    safe_high = _safe_float(window_high)
+    safe_low = _safe_float(window_low)
+    safe_close = _safe_float(window_close)
+    amplitude_ratio = (safe_high / safe_low - 1.0) if safe_high > 0 and safe_low > 0 else 0.0
+    abs_return_ratio = abs(safe_close / safe_open - 1.0) if safe_open > 0 and safe_close > 0 else 0.0
+    signed_return_ratio = (safe_close / safe_open - 1.0) if safe_open > 0 and safe_close > 0 else 0.0
+
+    net_qty = _safe_float(current_net_qty)
+    long_notional = max(net_qty, 0.0) * mid_price
+    short_notional = max(-net_qty, 0.0) * mid_price
+    long_soft_limit = max(_safe_float(max_long_notional), 0.0) * max(_safe_float(inventory_soft_ratio), 0.0)
+    short_soft_limit = max(_safe_float(max_short_notional), 0.0) * max(_safe_float(inventory_soft_ratio), 0.0)
+    hard_long_limit = max(_safe_float(max_long_notional), 0.0)
+    hard_short_limit = max(_safe_float(max_short_notional), 0.0)
+
+    reasons: list[str] = []
+    extreme_threshold = max(_safe_float(extreme_volatility_threshold), 0.0)
+    wide_threshold = max(_safe_float(volatility_wide_threshold), 0.0)
+    directional_threshold = max(_safe_float(directional_move_threshold), 0.0)
+    if extreme_threshold > 0 and (amplitude_ratio >= extreme_threshold or abs_return_ratio >= extreme_threshold):
+        return {
+            "buy_orders": [],
+            "sell_orders": [],
+            "bootstrap_orders": [],
+            "target_base_qty": 0.0,
+            "bootstrap_qty": 0.0,
+            "maker_state": {
+                "regime": "cooldown",
+                "blocked_reason": "extreme_volatility",
+                "reasons": ["extreme_volatility"],
+                "amplitude_ratio": amplitude_ratio,
+                "abs_return_ratio": abs_return_ratio,
+                "signed_return_ratio": signed_return_ratio,
+                "long_notional": long_notional,
+                "short_notional": short_notional,
+            },
+        }
+
+    regime = "normal"
+    spread_bps = max(_safe_float(base_spread_bps), 0.0)
+    if wide_threshold > 0 and (amplitude_ratio >= wide_threshold or abs_return_ratio >= wide_threshold):
+        regime = "volatility_wide"
+        spread_bps = max(_safe_float(wide_spread_bps), spread_bps)
+        reasons.append("volatility_wide")
+
+    fast_down = directional_threshold > 0 and signed_return_ratio <= -directional_threshold
+    fast_up = directional_threshold > 0 and signed_return_ratio >= directional_threshold
+    if fast_down:
+        reasons.append("fast_down_move")
+    if fast_up:
+        reasons.append("fast_up_move")
+
+    allow_buy = True
+    allow_sell = True
+    buy_role = "maker_entry_long"
+    sell_role = "maker_entry_short"
+    buy_qty_cap: float | None = None
+    sell_qty_cap: float | None = None
+
+    if net_qty > 0:
+        sell_role = "maker_reduce_long"
+        sell_qty_cap = net_qty
+    elif net_qty < 0:
+        buy_role = "maker_reduce_short"
+        buy_qty_cap = abs(net_qty)
+
+    if hard_long_limit > 0 and long_notional >= hard_long_limit:
+        regime = "hard_reduce_only"
+        reasons.append("hard_long_inventory")
+        allow_buy = False
+        allow_sell = net_qty > 0
+    elif hard_short_limit > 0 and short_notional >= hard_short_limit:
+        regime = "hard_reduce_only"
+        reasons.append("hard_short_inventory")
+        allow_sell = False
+        allow_buy = net_qty < 0
+    elif long_soft_limit > 0 and long_notional >= long_soft_limit:
+        regime = "long_inventory_reduce"
+        reasons.append("soft_long_inventory")
+        allow_buy = False
+        allow_sell = net_qty > 0
+    elif short_soft_limit > 0 and short_notional >= short_soft_limit:
+        regime = "short_inventory_reduce"
+        reasons.append("soft_short_inventory")
+        allow_sell = False
+        allow_buy = net_qty < 0
+
+    spread_ratio = spread_bps / 10_000.0
+
+    def _append_order(side: str, price: float, role: str, qty_cap: float | None = None) -> None:
+        rounded_price = _round_order_price(price, tick_size, side)
+        if rounded_price <= 0:
+            return
+        qty = _round_order_qty(safe_notional / rounded_price, step_size)
+        if qty_cap is not None:
+            qty = _round_order_qty(min(qty, max(qty_cap, 0.0)), step_size)
+        notional = rounded_price * qty
+        if qty <= 0:
+            return
+        if min_qty is not None and qty < min_qty:
+            return
+        if min_notional is not None and notional < min_notional:
+            return
+        order = _build_order(side=side, price=rounded_price, qty=qty, level=1, role=role)
+        if side.upper() == "BUY":
+            buy_orders.append(order)
+        else:
+            sell_orders.append(order)
+
+    if allow_buy:
+        _append_order("BUY", safe_bid * (1.0 - spread_ratio), buy_role, buy_qty_cap)
+    if allow_sell:
+        _append_order("SELL", safe_ask * (1.0 + spread_ratio), sell_role, sell_qty_cap)
+
+    return {
+        "buy_orders": [order.__dict__ for order in buy_orders],
+        "sell_orders": [order.__dict__ for order in sell_orders],
+        "bootstrap_orders": [],
+        "target_base_qty": 0.0,
+        "bootstrap_qty": 0.0,
+        "maker_state": {
+            "regime": regime,
+            "blocked_reason": None,
+            "reasons": reasons,
+            "amplitude_ratio": amplitude_ratio,
+            "abs_return_ratio": abs_return_ratio,
+            "signed_return_ratio": signed_return_ratio,
+            "spread_bps": spread_bps,
+            "long_notional": long_notional,
+            "short_notional": short_notional,
+            "long_soft_limit": long_soft_limit,
+            "short_soft_limit": short_soft_limit,
+            "max_long_notional": hard_long_limit,
+            "max_short_notional": hard_short_limit,
+        },
+    }
+
+
 def _normalize_lots(lots: list[dict[str, Any]] | None) -> list[dict[str, float]]:
     normalized: list[dict[str, float]] = []
     for item in lots or []:

@@ -68,6 +68,7 @@ from .semi_auto_plan import (
     build_static_binance_grid_plan,
     build_hedge_micro_grid_plan,
     build_inventory_target_neutral_plan,
+    build_maker_volatility_inventory_plan,
     build_best_quote_long_flip_plan,
     build_micro_grid_plan,
     build_short_micro_grid_plan,
@@ -2074,6 +2075,10 @@ def _is_inventory_target_neutral_mode(strategy_mode: str) -> bool:
 
 def _is_competition_inventory_grid_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "competition_inventory_grid"
+
+
+def _is_maker_volatility_inventory_mode(strategy_mode: str) -> bool:
+    return str(strategy_mode).strip() == "maker_volatility_inventory_v1"
 
 
 def _is_custom_grid_mode(args: argparse.Namespace) -> bool:
@@ -7711,6 +7716,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "synthetic_neutral",
         "inventory_target_neutral",
         "competition_inventory_grid",
+        "maker_volatility_inventory_v1",
     }:
         raise RuntimeError(f"Unsupported strategy_mode: {requested_strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
@@ -7815,6 +7821,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "blocked_reason": "not_evaluated",
         "placed_reduce_orders": 0,
         "forced_reduce_orders": [],
+    }
+    maker_volatility_inventory: dict[str, Any] = {
+        "regime": "not_applicable",
+        "blocked_reason": None,
+        "reasons": [],
     }
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
@@ -8063,7 +8074,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     actual_break_even_price = max(_safe_float(actual_position.get("breakEvenPrice")), 0.0)
     long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
     short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
-    if _is_inventory_target_neutral_mode(requested_strategy_mode) or _is_competition_inventory_grid_mode(requested_strategy_mode):
+    if (
+        _is_inventory_target_neutral_mode(requested_strategy_mode)
+        or _is_competition_inventory_grid_mode(requested_strategy_mode)
+        or _is_maker_volatility_inventory_mode(requested_strategy_mode)
+    ):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
     elif _is_one_way_short_mode(requested_strategy_mode):
@@ -8383,7 +8398,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if requested_strategy_mode == "synthetic_neutral" and strategy_mode != "synthetic_neutral":
             state["synthetic_ledger_resync_required"] = True
 
-    if _is_inventory_target_neutral_mode(strategy_mode):
+    if _is_inventory_target_neutral_mode(strategy_mode) or _is_maker_volatility_inventory_mode(strategy_mode):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
     elif strategy_mode == "hedge_neutral":
@@ -9332,6 +9347,142 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         target_base_qty = 0.0
         bootstrap_qty = 0.0
+    elif _is_maker_volatility_inventory_mode(strategy_mode):
+        maker_interval = str(getattr(effective_args, "maker_volatility_window", "1m") or "1m").strip() or "1m"
+        interval_minutes = {"1m": 1, "3m": 3, "5m": 5}.get(maker_interval, 1)
+        window_open = mid_price
+        window_high = mid_price
+        window_low = mid_price
+        window_close = mid_price
+        try:
+            end_ms = int(plan_now.timestamp() * 1000)
+            start_ms = end_ms - int(timedelta(minutes=interval_minutes).total_seconds() * 1000)
+            candles = fetch_futures_klines(
+                symbol=symbol,
+                interval=maker_interval if maker_interval in {"1m", "3m", "5m"} else "1m",
+                start_ms=start_ms,
+                end_ms=end_ms,
+                limit=10,
+            )
+            closed_candles = [item for item in candles if item.close_time <= plan_now]
+            candle = closed_candles[-1] if closed_candles else (candles[-1] if candles else None)
+            if candle is not None:
+                window_open = _safe_float(candle.open) or mid_price
+                window_high = _safe_float(candle.high) or mid_price
+                window_low = _safe_float(candle.low) or mid_price
+                window_close = _safe_float(candle.close) or mid_price
+        except Exception as exc:
+            maker_volatility_inventory = {
+                "regime": "blocked",
+                "blocked_reason": "kline_fetch_failed",
+                "reasons": ["kline_fetch_failed"],
+                "warning": f"{exc.__class__.__name__}: {exc}",
+            }
+
+        maker_state = state.setdefault("maker_volatility_inventory", {})
+        cooldown_until_raw = str((maker_state or {}).get("cooldown_until") or "").strip()
+        cooldown_active = False
+        cooldown_until: datetime | None = None
+        if cooldown_until_raw:
+            try:
+                cooldown_until = datetime.fromisoformat(cooldown_until_raw.replace("Z", "+00:00"))
+                if cooldown_until.tzinfo is None:
+                    cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+                cooldown_until = cooldown_until.astimezone(timezone.utc)
+                cooldown_active = cooldown_until > plan_now
+            except ValueError:
+                cooldown_until = None
+        if cooldown_active:
+            plan = {
+                "buy_orders": [],
+                "sell_orders": [],
+                "bootstrap_orders": [],
+                "target_base_qty": 0.0,
+                "bootstrap_qty": 0.0,
+                "maker_state": {
+                    "regime": "cooldown",
+                    "blocked_reason": "cooldown_active",
+                    "reasons": ["cooldown_active"],
+                    "cooldown_until": cooldown_until.isoformat() if cooldown_until else None,
+                },
+            }
+        elif maker_volatility_inventory.get("blocked_reason") == "kline_fetch_failed":
+            plan = {
+                "buy_orders": [],
+                "sell_orders": [],
+                "bootstrap_orders": [],
+                "target_base_qty": 0.0,
+                "bootstrap_qty": 0.0,
+                "maker_state": maker_volatility_inventory,
+            }
+        else:
+            plan = build_maker_volatility_inventory_plan(
+                bid_price=bid_price,
+                ask_price=ask_price,
+                current_net_qty=actual_net_qty,
+                window_open=window_open,
+                window_high=window_high,
+                window_low=window_low,
+                window_close=window_close,
+                base_spread_bps=float(getattr(effective_args, "maker_base_spread_bps", 4.0)),
+                wide_spread_bps=float(getattr(effective_args, "maker_wide_spread_bps", 12.0)),
+                order_notional=float(getattr(effective_args, "maker_order_notional", 30.0)),
+                max_long_notional=float(getattr(effective_args, "maker_max_long_notional", 300.0)),
+                max_short_notional=float(getattr(effective_args, "maker_max_short_notional", 300.0)),
+                inventory_soft_ratio=float(getattr(effective_args, "maker_inventory_soft_ratio", 0.7)),
+                volatility_wide_threshold=float(getattr(effective_args, "maker_volatility_wide_threshold", 0.006)),
+                extreme_volatility_threshold=float(getattr(effective_args, "maker_extreme_volatility_threshold", 0.012)),
+                directional_move_threshold=float(getattr(effective_args, "maker_directional_move_threshold", 0.004)),
+                tick_size=symbol_info.get("tick_size"),
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+            )
+        maker_volatility_inventory = dict(plan.get("maker_state") or {})
+        if maker_volatility_inventory.get("regime") == "cooldown" and maker_volatility_inventory.get("blocked_reason") == "extreme_volatility":
+            cooldown_seconds = max(_safe_float(getattr(effective_args, "maker_cooldown_seconds", 30.0)), 0.0)
+            if cooldown_seconds > 0:
+                cooldown_until = plan_now + timedelta(seconds=cooldown_seconds)
+                maker_volatility_inventory["cooldown_until"] = cooldown_until.isoformat()
+                maker_state["cooldown_until"] = cooldown_until.isoformat()
+        elif not cooldown_active:
+            maker_state["cooldown_until"] = None
+        maker_state["regime"] = str(maker_volatility_inventory.get("regime") or "normal")
+        maker_state["last_reason"] = ",".join(str(item) for item in list(maker_volatility_inventory.get("reasons") or []))
+        maker_state["last_updated_at"] = plan_now.isoformat()
+
+        inventory_tier = {
+            "enabled": False,
+            "active": False,
+            "ratio": 0.0,
+            "start_notional": None,
+            "end_notional": None,
+            "effective_buy_levels": len(plan.get("buy_orders", [])),
+            "effective_sell_levels": len(plan.get("sell_orders", [])),
+            "effective_per_order_notional": float(getattr(effective_args, "maker_order_notional", 30.0)),
+            "effective_base_position_notional": 0.0,
+        }
+        controls = {
+            "buy_paused": not bool(plan.get("buy_orders")),
+            "pause_reasons": list(maker_volatility_inventory.get("reasons") or []),
+            "short_paused": not bool(plan.get("sell_orders")),
+            "short_pause_reasons": list(maker_volatility_inventory.get("reasons") or []),
+            "current_long_notional": current_long_notional,
+            "current_short_notional": current_short_notional,
+        }
+        cap_controls = {
+            "cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only",
+            "buy_cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only" and actual_net_qty > 0,
+            "short_cap_applied": maker_volatility_inventory.get("regime") == "hard_reduce_only" and actual_net_qty < 0,
+            "buy_budget_notional": max(_safe_float(getattr(effective_args, "maker_max_long_notional", 300.0)) - current_long_notional, 0.0),
+            "short_budget_notional": max(_safe_float(getattr(effective_args, "maker_max_short_notional", 300.0)) - current_short_notional, 0.0),
+            "planned_buy_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("buy_orders", []))),
+            "planned_short_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("sell_orders", []))),
+            "max_position_notional": getattr(effective_args, "maker_max_long_notional", 300.0),
+            "max_short_position_notional": getattr(effective_args, "maker_max_short_notional", 300.0),
+        }
+        target_base_qty = 0.0
+        bootstrap_qty = 0.0
     elif _is_competition_inventory_grid_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("competition inventory grid 策略要求账户处于单向持仓模式")
@@ -10024,6 +10175,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
+        "maker_volatility_inventory": maker_volatility_inventory,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
         "adverse_inventory_reduce": adverse_inventory_reduce,
@@ -10584,13 +10736,37 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--symbol", type=str, default="NIGHTUSDT")
     parser.add_argument("--strategy-profile", type=str, default=AUTO_REGIME_STABLE_PROFILE)
-    parser.add_argument("--strategy-mode", type=str, default="one_way_long", choices=("one_way_long", "one_way_short", "hedge_neutral", "synthetic_neutral", "inventory_target_neutral", "competition_inventory_grid"))
+    parser.add_argument(
+        "--strategy-mode",
+        type=str,
+        default="one_way_long",
+        choices=(
+            "one_way_long",
+            "one_way_short",
+            "hedge_neutral",
+            "synthetic_neutral",
+            "inventory_target_neutral",
+            "competition_inventory_grid",
+            "maker_volatility_inventory_v1",
+        ),
+    )
     parser.add_argument("--step-price", type=float, default=0.00002)
     parser.add_argument("--buy-levels", type=int, default=8)
     parser.add_argument("--sell-levels", type=int, default=8)
     parser.add_argument("--per-order-notional", type=float, default=12.6)
     parser.add_argument("--startup-entry-multiplier", type=float, default=1.0)
     parser.add_argument("--base-position-notional", type=float, default=75.6)
+    parser.add_argument("--maker-base-spread-bps", type=float, default=4.0)
+    parser.add_argument("--maker-wide-spread-bps", type=float, default=12.0)
+    parser.add_argument("--maker-order-notional", type=float, default=30.0)
+    parser.add_argument("--maker-max-long-notional", type=float, default=300.0)
+    parser.add_argument("--maker-max-short-notional", type=float, default=300.0)
+    parser.add_argument("--maker-inventory-soft-ratio", type=float, default=0.7)
+    parser.add_argument("--maker-volatility-window", type=str, default="1m")
+    parser.add_argument("--maker-volatility-wide-threshold", type=float, default=0.006)
+    parser.add_argument("--maker-extreme-volatility-threshold", type=float, default=0.012)
+    parser.add_argument("--maker-directional-move-threshold", type=float, default=0.004)
+    parser.add_argument("--maker-cooldown-seconds", type=float, default=30.0)
     parser.add_argument("--sticky-entry-levels", type=int, default=None)
     parser.add_argument("--synthetic-residual-long-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-residual-short-flat-notional", type=float, default=None)
