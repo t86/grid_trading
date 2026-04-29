@@ -237,6 +237,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("function fmtFeeMoney(value)", page)
         self.assertIn("fmtFeeMoney(item.fees)", page)
         self.assertIn("fmtFeeMoney(summary.fees || 0)", page)
+        self.assertIn("const fee = Math.abs(Number(value));", page)
+        self.assertNotIn("const feeCost = -Number(value);", page)
         self.assertNotIn("fmtMoney(-item.fees)", page)
 
     @patch("grid_optimizer.web._build_running_status")

@@ -23143,8 +23143,8 @@ RUNNING_STATUS_PAGE = """<!doctype html>
     }
     function fmtFeeMoney(value) {
       if (value === null || value === undefined || Number.isNaN(Number(value))) return "--";
-      const feeCost = -Number(value);
-      return fmtMoney(feeCost, feeDigits(feeCost));
+      const fee = Math.abs(Number(value));
+      return fmtNum(fee, feeDigits(fee));
     }
     function fmtTs(value) {
       if (!value) return "--";
