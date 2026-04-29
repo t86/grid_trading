@@ -281,6 +281,47 @@ def _competition_neutral_ping_pong_preset(
 
 
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
+    "maker_volatility_inventory_v1": {
+        "label": "合约波动率库存做市 v1",
+        "description": "通用 futures maker 策略。按名义金额双边挂盘口，急速单边时加宽、暂停风险方向或进入 reduce-only/cooldown。",
+        "startable": True,
+        "kind": "maker",
+        "config": {
+            "strategy_mode": "maker_volatility_inventory_v1",
+            "step_price": 0.0001,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "per_order_notional": 30.0,
+            "base_position_notional": 0.0,
+            "maker_base_spread_bps": 4.0,
+            "maker_wide_spread_bps": 12.0,
+            "maker_order_notional": 30.0,
+            "maker_max_long_notional": 300.0,
+            "maker_max_short_notional": 300.0,
+            "maker_inventory_soft_ratio": 0.7,
+            "maker_volatility_window": "1m",
+            "maker_volatility_wide_threshold": 0.006,
+            "maker_extreme_volatility_threshold": 0.012,
+            "maker_directional_move_threshold": 0.004,
+            "maker_cooldown_seconds": 30.0,
+            "flat_start_enabled": False,
+            "warm_start_enabled": True,
+            "autotune_symbol_enabled": True,
+            "autotune_min_order_notional_only": True,
+            "adaptive_step_enabled": False,
+            "adverse_reduce_enabled": False,
+            "hard_loss_forced_reduce_enabled": False,
+            "exposure_escalation_enabled": False,
+            "volume_trigger_enabled": False,
+            "volume_trigger_stop_close_all_positions": False,
+            "volatility_trigger_enabled": False,
+            "volatility_trigger_stop_close_all_positions": False,
+            "sleep_seconds": 3.0,
+            "maker_retries": 2,
+            "max_new_orders": 4,
+            "max_total_notional": 700.0,
+        },
+    },
     "volume_long_v4": {
         "label": "量优先做多 v4",
         "description": "当前实盘主策略。偏多滚动微网格，保留成交量，带分钟熔断和库存分层。",
@@ -3267,6 +3308,17 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "max_plan_age_seconds": 30,
     "max_mid_drift_steps": 4.0,
     "maker_retries": 2,
+    "maker_base_spread_bps": 4.0,
+    "maker_wide_spread_bps": 12.0,
+    "maker_order_notional": 30.0,
+    "maker_max_long_notional": 300.0,
+    "maker_max_short_notional": 300.0,
+    "maker_inventory_soft_ratio": 0.7,
+    "maker_volatility_window": "1m",
+    "maker_volatility_wide_threshold": 0.006,
+    "maker_extreme_volatility_threshold": 0.012,
+    "maker_directional_move_threshold": 0.004,
+    "maker_cooldown_seconds": 30.0,
     "max_new_orders": 20,
     "max_total_notional": 1000.0,
     "run_start_time": None,
@@ -6900,6 +6952,11 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     if minimum_working_notional > 0:
         tuned["per_order_notional"] = max(_safe_float(tuned.get("per_order_notional"), "per_order_notional"), minimum_working_notional)
+        if str(tuned.get("strategy_mode", "")).strip() == "maker_volatility_inventory_v1":
+            tuned["maker_order_notional"] = max(
+                _safe_float(tuned.get("maker_order_notional"), "maker_order_notional"),
+                minimum_working_notional,
+            )
         if full_autotune_enabled:
             base_position_notional = _safe_float(tuned.get("base_position_notional"), "base_position_notional")
             if base_position_notional > 0:
@@ -7426,6 +7483,16 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "first_order_multiplier",
         "startup_entry_multiplier",
         "base_position_notional",
+        "maker_base_spread_bps",
+        "maker_wide_spread_bps",
+        "maker_order_notional",
+        "maker_max_long_notional",
+        "maker_max_short_notional",
+        "maker_inventory_soft_ratio",
+        "maker_volatility_wide_threshold",
+        "maker_extreme_volatility_threshold",
+        "maker_directional_move_threshold",
+        "maker_cooldown_seconds",
         "synthetic_residual_long_flat_notional",
         "synthetic_residual_short_flat_notional",
         "threshold_position_notional",
@@ -7598,6 +7665,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "strategy_profile",
         "strategy_mode",
         "symbol",
+        "maker_volatility_window",
         "margin_type",
         "state_path",
         "plan_json",
@@ -7933,6 +8001,15 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         ]
         if target is not None and pauses and target >= min(pauses):
             errors.append("hard_loss_forced_reduce_target_notional 必须低于两侧软阈值，确保能减到软阈值以下")
+    elif strategy_mode == "maker_volatility_inventory_v1":
+        require_positive("maker_order_notional")
+        require_positive("maker_max_long_notional")
+        require_positive("maker_max_short_notional")
+        require_positive("maker_inventory_soft_ratio")
+        require_positive("maker_extreme_volatility_threshold")
+        soft_ratio = number("maker_inventory_soft_ratio")
+        if soft_ratio is not None and soft_ratio > 1:
+            errors.append("maker_inventory_soft_ratio 必须 <= 1")
     else:
         require_positive("threshold_position_notional", "软阈值 threshold_position_notional")
         require_hard_loss()
@@ -8014,6 +8091,28 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("startup_entry_multiplier", 1.0)),
         "--base-position-notional",
         str(config["base_position_notional"]),
+        "--maker-base-spread-bps",
+        str(config.get("maker_base_spread_bps", 4.0)),
+        "--maker-wide-spread-bps",
+        str(config.get("maker_wide_spread_bps", 12.0)),
+        "--maker-order-notional",
+        str(config.get("maker_order_notional", 30.0)),
+        "--maker-max-long-notional",
+        str(config.get("maker_max_long_notional", 300.0)),
+        "--maker-max-short-notional",
+        str(config.get("maker_max_short_notional", 300.0)),
+        "--maker-inventory-soft-ratio",
+        str(config.get("maker_inventory_soft_ratio", 0.7)),
+        "--maker-volatility-window",
+        str(config.get("maker_volatility_window", "1m")),
+        "--maker-volatility-wide-threshold",
+        str(config.get("maker_volatility_wide_threshold", 0.006)),
+        "--maker-extreme-volatility-threshold",
+        str(config.get("maker_extreme_volatility_threshold", 0.012)),
+        "--maker-directional-move-threshold",
+        str(config.get("maker_directional_move_threshold", 0.004)),
+        "--maker-cooldown-seconds",
+        str(config.get("maker_cooldown_seconds", 30.0)),
         "--margin-type",
         str(config.get("margin_type", "KEEP")),
         "--leverage",

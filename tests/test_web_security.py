@@ -2068,6 +2068,116 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--fixed-center-enabled", command)
         self.assertIn("--reset-state", command)
 
+    def test_normalize_runner_control_payload_keeps_maker_inventory_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "strategy_profile": "maker_volatility_inventory_v1",
+                "strategy_mode": "maker_volatility_inventory_v1",
+                "symbol": "BARDUSDT",
+                "maker_base_spread_bps": "5",
+                "maker_wide_spread_bps": "15",
+                "maker_order_notional": "35",
+                "maker_max_long_notional": "350",
+                "maker_max_short_notional": "330",
+                "maker_inventory_soft_ratio": "0.65",
+                "maker_volatility_window": "3m",
+                "maker_volatility_wide_threshold": "0.007",
+                "maker_extreme_volatility_threshold": "0.014",
+                "maker_directional_move_threshold": "0.005",
+                "maker_cooldown_seconds": "45",
+            }
+        )
+
+        self.assertEqual(payload["strategy_mode"], "maker_volatility_inventory_v1")
+        self.assertEqual(payload["maker_base_spread_bps"], 5.0)
+        self.assertEqual(payload["maker_wide_spread_bps"], 15.0)
+        self.assertEqual(payload["maker_order_notional"], 35.0)
+        self.assertEqual(payload["maker_max_long_notional"], 350.0)
+        self.assertEqual(payload["maker_max_short_notional"], 330.0)
+        self.assertEqual(payload["maker_inventory_soft_ratio"], 0.65)
+        self.assertEqual(payload["maker_volatility_window"], "3m")
+        self.assertEqual(payload["maker_volatility_wide_threshold"], 0.007)
+        self.assertEqual(payload["maker_extreme_volatility_threshold"], 0.014)
+        self.assertEqual(payload["maker_directional_move_threshold"], 0.005)
+        self.assertEqual(payload["maker_cooldown_seconds"], 45.0)
+
+    def test_validate_runner_required_risk_guards_allows_maker_inventory_limits(self) -> None:
+        _validate_runner_required_risk_guards(
+            {
+                "symbol": "BARDUSDT",
+                "strategy_mode": "maker_volatility_inventory_v1",
+                "maker_order_notional": 30.0,
+                "maker_max_long_notional": 300.0,
+                "maker_max_short_notional": 300.0,
+                "maker_inventory_soft_ratio": 0.7,
+                "maker_extreme_volatility_threshold": 0.012,
+            }
+        )
+
+    def test_build_runner_command_includes_maker_inventory_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BARDUSDT",
+                "strategy_profile": "maker_volatility_inventory_v1",
+                "strategy_mode": "maker_volatility_inventory_v1",
+                "step_price": 0.0002,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 30.0,
+                "base_position_notional": 0.0,
+                "maker_base_spread_bps": 5.0,
+                "maker_wide_spread_bps": 15.0,
+                "maker_order_notional": 35.0,
+                "maker_max_long_notional": 350.0,
+                "maker_max_short_notional": 330.0,
+                "maker_inventory_soft_ratio": 0.65,
+                "maker_volatility_window": "3m",
+                "maker_volatility_wide_threshold": 0.007,
+                "maker_extreme_volatility_threshold": 0.014,
+                "maker_directional_move_threshold": 0.005,
+                "maker_cooldown_seconds": 45.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 4,
+                "max_total_notional": 700.0,
+                "sleep_seconds": 3,
+                "state_path": "output/bardusdt_loop_state.json",
+                "plan_json": "output/bardusdt_loop_latest_plan.json",
+                "submit_report_json": "output/bardusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/bardusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+
+        self.assertIn("--maker-base-spread-bps", command)
+        self.assertIn("5.0", command)
+        self.assertIn("--maker-wide-spread-bps", command)
+        self.assertIn("--maker-order-notional", command)
+        self.assertIn("35.0", command)
+        self.assertIn("--maker-max-long-notional", command)
+        self.assertIn("--maker-max-short-notional", command)
+        self.assertIn("--maker-inventory-soft-ratio", command)
+        self.assertIn("--maker-volatility-window", command)
+        self.assertIn("3m", command)
+        self.assertIn("--maker-volatility-wide-threshold", command)
+        self.assertIn("--maker-extreme-volatility-threshold", command)
+        self.assertIn("--maker-directional-move-threshold", command)
+        self.assertIn("--maker-cooldown-seconds", command)
+
+    def test_runner_preset_payload_for_maker_volatility_inventory_v1(self) -> None:
+        payload = _runner_preset_payload("maker_volatility_inventory_v1", {"symbol": "BARDUSDT"})
+
+        self.assertEqual(payload["strategy_profile"], "maker_volatility_inventory_v1")
+        self.assertEqual(payload["strategy_mode"], "maker_volatility_inventory_v1")
+        self.assertEqual(payload["maker_order_notional"], 30.0)
+        self.assertEqual(payload["maker_max_long_notional"], 300.0)
+        self.assertEqual(payload["maker_max_short_notional"], 300.0)
+
     def test_build_runner_command_includes_custom_grid_arguments(self) -> None:
         command = _build_runner_command(
             {
