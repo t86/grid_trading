@@ -13,6 +13,7 @@ from urllib.parse import quote, urlparse
 from .audit import build_audit_paths, income_row_time_ms, trade_row_time_ms
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
+from .data import fetch_spot_latest_price
 from .monitor import (
     RUNNER_CONTROL_PATH,
     _build_session_window,
@@ -27,6 +28,9 @@ from .notifications import alert_source_label
 
 RUNNING_STATUS_PAYLOAD_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 RUNNING_STATUS_PAYLOAD_CACHE_LOCK = threading.Lock()
+STABLE_FEE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
+FEE_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
+FEE_ASSET_PRICE_CACHE_TTL_SECONDS = 60.0
 
 
 def _running_status_cache_seconds(scope: str) -> float:
@@ -176,6 +180,41 @@ def _safe_float_or_none(value: Any) -> float | None:
         return None
 
 
+def _fee_asset_price_usdt(asset: str) -> float:
+    normalized_asset = str(asset or "").upper().strip()
+    if not normalized_asset:
+        return 0.0
+    now = time.time()
+    cached = FEE_ASSET_PRICE_CACHE.get(normalized_asset)
+    if cached is not None and now - cached[0] <= FEE_ASSET_PRICE_CACHE_TTL_SECONDS:
+        return cached[1]
+    try:
+        price = float(fetch_spot_latest_price(f"{normalized_asset}USDT"))
+    except Exception:
+        price = 0.0
+    if price > 0:
+        FEE_ASSET_PRICE_CACHE[normalized_asset] = (now, price)
+    return price
+
+
+def _commission_usdt(trade_summary: dict[str, Any]) -> float:
+    raw_by_asset = trade_summary.get("commission_raw_by_asset")
+    if not isinstance(raw_by_asset, dict):
+        return _safe_float(trade_summary.get("commission"))
+    total = 0.0
+    for asset, raw_amount in raw_by_asset.items():
+        amount = _safe_float(raw_amount)
+        if amount <= 0:
+            continue
+        normalized_asset = str(asset or "").upper().strip()
+        if normalized_asset in STABLE_FEE_ASSETS:
+            total += amount
+            continue
+        price = _fee_asset_price_usdt(normalized_asset)
+        total += amount * price if price > 0 else amount
+    return total
+
+
 def _safe_int_count(value: Any, fallback: int) -> int:
     try:
         return int(value)
@@ -309,7 +348,7 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         if plan_report.get("unrealized_pnl") is not None
         else submit_plan_snapshot.get("unrealized_pnl")
     )
-    total_fees = _safe_float(trade_summary.get("commission"))
+    total_fees = _commission_usdt(trade_summary)
     total_pnl = (
         _safe_float(trade_summary.get("realized_pnl"))
         + unrealized_pnl
@@ -319,7 +358,7 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
     recent_hour_pnl = (
         _safe_float(recent_trade_summary.get("realized_pnl"))
         + _safe_float(recent_income_summary.get("funding_fee"))
-        - _safe_float(recent_trade_summary.get("commission"))
+        - _commission_usdt(recent_trade_summary)
     )
 
     open_order_count = _deduped_runtime_order_count(plan_report, submit_report)

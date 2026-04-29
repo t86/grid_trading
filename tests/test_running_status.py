@@ -10,6 +10,25 @@ from unittest.mock import patch
 
 
 class RunningStatusTests(unittest.TestCase):
+    @patch("grid_optimizer.running_status.fetch_spot_latest_price")
+    def test_commission_usdt_converts_bnb_fee_assets(self, mock_price) -> None:
+        from grid_optimizer.running_status import _commission_usdt
+
+        mock_price.return_value = 600.0
+
+        value = _commission_usdt(
+            {
+                "commission": 9.0,
+                "commission_raw_by_asset": {
+                    "USDT": 1.0,
+                    "BNB": 0.25,
+                },
+            }
+        )
+
+        self.assertAlmostEqual(value, 151.0, places=8)
+        mock_price.assert_called_once_with("BNBUSDT")
+
     def _build_local_payload(
         self,
         control_configs: list[dict[str, str]],
