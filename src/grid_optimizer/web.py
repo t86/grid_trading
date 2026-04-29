@@ -151,6 +151,8 @@ RANKING_CACHE: dict[str, dict[str, Any]] = {}
 RANKING_CACHE_LOCK = threading.Lock()
 COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS = 600.0
 COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS = 60.0
+COMPETITION_BOARD_API_RESPONSE_CACHE: dict[str, tuple[float, bytes]] = {}
+COMPETITION_BOARD_API_RESPONSE_CACHE_LOCK = threading.Lock()
 BASIS_CACHE: dict[str, dict[str, Any]] = {}
 BASIS_CACHE_LOCK = threading.Lock()
 DETAIL_CACHE: dict[str, dict[str, Any]] = {}
@@ -3407,6 +3409,44 @@ def _competition_board_auto_refresh_interval_seconds() -> float:
     if value <= 0:
         return COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS
     return max(COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS, value)
+
+
+def _competition_board_api_cache_seconds() -> float:
+    raw = os.environ.get("GRID_COMPETITION_BOARD_API_CACHE_SECONDS", "30").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 30.0
+    return max(0.0, value)
+
+
+def _competition_board_refresh_bypass_cache_enabled() -> bool:
+    return os.environ.get("GRID_COMPETITION_BOARD_REFRESH_BYPASS_CACHE", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+
+
+def _build_competition_board_api_body(*, refresh: bool) -> bytes:
+    ttl = _competition_board_api_cache_seconds()
+    now = time.monotonic()
+    cache_key = "competition_board"
+    with COMPETITION_BOARD_API_RESPONSE_CACHE_LOCK:
+        cached = COMPETITION_BOARD_API_RESPONSE_CACHE.get(cache_key)
+        if (
+            ttl > 0
+            and cached is not None
+            and now - cached[0] <= ttl
+            and (not refresh or not _competition_board_refresh_bypass_cache_enabled())
+        ):
+            return cached[1]
+
+        snapshot = build_competition_board_snapshot(refresh=refresh)
+        body = json.dumps({"ok": True, "snapshot": snapshot}, ensure_ascii=False).encode("utf-8")
+        if ttl > 0:
+            COMPETITION_BOARD_API_RESPONSE_CACHE[cache_key] = (time.monotonic(), body)
+        return body
 
 
 def _load_web_auth_credentials() -> tuple[str, str] | None:
@@ -29747,11 +29787,14 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/competition_board":
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"
             try:
-                snapshot = build_competition_board_snapshot(refresh=refresh)
+                body = _build_competition_board_api_body(refresh=refresh)
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
-            self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("application/json; charset=utf-8", len(body))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/api/spot_runner/status":
             symbol = str(query.get("symbol", [SPOT_RUNNER_DEFAULT_CONFIG["symbol"]])[0]).upper().strip()
