@@ -245,6 +245,21 @@ class WebSecurityTests(unittest.TestCase):
         self.assertNotIn("const feeCost = -Number(value);", page)
         self.assertNotIn("fmtMoney(-item.fees)", page)
 
+    def test_running_status_spot_symbols_reads_spot_loop_control_files(self) -> None:
+        from grid_optimizer.web import _running_status_spot_symbols
+
+        with TemporaryDirectory() as temp_dir:
+            output_dir = Path(temp_dir) / "output"
+            output_dir.mkdir()
+            (output_dir / "tonusdt_spot_loop_runner_control.json").write_text(
+                json.dumps({"symbol": "TONUSDT"}),
+                encoding="utf-8",
+            )
+            with patch("grid_optimizer.web.Path", side_effect=lambda value=".": output_dir if value == "output" else Path(value)):
+                symbols = _running_status_spot_symbols()
+
+        self.assertEqual(symbols, ["TONUSDT"])
+
     @patch("grid_optimizer.web._build_running_status")
     def test_run_running_status_overview_query_uses_legacy_cross_payload(self, mock_build) -> None:
         mock_build.return_value = {"ok": True, "scope": "cross", "servers": []}

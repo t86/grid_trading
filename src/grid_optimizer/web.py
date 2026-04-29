@@ -29112,12 +29112,13 @@ def _running_status_symbols() -> list[str]:
 def _running_status_spot_symbols() -> list[str]:
     symbols: list[str] = []
     seen: set[str] = set()
-    for path in Path("output").glob("*_spot_runner_control.json"):
-        payload = _read_json_dict(path)
-        symbol = str((payload or {}).get("symbol") or "").upper().strip()
-        if symbol and symbol not in seen:
-            seen.add(symbol)
-            symbols.append(symbol)
+    for pattern in ("*_spot_loop_runner_control.json", "*_spot_runner_control.json"):
+        for path in Path("output").glob(pattern):
+            payload = _read_json_dict(path)
+            symbol = str((payload or {}).get("symbol") or "").upper().strip()
+            if symbol and symbol not in seen:
+                seen.add(symbol)
+                symbols.append(symbol)
     return symbols
 
 
