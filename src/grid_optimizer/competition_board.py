@@ -2875,6 +2875,13 @@ def _save_history_index(boards: dict[str, list[dict[str, Any]]]) -> None:
 def _load_history_index() -> dict[str, list[dict[str, Any]]]:
     payload = _read_json_file(HISTORY_INDEX_PATH, {})
     indexed = _normalize_history_index_payload(payload.get("boards", {}) if isinstance(payload, dict) else {})
+    if indexed and os.environ.get("GRID_COMPETITION_BOARD_HISTORY_RESCAN", "").strip().lower() not in {
+        "1",
+        "true",
+        "yes",
+    }:
+        return indexed
+
     scanned = _scan_history_index_from_disk()
     merged: dict[str, list[dict[str, Any]]] = {}
     for board_key in set(indexed) | set(scanned):
