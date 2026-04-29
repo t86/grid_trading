@@ -641,6 +641,91 @@ def resolve_adaptive_step_price(
     return report
 
 
+def resolve_volatility_entry_pause(
+    *,
+    adaptive_step: dict[str, Any],
+    enabled: bool,
+    window_30s_abs_return_ratio: float | None,
+    window_30s_amplitude_ratio: float | None,
+    window_1m_abs_return_ratio: float | None,
+    window_1m_amplitude_ratio: float | None,
+    window_3m_abs_return_ratio: float | None,
+    window_3m_amplitude_ratio: float | None,
+    window_5m_abs_return_ratio: float | None,
+    window_5m_amplitude_ratio: float | None,
+) -> dict[str, Any]:
+    metrics = dict(adaptive_step.get("metrics") or {}) if isinstance(adaptive_step, dict) else {}
+    report: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "active": False,
+        "dominant_window": None,
+        "dominant_metric": None,
+        "dominant_value": 0.0,
+        "dominant_threshold": 0.0,
+        "matched_reasons": [],
+        "reason": None,
+        "metrics": metrics,
+    }
+    if not enabled:
+        return report
+
+    thresholds = {
+        "window_30s": {
+            "abs_return_ratio": _safe_float(window_30s_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_30s_amplitude_ratio),
+        },
+        "window_1m": {
+            "abs_return_ratio": _safe_float(window_1m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_1m_amplitude_ratio),
+        },
+        "window_3m": {
+            "abs_return_ratio": _safe_float(window_3m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_3m_amplitude_ratio),
+        },
+        "window_5m": {
+            "abs_return_ratio": _safe_float(window_5m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_5m_amplitude_ratio),
+        },
+    }
+    candidates: list[tuple[float, str, str, float, float]] = []
+    for window_key, window_stats in metrics.items():
+        if not isinstance(window_stats, dict):
+            continue
+        window_thresholds = thresholds.get(window_key) or {}
+        values = {
+            "abs_return_ratio": abs(_safe_float(window_stats.get("return_ratio"))),
+            "amplitude_ratio": _safe_float(window_stats.get("amplitude_ratio")),
+        }
+        for metric, value in values.items():
+            threshold = _safe_float(window_thresholds.get(metric))
+            if threshold <= 0 or value < threshold:
+                continue
+            candidates.append((value / threshold, window_key, metric, value, threshold))
+    if not candidates:
+        return report
+
+    _, dominant_window, dominant_metric, dominant_value, dominant_threshold = max(
+        candidates,
+        key=lambda item: item[0],
+    )
+    matched_reasons = [
+        f"{window_key} {metric}={value * 100:.2f}% >= {threshold * 100:.2f}%"
+        for _, window_key, metric, value, threshold in sorted(candidates, key=lambda item: item[0], reverse=True)
+    ]
+    report.update(
+        {
+            "active": True,
+            "dominant_window": dominant_window,
+            "dominant_metric": dominant_metric,
+            "dominant_value": dominant_value,
+            "dominant_threshold": dominant_threshold,
+            "matched_reasons": matched_reasons,
+            "reason": matched_reasons[0] if matched_reasons else None,
+        }
+    )
+    return report
+
+
 def _resolve_fixed_center_roll(
     *,
     state: dict[str, Any],
@@ -3272,6 +3357,15 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         adaptive_step_max_scale=getattr(args, "adaptive_step_max_scale", 1.0),
         adaptive_step_min_per_order_scale=getattr(args, "adaptive_step_min_per_order_scale", 1.0),
         adaptive_step_min_position_limit_scale=getattr(args, "adaptive_step_min_position_limit_scale", 1.0),
+        volatility_entry_pause_enabled=getattr(args, "volatility_entry_pause_enabled", False),
+        volatility_entry_pause_30s_abs_return_ratio=getattr(args, "volatility_entry_pause_30s_abs_return_ratio", 0.0),
+        volatility_entry_pause_30s_amplitude_ratio=getattr(args, "volatility_entry_pause_30s_amplitude_ratio", 0.0),
+        volatility_entry_pause_1m_abs_return_ratio=getattr(args, "volatility_entry_pause_1m_abs_return_ratio", 0.0),
+        volatility_entry_pause_1m_amplitude_ratio=getattr(args, "volatility_entry_pause_1m_amplitude_ratio", 0.0),
+        volatility_entry_pause_3m_abs_return_ratio=getattr(args, "volatility_entry_pause_3m_abs_return_ratio", 0.0),
+        volatility_entry_pause_3m_amplitude_ratio=getattr(args, "volatility_entry_pause_3m_amplitude_ratio", 0.0),
+        volatility_entry_pause_5m_abs_return_ratio=getattr(args, "volatility_entry_pause_5m_abs_return_ratio", 0.0),
+        volatility_entry_pause_5m_amplitude_ratio=getattr(args, "volatility_entry_pause_5m_amplitude_ratio", 0.0),
         synthetic_trend_follow_enabled=getattr(args, "synthetic_trend_follow_enabled", False),
         synthetic_trend_follow_1m_abs_return_ratio=getattr(args, "synthetic_trend_follow_1m_abs_return_ratio", 0.0),
         synthetic_trend_follow_1m_amplitude_ratio=getattr(args, "synthetic_trend_follow_1m_amplitude_ratio", 0.0),
@@ -7933,6 +8027,19 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if adaptive_step.get("effective_max_total_notional") is not None:
             effective_args.max_total_notional = float(adaptive_step["effective_max_total_notional"])
 
+    volatility_entry_pause = resolve_volatility_entry_pause(
+        adaptive_step=adaptive_step,
+        enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
+        window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
+        window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
+        window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+        window_1m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+        window_3m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+        window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+        window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
+        window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
+    )
+
     effective_args = argparse.Namespace(**vars(effective_args))
     effective_args.take_profit_min_profit_ratio = _resolve_effective_take_profit_min_profit_ratio(
         strategy_mode=requested_strategy_mode,
@@ -10037,6 +10144,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
 
+    if volatility_entry_pause.get("active"):
+        entry_pause_reason = volatility_entry_pause.get("reason") or "active"
+        controls["buy_paused"] = True
+        controls["short_paused"] = True
+        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
+        controls["pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+        controls["short_pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+
     if bool(controls.get("buy_paused")):
         plan["bootstrap_orders"] = []
         plan["buy_orders"] = [
@@ -10175,6 +10291,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
+        "volatility_entry_pause": volatility_entry_pause,
         "maker_volatility_inventory": maker_volatility_inventory,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
@@ -10856,6 +10973,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--volatility-entry-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--volatility-entry-pause-30s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-30s-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-1m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-1m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-3m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--synthetic-trend-follow-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--synthetic-trend-follow-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--synthetic-trend-follow-1m-amplitude-ratio", type=float, default=0.0)
@@ -11021,6 +11147,14 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             "  adaptive_risk: "
             f"per_order_scale={_safe_float(adaptive_step.get('per_order_scale')):.2f} "
             f"position_limit_scale={_safe_float(adaptive_step.get('position_limit_scale')):.2f}"
+        )
+    volatility_entry_pause = (
+        summary.get("volatility_entry_pause") if isinstance(summary.get("volatility_entry_pause"), dict) else {}
+    )
+    if volatility_entry_pause.get("active"):
+        print(
+            "  volatility_entry_pause: "
+            f"active=yes reason={volatility_entry_pause.get('reason')}"
         )
     if summary.get("max_position_notional"):
         print(
@@ -11348,6 +11482,20 @@ def main() -> None:
         )
     ):
         raise SystemExit("adaptive step requires at least one positive shock/trend trigger threshold")
+    volatility_entry_pause_thresholds = (
+        args.volatility_entry_pause_30s_abs_return_ratio,
+        args.volatility_entry_pause_30s_amplitude_ratio,
+        args.volatility_entry_pause_1m_abs_return_ratio,
+        args.volatility_entry_pause_1m_amplitude_ratio,
+        args.volatility_entry_pause_3m_abs_return_ratio,
+        args.volatility_entry_pause_3m_amplitude_ratio,
+        args.volatility_entry_pause_5m_abs_return_ratio,
+        args.volatility_entry_pause_5m_amplitude_ratio,
+    )
+    if any(threshold < 0 for threshold in volatility_entry_pause_thresholds):
+        raise SystemExit("--volatility-entry-pause thresholds must be >= 0")
+    if args.volatility_entry_pause_enabled and not any(threshold > 0 for threshold in volatility_entry_pause_thresholds):
+        raise SystemExit("volatility entry pause requires at least one positive trigger threshold")
     if args.synthetic_trend_follow_1m_abs_return_ratio < 0 or args.synthetic_trend_follow_1m_amplitude_ratio < 0:
         raise SystemExit("--synthetic-trend-follow 1m thresholds must be >= 0")
     if args.synthetic_trend_follow_3m_abs_return_ratio < 0 or args.synthetic_trend_follow_3m_amplitude_ratio < 0:
@@ -11665,6 +11813,16 @@ def main() -> None:
                 "mid_price": _safe_float(plan_report.get("mid_price")),
                 "center_price": _safe_float(plan_report.get("center_price")),
                 "adaptive_step": dict(plan_report.get("adaptive_step") or {}),
+                "volatility_entry_pause": dict(plan_report.get("volatility_entry_pause") or {}),
+                "volatility_entry_pause_enabled": bool(
+                    (plan_report.get("volatility_entry_pause") or {}).get("enabled")
+                ),
+                "volatility_entry_pause_active": bool(
+                    (plan_report.get("volatility_entry_pause") or {}).get("active")
+                ),
+                "volatility_entry_pause_reason": (
+                    (plan_report.get("volatility_entry_pause") or {}).get("reason")
+                ),
                 "adaptive_step_enabled": bool((plan_report.get("adaptive_step") or {}).get("enabled")),
                 "adaptive_step_active": bool((plan_report.get("adaptive_step") or {}).get("active")),
                 "adaptive_step_controls_active": bool(

@@ -3243,6 +3243,15 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adaptive_step_max_scale": 1.0,
     "adaptive_step_min_per_order_scale": 1.0,
     "adaptive_step_min_position_limit_scale": 1.0,
+    "volatility_entry_pause_enabled": False,
+    "volatility_entry_pause_30s_abs_return_ratio": 0.0,
+    "volatility_entry_pause_30s_amplitude_ratio": 0.0,
+    "volatility_entry_pause_1m_abs_return_ratio": 0.0,
+    "volatility_entry_pause_1m_amplitude_ratio": 0.0,
+    "volatility_entry_pause_3m_abs_return_ratio": 0.0,
+    "volatility_entry_pause_3m_amplitude_ratio": 0.0,
+    "volatility_entry_pause_5m_abs_return_ratio": 0.0,
+    "volatility_entry_pause_5m_amplitude_ratio": 0.0,
     "synthetic_trend_follow_enabled": False,
     "synthetic_trend_follow_1m_abs_return_ratio": 0.0,
     "synthetic_trend_follow_1m_amplitude_ratio": 0.0,
@@ -7600,6 +7609,14 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "volatility_entry_pause_30s_abs_return_ratio",
+        "volatility_entry_pause_30s_amplitude_ratio",
+        "volatility_entry_pause_1m_abs_return_ratio",
+        "volatility_entry_pause_1m_amplitude_ratio",
+        "volatility_entry_pause_3m_abs_return_ratio",
+        "volatility_entry_pause_3m_amplitude_ratio",
+        "volatility_entry_pause_5m_abs_return_ratio",
+        "volatility_entry_pause_5m_amplitude_ratio",
         "static_buy_offset_steps",
         "static_sell_offset_steps",
         "synthetic_trend_follow_1m_abs_return_ratio",
@@ -7705,6 +7722,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_strong_short_pause_enabled",
         "market_bias_regime_switch_enabled",
         "adaptive_step_enabled",
+        "volatility_entry_pause_enabled",
         "synthetic_trend_follow_enabled",
         "synthetic_flow_sleeve_enabled",
         "adverse_reduce_enabled",
@@ -7766,6 +7784,14 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "volatility_entry_pause_30s_abs_return_ratio",
+        "volatility_entry_pause_30s_amplitude_ratio",
+        "volatility_entry_pause_1m_abs_return_ratio",
+        "volatility_entry_pause_1m_amplitude_ratio",
+        "volatility_entry_pause_3m_abs_return_ratio",
+        "volatility_entry_pause_3m_amplitude_ratio",
+        "volatility_entry_pause_5m_abs_return_ratio",
+        "volatility_entry_pause_5m_amplitude_ratio",
         "static_buy_offset_steps",
         "static_sell_offset_steps",
         "synthetic_trend_follow_1m_abs_return_ratio",
@@ -8420,6 +8446,51 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
     if config.get("adaptive_step_min_position_limit_scale") is not None:
         command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
     command.append(
+        "--volatility-entry-pause-enabled"
+        if config.get("volatility_entry_pause_enabled", False)
+        else "--no-volatility-entry-pause-enabled"
+    )
+    if config.get("volatility_entry_pause_30s_abs_return_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-30s-abs-return-ratio",
+            str(config["volatility_entry_pause_30s_abs_return_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_30s_amplitude_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-30s-amplitude-ratio",
+            str(config["volatility_entry_pause_30s_amplitude_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_1m_abs_return_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-1m-abs-return-ratio",
+            str(config["volatility_entry_pause_1m_abs_return_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_1m_amplitude_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-1m-amplitude-ratio",
+            str(config["volatility_entry_pause_1m_amplitude_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_3m_abs_return_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-3m-abs-return-ratio",
+            str(config["volatility_entry_pause_3m_abs_return_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_3m_amplitude_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-3m-amplitude-ratio",
+            str(config["volatility_entry_pause_3m_amplitude_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_5m_abs_return_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-5m-abs-return-ratio",
+            str(config["volatility_entry_pause_5m_abs_return_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_5m_amplitude_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-5m-amplitude-ratio",
+            str(config["volatility_entry_pause_5m_amplitude_ratio"]),
+        ])
+    command.append(
         "--synthetic-trend-follow-enabled"
         if config.get("synthetic_trend_follow_enabled", False)
         else "--no-synthetic-trend-follow-enabled"
@@ -8746,6 +8817,15 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "adaptive_step_max_scale",
             "adaptive_step_min_per_order_scale",
             "adaptive_step_min_position_limit_scale",
+            "volatility_entry_pause_enabled",
+            "volatility_entry_pause_30s_abs_return_ratio",
+            "volatility_entry_pause_30s_amplitude_ratio",
+            "volatility_entry_pause_1m_abs_return_ratio",
+            "volatility_entry_pause_1m_amplitude_ratio",
+            "volatility_entry_pause_3m_abs_return_ratio",
+            "volatility_entry_pause_3m_amplitude_ratio",
+            "volatility_entry_pause_5m_abs_return_ratio",
+            "volatility_entry_pause_5m_amplitude_ratio",
             "synthetic_trend_follow_enabled",
             "synthetic_trend_follow_1m_abs_return_ratio",
             "synthetic_trend_follow_1m_amplitude_ratio",
@@ -17587,6 +17667,41 @@ MONITOR_PAGE = """<!doctype html>
                 </label>
               </div>
             </section>
+            <section class="runner-form-section" data-runner-section="volatility_entry_pause">
+              <h3>波动暂停开仓</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_volatility_entry_pause_enabled" type="checkbox" />
+                    <span>启用波动暂停开仓</span>
+                  </span>
+                </label>
+                <label>30 秒绝对涨跌阈值
+                  <input id="runner_field_volatility_entry_pause_30s_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>30 秒振幅阈值
+                  <input id="runner_field_volatility_entry_pause_30s_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>1 分钟绝对涨跌阈值
+                  <input id="runner_field_volatility_entry_pause_1m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>1 分钟振幅阈值
+                  <input id="runner_field_volatility_entry_pause_1m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>3 分钟绝对涨跌阈值
+                  <input id="runner_field_volatility_entry_pause_3m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>3 分钟振幅阈值
+                  <input id="runner_field_volatility_entry_pause_3m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>5 分钟绝对涨跌阈值
+                  <input id="runner_field_volatility_entry_pause_5m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>5 分钟振幅阈值
+                  <input id="runner_field_volatility_entry_pause_5m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
+              </div>
+            </section>
             <section class="runner-form-section" data-runner-section="auto_regime">
               <h3>自动切换</h3>
               <div class="runner-form-fields">
@@ -20325,6 +20440,15 @@ MONITOR_PAGE = """<!doctype html>
       { key: "adaptive_step_max_scale", id: "runner_field_adaptive_step_max_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_per_order_scale", id: "runner_field_adaptive_step_min_per_order_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_position_limit_scale", id: "runner_field_adaptive_step_min_position_limit_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_enabled", id: "runner_field_volatility_entry_pause_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_30s_abs_return_ratio", id: "runner_field_volatility_entry_pause_30s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_30s_amplitude_ratio", id: "runner_field_volatility_entry_pause_30s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_1m_abs_return_ratio", id: "runner_field_volatility_entry_pause_1m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_1m_amplitude_ratio", id: "runner_field_volatility_entry_pause_1m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_3m_abs_return_ratio", id: "runner_field_volatility_entry_pause_3m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_3m_amplitude_ratio", id: "runner_field_volatility_entry_pause_3m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_5m_abs_return_ratio", id: "runner_field_volatility_entry_pause_5m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_5m_amplitude_ratio", id: "runner_field_volatility_entry_pause_5m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "auto_regime_enabled", id: "runner_field_auto_regime_enabled", type: "boolean", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_confirm_cycles", id: "runner_field_auto_regime_confirm_cycles", type: "integer", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_stable_15m_max_amplitude_ratio", id: "runner_field_auto_regime_stable_15m_max_amplitude_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
