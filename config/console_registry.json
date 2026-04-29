@@ -20,10 +20,10 @@
     {
       "id": "srv_111",
       "label": "Online Entry",
-      "base_url": "http://43.155.136.111:8787",
+      "base_url": "http://43.155.136.111:8788",
       "location": "Oracle",
       "enabled": true,
-      "capabilities": ["futures_monitor", "competition_board", "strategies"]
+      "capabilities": ["futures_monitor", "competition_board", "strategies", "spot_runner", "spot_strategies"]
     }
   ],
   "accounts": [

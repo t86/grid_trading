@@ -10950,6 +10950,54 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
         snapshot["warnings"].append(f"{type(exc).__name__}: {exc}")
     return snapshot
 
+
+def _fetch_remote_spot_runner_snapshot(*, server_id: str, symbol: str) -> dict[str, Any]:
+    normalized_server_id = str(server_id or "").strip()
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_server_id:
+        raise ValueError("server_id is required")
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    registry = load_console_registry()
+    server = (registry.get("servers_by_id") or {}).get(normalized_server_id)
+    if not isinstance(server, dict):
+        raise ValueError(f"unknown server_id: {normalized_server_id}")
+    if not bool(server.get("enabled", True)):
+        raise ValueError(f"server is disabled: {normalized_server_id}")
+    capabilities = set(str(item) for item in list(server.get("capabilities") or []))
+    if "spot_runner" not in capabilities and "spot_strategies" not in capabilities:
+        raise ValueError(f"server does not expose spot runner: {normalized_server_id}")
+
+    base_url = str(server.get("base_url", "")).strip().rstrip("/")
+    if not base_url:
+        raise ValueError(f"server missing base_url: {normalized_server_id}")
+    url = f"{base_url}/api/spot_runner/status?symbol={quote(normalized_symbol)}"
+    headers = {"Accept": "application/json"}
+    username = os.environ.get(f"GRID_NODE_{normalized_server_id.upper()}_USERNAME")
+    password = os.environ.get(f"GRID_NODE_{normalized_server_id.upper()}_PASSWORD")
+    if username and password:
+        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
+        headers["Authorization"] = f"Basic {token}"
+    request = Request(url, headers=headers)
+    try:
+        with urlopen(request, timeout=_running_status_remote_timeout_seconds()) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        error = payload.get("error", "invalid response") if isinstance(payload, dict) else "invalid response"
+        raise RuntimeError(str(error))
+    snapshot = payload.get("snapshot")
+    if not isinstance(snapshot, dict):
+        raise RuntimeError("remote spot response missing snapshot")
+    return {
+        "ok": True,
+        "server_id": normalized_server_id,
+        "server_label": str(server.get("label") or normalized_server_id),
+        "source_base_url": base_url,
+        "snapshot": snapshot,
+    }
+
 SERVER_HUB_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -25079,14 +25127,25 @@ STRATEGIES_PAGE = """<!doctype html>
       <a href="/spot_strategies">打开现货总览</a>
     </section>
     <div id="spot_cards" class="grid"></div>
+    <section class="subhead">
+      <div>
+        <h2>远端现货策略</h2>
+        <p>跨服务器拉取现货 runner 状态，用于集中查看 111 等入口机的现货刷量信息。</p>
+      </div>
+    </section>
+    <div id="remote_spot_cards" class="grid"></div>
   </div>
 
   <script>
     const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"];
+    const REMOTE_SPOT_SOURCES = [
+      { label: "111", serverId: "srv_111", symbols: ["TONUSDT"] },
+    ];
     const cardsEl = document.getElementById("cards");
     const spotCardsEl = document.getElementById("spot_cards");
+    const remoteSpotCardsEl = document.getElementById("remote_spot_cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");
     const refreshBtn = document.getElementById("refresh_btn");
@@ -25429,6 +25488,22 @@ STRATEGIES_PAGE = """<!doctype html>
     }
 
     function renderSpotCard(snapshot) {
+      if (snapshot.load_error) {
+        return `
+          <section class="card strategy-card">
+            <div class="topline">
+              <div class="title">
+                <h2>${escapeHtml(snapshot.symbol || "--")}</h2>
+                <p>${escapeHtml(snapshot.load_error)}</p>
+              </div>
+              <div class="badges">
+                <span class="badge bad">加载失败</span>
+                <span class="badge warn">${escapeHtml(snapshot.source_label || "远端")}</span>
+              </div>
+            </div>
+          </section>
+        `;
+      }
       const runner = snapshot.runner || {};
       const config = snapshot.config || {};
       const state = snapshot.state || {};
@@ -25457,6 +25532,7 @@ STRATEGIES_PAGE = """<!doctype html>
             <div class="badges">
               <span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span>
               <span class="badge warn">Spot</span>
+              <span class="badge warn">${escapeHtml(snapshot.source_label || "本机")}</span>
               <span class="badge good">step ${escapeHtml(fmtNum(config.step_price || 0, 6))}</span>
             </div>
           </div>
@@ -25546,6 +25622,53 @@ STRATEGIES_PAGE = """<!doctype html>
       return results;
     }
 
+    async function fetchRemoteSpotStrategySnapshots(sources, concurrency = 1) {
+      const tasks = [];
+      for (const source of sources || []) {
+        for (const symbol of source.symbols || []) {
+          tasks.push({ source, symbol });
+        }
+      }
+      const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
+      const results = new Array(tasks.length);
+      let nextIndex = 0;
+
+      async function worker() {
+        while (true) {
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+          if (currentIndex >= tasks.length) {
+            return;
+          }
+          const task = tasks[currentIndex];
+          const serverId = String(task.source.serverId || "");
+          const url = `/api/remote_spot_runner/status?server_id=${encodeURIComponent(serverId)}&symbol=${encodeURIComponent(task.symbol)}`;
+          try {
+            const resp = await fetch(url);
+            const data = await resp.json();
+            if (!resp.ok || !data.ok) {
+              throw new Error(data.error || `HTTP ${resp.status}`);
+            }
+            const snapshot = data.snapshot || data;
+            snapshot.source_label = task.source.label || serverId;
+            snapshot.source_server_id = serverId;
+            snapshot.source_base_url = data.source_base_url || "";
+            results[currentIndex] = snapshot;
+          } catch (err) {
+            results[currentIndex] = {
+              symbol: task.symbol,
+              source_label: task.source.label || serverId,
+              source_server_id: serverId,
+              load_error: String(err),
+            };
+          }
+        }
+      }
+
+      await Promise.all(Array.from({ length: Math.min(normalizedConcurrency, tasks.length) }, () => worker()));
+      return results;
+    }
+
     async function loadStrategies() {
       if (strategiesLoadPromise) {
         return strategiesLoadPromise;
@@ -25562,17 +25685,22 @@ STRATEGIES_PAGE = """<!doctype html>
           }
           const results = await fetchStrategySnapshots(symbols, 1);
           const spotResults = await fetchSpotStrategySnapshots(DEFAULT_SPOT_SYMBOLS, 1);
+          const remoteSpotResults = await fetchRemoteSpotStrategySnapshots(REMOTE_SPOT_SOURCES, 2);
           const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
           const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
           const spotRunningCount = spotResults.filter((item) => Boolean((item.runner || {}).is_running)).length;
           const spotGross = spotResults.reduce((total, item) => total + Number(((item.trade_summary || {}).gross_notional) || 0), 0);
-          summaryEl.textContent = `当前拉取 ${results.length} 个合约币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。现货 ${spotResults.length} 个；运行 ${spotRunningCount} 个；成交额 ${fmtNum(spotGross, 2)}U。`;
+          const remoteSpotRunningCount = remoteSpotResults.filter((item) => Boolean((item.runner || {}).is_running)).length;
+          const remoteSpotGross = remoteSpotResults.reduce((total, item) => total + Number(((item.trade_summary || {}).gross_notional) || 0), 0);
+          summaryEl.textContent = `当前拉取 ${results.length} 个合约币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。现货 ${spotResults.length} 个；运行 ${spotRunningCount} 个；成交额 ${fmtNum(spotGross, 2)}U。远端现货 ${remoteSpotResults.length} 个；运行 ${remoteSpotRunningCount} 个；成交额 ${fmtNum(remoteSpotGross, 2)}U。`;
           cardsEl.innerHTML = results.map(renderCard).join("");
           spotCardsEl.innerHTML = spotResults.map(renderSpotCard).join("");
+          remoteSpotCardsEl.innerHTML = remoteSpotResults.length ? remoteSpotResults.map(renderSpotCard).join("") : '<div class="empty">未配置远端现货策略。</div>';
           metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
         } catch (err) {
           cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
           spotCardsEl.innerHTML = `<div class="empty">现货加载失败：${escapeHtml(err)}</div>`;
+          remoteSpotCardsEl.innerHTML = `<div class="empty">远端现货加载失败：${escapeHtml(err)}</div>`;
           metaEl.textContent = `刷新失败：${err}`;
         }
       })();
@@ -29724,6 +29852,19 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
             return
+        if path == "/api/remote_spot_runner/status":
+            server_id = str(query.get("server_id", [""])[0]).strip()
+            symbol = str(query.get("symbol", [""])[0]).upper().strip()
+            try:
+                payload = _fetch_remote_spot_runner_snapshot(server_id=server_id, symbol=symbol)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
+            return
         if path == "/api/manual_trade/status":
             symbol = str(query.get("symbol", ["BTCUSDT"])[0]).upper().strip() or "BTCUSDT"
             try:
@@ -30018,6 +30159,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/grid_preview"
             or path == "/api/competition_board"
             or path == "/api/spot_runner/status"
+            or path == "/api/remote_spot_runner/status"
             or path == "/api/spot_runner/save"
             or path == "/api/manual_trade/status"
         ):

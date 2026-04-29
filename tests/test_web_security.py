@@ -36,6 +36,7 @@ from grid_optimizer.web import (
     _resolve_runner_start_config,
     _render_running_status_overview_page,
     _render_running_status_page,
+    _fetch_remote_spot_runner_snapshot,
     _run_loop_monitor_query,
     _run_running_status_overview_query,
     _reconcile_runner_volatility_trigger,
@@ -3815,6 +3816,45 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('id="spot_cards"', STRATEGIES_PAGE)
         self.assertIn('const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"]', STRATEGIES_PAGE)
         self.assertIn("/api/spot_runner/status", STRATEGIES_PAGE)
+
+    def test_strategies_page_contains_remote_spot_strategy_sources(self) -> None:
+        self.assertIn("远端现货策略", STRATEGIES_PAGE)
+        self.assertIn('id="remote_spot_cards"', STRATEGIES_PAGE)
+        self.assertIn("REMOTE_SPOT_SOURCES", STRATEGIES_PAGE)
+        self.assertIn('serverId: "srv_111"', STRATEGIES_PAGE)
+        self.assertIn("/api/remote_spot_runner/status", STRATEGIES_PAGE)
+        self.assertIn("fetchRemoteSpotStrategySnapshots", STRATEGIES_PAGE)
+
+    @patch("grid_optimizer.web.urlopen")
+    @patch("grid_optimizer.web.load_console_registry")
+    def test_fetch_remote_spot_runner_snapshot_uses_registry_server(self, mock_registry, mock_urlopen) -> None:
+        mock_registry.return_value = {
+            "servers_by_id": {
+                "srv_111": {
+                    "id": "srv_111",
+                    "label": "111",
+                    "base_url": "http://111.example:8788",
+                    "enabled": True,
+                    "capabilities": ["spot_runner"],
+                }
+            }
+        }
+        response = Mock()
+        response.read.return_value = json.dumps(
+            {"ok": True, "snapshot": {"symbol": "TONUSDT", "runner": {"is_running": True}}},
+        ).encode("utf-8")
+        response.__enter__ = Mock(return_value=response)
+        response.__exit__ = Mock(return_value=False)
+        mock_urlopen.return_value = response
+
+        payload = _fetch_remote_spot_runner_snapshot(server_id="srv_111", symbol="tonusdt")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["server_id"], "srv_111")
+        self.assertEqual(payload["source_base_url"], "http://111.example:8788")
+        self.assertEqual(payload["snapshot"]["symbol"], "TONUSDT")
+        request = mock_urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, "http://111.example:8788/api/spot_runner/status?symbol=TONUSDT")
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:
