@@ -2784,8 +2784,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(all((call.kwargs.get("limit") or 0) > 0 for call in mock_tail.call_args_list))
         mock_read_jsonl.assert_not_called()
 
-    @patch("grid_optimizer.web.fetch_spot_latest_price", side_effect=AssertionError("status page must not fetch prices"))
-    def test_status_commission_usdt_does_not_fetch_non_stable_fee_prices(self, mock_price) -> None:
+    @patch("grid_optimizer.web.fetch_spot_latest_price")
+    def test_status_commission_usdt_converts_non_stable_fee_assets(self, mock_price) -> None:
+        mock_price.return_value = 600.0
+
         value = _status_commission_usdt(
             {
                 "commission": 9.0,
@@ -2796,8 +2798,8 @@ class WebSecurityTests(unittest.TestCase):
             }
         )
 
-        self.assertAlmostEqual(value, 1.25, places=8)
-        mock_price.assert_not_called()
+        self.assertAlmostEqual(value, 151.0, places=8)
+        mock_price.assert_called_once_with("BNBUSDT")
 
     @patch("grid_optimizer.web.resolve_active_competition_board", side_effect=AssertionError("overview must stay fast"))
     def test_fast_running_status_stats_start_does_not_query_competition_board(self, mock_board) -> None:

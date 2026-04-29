@@ -171,6 +171,8 @@ FUNDING_MARGIN_RATIO = 0.5
 GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
 STABLE_SPOT_QUOTES = ("USDT", "USDC", "FDUSD", "BUSD")
+_STATUS_COMMISSION_PRICE_CACHE: dict[str, tuple[float, float]] = {}
+_STATUS_COMMISSION_PRICE_CACHE_TTL_SECONDS = 60.0
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
 HOURLY_EMAIL_REPORT_STATE_PATH = Path("output/hourly_email_report_state.json")
 MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
@@ -28909,16 +28911,38 @@ def _status_float(value: Any) -> float:
         return 0.0
 
 
+def _status_commission_asset_price_usdt(asset: str) -> float:
+    normalized_asset = str(asset or "").upper().strip()
+    if not normalized_asset:
+        return 0.0
+    now = time.time()
+    cached = _STATUS_COMMISSION_PRICE_CACHE.get(normalized_asset)
+    if cached is not None and now - cached[0] <= _STATUS_COMMISSION_PRICE_CACHE_TTL_SECONDS:
+        return cached[1]
+    try:
+        price = float(fetch_spot_latest_price(f"{normalized_asset}USDT"))
+    except Exception:
+        price = 0.0
+    if price > 0:
+        _STATUS_COMMISSION_PRICE_CACHE[normalized_asset] = (now, price)
+    return price
+
+
 def _status_commission_usdt(trade_summary: dict[str, Any]) -> float:
     raw_by_asset = trade_summary.get("commission_raw_by_asset")
     if not isinstance(raw_by_asset, dict):
         return _status_float(trade_summary.get("commission"))
     total = 0.0
-    for _asset, raw_amount in raw_by_asset.items():
+    for asset, raw_amount in raw_by_asset.items():
         amount = _status_float(raw_amount)
         if amount <= 0:
             continue
-        total += amount
+        normalized_asset = str(asset or "").upper().strip()
+        if normalized_asset in STABLE_SPOT_QUOTES:
+            total += amount
+            continue
+        price = _status_commission_asset_price_usdt(normalized_asset)
+        total += amount * price if price > 0 else amount
     return total
 
 
