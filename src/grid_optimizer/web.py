@@ -24398,6 +24398,23 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       color: var(--muted);
       font-size: 14px;
     }
+    .subhead {
+      margin-top: 20px;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .subhead h2 {
+      margin: 0;
+      font-size: 22px;
+    }
+    .subhead p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
     .grid {
       margin-top: 18px;
       display: grid;
@@ -25054,12 +25071,22 @@ STRATEGIES_PAGE = """<!doctype html>
       </div>
     </section>
     <div id="cards" class="grid"></div>
+    <section class="subhead">
+      <div>
+        <h2>现货策略</h2>
+        <p>列出现货 runner 的运行状态、成交额、库存、挂单和损耗估算。</p>
+      </div>
+      <a href="/spot_strategies">打开现货总览</a>
+    </section>
+    <div id="spot_cards" class="grid"></div>
   </div>
 
   <script>
     const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
+    const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"];
     const cardsEl = document.getElementById("cards");
+    const spotCardsEl = document.getElementById("spot_cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");
     const refreshBtn = document.getElementById("refresh_btn");
@@ -25394,6 +25421,79 @@ STRATEGIES_PAGE = """<!doctype html>
       `;
     }
 
+    function spotLossRateBps(snapshot) {
+      const trade = snapshot.trade_summary || {};
+      const gross = Number(trade.gross_notional || 0);
+      if (!gross) return null;
+      return -Number(trade.net_pnl_estimate || 0) / gross * 10000;
+    }
+
+    function renderSpotCard(snapshot) {
+      const runner = snapshot.runner || {};
+      const config = snapshot.config || {};
+      const state = snapshot.state || {};
+      const trade = snapshot.trade_summary || {};
+      const risk = snapshot.risk_controls || {};
+      const balances = snapshot.balances || {};
+      const market = snapshot.market || {};
+      const currentPrice = Number(market.mid_price || ((Number(market.bid_price || 0) + Number(market.ask_price || 0)) / 2) || 0);
+      const inventoryQty = Number(state.inventory_qty || 0);
+      const inventoryNotional = inventoryQty * currentPrice;
+      const isRunning = Boolean(runner.is_running);
+      const hasExposure = inventoryQty > 0 || Number(balances.base_locked || 0) > 0 || (snapshot.open_orders || []).length > 0;
+      const stateLabel = isRunning ? "运行中" : (hasExposure ? "停机但仍有库存/挂单" : "未运行");
+      const stateClass = isRunning ? "good" : (hasExposure ? "warn" : "bad");
+      const lossRate = spotLossRateBps(snapshot);
+      const buyCount = (snapshot.open_orders || []).filter((item) => item.side === "BUY").length;
+      const sellCount = (snapshot.open_orders || []).filter((item) => item.side === "SELL").length;
+      const makerRate = Number(trade.trade_count || 0) > 0 ? Number(trade.maker_count || 0) / Number(trade.trade_count || 1) : null;
+      return `
+        <section class="card strategy-card">
+          <div class="topline">
+            <div class="title">
+              <h2>${escapeHtml(snapshot.symbol || "--")}</h2>
+              <p>${escapeHtml(String(config.strategy_mode || "--"))}</p>
+            </div>
+            <div class="badges">
+              <span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span>
+              <span class="badge warn">Spot</span>
+              <span class="badge good">step ${escapeHtml(fmtNum(config.step_price || 0, 6))}</span>
+            </div>
+          </div>
+          <div class="metrics">
+            <div class="metric">
+              <div class="label">现货库存</div>
+              <div class="value">${escapeHtml(fmtNum(inventoryQty, 4))}</div>
+              <div class="sub">约 ${escapeHtml(fmtNum(inventoryNotional, 4))}U · 均价 ${escapeHtml(fmtNum(state.inventory_avg_cost || 0, 6))}</div>
+            </div>
+            <div class="metric">
+              <div class="label">当前挂单</div>
+              <div class="value">${escapeHtml(fmtNum((snapshot.open_orders || []).length, 0))}</div>
+              <div class="sub">买/卖 ${escapeHtml(fmtNum(buyCount, 0))} / ${escapeHtml(fmtNum(sellCount, 0))}</div>
+            </div>
+            <div class="metric">
+              <div class="label">累计成交额</div>
+              <div class="value">${escapeHtml(fmtNum(trade.gross_notional || 0, 2))}</div>
+              <div class="sub">买 ${escapeHtml(fmtNum(trade.buy_notional || 0, 2))} / 卖 ${escapeHtml(fmtNum(trade.sell_notional || 0, 2))}</div>
+            </div>
+            <div class="metric">
+              <div class="label">净损耗估算</div>
+              <div class="value ${statusClass(Number(trade.net_pnl_estimate || 0))}">${escapeHtml(fmtMoney(trade.net_pnl_estimate || 0))}</div>
+              <div class="sub">损耗 ${escapeHtml(lossRate === null ? "--" : fmtNum(lossRate, 2))} bps · maker ${escapeHtml(makerRate === null ? "--" : fmtPct(makerRate))}</div>
+            </div>
+          </div>
+          <table>
+            <tbody>
+              <tr><th>当前中价</th><td>${escapeHtml(fmtNum(currentPrice, 7))}</td><th>成交笔数</th><td>${escapeHtml(fmtNum(trade.trade_count || 0, 0))}</td></tr>
+              <tr><th>手续费</th><td>${escapeHtml(fmtMoney(-(trade.commission_quote || 0)))}</td><th>已实现</th><td>${escapeHtml(fmtMoney(trade.realized_pnl || 0))}</td></tr>
+              <tr><th>小时亏损</th><td>${escapeHtml(fmtNum(risk.rolling_hourly_loss || 0, 4))} / ${escapeHtml(fmtNum(risk.rolling_hourly_loss_limit || 0, 4))}</td><th>累计上限</th><td>${escapeHtml(fmtNum(risk.cumulative_gross_notional || 0, 2))} / ${escapeHtml(fmtNum(risk.max_cumulative_notional || 0, 2))}</td></tr>
+              <tr><th>可用余额</th><td>${escapeHtml(fmtNum(balances.quote_free || 0, 4))} ${escapeHtml(balances.quote_asset || "")}</td><th>锁定</th><td>${escapeHtml(fmtNum(balances.quote_locked || 0, 4))} ${escapeHtml(balances.quote_asset || "")} / ${escapeHtml(fmtNum(balances.base_locked || 0, 4))} ${escapeHtml(balances.base_asset || "")}</td></tr>
+            </tbody>
+          </table>
+        </section>
+      `;
+    }
+
     async function fetchStrategySnapshots(symbols, concurrency = 1) {
       const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
       const results = new Array(symbols.length);
@@ -25420,6 +25520,32 @@ STRATEGIES_PAGE = """<!doctype html>
       return results;
     }
 
+    async function fetchSpotStrategySnapshots(symbols, concurrency = 1) {
+      const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
+      const results = new Array(symbols.length);
+      let nextIndex = 0;
+
+      async function worker() {
+        while (true) {
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+          if (currentIndex >= symbols.length) {
+            return;
+          }
+          const symbol = symbols[currentIndex];
+          const resp = await fetch(`/api/spot_runner/status?symbol=${encodeURIComponent(symbol)}`);
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) {
+            throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
+          }
+          results[currentIndex] = data.snapshot || data;
+        }
+      }
+
+      await Promise.all(Array.from({ length: Math.min(normalizedConcurrency, symbols.length) }, () => worker()));
+      return results;
+    }
+
     async function loadStrategies() {
       if (strategiesLoadPromise) {
         return strategiesLoadPromise;
@@ -25435,13 +25561,18 @@ STRATEGIES_PAGE = """<!doctype html>
             return;
           }
           const results = await fetchStrategySnapshots(symbols, 1);
+          const spotResults = await fetchSpotStrategySnapshots(DEFAULT_SPOT_SYMBOLS, 1);
           const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
           const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
-          summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
+          const spotRunningCount = spotResults.filter((item) => Boolean((item.runner || {}).is_running)).length;
+          const spotGross = spotResults.reduce((total, item) => total + Number(((item.trade_summary || {}).gross_notional) || 0), 0);
+          summaryEl.textContent = `当前拉取 ${results.length} 个合约币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。现货 ${spotResults.length} 个；运行 ${spotRunningCount} 个；成交额 ${fmtNum(spotGross, 2)}U。`;
           cardsEl.innerHTML = results.map(renderCard).join("");
+          spotCardsEl.innerHTML = spotResults.map(renderSpotCard).join("");
           metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
         } catch (err) {
           cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
+          spotCardsEl.innerHTML = `<div class="empty">现货加载失败：${escapeHtml(err)}</div>`;
           metaEl.textContent = `刷新失败：${err}`;
         }
       })();

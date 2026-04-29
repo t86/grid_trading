@@ -3810,6 +3810,12 @@ class WebSecurityTests(unittest.TestCase):
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
         self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
 
+    def test_strategies_page_contains_spot_strategy_overview(self) -> None:
+        self.assertIn("现货策略", STRATEGIES_PAGE)
+        self.assertIn('id="spot_cards"', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"]', STRATEGIES_PAGE)
+        self.assertIn("/api/spot_runner/status", STRATEGIES_PAGE)
+
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:
         config = {
