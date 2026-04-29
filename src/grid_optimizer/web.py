@@ -29788,8 +29788,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/running_status":
             try:
+                cache_scope = str((query.get("scope") or [""])[0] or "").strip().lower()
+                cache_symbol = str((query.get("symbol") or [""])[0] or "").upper().strip()
                 body = _build_running_status_api_body(
-                    f"running_status:{parsed.query}",
+                    f"running_status:scope={cache_scope}:symbol={cache_symbol}",
                     lambda: _run_running_status_query(query),
                 )
             except ValueError as exc:
@@ -29805,8 +29807,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/running_status_overview":
             try:
+                cache_scope = str((query.get("scope") or ["cross"])[0] or "cross").strip().lower()
                 body = _build_running_status_api_body(
-                    f"running_status_overview:{parsed.query}",
+                    f"running_status_overview:scope={cache_scope}",
                     lambda: _run_running_status_overview_query(query),
                 )
             except ValueError as exc:
