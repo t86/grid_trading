@@ -90,6 +90,46 @@ class ConsoleRegistryTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "Unknown server_id"):
                 load_console_registry(registry_path)
 
+    def test_load_console_registry_uses_explicit_env_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry_path = Path(temp_dir) / "console_registry.json"
+            registry_path.write_text(
+                json.dumps(
+                    {
+                        "servers": [
+                            {
+                                "id": "srv_env",
+                                "label": "Env",
+                                "base_url": "http://env:8788",
+                                "enabled": True,
+                                "capabilities": ["spot_runner"],
+                            }
+                        ],
+                        "accounts": [
+                            {
+                                "id": "acct_env",
+                                "label": "Env",
+                                "server_id": "srv_env",
+                                "kind": "spot",
+                                "priority": 1,
+                                "enabled": True,
+                                "default_symbols": ["TONUSDT"],
+                                "competition_symbols": ["TON"],
+                                "pages": ["/strategies"],
+                            }
+                        ],
+                        "competition_source": {"server_id": "srv_env", "path": "/api/competition_board"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            with patch.dict("os.environ", {"GRID_CONSOLE_REGISTRY_PATH": str(registry_path)}):
+                registry = load_console_registry()
+
+        self.assertEqual(registry["default_account"]["id"], "acct_env")
+        self.assertEqual(registry["servers_by_id"]["srv_env"]["base_url"], "http://env:8788")
+
 
 class ConsoleOverviewTests(unittest.TestCase):
     def _registry(self) -> dict[str, object]:

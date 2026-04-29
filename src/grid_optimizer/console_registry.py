@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,8 @@ ALLOWED_ACCOUNT_KINDS = {"futures", "spot", "mixed"}
 
 
 def load_console_registry(path: Path | str | None = None) -> dict[str, Any]:
-    registry_path = Path(path) if path is not None else DEFAULT_CONSOLE_REGISTRY_PATH
+    env_path = str(os.environ.get("GRID_CONSOLE_REGISTRY_PATH") or "").strip()
+    registry_path = Path(path) if path is not None else Path(env_path or DEFAULT_CONSOLE_REGISTRY_PATH)
     raw = json.loads(registry_path.read_text(encoding="utf-8"))
     if not isinstance(raw, dict):
         raise ValueError("Console registry must be a JSON object")
