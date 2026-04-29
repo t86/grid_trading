@@ -14,6 +14,7 @@ from grid_optimizer.web import (
     HTML_PAGE,
     STRATEGIES_PAGE,
     _Handler,
+    _build_running_status,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
     _build_flatten_command,
@@ -36,7 +37,6 @@ from grid_optimizer.web import (
     _resolve_runner_start_config,
     _render_running_status_overview_page,
     _render_running_status_page,
-    _fetch_remote_spot_runner_snapshot,
     _run_loop_monitor_query,
     _run_running_status_overview_query,
     _reconcile_runner_volatility_trigger,
@@ -226,10 +226,13 @@ class WebSecurityTests(unittest.TestCase):
         page = _render_running_status_overview_page()
 
         self.assertIn("运行中币种状态", page)
-        self.assertIn("按服务器汇总正在运行的合约策略", page)
+        self.assertIn("按服务器汇总正在运行的合约与现货策略", page)
         self.assertIn("/api/running_status_overview?scope=cross", page)
         self.assertIn("总成交量", page)
+        self.assertIn("<th>市场</th>", page)
+        self.assertIn("<th>最近成交</th>", page)
         self.assertIn("持仓状态", page)
+        self.assertIn("summary.spot_symbol_count", page)
         self.assertNotIn('const INITIAL_VIEW_MODE = "local";', page)
 
     def test_running_status_overview_page_formats_fee_column_without_negative_zero(self) -> None:
@@ -250,6 +253,54 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(payload, {"ok": True, "scope": "cross", "servers": []})
         mock_build.assert_called_once_with(scope="cross")
+
+    @patch("grid_optimizer.web._build_spot_runner_snapshot")
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    @patch("grid_optimizer.web._running_status_spot_symbols")
+    @patch("grid_optimizer.web._running_status_symbols")
+    def test_running_status_overview_local_payload_includes_spot_rows(
+        self,
+        mock_futures_symbols,
+        mock_spot_symbols,
+        mock_spot_runner,
+        mock_spot_snapshot,
+    ) -> None:
+        mock_futures_symbols.return_value = []
+        mock_spot_symbols.return_value = ["TONUSDT"]
+        mock_spot_runner.return_value = {"is_running": True, "pid": 123, "elapsed": "1:00"}
+        mock_spot_snapshot.return_value = {
+            "symbol": "TONUSDT",
+            "runner": {"is_running": True, "pid": 123, "elapsed": "1:00"},
+            "config": {"symbol": "TONUSDT", "strategy_mode": "spot_competition_inventory_grid"},
+            "state": {"inventory_qty": 10.0, "inventory_avg_cost": 1.2, "inventory_cost_quote": 12.0},
+            "market": {"mid_price": 1.25},
+            "trade_summary": {
+                "gross_notional": 300.0,
+                "realized_pnl": -0.2,
+                "unrealized_pnl": 0.5,
+                "net_pnl_estimate": 0.3,
+                "commission_quote": 0.12,
+                "trade_count": 6,
+                "buy_count": 3,
+                "sell_count": 3,
+                "recent_trades": [{"time": 4102444800000, "side": "BUY", "price": 1.25, "qty": 8.0, "notional": 10.0}],
+            },
+            "open_orders": [{"side": "BUY", "price": "1.24", "origQty": "8"}],
+            "latest_event": {"ts": "2026-04-29T00:00:00+00:00"},
+        }
+
+        with patch("grid_optimizer.web._running_status_overview_cache_seconds", return_value=0.0):
+            payload = _build_running_status(scope="local")
+
+        self.assertEqual(payload["summary"]["spot_symbol_count"], 1)
+        self.assertEqual(payload["summary"]["futures_symbol_count"], 0)
+        row = payload["server"]["symbols"][0]
+        self.assertEqual(row["market_type"], "spot")
+        self.assertEqual(row["market_label"], "现货")
+        self.assertEqual(row["strategy_name"], "现货竞赛库存网格")
+        self.assertEqual(row["total_volume"], 300.0)
+        self.assertEqual(row["fees"], 0.12)
+        self.assertIn("BUY", row["latest_trade_summary"])
 
     def test_legacy_running_status_server_from_new_local_payload_uses_running_cards(self) -> None:
         server = _legacy_running_status_server_from_payload(
@@ -3810,51 +3861,6 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
         self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
-
-    def test_strategies_page_contains_spot_strategy_overview(self) -> None:
-        self.assertIn("现货策略", STRATEGIES_PAGE)
-        self.assertIn('id="spot_cards"', STRATEGIES_PAGE)
-        self.assertIn('const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"]', STRATEGIES_PAGE)
-        self.assertIn("/api/spot_runner/status", STRATEGIES_PAGE)
-
-    def test_strategies_page_contains_remote_spot_strategy_sources(self) -> None:
-        self.assertIn("远端现货策略", STRATEGIES_PAGE)
-        self.assertIn('id="remote_spot_cards"', STRATEGIES_PAGE)
-        self.assertIn("REMOTE_SPOT_SOURCES", STRATEGIES_PAGE)
-        self.assertIn('serverId: "srv_111"', STRATEGIES_PAGE)
-        self.assertIn("/api/remote_spot_runner/status", STRATEGIES_PAGE)
-        self.assertIn("fetchRemoteSpotStrategySnapshots", STRATEGIES_PAGE)
-
-    @patch("grid_optimizer.web.urlopen")
-    @patch("grid_optimizer.web.load_console_registry")
-    def test_fetch_remote_spot_runner_snapshot_uses_registry_server(self, mock_registry, mock_urlopen) -> None:
-        mock_registry.return_value = {
-            "servers_by_id": {
-                "srv_111": {
-                    "id": "srv_111",
-                    "label": "111",
-                    "base_url": "http://111.example:8788",
-                    "enabled": True,
-                    "capabilities": ["spot_runner"],
-                }
-            }
-        }
-        response = Mock()
-        response.read.return_value = json.dumps(
-            {"ok": True, "snapshot": {"symbol": "TONUSDT", "runner": {"is_running": True}}},
-        ).encode("utf-8")
-        response.__enter__ = Mock(return_value=response)
-        response.__exit__ = Mock(return_value=False)
-        mock_urlopen.return_value = response
-
-        payload = _fetch_remote_spot_runner_snapshot(server_id="srv_111", symbol="tonusdt")
-
-        self.assertTrue(payload["ok"])
-        self.assertEqual(payload["server_id"], "srv_111")
-        self.assertEqual(payload["source_base_url"], "http://111.example:8788")
-        self.assertEqual(payload["snapshot"]["symbol"], "TONUSDT")
-        request = mock_urlopen.call_args.args[0]
-        self.assertEqual(request.full_url, "http://111.example:8788/api/spot_runner/status?symbol=TONUSDT")
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:

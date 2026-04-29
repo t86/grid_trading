@@ -10950,54 +10950,6 @@ def _build_spot_runner_snapshot(symbol: str | None = None) -> dict[str, Any]:
         snapshot["warnings"].append(f"{type(exc).__name__}: {exc}")
     return snapshot
 
-
-def _fetch_remote_spot_runner_snapshot(*, server_id: str, symbol: str) -> dict[str, Any]:
-    normalized_server_id = str(server_id or "").strip()
-    normalized_symbol = str(symbol or "").upper().strip()
-    if not normalized_server_id:
-        raise ValueError("server_id is required")
-    if not normalized_symbol:
-        raise ValueError("symbol is required")
-    registry = load_console_registry()
-    server = (registry.get("servers_by_id") or {}).get(normalized_server_id)
-    if not isinstance(server, dict):
-        raise ValueError(f"unknown server_id: {normalized_server_id}")
-    if not bool(server.get("enabled", True)):
-        raise ValueError(f"server is disabled: {normalized_server_id}")
-    capabilities = set(str(item) for item in list(server.get("capabilities") or []))
-    if "spot_runner" not in capabilities and "spot_strategies" not in capabilities:
-        raise ValueError(f"server does not expose spot runner: {normalized_server_id}")
-
-    base_url = str(server.get("base_url", "")).strip().rstrip("/")
-    if not base_url:
-        raise ValueError(f"server missing base_url: {normalized_server_id}")
-    url = f"{base_url}/api/spot_runner/status?symbol={quote(normalized_symbol)}"
-    headers = {"Accept": "application/json"}
-    username = os.environ.get(f"GRID_NODE_{normalized_server_id.upper()}_USERNAME")
-    password = os.environ.get(f"GRID_NODE_{normalized_server_id.upper()}_PASSWORD")
-    if username and password:
-        token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
-        headers["Authorization"] = f"Basic {token}"
-    request = Request(url, headers=headers)
-    try:
-        with urlopen(request, timeout=_running_status_remote_timeout_seconds()) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-    except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        raise RuntimeError(f"{type(exc).__name__}: {exc}") from exc
-    if not isinstance(payload, dict) or not payload.get("ok"):
-        error = payload.get("error", "invalid response") if isinstance(payload, dict) else "invalid response"
-        raise RuntimeError(str(error))
-    snapshot = payload.get("snapshot")
-    if not isinstance(snapshot, dict):
-        raise RuntimeError("remote spot response missing snapshot")
-    return {
-        "ok": True,
-        "server_id": normalized_server_id,
-        "server_label": str(server.get("label") or normalized_server_id),
-        "source_base_url": base_url,
-        "snapshot": snapshot,
-    }
-
 SERVER_HUB_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -23241,7 +23193,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
   <main class="wrap">
     <section class="card">
       <h1>运行中币种状态</h1>
-      <p>按服务器汇总正在运行的合约策略，统一看成交额、最近一小时成交额、盈亏拆解、挂单和持仓。</p>
+      <p>按服务器汇总正在运行的合约与现货策略，统一看成交额、最近一小时成交额、盈亏拆解、挂单和持仓。</p>
       <div class="links">
         <a href="/monitor">单币监控</a>
         <a href="/running_status">运行控制台</a>
@@ -23309,7 +23261,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
     function renderSummary(payload) {
       const summary = payload.summary || {};
       const cards = [
-        ["运行币种", fmtNum(summary.running_symbol_count || 0, 0), `${fmtNum(summary.server_count || 0, 0)} 台服务器`],
+        ["运行币种", fmtNum(summary.running_symbol_count || 0, 0), `${fmtNum(summary.server_count || 0, 0)} 台服务器 · 合约 ${fmtNum(summary.futures_symbol_count || 0, 0)} / 现货 ${fmtNum(summary.spot_symbol_count || 0, 0)}`],
         ["总成交量", fmtNum(summary.total_volume || 0, 4), "按交易赛/会话统计窗口"],
         ["最近一小时成交量", fmtNum(summary.recent_hour_volume || 0, 4), "取每个币种最新小时桶"],
         ["总盈亏", fmtMoney(summary.total_pnl || 0), `交易 ${fmtMoney(summary.trade_pnl || 0)} · 未实现 ${fmtMoney(summary.unrealized_pnl || 0)}`],
@@ -23328,6 +23280,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       const body = rows.map((item) => `
         <tr>
           <td><span class="pill">${escapeHtml(item.symbol)}</span></td>
+          <td>${escapeHtml(item.market_label || (item.market_type === "spot" ? "现货" : "合约"))}</td>
           <td>${escapeHtml(item.strategy_name || item.strategy_profile || "--")}</td>
           <td>${escapeHtml(fmtNum(item.total_volume, 4))}</td>
           <td>${escapeHtml(fmtNum(item.recent_hour_volume, 4))}</td>
@@ -23336,6 +23289,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
           <td class="${moneyClass(item.unrealized_pnl)}">${escapeHtml(fmtMoney(item.unrealized_pnl))}</td>
           <td class="${moneyClass(-item.fees)}">${escapeHtml(fmtFeeMoney(item.fees))}</td>
           <td class="${moneyClass(item.funding_fee)}">${escapeHtml(fmtMoney(item.funding_fee))}</td>
+          <td>${escapeHtml(item.latest_trade_summary || "--")}</td>
           <td>${escapeHtml(item.open_order_summary || "--")}</td>
           <td>${escapeHtml(item.position_summary || "--")}</td>
           <td>${escapeHtml(fmtTs(item.updated_at))}</td>
@@ -23356,7 +23310,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
               <table>
                 <thead>
                   <tr>
-                    <th>币种</th><th>策略名称</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
+                    <th>币种</th><th>市场</th><th>策略名称</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>最近成交</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
                   </tr>
                 </thead>
                 <tbody>${body}</tbody>
@@ -24446,23 +24400,6 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       color: var(--muted);
       font-size: 14px;
     }
-    .subhead {
-      margin-top: 20px;
-      display: flex;
-      align-items: flex-end;
-      justify-content: space-between;
-      gap: 12px;
-    }
-    .subhead h2 {
-      margin: 0;
-      font-size: 22px;
-    }
-    .subhead p {
-      margin: 6px 0 0;
-      color: var(--muted);
-      font-size: 14px;
-      line-height: 1.6;
-    }
     .grid {
       margin-top: 18px;
       display: grid;
@@ -25119,33 +25056,12 @@ STRATEGIES_PAGE = """<!doctype html>
       </div>
     </section>
     <div id="cards" class="grid"></div>
-    <section class="subhead">
-      <div>
-        <h2>现货策略</h2>
-        <p>列出现货 runner 的运行状态、成交额、库存、挂单和损耗估算。</p>
-      </div>
-      <a href="/spot_strategies">打开现货总览</a>
-    </section>
-    <div id="spot_cards" class="grid"></div>
-    <section class="subhead">
-      <div>
-        <h2>远端现货策略</h2>
-        <p>跨服务器拉取现货 runner 状态，用于集中查看 111 等入口机的现货刷量信息。</p>
-      </div>
-    </section>
-    <div id="remote_spot_cards" class="grid"></div>
   </div>
 
   <script>
     const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
-    const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"];
-    const REMOTE_SPOT_SOURCES = [
-      { label: "111", serverId: "srv_111", symbols: ["TONUSDT"] },
-    ];
     const cardsEl = document.getElementById("cards");
-    const spotCardsEl = document.getElementById("spot_cards");
-    const remoteSpotCardsEl = document.getElementById("remote_spot_cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");
     const refreshBtn = document.getElementById("refresh_btn");
@@ -25480,96 +25396,6 @@ STRATEGIES_PAGE = """<!doctype html>
       `;
     }
 
-    function spotLossRateBps(snapshot) {
-      const trade = snapshot.trade_summary || {};
-      const gross = Number(trade.gross_notional || 0);
-      if (!gross) return null;
-      return -Number(trade.net_pnl_estimate || 0) / gross * 10000;
-    }
-
-    function renderSpotCard(snapshot) {
-      if (snapshot.load_error) {
-        return `
-          <section class="card strategy-card">
-            <div class="topline">
-              <div class="title">
-                <h2>${escapeHtml(snapshot.symbol || "--")}</h2>
-                <p>${escapeHtml(snapshot.load_error)}</p>
-              </div>
-              <div class="badges">
-                <span class="badge bad">加载失败</span>
-                <span class="badge warn">${escapeHtml(snapshot.source_label || "远端")}</span>
-              </div>
-            </div>
-          </section>
-        `;
-      }
-      const runner = snapshot.runner || {};
-      const config = snapshot.config || {};
-      const state = snapshot.state || {};
-      const trade = snapshot.trade_summary || {};
-      const risk = snapshot.risk_controls || {};
-      const balances = snapshot.balances || {};
-      const market = snapshot.market || {};
-      const currentPrice = Number(market.mid_price || ((Number(market.bid_price || 0) + Number(market.ask_price || 0)) / 2) || 0);
-      const inventoryQty = Number(state.inventory_qty || 0);
-      const inventoryNotional = inventoryQty * currentPrice;
-      const isRunning = Boolean(runner.is_running);
-      const hasExposure = inventoryQty > 0 || Number(balances.base_locked || 0) > 0 || (snapshot.open_orders || []).length > 0;
-      const stateLabel = isRunning ? "运行中" : (hasExposure ? "停机但仍有库存/挂单" : "未运行");
-      const stateClass = isRunning ? "good" : (hasExposure ? "warn" : "bad");
-      const lossRate = spotLossRateBps(snapshot);
-      const buyCount = (snapshot.open_orders || []).filter((item) => item.side === "BUY").length;
-      const sellCount = (snapshot.open_orders || []).filter((item) => item.side === "SELL").length;
-      const makerRate = Number(trade.trade_count || 0) > 0 ? Number(trade.maker_count || 0) / Number(trade.trade_count || 1) : null;
-      return `
-        <section class="card strategy-card">
-          <div class="topline">
-            <div class="title">
-              <h2>${escapeHtml(snapshot.symbol || "--")}</h2>
-              <p>${escapeHtml(String(config.strategy_mode || "--"))}</p>
-            </div>
-            <div class="badges">
-              <span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span>
-              <span class="badge warn">Spot</span>
-              <span class="badge warn">${escapeHtml(snapshot.source_label || "本机")}</span>
-              <span class="badge good">step ${escapeHtml(fmtNum(config.step_price || 0, 6))}</span>
-            </div>
-          </div>
-          <div class="metrics">
-            <div class="metric">
-              <div class="label">现货库存</div>
-              <div class="value">${escapeHtml(fmtNum(inventoryQty, 4))}</div>
-              <div class="sub">约 ${escapeHtml(fmtNum(inventoryNotional, 4))}U · 均价 ${escapeHtml(fmtNum(state.inventory_avg_cost || 0, 6))}</div>
-            </div>
-            <div class="metric">
-              <div class="label">当前挂单</div>
-              <div class="value">${escapeHtml(fmtNum((snapshot.open_orders || []).length, 0))}</div>
-              <div class="sub">买/卖 ${escapeHtml(fmtNum(buyCount, 0))} / ${escapeHtml(fmtNum(sellCount, 0))}</div>
-            </div>
-            <div class="metric">
-              <div class="label">累计成交额</div>
-              <div class="value">${escapeHtml(fmtNum(trade.gross_notional || 0, 2))}</div>
-              <div class="sub">买 ${escapeHtml(fmtNum(trade.buy_notional || 0, 2))} / 卖 ${escapeHtml(fmtNum(trade.sell_notional || 0, 2))}</div>
-            </div>
-            <div class="metric">
-              <div class="label">净损耗估算</div>
-              <div class="value ${statusClass(Number(trade.net_pnl_estimate || 0))}">${escapeHtml(fmtMoney(trade.net_pnl_estimate || 0))}</div>
-              <div class="sub">损耗 ${escapeHtml(lossRate === null ? "--" : fmtNum(lossRate, 2))} bps · maker ${escapeHtml(makerRate === null ? "--" : fmtPct(makerRate))}</div>
-            </div>
-          </div>
-          <table>
-            <tbody>
-              <tr><th>当前中价</th><td>${escapeHtml(fmtNum(currentPrice, 7))}</td><th>成交笔数</th><td>${escapeHtml(fmtNum(trade.trade_count || 0, 0))}</td></tr>
-              <tr><th>手续费</th><td>${escapeHtml(fmtMoney(-(trade.commission_quote || 0)))}</td><th>已实现</th><td>${escapeHtml(fmtMoney(trade.realized_pnl || 0))}</td></tr>
-              <tr><th>小时亏损</th><td>${escapeHtml(fmtNum(risk.rolling_hourly_loss || 0, 4))} / ${escapeHtml(fmtNum(risk.rolling_hourly_loss_limit || 0, 4))}</td><th>累计上限</th><td>${escapeHtml(fmtNum(risk.cumulative_gross_notional || 0, 2))} / ${escapeHtml(fmtNum(risk.max_cumulative_notional || 0, 2))}</td></tr>
-              <tr><th>可用余额</th><td>${escapeHtml(fmtNum(balances.quote_free || 0, 4))} ${escapeHtml(balances.quote_asset || "")}</td><th>锁定</th><td>${escapeHtml(fmtNum(balances.quote_locked || 0, 4))} ${escapeHtml(balances.quote_asset || "")} / ${escapeHtml(fmtNum(balances.base_locked || 0, 4))} ${escapeHtml(balances.base_asset || "")}</td></tr>
-            </tbody>
-          </table>
-        </section>
-      `;
-    }
-
     async function fetchStrategySnapshots(symbols, concurrency = 1) {
       const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
       const results = new Array(symbols.length);
@@ -25596,79 +25422,6 @@ STRATEGIES_PAGE = """<!doctype html>
       return results;
     }
 
-    async function fetchSpotStrategySnapshots(symbols, concurrency = 1) {
-      const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
-      const results = new Array(symbols.length);
-      let nextIndex = 0;
-
-      async function worker() {
-        while (true) {
-          const currentIndex = nextIndex;
-          nextIndex += 1;
-          if (currentIndex >= symbols.length) {
-            return;
-          }
-          const symbol = symbols[currentIndex];
-          const resp = await fetch(`/api/spot_runner/status?symbol=${encodeURIComponent(symbol)}`);
-          const data = await resp.json();
-          if (!resp.ok || !data.ok) {
-            throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
-          }
-          results[currentIndex] = data.snapshot || data;
-        }
-      }
-
-      await Promise.all(Array.from({ length: Math.min(normalizedConcurrency, symbols.length) }, () => worker()));
-      return results;
-    }
-
-    async function fetchRemoteSpotStrategySnapshots(sources, concurrency = 1) {
-      const tasks = [];
-      for (const source of sources || []) {
-        for (const symbol of source.symbols || []) {
-          tasks.push({ source, symbol });
-        }
-      }
-      const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
-      const results = new Array(tasks.length);
-      let nextIndex = 0;
-
-      async function worker() {
-        while (true) {
-          const currentIndex = nextIndex;
-          nextIndex += 1;
-          if (currentIndex >= tasks.length) {
-            return;
-          }
-          const task = tasks[currentIndex];
-          const serverId = String(task.source.serverId || "");
-          const url = `/api/remote_spot_runner/status?server_id=${encodeURIComponent(serverId)}&symbol=${encodeURIComponent(task.symbol)}`;
-          try {
-            const resp = await fetch(url);
-            const data = await resp.json();
-            if (!resp.ok || !data.ok) {
-              throw new Error(data.error || `HTTP ${resp.status}`);
-            }
-            const snapshot = data.snapshot || data;
-            snapshot.source_label = task.source.label || serverId;
-            snapshot.source_server_id = serverId;
-            snapshot.source_base_url = data.source_base_url || "";
-            results[currentIndex] = snapshot;
-          } catch (err) {
-            results[currentIndex] = {
-              symbol: task.symbol,
-              source_label: task.source.label || serverId,
-              source_server_id: serverId,
-              load_error: String(err),
-            };
-          }
-        }
-      }
-
-      await Promise.all(Array.from({ length: Math.min(normalizedConcurrency, tasks.length) }, () => worker()));
-      return results;
-    }
-
     async function loadStrategies() {
       if (strategiesLoadPromise) {
         return strategiesLoadPromise;
@@ -25684,23 +25437,13 @@ STRATEGIES_PAGE = """<!doctype html>
             return;
           }
           const results = await fetchStrategySnapshots(symbols, 1);
-          const spotResults = await fetchSpotStrategySnapshots(DEFAULT_SPOT_SYMBOLS, 1);
-          const remoteSpotResults = await fetchRemoteSpotStrategySnapshots(REMOTE_SPOT_SOURCES, 2);
           const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
           const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
-          const spotRunningCount = spotResults.filter((item) => Boolean((item.runner || {}).is_running)).length;
-          const spotGross = spotResults.reduce((total, item) => total + Number(((item.trade_summary || {}).gross_notional) || 0), 0);
-          const remoteSpotRunningCount = remoteSpotResults.filter((item) => Boolean((item.runner || {}).is_running)).length;
-          const remoteSpotGross = remoteSpotResults.reduce((total, item) => total + Number(((item.trade_summary || {}).gross_notional) || 0), 0);
-          summaryEl.textContent = `当前拉取 ${results.length} 个合约币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。现货 ${spotResults.length} 个；运行 ${spotRunningCount} 个；成交额 ${fmtNum(spotGross, 2)}U。远端现货 ${remoteSpotResults.length} 个；运行 ${remoteSpotRunningCount} 个；成交额 ${fmtNum(remoteSpotGross, 2)}U。`;
+          summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
           cardsEl.innerHTML = results.map(renderCard).join("");
-          spotCardsEl.innerHTML = spotResults.map(renderSpotCard).join("");
-          remoteSpotCardsEl.innerHTML = remoteSpotResults.length ? remoteSpotResults.map(renderSpotCard).join("") : '<div class="empty">未配置远端现货策略。</div>';
           metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
         } catch (err) {
           cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
-          spotCardsEl.innerHTML = `<div class="empty">现货加载失败：${escapeHtml(err)}</div>`;
-          remoteSpotCardsEl.innerHTML = `<div class="empty">远端现货加载失败：${escapeHtml(err)}</div>`;
           metaEl.textContent = `刷新失败：${err}`;
         }
       })();
@@ -29138,7 +28881,7 @@ def _running_status_server_entries() -> list[dict[str, str]]:
         for entry in [
             {"label": "43.155.163.114", "url": "http://43.155.163.114:8788"},
             {"label": "43.131.232.150", "url": "http://43.131.232.150:8789"},
-            {"label": "43.155.136.111", "url": "http://43.155.136.111:8787"},
+            {"label": "43.155.136.111", "url": "http://43.155.136.111:8788"},
         ]
         if should_include(entry["url"])
     ]
@@ -29166,6 +28909,22 @@ def _summarize_open_orders_for_status(snapshot: dict[str, Any]) -> str:
     return f"{len(rows)} 笔，买/卖 {buy_count}/{sell_count}，名义 {notional:.4f}U"
 
 
+def _summarize_spot_open_orders_for_status(snapshot: dict[str, Any]) -> str:
+    rows = snapshot.get("open_orders") or []
+    if not isinstance(rows, list) or not rows:
+        return "无挂单"
+    buy_count = sum(1 for item in rows if str((item or {}).get("side", "")).upper() == "BUY")
+    sell_count = sum(1 for item in rows if str((item or {}).get("side", "")).upper() == "SELL")
+    notional = 0.0
+    for item in rows:
+        if not isinstance(item, dict):
+            continue
+        price = _status_float(item.get("price"))
+        qty = _status_float(item.get("orig_qty") if item.get("orig_qty") is not None else item.get("origQty"))
+        notional += price * qty
+    return f"{len(rows)} 笔，买/卖 {buy_count}/{sell_count}，名义 {notional:.4f}U"
+
+
 def _summarize_position_for_status(snapshot: dict[str, Any]) -> str:
     position = snapshot.get("position") or {}
     market = snapshot.get("market") or {}
@@ -29180,6 +28939,25 @@ def _summarize_position_for_status(snapshot: dict[str, Any]) -> str:
     return (
         f"{side} {net_qty:.8g}，多/空 {long_qty:.8g}/{short_qty:.8g}，"
         f"名义 {notional:.4f}U，未实现 {float(position.get('unrealized_pnl') or 0.0):+.4f}U"
+    )
+
+
+def _summarize_spot_inventory_for_status(snapshot: dict[str, Any]) -> str:
+    state = snapshot.get("state") or {}
+    balances = snapshot.get("balances") if isinstance(snapshot.get("balances"), dict) else {}
+    market = snapshot.get("market") if isinstance(snapshot.get("market"), dict) else {}
+    trade = snapshot.get("trade_summary") if isinstance(snapshot.get("trade_summary"), dict) else {}
+    if not isinstance(state, dict):
+        state = {}
+    qty = _status_float(state.get("inventory_qty") or state.get("managed_base_qty"))
+    avg_cost = _status_float(state.get("inventory_avg_cost"))
+    mid_price = _status_float(market.get("mid_price"))
+    notional = qty * mid_price if mid_price > 0 else _status_float(state.get("inventory_cost_quote"))
+    base_asset = str(balances.get("base_asset") or "").upper().strip()
+    asset_suffix = f" {base_asset}" if base_asset else ""
+    return (
+        f"库存 {qty:.8g}{asset_suffix}，均价 {avg_cost:.8g}，"
+        f"名义 {notional:.4f}U，浮盈 {float(trade.get('unrealized_pnl') or 0.0):+.4f}U"
     )
 
 
@@ -29208,6 +28986,8 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
     total_pnl = trade_pnl + unrealized_pnl + funding_fee - fees
     return {
         "symbol": snapshot.get("symbol"),
+        "market_type": "futures",
+        "market_label": "合约",
         "strategy_name": strategy_name or effective_profile or requested_profile or "--",
         "strategy_profile": effective_profile or requested_profile,
         "requested_strategy_profile": requested_profile,
@@ -29223,6 +29003,89 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
         "open_order_count": len(snapshot.get("open_orders") or []),
         "open_order_summary": _summarize_open_orders_for_status(snapshot),
         "position_summary": _summarize_position_for_status(snapshot),
+        "runner": {"pid": runner.get("pid"), "elapsed": runner.get("elapsed")},
+    }
+
+
+def _spot_strategy_label(strategy_mode: str) -> str:
+    return {
+        "spot_one_way_long": "Spot V1 单向做多静态网格",
+        "spot_volume_shift_long": "现货量优先移中心",
+        "spot_competition_inventory_grid": "现货竞赛库存网格",
+    }.get(strategy_mode, strategy_mode or "--")
+
+
+def _latest_hour_spot_volume(snapshot: dict[str, Any]) -> float:
+    trade = snapshot.get("trade_summary") if isinstance(snapshot.get("trade_summary"), dict) else {}
+    recent_trades = trade.get("recent_trades") if isinstance(trade, dict) else []
+    if not isinstance(recent_trades, list):
+        return 0.0
+    hour_floor_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
+    total = 0.0
+    for item in recent_trades:
+        if not isinstance(item, dict):
+            continue
+        try:
+            trade_time_ms = int(item.get("time") or item.get("time_ms") or item.get("T") or 0)
+        except (TypeError, ValueError):
+            trade_time_ms = 0
+        if trade_time_ms >= hour_floor_ms:
+            total += _status_float(item.get("notional"))
+    return total
+
+
+def _latest_spot_trade_display(snapshot: dict[str, Any]) -> str:
+    trade = snapshot.get("trade_summary") if isinstance(snapshot.get("trade_summary"), dict) else {}
+    recent_trades = trade.get("recent_trades") if isinstance(trade, dict) else []
+    if not isinstance(recent_trades, list) or not recent_trades:
+        return "--"
+    latest = recent_trades[-1] if isinstance(recent_trades[-1], dict) else {}
+    side = str(latest.get("side") or "").upper().strip() or "--"
+    price = _status_float(latest.get("price"))
+    qty = _status_float(latest.get("qty"))
+    notional = _status_float(latest.get("notional"))
+    return f"{side} {qty:.8g} @ {price:.8g}，{notional:.4f}U"
+
+
+def _spot_snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any] | None:
+    runner = snapshot.get("runner") or {}
+    if not isinstance(runner, dict) or not bool(runner.get("is_running")):
+        return None
+    config = snapshot.get("config") if isinstance(snapshot.get("config"), dict) else {}
+    symbol = str(snapshot.get("symbol") or config.get("symbol") or "").upper().strip()
+    if not symbol:
+        return None
+    strategy_mode = str(config.get("strategy_mode") or "").strip()
+    trade = snapshot.get("trade_summary") if isinstance(snapshot.get("trade_summary"), dict) else {}
+    trade_pnl = _status_float(trade.get("realized_pnl"))
+    unrealized_pnl = _status_float(trade.get("unrealized_pnl"))
+    fees = _status_float(trade.get("commission_quote") if trade.get("commission_quote") is not None else trade.get("commission"))
+    net_pnl = _status_float(trade.get("net_pnl_estimate"))
+    if net_pnl == 0.0 and (trade_pnl or unrealized_pnl):
+        net_pnl = trade_pnl + unrealized_pnl
+    return {
+        "symbol": symbol,
+        "market_type": "spot",
+        "market_label": "现货",
+        "strategy_name": _spot_strategy_label(strategy_mode),
+        "strategy_profile": strategy_mode,
+        "requested_strategy_profile": strategy_mode,
+        "strategy_mode": strategy_mode,
+        "updated_at": snapshot.get("latest_event", {}).get("ts") if isinstance(snapshot.get("latest_event"), dict) else None,
+        "total_volume": _status_float(trade.get("gross_notional")),
+        "recent_hour_volume": _latest_hour_spot_volume(snapshot),
+        "total_pnl": net_pnl,
+        "trade_pnl": trade_pnl,
+        "unrealized_pnl": unrealized_pnl,
+        "fees": fees,
+        "funding_fee": 0.0,
+        "open_order_count": len(snapshot.get("open_orders") or []),
+        "open_order_summary": _summarize_spot_open_orders_for_status(snapshot),
+        "position_summary": _summarize_spot_inventory_for_status(snapshot),
+        "latest_trade_summary": _latest_spot_trade_display(snapshot),
+        "trade_count": int(_status_float(trade.get("trade_count"))),
+        "buy_count": int(_status_float(trade.get("buy_count"))),
+        "sell_count": int(_status_float(trade.get("sell_count"))),
         "runner": {"pid": runner.get("pid"), "elapsed": runner.get("elapsed")},
     }
 
@@ -29243,6 +29106,18 @@ def _running_status_symbols() -> list[str]:
     for path in Path("output").glob("*_loop_runner_control.json"):
         payload = _read_json_dict(path)
         add_symbol((payload or {}).get("symbol"))
+    return symbols
+
+
+def _running_status_spot_symbols() -> list[str]:
+    symbols: list[str] = []
+    seen: set[str] = set()
+    for path in Path("output").glob("*_spot_runner_control.json"):
+        payload = _read_json_dict(path)
+        symbol = str((payload or {}).get("symbol") or "").upper().strip()
+        if symbol and symbol not in seen:
+            seen.add(symbol)
+            symbols.append(symbol)
     return symbols
 
 
@@ -29466,7 +29341,9 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
 
 def _build_local_running_status() -> dict[str, Any]:
     symbols = _running_status_symbols()
+    spot_symbols = _running_status_spot_symbols()
     running_symbols: list[str] = []
+    running_spot_symbols: list[str] = []
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
     for symbol in symbols:
@@ -29479,9 +29356,22 @@ def _build_local_running_status() -> dict[str, Any]:
             errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
             continue
 
+    for symbol in spot_symbols:
+        try:
+            runner = _read_spot_runner_process_for_symbol(symbol)
+            if not bool(runner.get("is_running")):
+                continue
+            running_spot_symbols.append(symbol)
+        except Exception as exc:
+            errors.append({"symbol": symbol, "market_type": "spot", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+
     def build_item(symbol: str) -> dict[str, Any] | None:
         runner = read_symbol_runner_process(symbol)
         return _build_fast_running_status_item(symbol, runner)
+
+    def build_spot_item(symbol: str) -> dict[str, Any] | None:
+        return _spot_snapshot_to_running_status_item(_build_spot_runner_snapshot(symbol))
 
     with ThreadPoolExecutor(max_workers=min(max(len(running_symbols), 1), 4)) as executor:
         futures = {executor.submit(build_item, symbol): symbol for symbol in running_symbols}
@@ -29491,6 +29381,17 @@ def _build_local_running_status() -> dict[str, Any]:
                 item = future.result()
             except Exception as exc:
                 errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
+                continue
+            if item is not None:
+                rows.append(item)
+    with ThreadPoolExecutor(max_workers=min(max(len(running_spot_symbols), 1), 4)) as executor:
+        futures = {executor.submit(build_spot_item, symbol): symbol for symbol in running_spot_symbols}
+        for future in as_completed(futures):
+            symbol = futures[future]
+            try:
+                item = future.result()
+            except Exception as exc:
+                errors.append({"symbol": symbol, "market_type": "spot", "error": f"{type(exc).__name__}: {exc}"})
                 continue
             if item is not None:
                 rows.append(item)
@@ -29514,6 +29415,8 @@ def _running_status_summary(servers: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "server_count": len(servers),
         "running_symbol_count": len(rows),
+        "futures_symbol_count": sum(1 for item in rows if str(item.get("market_type") or "futures") != "spot"),
+        "spot_symbol_count": sum(1 for item in rows if str(item.get("market_type") or "") == "spot"),
         "total_volume": sum(float(item.get("total_volume") or 0.0) for item in rows),
         "recent_hour_volume": sum(float(item.get("recent_hour_volume") or 0.0) for item in rows),
         "total_pnl": sum(float(item.get("total_pnl") or 0.0) for item in rows),
@@ -29528,6 +29431,8 @@ def _legacy_running_status_item_from_card(card: dict[str, Any]) -> dict[str, Any
     open_order_count = int(_status_float(card.get("open_order_count")))
     return {
         "symbol": str(card.get("symbol") or "").upper().strip(),
+        "market_type": str(card.get("market_type") or "futures").strip() or "futures",
+        "market_label": str(card.get("market_label") or ("现货" if str(card.get("market_type") or "") == "spot" else "合约")).strip(),
         "strategy_name": card.get("strategy_name") or card.get("strategy_profile") or "--",
         "strategy_profile": card.get("strategy_profile"),
         "requested_strategy_profile": card.get("requested_strategy_profile") or card.get("strategy_profile"),
@@ -29543,6 +29448,10 @@ def _legacy_running_status_item_from_card(card: dict[str, Any]) -> dict[str, Any
         "open_order_count": open_order_count,
         "open_order_summary": card.get("open_order_summary") or f"{open_order_count} 笔",
         "position_summary": card.get("position_summary") or card.get("current_position_display") or "--",
+        "latest_trade_summary": card.get("latest_trade_summary") or "--",
+        "trade_count": int(_status_float(card.get("trade_count"))),
+        "buy_count": int(_status_float(card.get("buy_count"))),
+        "sell_count": int(_status_float(card.get("sell_count"))),
         "runner": {"pid": card.get("pid"), "elapsed": card.get("elapsed")},
     }
 
@@ -29852,19 +29761,6 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
             return
-        if path == "/api/remote_spot_runner/status":
-            server_id = str(query.get("server_id", [""])[0]).strip()
-            symbol = str(query.get("symbol", [""])[0]).upper().strip()
-            try:
-                payload = _fetch_remote_spot_runner_snapshot(server_id=server_id, symbol=symbol)
-            except ValueError as exc:
-                self._send_json({"ok": False, "error": str(exc)}, status=400)
-                return
-            except Exception as exc:
-                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=502)
-                return
-            self._send_json(payload, status=HTTPStatus.OK)
-            return
         if path == "/api/manual_trade/status":
             symbol = str(query.get("symbol", ["BTCUSDT"])[0]).upper().strip() or "BTCUSDT"
             try:
@@ -30159,7 +30055,6 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/grid_preview"
             or path == "/api/competition_board"
             or path == "/api/spot_runner/status"
-            or path == "/api/remote_spot_runner/status"
             or path == "/api/spot_runner/save"
             or path == "/api/manual_trade/status"
         ):
