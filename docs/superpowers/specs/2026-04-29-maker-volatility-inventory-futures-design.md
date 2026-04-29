@@ -1,39 +1,48 @@
-# Maker Volatility Inventory Futures Design
+# 合约波动率库存做市策略设计
 
-## Goal
+## 目标
 
-Add a testable futures maker strategy that provides simple two-sided liquidity while controlling loss, inventory drift, and order churn. The first version uses notional sizing, so "single order 30, max one-sided 300" means quote notional, not coin quantity.
+新增一个可测试的合约 maker 策略，用简单的双边挂单提供流动性，同时控制亏损、库存漂移和订单抖动。第一版使用名义金额口径，所以“单笔 30、单边最大 300”表示报价资产名义金额，不表示币数量。
 
-## Scope
+## 范围
 
-The strategy runs inside the existing futures `loop_runner` execution framework. It should not be a separate bot and should not modify the behavior of existing `synthetic_neutral`, `hedge_neutral`, `one_way_long`, or `one_way_short` presets.
+策略运行在现有合约 `loop_runner` 执行框架内。它不是一个单独 bot，也不应该改变已有 `synthetic_neutral`、`hedge_neutral`、`one_way_long` 或 `one_way_short` 预设的行为。
 
-New strategy mode:
+新增策略模式：
 
 ```text
 maker_volatility_inventory_v1
 ```
 
-The strategy reuses existing runner capabilities:
+策略复用现有 runner 能力：
 
-- futures market data via REST or websocket snapshot
-- account and position reads
-- post-only order preparation and retry handling
-- plan validation, `max_new_orders`, `max_total_notional`, stale-order handling
-- runtime guards, state files, audit files, and runner control paths
+- 合约行情数据，包括 REST 或 websocket 快照
+- 账户和持仓读取
+- post-only 订单准备和重试处理
+- plan 校验、`max_new_orders`、`max_total_notional`、旧单处理
+- runtime guards、状态文件、审计文件和 runner 控制路径
 
-## Strategy Behavior
+## 策略行为
 
-Each cycle reads best bid, best ask, mid price, current net position, and recent futures klines. It generates target maker orders near the top of book:
+每轮读取买一、卖一、中价、当前净持仓和最近合约 K 线。策略在盘口附近生成目标 maker 订单：
 
-- `normal`: place one buy and one sell around the current book using `maker_base_spread_bps`.
-- `volatility_wide`: if recent amplitude or absolute return exceeds the configured threshold, widen both sides using `maker_wide_spread_bps`.
-- `long_inventory_reduce`: if long notional reaches the soft inventory threshold, reduce or pause new buy orders and keep sell orders.
-- `short_inventory_reduce`: if short notional reaches the soft inventory threshold, reduce or pause new sell orders and keep buy orders.
-- `hard_reduce_only`: if one-sided notional reaches the hard maximum, only generate orders that reduce that exposure.
-- `cooldown`: after extreme volatility or repeated submit rejection signals, pause new opening orders until the cooldown expires.
+- `normal`：使用 `maker_base_spread_bps`，围绕当前盘口挂一笔买单和一笔卖单。
+- `volatility_wide`：如果最近振幅或绝对涨跌超过配置阈值，使用 `maker_wide_spread_bps` 加宽双边报价。
+- `long_inventory_reduce`：如果多头名义金额达到软库存阈值，减少或暂停新的买单，保留卖单。
+- `short_inventory_reduce`：如果空头名义金额达到软库存阈值，减少或暂停新的卖单，保留买单。
+- `hard_reduce_only`：如果单边名义金额达到硬上限，只生成降低该方向敞口的订单。
+- `cooldown`：极端波动或连续提交拒单信号之后，暂停新增开仓订单，直到冷却结束。
 
-Inventory rules are based on actual net position notional:
+急速单边行情按防守优先处理：
+
+- 普通高波动先进入 `volatility_wide`，加宽 spread，但仍允许双边 maker 单。
+- 如果高波动同时伴随方向性急跌，并且多头库存达到软阈值，进入 `long_inventory_reduce`，暂停新的 BUY，只保留降低多头敞口的 SELL。
+- 如果高波动同时伴随方向性急涨，并且空头库存达到软阈值，进入 `short_inventory_reduce`，暂停新的 SELL，只保留降低空头敞口的 BUY。
+- 如果单边库存达到硬上限，直接进入 `hard_reduce_only`，不再新增风险方向。
+- 如果最近振幅或绝对涨跌达到极端阈值，进入 `cooldown`，暂停新增开仓订单，等待盘口重新稳定。
+- v1 不主动吃单止损；如果后续实盘证明 maker 减仓太慢，再增加 aggressive reduce。
+
+库存规则基于实际净持仓名义金额：
 
 ```text
 long_notional = max(net_qty, 0) * mid
@@ -41,9 +50,9 @@ short_notional = max(-net_qty, 0) * mid
 soft_limit = hard_limit * maker_inventory_soft_ratio
 ```
 
-## Configuration
+## 配置
 
-Initial fields:
+第一版字段：
 
 ```json
 {
@@ -57,30 +66,31 @@ Initial fields:
   "maker_volatility_window": "1m",
   "maker_volatility_wide_threshold": 0.006,
   "maker_extreme_volatility_threshold": 0.012,
+  "maker_directional_move_threshold": 0.004,
   "maker_cooldown_seconds": 30.0
 }
 ```
 
-The first version supports one order per side per cycle. Existing runner-level `max_new_orders` and `max_total_notional` remain the final submission limits.
+第一版每轮每边最多生成一笔订单。现有 runner 级别的 `max_new_orders` 和 `max_total_notional` 仍然是最终提交限制。
 
-## Order Construction
+## 订单构造
 
-For each side:
+每个方向的规则：
 
-- Buy price is below or equal to the resting bid side after spread adjustment.
-- Sell price is above or equal to the resting ask side after spread adjustment.
-- Quantity is `maker_order_notional / price`, rounded by existing symbol step rules.
-- Orders use role names that make reduce-only handling explicit:
+- 买单价格在 spread 调整后低于或等于买一侧可挂价格。
+- 卖单价格在 spread 调整后高于或等于卖一侧可挂价格。
+- 数量按 `maker_order_notional / price` 计算，并沿用现有交易对 step 规则取整。
+- 订单使用能明确表达 reduce-only 语义的 role：
   - `maker_entry_long`
   - `maker_entry_short`
   - `maker_reduce_long`
   - `maker_reduce_short`
 
-Post-only price adjustment remains the responsibility of the existing submit path.
+post-only 价格调整仍由现有提交路径负责。
 
-## State
+## 状态
 
-The runner state stores a small strategy state object:
+runner state 中保存一个小的策略状态对象：
 
 ```json
 {
@@ -93,26 +103,29 @@ The runner state stores a small strategy state object:
 }
 ```
 
-State transitions should require only the current cycle in v1. Hysteresis can be added later if live behavior is too noisy.
+v1 的状态切换只依赖当前轮数据。实盘如果发现状态过于频繁抖动，再增加滞后确认逻辑。
 
-## Errors And Guards
+## 错误和保护
 
-If market data is missing or invalid, the plan should contain no new orders and include a clear blocked reason.
+如果行情数据缺失或无效，plan 不应生成新订单，并且要包含清晰的 blocked reason。
 
-If the account is not in one-way mode, v1 should still use actual net exposure and avoid hedge-position-specific behavior. Hedge mode support can be added later after tests define position-side semantics.
+如果账户不是单向持仓模式，v1 仍然按实际净敞口计算，避免引入 hedge mode 专属行为。双向持仓支持可以等测试明确 position-side 语义后再加。
 
-The strategy must not self-trade intentionally. It only submits maker orders through the normal strategy order prefix and relies on Binance/account STP settings plus the existing order diff to avoid unnecessary crossed behavior.
+策略不能有意自成交。它只通过正常策略订单前缀提交 maker 订单，并依赖 Binance/账户 STP 设置以及现有订单 diff，减少不必要的交叉行为。
 
-## Testing
+## 测试
 
-Add focused unit tests before implementation:
+实现前先增加聚焦单元测试：
 
-- normal regime generates one buy and one sell order.
-- high volatility widens prices relative to the base spread.
-- long soft inventory suppresses or reduces buy orders.
-- short soft inventory suppresses or reduces sell orders.
-- hard long inventory generates only long-reducing sell orders.
-- hard short inventory generates only short-reducing buy orders.
-- invalid market data produces no orders with a blocked reason.
+- `normal` 状态生成一笔买单和一笔卖单。
+- 高波动时，相比基础 spread，报价会变宽。
+- 极端波动时进入 `cooldown`，不生成新增开仓单。
+- 多头软库存触发时，抑制或减少买单。
+- 空头软库存触发时，抑制或减少卖单。
+- 急跌且多头软库存触发时，只保留降低多头敞口的卖单。
+- 急涨且空头软库存触发时，只保留降低空头敞口的买单。
+- 多头达到硬上限时，只生成降低多头敞口的卖单。
+- 空头达到硬上限时，只生成降低空头敞口的买单。
+- 行情数据无效时，不生成订单，并返回 blocked reason。
 
-Integration tests should cover `generate_plan_report()` recognizing the new `strategy_mode` and still producing a plan compatible with existing submit validation.
+集成测试需要覆盖 `generate_plan_report()` 能识别新的 `strategy_mode`，并且生成的 plan 仍然兼容现有提交校验。

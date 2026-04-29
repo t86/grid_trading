@@ -77,11 +77,206 @@ from grid_optimizer.loop_runner import (
     sync_synthetic_ledger,
     update_synthetic_order_refs,
 )
-from grid_optimizer.semi_auto_plan import build_hedge_micro_grid_plan, build_static_binance_grid_plan
+from grid_optimizer.semi_auto_plan import (
+    build_hedge_micro_grid_plan,
+    build_maker_volatility_inventory_plan,
+    build_static_binance_grid_plan,
+)
 from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def _maker_plan(self, **overrides):
+        params = {
+            "bid_price": 100.0,
+            "ask_price": 100.2,
+            "current_net_qty": 0.0,
+            "window_open": 100.0,
+            "window_high": 100.25,
+            "window_low": 99.95,
+            "window_close": 100.1,
+            "base_spread_bps": 4.0,
+            "wide_spread_bps": 12.0,
+            "order_notional": 30.0,
+            "max_long_notional": 300.0,
+            "max_short_notional": 300.0,
+            "inventory_soft_ratio": 0.7,
+            "volatility_wide_threshold": 0.006,
+            "extreme_volatility_threshold": 0.012,
+            "directional_move_threshold": 0.004,
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        params.update(overrides)
+        return build_maker_volatility_inventory_plan(**params)
+
+    def test_maker_volatility_inventory_normal_generates_two_sided_orders(self) -> None:
+        plan = self._maker_plan()
+
+        self.assertEqual(plan["maker_state"]["regime"], "normal")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "maker_entry_long")
+        self.assertEqual(plan["sell_orders"][0]["role"], "maker_entry_short")
+        self.assertLess(plan["buy_orders"][0]["price"], 100.0)
+        self.assertGreater(plan["sell_orders"][0]["price"], 100.2)
+
+    def test_maker_volatility_inventory_high_volatility_widens_quotes(self) -> None:
+        normal = self._maker_plan()
+        wide = self._maker_plan(window_high=100.7, window_low=99.8, window_close=100.4)
+
+        self.assertEqual(wide["maker_state"]["regime"], "volatility_wide")
+        self.assertLess(wide["buy_orders"][0]["price"], normal["buy_orders"][0]["price"])
+        self.assertGreater(wide["sell_orders"][0]["price"], normal["sell_orders"][0]["price"])
+
+    def test_maker_volatility_inventory_extreme_volatility_enters_cooldown(self) -> None:
+        plan = self._maker_plan(window_high=102.0, window_low=99.5, window_close=101.5)
+
+        self.assertEqual(plan["maker_state"]["regime"], "cooldown")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["maker_state"]["blocked_reason"], "extreme_volatility")
+
+    def test_maker_volatility_inventory_soft_long_inventory_suppresses_buy(self) -> None:
+        plan = self._maker_plan(current_net_qty=2.2)
+
+        self.assertEqual(plan["maker_state"]["regime"], "long_inventory_reduce")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "maker_reduce_long")
+
+    def test_maker_volatility_inventory_soft_short_inventory_suppresses_sell(self) -> None:
+        plan = self._maker_plan(current_net_qty=-2.2)
+
+        self.assertEqual(plan["maker_state"]["regime"], "short_inventory_reduce")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["buy_orders"][0]["role"], "maker_reduce_short")
+
+    def test_maker_volatility_inventory_hard_long_inventory_reduce_only(self) -> None:
+        plan = self._maker_plan(current_net_qty=3.1)
+
+        self.assertEqual(plan["maker_state"]["regime"], "hard_reduce_only")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "maker_reduce_long")
+
+    def test_maker_volatility_inventory_hard_short_inventory_reduce_only(self) -> None:
+        plan = self._maker_plan(current_net_qty=-3.1)
+
+        self.assertEqual(plan["maker_state"]["regime"], "hard_reduce_only")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["buy_orders"][0]["role"], "maker_reduce_short")
+
+    def test_maker_volatility_inventory_fast_selloff_with_long_inventory_reduce_only(self) -> None:
+        plan = self._maker_plan(current_net_qty=2.2, window_high=100.4, window_low=99.5, window_close=99.5)
+
+        self.assertEqual(plan["maker_state"]["regime"], "long_inventory_reduce")
+        self.assertIn("fast_down_move", plan["maker_state"]["reasons"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"][0]["role"], "maker_reduce_long")
+
+    def test_maker_volatility_inventory_fast_rally_with_short_inventory_reduce_only(self) -> None:
+        plan = self._maker_plan(current_net_qty=-2.2, window_high=100.7, window_low=99.8, window_close=100.5)
+
+        self.assertEqual(plan["maker_state"]["regime"], "short_inventory_reduce")
+        self.assertIn("fast_up_move", plan["maker_state"]["reasons"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["buy_orders"][0]["role"], "maker_reduce_short")
+
+    def test_maker_volatility_inventory_invalid_market_data_blocks_orders(self) -> None:
+        plan = self._maker_plan(bid_price=0.0)
+
+        self.assertEqual(plan["maker_state"]["regime"], "blocked")
+        self.assertEqual(plan["maker_state"]["blocked_reason"], "invalid_market_data")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_klines")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_maker_volatility_inventory_generate_plan_report_uses_futures_runner(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_klines,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "100.0", "ask_price": "100.2"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BARDUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        now = datetime(2026, 4, 29, 8, 0, tzinfo=timezone.utc)
+        mock_klines.return_value = [
+            Candle(
+                open_time=now - timedelta(minutes=1),
+                close_time=now,
+                open=100.0,
+                high=100.25,
+                low=99.95,
+                close=100.1,
+            )
+        ]
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                strategy_mode="maker_volatility_inventory_v1",
+                strategy_profile="maker_volatility_inventory_v1",
+                maker_base_spread_bps=4.0,
+                maker_wide_spread_bps=12.0,
+                maker_order_notional=30.0,
+                maker_max_long_notional=300.0,
+                maker_max_short_notional=300.0,
+                maker_inventory_soft_ratio=0.7,
+                maker_volatility_window="1m",
+                maker_volatility_wide_threshold=0.006,
+                maker_extreme_volatility_threshold=0.012,
+                maker_directional_move_threshold=0.004,
+                maker_cooldown_seconds=30.0,
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["strategy_mode"], "maker_volatility_inventory_v1")
+        self.assertEqual(report["maker_volatility_inventory"]["regime"], "normal")
+        self.assertEqual(len(report["buy_orders"]), 1)
+        self.assertEqual(len(report["sell_orders"]), 1)
+        self.assertEqual(report["buy_orders"][0]["role"], "maker_entry_long")
+        self.assertEqual(report["sell_orders"][0]["role"], "maker_entry_short")
+
     def test_filter_futures_strategy_orders_ignores_manual_and_flatten_orders(self) -> None:
         open_orders = [
             {"clientOrderId": "gx-btcusdc-001", "orderId": 1},
