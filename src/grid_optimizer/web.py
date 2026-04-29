@@ -153,6 +153,8 @@ COMPETITION_BOARD_AUTO_REFRESH_DEFAULT_SECONDS = 600.0
 COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS = 60.0
 COMPETITION_BOARD_API_RESPONSE_CACHE: dict[str, tuple[float, bytes]] = {}
 COMPETITION_BOARD_API_RESPONSE_CACHE_LOCK = threading.Lock()
+RUNNING_STATUS_API_RESPONSE_CACHE: dict[str, tuple[float, bytes]] = {}
+RUNNING_STATUS_API_RESPONSE_CACHE_LOCK = threading.Lock()
 BASIS_CACHE: dict[str, dict[str, Any]] = {}
 BASIS_CACHE_LOCK = threading.Lock()
 DETAIL_CACHE: dict[str, dict[str, Any]] = {}
@@ -3446,6 +3448,28 @@ def _build_competition_board_api_body(*, refresh: bool) -> bytes:
         body = json.dumps({"ok": True, "snapshot": snapshot}, ensure_ascii=False).encode("utf-8")
         if ttl > 0:
             COMPETITION_BOARD_API_RESPONSE_CACHE[cache_key] = (time.monotonic(), body)
+        return body
+
+
+def _running_status_api_cache_seconds() -> float:
+    raw = os.environ.get("GRID_RUNNING_STATUS_API_CACHE_SECONDS", "30").strip()
+    try:
+        value = float(raw)
+    except ValueError:
+        return 30.0
+    return max(0.0, value)
+
+
+def _build_running_status_api_body(cache_key: str, payload_factory: Callable[[], dict[str, Any]]) -> bytes:
+    ttl = _running_status_api_cache_seconds()
+    now = time.monotonic()
+    with RUNNING_STATUS_API_RESPONSE_CACHE_LOCK:
+        cached = RUNNING_STATUS_API_RESPONSE_CACHE.get(cache_key)
+        if ttl > 0 and cached is not None and now - cached[0] <= ttl:
+            return cached[1]
+        body = json.dumps(payload_factory(), ensure_ascii=False).encode("utf-8")
+        if ttl > 0:
+            RUNNING_STATUS_API_RESPONSE_CACHE[cache_key] = (time.monotonic(), body)
         return body
 
 
@@ -29226,7 +29250,7 @@ def _running_status_audit_limit() -> int:
         value = int(raw)
     except ValueError:
         return 20000
-    return max(1000, value)
+    return max(100, value)
 
 
 def _read_running_status_audit_rows(path: Path) -> list[dict[str, Any]]:
@@ -29764,25 +29788,37 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/running_status":
             try:
-                payload = _run_running_status_query(query)
+                body = _build_running_status_api_body(
+                    f"running_status:{parsed.query}",
+                    lambda: _run_running_status_query(query),
+                )
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
-            self._send_json(payload, status=HTTPStatus.OK)
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("application/json; charset=utf-8", len(body))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/api/running_status_overview":
             try:
-                payload = _run_running_status_overview_query(query)
+                body = _build_running_status_api_body(
+                    f"running_status_overview:{parsed.query}",
+                    lambda: _run_running_status_overview_query(query),
+                )
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
-            self._send_json(payload, status=HTTPStatus.OK)
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("application/json; charset=utf-8", len(body))
+            self.end_headers()
+            self.wfile.write(body)
             return
         if path == "/api/competition_board":
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"

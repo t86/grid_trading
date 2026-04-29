@@ -103,7 +103,7 @@ def _runtime_jsonl_limit() -> int:
         value = int(raw)
     except ValueError:
         return 5000
-    return max(200, value)
+    return max(100, value)
 
 
 def _read_jsonl_tail(path: Path, *, limit: int) -> list[dict[str, Any]]:
