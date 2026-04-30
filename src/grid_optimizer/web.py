@@ -995,7 +995,18 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "short_cover_pause_down_return_trigger_ratio": -0.0022,
             "take_profit_min_profit_ratio": 0.0001,
             "freeze_shift_abs_return_trigger_ratio": 0.006,
-            "adaptive_step_enabled": False,
+            "adaptive_step_enabled": True,
+            "adaptive_step_30s_abs_return_ratio": 0.0010,
+            "adaptive_step_30s_amplitude_ratio": 0.0014,
+            "adaptive_step_1m_abs_return_ratio": 0.0016,
+            "adaptive_step_1m_amplitude_ratio": 0.0022,
+            "adaptive_step_3m_abs_return_ratio": 0.0035,
+            "adaptive_step_3m_amplitude_ratio": 0.0045,
+            "adaptive_step_5m_abs_return_ratio": 0.0050,
+            "adaptive_step_5m_amplitude_ratio": 0.0065,
+            "adaptive_step_max_scale": 2.5,
+            "adaptive_step_min_per_order_scale": 1.0,
+            "adaptive_step_min_position_limit_scale": 0.75,
             "synthetic_trend_follow_enabled": False,
             "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
             "rolling_hourly_loss_limit": 6.0,
@@ -2614,9 +2625,11 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "adaptive_step_30s_abs_return_ratio": 0.0025,
             "adaptive_step_30s_amplitude_ratio": 0.0040,
             "adaptive_step_1m_abs_return_ratio": 0.0040,
-            "adaptive_step_1m_amplitude_ratio": 0.0060,
+            "adaptive_step_1m_amplitude_ratio": 0.00375,
             "adaptive_step_3m_abs_return_ratio": 0.0090,
+            "adaptive_step_3m_amplitude_ratio": 0.0060,
             "adaptive_step_5m_abs_return_ratio": 0.0130,
+            "adaptive_step_5m_amplitude_ratio": 0.0080,
             "adaptive_step_max_scale": 2.5,
             "adaptive_step_min_per_order_scale": 0.70,
             "adaptive_step_min_position_limit_scale": 0.75,
@@ -3239,7 +3252,9 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adaptive_step_1m_abs_return_ratio": 0.0,
     "adaptive_step_1m_amplitude_ratio": 0.0,
     "adaptive_step_3m_abs_return_ratio": 0.0,
+    "adaptive_step_3m_amplitude_ratio": 0.0,
     "adaptive_step_5m_abs_return_ratio": 0.0,
+    "adaptive_step_5m_amplitude_ratio": 0.0,
     "adaptive_step_max_scale": 1.0,
     "adaptive_step_min_per_order_scale": 1.0,
     "adaptive_step_min_position_limit_scale": 1.0,
@@ -7605,7 +7620,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_1m_abs_return_ratio",
         "adaptive_step_1m_amplitude_ratio",
         "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_3m_amplitude_ratio",
         "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_5m_amplitude_ratio",
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
@@ -7780,7 +7797,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_1m_abs_return_ratio",
         "adaptive_step_1m_amplitude_ratio",
         "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_3m_amplitude_ratio",
         "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_5m_amplitude_ratio",
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
@@ -8437,8 +8456,12 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--adaptive-step-1m-amplitude-ratio", str(config["adaptive_step_1m_amplitude_ratio"])])
     if config.get("adaptive_step_3m_abs_return_ratio") is not None:
         command.extend(["--adaptive-step-3m-abs-return-ratio", str(config["adaptive_step_3m_abs_return_ratio"])])
+    if config.get("adaptive_step_3m_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-3m-amplitude-ratio", str(config["adaptive_step_3m_amplitude_ratio"])])
     if config.get("adaptive_step_5m_abs_return_ratio") is not None:
         command.extend(["--adaptive-step-5m-abs-return-ratio", str(config["adaptive_step_5m_abs_return_ratio"])])
+    if config.get("adaptive_step_5m_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-5m-amplitude-ratio", str(config["adaptive_step_5m_amplitude_ratio"])])
     if config.get("adaptive_step_max_scale") is not None:
         command.extend(["--adaptive-step-max-scale", str(config["adaptive_step_max_scale"])])
     if config.get("adaptive_step_min_per_order_scale") is not None:
@@ -8813,7 +8836,9 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "adaptive_step_1m_abs_return_ratio",
             "adaptive_step_1m_amplitude_ratio",
             "adaptive_step_3m_abs_return_ratio",
+            "adaptive_step_3m_amplitude_ratio",
             "adaptive_step_5m_abs_return_ratio",
+            "adaptive_step_5m_amplitude_ratio",
             "adaptive_step_max_scale",
             "adaptive_step_min_per_order_scale",
             "adaptive_step_min_position_limit_scale",
@@ -17653,8 +17678,14 @@ MONITOR_PAGE = """<!doctype html>
                 <label>3 分钟绝对涨跌阈值
                   <input id="runner_field_adaptive_step_3m_abs_return_ratio" type="number" min="0" step="0.000001" />
                 </label>
+                <label>3 分钟振幅阈值
+                  <input id="runner_field_adaptive_step_3m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
                 <label>5 分钟绝对涨跌阈值
                   <input id="runner_field_adaptive_step_5m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>5 分钟振幅阈值
+                  <input id="runner_field_adaptive_step_5m_amplitude_ratio" type="number" min="0" step="0.000001" />
                 </label>
                 <label>最大放大倍数
                   <input id="runner_field_adaptive_step_max_scale" type="number" min="0" step="0.01" />
@@ -18331,6 +18362,7 @@ MONITOR_PAGE = """<!doctype html>
           maker_retries: 2,
           max_new_orders: Math.max((levels * 2) + 4, 16),
           autotune_symbol_enabled: false,
+          ...(options.extraConfig || {}),
         },
       };
     }
@@ -19016,7 +19048,18 @@ MONITOR_PAGE = """<!doctype html>
           short_cover_pause_down_return_trigger_ratio: -0.0022,
           take_profit_min_profit_ratio: 0.0001,
           freeze_shift_abs_return_trigger_ratio: 0.006,
-          adaptive_step_enabled: false,
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.0010,
+          adaptive_step_30s_amplitude_ratio: 0.0014,
+          adaptive_step_1m_abs_return_ratio: 0.0016,
+          adaptive_step_1m_amplitude_ratio: 0.0022,
+          adaptive_step_3m_abs_return_ratio: 0.0035,
+          adaptive_step_3m_amplitude_ratio: 0.0045,
+          adaptive_step_5m_abs_return_ratio: 0.0050,
+          adaptive_step_5m_amplitude_ratio: 0.0065,
+          adaptive_step_max_scale: 2.5,
+          adaptive_step_min_per_order_scale: 1.0,
+          adaptive_step_min_position_limit_scale: 0.75,
           synthetic_trend_follow_enabled: false,
           runtime_guard_stats_start_time: "2026-03-31T18:00:00+08:00",
           rolling_hourly_loss_limit: 6.0,
@@ -19666,6 +19709,20 @@ MONITOR_PAGE = """<!doctype html>
         maxActualNetNotional: 90.0,
         maxSyntheticDriftNotional: 50.0,
         levels: 6,
+        extraConfig: {
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.0025,
+          adaptive_step_30s_amplitude_ratio: 0.004,
+          adaptive_step_1m_abs_return_ratio: 0.004,
+          adaptive_step_1m_amplitude_ratio: 0.00375,
+          adaptive_step_3m_abs_return_ratio: 0.009,
+          adaptive_step_3m_amplitude_ratio: 0.006,
+          adaptive_step_5m_abs_return_ratio: 0.013,
+          adaptive_step_5m_amplitude_ratio: 0.008,
+          adaptive_step_max_scale: 2.5,
+          adaptive_step_min_per_order_scale: 0.7,
+          adaptive_step_min_position_limit_scale: 0.75,
+        },
       }),
       competitionSprintPreset({
         key: "btcusdc_competition_maker_neutral_conservative_v1",
@@ -20436,7 +20493,9 @@ MONITOR_PAGE = """<!doctype html>
       { key: "adaptive_step_1m_abs_return_ratio", id: "runner_field_adaptive_step_1m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_1m_amplitude_ratio", id: "runner_field_adaptive_step_1m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_3m_abs_return_ratio", id: "runner_field_adaptive_step_3m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_3m_amplitude_ratio", id: "runner_field_adaptive_step_3m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_5m_abs_return_ratio", id: "runner_field_adaptive_step_5m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_5m_amplitude_ratio", id: "runner_field_adaptive_step_5m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_max_scale", id: "runner_field_adaptive_step_max_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_per_order_scale", id: "runner_field_adaptive_step_min_per_order_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_position_limit_scale", id: "runner_field_adaptive_step_min_position_limit_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },

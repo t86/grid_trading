@@ -472,6 +472,8 @@ def resolve_adaptive_step_price(
     window_3m_abs_return_ratio: float | None,
     window_5m_abs_return_ratio: float | None,
     max_scale: float,
+    window_3m_amplitude_ratio: float | None = None,
+    window_5m_amplitude_ratio: float | None = None,
     base_per_order_notional: float | None = None,
     base_base_position_notional: float | None = None,
     base_inventory_tier_start_notional: float | None = None,
@@ -555,9 +557,11 @@ def resolve_adaptive_step_price(
         },
         "window_3m": {
             "abs_return_ratio": _safe_float(window_3m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_3m_amplitude_ratio),
         },
         "window_5m": {
             "abs_return_ratio": _safe_float(window_5m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_5m_amplitude_ratio),
         },
     }
     candidates: list[tuple[float, str, str, float, float]] = []
@@ -3353,7 +3357,9 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         adaptive_step_1m_abs_return_ratio=getattr(args, "adaptive_step_1m_abs_return_ratio", 0.0),
         adaptive_step_1m_amplitude_ratio=getattr(args, "adaptive_step_1m_amplitude_ratio", 0.0),
         adaptive_step_3m_abs_return_ratio=getattr(args, "adaptive_step_3m_abs_return_ratio", 0.0),
+        adaptive_step_3m_amplitude_ratio=getattr(args, "adaptive_step_3m_amplitude_ratio", 0.0),
         adaptive_step_5m_abs_return_ratio=getattr(args, "adaptive_step_5m_abs_return_ratio", 0.0),
+        adaptive_step_5m_amplitude_ratio=getattr(args, "adaptive_step_5m_amplitude_ratio", 0.0),
         adaptive_step_max_scale=getattr(args, "adaptive_step_max_scale", 1.0),
         adaptive_step_min_per_order_scale=getattr(args, "adaptive_step_min_per_order_scale", 1.0),
         adaptive_step_min_position_limit_scale=getattr(args, "adaptive_step_min_position_limit_scale", 1.0),
@@ -7987,6 +7993,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         window_3m_abs_return_ratio=getattr(effective_args, "adaptive_step_3m_abs_return_ratio", None),
         window_5m_abs_return_ratio=getattr(effective_args, "adaptive_step_5m_abs_return_ratio", None),
         max_scale=float(getattr(effective_args, "adaptive_step_max_scale", 1.0)),
+        window_3m_amplitude_ratio=getattr(effective_args, "adaptive_step_3m_amplitude_ratio", None),
+        window_5m_amplitude_ratio=getattr(effective_args, "adaptive_step_5m_amplitude_ratio", None),
         base_per_order_notional=getattr(effective_args, "per_order_notional", None),
         base_base_position_notional=getattr(effective_args, "base_position_notional", None),
         base_inventory_tier_start_notional=getattr(effective_args, "inventory_tier_start_notional", None),
@@ -10969,7 +10977,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-1m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-3m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-5m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-5m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
@@ -11462,8 +11472,10 @@ def main() -> None:
         raise SystemExit("--adaptive-step 30s thresholds must be >= 0")
     if args.adaptive_step_1m_abs_return_ratio < 0 or args.adaptive_step_1m_amplitude_ratio < 0:
         raise SystemExit("--adaptive-step 1m thresholds must be >= 0")
-    if args.adaptive_step_3m_abs_return_ratio < 0 or args.adaptive_step_5m_abs_return_ratio < 0:
-        raise SystemExit("--adaptive-step trend thresholds must be >= 0")
+    if args.adaptive_step_3m_abs_return_ratio < 0 or args.adaptive_step_3m_amplitude_ratio < 0:
+        raise SystemExit("--adaptive-step 3m thresholds must be >= 0")
+    if args.adaptive_step_5m_abs_return_ratio < 0 or args.adaptive_step_5m_amplitude_ratio < 0:
+        raise SystemExit("--adaptive-step 5m thresholds must be >= 0")
     if args.adaptive_step_enabled and args.adaptive_step_max_scale <= 1.0:
         raise SystemExit("--adaptive-step-max-scale must be > 1 when adaptive step is enabled")
     if args.adaptive_step_min_per_order_scale <= 0 or args.adaptive_step_min_per_order_scale > 1.0:
@@ -11478,7 +11490,9 @@ def main() -> None:
             args.adaptive_step_1m_abs_return_ratio,
             args.adaptive_step_1m_amplitude_ratio,
             args.adaptive_step_3m_abs_return_ratio,
+            args.adaptive_step_3m_amplitude_ratio,
             args.adaptive_step_5m_abs_return_ratio,
+            args.adaptive_step_5m_amplitude_ratio,
         )
     ):
         raise SystemExit("adaptive step requires at least one positive shock/trend trigger threshold")

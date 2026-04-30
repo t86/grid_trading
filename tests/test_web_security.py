@@ -776,7 +776,9 @@ class WebSecurityTests(unittest.TestCase):
                 "adaptive_step_1m_abs_return_ratio": 0.0045,
                 "adaptive_step_1m_amplitude_ratio": 0.0065,
                 "adaptive_step_3m_abs_return_ratio": 0.0100,
+                "adaptive_step_3m_amplitude_ratio": 0.0080,
                 "adaptive_step_5m_abs_return_ratio": 0.0140,
+                "adaptive_step_5m_amplitude_ratio": 0.0100,
                 "adaptive_step_max_scale": 3.0,
                 "adaptive_step_min_per_order_scale": 0.35,
                 "adaptive_step_min_position_limit_scale": 0.45,
@@ -1651,6 +1653,9 @@ class WebSecurityTests(unittest.TestCase):
                 if profile == "ordiusdc_competition_neutral_ping_pong_v1":
                     self.assertTrue(payload["adaptive_step_enabled"])
                     self.assertEqual(payload["adaptive_step_max_scale"], 2.5)
+                    self.assertAlmostEqual(payload["adaptive_step_1m_amplitude_ratio"], 0.00375)
+                    self.assertAlmostEqual(payload["adaptive_step_3m_amplitude_ratio"], 0.006)
+                    self.assertAlmostEqual(payload["adaptive_step_5m_amplitude_ratio"], 0.008)
                 else:
                     self.assertFalse(payload["adaptive_step_enabled"])
                 if profile == "btcusdc_competition_neutral_ping_pong_v1":
@@ -1987,7 +1992,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["max_short_position_notional"], 320.0)
         self.assertEqual(config["max_total_notional"], 2200.0)
         self.assertEqual(config["leverage"], 10)
-        self.assertFalse(config["adaptive_step_enabled"])
+        self.assertTrue(config["adaptive_step_enabled"])
+        self.assertEqual(config["adaptive_step_max_scale"], 2.5)
         self.assertFalse(config["synthetic_trend_follow_enabled"])
         self.assertFalse(config["autotune_symbol_enabled"])
 
@@ -2522,7 +2528,9 @@ class WebSecurityTests(unittest.TestCase):
                 "adaptive_step_1m_abs_return_ratio": 0.0045,
                 "adaptive_step_1m_amplitude_ratio": 0.0065,
                 "adaptive_step_3m_abs_return_ratio": 0.0100,
+                "adaptive_step_3m_amplitude_ratio": 0.0080,
                 "adaptive_step_5m_abs_return_ratio": 0.0140,
+                "adaptive_step_5m_amplitude_ratio": 0.0100,
                 "adaptive_step_max_scale": 3.0,
                 "adaptive_step_min_per_order_scale": 0.35,
                 "adaptive_step_min_position_limit_scale": 0.45,
@@ -2550,7 +2558,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adaptive-step-1m-abs-return-ratio", command)
         self.assertIn("--adaptive-step-1m-amplitude-ratio", command)
         self.assertIn("--adaptive-step-3m-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-3m-amplitude-ratio", command)
         self.assertIn("--adaptive-step-5m-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-5m-amplitude-ratio", command)
         self.assertIn("--adaptive-step-max-scale", command)
         self.assertIn("--adaptive-step-min-per-order-scale", command)
         self.assertIn("--adaptive-step-min-position-limit-scale", command)
@@ -3876,6 +3886,11 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
         self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
+
+    def test_monitor_page_ordiusdc_ping_pong_includes_adaptive_step_amplitude_controls(self) -> None:
+        self.assertIn("adaptive_step_1m_amplitude_ratio: 0.00375", MONITOR_PAGE)
+        self.assertIn("adaptive_step_3m_amplitude_ratio: 0.006", MONITOR_PAGE)
+        self.assertIn("adaptive_step_5m_amplitude_ratio: 0.008", MONITOR_PAGE)
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:
