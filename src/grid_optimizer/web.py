@@ -16550,7 +16550,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     symbolEl.addEventListener("change", () => refreshStatus({ force: true }).catch((err) => actionMetaEl.textContent = err.message));
     loadSymbols()
       .then(refreshStatus)
-      .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 3000); })
+      .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 8000); })
       .catch((err) => { actionMetaEl.textContent = err.message; });
   </script>
 </body>

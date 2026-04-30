@@ -171,6 +171,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("/api/manual_trade/maker", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
+        self.assertIn("setInterval(() => refreshStatus().catch(() => {}), 8000)", MANUAL_TRADE_PAGE)
         self.assertIn("fetchJsonWithTimeout", MANUAL_TRADE_PAGE)
         self.assertIn("cancelStatusRefresh()", MANUAL_TRADE_PAGE)
         self.assertIn('setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500)', MANUAL_TRADE_PAGE)
