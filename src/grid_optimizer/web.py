@@ -3418,10 +3418,23 @@ def _security_headers() -> dict[str, str]:
 
 
 def _competition_board_auto_refresh_enabled() -> bool:
+    if not _competition_board_enabled():
+        return False
     raw = os.environ.get("GRID_COMPETITION_BOARD_AUTO_REFRESH", "").strip().lower()
     if not raw:
         return True
     return raw in {"1", "true", "yes", "on"}
+
+
+def _competition_board_enabled() -> bool:
+    raw = os.environ.get("GRID_COMPETITION_BOARD_ENABLED", "").strip().lower()
+    if not raw:
+        return True
+    return raw not in {"0", "false", "no", "off"}
+
+
+def _competition_board_disabled_payload() -> dict[str, Any]:
+    return {"ok": False, "error": "competition board is disabled"}
 
 
 def _competition_board_auto_refresh_interval_seconds() -> float:
@@ -29965,6 +29978,9 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_html(RANKING_PAGE, status=HTTPStatus.OK)
             return
         if path in {"/competition_board", "/competition_board.html"}:
+            if not _competition_board_enabled():
+                self._send_json(_competition_board_disabled_payload(), status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             self._send_html(COMPETITION_BOARD_PAGE, status=HTTPStatus.OK)
             return
         if path in {"/basis", "/basis.html"}:
@@ -30036,6 +30052,9 @@ class _Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
             return
         if path == "/api/competition_board":
+            if not _competition_board_enabled():
+                self._send_json(_competition_board_disabled_payload(), status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"
             try:
                 body = _build_competition_board_api_body(refresh=refresh)
@@ -30272,6 +30291,12 @@ class _Handler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         if path in {"/competition_board", "/competition_board.html"}:
+            if not _competition_board_enabled():
+                body = json.dumps(_competition_board_disabled_payload(), ensure_ascii=False).encode("utf-8")
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self._send_common_headers("application/json; charset=utf-8", len(body))
+                self.end_headers()
+                return
             body = COMPETITION_BOARD_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("text/html; charset=utf-8", len(body))
@@ -30353,6 +30378,12 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/spot_runner/save"
             or path == "/api/manual_trade/status"
         ):
+            if path == "/api/competition_board" and not _competition_board_enabled():
+                body = json.dumps(_competition_board_disabled_payload(), ensure_ascii=False).encode("utf-8")
+                self.send_response(HTTPStatus.SERVICE_UNAVAILABLE)
+                self._send_common_headers("application/json; charset=utf-8", len(body))
+                self.end_headers()
+                return
             body = json.dumps({"ok": True}, ensure_ascii=False).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self._send_common_headers("application/json; charset=utf-8", len(body))
@@ -30533,6 +30564,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/api/competition_entries":
+            if not _competition_board_enabled():
+                self._send_json(_competition_board_disabled_payload(), status=HTTPStatus.SERVICE_UNAVAILABLE)
+                return
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:

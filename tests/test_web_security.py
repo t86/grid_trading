@@ -22,6 +22,7 @@ from grid_optimizer.web import (
     _delete_custom_grid_runner_preset,
     _build_runner_command,
     _client_ip_allowed,
+    _competition_board_auto_refresh_enabled,
     _default_runtime_paths_for_symbol,
     _cancel_symbol_open_orders,
     _execute_stop_actions,
@@ -244,6 +245,55 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("const fee = Math.abs(Number(value));", page)
         self.assertNotIn("const feeCost = -Number(value);", page)
         self.assertNotIn("fmtMoney(-item.fees)", page)
+
+    def test_competition_board_disabled_blocks_get_routes(self) -> None:
+        for path in ("/competition_board", "/api/competition_board?refresh=1"):
+            with self.subTest(path=path), patch.dict(
+                "grid_optimizer.web.os.environ",
+                {"GRID_COMPETITION_BOARD_ENABLED": "0"},
+            ), patch("grid_optimizer.web.build_competition_board_snapshot") as mock_snapshot:
+                handler = object.__new__(_Handler)
+                handler.path = path
+                handler.headers = {}
+                handler._authorize_request = lambda: True
+                handler._send_json = Mock()
+
+                _Handler.do_GET(handler)
+
+                handler._send_json.assert_called_once()
+                self.assertFalse(handler._send_json.call_args.args[0]["ok"])
+                self.assertEqual(handler._send_json.call_args.kwargs["status"], 503)
+                mock_snapshot.assert_not_called()
+
+    def test_competition_board_disabled_blocks_entry_updates(self) -> None:
+        payload = b'{"action":"upsert","symbol":"BTCUSDC"}'
+        with patch.dict(
+            "grid_optimizer.web.os.environ",
+            {"GRID_COMPETITION_BOARD_ENABLED": "0"},
+        ), patch("grid_optimizer.web.build_competition_board_snapshot") as mock_snapshot:
+            handler = object.__new__(_Handler)
+            handler.path = "/api/competition_entries"
+            handler.headers = {"Content-Length": str(len(payload))}
+            handler.rfile = io.BytesIO(payload)
+            handler._authorize_request = lambda: True
+            handler._send_json = Mock()
+
+            _Handler.do_POST(handler)
+
+            handler._send_json.assert_called_once()
+            self.assertFalse(handler._send_json.call_args.args[0]["ok"])
+            self.assertEqual(handler._send_json.call_args.kwargs["status"], 503)
+            mock_snapshot.assert_not_called()
+
+    def test_competition_board_disabled_turns_off_auto_refresh(self) -> None:
+        with patch.dict(
+            "grid_optimizer.web.os.environ",
+            {
+                "GRID_COMPETITION_BOARD_ENABLED": "0",
+                "GRID_COMPETITION_BOARD_AUTO_REFRESH": "1",
+            },
+        ):
+            self.assertFalse(_competition_board_auto_refresh_enabled())
 
     def test_running_status_spot_symbols_reads_spot_loop_control_files(self) -> None:
         from grid_optimizer.web import _running_status_spot_symbols
