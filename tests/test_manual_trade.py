@@ -16,6 +16,7 @@ from grid_optimizer.web import (
     _manual_trade_current_task,
     _manual_trade_ensure_isolated,
     _manual_trade_history_for_symbol,
+    _manual_trade_public_history_for_symbol,
     _manual_trade_maker_worker,
     MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS,
     MANUAL_TRADE_SLEEP_SECONDS,
@@ -175,6 +176,11 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("fetchJsonWithTimeout", MANUAL_TRADE_PAGE)
         self.assertIn("cancelStatusRefresh()", MANUAL_TRADE_PAGE)
         self.assertIn('setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500)', MANUAL_TRADE_PAGE)
+        self.assertIn('new URLSearchParams(window.location.search).get("symbol")', MANUAL_TRADE_PAGE)
+        self.assertIn('symbols.includes("BTCUSDC") ? "BTCUSDC"', MANUAL_TRADE_PAGE)
+        self.assertIn("clearSnapshotForSymbol(symbolEl.value)", MANUAL_TRADE_PAGE)
+        self.assertIn("if (snapshot.symbol && symbolEl.value && snapshot.symbol !== symbolEl.value) return", MANUAL_TRADE_PAGE)
+        self.assertIn("manualPrefixForSymbol", MANUAL_TRADE_PAGE)
         self.assertIn('id="history_body"', MANUAL_TRADE_PAGE)
         self.assertIn("renderHistory(snapshot.history || [])", MANUAL_TRADE_PAGE)
 
@@ -206,6 +212,27 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(eth_history[0]["symbol"], "ETHUSDC")
         self.assertIn('"BTCUSDC"', self.history_path.read_text(encoding="utf-8"))
         self.assertIn('"ETHUSDC"', self.history_path.read_text(encoding="utf-8"))
+
+    def test_manual_trade_public_history_is_compact_and_limited(self) -> None:
+        for idx in range(205):
+            _manual_trade_append_history(
+                {
+                    "source": "maker",
+                    "symbol": "BTCUSDC",
+                    "side": "BUY",
+                    "executed_qty": 0.01,
+                    "avg_fill_price": 100.0 + idx,
+                    "legs_done": [{"last_order": {"large": "payload"}}],
+                    "orders": [{"large": "payload"}],
+                }
+            )
+
+        public_history = _manual_trade_public_history_for_symbol("BTCUSDC")
+        self.assertEqual(len(public_history), 200)
+        self.assertEqual(public_history[0]["avg_fill_price"], 105.0)
+        self.assertEqual(public_history[-1]["avg_fill_price"], 304.0)
+        self.assertNotIn("legs_done", public_history[-1])
+        self.assertNotIn("orders", public_history[-1])
 
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     @patch("grid_optimizer.web.fetch_futures_account_info_v3")

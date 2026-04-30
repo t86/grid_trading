@@ -182,6 +182,23 @@ HOURLY_EMAIL_REPORT_STATE_PATH = Path("output/hourly_email_report_state.json")
 MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
 CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
 MANUAL_TRADE_HISTORY_PATH = Path("output/manual_trade_history.json")
+MANUAL_TRADE_STATUS_HISTORY_LIMIT = 200
+MANUAL_TRADE_STATUS_HISTORY_FIELDS = (
+    "id",
+    "source",
+    "symbol",
+    "side",
+    "status",
+    "target_notional",
+    "planned_notional",
+    "executed_qty",
+    "avg_fill_price",
+    "last_fill_price",
+    "fill_notional",
+    "attempts",
+    "started_at",
+    "completed_at",
+)
 VOLUME_TRIGGER_WINDOW_MINUTES: dict[str, int] = {
     "15m": 15,
     "30m": 30,
@@ -9569,6 +9586,16 @@ def _manual_trade_history_for_symbol(symbol: str) -> list[dict[str, Any]]:
     return [dict(item) for item in symbols.get(key, [])]
 
 
+def _manual_trade_public_history_item(item: dict[str, Any]) -> dict[str, Any]:
+    return {field: item[field] for field in MANUAL_TRADE_STATUS_HISTORY_FIELDS if field in item}
+
+
+def _manual_trade_public_history_for_symbol(symbol: str) -> list[dict[str, Any]]:
+    history = _manual_trade_history_for_symbol(symbol)
+    recent = history[-MANUAL_TRADE_STATUS_HISTORY_LIMIT:]
+    return [_manual_trade_public_history_item(item) for item in recent]
+
+
 def _manual_trade_append_history(item: dict[str, Any]) -> dict[str, Any]:
     record = dict(item)
     record["symbol"] = _manual_trade_task_key(str(record.get("symbol", "")))
@@ -9802,7 +9829,7 @@ def _manual_trade_snapshot(symbol: str) -> dict[str, Any]:
         "manual_prefix": prefix,
         "runner": runner,
         "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol)),
-        "history": _manual_trade_history_for_symbol(normalized_symbol),
+        "history": _manual_trade_public_history_for_symbol(normalized_symbol),
     }
 
 
@@ -16445,6 +16472,25 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       if (!Number.isFinite(num)) return "--";
       return num.toLocaleString(undefined, { maximumFractionDigits: digits });
     }
+    function manualPrefixForSymbol(symbol) {
+      return `mt_${String(symbol || "").toLowerCase().replace(/[^a-z0-9_]/g, "")}`;
+    }
+    function clearSnapshotForSymbol(symbol, message = "等待状态刷新...") {
+      document.getElementById("prefix_code").textContent = manualPrefixForSymbol(symbol);
+      document.getElementById("position_mode_value").textContent = "--";
+      document.getElementById("margin_value").textContent = "--";
+      document.getElementById("position_amt_value").textContent = "--";
+      document.getElementById("entry_value").textContent = "-- / --";
+      document.getElementById("bid_value").textContent = "--";
+      document.getElementById("ask_value").textContent = "--";
+      document.getElementById("orders_value").textContent = "--";
+      document.getElementById("runner_value").textContent = "--";
+      riskBoxEl.style.display = "none";
+      riskBoxEl.innerHTML = "";
+      renderTask(null);
+      renderHistory([]);
+      topMetaEl.textContent = message;
+    }
     async function readJson(resp) {
       const raw = await resp.text();
       const data = raw ? JSON.parse(raw) : {};
@@ -16476,11 +16522,14 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const resp = await fetch("/api/symbols?market_type=futures&contract_type=usdm");
       const data = await readJson(resp);
       symbols = Array.isArray(data.symbols) ? data.symbols : [];
-      const previous = symbolEl.value;
+      const requested = new URLSearchParams(window.location.search).get("symbol");
+      const previous = (symbolEl.value || requested || "").toUpperCase();
       symbolEl.innerHTML = symbols.map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)}</option>`).join("");
-      symbolEl.value = symbols.includes(previous) ? previous : (symbols.includes("BARDUSDT") ? "BARDUSDT" : symbols[0] || "BTCUSDT");
+      symbolEl.value = symbols.includes(previous) ? previous : (symbols.includes("BTCUSDC") ? "BTCUSDC" : symbols[0] || "BTCUSDT");
+      clearSnapshotForSymbol(symbolEl.value);
     }
     function renderSnapshot(snapshot) {
+      if (snapshot.symbol && symbolEl.value && snapshot.symbol !== symbolEl.value) return;
       document.getElementById("prefix_code").textContent = snapshot.manual_prefix || "mt_";
       document.getElementById("position_mode_value").textContent = snapshot.one_way_position ? "单向" : "双向";
       document.getElementById("margin_value").textContent = snapshot.isolated ? "逐仓" : "非逐仓";
@@ -16582,6 +16631,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     async function submitAction(endpoint, side) {
       cancelStatusRefresh();
       actionMetaEl.textContent = "提交中...";
+      clearSnapshotForSymbol(symbolEl.value, `${symbolEl.value} 提交中...`);
       const data = await fetchJsonWithTimeout(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -16614,7 +16664,10 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
-    symbolEl.addEventListener("change", () => refreshStatus({ force: true }).catch((err) => actionMetaEl.textContent = err.message));
+    symbolEl.addEventListener("change", () => {
+      clearSnapshotForSymbol(symbolEl.value);
+      refreshStatus({ force: true }).catch((err) => actionMetaEl.textContent = err.message);
+    });
     loadSymbols()
       .then(refreshStatus)
       .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 8000); })
