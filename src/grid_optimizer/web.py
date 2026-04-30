@@ -6844,6 +6844,9 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "threshold_reduce_target_notional": 0.0,
     "warmup_position_notional": 0.0,
     "require_non_loss_exit": False,
+    "spot_taker_exit_enabled": False,
+    "spot_taker_exit_fee_ratio": 0.001,
+    "spot_taker_exit_min_profit_ratio": 0.0,
     "max_order_position_notional": 0.0,
     "max_position_notional": 0.0,
     "sleep_seconds": 10.0,
@@ -10477,6 +10480,18 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("require_non_loss_exit", SPOT_RUNNER_DEFAULT_CONFIG["require_non_loss_exit"]),
         "require_non_loss_exit",
     )
+    spot_taker_exit_enabled = _safe_bool(
+        payload.get("spot_taker_exit_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_taker_exit_enabled"]),
+        "spot_taker_exit_enabled",
+    )
+    spot_taker_exit_fee_ratio = _safe_float(
+        payload.get("spot_taker_exit_fee_ratio", SPOT_RUNNER_DEFAULT_CONFIG["spot_taker_exit_fee_ratio"]),
+        "spot_taker_exit_fee_ratio",
+    )
+    spot_taker_exit_min_profit_ratio = _safe_float(
+        payload.get("spot_taker_exit_min_profit_ratio", SPOT_RUNNER_DEFAULT_CONFIG["spot_taker_exit_min_profit_ratio"]),
+        "spot_taker_exit_min_profit_ratio",
+    )
     max_order_position_notional = _safe_float(
         payload.get("max_order_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_order_position_notional"]),
         "max_order_position_notional",
@@ -10591,6 +10606,10 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("threshold_position_notional must be >= 0")
         if warmup_position_notional < 0:
             raise ValueError("warmup_position_notional must be >= 0")
+        if spot_taker_exit_fee_ratio < 0:
+            raise ValueError("spot_taker_exit_fee_ratio must be >= 0")
+        if spot_taker_exit_min_profit_ratio < 0:
+            raise ValueError("spot_taker_exit_min_profit_ratio must be >= 0")
         if max_order_position_notional < 0:
             raise ValueError("max_order_position_notional must be >= 0")
         if max_position_notional <= 0:
@@ -10633,6 +10652,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "threshold_reduce_target_notional": threshold_reduce_target_notional,
             "warmup_position_notional": warmup_position_notional,
             "require_non_loss_exit": require_non_loss_exit,
+            "spot_taker_exit_enabled": spot_taker_exit_enabled,
+            "spot_taker_exit_fee_ratio": spot_taker_exit_fee_ratio,
+            "spot_taker_exit_min_profit_ratio": spot_taker_exit_min_profit_ratio,
             "max_order_position_notional": max_order_position_notional,
             "max_position_notional": max_position_notional,
             "sleep_seconds": sleep_seconds,
@@ -10733,6 +10755,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--inventory-recycle-loss-tolerance-ratio", config.get("inventory_recycle_loss_tolerance_ratio")),
         ("--inventory-recycle-min-profit-ratio", config.get("inventory_recycle_min_profit_ratio")),
         ("--max-single-cycle-new-orders", config.get("max_single_cycle_new_orders")),
+        ("--spot-taker-exit-fee-ratio", config.get("spot_taker_exit_fee_ratio")),
+        ("--spot-taker-exit-min-profit-ratio", config.get("spot_taker_exit_min_profit_ratio")),
         ("--run-start-time", config.get("run_start_time")),
         ("--run-end-time", config.get("run_end_time")),
         ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
@@ -10744,6 +10768,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
             command.extend([flag, str(value)])
     if _truthy(config.get("require_non_loss_exit", False)):
         command.append("--require-non-loss-exit")
+    if _truthy(config.get("spot_taker_exit_enabled", False)):
+        command.append("--spot-taker-exit-enabled")
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")
     command.append("--apply" if config.get("apply", True) else "--no-apply")
     return command
@@ -10830,6 +10856,9 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "inventory_recycle_loss_tolerance_ratio",
             "inventory_recycle_min_profit_ratio",
             "max_single_cycle_new_orders",
+            "spot_taker_exit_enabled",
+            "spot_taker_exit_fee_ratio",
+            "spot_taker_exit_min_profit_ratio",
             "run_start_time",
             "run_end_time",
             "runtime_guard_stats_start_time",

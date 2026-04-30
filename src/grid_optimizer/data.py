@@ -1320,9 +1320,10 @@ def post_spot_order(
         "side": side.upper(),
         "type": normalized_type,
         "quantity": _format_request_number(quantity),
-        "price": _format_request_number(price),
         "recvWindow": recv_window,
     }
+    if normalized_type != "MARKET":
+        params["price"] = _format_request_number(price)
     if normalized_type == "LIMIT":
         params["timeInForce"] = str(time_in_force or "GTC").upper().strip() or "GTC"
     if new_client_order_id:

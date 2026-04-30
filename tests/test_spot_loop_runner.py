@@ -39,6 +39,11 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "--warmup-position-notional",
                 "30",
                 "--require-non-loss-exit",
+                "--spot-taker-exit-enabled",
+                "--spot-taker-exit-fee-ratio",
+                "0.001",
+                "--spot-taker-exit-min-profit-ratio",
+                "0.0002",
                 "--runtime-guard-stats-start-time",
                 "2026-04-05T00:00:00+00:00",
                 "--max-order-position-notional",
@@ -53,6 +58,9 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.threshold_position_notional, 200.0)
         self.assertEqual(args.warmup_position_notional, 30.0)
         self.assertTrue(args.require_non_loss_exit)
+        self.assertTrue(args.spot_taker_exit_enabled)
+        self.assertEqual(args.spot_taker_exit_fee_ratio, 0.001)
+        self.assertEqual(args.spot_taker_exit_min_profit_ratio, 0.0002)
         self.assertEqual(args.runtime_guard_stats_start_time, "2026-04-05T00:00:00+00:00")
         self.assertEqual(args.max_order_position_notional, 300.0)
         self.assertEqual(args.max_position_notional, 400.0)

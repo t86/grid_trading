@@ -199,6 +199,9 @@ class SpotRunnerTests(unittest.TestCase):
                 "threshold_position_notional": 320.0,
                 "max_order_position_notional": 420.0,
                 "max_position_notional": 520.0,
+                "spot_taker_exit_enabled": True,
+                "spot_taker_exit_fee_ratio": 0.001,
+                "spot_taker_exit_min_profit_ratio": 0.0002,
             }
         )
 
@@ -210,6 +213,9 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--threshold-position-notional", command)
         self.assertIn("--max-order-position-notional", command)
         self.assertIn("--max-position-notional", command)
+        self.assertIn("--spot-taker-exit-enabled", command)
+        self.assertIn("--spot-taker-exit-fee-ratio", command)
+        self.assertIn("--spot-taker-exit-min-profit-ratio", command)
 
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")

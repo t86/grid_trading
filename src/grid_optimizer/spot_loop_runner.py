@@ -1400,6 +1400,181 @@ def _cancel_orders(
     return count
 
 
+def _apply_taker_sell_response_to_state(
+    *,
+    state: dict[str, Any],
+    response: dict[str, Any],
+    base_asset: str,
+    quote_asset: str,
+) -> dict[str, Any]:
+    metrics = state.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = _new_metrics()
+        state["metrics"] = metrics
+    lots = state.get("inventory_lots")
+    if not isinstance(lots, list):
+        lots = []
+    transact_time_ms = _safe_int(response.get("transactTime")) or int(time.time() * 1000)
+    order_id = _safe_int(response.get("orderId"))
+    applied_qty = 0.0
+    applied_notional = 0.0
+    applied_realized_pnl = 0.0
+    applied_commission_quote = 0.0
+    fills = response.get("fills")
+    if not isinstance(fills, list):
+        fills = []
+    for idx, fill in enumerate(fills):
+        if not isinstance(fill, dict):
+            continue
+        price = max(_safe_float(fill.get("price")), 0.0)
+        qty = max(_safe_float(fill.get("qty")), 0.0)
+        if price <= 0 or qty <= 0:
+            continue
+        commission = max(_safe_float(fill.get("commission")), 0.0)
+        commission_asset = str(fill.get("commissionAsset", "")).upper().strip()
+        commission_quote = _normalize_commission_quote(
+            commission=commission,
+            commission_asset=commission_asset,
+            price=price,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        consume_qty = qty + (commission if commission_asset == base_asset else 0.0)
+        lots, consumed_cost = _consume_inventory_lots(lots, consume_qty)
+        proceeds_quote = price * qty - commission_quote
+        realized_pnl = proceeds_quote - consumed_cost
+        trade = {
+            "id": _safe_int(fill.get("tradeId")) or order_id * 1000 + idx,
+            "orderId": order_id,
+            "time": transact_time_ms,
+            "isMaker": False,
+        }
+        _record_trade_metrics(
+            metrics=metrics,
+            trade=trade,
+            side="SELL",
+            price=price,
+            qty=qty,
+            commission_quote=commission_quote,
+            commission_asset=commission_asset,
+            commission_raw=commission,
+            realized_pnl=realized_pnl,
+            role="taker_exit",
+        )
+        applied_qty += qty
+        applied_notional += price * qty
+        applied_realized_pnl += realized_pnl
+        applied_commission_quote += commission_quote
+    state["inventory_lots"] = lots
+    state["last_trade_time_ms"] = max(_safe_int(state.get("last_trade_time_ms")), transact_time_ms)
+    state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    return {
+        "executed_qty": applied_qty,
+        "executed_notional": applied_notional,
+        "realized_pnl": applied_realized_pnl,
+        "commission_quote": applied_commission_quote,
+        "order_id": order_id,
+    }
+
+
+def _maybe_execute_spot_taker_exit(
+    *,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    strategy_open_orders: list[dict[str, Any]],
+    bid_price: float,
+    base_asset: str,
+    quote_asset: str,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    result = {
+        "enabled": bool(getattr(args, "spot_taker_exit_enabled", False)),
+        "executed": False,
+        "reason": "",
+        "canceled_count": 0,
+        "order": None,
+        "execution": None,
+        "break_even_price": 0.0,
+        "effective_bid_after_fee": 0.0,
+    }
+    if not result["enabled"]:
+        return result
+    lots = state.get("inventory_lots")
+    if not isinstance(lots, list):
+        lots = []
+    inventory_qty = _sum_inventory_qty(lots)
+    inventory_cost = _sum_inventory_cost(lots)
+    if inventory_qty <= EPSILON or inventory_cost <= EPSILON:
+        result["reason"] = "flat"
+        return result
+    fee_ratio = max(_safe_float(getattr(args, "spot_taker_exit_fee_ratio", 0.001)), 0.0)
+    min_profit_ratio = max(_safe_float(getattr(args, "spot_taker_exit_min_profit_ratio", 0.0)), 0.0)
+    avg_cost = inventory_cost / inventory_qty
+    effective_bid = max(bid_price, 0.0) * max(1.0 - fee_ratio, 0.0)
+    break_even_price = avg_cost * (1.0 + min_profit_ratio)
+    result["break_even_price"] = break_even_price
+    result["effective_bid_after_fee"] = effective_bid
+    if effective_bid + EPSILON < break_even_price:
+        result["reason"] = "below_break_even"
+        return result
+    if strategy_open_orders:
+        result["canceled_count"] = _cancel_orders(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            orders=strategy_open_orders,
+        )
+    account_info = fetch_spot_account_info(api_key, api_secret)
+    base_free, _ = _extract_balance(account_info, base_asset)
+    sell_qty = _round_order_qty(min(base_free, inventory_qty), step_size)
+    if sell_qty <= EPSILON:
+        result["reason"] = "no_free_base"
+        return result
+    if min_qty is not None and sell_qty < min_qty:
+        result["reason"] = "below_min_qty"
+        return result
+    if min_notional is not None and sell_qty * max(bid_price, 0.0) < min_notional:
+        result["reason"] = "below_min_notional"
+        return result
+    if not _truthy(args.apply):
+        result["executed"] = True
+        result["reason"] = "dry_run"
+        result["execution"] = {"executed_qty": sell_qty, "executed_notional": sell_qty * max(bid_price, 0.0)}
+        return result
+    client_order_id = _build_client_order_id(str(args.client_order_prefix), "takerexit", "SELL")
+    placed = post_spot_order(
+        symbol=symbol,
+        side="SELL",
+        quantity=sell_qty,
+        price=bid_price,
+        api_key=api_key,
+        api_secret=api_secret,
+        order_type="LIMIT",
+        time_in_force="IOC",
+        new_client_order_id=client_order_id,
+    )
+    execution = _apply_taker_sell_response_to_state(
+        state=state,
+        response=placed,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+    )
+    result.update(
+        {
+            "executed": True,
+            "reason": "executed",
+            "order": placed,
+            "execution": execution,
+        }
+    )
+    return result
+
+
 def _build_runtime_guard_summary(
     *,
     args: argparse.Namespace,
@@ -1631,6 +1806,25 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         _append_jsonl(Path(args.summary_jsonl), summary)
         return summary
 
+    taker_exit_result = _maybe_execute_spot_taker_exit(
+        args=args,
+        state=state,
+        symbol=symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        strategy_open_orders=strategy_open_orders,
+        bid_price=bid_price,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+        step_size=symbol_info.get("step_size"),
+        min_qty=symbol_info.get("min_qty"),
+        min_notional=symbol_info.get("min_notional"),
+    )
+    if taker_exit_result.get("executed"):
+        account_info = fetch_spot_account_info(api_key, api_secret)
+        open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
+        strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+
     if strategy_mode == "spot_one_way_long":
         desired_orders = _build_static_desired_orders(
             cells=cells,
@@ -1807,6 +2001,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "threshold_reduce_target_notional": _safe_float(controls.get("threshold_reduce_target_notional")),
         "warmup_position_notional": _safe_float(controls.get("warmup_position_notional")),
         "require_non_loss_exit": bool(controls.get("require_non_loss_exit")),
+        "spot_taker_exit": taker_exit_result,
         "shift_moves": controls.get("shift_moves", []),
         "runtime_status": runtime_guard_result.runtime_status,
         "stop_triggered": runtime_guard_result.stop_triggered,
@@ -1902,6 +2097,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--threshold-reduce-target-notional", type=float, default=0.0)
     parser.add_argument("--warmup-position-notional", type=float, default=0.0)
     parser.add_argument("--require-non-loss-exit", action="store_true")
+    parser.add_argument("--spot-taker-exit-enabled", action="store_true")
+    parser.add_argument("--spot-taker-exit-fee-ratio", type=float, default=0.001)
+    parser.add_argument("--spot-taker-exit-min-profit-ratio", type=float, default=0.0)
     parser.add_argument("--max-order-position-notional", type=float, default=0.0)
     parser.add_argument("--max-position-notional", type=float, default=0.0)
     parser.add_argument("--max-single-cycle-new-orders", type=int, default=8)
