@@ -23,6 +23,7 @@ from .audit import (
     parse_iso_ts as _parse_iso_ts,
     read_json as _read_json,
     read_jsonl_filtered,
+    read_trade_audit_rows,
     trade_row_key,
     trade_row_time_ms,
 )
@@ -454,7 +455,7 @@ def _load_or_fetch_trade_rows(
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     effective_start = session_start or (datetime.now(timezone.utc) - timedelta(days=DEFAULT_AUDIT_LOOKBACK_DAYS))
     floor_ms = int(effective_start.timestamp() * 1000)
-    audit_rows = read_jsonl_filtered(
+    audit_rows = read_trade_audit_rows(
         audit_path,
         limit=0,
         predicate=lambda item: int(trade_row_time_ms(item) or 0) >= floor_ms,

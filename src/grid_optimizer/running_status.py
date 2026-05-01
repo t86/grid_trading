@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlparse
 
-from .audit import build_audit_paths, income_row_time_ms, trade_row_time_ms
+from .audit import build_audit_paths, income_row_time_ms, read_trade_audit_rows, trade_row_time_ms
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
 from .data import fetch_spot_latest_price
@@ -295,7 +295,7 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
     events = _read_runtime_rows(Path(runtime_paths["events_path"]))
     session_start = _resolve_last_run_start(events, submit_report, runner)
     audit_paths = build_audit_paths(Path(runtime_paths["events_path"]))
-    trade_rows = _read_runtime_rows(audit_paths["trade_audit"])
+    trade_rows = read_trade_audit_rows(audit_paths["trade_audit"], limit=0)
     income_rows = _read_runtime_rows(audit_paths["income_audit"])
     trade_rows = _filter_rows_since(trade_rows, since=session_start, row_time_ms=trade_row_time_ms)
     income_rows = _filter_rows_since(income_rows, since=session_start, row_time_ms=income_row_time_ms)

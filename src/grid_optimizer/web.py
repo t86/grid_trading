@@ -33,6 +33,7 @@ from .audit import (
     income_row_time_ms,
     iter_jsonl,
     read_jsonl_filtered,
+    read_trade_audit_rows,
     trade_row_time_ms,
 )
 from .backtest import (
@@ -3652,7 +3653,7 @@ def _summarize_symbol_trade_window(
         "commission_by_asset": {},
     }
 
-    for row in iter_jsonl(audit_paths["trade_audit"]):
+    for row in read_trade_audit_rows(audit_paths["trade_audit"], limit=0):
         ts_ms = int(_email_float(row.get("time")))
         if ts_ms <= 0:
             continue
@@ -8083,6 +8084,38 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         if not enabled(field):
             errors.append(f"{label or field} 必须开启")
 
+    def require_fast_entry_pause() -> None:
+        require_enabled("volatility_entry_pause_enabled", "快速波动暂停加仓 volatility_entry_pause_enabled")
+        require_positive(
+            "volatility_entry_pause_30s_abs_return_ratio",
+            "30s 涨跌幅暂停加仓阈值 volatility_entry_pause_30s_abs_return_ratio",
+        )
+        require_positive(
+            "volatility_entry_pause_30s_amplitude_ratio",
+            "30s 振幅暂停加仓阈值 volatility_entry_pause_30s_amplitude_ratio",
+        )
+        require_positive(
+            "volatility_entry_pause_1m_abs_return_ratio",
+            "1m 涨跌幅暂停加仓阈值 volatility_entry_pause_1m_abs_return_ratio",
+        )
+        require_positive(
+            "volatility_entry_pause_1m_amplitude_ratio",
+            "1m 振幅暂停加仓阈值 volatility_entry_pause_1m_amplitude_ratio",
+        )
+
+    def require_extreme_volatility_stop() -> None:
+        require_enabled("volatility_trigger_enabled", "极端波动停机/减仓 volatility_trigger_enabled")
+        require_positive("volatility_trigger_abs_return_ratio", "极端涨跌幅阈值 volatility_trigger_abs_return_ratio")
+        require_positive("volatility_trigger_amplitude_ratio", "极端振幅阈值 volatility_trigger_amplitude_ratio")
+        require_enabled("volatility_trigger_stop_cancel_open_orders", "极端波动撤挂单 volatility_trigger_stop_cancel_open_orders")
+        if not enabled("volatility_trigger_stop_close_all_positions") and not positive(
+            "volatility_trigger_stop_reduce_to_notional"
+        ):
+            errors.append(
+                "极端波动必须配置 close_all_positions 或 volatility_trigger_stop_reduce_to_notional，"
+                "确保只能减仓/停机，不能继续加仓"
+            )
+
     def require_hard_loss() -> None:
         require_enabled("hard_loss_forced_reduce_enabled")
         require_positive("hard_loss_forced_reduce_target_notional")
@@ -8108,7 +8141,13 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         require_positive("adverse_reduce_max_order_notional")
 
     if strategy_mode == "one_way_long":
+        require_fast_entry_pause()
+        require_extreme_volatility_stop()
         require_positive("pause_buy_position_notional", "多仓软阈值 pause_buy_position_notional")
+        require_positive("buy_pause_amp_trigger_ratio", "下跌振幅暂停买入 buy_pause_amp_trigger_ratio")
+        down_pause = number("buy_pause_down_return_trigger_ratio")
+        if down_pause is None or down_pause >= 0:
+            errors.append("buy_pause_down_return_trigger_ratio 必须设置为 < 0，确保下跌超过阈值停止加多")
         require_exposure_escalation()
         require_hard_loss()
         pause = number("pause_buy_position_notional")
@@ -8118,6 +8157,8 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
                 if target is not None and target >= pause:
                     errors.append(f"{field} 必须低于 pause_buy_position_notional，确保能减到软阈值以下")
     elif strategy_mode == "one_way_short":
+        require_fast_entry_pause()
+        require_extreme_volatility_stop()
         require_positive("pause_short_position_notional", "空仓软阈值 pause_short_position_notional")
         require_positive("threshold_position_notional", "空仓超时阈值 threshold_position_notional")
         require_positive("short_threshold_timeout_seconds")
@@ -8131,8 +8172,14 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         if pause is not None and target is not None and target >= pause:
             errors.append("hard_loss_forced_reduce_target_notional 必须低于 pause_short_position_notional，确保能减到软阈值以下")
     elif strategy_mode in {"synthetic_neutral", "hedge_neutral", "inventory_target_neutral"}:
+        require_fast_entry_pause()
+        require_extreme_volatility_stop()
         require_positive("pause_buy_position_notional", "多仓软阈值 pause_buy_position_notional")
         require_positive("pause_short_position_notional", "空仓软阈值 pause_short_position_notional")
+        require_positive("buy_pause_amp_trigger_ratio", "下跌振幅暂停买入 buy_pause_amp_trigger_ratio")
+        down_pause = number("buy_pause_down_return_trigger_ratio")
+        if down_pause is None or down_pause >= 0:
+            errors.append("buy_pause_down_return_trigger_ratio 必须设置为 < 0，确保下跌超过阈值停止加多")
         require_adverse_reduce(long=True, short=True)
         require_hard_loss()
         target = number("hard_loss_forced_reduce_target_notional")
@@ -8153,6 +8200,8 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         if soft_ratio is not None and soft_ratio > 1:
             errors.append("maker_inventory_soft_ratio 必须 <= 1")
     else:
+        require_fast_entry_pause()
+        require_extreme_volatility_stop()
         require_positive("threshold_position_notional", "软阈值 threshold_position_notional")
         require_hard_loss()
 
@@ -29535,6 +29584,10 @@ def _read_running_status_audit_rows(path: Path) -> list[dict[str, Any]]:
     return _read_running_status_jsonl_tail(path, limit=_running_status_audit_limit())
 
 
+def _read_running_status_trade_rows(path: Path) -> list[dict[str, Any]]:
+    return read_trade_audit_rows(path, limit=0)
+
+
 def _build_status_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -29631,7 +29684,7 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         submit_report=submit_report,
     )
     audit_paths = build_audit_paths(event_path)
-    trade_rows = _read_running_status_audit_rows(audit_paths["trade_audit"])
+    trade_rows = _read_running_status_trade_rows(audit_paths["trade_audit"])
     income_rows = _read_running_status_audit_rows(audit_paths["income_audit"])
     stats_start_time = _fast_running_status_stats_start_time(runner)
     if stats_start_time is not None:

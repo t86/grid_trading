@@ -13,6 +13,7 @@ from grid_optimizer.audit import (
     parse_iso_ts,
     read_jsonl,
     read_jsonl_filtered,
+    read_trade_audit_rows,
     scan_iso_bounds,
     trade_row_key,
     trade_row_time_ms,
@@ -105,6 +106,61 @@ class AuditTests(unittest.TestCase):
             rows = read_jsonl_filtered(path, limit=0, predicate=lambda item: int(item["time"]) >= 2000)
 
         self.assertEqual([row["id"] for row in rows], [2, 3])
+
+    def test_read_trade_audit_rows_includes_archives_and_dedupes(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "output"
+            archive_dir = output_dir / "archive_removed_chip114_20260428_011520"
+            archive_dir.mkdir(parents=True)
+            current_path = output_dir / "chipusdt_loop_trade_audit.jsonl"
+            archive_path = archive_dir / "chipusdt_loop_trade_audit.jsonl"
+            archive_path.write_text(
+                "\n".join(
+                    [
+                        '{"id": 1, "time": 1000, "side": "BUY", "price": "0.1", "qty": "10"}',
+                        '{"id": 2, "time": 2000, "side": "SELL", "price": "0.2", "qty": "10"}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            current_path.write_text(
+                "\n".join(
+                    [
+                        '{"id": 2, "time": 2000, "side": "SELL", "price": "0.2", "qty": "10"}',
+                        '{"id": 3, "time": 3000, "side": "BUY", "price": "0.3", "qty": "10"}',
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            rows = read_trade_audit_rows(current_path, limit=0)
+
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3])
+
+    def test_read_trade_audit_rows_refreshes_archive_cache_when_file_changes(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            output_dir = Path(tmpdir) / "output"
+            archive_dir = output_dir / "archive_removed_chip114_20260428_011520"
+            archive_dir.mkdir(parents=True)
+            current_path = output_dir / "chipusdt_loop_trade_audit.jsonl"
+            archive_path = archive_dir / "chipusdt_loop_trade_audit.jsonl"
+            current_path.write_text("", encoding="utf-8")
+            archive_path.write_text(
+                '{"id": 1, "time": 1000, "side": "BUY", "price": "0.1", "qty": "10"}\n',
+                encoding="utf-8",
+            )
+
+            first_rows = read_trade_audit_rows(current_path, limit=0)
+            archive_path.write_text(
+                '{"id": 2, "time": 2000, "side": "SELL", "price": "0.2", "qty": "10"}\n',
+                encoding="utf-8",
+            )
+            second_rows = read_trade_audit_rows(current_path, limit=0)
+
+        self.assertEqual([row["id"] for row in first_rows], [1])
+        self.assertEqual([row["id"] for row in second_rows], [2])
 
     def test_fetch_time_paged_splits_requests_by_max_window(self) -> None:
         calls: list[tuple[int | None, int | None]] = []

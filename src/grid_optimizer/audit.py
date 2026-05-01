@@ -9,6 +9,7 @@ from typing import Any, Callable, Iterator
 DEFAULT_AUDIT_LOOKBACK_DAYS = 7
 _JSONL_LINE_COUNT_CACHE: dict[str, tuple[int, int, int]] = {}
 _ISO_BOUNDS_CACHE: dict[str, tuple[int, int, datetime | None, datetime | None]] = {}
+_ARCHIVED_TRADE_AUDIT_ROWS_CACHE: dict[str, tuple[int, int, list[dict[str, Any]]]] = {}
 
 
 def build_audit_paths(events_path: str | Path) -> dict[str, Path]:
@@ -86,6 +87,97 @@ def read_jsonl_filtered(
             continue
         rows.append(item)
     return list(rows)
+
+
+def related_trade_audit_paths(path: Path) -> list[Path]:
+    """Return current and archived trade audit files for a symbol audit path."""
+
+    audit_path = Path(path)
+    paths: list[Path] = []
+    seen: set[Path] = set()
+
+    def add(candidate: Path) -> None:
+        normalized = candidate.resolve() if candidate.exists() else candidate
+        if normalized in seen:
+            return
+        seen.add(normalized)
+        paths.append(candidate)
+
+    parent = audit_path.parent
+    if parent.exists():
+        name_pattern = f"{audit_path.name}*"
+        archive_paths: list[Path] = []
+        for archive_dir in sorted(parent.glob("archive*")):
+            if not archive_dir.is_dir():
+                continue
+            archive_paths.extend(
+                candidate
+                for candidate in sorted(archive_dir.rglob(name_pattern))
+                if candidate.is_file()
+            )
+        archive_paths.sort(key=lambda candidate: (candidate.stat().st_mtime_ns, str(candidate)))
+        for candidate in archive_paths:
+            add(candidate)
+
+    add(audit_path)
+    return paths
+
+
+def _read_archived_trade_audit_rows(path: Path) -> list[dict[str, Any]]:
+    try:
+        stat = path.stat()
+    except OSError:
+        return []
+    signature = (int(stat.st_mtime_ns), int(stat.st_size))
+    cache_key = str(path)
+    cached = _ARCHIVED_TRADE_AUDIT_ROWS_CACHE.get(cache_key)
+    if cached is not None and cached[:2] == signature:
+        return cached[2]
+    rows = list(iter_jsonl(path))
+    _ARCHIVED_TRADE_AUDIT_ROWS_CACHE[cache_key] = (signature[0], signature[1], rows)
+    return rows
+
+
+def read_trade_audit_rows(
+    path: Path,
+    *,
+    include_archives: bool = True,
+    limit: int = 0,
+    predicate: Callable[[dict[str, Any]], bool] | None = None,
+) -> list[dict[str, Any]]:
+    """Read trade audit rows across current and archived files, de-duplicated."""
+
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    paths = related_trade_audit_paths(path) if include_archives else [Path(path)]
+    current_path = Path(path)
+    try:
+        current_resolved = current_path.resolve()
+    except OSError:
+        current_resolved = current_path
+    for audit_path in paths:
+        try:
+            audit_resolved = audit_path.resolve()
+        except OSError:
+            audit_resolved = audit_path
+        source_rows = (
+            iter_jsonl(audit_path)
+            if audit_resolved == current_resolved
+            else _read_archived_trade_audit_rows(audit_path)
+        )
+        for item in source_rows:
+            if predicate is not None and not predicate(item):
+                continue
+            ts_ms = trade_row_time_ms(item)
+            key = trade_row_key(item)
+            identity = (ts_ms, key)
+            if ts_ms > 0 and key:
+                if identity in seen:
+                    continue
+                seen.add(identity)
+            rows.append(item)
+    sorted_rows = sorted(rows, key=lambda item: (trade_row_time_ms(item), trade_row_key(item)))
+    return sorted_rows[-limit:] if limit > 0 else sorted_rows
 
 
 def count_jsonl_lines(path: Path) -> int:

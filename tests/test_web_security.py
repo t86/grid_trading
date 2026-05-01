@@ -92,6 +92,18 @@ class WebSecurityTests(unittest.TestCase):
     def _required_long_risk_guards(self, *, pause: float = 750.0, target: float = 430.0) -> dict[str, float | bool]:
         return {
             "pause_buy_position_notional": pause,
+            "buy_pause_amp_trigger_ratio": 0.003,
+            "buy_pause_down_return_trigger_ratio": -0.0015,
+            "volatility_entry_pause_enabled": True,
+            "volatility_entry_pause_30s_abs_return_ratio": 0.0015,
+            "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
+            "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
+            "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_abs_return_ratio": 0.025,
+            "volatility_trigger_amplitude_ratio": 0.04,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_reduce_to_notional": 5.0,
             "exposure_escalation_enabled": True,
             "exposure_escalation_notional": pause,
             "exposure_escalation_hold_seconds": 120.0,
@@ -107,6 +119,16 @@ class WebSecurityTests(unittest.TestCase):
     def _required_short_risk_guards(self, *, pause: float = 750.0, target: float = 430.0) -> dict[str, float | bool]:
         return {
             "pause_short_position_notional": pause,
+            "volatility_entry_pause_enabled": True,
+            "volatility_entry_pause_30s_abs_return_ratio": 0.0015,
+            "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
+            "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
+            "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "volatility_trigger_enabled": True,
+            "volatility_trigger_abs_return_ratio": 0.025,
+            "volatility_trigger_amplitude_ratio": 0.04,
+            "volatility_trigger_stop_cancel_open_orders": True,
+            "volatility_trigger_stop_reduce_to_notional": 5.0,
             "threshold_position_notional": pause + 100.0,
             "short_threshold_timeout_seconds": 30.0,
             "adverse_reduce_enabled": True,
@@ -2993,14 +3015,17 @@ class WebSecurityTests(unittest.TestCase):
 
     @patch("grid_optimizer.web._running_status_stats_start_time", return_value=None)
     @patch("grid_optimizer.web.read_jsonl_filtered")
+    @patch("grid_optimizer.web.read_trade_audit_rows")
     @patch("grid_optimizer.web._read_running_status_jsonl_tail")
     def test_fast_running_status_reads_bounded_audit_rows(
         self,
         mock_tail,
+        mock_trade_rows,
         mock_read_jsonl,
         _mock_stats_start,
     ) -> None:
         mock_tail.return_value = []
+        mock_trade_rows.return_value = []
 
         item = _build_fast_running_status_item(
             "SOONUSDT",
@@ -3017,7 +3042,8 @@ class WebSecurityTests(unittest.TestCase):
         )
 
         self.assertIsNotNone(item)
-        self.assertEqual(mock_tail.call_count, 2)
+        mock_trade_rows.assert_called_once()
+        self.assertEqual(mock_tail.call_count, 1)
         self.assertTrue(all((call.kwargs.get("limit") or 0) > 0 for call in mock_tail.call_args_list))
         mock_read_jsonl.assert_not_called()
 
@@ -3148,6 +3174,28 @@ class WebSecurityTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "hard_loss_forced_reduce_unrealized_loss_limit"):
+            _validate_runner_required_risk_guards(config)
+
+    def test_validate_runner_required_risk_guards_blocks_missing_fast_entry_pause(self) -> None:
+        config = {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            **self._required_neutral_risk_guards(),
+            "volatility_entry_pause_enabled": False,
+        }
+
+        with self.assertRaisesRegex(ValueError, "快速波动暂停加仓"):
+            _validate_runner_required_risk_guards(config)
+
+    def test_validate_runner_required_risk_guards_blocks_missing_extreme_volatility_stop(self) -> None:
+        config = {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            **self._required_neutral_risk_guards(),
+            "volatility_trigger_stop_cancel_open_orders": False,
+        }
+
+        with self.assertRaisesRegex(ValueError, "极端波动撤挂单"):
             _validate_runner_required_risk_guards(config)
 
     def test_validate_runner_required_risk_guards_blocks_missing_short_timeout(self) -> None:

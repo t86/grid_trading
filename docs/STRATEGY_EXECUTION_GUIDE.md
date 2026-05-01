@@ -138,6 +138,10 @@
 
 风险控制：
 
+- 所有新开合约刷量策略必须先满足 [Strategy Risk Guard Policy](STRATEGY_RISK_GUARD_POLICY.md)。
+  - 快速振幅或涨跌幅超过阈值时，必须第一时间暂停加仓。
+  - 暂停后只能减仓或等待，不能继续新增同方向仓位。
+  - 极端波动必须撤挂单并暂停交易或减到安全仓位。
 - `pause_buy_position_notional`
   - 多仓名义达到阈值后，清掉 bootstrap 和买单，只保留卖单卸仓。
 - `max_position_notional`
