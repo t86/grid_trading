@@ -3260,6 +3260,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "max_short_position_notional": None,
     "buy_pause_amp_trigger_ratio": 0.0075,
     "buy_pause_down_return_trigger_ratio": -0.0035,
+    "take_profit_enabled": True,
     "take_profit_min_profit_ratio": None,
     "freeze_shift_abs_return_trigger_ratio": 0.005,
     "volume_long_v4_soft_loss_steps": 0.5,
@@ -7772,6 +7773,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_weak_buy_pause_enabled",
         "market_bias_strong_short_pause_enabled",
         "market_bias_regime_switch_enabled",
+        "take_profit_enabled",
         "adaptive_step_enabled",
         "volatility_entry_pause_enabled",
         "synthetic_trend_follow_enabled",
@@ -8521,6 +8523,7 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--short-cover-pause-down-return-trigger-ratio", str(config["short_cover_pause_down_return_trigger_ratio"])])
     if config.get("take_profit_min_profit_ratio") is not None:
         command.extend(["--take-profit-min-profit-ratio", str(config["take_profit_min_profit_ratio"])])
+    command.append("--take-profit-enabled" if config.get("take_profit_enabled", True) else "--no-take-profit-enabled")
     if config.get("freeze_shift_abs_return_trigger_ratio") is not None:
         command.extend(["--freeze-shift-abs-return-trigger-ratio", str(config["freeze_shift_abs_return_trigger_ratio"])])
     if config.get("volume_long_v4_soft_loss_steps") is not None:

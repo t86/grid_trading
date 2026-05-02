@@ -902,6 +902,17 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(payload["take_profit_min_profit_ratio"], 0.0005)
 
+    def test_normalize_runner_control_payload_supports_take_profit_enabled(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "BASEDUSDT",
+                "strategy_profile": "based_volume_guarded_bard_v2",
+                "take_profit_enabled": False,
+            }
+        )
+
+        self.assertFalse(payload["take_profit_enabled"])
+
     def test_resolve_runner_volume_trigger_action_starts_when_volume_above_threshold(self) -> None:
         decision = _resolve_runner_volume_trigger_action(
             {
@@ -2212,6 +2223,23 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--no-warm-start-enabled", command)
         self.assertIn("--fixed-center-enabled", command)
         self.assertIn("--reset-state", command)
+
+    def test_build_runner_command_can_disable_take_profit(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "IPUSDC",
+                "strategy_profile": "volume_neutral_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0006,
+                "buy_levels": 8,
+                "sell_levels": 8,
+                "per_order_notional": 40.0,
+                "base_position_notional": 0.0,
+                "take_profit_enabled": False,
+            }
+        )
+
+        self.assertIn("--no-take-profit-enabled", command)
 
     def test_normalize_runner_control_payload_keeps_maker_inventory_fields(self) -> None:
         payload = _normalize_runner_control_payload(

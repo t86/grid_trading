@@ -1233,6 +1233,24 @@ def _order_role(order: dict[str, Any]) -> str:
     return str(order.get("role", "")).lower().strip()
 
 
+TAKE_PROFIT_EXIT_ROLES = {"take_profit", "take_profit_long", "take_profit_short"}
+
+
+def remove_take_profit_exit_orders(plan: dict[str, Any]) -> dict[str, Any]:
+    report = {"dropped_sell_orders": 0, "dropped_buy_orders": 0}
+    for key, counter_key in (("sell_orders", "dropped_sell_orders"), ("buy_orders", "dropped_buy_orders")):
+        kept_orders: list[dict[str, Any]] = []
+        for item in plan.get(key, []):
+            if not isinstance(item, dict):
+                continue
+            if _order_role(item) in TAKE_PROFIT_EXIT_ROLES:
+                report[counter_key] += 1
+                continue
+            kept_orders.append(dict(item))
+        plan[key] = kept_orders
+    return report
+
+
 def _volume_long_v4_order_role(order: dict[str, Any]) -> str:
     explicit_role = _order_role(order)
     if explicit_role:
@@ -9230,6 +9248,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
         )
+        take_profit_disabled_report = None
+        if not bool(getattr(effective_args, "take_profit_enabled", True)):
+            take_profit_disabled_report = remove_take_profit_exit_orders(plan)
         long_active_delever = apply_active_delever_long(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -9311,6 +9332,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 bid_price=bid_price,
                 ask_price=ask_price,
             )
+        if take_profit_disabled_report is not None:
+            final_take_profit_disabled_report = remove_take_profit_exit_orders(plan)
+            take_profit_guard = {
+                **take_profit_guard,
+                "enabled": False,
+                "take_profit_enabled": False,
+                "disabled_reason": "take_profit_disabled",
+                "dropped_sell_orders": int(take_profit_guard.get("dropped_sell_orders") or 0)
+                + int(take_profit_disabled_report.get("dropped_sell_orders") or 0)
+                + int(final_take_profit_disabled_report.get("dropped_sell_orders") or 0),
+                "dropped_buy_orders": int(take_profit_guard.get("dropped_buy_orders") or 0)
+                + int(take_profit_disabled_report.get("dropped_buy_orders") or 0)
+                + int(final_take_profit_disabled_report.get("dropped_buy_orders") or 0),
+            }
         active_delever = {
             "enabled": bool(long_active_delever.get("enabled")) or bool(short_active_delever.get("enabled")),
             "active": bool(long_active_delever.get("active")) or bool(short_active_delever.get("active")),
@@ -10305,6 +10340,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
         "adverse_inventory_reduce": adverse_inventory_reduce,
         "take_profit_guard": take_profit_guard,
+        "take_profit_enabled": bool(getattr(effective_args, "take_profit_enabled", True)),
         "volume_long_v4_delever": volume_long_v4_delever,
         "volume_long_v4_flow_sleeve": volume_long_v4_flow_sleeve,
         "exposure_escalation": exposure_escalation,
@@ -10967,6 +11003,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--buy-pause-down-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--short-cover-pause-amp-trigger-ratio", type=float, default=None)
     parser.add_argument("--short-cover-pause-down-return-trigger-ratio", type=float, default=None)
+    parser.add_argument("--take-profit-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--take-profit-min-profit-ratio", type=float, default=None)
     parser.add_argument("--freeze-shift-abs-return-trigger-ratio", type=float, default=None)
     parser.add_argument("--volume-long-v4-soft-loss-steps", type=float, default=0.5)

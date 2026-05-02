@@ -74,6 +74,7 @@ from grid_optimizer.loop_runner import (
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
     apply_synthetic_trend_follow_guard,
+    remove_take_profit_exit_orders,
     sync_synthetic_ledger,
     update_synthetic_order_refs,
 )
@@ -86,6 +87,26 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_remove_take_profit_exit_orders_keeps_active_delever(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 10, "role": "take_profit_short"},
+                {"side": "BUY", "price": 0.98, "qty": 10, "role": "active_delever_short"},
+                {"side": "BUY", "price": 0.97, "qty": 10, "role": "entry_long"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 10, "role": "take_profit_long"},
+                {"side": "SELL", "price": 1.02, "qty": 10, "role": "active_delever_long"},
+                {"side": "SELL", "price": 1.03, "qty": 10, "role": "entry_short"},
+            ],
+        }
+
+        report = remove_take_profit_exit_orders(plan)
+
+        self.assertEqual(report, {"dropped_sell_orders": 1, "dropped_buy_orders": 1})
+        self.assertEqual([item["role"] for item in plan["buy_orders"]], ["active_delever_short", "entry_long"])
+        self.assertEqual([item["role"] for item in plan["sell_orders"]], ["active_delever_long", "entry_short"])
+
     def _maker_plan(self, **overrides):
         params = {
             "bid_price": 100.0,
