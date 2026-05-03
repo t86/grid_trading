@@ -91,6 +91,12 @@ class MasterSprintTests(unittest.TestCase):
         self.assertIn("大师赛追踪看板", master_sprint.MASTER_SPRINT_PAGE)
         self.assertIn("每万 U 预估奖励", master_sprint.MASTER_SPRINT_PAGE)
 
+    def test_altcoins_week2_uses_page_resource_id(self) -> None:
+        altcoins = next(config for config in master_sprint.SPRINT_BOARD_CONFIGS if config.slug == "altcoins_week2")
+
+        self.assertEqual(altcoins.resource_id, 52057)
+        self.assertEqual(altcoins.referer, "https://www.binance.com/zh-CN/activity/trading-competition/altcoinsprint-2026wk2")
+
 
 if __name__ == "__main__":
     unittest.main()
