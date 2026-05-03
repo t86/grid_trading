@@ -52,6 +52,7 @@ from .competition_board import (
 )
 from .console_overview import _fetch_remote_json
 from .console_registry import load_console_registry
+from .master_sprint import MASTER_SPRINT_PAGE, build_master_sprint_snapshot
 from .data import (
     cache_file_path,
     delete_futures_order,
@@ -30134,6 +30135,9 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             self._send_html(COMPETITION_BOARD_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/master_sprint", "/master_sprint.html"}:
+            self._send_html(MASTER_SPRINT_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/basis", "/basis.html"}:
             self._send_html(BASIS_PAGE, status=HTTPStatus.OK)
             return
@@ -30216,6 +30220,15 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("application/json; charset=utf-8", len(body))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if path == "/api/master_sprint_board":
+            refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"
+            try:
+                snapshot = build_master_sprint_snapshot(refresh=refresh)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
             return
         if path == "/api/spot_runner/status":
             symbol = str(query.get("symbol", [SPOT_RUNNER_DEFAULT_CONFIG["symbol"]])[0]).upper().strip()
@@ -30453,6 +30466,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/master_sprint", "/master_sprint.html"}:
+            body = MASTER_SPRINT_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/basis", "/basis.html"}:
             body = BASIS_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -30525,6 +30544,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/running_status"
             or path == "/api/grid_preview"
             or path == "/api/competition_board"
+            or path == "/api/master_sprint_board"
             or path == "/api/spot_runner/status"
             or path == "/api/spot_runner/save"
             or path == "/api/manual_trade/status"
