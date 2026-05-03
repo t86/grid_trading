@@ -13,6 +13,7 @@ from typing import Any
 import requests
 
 from .audit import build_audit_paths, read_trade_audit_rows, trade_row_time_ms
+from .competition_board import _fetch_symbol_close_price_usdt
 from .monitor import runner_control_path_for_symbol, summarize_user_trades
 
 UTC_PLUS_8 = timezone(timedelta(hours=8))
@@ -37,6 +38,7 @@ class SprintBoardConfig:
     threshold_unit: str
     leaderboard_unit: str
     symbols: tuple[str, ...]
+    reward_pools: tuple[dict[str, Any], ...] = ()
 
 
 # Week-2 resource ids are kept here so we can adjust them in one place if Binance
@@ -54,6 +56,20 @@ SPRINT_BOARD_CONFIGS: tuple[SprintBoardConfig, ...] = (
         threshold_unit="USDT",
         leaderboard_unit="USDT",
         symbols=("BZUSDT", "CLUSDT"),
+        reward_pools=(
+            {
+                "label": "低于 70 亿合并交易量",
+                "value": 120000.0,
+                "unit": "USDT",
+                "note": "TradFi 周奖池低档",
+            },
+            {
+                "label": "达到 70 亿合并交易量",
+                "value": 270000.0,
+                "unit": "USDT",
+                "note": "TradFi 周奖池高档",
+            },
+        ),
     ),
     SprintBoardConfig(
         slug="um_week2",
@@ -67,6 +83,14 @@ SPRINT_BOARD_CONFIGS: tuple[SprintBoardConfig, ...] = (
         threshold_unit="USDT",
         leaderboard_unit="USDT",
         symbols=("ETHUSDC", "BTCUSDC"),
+        reward_pools=(
+            {
+                "label": "UM 周奖池",
+                "value": 330.0,
+                "unit": "BNB",
+                "note": "按当前 BNBUSDT 价格折算",
+            },
+        ),
     ),
     SprintBoardConfig(
         slug="altcoins_week2",
@@ -80,6 +104,20 @@ SPRINT_BOARD_CONFIGS: tuple[SprintBoardConfig, ...] = (
         threshold_unit="USDT",
         leaderboard_unit="USDT",
         symbols=("TRUMPUSDC", "ORDIUSDC", "IPUSDC"),
+        reward_pools=(
+            {
+                "label": "PUMP 周奖池",
+                "value": 50000000.0,
+                "unit": "PUMP",
+                "note": "需要 PUMPUSDT 价格后才能折 U",
+            },
+            {
+                "label": "BANK 周奖池",
+                "value": 2500000.0,
+                "unit": "BANK",
+                "note": "需要 BANKUSDT 价格后才能折 U",
+            },
+        ),
     ),
 )
 
@@ -236,7 +274,7 @@ MASTER_SPRINT_PAGE = r"""
     .summary-grid {
       margin-top: 16px;
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(5, minmax(0, 1fr));
       gap: 12px;
     }
     .summary-card {
@@ -372,6 +410,51 @@ MASTER_SPRINT_PAGE = r"""
       return "bad";
     }
 
+    function validRewardEstimates(estimates) {
+      return (Array.isArray(estimates) ? estimates : [])
+        .filter((item) => Number.isFinite(Number(item.reward_per_10k_volume_usdt)));
+    }
+
+    function formatBestRewardPer10k(estimates) {
+      const rows = validRewardEstimates(estimates);
+      if (!rows.length) return "--";
+      const best = rows.reduce((acc, item) =>
+        Number(item.reward_per_10k_volume_usdt) > Number(acc.reward_per_10k_volume_usdt) ? item : acc
+      );
+      return `${fmtNum(best.reward_per_10k_volume_usdt, 4)} U`;
+    }
+
+    function formatRewardEstimateSub(estimates) {
+      const rows = Array.isArray(estimates) ? estimates : [];
+      const valid = validRewardEstimates(rows);
+      if (valid.length > 1) {
+        return valid.map((item) => `${item.label}: ${fmtNum(item.reward_per_10k_volume_usdt, 4)}U / 万U`).join(" · ");
+      }
+      if (valid.length === 1) {
+        const item = valid[0];
+        const price = Number.isFinite(Number(item.reward_price_usdt))
+          ? `现价 ${fmtNum(item.reward_price_usdt, 4)}U`
+          : "";
+        return [item.pool_text || item.label || "奖池", price].filter(Boolean).join(" · ");
+      }
+      return rows.length ? "缺少奖励币价格或官方前 500 总量，暂无法折 U。" : "未配置奖池。";
+    }
+
+    function formatRewardEstimateLines(estimates) {
+      const rows = Array.isArray(estimates) ? estimates : [];
+      if (!rows.length) return "--";
+      return rows.map((item) => {
+        const per10k = Number.isFinite(Number(item.reward_per_10k_volume_usdt))
+          ? `${fmtNum(item.reward_per_10k_volume_usdt, 4)} U / 万U`
+          : "暂无法折 U";
+        const price = Number.isFinite(Number(item.reward_price_usdt))
+          ? `，价格 ${fmtNum(item.reward_price_usdt, 4)}U`
+          : "";
+        const note = item.note ? `，${escapeHtml(item.note)}` : "";
+        return `<div>${escapeHtml(item.label || "奖池")}：${escapeHtml(item.pool_text || "--")} => ${escapeHtml(per10k)}${escapeHtml(price)}${note}</div>`;
+      }).join("");
+    }
+
     function renderMeta(snapshot) {
       const items = [
         { label: "刷新状态", value: snapshot.refresh_status_text || "--" },
@@ -453,6 +536,11 @@ MASTER_SPRINT_PAGE = r"""
               <div class="value">${escapeHtml(fmtNum(local.total_volume, 2))}</div>
               <div class="sub">距离入门门槛 ${escapeHtml(fmtNum(local.distance_to_entry_threshold, 2))} ${escapeHtml(item.threshold_unit || "")}</div>
             </div>
+            <div class="summary-card">
+              <div class="label">每万 U 预估奖励</div>
+              <div class="value">${escapeHtml(formatBestRewardPer10k(item.reward_estimates || []))}</div>
+              <div class="sub">${escapeHtml(formatRewardEstimateSub(item.reward_estimates || []))}</div>
+            </div>
           </div>
           <div class="detail-grid">
             <div class="summary-card">
@@ -469,6 +557,7 @@ MASTER_SPRINT_PAGE = r"""
                   <tr><th>拉取到的榜单条数</th><td>${escapeHtml(fmtNum(official.rows_fetched, 0))}</td></tr>
                   <tr><th>最近本机成交</th><td>${escapeHtml(local.last_trade_time_cst || "--")}</td></tr>
                   <tr><th>本机总成交笔数</th><td>${escapeHtml(fmtNum(local.trade_count, 0))}</td></tr>
+                  <tr><th>奖池估算</th><td>${formatRewardEstimateLines(item.reward_estimates || [])}</td></tr>
                 </tbody>
               </table>
               ${officialError}
@@ -540,6 +629,62 @@ def _format_cst_label(value: datetime | None) -> str:
     if value is None:
         return ""
     return value.astimezone(UTC_PLUS_8).strftime("%Y-%m-%d %H:%M")
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None:
+        return None
+    text = str(value).strip().replace(",", "")
+    if not text:
+        return None
+    try:
+        return float(text)
+    except ValueError:
+        return None
+
+
+def _reward_price_usdt(unit: str, at_time: datetime) -> float | None:
+    normalized = str(unit or "").strip().upper()
+    if not normalized or "/" in normalized:
+        return None
+    if normalized in {"USD", "USDT", "USDC"}:
+        return 1.0
+    return _fetch_symbol_close_price_usdt(normalized, at_time)
+
+
+def _reward_estimates(config: SprintBoardConfig, official: dict[str, Any], now: datetime) -> list[dict[str, Any]]:
+    top500_volume = _safe_float(official.get("top500_total_volume"))
+    estimates: list[dict[str, Any]] = []
+    for pool in config.reward_pools:
+        if not isinstance(pool, dict):
+            continue
+        value = _safe_float(pool.get("value"))
+        unit = str(pool.get("unit") or "").strip().upper()
+        price_usdt = _reward_price_usdt(unit, now) if value is not None else None
+        reward_value_usdt = value * price_usdt if value is not None and price_usdt is not None else None
+        reward_per_10k_volume_usdt = (
+            reward_value_usdt / top500_volume * 10000.0
+            if reward_value_usdt is not None and top500_volume is not None and top500_volume > 0
+            else None
+        )
+        estimates.append(
+            {
+                "label": str(pool.get("label") or unit or "奖池").strip(),
+                "pool_value": value,
+                "pool_unit": unit,
+                "pool_text": (
+                    f"{_format_number(value, 2)} {unit}".strip()
+                    if value is not None
+                    else str(pool.get("text") or "").strip()
+                ),
+                "reward_price_usdt": price_usdt,
+                "reward_value_usdt": reward_value_usdt,
+                "top500_total_volume": top500_volume,
+                "reward_per_10k_volume_usdt": reward_per_10k_volume_usdt,
+                "note": str(pool.get("note") or "").strip(),
+            }
+        )
+    return estimates
 
 
 def _refresh_target_for(now: datetime) -> datetime:
@@ -704,7 +849,7 @@ def _fetch_board_rows(resource_id: int, referer: str, *, max_rows: int = 500) ->
     }
 
 
-def _competition_snapshot(config: SprintBoardConfig) -> dict[str, Any]:
+def _competition_snapshot(config: SprintBoardConfig, now: datetime) -> dict[str, Any]:
     start_at = _parse_iso_datetime(config.start_at)
     end_at = _parse_iso_datetime(config.end_at)
     if start_at is None or end_at is None:
@@ -753,6 +898,8 @@ def _competition_snapshot(config: SprintBoardConfig) -> dict[str, Any]:
             status = "partial"
             status_text = "本机成交额已更新，官方榜单抓取失败"
 
+    reward_estimates = _reward_estimates(config, official, now)
+
     return {
         "slug": config.slug,
         "label": config.label,
@@ -771,6 +918,7 @@ def _competition_snapshot(config: SprintBoardConfig) -> dict[str, Any]:
         "status": status,
         "status_text": status_text,
         "official": official,
+        "reward_estimates": reward_estimates,
         "local": {
             "total_volume": total_volume,
             "trade_count": total_trades,
@@ -783,7 +931,7 @@ def _competition_snapshot(config: SprintBoardConfig) -> dict[str, Any]:
 
 
 def _build_snapshot_payload(now: datetime) -> dict[str, Any]:
-    competitions = [_competition_snapshot(config) for config in SPRINT_BOARD_CONFIGS]
+    competitions = [_competition_snapshot(config, now) for config in SPRINT_BOARD_CONFIGS]
     refreshed_target = _refresh_target_for(now)
     next_refresh_target = _next_refresh_target_for(now)
     return {

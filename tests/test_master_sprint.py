@@ -34,6 +34,13 @@ class MasterSprintTests(unittest.TestCase):
             threshold_unit="USDT",
             leaderboard_unit="USDT",
             symbols=("ETHUSDC", "BTCUSDC"),
+            reward_pools=(
+                {
+                    "label": "UM 周奖池",
+                    "value": 330.0,
+                    "unit": "BNB",
+                },
+            ),
         )
         fake_official = {
             "resource_id": 52057,
@@ -62,7 +69,9 @@ class MasterSprintTests(unittest.TestCase):
         ]
         with patch.object(master_sprint, "SPRINT_BOARD_CONFIGS", (config,)), patch.object(
             master_sprint, "_fetch_board_rows", return_value=fake_official
-        ), patch.object(master_sprint, "_local_symbol_metrics", side_effect=symbol_metrics):
+        ), patch.object(master_sprint, "_local_symbol_metrics", side_effect=symbol_metrics), patch.object(
+            master_sprint, "_fetch_symbol_close_price_usdt", return_value=600.0
+        ):
             payload = master_sprint._build_snapshot_payload(datetime(2026, 5, 3, 8, 10, tzinfo=timezone.utc))
 
         self.assertEqual(payload["competition_count"], 1)
@@ -74,10 +83,13 @@ class MasterSprintTests(unittest.TestCase):
         self.assertEqual(competition["local"]["trade_count"], 30)
         self.assertEqual(competition["local"]["distance_to_entry_threshold"], 300.0)
         self.assertEqual(competition["local"]["last_trade_time_cst"], "2026-05-02 12:00")
+        self.assertEqual(competition["reward_estimates"][0]["reward_value_usdt"], 198000.0)
+        self.assertAlmostEqual(competition["reward_estimates"][0]["reward_per_10k_volume_usdt"], 0.364507, places=6)
 
     def test_master_sprint_page_points_to_api(self) -> None:
         self.assertIn("/api/master_sprint_board", master_sprint.MASTER_SPRINT_PAGE)
         self.assertIn("大师赛追踪看板", master_sprint.MASTER_SPRINT_PAGE)
+        self.assertIn("每万 U 预估奖励", master_sprint.MASTER_SPRINT_PAGE)
 
 
 if __name__ == "__main__":
