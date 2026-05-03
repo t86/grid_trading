@@ -9660,6 +9660,30 @@ def _manual_trade_append_history(item: dict[str, Any]) -> dict[str, Any]:
     return dict(record)
 
 
+def _manual_trade_delete_history(symbol: str, record_id: str) -> dict[str, Any]:
+    key = _manual_trade_task_key(symbol)
+    clean_id = str(record_id or "").strip()
+    if not key:
+        raise ValueError("symbol is required")
+    if not clean_id:
+        raise ValueError("history id is required")
+    with MANUAL_TRADE_HISTORY_LOCK:
+        symbols = _manual_trade_history_map()
+        items = list(symbols.get(key, []))
+        kept: list[dict[str, Any]] = []
+        deleted: dict[str, Any] | None = None
+        for item in items:
+            if deleted is None and str(item.get("id", "")) == clean_id:
+                deleted = dict(item)
+                continue
+            kept.append(item)
+        if deleted is None:
+            raise ValueError("history record not found")
+        symbols[key] = kept
+        _write_manual_trade_history_map(symbols)
+    return dict(deleted)
+
+
 def _manual_trade_fill_price_from_order(order: dict[str, Any], executed_qty: float) -> float:
     avg_price = _safe_numeric(order.get("avgPrice"))
     if avg_price > 0:
@@ -16405,6 +16429,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     button.buy { background:var(--good); border-color:var(--good); color:#fff; }
     button.sell { background:var(--bad); border-color:var(--bad); color:#fff; }
     button.danger { color:var(--bad); background:#fff; border-color:rgba(180,35,24,.35); }
+    .history-delete-btn { min-height:30px; padding:0 10px; border-radius:8px; font-size:12px; white-space:nowrap; }
     button:disabled { opacity:.55; cursor:not-allowed; }
     .grid { display:grid; grid-template-columns:1.05fr .95fr; gap:16px; align-items:start; }
     .fields { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
@@ -16498,8 +16523,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       <h2>成交历史</h2>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>时间</th><th>类型</th><th>方向</th><th>目标</th><th>预计挂单</th><th>成交额</th><th>成交均价</th><th>最后价格</th><th>成交数量</th><th>尝试次数</th></tr></thead>
-          <tbody id="history_body"><tr><td colspan="10">暂无成交历史</td></tr></tbody>
+          <thead><tr><th>时间</th><th>类型</th><th>方向</th><th>目标</th><th>预计挂单</th><th>成交额</th><th>成交均价</th><th>最后价格</th><th>成交数量</th><th>尝试次数</th><th>操作</th></tr></thead>
+          <tbody id="history_body"><tr><td colspan="11">暂无成交历史</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -16643,7 +16668,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const body = document.getElementById("history_body");
       const rows = Array.isArray(history) ? [...history].reverse() : [];
       if (!rows.length) {
-        body.innerHTML = '<tr><td colspan="10">暂无成交历史</td></tr>';
+        body.innerHTML = '<tr><td colspan="11">暂无成交历史</td></tr>';
         return;
       }
       body.innerHTML = rows.map((item) => `<tr>
@@ -16657,7 +16682,11 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <td>${fmt(item.last_fill_price, 8)}</td>
         <td>${fmt(item.executed_qty, 8)}</td>
         <td>${escapeHtml(item.attempts || 0)}</td>
+        <td><button class="danger history-delete-btn" data-history-id="${escapeHtml(item.id || "")}">删除</button></td>
       </tr>`).join("");
+      body.querySelectorAll(".history-delete-btn").forEach((button) => {
+        button.addEventListener("click", () => deleteHistory(String(button.dataset.historyId || "")).catch((err) => actionMetaEl.textContent = err.message));
+      });
     }
     async function refreshStatus({ force = false } = {}) {
       if (refreshInFlight) {
@@ -16709,6 +16738,19 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       actionMetaEl.textContent = `已请求取消，撤单 ${data.cleanup ? data.cleanup.success : 0}/${data.cleanup ? data.cleanup.attempted : 0}`;
       if (data.task) renderTask(data.task);
       await refreshStatus({ force: true });
+    }
+    async function deleteHistory(recordId) {
+      if (!recordId) throw new Error("缺少成交记录 ID");
+      if (!window.confirm("确认删除这条成交历史记录？")) return;
+      actionMetaEl.textContent = "删除成交历史中...";
+      const data = await fetchJsonWithTimeout("/api/manual_trade/history/delete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ symbol: symbolEl.value, id: recordId }),
+      }, 5000);
+      actionMetaEl.textContent = "成交历史已删除。";
+      if (data.snapshot) renderSnapshot(data.snapshot);
+      else await refreshStatus({ force: true });
     }
     document.getElementById("refresh_btn").addEventListener("click", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "BUY").catch((err) => actionMetaEl.textContent = err.message));
@@ -30515,7 +30557,12 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if not self._authorize_request():
             return
-        if path in {"/api/manual_trade/maker", "/api/manual_trade/take", "/api/manual_trade/cancel"}:
+        if path in {
+            "/api/manual_trade/maker",
+            "/api/manual_trade/take",
+            "/api/manual_trade/cancel",
+            "/api/manual_trade/history/delete",
+        }:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -30540,6 +30587,13 @@ class _Handler(BaseHTTPRequestHandler):
                 elif path.endswith("/take"):
                     result = _manual_trade_execute_take(payload)
                     self._send_json({"ok": True, **result}, status=200)
+                elif path.endswith("/history/delete"):
+                    symbol = str(payload.get("symbol", "")).upper().strip()
+                    deleted = _manual_trade_delete_history(symbol, str(payload.get("id", "")))
+                    self._send_json(
+                        {"ok": True, "symbol": symbol, "deleted": deleted, "snapshot": _manual_trade_snapshot(symbol)},
+                        status=200,
+                    )
                 else:
                     result = _manual_trade_cancel(payload)
                     self._send_json({"ok": True, **result}, status=200)

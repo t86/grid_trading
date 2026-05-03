@@ -15,6 +15,7 @@ from grid_optimizer.web import (
     _manual_trade_cancel,
     _manual_trade_current_task,
     _manual_trade_ensure_isolated,
+    _manual_trade_delete_history,
     _manual_trade_history_for_symbol,
     _manual_trade_public_history_for_symbol,
     _manual_trade_maker_worker,
@@ -172,6 +173,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("/api/manual_trade/maker", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
+        self.assertIn("/api/manual_trade/history/delete", MANUAL_TRADE_PAGE)
         self.assertIn("setInterval(() => refreshStatus().catch(() => {}), 8000)", MANUAL_TRADE_PAGE)
         self.assertIn("fetchJsonWithTimeout", MANUAL_TRADE_PAGE)
         self.assertIn("cancelStatusRefresh()", MANUAL_TRADE_PAGE)
@@ -183,6 +185,8 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("manualPrefixForSymbol", MANUAL_TRADE_PAGE)
         self.assertIn('id="history_body"', MANUAL_TRADE_PAGE)
         self.assertIn("renderHistory(snapshot.history || [])", MANUAL_TRADE_PAGE)
+        self.assertIn("history-delete-btn", MANUAL_TRADE_PAGE)
+        self.assertIn("deleteHistory", MANUAL_TRADE_PAGE)
 
     def test_manual_trade_history_is_symbol_scoped(self) -> None:
         _manual_trade_append_history(
@@ -212,6 +216,45 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(eth_history[0]["symbol"], "ETHUSDC")
         self.assertIn('"BTCUSDC"', self.history_path.read_text(encoding="utf-8"))
         self.assertIn('"ETHUSDC"', self.history_path.read_text(encoding="utf-8"))
+
+    def test_manual_trade_delete_history_removes_single_symbol_record(self) -> None:
+        first = _manual_trade_append_history(
+            {
+                "source": "maker",
+                "symbol": "BTCUSDC",
+                "side": "BUY",
+                "executed_qty": 0.01,
+                "avg_fill_price": 100.0,
+            }
+        )
+        second = _manual_trade_append_history(
+            {
+                "source": "maker",
+                "symbol": "BTCUSDC",
+                "side": "SELL",
+                "executed_qty": 0.02,
+                "avg_fill_price": 101.0,
+            }
+        )
+        other_symbol = _manual_trade_append_history(
+            {
+                "source": "maker",
+                "symbol": "ETHUSDC",
+                "side": "BUY",
+                "executed_qty": 0.1,
+                "avg_fill_price": 10.0,
+            }
+        )
+
+        deleted = _manual_trade_delete_history("BTCUSDC", first["id"])
+
+        self.assertEqual(deleted["id"], first["id"])
+        self.assertEqual([item["id"] for item in _manual_trade_history_for_symbol("BTCUSDC")], [second["id"]])
+        self.assertEqual([item["id"] for item in _manual_trade_history_for_symbol("ETHUSDC")], [other_symbol["id"]])
+
+    def test_manual_trade_delete_history_rejects_missing_record(self) -> None:
+        with self.assertRaisesRegex(ValueError, "not found"):
+            _manual_trade_delete_history("BTCUSDC", "missing")
 
     def test_manual_trade_public_history_is_compact_and_limited(self) -> None:
         for idx in range(205):
