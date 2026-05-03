@@ -3629,7 +3629,7 @@ def _pid_is_running(pid_path: Path) -> bool:
     return True
 
 
-def _start_futures_flatten_process(symbol: str) -> dict[str, Any]:
+def _start_futures_flatten_process(symbol: str, *, allow_loss: bool = False) -> dict[str, Any]:
     pid_path = _flatten_pid_path(symbol)
     if _pid_is_running(pid_path):
         return {"started": False, "already_running": True}
@@ -3656,6 +3656,8 @@ def _start_futures_flatten_process(symbol: str) -> dict[str, Any]:
         "--events-jsonl",
         str(_flatten_events_path(symbol)),
     ]
+    if allow_loss:
+        command.append("--allow-loss")
     with log_path.open("ab") as log_file:
         proc = subprocess.Popen(
             command,
@@ -3914,9 +3916,14 @@ def _maybe_handle_runtime_guard(
         recv_window=args.recv_window,
     )
     flatten_result = {"started": False, "already_running": False}
-    flatten_snapshot = load_live_flatten_snapshot(args.symbol.upper().strip(), api_key, api_secret)
+    flatten_snapshot = load_live_flatten_snapshot(
+        args.symbol.upper().strip(),
+        api_key,
+        api_secret,
+        allow_loss=True,
+    )
     if list(flatten_snapshot.get("orders", [])):
-        flatten_result = _start_futures_flatten_process(args.symbol.upper().strip())
+        flatten_result = _start_futures_flatten_process(args.symbol.upper().strip(), allow_loss=True)
     return _build_runtime_guard_stop_summary(
         args=args,
         cycle=cycle,
