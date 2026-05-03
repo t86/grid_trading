@@ -418,10 +418,8 @@ MASTER_SPRINT_PAGE = r"""
     function formatBestRewardPer10k(estimates) {
       const rows = validRewardEstimates(estimates);
       if (!rows.length) return "--";
-      const best = rows.reduce((acc, item) =>
-        Number(item.reward_per_10k_volume_usdt) > Number(acc.reward_per_10k_volume_usdt) ? item : acc
-      );
-      return `${fmtNum(best.reward_per_10k_volume_usdt, 4)} U`;
+      const total = rows.reduce((acc, item) => acc + Number(item.reward_per_10k_volume_usdt || 0), 0);
+      return `${fmtNum(total, 4)} U`;
     }
 
     function formatRewardEstimateSub(estimates) {
