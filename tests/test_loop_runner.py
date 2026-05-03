@@ -16,6 +16,7 @@ from grid_optimizer.loop_runner import (
     _build_parser,
     _should_sync_account_audit,
     _uses_entry_price_cost_basis,
+    _uses_synthetic_lot_cost_guard,
     _uses_volume_long_v4_staged_delever,
     _apply_synthetic_trade_fill,
     _decorate_synthetic_open_orders,
@@ -106,6 +107,9 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report, {"dropped_sell_orders": 1, "dropped_buy_orders": 1})
         self.assertEqual([item["role"] for item in plan["buy_orders"]], ["active_delever_short", "entry_long"])
         self.assertEqual([item["role"] for item in plan["sell_orders"]], ["active_delever_long", "entry_short"])
+
+    def test_chip_profile_uses_synthetic_lot_cost_guard(self) -> None:
+        self.assertTrue(_uses_synthetic_lot_cost_guard("chip_low_wear_guarded_v1"))
 
     def _maker_plan(self, **overrides):
         params = {

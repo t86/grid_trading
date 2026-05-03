@@ -1177,6 +1177,19 @@ def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
     }
 
 
+SYNTHETIC_LOT_COST_GUARD_PROFILES = {
+    "bard_12h_push_neutral_v2",
+    "based_volume_guarded_bard_v2",
+    "chip_low_wear_guarded_v1",
+    "xaut_competition_push_neutral_v1",
+    "xaut_volume_guarded_bard_v2",
+}
+
+
+def _uses_synthetic_lot_cost_guard(strategy_profile: str | None) -> bool:
+    return str(strategy_profile or "").strip() in SYNTHETIC_LOT_COST_GUARD_PROFILES
+
+
 def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: bool = False) -> float:
     keys = ("entryPrice", "breakEvenPrice") if prefer_entry_price else ("breakEvenPrice", "entryPrice")
     for key in keys:
@@ -8552,12 +8565,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
-    synthetic_lot_cost_guard_profiles = {
-        "bard_12h_push_neutral_v2",
-        "based_volume_guarded_bard_v2",
-        "xaut_competition_push_neutral_v1",
-        "xaut_volume_guarded_bard_v2",
-    }
     synthetic_residual_long_flat_notional = max(
         _safe_float(getattr(effective_args, "synthetic_residual_long_flat_notional", None)),
         0.0,
@@ -8571,7 +8578,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     synthetic_lot_cost_guard_enabled = (
         requested_strategy_mode in {"hedge_neutral", "synthetic_neutral"}
         and (
-            str(getattr(effective_args, "strategy_profile", "")).strip() in synthetic_lot_cost_guard_profiles
+            _uses_synthetic_lot_cost_guard(getattr(effective_args, "strategy_profile", None))
             or synthetic_residual_long_flat_notional > 0
             or synthetic_residual_short_flat_notional > 0
         )
