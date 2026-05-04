@@ -326,7 +326,10 @@ SOON_EXECUTION_REGIME_SHADOW_CONFIG: dict[str, Any] = {
     "execution_regime_depth_exit_q": 0.10,
     "execution_regime_vol_protection_enabled": False,
     "execution_regime_vol_protection_min_scale": 0.2,
-} dict[str, dict[str, Any]] = {
+}
+
+
+RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     "maker_volatility_inventory_v1": {
         "label": "合约波动率库存做市 v1",
         "description": "通用 futures maker 策略。按名义金额双边挂盘口，急速单边时加宽、暂停风险方向或进入 reduce-only/cooldown。",

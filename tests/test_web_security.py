@@ -566,6 +566,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_reduce_escalate_after_seconds"], 900.0)
         self.assertEqual(payload["volatility_trigger_reduce_escalate_abs_return_ratio"], 0.02)
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+        self.assertTrue(payload["execution_regime_enabled"])
+        self.assertEqual(payload["execution_regime_vol_p50_ratio"], 0.002)
+        self.assertEqual(payload["execution_regime_vol_p95_ratio"], 0.010)
+        self.assertEqual(payload["execution_regime_spread_p50_bps"], 3.0)
+        self.assertEqual(payload["execution_regime_spread_p95_bps"], 18.0)
 
     def test_runner_preset_payload_rejects_soon_profile_for_other_symbols(self) -> None:
         with self.assertRaises(ValueError):
@@ -2664,6 +2669,20 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adaptive-step-max-scale", command)
         self.assertIn("--adaptive-step-min-per-order-scale", command)
         self.assertIn("--adaptive-step-min-position-limit-scale", command)
+
+    def test_build_runner_command_includes_execution_regime_arguments(self) -> None:
+        config = _runner_preset_payload("soon_volume_neutral_ping_pong_v1", {"symbol": "SOONUSDT"})
+
+        command = _build_runner_command(config)
+
+        self.assertIn("--execution-regime-enabled", command)
+        self.assertIn("--execution-regime-vol-p50-ratio", command)
+        self.assertIn("--execution-regime-vol-p95-ratio", command)
+        self.assertIn("--execution-regime-spread-p50-bps", command)
+        self.assertIn("--execution-regime-spread-p95-bps", command)
+        self.assertIn("--execution-regime-confirm-normal-to-caution", command)
+        self.assertEqual(command[command.index("--execution-regime-vol-p50-ratio") + 1], "0.002")
+        self.assertEqual(command[command.index("--execution-regime-spread-p95-bps") + 1], "18.0")
 
     def test_build_runner_command_includes_synthetic_trend_follow_arguments(self) -> None:
         command = _build_runner_command(
