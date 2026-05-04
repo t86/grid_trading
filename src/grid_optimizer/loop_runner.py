@@ -96,10 +96,12 @@ from .execution_regime import (
     ExecutionRegimeMemory,
     REGIME_NORMAL,
     assess_execution_regime,
+    get_volatility_position_protection,
 )
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
+from .notifications import alert_source_label, send_alert_email
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
 AUTO_REGIME_DEFENSIVE_PROFILE = "volatility_defensive_v1"
@@ -7040,6 +7042,207 @@ def assess_auto_regime(
     return report
 
 
+def _format_signed_ratio_pct(value: Any) -> str:
+    return f"{_safe_float(value) * 100:+.2f}%"
+
+
+def _format_ratio_pct(value: Any) -> str:
+    return f"{_safe_float(value) * 100:.2f}%"
+
+
+def _aggregate_candle_window(candles: list[Any]) -> dict[str, Any] | None:
+    if not candles:
+        return None
+    open_price = max(float(candles[0].open), 0.0)
+    close_price = max(float(candles[-1].close), 0.0)
+    high_price = max(max(float(item.high), 0.0) for item in candles)
+    low_price = min(max(float(item.low), 0.0) for item in candles)
+    return_ratio = ((close_price / open_price) - 1.0) if open_price > 0 else 0.0
+    amplitude_ratio = ((high_price / low_price) - 1.0) if low_price > 0 else 0.0
+    return {
+        "open_time": candles[0].open_time.isoformat(),
+        "close_time": candles[-1].close_time.isoformat(),
+        "open": open_price,
+        "close": close_price,
+        "high": high_price,
+        "low": low_price,
+        "return_ratio": return_ratio,
+        "amplitude_ratio": amplitude_ratio,
+    }
+
+
+def build_volatility_email_windows(
+    *,
+    symbol: str,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    current_time = now or datetime.now(timezone.utc)
+    end_ms = int(current_time.timestamp() * 1000)
+    start_ms = end_ms - int(timedelta(minutes=130).total_seconds() * 1000)
+    report: dict[str, Any] = {
+        "available": False,
+        "warning": None,
+        "windows": {},
+    }
+    try:
+        candles = fetch_futures_klines(
+            symbol=symbol,
+            interval="1m",
+            start_ms=start_ms,
+            end_ms=end_ms,
+            limit=130,
+        )
+    except Exception as exc:
+        report["warning"] = f"{exc.__class__.__name__}: {exc}"
+        return report
+
+    closed_candles = [item for item in candles if item.close_time <= current_time]
+    if len(closed_candles) < 120:
+        report["warning"] = "insufficient_closed_1m_candles"
+        return report
+
+    windows: dict[str, Any] = {}
+    for label, count in (("1m", 1), ("15m", 15), ("60m", 60)):
+        if len(closed_candles) < count * 2:
+            windows[label] = {"current": None, "previous": None}
+            continue
+        previous = _aggregate_candle_window(closed_candles[-(count * 2) : -count])
+        current = _aggregate_candle_window(closed_candles[-count:])
+        windows[label] = {
+            "previous": previous,
+            "current": current,
+            "amplitude_multiplier": (
+                float(current["amplitude_ratio"]) / float(previous["amplitude_ratio"])
+                if previous and current and float(previous["amplitude_ratio"]) > 0
+                else None
+            ),
+        }
+
+    report["available"] = True
+    report["windows"] = windows
+    return report
+
+
+def _volatility_email_window_lines(windows: dict[str, Any]) -> list[str]:
+    labels = {"60m": "1小时", "15m": "15分钟", "1m": "1分钟"}
+    lines: list[str] = []
+    for key in ("60m", "15m", "1m"):
+        item = windows.get(key) if isinstance(windows, dict) else None
+        if not isinstance(item, dict):
+            continue
+        previous = item.get("previous") if isinstance(item.get("previous"), dict) else {}
+        current = item.get("current") if isinstance(item.get("current"), dict) else {}
+        multiplier = item.get("amplitude_multiplier")
+        multiplier_text = f" · 放大 {float(multiplier):.2f}x" if multiplier is not None else ""
+        lines.append(
+            f"{labels[key]}: 前一段 振幅 {_format_ratio_pct(previous.get('amplitude_ratio'))} / 涨跌 {_format_signed_ratio_pct(previous.get('return_ratio'))}; "
+            f"当前 振幅 {_format_ratio_pct(current.get('amplitude_ratio'))} / 涨跌 {_format_signed_ratio_pct(current.get('return_ratio'))}"
+            f"{multiplier_text}"
+        )
+    return lines
+
+
+def maybe_send_volatility_email_alert(
+    *,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    plan_report: dict[str, Any],
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    enabled = bool(getattr(args, "volatility_alert_email_enabled", False))
+    symbol = str(plan_report.get("symbol") or getattr(args, "symbol", "")).upper().strip()
+    report: dict[str, Any] = {
+        "enabled": enabled,
+        "available": False,
+        "triggered": False,
+        "sent": False,
+        "reason": "disabled" if not enabled else None,
+        "windows": {},
+        "send_result": None,
+    }
+    if not enabled:
+        return report
+
+    current_time = now or datetime.now(timezone.utc)
+    window_report = build_volatility_email_windows(symbol=symbol, now=current_time)
+    report.update(window_report)
+    if not window_report.get("available"):
+        report["reason"] = window_report.get("warning") or "unavailable"
+        return report
+
+    thresholds = {
+        "1m": max(_safe_float(getattr(args, "volatility_alert_1m_amplitude_ratio", 0.0)), 0.0),
+        "15m": max(_safe_float(getattr(args, "volatility_alert_15m_amplitude_ratio", 0.0)), 0.0),
+        "60m": max(_safe_float(getattr(args, "volatility_alert_60m_amplitude_ratio", 0.0)), 0.0),
+    }
+    increase_multiplier = max(_safe_float(getattr(args, "volatility_alert_increase_multiplier", 1.0)), 1.0)
+    triggered: list[str] = []
+    windows = dict(window_report.get("windows") or {})
+    for key, threshold in thresholds.items():
+        item = windows.get(key) if isinstance(windows.get(key), dict) else {}
+        current = item.get("current") if isinstance(item.get("current"), dict) else {}
+        previous = item.get("previous") if isinstance(item.get("previous"), dict) else {}
+        current_amp = _safe_float(current.get("amplitude_ratio"))
+        previous_amp = _safe_float(previous.get("amplitude_ratio"))
+        expanded = previous_amp <= 0 or current_amp >= previous_amp * increase_multiplier
+        if threshold > 0 and current_amp >= threshold and expanded:
+            triggered.append(key)
+
+    report["triggered_windows"] = triggered
+    if not triggered:
+        report["reason"] = "below_threshold"
+        return report
+
+    alert_state = dict(state.get("volatility_email_alert") or {})
+    cooldown_seconds = max(_safe_float(getattr(args, "volatility_alert_cooldown_seconds", 1800.0)), 0.0)
+    last_sent_at_raw = str(alert_state.get("last_sent_at") or "").strip()
+    if last_sent_at_raw:
+        try:
+            last_sent_at = datetime.fromisoformat(last_sent_at_raw)
+            if last_sent_at.tzinfo is None:
+                last_sent_at = last_sent_at.replace(tzinfo=timezone.utc)
+            remaining = cooldown_seconds - (current_time - last_sent_at).total_seconds()
+            if remaining > 0:
+                report["triggered"] = True
+                report["reason"] = "cooldown"
+                report["cooldown_remaining_seconds"] = remaining
+                return report
+        except ValueError:
+            pass
+
+    body_lines = [
+        f"{symbol} 波动明显放大，触发窗口: {', '.join(triggered)}",
+        "",
+        *_volatility_email_window_lines(windows),
+        "",
+        f"当前中价: {_safe_float(plan_report.get('mid_price')):.8f}",
+        f"当前净仓: {_safe_float(plan_report.get('actual_net_qty')):.4f} · 净名义: {_safe_float(plan_report.get('actual_net_notional')):.4f} USDT",
+        f"策略: {plan_report.get('effective_strategy_profile') or plan_report.get('strategy_profile') or ''}",
+        f"时间: {current_time.isoformat()}",
+    ]
+    subject = f"[grid][{alert_source_label()}] {symbol} 波动放大提醒"
+    send_result = send_alert_email(
+        subject=subject,
+        body="\n".join(body_lines),
+        config_path=Path(str(getattr(args, "volatility_alert_config_json", ""))).expanduser()
+        if str(getattr(args, "volatility_alert_config_json", "")).strip()
+        else None,
+    )
+    alert_state.update(
+        {
+            "last_sent_at": current_time.isoformat(),
+            "last_triggered_windows": triggered,
+            "last_send_result": send_result,
+        }
+    )
+    state["volatility_email_alert"] = alert_state
+    report["triggered"] = True
+    report["sent"] = bool(send_result.get("sent"))
+    report["send_result"] = send_result
+    report["reason"] = "sent" if report["sent"] else str(send_result.get("error") or "send_failed")
+    return report
+
+
 def determine_interval_center_price(
     *,
     symbol: str,
@@ -8441,6 +8644,35 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         mid_price=mid_price,
         actual_net_notional=actual_net_qty * max(mid_price, 0.0),
     )
+    vol_protection = get_volatility_position_protection(
+        regime_state=execution_regime.get("state", REGIME_NORMAL),
+        risk_score=float(execution_regime.get("risk_score", 0.0)),
+        enabled=bool(getattr(args, "execution_regime_vol_protection_enabled", False)),
+        max_position_notional=getattr(args, "max_position_notional", None),
+        max_short_position_notional=getattr(args, "max_short_position_notional", None),
+        max_total_notional=getattr(args, "max_total_notional", None),
+        pause_buy_position_notional=getattr(args, "pause_buy_position_notional", None),
+        pause_short_position_notional=getattr(args, "pause_short_position_notional", None),
+        inventory_tier_start_notional=getattr(args, "inventory_tier_start_notional", None),
+        inventory_tier_end_notional=getattr(args, "inventory_tier_end_notional", None),
+        adverse_reduce_target_ratio=getattr(args, "adverse_reduce_target_ratio", 0.65),
+        cancel_non_protective_on_exit=bool(getattr(args, "execution_regime_vol_protection_cancel_on_exit", True)),
+    )
+    execution_regime["vol_protection"] = {
+        "enabled": vol_protection.enabled,
+        "active": vol_protection.active,
+        "reason": vol_protection.reason,
+        "scale": vol_protection.scale,
+        "adverse_reduce_target_ratio": vol_protection.adverse_reduce_target_ratio,
+        "should_cancel_non_protective_orders": vol_protection.should_cancel_non_protective_orders,
+        "effective_max_position_notional": vol_protection.effective_max_position_notional,
+        "effective_max_short_position_notional": vol_protection.effective_max_short_position_notional,
+        "effective_max_total_notional": vol_protection.effective_max_total_notional,
+        "effective_pause_buy_position_notional": vol_protection.effective_pause_buy_position_notional,
+        "effective_pause_short_position_notional": vol_protection.effective_pause_short_position_notional,
+        "effective_inventory_tier_start_notional": vol_protection.effective_inventory_tier_start_notional,
+        "effective_inventory_tier_end_notional": vol_protection.effective_inventory_tier_end_notional,
+    }
     current_long_avg_price = 0.0
     current_short_avg_price = 0.0
     if requested_strategy_mode == "hedge_neutral":
@@ -11243,6 +11475,13 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-alert-email-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--volatility-alert-1m-amplitude-ratio", type=float, default=0.0025)
+    parser.add_argument("--volatility-alert-15m-amplitude-ratio", type=float, default=0.006)
+    parser.add_argument("--volatility-alert-60m-amplitude-ratio", type=float, default=0.010)
+    parser.add_argument("--volatility-alert-increase-multiplier", type=float, default=1.5)
+    parser.add_argument("--volatility-alert-cooldown-seconds", type=float, default=1800.0)
+    parser.add_argument("--volatility-alert-config-json", type=str, default="")
     parser.add_argument("--execution-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--execution-regime-vol-p50-ratio", type=float, default=0.003)
     parser.add_argument("--execution-regime-vol-p95-ratio", type=float, default=0.012)
@@ -11275,6 +11514,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--execution-regime-inventory-notional-limit", type=float, default=None)
     parser.add_argument("--execution-regime-rolling-loss-abs", type=float, default=None)
     parser.add_argument("--execution-regime-rolling-loss-limit", type=float, default=None)
+    parser.add_argument("--execution-regime-vol-protection-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--execution-regime-vol-protection-min-scale", type=float, default=0.2)
+    parser.add_argument("--execution-regime-vol-protection-cancel-on-exit", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--synthetic-trend-follow-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--synthetic-trend-follow-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--synthetic-trend-follow-1m-amplitude-ratio", type=float, default=0.0)
@@ -11461,6 +11703,13 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         print(
             "  volatility_entry_pause: "
             f"active=yes reason={volatility_entry_pause.get('reason')}"
+        )
+    if summary.get("volatility_email_alert_enabled"):
+        print(
+            "  volatility_email_alert: "
+            f"triggered={'yes' if summary.get('volatility_email_alert_triggered') else 'no'} "
+            f"sent={'yes' if summary.get('volatility_email_alert_sent') else 'no'} "
+            f"reason={summary.get('volatility_email_alert_reason') or '--'}"
         )
     if summary.get("max_position_notional"):
         print(
@@ -11806,6 +12055,19 @@ def main() -> None:
         raise SystemExit("--volatility-entry-pause thresholds must be >= 0")
     if args.volatility_entry_pause_enabled and not any(threshold > 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("volatility entry pause requires at least one positive trigger threshold")
+    volatility_alert_thresholds = (
+        args.volatility_alert_1m_amplitude_ratio,
+        args.volatility_alert_15m_amplitude_ratio,
+        args.volatility_alert_60m_amplitude_ratio,
+    )
+    if any(threshold < 0 for threshold in volatility_alert_thresholds):
+        raise SystemExit("--volatility-alert amplitude ratios must be >= 0")
+    if args.volatility_alert_email_enabled and not any(threshold > 0 for threshold in volatility_alert_thresholds):
+        raise SystemExit("volatility email alert requires at least one positive amplitude threshold")
+    if args.volatility_alert_increase_multiplier < 1:
+        raise SystemExit("--volatility-alert-increase-multiplier must be >= 1")
+    if args.volatility_alert_cooldown_seconds < 0:
+        raise SystemExit("--volatility-alert-cooldown-seconds must be >= 0")
     if args.synthetic_trend_follow_1m_abs_return_ratio < 0 or args.synthetic_trend_follow_1m_amplitude_ratio < 0:
         raise SystemExit("--synthetic-trend-follow 1m thresholds must be >= 0")
     if args.synthetic_trend_follow_3m_abs_return_ratio < 0 or args.synthetic_trend_follow_3m_amplitude_ratio < 0:
@@ -12108,372 +12370,384 @@ def main() -> None:
                 )
 
                 summary = {
-                "ts": cycle_started_at.isoformat(),
-                "cycle": cycle,
-                "symbol": args.symbol.upper().strip(),
-                "strategy_profile": str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)),
-                "effective_strategy_profile": str(
-                    plan_report.get("effective_strategy_profile") or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
-                ),
-                "effective_strategy_label": str(plan_report.get("effective_strategy_label") or ""),
-                "strategy_mode": str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")),
-                "requested_strategy_mode": str(
-                    plan_report.get("requested_strategy_mode") or getattr(args, "strategy_mode", "one_way_long")
-                ),
-                "mid_price": _safe_float(plan_report.get("mid_price")),
-                "center_price": _safe_float(plan_report.get("center_price")),
-                "adaptive_step": dict(plan_report.get("adaptive_step") or {}),
-                "volatility_entry_pause": dict(plan_report.get("volatility_entry_pause") or {}),
-                "volatility_entry_pause_enabled": bool(
-                    (plan_report.get("volatility_entry_pause") or {}).get("enabled")
-                ),
-                "volatility_entry_pause_active": bool(
-                    (plan_report.get("volatility_entry_pause") or {}).get("active")
-                ),
-                "volatility_entry_pause_reason": (
-                    (plan_report.get("volatility_entry_pause") or {}).get("reason")
-                ),
-                "execution_regime": dict(plan_report.get("execution_regime") or {}),
-                "execution_regime_enabled": bool((plan_report.get("execution_regime") or {}).get("enabled")),
-                "execution_regime_state": str(((plan_report.get("execution_regime") or {}).get("state", "") or "")),
-                "execution_regime_raw_state": str(((plan_report.get("execution_regime") or {}).get("raw_state", "") or "")),
-                "execution_regime_risk_score": _safe_float((plan_report.get("execution_regime") or {}).get("risk_score")),
-                "execution_regime_hard_risk": bool((plan_report.get("execution_regime") or {}).get("hard_risk")),
-                "execution_regime_reason_codes": list((plan_report.get("execution_regime") or {}).get("reason_codes") or []),
-                "execution_regime_quote_offset_bps": _safe_float(
-                    ((plan_report.get("execution_regime") or {}).get("params") or {}).get("quote_offset_bps")
-                ),
-                "execution_regime_refresh_interval_ms": int(
-                    _safe_float(((plan_report.get("execution_regime") or {}).get("params") or {}).get("refresh_interval_ms"))
-                ),
-                "execution_regime_order_size_pct": _safe_float(
-                    ((plan_report.get("execution_regime") or {}).get("params") or {}).get("order_size_pct")
-                ),
-                "adaptive_step_enabled": bool((plan_report.get("adaptive_step") or {}).get("enabled")),
-                "adaptive_step_active": bool((plan_report.get("adaptive_step") or {}).get("active")),
-                "adaptive_step_controls_active": bool(
-                    (plan_report.get("adaptive_step") or {}).get("controls_active")
-                ),
-                "adaptive_step_base_step_price": _safe_float(
-                    (plan_report.get("adaptive_step") or {}).get("base_step_price")
-                ),
-                "adaptive_step_effective_step_price": _safe_float(
-                    (plan_report.get("adaptive_step") or {}).get("effective_step_price")
-                ),
-                "adaptive_step_scale": _safe_float((plan_report.get("adaptive_step") or {}).get("scale")),
-                "adaptive_step_raw_scale": _safe_float((plan_report.get("adaptive_step") or {}).get("raw_scale")),
-                "adaptive_step_per_order_scale": _safe_float(
-                    (plan_report.get("adaptive_step") or {}).get("per_order_scale")
-                ),
-                "adaptive_step_position_limit_scale": _safe_float(
-                    (plan_report.get("adaptive_step") or {}).get("position_limit_scale")
-                ),
-                "adaptive_step_dominant_window": (
-                    (plan_report.get("adaptive_step") or {}).get("dominant_window")
-                ),
-                "adaptive_step_dominant_metric": (
-                    (plan_report.get("adaptive_step") or {}).get("dominant_metric")
-                ),
-                "adaptive_step_dominant_value": _safe_float(
-                    (plan_report.get("adaptive_step") or {}).get("dominant_value")
-                ),
-                "adaptive_step_dominant_threshold": _safe_float(
-                    (plan_report.get("adaptive_step") or {}).get("dominant_threshold")
-                ),
-                "adaptive_step_reason": (plan_report.get("adaptive_step") or {}).get("reason"),
-                "adaptive_step_history_count": int(
-                    ((plan_report.get("adaptive_step") or {}).get("history_count", 0) or 0)
-                ),
-                "adaptive_step_window_30s_return_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_30s") or {}).get("return_ratio")
-                ),
-                "adaptive_step_window_30s_amplitude_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_30s") or {}).get("amplitude_ratio")
-                ),
-                "adaptive_step_window_1m_return_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_1m") or {}).get("return_ratio")
-                ),
-                "adaptive_step_window_1m_amplitude_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_1m") or {}).get("amplitude_ratio")
-                ),
-                "adaptive_step_window_3m_return_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_3m") or {}).get("return_ratio")
-                ),
-                "adaptive_step_window_3m_amplitude_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_3m") or {}).get("amplitude_ratio")
-                ),
-                "adaptive_step_window_5m_return_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("return_ratio")
-                ),
-                "adaptive_step_window_5m_amplitude_ratio": _safe_float(
-                    (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("amplitude_ratio")
-                ),
-                "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
-                "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
-                "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
-                "current_short_notional": _safe_float(plan_report.get("current_short_notional")),
-                "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
-                "actual_net_notional": _safe_float(plan_report.get("actual_net_notional")),
-                "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
-                "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
-                "synthetic_unmatched_trade_count": int(
-                    ((plan_report.get("synthetic_ledger") or {}).get("unmatched_trade_count", 0) or 0)
-                ),
-                "open_order_count": int(plan_report.get("open_order_count", 0) or 0),
-                "kept_order_count": len(plan_report.get("kept_orders", [])),
-                "missing_order_count": len(plan_report.get("missing_orders", [])),
-                "stale_order_count": len(plan_report.get("stale_orders", [])),
-                "placed_count": len(submit_report.get("placed_orders", [])),
-                "canceled_count": len(submit_report.get("canceled_orders", [])),
-                "buy_paused": bool(plan_report.get("buy_paused")),
-                "pause_reasons": list(plan_report.get("pause_reasons", [])),
-                "buy_cap_applied": bool(plan_report.get("buy_cap_applied")),
-                "buy_budget_notional": _safe_float(plan_report.get("buy_budget_notional")),
-                "planned_buy_notional": _safe_float(plan_report.get("planned_buy_notional")),
-                "max_position_notional": _safe_float(plan_report.get("max_position_notional")),
-                "short_cap_applied": bool(plan_report.get("short_cap_applied")),
-                "short_cover_paused": bool(plan_report.get("short_cover_paused")),
-                "short_paused": bool(plan_report.get("short_paused") or plan_report.get("short_cover_paused")),
-                "short_pause_reasons": list(plan_report.get("short_pause_reasons", [])),
-                "short_budget_notional": _safe_float(plan_report.get("short_budget_notional")),
-                "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
-                "max_short_position_notional": _safe_float(plan_report.get("max_short_position_notional")),
-                "short_threshold_timeout_active": bool((plan_report.get("short_threshold_timeout") or {}).get("timeout_active")),
-                "short_threshold_timeout_duration_seconds": _safe_float(
-                    (plan_report.get("short_threshold_timeout") or {}).get("duration_seconds")
-                ),
-                "short_threshold_timeout_hold_seconds": _safe_float(
-                    (plan_report.get("short_threshold_timeout") or {}).get("hold_seconds")
-                ),
-                "effective_short_plan_qty": _safe_float(plan_report.get("effective_short_plan_qty")),
-                "residual_long_flat_notional": _safe_float(plan_report.get("residual_long_flat_notional")),
-                "residual_long_flattened": bool(plan_report.get("residual_long_flattened")),
-                "residual_long_flattened_qty": _safe_float(plan_report.get("residual_long_flattened_qty")),
-                "residual_long_flattened_notional": _safe_float(plan_report.get("residual_long_flattened_notional")),
-                "residual_short_flat_notional": _safe_float(plan_report.get("residual_short_flat_notional")),
-                "residual_short_flattened": bool(plan_report.get("residual_short_flattened")),
-                "residual_short_flattened_qty": _safe_float(plan_report.get("residual_short_flattened_qty")),
-                "residual_short_flattened_notional": _safe_float(plan_report.get("residual_short_flattened_notional")),
-                "effective_synthetic_tiny_long_residual_notional": _safe_float(
-                    plan_report.get("effective_synthetic_tiny_long_residual_notional")
-                ),
-                "effective_synthetic_tiny_short_residual_notional": _safe_float(
-                    plan_report.get("effective_synthetic_tiny_short_residual_notional")
-                ),
-                "synthetic_tiny_long_residual_notional": _safe_float(plan_report.get("synthetic_tiny_long_residual_notional")),
-                "synthetic_tiny_short_residual_notional": _safe_float(plan_report.get("synthetic_tiny_short_residual_notional")),
-                "dominant_long_with_tiny_short_residual": bool(plan_report.get("dominant_long_with_tiny_short_residual")),
-                "dominant_short_with_tiny_long_residual": bool(plan_report.get("dominant_short_with_tiny_long_residual")),
-                "synthetic_tp_only_watchdog_candidate": bool(
-                    ((plan_report.get("synthetic_tp_only_watchdog") or {}).get("candidate"))
-                ),
-                "synthetic_tp_only_watchdog_active": bool(
-                    ((plan_report.get("synthetic_tp_only_watchdog") or {}).get("active"))
-                ),
-                "synthetic_tp_only_watchdog_duration_seconds": _safe_float(
-                    (plan_report.get("synthetic_tp_only_watchdog") or {}).get("duration_seconds")
-                ),
-                "synthetic_tp_only_watchdog_buy_gap_steps": _safe_float(
-                    (plan_report.get("synthetic_tp_only_watchdog") or {}).get("buy_gap_steps")
-                ),
-                "synthetic_tp_only_watchdog_sell_gap_steps": _safe_float(
-                    (plan_report.get("synthetic_tp_only_watchdog") or {}).get("sell_gap_steps")
-                ),
-                "synthetic_tp_only_watchdog_reason": (plan_report.get("synthetic_tp_only_watchdog") or {}).get("reason"),
-                "take_profit_guard": dict(plan_report.get("take_profit_guard") or {}),
-                "volume_long_v4_delever": dict(plan_report.get("volume_long_v4_delever") or {}),
-                "volume_long_v4_flow_sleeve": dict(plan_report.get("volume_long_v4_flow_sleeve") or {}),
-                "exposure_escalation": dict(plan_report.get("exposure_escalation") or {}),
-                "adverse_reduce_enabled": bool((plan_report.get("adverse_inventory_reduce") or {}).get("enabled")),
-                "adverse_reduce_active": bool((plan_report.get("adverse_inventory_reduce") or {}).get("active")),
-                "adverse_reduce_direction": str(
-                    ((plan_report.get("adverse_inventory_reduce") or {}).get("direction", "") or "")
-                ),
-                "adverse_reduce_blocked_reason": (
-                    (plan_report.get("adverse_inventory_reduce") or {}).get("blocked_reason")
-                ),
-                "adverse_reduce_short_adverse_ratio": _safe_float(
-                    (plan_report.get("adverse_inventory_reduce") or {}).get("short_adverse_ratio")
-                ),
-                "adverse_reduce_placed_reduce_orders": int(
-                    ((plan_report.get("adverse_inventory_reduce") or {}).get("placed_reduce_orders", 0) or 0)
-                ),
-                "inventory_tier_active": bool((plan_report.get("inventory_tier") or {}).get("active")),
-                "inventory_tier_ratio": _safe_float((plan_report.get("inventory_tier") or {}).get("ratio")),
-                "volatility_buy_pause": bool((plan_report.get("market_guard") or {}).get("buy_pause_active")),
-                "shift_frozen": bool((plan_report.get("market_guard") or {}).get("shift_frozen")),
-                "market_guard_return_ratio": _safe_float((plan_report.get("market_guard") or {}).get("return_ratio")),
-                "market_guard_amplitude_ratio": _safe_float((plan_report.get("market_guard") or {}).get("amplitude_ratio")),
-                "auto_regime_enabled": bool(getattr(args, "auto_regime_enabled", False)),
-                "auto_regime_regime": str(((plan_report.get("auto_regime") or {}).get("regime", "") or "")),
-                "auto_regime_reason": (plan_report.get("auto_regime") or {}).get("reason"),
-                "auto_regime_pending_count": int(((plan_report.get("auto_regime") or {}).get("pending_count", 0) or 0)),
-                "auto_regime_confirm_cycles": int(((plan_report.get("auto_regime") or {}).get("confirm_cycles", 0) or 0)),
-                "auto_regime_switched": bool((plan_report.get("auto_regime") or {}).get("switched")),
-                "xaut_adaptive_enabled": bool(plan_report.get("xaut_adaptive")),
-                "xaut_adaptive_state": str(((plan_report.get("xaut_adaptive") or {}).get("active_state", "") or "")),
-                "xaut_adaptive_candidate_state": str(((plan_report.get("xaut_adaptive") or {}).get("candidate_state", "") or "")),
-                "xaut_adaptive_pending_count": int(((plan_report.get("xaut_adaptive") or {}).get("pending_count", 0) or 0)),
-                "xaut_adaptive_reason": (plan_report.get("xaut_adaptive") or {}).get("reason"),
-                "neutral_hourly_scale_enabled": bool(((plan_report.get("neutral_hourly_scale") or {}).get("enabled"))),
-                "neutral_hourly_scale_ratio": _safe_float((plan_report.get("neutral_hourly_scale") or {}).get("scale")),
-                "neutral_hourly_regime": str(((plan_report.get("neutral_hourly_scale") or {}).get("regime", "") or "")),
-                "neutral_hourly_reason": (plan_report.get("neutral_hourly_scale") or {}).get("reason"),
-                "neutral_hourly_bucket": (plan_report.get("neutral_hourly_scale") or {}).get("bucket"),
-                "market_bias_enabled": bool(((plan_report.get("market_bias") or {}).get("enabled"))),
-                "market_bias_active": bool(((plan_report.get("market_bias") or {}).get("active"))),
-                "market_bias_regime": str(((plan_report.get("market_bias") or {}).get("regime", "") or "")),
-                "market_bias_score": _safe_float((plan_report.get("market_bias") or {}).get("bias_score")),
-                "market_bias_shift_steps": _safe_float((plan_report.get("market_bias") or {}).get("shift_steps")),
-                "market_bias_buy_offset_steps": _safe_float((plan_report.get("market_bias") or {}).get("buy_offset_steps")),
-                "market_bias_sell_offset_steps": _safe_float((plan_report.get("market_bias") or {}).get("sell_offset_steps")),
-                "market_bias_drift_steps": _safe_float((plan_report.get("market_bias") or {}).get("drift_steps")),
-                "market_bias_return_steps": _safe_float((plan_report.get("market_bias") or {}).get("return_steps")),
-                "market_bias_weak_buy_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_enabled"))),
-                "market_bias_weak_buy_pause_active": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_active"))),
-                "market_bias_weak_buy_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("weak_buy_pause_threshold")),
-                "market_bias_weak_buy_probe_scale": _safe_float((plan_report.get("market_bias") or {}).get("weak_buy_probe_scale")),
-                "market_bias_strong_short_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_enabled"))),
-                "market_bias_strong_short_pause_active": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_active"))),
-                "market_bias_strong_short_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("strong_short_pause_threshold")),
-                "market_bias_strong_short_probe_scale": _safe_float((plan_report.get("market_bias") or {}).get("strong_short_probe_scale")),
-                "market_bias_regime_switch_enabled": bool(((plan_report.get("market_bias_regime_switch") or {}).get("enabled"))),
-                "market_bias_switch_active_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("active_mode", "") or "")),
-                "market_bias_switch_candidate_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("candidate_mode", "") or "")),
-                "market_bias_switch_pending_count": int(((plan_report.get("market_bias_regime_switch") or {}).get("pending_count", 0) or 0)),
-                "market_bias_switch_confirm_cycles": int(((plan_report.get("market_bias_regime_switch") or {}).get("confirm_cycles", 0) or 0)),
-                "market_bias_switch_reason": (plan_report.get("market_bias_regime_switch") or {}).get("reason"),
-                "market_bias_switch_switched": bool(((plan_report.get("market_bias_regime_switch") or {}).get("switched"))),
-                "synthetic_trend_follow_enabled": bool(((plan_report.get("synthetic_trend_follow") or {}).get("enabled"))),
-                "synthetic_trend_follow_active": bool(((plan_report.get("synthetic_trend_follow") or {}).get("active"))),
-                "synthetic_trend_follow_mode": str(((plan_report.get("synthetic_trend_follow") or {}).get("mode", "") or "")),
-                "synthetic_trend_follow_direction": str(((plan_report.get("synthetic_trend_follow") or {}).get("direction", "") or "")),
-                "synthetic_trend_follow_reason": (plan_report.get("synthetic_trend_follow") or {}).get("reason"),
-                "synthetic_trend_follow_reverse_delay_active": bool(
-                    ((plan_report.get("synthetic_trend_follow") or {}).get("reverse_delay_active"))
-                ),
-                "synthetic_trend_follow_reverse_delay_remaining_seconds": _safe_float(
-                    (plan_report.get("synthetic_trend_follow") or {}).get("reverse_delay_remaining_seconds")
-                ),
-                "synthetic_flow_sleeve_enabled": bool(((plan_report.get("synthetic_flow_sleeve") or {}).get("enabled"))),
-                "synthetic_flow_sleeve_active": bool(((plan_report.get("synthetic_flow_sleeve") or {}).get("active"))),
-                "synthetic_flow_sleeve_direction": str(
-                    ((plan_report.get("synthetic_flow_sleeve") or {}).get("direction", "") or "")
-                ),
-                "synthetic_flow_sleeve_placed_order_count": int(
-                    ((plan_report.get("synthetic_flow_sleeve") or {}).get("placed_order_count", 0) or 0)
-                ),
-                "synthetic_flow_sleeve_placed_notional": _safe_float(
-                    (plan_report.get("synthetic_flow_sleeve") or {}).get("placed_notional")
-                ),
-                "synthetic_flow_sleeve_remaining_notional": _safe_float(
-                    (plan_report.get("synthetic_flow_sleeve") or {}).get("remaining_sleeve_notional")
-                ),
-                "synthetic_flow_sleeve_blocked_reason": (
-                    (plan_report.get("synthetic_flow_sleeve") or {}).get("blocked_reason")
-                ),
-                "volume_long_v4_flow_sleeve_enabled": bool(
-                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("enabled"))
-                ),
-                "volume_long_v4_flow_sleeve_active": bool(
-                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("active"))
-                ),
-                "volume_long_v4_flow_sleeve_placed_order_count": int(
-                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("placed_order_count", 0) or 0)
-                ),
-                "volume_long_v4_flow_sleeve_placed_notional": _safe_float(
-                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("placed_notional")
-                ),
-                "volume_long_v4_flow_sleeve_released_take_profit_order_count": int(
-                    ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("released_take_profit_order_count", 0) or 0)
-                ),
-                "volume_long_v4_flow_sleeve_released_take_profit_notional": _safe_float(
-                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("released_take_profit_notional")
-                ),
-                "volume_long_v4_flow_sleeve_remaining_notional": _safe_float(
-                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("remaining_sleeve_notional")
-                ),
-                "volume_long_v4_flow_sleeve_loss_floor_price": _safe_float(
-                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("loss_floor_price")
-                ),
-                "volume_long_v4_flow_sleeve_blocked_reason": (
-                    (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("blocked_reason")
-                ),
-                "exposure_escalation_enabled": bool(
-                    ((plan_report.get("exposure_escalation") or {}).get("enabled"))
-                ),
-                "exposure_escalation_active": bool(
-                    ((plan_report.get("exposure_escalation") or {}).get("active"))
-                ),
-                "exposure_escalation_reason": (
-                    (plan_report.get("exposure_escalation") or {}).get("reason")
-                    or (plan_report.get("exposure_escalation") or {}).get("blocked_reason")
-                ),
-                "exposure_escalation_held_seconds": _safe_float(
-                    (plan_report.get("exposure_escalation") or {}).get("held_seconds")
-                ),
-                "exposure_escalation_unrealized_pnl": _safe_float(
-                    (plan_report.get("exposure_escalation") or {}).get("unrealized_pnl")
-                ),
-                "effective_buy_levels": int(plan_report.get("effective_buy_levels", 0) or 0),
-                "effective_sell_levels": int(plan_report.get("effective_sell_levels", 0) or 0),
-                "effective_per_order_notional": _safe_float(plan_report.get("effective_per_order_notional")),
-                "effective_base_position_notional": _safe_float(plan_report.get("effective_base_position_notional")),
-                "custom_grid_runtime_min_price": _safe_float(plan_report.get("custom_grid_runtime_min_price")),
-                "custom_grid_runtime_max_price": _safe_float(plan_report.get("custom_grid_runtime_max_price")),
-                "custom_grid_roll_enabled": bool(((plan_report.get("custom_grid_roll") or {}).get("enabled"))),
-                "custom_grid_roll_checked": bool(((plan_report.get("custom_grid_roll") or {}).get("checked"))),
-                "custom_grid_roll_triggered": bool(((plan_report.get("custom_grid_roll") or {}).get("triggered"))),
-                "custom_grid_roll_reason": (plan_report.get("custom_grid_roll") or {}).get("reason"),
-                "custom_grid_roll_interval_minutes": int(((plan_report.get("custom_grid_roll") or {}).get("interval_minutes", 0) or 0)),
-                "custom_grid_roll_trade_threshold": int(((plan_report.get("custom_grid_roll") or {}).get("trade_threshold", 0) or 0)),
-                "custom_grid_roll_upper_distance_ratio": _safe_float((plan_report.get("custom_grid_roll") or {}).get("upper_distance_ratio")),
-                "custom_grid_roll_shift_levels": int(((plan_report.get("custom_grid_roll") or {}).get("shift_levels", 0) or 0)),
-                "custom_grid_roll_current_trade_count": int(((plan_report.get("custom_grid_roll") or {}).get("current_trade_count", 0) or 0)),
-                "custom_grid_roll_trade_baseline": int(((plan_report.get("custom_grid_roll") or {}).get("trade_baseline", 0) or 0)),
-                "custom_grid_roll_trades_since_last_roll": int(((plan_report.get("custom_grid_roll") or {}).get("trades_since_last_roll", 0) or 0)),
-                "custom_grid_roll_levels_above_current": int(((plan_report.get("custom_grid_roll") or {}).get("levels_above_current", 0) or 0)),
-                "custom_grid_roll_required_levels_above": int(((plan_report.get("custom_grid_roll") or {}).get("required_levels_above", 0) or 0)),
-                "custom_grid_roll_last_check_bucket": (plan_report.get("custom_grid_roll") or {}).get("last_check_bucket"),
-                "custom_grid_roll_last_applied_at": (plan_report.get("custom_grid_roll") or {}).get("last_applied_at"),
-                "custom_grid_roll_last_applied_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_applied_price")),
-                "custom_grid_roll_old_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("old_min_price")),
-                "custom_grid_roll_old_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("old_max_price")),
-                "custom_grid_roll_new_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("new_min_price")),
-                "custom_grid_roll_new_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("new_max_price")),
-                "custom_grid_roll_last_old_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_old_min_price")),
-                "custom_grid_roll_last_old_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_old_max_price")),
-                "custom_grid_roll_last_new_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_new_min_price")),
-                "custom_grid_roll_last_new_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_new_max_price")),
-                "fixed_center_roll": dict(plan_report.get("fixed_center_roll") or {}),
-                "shift_moves": list(plan_report.get("shift_moves", [])),
-                "reconcile": reconcile_snapshot,
-                "reconcile_checked": bool(reconcile_snapshot.get("checked")),
-                "reconcile_ok": reconcile_snapshot.get("ok"),
-                "reconcile_message": reconcile_snapshot.get("message"),
-                "reconcile_interval_cycles": int(reconcile_snapshot.get("interval_cycles", 0) or 0),
-                "reconcile_expected_open_order_count": int(reconcile_snapshot.get("expected_open_order_count", 0) or 0),
-                "reconcile_actual_open_order_count": int(reconcile_snapshot.get("actual_open_order_count", 0) or 0),
-                "reconcile_expected_actual_net_qty": _safe_float(reconcile_snapshot.get("expected_actual_net_qty")),
-                "reconcile_actual_actual_net_qty": _safe_float(reconcile_snapshot.get("actual_actual_net_qty")),
-                "executed": bool(submit_report.get("executed")),
-                "trade_audit_appended": int(audit_sync.get("trade_appended", 0) or 0),
-                "income_audit_appended": int(audit_sync.get("income_appended", 0) or 0),
-                "audit_error": audit_sync.get("error"),
-                "error_message": None,
-                "runtime_status": runtime_guard_result.runtime_status,
-                "stop_triggered": runtime_guard_result.stop_triggered,
-                "stop_reason": runtime_guard_result.primary_reason,
-                "stop_reasons": runtime_guard_result.matched_reasons,
-                "stop_triggered_at": runtime_guard_result.triggered_at,
-                "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
-                "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
-                "runtime_guard_stats_start_time": runtime_stats_start_time.isoformat() if runtime_stats_start_time else None,
-                "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
-                "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
-                "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
-                "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
-            }
+                    "ts": cycle_started_at.isoformat(),
+                    "cycle": cycle,
+                    "symbol": args.symbol.upper().strip(),
+                    "strategy_profile": str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)),
+                    "effective_strategy_profile": str(
+                        plan_report.get("effective_strategy_profile") or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
+                    ),
+                    "effective_strategy_label": str(plan_report.get("effective_strategy_label") or ""),
+                    "strategy_mode": str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")),
+                    "requested_strategy_mode": str(
+                        plan_report.get("requested_strategy_mode") or getattr(args, "strategy_mode", "one_way_long")
+                    ),
+                    "mid_price": _safe_float(plan_report.get("mid_price")),
+                    "center_price": _safe_float(plan_report.get("center_price")),
+                    "adaptive_step": dict(plan_report.get("adaptive_step") or {}),
+                    "volatility_entry_pause": dict(plan_report.get("volatility_entry_pause") or {}),
+                    "volatility_entry_pause_enabled": bool(
+                        (plan_report.get("volatility_entry_pause") or {}).get("enabled")
+                    ),
+                    "volatility_entry_pause_active": bool(
+                        (plan_report.get("volatility_entry_pause") or {}).get("active")
+                    ),
+                    "volatility_entry_pause_reason": (
+                        (plan_report.get("volatility_entry_pause") or {}).get("reason")
+                    ),
+                    "execution_regime": dict(plan_report.get("execution_regime") or {}),
+                    "execution_regime_enabled": bool((plan_report.get("execution_regime") or {}).get("enabled")),
+                    "execution_regime_state": str(((plan_report.get("execution_regime") or {}).get("state", "") or "")),
+                    "execution_regime_raw_state": str(((plan_report.get("execution_regime") or {}).get("raw_state", "") or "")),
+                    "execution_regime_risk_score": _safe_float((plan_report.get("execution_regime") or {}).get("risk_score")),
+                    "execution_regime_hard_risk": bool((plan_report.get("execution_regime") or {}).get("hard_risk")),
+                    "execution_regime_reason_codes": list((plan_report.get("execution_regime") or {}).get("reason_codes") or []),
+                    "execution_regime_quote_offset_bps": _safe_float(
+                        ((plan_report.get("execution_regime") or {}).get("params") or {}).get("quote_offset_bps")
+                    ),
+                    "execution_regime_refresh_interval_ms": int(
+                        _safe_float(((plan_report.get("execution_regime") or {}).get("params") or {}).get("refresh_interval_ms"))
+                    ),
+                    "execution_regime_order_size_pct": _safe_float(
+                        ((plan_report.get("execution_regime") or {}).get("params") or {}).get("order_size_pct")
+                    ),
+                    "adaptive_step_enabled": bool((plan_report.get("adaptive_step") or {}).get("enabled")),
+                    "adaptive_step_active": bool((plan_report.get("adaptive_step") or {}).get("active")),
+                    "adaptive_step_controls_active": bool(
+                        (plan_report.get("adaptive_step") or {}).get("controls_active")
+                    ),
+                    "adaptive_step_base_step_price": _safe_float(
+                        (plan_report.get("adaptive_step") or {}).get("base_step_price")
+                    ),
+                    "adaptive_step_effective_step_price": _safe_float(
+                        (plan_report.get("adaptive_step") or {}).get("effective_step_price")
+                    ),
+                    "adaptive_step_scale": _safe_float((plan_report.get("adaptive_step") or {}).get("scale")),
+                    "adaptive_step_raw_scale": _safe_float((plan_report.get("adaptive_step") or {}).get("raw_scale")),
+                    "adaptive_step_per_order_scale": _safe_float(
+                        (plan_report.get("adaptive_step") or {}).get("per_order_scale")
+                    ),
+                    "adaptive_step_position_limit_scale": _safe_float(
+                        (plan_report.get("adaptive_step") or {}).get("position_limit_scale")
+                    ),
+                    "adaptive_step_dominant_window": (
+                        (plan_report.get("adaptive_step") or {}).get("dominant_window")
+                    ),
+                    "adaptive_step_dominant_metric": (
+                        (plan_report.get("adaptive_step") or {}).get("dominant_metric")
+                    ),
+                    "adaptive_step_dominant_value": _safe_float(
+                        (plan_report.get("adaptive_step") or {}).get("dominant_value")
+                    ),
+                    "adaptive_step_dominant_threshold": _safe_float(
+                        (plan_report.get("adaptive_step") or {}).get("dominant_threshold")
+                    ),
+                    "adaptive_step_reason": (plan_report.get("adaptive_step") or {}).get("reason"),
+                    "adaptive_step_history_count": int(
+                        ((plan_report.get("adaptive_step") or {}).get("history_count", 0) or 0)
+                    ),
+                    "adaptive_step_window_30s_return_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_30s") or {}).get("return_ratio")
+                    ),
+                    "adaptive_step_window_30s_amplitude_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_30s") or {}).get("amplitude_ratio")
+                    ),
+                    "adaptive_step_window_1m_return_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_1m") or {}).get("return_ratio")
+                    ),
+                    "adaptive_step_window_1m_amplitude_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_1m") or {}).get("amplitude_ratio")
+                    ),
+                    "adaptive_step_window_3m_return_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_3m") or {}).get("return_ratio")
+                    ),
+                    "adaptive_step_window_3m_amplitude_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_3m") or {}).get("amplitude_ratio")
+                    ),
+                    "adaptive_step_window_5m_return_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("return_ratio")
+                    ),
+                    "adaptive_step_window_5m_amplitude_ratio": _safe_float(
+                        (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("amplitude_ratio")
+                    ),
+                    "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
+                    "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
+                    "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
+                    "current_short_notional": _safe_float(plan_report.get("current_short_notional")),
+                    "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
+                    "actual_net_notional": _safe_float(plan_report.get("actual_net_notional")),
+                    "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
+                    "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
+                    "synthetic_unmatched_trade_count": int(
+                        ((plan_report.get("synthetic_ledger") or {}).get("unmatched_trade_count", 0) or 0)
+                    ),
+                    "open_order_count": int(plan_report.get("open_order_count", 0) or 0),
+                    "kept_order_count": len(plan_report.get("kept_orders", [])),
+                    "missing_order_count": len(plan_report.get("missing_orders", [])),
+                    "stale_order_count": len(plan_report.get("stale_orders", [])),
+                    "placed_count": len(submit_report.get("placed_orders", [])),
+                    "canceled_count": len(submit_report.get("canceled_orders", [])),
+                    "buy_paused": bool(plan_report.get("buy_paused")),
+                    "pause_reasons": list(plan_report.get("pause_reasons", [])),
+                    "buy_cap_applied": bool(plan_report.get("buy_cap_applied")),
+                    "buy_budget_notional": _safe_float(plan_report.get("buy_budget_notional")),
+                    "planned_buy_notional": _safe_float(plan_report.get("planned_buy_notional")),
+                    "max_position_notional": _safe_float(plan_report.get("max_position_notional")),
+                    "short_cap_applied": bool(plan_report.get("short_cap_applied")),
+                    "short_cover_paused": bool(plan_report.get("short_cover_paused")),
+                    "short_paused": bool(plan_report.get("short_paused") or plan_report.get("short_cover_paused")),
+                    "short_pause_reasons": list(plan_report.get("short_pause_reasons", [])),
+                    "short_budget_notional": _safe_float(plan_report.get("short_budget_notional")),
+                    "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
+                    "max_short_position_notional": _safe_float(plan_report.get("max_short_position_notional")),
+                    "short_threshold_timeout_active": bool((plan_report.get("short_threshold_timeout") or {}).get("timeout_active")),
+                    "short_threshold_timeout_duration_seconds": _safe_float(
+                        (plan_report.get("short_threshold_timeout") or {}).get("duration_seconds")
+                    ),
+                    "short_threshold_timeout_hold_seconds": _safe_float(
+                        (plan_report.get("short_threshold_timeout") or {}).get("hold_seconds")
+                    ),
+                    "effective_short_plan_qty": _safe_float(plan_report.get("effective_short_plan_qty")),
+                    "residual_long_flat_notional": _safe_float(plan_report.get("residual_long_flat_notional")),
+                    "residual_long_flattened": bool(plan_report.get("residual_long_flattened")),
+                    "residual_long_flattened_qty": _safe_float(plan_report.get("residual_long_flattened_qty")),
+                    "residual_long_flattened_notional": _safe_float(plan_report.get("residual_long_flattened_notional")),
+                    "residual_short_flat_notional": _safe_float(plan_report.get("residual_short_flat_notional")),
+                    "residual_short_flattened": bool(plan_report.get("residual_short_flattened")),
+                    "residual_short_flattened_qty": _safe_float(plan_report.get("residual_short_flattened_qty")),
+                    "residual_short_flattened_notional": _safe_float(plan_report.get("residual_short_flattened_notional")),
+                    "effective_synthetic_tiny_long_residual_notional": _safe_float(
+                        plan_report.get("effective_synthetic_tiny_long_residual_notional")
+                    ),
+                    "effective_synthetic_tiny_short_residual_notional": _safe_float(
+                        plan_report.get("effective_synthetic_tiny_short_residual_notional")
+                    ),
+                    "synthetic_tiny_long_residual_notional": _safe_float(plan_report.get("synthetic_tiny_long_residual_notional")),
+                    "synthetic_tiny_short_residual_notional": _safe_float(plan_report.get("synthetic_tiny_short_residual_notional")),
+                    "dominant_long_with_tiny_short_residual": bool(plan_report.get("dominant_long_with_tiny_short_residual")),
+                    "dominant_short_with_tiny_long_residual": bool(plan_report.get("dominant_short_with_tiny_long_residual")),
+                    "synthetic_tp_only_watchdog_candidate": bool(
+                        ((plan_report.get("synthetic_tp_only_watchdog") or {}).get("candidate"))
+                    ),
+                    "synthetic_tp_only_watchdog_active": bool(
+                        ((plan_report.get("synthetic_tp_only_watchdog") or {}).get("active"))
+                    ),
+                    "synthetic_tp_only_watchdog_duration_seconds": _safe_float(
+                        (plan_report.get("synthetic_tp_only_watchdog") or {}).get("duration_seconds")
+                    ),
+                    "synthetic_tp_only_watchdog_buy_gap_steps": _safe_float(
+                        (plan_report.get("synthetic_tp_only_watchdog") or {}).get("buy_gap_steps")
+                    ),
+                    "synthetic_tp_only_watchdog_sell_gap_steps": _safe_float(
+                        (plan_report.get("synthetic_tp_only_watchdog") or {}).get("sell_gap_steps")
+                    ),
+                    "synthetic_tp_only_watchdog_reason": (plan_report.get("synthetic_tp_only_watchdog") or {}).get("reason"),
+                    "take_profit_guard": dict(plan_report.get("take_profit_guard") or {}),
+                    "volume_long_v4_delever": dict(plan_report.get("volume_long_v4_delever") or {}),
+                    "volume_long_v4_flow_sleeve": dict(plan_report.get("volume_long_v4_flow_sleeve") or {}),
+                    "exposure_escalation": dict(plan_report.get("exposure_escalation") or {}),
+                    "adverse_reduce_enabled": bool((plan_report.get("adverse_inventory_reduce") or {}).get("enabled")),
+                    "adverse_reduce_active": bool((plan_report.get("adverse_inventory_reduce") or {}).get("active")),
+                    "adverse_reduce_direction": str(
+                        ((plan_report.get("adverse_inventory_reduce") or {}).get("direction", "") or "")
+                    ),
+                    "adverse_reduce_blocked_reason": (
+                        (plan_report.get("adverse_inventory_reduce") or {}).get("blocked_reason")
+                    ),
+                    "adverse_reduce_short_adverse_ratio": _safe_float(
+                        (plan_report.get("adverse_inventory_reduce") or {}).get("short_adverse_ratio")
+                    ),
+                    "adverse_reduce_placed_reduce_orders": int(
+                        ((plan_report.get("adverse_inventory_reduce") or {}).get("placed_reduce_orders", 0) or 0)
+                    ),
+                    "inventory_tier_active": bool((plan_report.get("inventory_tier") or {}).get("active")),
+                    "inventory_tier_ratio": _safe_float((plan_report.get("inventory_tier") or {}).get("ratio")),
+                    "volatility_buy_pause": bool((plan_report.get("market_guard") or {}).get("buy_pause_active")),
+                    "shift_frozen": bool((plan_report.get("market_guard") or {}).get("shift_frozen")),
+                    "market_guard_return_ratio": _safe_float((plan_report.get("market_guard") or {}).get("return_ratio")),
+                    "market_guard_amplitude_ratio": _safe_float((plan_report.get("market_guard") or {}).get("amplitude_ratio")),
+                    "auto_regime_enabled": bool(getattr(args, "auto_regime_enabled", False)),
+                    "auto_regime_regime": str(((plan_report.get("auto_regime") or {}).get("regime", "") or "")),
+                    "auto_regime_reason": (plan_report.get("auto_regime") or {}).get("reason"),
+                    "auto_regime_pending_count": int(((plan_report.get("auto_regime") or {}).get("pending_count", 0) or 0)),
+                    "auto_regime_confirm_cycles": int(((plan_report.get("auto_regime") or {}).get("confirm_cycles", 0) or 0)),
+                    "auto_regime_switched": bool((plan_report.get("auto_regime") or {}).get("switched")),
+                    "xaut_adaptive_enabled": bool(plan_report.get("xaut_adaptive")),
+                    "xaut_adaptive_state": str(((plan_report.get("xaut_adaptive") or {}).get("active_state", "") or "")),
+                    "xaut_adaptive_candidate_state": str(((plan_report.get("xaut_adaptive") or {}).get("candidate_state", "") or "")),
+                    "xaut_adaptive_pending_count": int(((plan_report.get("xaut_adaptive") or {}).get("pending_count", 0) or 0)),
+                    "xaut_adaptive_reason": (plan_report.get("xaut_adaptive") or {}).get("reason"),
+                    "neutral_hourly_scale_enabled": bool(((plan_report.get("neutral_hourly_scale") or {}).get("enabled"))),
+                    "neutral_hourly_scale_ratio": _safe_float((plan_report.get("neutral_hourly_scale") or {}).get("scale")),
+                    "neutral_hourly_regime": str(((plan_report.get("neutral_hourly_scale") or {}).get("regime", "") or "")),
+                    "neutral_hourly_reason": (plan_report.get("neutral_hourly_scale") or {}).get("reason"),
+                    "neutral_hourly_bucket": (plan_report.get("neutral_hourly_scale") or {}).get("bucket"),
+                    "market_bias_enabled": bool(((plan_report.get("market_bias") or {}).get("enabled"))),
+                    "market_bias_active": bool(((plan_report.get("market_bias") or {}).get("active"))),
+                    "market_bias_regime": str(((plan_report.get("market_bias") or {}).get("regime", "") or "")),
+                    "market_bias_score": _safe_float((plan_report.get("market_bias") or {}).get("bias_score")),
+                    "market_bias_shift_steps": _safe_float((plan_report.get("market_bias") or {}).get("shift_steps")),
+                    "market_bias_buy_offset_steps": _safe_float((plan_report.get("market_bias") or {}).get("buy_offset_steps")),
+                    "market_bias_sell_offset_steps": _safe_float((plan_report.get("market_bias") or {}).get("sell_offset_steps")),
+                    "market_bias_drift_steps": _safe_float((plan_report.get("market_bias") or {}).get("drift_steps")),
+                    "market_bias_return_steps": _safe_float((plan_report.get("market_bias") or {}).get("return_steps")),
+                    "market_bias_weak_buy_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_enabled"))),
+                    "market_bias_weak_buy_pause_active": bool(((plan_report.get("market_bias") or {}).get("weak_buy_pause_active"))),
+                    "market_bias_weak_buy_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("weak_buy_pause_threshold")),
+                    "market_bias_weak_buy_probe_scale": _safe_float((plan_report.get("market_bias") or {}).get("weak_buy_probe_scale")),
+                    "market_bias_strong_short_pause_enabled": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_enabled"))),
+                    "market_bias_strong_short_pause_active": bool(((plan_report.get("market_bias") or {}).get("strong_short_pause_active"))),
+                    "market_bias_strong_short_pause_threshold": _safe_float((plan_report.get("market_bias") or {}).get("strong_short_pause_threshold")),
+                    "market_bias_strong_short_probe_scale": _safe_float((plan_report.get("market_bias") or {}).get("strong_short_probe_scale")),
+                    "market_bias_regime_switch_enabled": bool(((plan_report.get("market_bias_regime_switch") or {}).get("enabled"))),
+                    "market_bias_switch_active_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("active_mode", "") or "")),
+                    "market_bias_switch_candidate_mode": str(((plan_report.get("market_bias_regime_switch") or {}).get("candidate_mode", "") or "")),
+                    "market_bias_switch_pending_count": int(((plan_report.get("market_bias_regime_switch") or {}).get("pending_count", 0) or 0)),
+                    "market_bias_switch_confirm_cycles": int(((plan_report.get("market_bias_regime_switch") or {}).get("confirm_cycles", 0) or 0)),
+                    "market_bias_switch_reason": (plan_report.get("market_bias_regime_switch") or {}).get("reason"),
+                    "market_bias_switch_switched": bool(((plan_report.get("market_bias_regime_switch") or {}).get("switched"))),
+                    "synthetic_trend_follow_enabled": bool(((plan_report.get("synthetic_trend_follow") or {}).get("enabled"))),
+                    "synthetic_trend_follow_active": bool(((plan_report.get("synthetic_trend_follow") or {}).get("active"))),
+                    "synthetic_trend_follow_mode": str(((plan_report.get("synthetic_trend_follow") or {}).get("mode", "") or "")),
+                    "synthetic_trend_follow_direction": str(((plan_report.get("synthetic_trend_follow") or {}).get("direction", "") or "")),
+                    "synthetic_trend_follow_reason": (plan_report.get("synthetic_trend_follow") or {}).get("reason"),
+                    "synthetic_trend_follow_reverse_delay_active": bool(
+                        ((plan_report.get("synthetic_trend_follow") or {}).get("reverse_delay_active"))
+                    ),
+                    "synthetic_trend_follow_reverse_delay_remaining_seconds": _safe_float(
+                        (plan_report.get("synthetic_trend_follow") or {}).get("reverse_delay_remaining_seconds")
+                    ),
+                    "synthetic_flow_sleeve_enabled": bool(((plan_report.get("synthetic_flow_sleeve") or {}).get("enabled"))),
+                    "synthetic_flow_sleeve_active": bool(((plan_report.get("synthetic_flow_sleeve") or {}).get("active"))),
+                    "synthetic_flow_sleeve_direction": str(
+                        ((plan_report.get("synthetic_flow_sleeve") or {}).get("direction", "") or "")
+                    ),
+                    "synthetic_flow_sleeve_placed_order_count": int(
+                        ((plan_report.get("synthetic_flow_sleeve") or {}).get("placed_order_count", 0) or 0)
+                    ),
+                    "synthetic_flow_sleeve_placed_notional": _safe_float(
+                        (plan_report.get("synthetic_flow_sleeve") or {}).get("placed_notional")
+                    ),
+                    "synthetic_flow_sleeve_remaining_notional": _safe_float(
+                        (plan_report.get("synthetic_flow_sleeve") or {}).get("remaining_sleeve_notional")
+                    ),
+                    "synthetic_flow_sleeve_blocked_reason": (
+                        (plan_report.get("synthetic_flow_sleeve") or {}).get("blocked_reason")
+                    ),
+                    "volume_long_v4_flow_sleeve_enabled": bool(
+                        ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("enabled"))
+                    ),
+                    "volume_long_v4_flow_sleeve_active": bool(
+                        ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("active"))
+                    ),
+                    "volume_long_v4_flow_sleeve_placed_order_count": int(
+                        ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("placed_order_count", 0) or 0)
+                    ),
+                    "volume_long_v4_flow_sleeve_placed_notional": _safe_float(
+                        (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("placed_notional")
+                    ),
+                    "volume_long_v4_flow_sleeve_released_take_profit_order_count": int(
+                        ((plan_report.get("volume_long_v4_flow_sleeve") or {}).get("released_take_profit_order_count", 0) or 0)
+                    ),
+                    "volume_long_v4_flow_sleeve_released_take_profit_notional": _safe_float(
+                        (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("released_take_profit_notional")
+                    ),
+                    "volume_long_v4_flow_sleeve_remaining_notional": _safe_float(
+                        (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("remaining_sleeve_notional")
+                    ),
+                    "volume_long_v4_flow_sleeve_loss_floor_price": _safe_float(
+                        (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("loss_floor_price")
+                    ),
+                    "volume_long_v4_flow_sleeve_blocked_reason": (
+                        (plan_report.get("volume_long_v4_flow_sleeve") or {}).get("blocked_reason")
+                    ),
+                    "exposure_escalation_enabled": bool(
+                        ((plan_report.get("exposure_escalation") or {}).get("enabled"))
+                    ),
+                    "exposure_escalation_active": bool(
+                        ((plan_report.get("exposure_escalation") or {}).get("active"))
+                    ),
+                    "exposure_escalation_reason": (
+                        (plan_report.get("exposure_escalation") or {}).get("reason")
+                        or (plan_report.get("exposure_escalation") or {}).get("blocked_reason")
+                    ),
+                    "exposure_escalation_held_seconds": _safe_float(
+                        (plan_report.get("exposure_escalation") or {}).get("held_seconds")
+                    ),
+                    "exposure_escalation_unrealized_pnl": _safe_float(
+                        (plan_report.get("exposure_escalation") or {}).get("unrealized_pnl")
+                    ),
+                    "effective_buy_levels": int(plan_report.get("effective_buy_levels", 0) or 0),
+                    "effective_sell_levels": int(plan_report.get("effective_sell_levels", 0) or 0),
+                    "effective_per_order_notional": _safe_float(plan_report.get("effective_per_order_notional")),
+                    "effective_base_position_notional": _safe_float(plan_report.get("effective_base_position_notional")),
+                    "custom_grid_runtime_min_price": _safe_float(plan_report.get("custom_grid_runtime_min_price")),
+                    "custom_grid_runtime_max_price": _safe_float(plan_report.get("custom_grid_runtime_max_price")),
+                    "custom_grid_roll_enabled": bool(((plan_report.get("custom_grid_roll") or {}).get("enabled"))),
+                    "custom_grid_roll_checked": bool(((plan_report.get("custom_grid_roll") or {}).get("checked"))),
+                    "custom_grid_roll_triggered": bool(((plan_report.get("custom_grid_roll") or {}).get("triggered"))),
+                    "custom_grid_roll_reason": (plan_report.get("custom_grid_roll") or {}).get("reason"),
+                    "custom_grid_roll_interval_minutes": int(((plan_report.get("custom_grid_roll") or {}).get("interval_minutes", 0) or 0)),
+                    "custom_grid_roll_trade_threshold": int(((plan_report.get("custom_grid_roll") or {}).get("trade_threshold", 0) or 0)),
+                    "custom_grid_roll_upper_distance_ratio": _safe_float((plan_report.get("custom_grid_roll") or {}).get("upper_distance_ratio")),
+                    "custom_grid_roll_shift_levels": int(((plan_report.get("custom_grid_roll") or {}).get("shift_levels", 0) or 0)),
+                    "custom_grid_roll_current_trade_count": int(((plan_report.get("custom_grid_roll") or {}).get("current_trade_count", 0) or 0)),
+                    "custom_grid_roll_trade_baseline": int(((plan_report.get("custom_grid_roll") or {}).get("trade_baseline", 0) or 0)),
+                    "custom_grid_roll_trades_since_last_roll": int(((plan_report.get("custom_grid_roll") or {}).get("trades_since_last_roll", 0) or 0)),
+                    "custom_grid_roll_levels_above_current": int(((plan_report.get("custom_grid_roll") or {}).get("levels_above_current", 0) or 0)),
+                    "custom_grid_roll_required_levels_above": int(((plan_report.get("custom_grid_roll") or {}).get("required_levels_above", 0) or 0)),
+                    "custom_grid_roll_last_check_bucket": (plan_report.get("custom_grid_roll") or {}).get("last_check_bucket"),
+                    "custom_grid_roll_last_applied_at": (plan_report.get("custom_grid_roll") or {}).get("last_applied_at"),
+                    "custom_grid_roll_last_applied_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_applied_price")),
+                    "custom_grid_roll_old_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("old_min_price")),
+                    "custom_grid_roll_old_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("old_max_price")),
+                    "custom_grid_roll_new_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("new_min_price")),
+                    "custom_grid_roll_new_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("new_max_price")),
+                    "custom_grid_roll_last_old_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_old_min_price")),
+                    "custom_grid_roll_last_old_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_old_max_price")),
+                    "custom_grid_roll_last_new_min_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_new_min_price")),
+                    "custom_grid_roll_last_new_max_price": _safe_float((plan_report.get("custom_grid_roll") or {}).get("last_new_max_price")),
+                    "fixed_center_roll": dict(plan_report.get("fixed_center_roll") or {}),
+                    "shift_moves": list(plan_report.get("shift_moves", [])),
+                    "reconcile": reconcile_snapshot,
+                    "reconcile_checked": bool(reconcile_snapshot.get("checked")),
+                    "reconcile_ok": reconcile_snapshot.get("ok"),
+                    "reconcile_message": reconcile_snapshot.get("message"),
+                    "reconcile_interval_cycles": int(reconcile_snapshot.get("interval_cycles", 0) or 0),
+                    "reconcile_expected_open_order_count": int(reconcile_snapshot.get("expected_open_order_count", 0) or 0),
+                    "reconcile_actual_open_order_count": int(reconcile_snapshot.get("actual_open_order_count", 0) or 0),
+                    "reconcile_expected_actual_net_qty": _safe_float(reconcile_snapshot.get("expected_actual_net_qty")),
+                    "reconcile_actual_actual_net_qty": _safe_float(reconcile_snapshot.get("actual_actual_net_qty")),
+                    "executed": bool(submit_report.get("executed")),
+                    "trade_audit_appended": int(audit_sync.get("trade_appended", 0) or 0),
+                    "income_audit_appended": int(audit_sync.get("income_appended", 0) or 0),
+                    "audit_error": audit_sync.get("error"),
+                    "error_message": None,
+                    "runtime_status": runtime_guard_result.runtime_status,
+                    "stop_triggered": runtime_guard_result.stop_triggered,
+                    "stop_reason": runtime_guard_result.primary_reason,
+                    "stop_reasons": runtime_guard_result.matched_reasons,
+                    "stop_triggered_at": runtime_guard_result.triggered_at,
+                    "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
+                    "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
+                    "runtime_guard_stats_start_time": runtime_stats_start_time.isoformat() if runtime_stats_start_time else None,
+                    "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                    "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+                    "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
+                    "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+                }
+                volatility_email_alert = maybe_send_volatility_email_alert(
+                    args=args,
+                    state=state,
+                    plan_report=plan_report,
+                    now=cycle_started_at,
+                )
+                summary["volatility_email_alert"] = volatility_email_alert
+                summary["volatility_email_alert_enabled"] = bool(volatility_email_alert.get("enabled"))
+                summary["volatility_email_alert_triggered"] = bool(volatility_email_alert.get("triggered"))
+                summary["volatility_email_alert_sent"] = bool(volatility_email_alert.get("sent"))
+                summary["volatility_email_alert_reason"] = volatility_email_alert.get("reason")
+                _write_json(state_path, state)
                 _append_jsonl(summary_path, summary)
                 _print_cycle_summary(summary)
                 consecutive_errors = 0

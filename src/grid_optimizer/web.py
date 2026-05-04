@@ -324,10 +324,9 @@ SOON_EXECUTION_REGIME_SHADOW_CONFIG: dict[str, Any] = {
     "execution_regime_vol_exit_q": 0.95,
     "execution_regime_spread_exit_q": 0.95,
     "execution_regime_depth_exit_q": 0.10,
-}
-
-
-RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
+    "execution_regime_vol_protection_enabled": False,
+    "execution_regime_vol_protection_min_scale": 0.2,
+} dict[str, dict[str, Any]] = {
     "maker_volatility_inventory_v1": {
         "label": "合约波动率库存做市 v1",
         "description": "通用 futures maker 策略。按名义金额双边挂盘口，急速单边时加宽、暂停风险方向或进入 reduce-only/cooldown。",
@@ -8712,6 +8711,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         ("execution_regime_inventory_notional_limit", "--execution-regime-inventory-notional-limit"),
         ("execution_regime_rolling_loss_abs", "--execution-regime-rolling-loss-abs"),
         ("execution_regime_rolling_loss_limit", "--execution-regime-rolling-loss-limit"),
+        ("execution_regime_vol_protection_enabled", "--execution-regime-vol-protection-enabled"),
+        ("execution_regime_vol_protection_min_scale", "--execution-regime-vol-protection-min-scale"),
     ):
         if config.get(config_key) is not None:
             command.extend([flag, str(config[config_key])])
@@ -18219,6 +18220,15 @@ MONITOR_PAGE = """<!doctype html>
                 <label>进入谨慎确认轮数
                   <input id="runner_field_execution_regime_confirm_normal_to_caution" type="number" min="1" step="1" />
                 </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_execution_regime_vol_protection_enabled" type="checkbox" />
+                    <span>极端波动时压缩仓位上限</span>
+                  </span>
+                </label>
+                <label>压缩下限比例
+                  <input id="runner_field_execution_regime_vol_protection_min_scale" type="number" min="0.05" max="0.5" step="0.05" />
+                </label>
               </div>
               <div class="runner-form-hint">这一层当前只输出状态和建议参数，不直接改变真实订单。真实生效的下单保护仍由软/硬阈值、分钟停买、volatility trigger 和 adaptive step 执行。</div>
             </section>
@@ -18846,6 +18856,8 @@ MONITOR_PAGE = """<!doctype html>
       execution_regime_vol_exit_q: 0.95,
       execution_regime_spread_exit_q: 0.95,
       execution_regime_depth_exit_q: 0.10,
+      execution_regime_vol_protection_enabled: false,
+      execution_regime_vol_protection_min_scale: 0.2,
     };
     function competitionNeutralPingPongPreset(options) {
       const symbol = String(options.symbol || "").trim().toUpperCase();
@@ -21060,6 +21072,8 @@ MONITOR_PAGE = """<!doctype html>
       { key: "execution_regime_normal_score_upper", id: "runner_field_execution_regime_normal_score_upper", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "execution_regime_caution_score_upper", id: "runner_field_execution_regime_caution_score_upper", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "execution_regime_confirm_normal_to_caution", id: "runner_field_execution_regime_confirm_normal_to_caution", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_vol_protection_enabled", id: "runner_field_execution_regime_vol_protection_enabled", type: "boolean", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_vol_protection_min_scale", id: "runner_field_execution_regime_vol_protection_min_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_enabled", id: "runner_field_volatility_entry_pause_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_abs_return_ratio", id: "runner_field_volatility_entry_pause_30s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_amplitude_ratio", id: "runner_field_volatility_entry_pause_30s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },

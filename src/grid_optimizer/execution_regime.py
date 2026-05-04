@@ -404,3 +404,94 @@ def assess_execution_regime(
         params=params,
         normalized_features=normalized_features,
     )
+
+
+@dataclass(frozen=True)
+class VolatilityPositionProtection:
+    enabled: bool
+    active: bool
+    reason: str | None
+    scale: float
+    effective_max_position_notional: float | None
+    effective_max_short_position_notional: float | None
+    effective_max_total_notional: float | None
+    effective_pause_buy_position_notional: float | None
+    effective_pause_short_position_notional: float | None
+    effective_inventory_tier_start_notional: float | None
+    effective_inventory_tier_end_notional: float | None
+    adverse_reduce_target_ratio: float
+    should_cancel_non_protective_orders: bool
+
+
+def get_volatility_position_protection(
+    regime_state: str,
+    risk_score: float,
+    *,
+    enabled: bool,
+    max_position_notional: float | None,
+    max_short_position_notional: float | None,
+    max_total_notional: float | None,
+    pause_buy_position_notional: float | None,
+    pause_short_position_notional: float | None,
+    inventory_tier_start_notional: float | None,
+    inventory_tier_end_notional: float | None,
+    adverse_reduce_target_ratio: float,
+    cancel_non_protective_on_exit: bool = True,
+) -> VolatilityPositionProtection:
+    scale = 1.0
+    reason = None
+    should_cancel = False
+
+    if not enabled:
+        return VolatilityPositionProtection(
+            enabled=False,
+            active=False,
+            reason=None,
+            scale=1.0,
+            effective_max_position_notional=max_position_notional,
+            effective_max_short_position_notional=max_short_position_notional,
+            effective_max_total_notional=max_total_notional,
+            effective_pause_buy_position_notional=pause_buy_position_notional,
+            effective_pause_short_position_notional=pause_short_position_notional,
+            effective_inventory_tier_start_notional=inventory_tier_start_notional,
+            effective_inventory_tier_end_notional=inventory_tier_end_notional,
+            adverse_reduce_target_ratio=adverse_reduce_target_ratio,
+            should_cancel_non_protective_orders=False,
+        )
+
+    if regime_state in (REGIME_CAUTION, REGIME_EXIT):
+        # Linear scale: at score=0.6 → scale=1.0, at score=0.8+ → scale=0.2
+        raw_scale = 1.0 - (risk_score - 0.6) * 4.0
+        scale = _clamp(raw_scale, 0.2, 1.0)
+        if regime_state == REGIME_EXIT:
+            scale = _clamp(scale, 0.1, scale)
+            should_cancel = cancel_non_protective_on_exit
+            reason = f"regime={regime_state} score={risk_score:.3f} scale={scale:.2f}"
+        else:
+            reason = f"regime={regime_state} score={risk_score:.3f} scale={scale:.2f}"
+
+    # Adjust adverse_reduce target_ratio: more aggressive at higher risk
+    # Base ratio (e.g. 0.65) → scaled down to 0.05 at EXIT
+    adjusted_adverse_target = adverse_reduce_target_ratio * scale
+    adjusted_adverse_target = _clamp(adjusted_adverse_target, 0.05, 1.0)
+
+    def _scale_limit(value: float | None) -> float | None:
+        if value is None:
+            return None
+        return max(float(value) * scale, 0.0)
+
+    return VolatilityPositionProtection(
+        enabled=True,
+        active=regime_state in (REGIME_CAUTION, REGIME_EXIT),
+        reason=reason,
+        scale=scale,
+        effective_max_position_notional=_scale_limit(max_position_notional),
+        effective_max_short_position_notional=_scale_limit(max_short_position_notional),
+        effective_max_total_notional=_scale_limit(max_total_notional),
+        effective_pause_buy_position_notional=_scale_limit(pause_buy_position_notional),
+        effective_pause_short_position_notional=_scale_limit(pause_short_position_notional),
+        effective_inventory_tier_start_notional=_scale_limit(inventory_tier_start_notional),
+        effective_inventory_tier_end_notional=_scale_limit(inventory_tier_end_notional),
+        adverse_reduce_target_ratio=adjusted_adverse_target,
+        should_cancel_non_protective_orders=should_cancel,
+    )
