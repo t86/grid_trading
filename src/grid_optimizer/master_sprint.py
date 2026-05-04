@@ -75,7 +75,7 @@ SPRINT_BOARD_CONFIGS: tuple[SprintBoardConfig, ...] = (
         slug="um_week2",
         label="UM 大师赛",
         phase_label="第 2 期",
-        resource_id=int(os.environ.get("GRID_MASTER_SPRINT_UM_RESOURCE_ID") or 52057),
+        resource_id=int(os.environ.get("GRID_MASTER_SPRINT_UM_RESOURCE_ID") or 52060),
         referer="https://www.binance.com/zh-CN/activity/trading-competition/umsprint-2026wk2-new?ref=YEK2JZJT",
         start_at="2026-04-28T08:00:00+08:00",
         end_at="2026-05-05T07:59:00+08:00",

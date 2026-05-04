@@ -26,7 +26,7 @@ class MasterSprintTests(unittest.TestCase):
             slug="um_week2",
             label="UM 大师赛",
             phase_label="第 2 期",
-            resource_id=52057,
+            resource_id=52060,
             referer="https://example.com",
             start_at="2026-04-28T08:00:00+08:00",
             end_at="2026-05-05T07:59:00+08:00",
@@ -91,11 +91,11 @@ class MasterSprintTests(unittest.TestCase):
         self.assertIn("大师赛追踪看板", master_sprint.MASTER_SPRINT_PAGE)
         self.assertIn("每万 U 预估奖励", master_sprint.MASTER_SPRINT_PAGE)
 
-    def test_altcoins_week2_uses_page_resource_id(self) -> None:
-        altcoins = next(config for config in master_sprint.SPRINT_BOARD_CONFIGS if config.slug == "altcoins_week2")
+    def test_um_week2_uses_page_resource_id(self) -> None:
+        um = next(config for config in master_sprint.SPRINT_BOARD_CONFIGS if config.slug == "um_week2")
 
-        self.assertEqual(altcoins.resource_id, 52057)
-        self.assertEqual(altcoins.referer, "https://www.binance.com/zh-CN/activity/trading-competition/altcoinsprint-2026wk2")
+        self.assertEqual(um.resource_id, 52060)
+        self.assertEqual(um.referer, "https://www.binance.com/zh-CN/activity/trading-competition/umsprint-2026wk2-new?ref=YEK2JZJT")
 
 
 if __name__ == "__main__":
