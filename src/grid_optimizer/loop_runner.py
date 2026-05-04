@@ -90,6 +90,13 @@ from .submit_plan import (
     validate_plan_report,
 )
 from .dry_run import _round_order_price, _round_order_qty
+from .execution_regime import (
+    ExecutionRegimeConfig,
+    ExecutionRegimeFeatures,
+    ExecutionRegimeMemory,
+    REGIME_NORMAL,
+    assess_execution_regime,
+)
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
@@ -6082,6 +6089,7 @@ def assess_market_guard(
     short_cover_pause_down_return_trigger_ratio: float | None,
     freeze_shift_abs_return_trigger_ratio: float | None,
     now: datetime | None = None,
+    force_fetch: bool = False,
 ) -> dict[str, Any]:
     guard = {
         "enabled": any(
@@ -6109,6 +6117,8 @@ def assess_market_guard(
         "return_ratio": 0.0,
         "amplitude_ratio": 0.0,
     }
+    if force_fetch:
+        guard["enabled"] = True
     if not guard["enabled"]:
         return guard
 
@@ -6255,6 +6265,185 @@ def _latest_closed_window(candles: list[Any], *, now: datetime | None = None) ->
         "amplitude_ratio": amplitude_ratio,
         "return_ratio": return_ratio,
     }
+
+
+def _ratio_to_proxy_quantile(value: Any, *, p50: Any, p95: Any) -> float | None:
+    safe_p50 = max(_safe_float(p50), 0.0)
+    safe_p95 = max(_safe_float(p95), 0.0)
+    if safe_p95 <= 0:
+        return None
+    safe_value = max(_safe_float(value), 0.0)
+    if safe_p50 <= 0 or safe_p95 <= safe_p50:
+        return min(safe_value / safe_p95, 1.0)
+    if safe_value <= safe_p50:
+        return min(0.5 * safe_value / safe_p50, 0.5)
+    return min(0.5 + 0.5 * ((safe_value - safe_p50) / (safe_p95 - safe_p50)), 1.0)
+
+
+def _depth_to_proxy_quantile(value: Any, *, p10: Any, p50: Any) -> float | None:
+    safe_p10 = max(_safe_float(p10), 0.0)
+    safe_p50 = max(_safe_float(p50), 0.0)
+    if safe_p50 <= 0:
+        return None
+    safe_value = max(_safe_float(value), 0.0)
+    if safe_value <= safe_p10:
+        return min(0.1 * (safe_value / safe_p10), 0.1) if safe_p10 > 0 else 0.0
+    if safe_value <= safe_p50:
+        return min(0.1 + 0.4 * ((safe_value - safe_p10) / max(safe_p50 - safe_p10, 1e-12)), 0.5)
+    return min(0.5 + 0.5 * ((safe_value - safe_p50) / safe_p50), 1.0)
+
+
+def _execution_regime_memory_from_state(raw: Any) -> ExecutionRegimeMemory:
+    if not isinstance(raw, dict):
+        return ExecutionRegimeMemory()
+    return ExecutionRegimeMemory(
+        state=str(raw.get("state") or REGIME_NORMAL),
+        pending_state=str(raw.get("pending_state")) if raw.get("pending_state") else None,
+        pending_count=max(int(raw.get("pending_count", 0) or 0), 0),
+    )
+
+
+def _build_execution_regime_config(args: argparse.Namespace) -> ExecutionRegimeConfig:
+    return ExecutionRegimeConfig(
+        safe_score_upper=float(getattr(args, "execution_regime_safe_score_upper", 0.35)),
+        normal_score_upper=float(getattr(args, "execution_regime_normal_score_upper", 0.60)),
+        caution_score_upper=float(getattr(args, "execution_regime_caution_score_upper", 0.80)),
+        recover_exit_to_caution_score=float(getattr(args, "execution_regime_recover_exit_to_caution_score", 0.75)),
+        recover_caution_to_normal_score=float(getattr(args, "execution_regime_recover_caution_to_normal_score", 0.55)),
+        recover_normal_to_safe_score=float(getattr(args, "execution_regime_recover_normal_to_safe_score", 0.30)),
+        confirm_exit_to_caution=max(int(getattr(args, "execution_regime_confirm_exit_to_caution", 5) or 5), 1),
+        confirm_caution_to_normal=max(int(getattr(args, "execution_regime_confirm_caution_to_normal", 3) or 3), 1),
+        confirm_normal_to_safe=max(int(getattr(args, "execution_regime_confirm_normal_to_safe", 5) or 5), 1),
+        confirm_normal_to_caution=max(int(getattr(args, "execution_regime_confirm_normal_to_caution", 2) or 2), 1),
+        vol_exit_q=float(getattr(args, "execution_regime_vol_exit_q", 0.95)),
+        spread_exit_q=float(getattr(args, "execution_regime_spread_exit_q", 0.95)),
+        depth_exit_q=float(getattr(args, "execution_regime_depth_exit_q", 0.10)),
+        latency_ms_exit=getattr(args, "execution_regime_latency_ms_exit", None),
+        order_failure_rate_exit=getattr(args, "execution_regime_order_failure_rate_exit", None),
+        inventory_notional_limit=getattr(args, "execution_regime_inventory_notional_limit", None),
+        rolling_loss_limit=getattr(args, "execution_regime_rolling_loss_limit", None),
+    )
+
+
+def build_execution_regime_report(
+    *,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    market_guard: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    mid_price: float,
+    actual_net_notional: float,
+) -> dict[str, Any]:
+    enabled = bool(getattr(args, "execution_regime_enabled", False))
+    report: dict[str, Any] = {
+        "enabled": enabled,
+        "mode": "shadow",
+        "source": "proxy_thresholds",
+        "state": "DISABLED",
+        "raw_state": "DISABLED",
+        "risk_score": 0.0,
+        "hard_risk": False,
+        "reason_codes": [],
+        "missing_features": [],
+        "params": {},
+        "features": {},
+        "memory": {},
+        "applied": False,
+    }
+    if not enabled:
+        state.pop("execution_regime", None)
+        return report
+
+    spread_bps = ((ask_price - bid_price) / mid_price * 10_000.0) if mid_price > 0 else 0.0
+    window_1m = market_guard.get("window_1m") if isinstance(market_guard, dict) else None
+    window_3m = market_guard.get("window_3m") if isinstance(market_guard, dict) else None
+    has_window_data = isinstance(window_1m, dict) or isinstance(window_3m, dict)
+    amplitude_1m = _safe_float((window_1m or {}).get("amplitude_ratio"))
+    amplitude_3m = _safe_float((window_3m or {}).get("amplitude_ratio"))
+    return_1m = _safe_float((window_1m or {}).get("return_ratio"))
+    return_3m = _safe_float((window_3m or {}).get("return_ratio"))
+    valid_market_data = bid_price > 0 and ask_price > 0 and ask_price >= bid_price and mid_price > 0
+
+    vol_q = (
+        _ratio_to_proxy_quantile(
+            max(amplitude_1m, amplitude_3m),
+            p50=getattr(args, "execution_regime_vol_p50_ratio", 0.003),
+            p95=getattr(args, "execution_regime_vol_p95_ratio", 0.012),
+        )
+        if has_window_data
+        else None
+    )
+    spread_q = _ratio_to_proxy_quantile(
+        spread_bps,
+        p50=getattr(args, "execution_regime_spread_p50_bps", 4.0),
+        p95=getattr(args, "execution_regime_spread_p95_bps", 20.0),
+    )
+    trend_q = (
+        _ratio_to_proxy_quantile(
+            max(abs(return_1m), abs(return_3m)),
+            p50=getattr(args, "execution_regime_trend_p50_ratio", 0.002),
+            p95=getattr(args, "execution_regime_trend_p95_ratio", 0.010),
+        )
+        if has_window_data
+        else None
+    )
+    depth_q = _depth_to_proxy_quantile(
+        getattr(args, "execution_regime_depth_value", None),
+        p10=getattr(args, "execution_regime_depth_p10_notional", 0.0),
+        p50=getattr(args, "execution_regime_depth_p50_notional", 0.0),
+    )
+
+    features = ExecutionRegimeFeatures(
+        vol_q=vol_q,
+        spread_q=spread_q,
+        impact_q=getattr(args, "execution_regime_impact_q", None),
+        trend_q=trend_q,
+        anomaly_q=getattr(args, "execution_regime_anomaly_q", None),
+        depth_q=depth_q,
+        valid_market_data=valid_market_data,
+        latency_ms=getattr(args, "execution_regime_latency_ms", None),
+        order_failure_rate=getattr(args, "execution_regime_order_failure_rate", None),
+        inventory_notional_abs=abs(actual_net_notional),
+        rolling_loss_abs=getattr(args, "execution_regime_rolling_loss_abs", None),
+    )
+    decision = assess_execution_regime(
+        features,
+        previous=_execution_regime_memory_from_state(state.get("execution_regime")),
+        config=_build_execution_regime_config(args),
+    )
+    state["execution_regime"] = {
+        "state": decision.memory.state,
+        "pending_state": decision.memory.pending_state,
+        "pending_count": decision.memory.pending_count,
+        "updated_at": _isoformat(_utc_now()),
+    }
+    report.update(
+        {
+            "state": decision.state,
+            "raw_state": decision.raw_state,
+            "risk_score": decision.risk_score,
+            "hard_risk": decision.hard_risk,
+            "reason_codes": list(decision.reason_codes),
+            "missing_features": list(decision.missing_features),
+            "params": decision.params.to_dict(),
+            "features": {
+                **decision.normalized_features,
+                "spread_bps": spread_bps,
+                "amplitude_1m": amplitude_1m,
+                "amplitude_3m": amplitude_3m,
+                "return_1m": return_1m,
+                "return_3m": return_3m,
+                "actual_net_notional_abs": abs(actual_net_notional),
+            },
+            "memory": {
+                "state": decision.memory.state,
+                "pending_state": decision.memory.pending_state,
+                "pending_count": decision.memory.pending_count,
+            },
+        }
+    )
+    return report
 
 
 def resolve_synthetic_trend_follow(
@@ -8099,6 +8288,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         short_cover_pause_down_return_trigger_ratio=getattr(effective_args, "short_cover_pause_down_return_trigger_ratio", None),
         freeze_shift_abs_return_trigger_ratio=effective_args.freeze_shift_abs_return_trigger_ratio,
         now=plan_now,
+        force_fetch=bool(getattr(args, "execution_regime_enabled", False)),
     )
     center_price = float(state["center_price"])
     shift_moves: list[dict[str, Any]] = []
@@ -8242,6 +8432,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    execution_regime = build_execution_regime_report(
+        args=args,
+        state=state,
+        market_guard=market_guard,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        mid_price=mid_price,
+        actual_net_notional=actual_net_qty * max(mid_price, 0.0),
+    )
     current_long_avg_price = 0.0
     current_short_avg_price = 0.0
     if requested_strategy_mode == "hedge_neutral":
@@ -10347,6 +10546,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "sticky_exit_mode": sticky_exit_mode,
         "shift_moves": shift_moves,
         "market_guard": market_guard,
+        "execution_regime": execution_regime,
         "adaptive_step": adaptive_step,
         "volatility_entry_pause": volatility_entry_pause,
         "maker_volatility_inventory": maker_volatility_inventory,
@@ -11043,6 +11243,38 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--execution-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--execution-regime-vol-p50-ratio", type=float, default=0.003)
+    parser.add_argument("--execution-regime-vol-p95-ratio", type=float, default=0.012)
+    parser.add_argument("--execution-regime-spread-p50-bps", type=float, default=4.0)
+    parser.add_argument("--execution-regime-spread-p95-bps", type=float, default=20.0)
+    parser.add_argument("--execution-regime-trend-p50-ratio", type=float, default=0.002)
+    parser.add_argument("--execution-regime-trend-p95-ratio", type=float, default=0.010)
+    parser.add_argument("--execution-regime-depth-value", type=float, default=None)
+    parser.add_argument("--execution-regime-depth-p10-notional", type=float, default=0.0)
+    parser.add_argument("--execution-regime-depth-p50-notional", type=float, default=0.0)
+    parser.add_argument("--execution-regime-impact-q", type=float, default=None)
+    parser.add_argument("--execution-regime-anomaly-q", type=float, default=None)
+    parser.add_argument("--execution-regime-safe-score-upper", type=float, default=0.35)
+    parser.add_argument("--execution-regime-normal-score-upper", type=float, default=0.60)
+    parser.add_argument("--execution-regime-caution-score-upper", type=float, default=0.80)
+    parser.add_argument("--execution-regime-recover-exit-to-caution-score", type=float, default=0.75)
+    parser.add_argument("--execution-regime-recover-caution-to-normal-score", type=float, default=0.55)
+    parser.add_argument("--execution-regime-recover-normal-to-safe-score", type=float, default=0.30)
+    parser.add_argument("--execution-regime-confirm-exit-to-caution", type=int, default=5)
+    parser.add_argument("--execution-regime-confirm-caution-to-normal", type=int, default=3)
+    parser.add_argument("--execution-regime-confirm-normal-to-safe", type=int, default=5)
+    parser.add_argument("--execution-regime-confirm-normal-to-caution", type=int, default=2)
+    parser.add_argument("--execution-regime-vol-exit-q", type=float, default=0.95)
+    parser.add_argument("--execution-regime-spread-exit-q", type=float, default=0.95)
+    parser.add_argument("--execution-regime-depth-exit-q", type=float, default=0.10)
+    parser.add_argument("--execution-regime-latency-ms", type=float, default=None)
+    parser.add_argument("--execution-regime-latency-ms-exit", type=float, default=None)
+    parser.add_argument("--execution-regime-order-failure-rate", type=float, default=None)
+    parser.add_argument("--execution-regime-order-failure-rate-exit", type=float, default=None)
+    parser.add_argument("--execution-regime-inventory-notional-limit", type=float, default=None)
+    parser.add_argument("--execution-regime-rolling-loss-abs", type=float, default=None)
+    parser.add_argument("--execution-regime-rolling-loss-limit", type=float, default=None)
     parser.add_argument("--synthetic-trend-follow-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--synthetic-trend-follow-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--synthetic-trend-follow-1m-amplitude-ratio", type=float, default=0.0)
@@ -11195,6 +11427,19 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"ret={summary.get('market_guard_return_ratio', 0.0) * 100:.2f}% "
             f"amp={summary.get('market_guard_amplitude_ratio', 0.0) * 100:.2f}%"
         )
+    if summary.get("execution_regime_enabled"):
+        print(
+            "  execution_regime: "
+            f"state={summary.get('execution_regime_state', '--')} "
+            f"raw={summary.get('execution_regime_raw_state', '--')} "
+            f"score={_safe_float(summary.get('execution_regime_risk_score')):.2f} "
+            f"quote={_safe_float(summary.get('execution_regime_quote_offset_bps')):.2f}bps "
+            f"refresh={int(summary.get('execution_regime_refresh_interval_ms', 0) or 0)}ms "
+            f"size={_safe_float(summary.get('execution_regime_order_size_pct')):.2f}%"
+        )
+        reason_codes = list(summary.get("execution_regime_reason_codes") or [])
+        if reason_codes:
+            print(f"  execution_regime_reason: {', '.join(str(item) for item in reason_codes[:6])}")
     adaptive_step = summary.get("adaptive_step") if isinstance(summary.get("adaptive_step"), dict) else {}
     if adaptive_step.get("controls_active"):
         print(
@@ -11888,6 +12133,22 @@ def main() -> None:
                 "volatility_entry_pause_reason": (
                     (plan_report.get("volatility_entry_pause") or {}).get("reason")
                 ),
+                "execution_regime": dict(plan_report.get("execution_regime") or {}),
+                "execution_regime_enabled": bool((plan_report.get("execution_regime") or {}).get("enabled")),
+                "execution_regime_state": str(((plan_report.get("execution_regime") or {}).get("state", "") or "")),
+                "execution_regime_raw_state": str(((plan_report.get("execution_regime") or {}).get("raw_state", "") or "")),
+                "execution_regime_risk_score": _safe_float((plan_report.get("execution_regime") or {}).get("risk_score")),
+                "execution_regime_hard_risk": bool((plan_report.get("execution_regime") or {}).get("hard_risk")),
+                "execution_regime_reason_codes": list((plan_report.get("execution_regime") or {}).get("reason_codes") or []),
+                "execution_regime_quote_offset_bps": _safe_float(
+                    ((plan_report.get("execution_regime") or {}).get("params") or {}).get("quote_offset_bps")
+                ),
+                "execution_regime_refresh_interval_ms": int(
+                    _safe_float(((plan_report.get("execution_regime") or {}).get("params") or {}).get("refresh_interval_ms"))
+                ),
+                "execution_regime_order_size_pct": _safe_float(
+                    ((plan_report.get("execution_regime") or {}).get("params") or {}).get("order_size_pct")
+                ),
                 "adaptive_step_enabled": bool((plan_report.get("adaptive_step") or {}).get("enabled")),
                 "adaptive_step_active": bool((plan_report.get("adaptive_step") or {}).get("active")),
                 "adaptive_step_controls_active": bool(
@@ -11972,6 +12233,8 @@ def main() -> None:
                 "max_position_notional": _safe_float(plan_report.get("max_position_notional")),
                 "short_cap_applied": bool(plan_report.get("short_cap_applied")),
                 "short_cover_paused": bool(plan_report.get("short_cover_paused")),
+                "short_paused": bool(plan_report.get("short_paused") or plan_report.get("short_cover_paused")),
+                "short_pause_reasons": list(plan_report.get("short_pause_reasons", [])),
                 "short_budget_notional": _safe_float(plan_report.get("short_budget_notional")),
                 "planned_short_notional": _safe_float(plan_report.get("planned_short_notional")),
                 "max_short_position_notional": _safe_float(plan_report.get("max_short_position_notional")),

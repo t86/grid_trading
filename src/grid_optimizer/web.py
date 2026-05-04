@@ -303,6 +303,30 @@ def _competition_neutral_ping_pong_preset(
     }
 
 
+SOON_EXECUTION_REGIME_SHADOW_CONFIG: dict[str, Any] = {
+    "execution_regime_enabled": True,
+    "execution_regime_vol_p50_ratio": 0.002,
+    "execution_regime_vol_p95_ratio": 0.010,
+    "execution_regime_spread_p50_bps": 3.0,
+    "execution_regime_spread_p95_bps": 18.0,
+    "execution_regime_trend_p50_ratio": 0.0015,
+    "execution_regime_trend_p95_ratio": 0.008,
+    "execution_regime_safe_score_upper": 0.35,
+    "execution_regime_normal_score_upper": 0.60,
+    "execution_regime_caution_score_upper": 0.80,
+    "execution_regime_recover_exit_to_caution_score": 0.72,
+    "execution_regime_recover_caution_to_normal_score": 0.52,
+    "execution_regime_recover_normal_to_safe_score": 0.28,
+    "execution_regime_confirm_normal_to_caution": 2,
+    "execution_regime_confirm_exit_to_caution": 5,
+    "execution_regime_confirm_caution_to_normal": 3,
+    "execution_regime_confirm_normal_to_safe": 5,
+    "execution_regime_vol_exit_q": 0.95,
+    "execution_regime_spread_exit_q": 0.95,
+    "execution_regime_depth_exit_q": 0.10,
+}
+
+
 RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
     "maker_volatility_inventory_v1": {
         "label": "合约波动率库存做市 v1",
@@ -2428,6 +2452,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
         max_actual_net_notional=180.0,
         max_synthetic_drift_notional=90.0,
         levels=8,
+        extra_config=SOON_EXECUTION_REGIME_SHADOW_CONFIG,
     ),
     "chipusdt_competition_neutral_ping_pong_v1": _competition_neutral_ping_pong_preset(
         key="chipusdt_competition_neutral_ping_pong_v1",
@@ -2935,6 +2960,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "volatility_trigger_reduce_escalate_after_seconds": 900.0,
             "volatility_trigger_reduce_escalate_abs_return_ratio": 0.02,
             "volatility_trigger_stop_close_all_positions": True,
+            **SOON_EXECUTION_REGIME_SHADOW_CONFIG,
             "sleep_seconds": 5.0,
         },
     },
@@ -3278,6 +3304,38 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adaptive_step_max_scale": 1.0,
     "adaptive_step_min_per_order_scale": 1.0,
     "adaptive_step_min_position_limit_scale": 1.0,
+    "execution_regime_enabled": False,
+    "execution_regime_vol_p50_ratio": 0.003,
+    "execution_regime_vol_p95_ratio": 0.012,
+    "execution_regime_spread_p50_bps": 4.0,
+    "execution_regime_spread_p95_bps": 20.0,
+    "execution_regime_trend_p50_ratio": 0.002,
+    "execution_regime_trend_p95_ratio": 0.010,
+    "execution_regime_depth_value": None,
+    "execution_regime_depth_p10_notional": 0.0,
+    "execution_regime_depth_p50_notional": 0.0,
+    "execution_regime_impact_q": None,
+    "execution_regime_anomaly_q": None,
+    "execution_regime_safe_score_upper": 0.35,
+    "execution_regime_normal_score_upper": 0.60,
+    "execution_regime_caution_score_upper": 0.80,
+    "execution_regime_recover_exit_to_caution_score": 0.75,
+    "execution_regime_recover_caution_to_normal_score": 0.55,
+    "execution_regime_recover_normal_to_safe_score": 0.30,
+    "execution_regime_confirm_exit_to_caution": 5,
+    "execution_regime_confirm_caution_to_normal": 3,
+    "execution_regime_confirm_normal_to_safe": 5,
+    "execution_regime_confirm_normal_to_caution": 2,
+    "execution_regime_vol_exit_q": 0.95,
+    "execution_regime_spread_exit_q": 0.95,
+    "execution_regime_depth_exit_q": 0.10,
+    "execution_regime_latency_ms": None,
+    "execution_regime_latency_ms_exit": None,
+    "execution_regime_order_failure_rate": None,
+    "execution_regime_order_failure_rate_exit": None,
+    "execution_regime_inventory_notional_limit": None,
+    "execution_regime_rolling_loss_abs": None,
+    "execution_regime_rolling_loss_limit": None,
     "volatility_entry_pause_enabled": False,
     "volatility_entry_pause_30s_abs_return_ratio": 0.0,
     "volatility_entry_pause_30s_amplitude_ratio": 0.0,
@@ -7662,6 +7720,33 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "execution_regime_vol_p50_ratio",
+        "execution_regime_vol_p95_ratio",
+        "execution_regime_spread_p50_bps",
+        "execution_regime_spread_p95_bps",
+        "execution_regime_trend_p50_ratio",
+        "execution_regime_trend_p95_ratio",
+        "execution_regime_depth_value",
+        "execution_regime_depth_p10_notional",
+        "execution_regime_depth_p50_notional",
+        "execution_regime_impact_q",
+        "execution_regime_anomaly_q",
+        "execution_regime_safe_score_upper",
+        "execution_regime_normal_score_upper",
+        "execution_regime_caution_score_upper",
+        "execution_regime_recover_exit_to_caution_score",
+        "execution_regime_recover_caution_to_normal_score",
+        "execution_regime_recover_normal_to_safe_score",
+        "execution_regime_vol_exit_q",
+        "execution_regime_spread_exit_q",
+        "execution_regime_depth_exit_q",
+        "execution_regime_latency_ms",
+        "execution_regime_latency_ms_exit",
+        "execution_regime_order_failure_rate",
+        "execution_regime_order_failure_rate_exit",
+        "execution_regime_inventory_notional_limit",
+        "execution_regime_rolling_loss_abs",
+        "execution_regime_rolling_loss_limit",
         "volatility_entry_pause_30s_abs_return_ratio",
         "volatility_entry_pause_30s_amplitude_ratio",
         "volatility_entry_pause_1m_abs_return_ratio",
@@ -7758,6 +7843,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "near_market_reentry_confirm_cycles",
         "auto_regime_confirm_cycles",
         "market_bias_regime_switch_confirm_cycles",
+        "execution_regime_confirm_exit_to_caution",
+        "execution_regime_confirm_caution_to_normal",
+        "execution_regime_confirm_normal_to_safe",
+        "execution_regime_confirm_normal_to_caution",
         "synthetic_flow_sleeve_levels",
         "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
@@ -7776,6 +7865,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_enabled",
         "take_profit_enabled",
         "adaptive_step_enabled",
+        "execution_regime_enabled",
         "volatility_entry_pause_enabled",
         "synthetic_trend_follow_enabled",
         "synthetic_flow_sleeve_enabled",
@@ -7840,6 +7930,37 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "execution_regime_vol_p50_ratio",
+        "execution_regime_vol_p95_ratio",
+        "execution_regime_spread_p50_bps",
+        "execution_regime_spread_p95_bps",
+        "execution_regime_trend_p50_ratio",
+        "execution_regime_trend_p95_ratio",
+        "execution_regime_depth_value",
+        "execution_regime_depth_p10_notional",
+        "execution_regime_depth_p50_notional",
+        "execution_regime_impact_q",
+        "execution_regime_anomaly_q",
+        "execution_regime_safe_score_upper",
+        "execution_regime_normal_score_upper",
+        "execution_regime_caution_score_upper",
+        "execution_regime_recover_exit_to_caution_score",
+        "execution_regime_recover_caution_to_normal_score",
+        "execution_regime_recover_normal_to_safe_score",
+        "execution_regime_confirm_exit_to_caution",
+        "execution_regime_confirm_caution_to_normal",
+        "execution_regime_confirm_normal_to_safe",
+        "execution_regime_confirm_normal_to_caution",
+        "execution_regime_vol_exit_q",
+        "execution_regime_spread_exit_q",
+        "execution_regime_depth_exit_q",
+        "execution_regime_latency_ms",
+        "execution_regime_latency_ms_exit",
+        "execution_regime_order_failure_rate",
+        "execution_regime_order_failure_rate_exit",
+        "execution_regime_inventory_notional_limit",
+        "execution_regime_rolling_loss_abs",
+        "execution_regime_rolling_loss_limit",
         "volatility_entry_pause_30s_abs_return_ratio",
         "volatility_entry_pause_30s_amplitude_ratio",
         "volatility_entry_pause_1m_abs_return_ratio",
@@ -8555,6 +8676,46 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
     if config.get("adaptive_step_min_position_limit_scale") is not None:
         command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
     command.append(
+        "--execution-regime-enabled"
+        if config.get("execution_regime_enabled", False)
+        else "--no-execution-regime-enabled"
+    )
+    for config_key, flag in (
+        ("execution_regime_vol_p50_ratio", "--execution-regime-vol-p50-ratio"),
+        ("execution_regime_vol_p95_ratio", "--execution-regime-vol-p95-ratio"),
+        ("execution_regime_spread_p50_bps", "--execution-regime-spread-p50-bps"),
+        ("execution_regime_spread_p95_bps", "--execution-regime-spread-p95-bps"),
+        ("execution_regime_trend_p50_ratio", "--execution-regime-trend-p50-ratio"),
+        ("execution_regime_trend_p95_ratio", "--execution-regime-trend-p95-ratio"),
+        ("execution_regime_depth_value", "--execution-regime-depth-value"),
+        ("execution_regime_depth_p10_notional", "--execution-regime-depth-p10-notional"),
+        ("execution_regime_depth_p50_notional", "--execution-regime-depth-p50-notional"),
+        ("execution_regime_impact_q", "--execution-regime-impact-q"),
+        ("execution_regime_anomaly_q", "--execution-regime-anomaly-q"),
+        ("execution_regime_safe_score_upper", "--execution-regime-safe-score-upper"),
+        ("execution_regime_normal_score_upper", "--execution-regime-normal-score-upper"),
+        ("execution_regime_caution_score_upper", "--execution-regime-caution-score-upper"),
+        ("execution_regime_recover_exit_to_caution_score", "--execution-regime-recover-exit-to-caution-score"),
+        ("execution_regime_recover_caution_to_normal_score", "--execution-regime-recover-caution-to-normal-score"),
+        ("execution_regime_recover_normal_to_safe_score", "--execution-regime-recover-normal-to-safe-score"),
+        ("execution_regime_confirm_exit_to_caution", "--execution-regime-confirm-exit-to-caution"),
+        ("execution_regime_confirm_caution_to_normal", "--execution-regime-confirm-caution-to-normal"),
+        ("execution_regime_confirm_normal_to_safe", "--execution-regime-confirm-normal-to-safe"),
+        ("execution_regime_confirm_normal_to_caution", "--execution-regime-confirm-normal-to-caution"),
+        ("execution_regime_vol_exit_q", "--execution-regime-vol-exit-q"),
+        ("execution_regime_spread_exit_q", "--execution-regime-spread-exit-q"),
+        ("execution_regime_depth_exit_q", "--execution-regime-depth-exit-q"),
+        ("execution_regime_latency_ms", "--execution-regime-latency-ms"),
+        ("execution_regime_latency_ms_exit", "--execution-regime-latency-ms-exit"),
+        ("execution_regime_order_failure_rate", "--execution-regime-order-failure-rate"),
+        ("execution_regime_order_failure_rate_exit", "--execution-regime-order-failure-rate-exit"),
+        ("execution_regime_inventory_notional_limit", "--execution-regime-inventory-notional-limit"),
+        ("execution_regime_rolling_loss_abs", "--execution-regime-rolling-loss-abs"),
+        ("execution_regime_rolling_loss_limit", "--execution-regime-rolling-loss-limit"),
+    ):
+        if config.get(config_key) is not None:
+            command.extend([flag, str(config[config_key])])
+    command.append(
         "--volatility-entry-pause-enabled"
         if config.get("volatility_entry_pause_enabled", False)
         else "--no-volatility-entry-pause-enabled"
@@ -8928,6 +9089,38 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "adaptive_step_max_scale",
             "adaptive_step_min_per_order_scale",
             "adaptive_step_min_position_limit_scale",
+            "execution_regime_enabled",
+            "execution_regime_vol_p50_ratio",
+            "execution_regime_vol_p95_ratio",
+            "execution_regime_spread_p50_bps",
+            "execution_regime_spread_p95_bps",
+            "execution_regime_trend_p50_ratio",
+            "execution_regime_trend_p95_ratio",
+            "execution_regime_depth_value",
+            "execution_regime_depth_p10_notional",
+            "execution_regime_depth_p50_notional",
+            "execution_regime_impact_q",
+            "execution_regime_anomaly_q",
+            "execution_regime_safe_score_upper",
+            "execution_regime_normal_score_upper",
+            "execution_regime_caution_score_upper",
+            "execution_regime_recover_exit_to_caution_score",
+            "execution_regime_recover_caution_to_normal_score",
+            "execution_regime_recover_normal_to_safe_score",
+            "execution_regime_confirm_exit_to_caution",
+            "execution_regime_confirm_caution_to_normal",
+            "execution_regime_confirm_normal_to_safe",
+            "execution_regime_confirm_normal_to_caution",
+            "execution_regime_vol_exit_q",
+            "execution_regime_spread_exit_q",
+            "execution_regime_depth_exit_q",
+            "execution_regime_latency_ms",
+            "execution_regime_latency_ms_exit",
+            "execution_regime_order_failure_rate",
+            "execution_regime_order_failure_rate_exit",
+            "execution_regime_inventory_notional_limit",
+            "execution_regime_rolling_loss_abs",
+            "execution_regime_rolling_loss_limit",
             "volatility_entry_pause_enabled",
             "volatility_entry_pause_30s_abs_return_ratio",
             "volatility_entry_pause_30s_amplitude_ratio",
@@ -17456,6 +17649,47 @@ MONITOR_PAGE = """<!doctype html>
       background: #f0ece3;
       color: #574c36;
     }
+    .timeline-table td { min-width: 118px; }
+    .timeline-table .wide { min-width: 260px; }
+    .risk-tag {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3px 9px;
+      border-radius: 999px;
+      font-size: 11px;
+      font-weight: 800;
+      border: 1px solid rgba(108, 104, 95, 0.18);
+      background: #f6f2e8;
+      color: #574c36;
+      white-space: nowrap;
+    }
+    .risk-tag.critical {
+      color: var(--bad);
+      background: #fff4f2;
+      border-color: rgba(180, 35, 24, 0.20);
+    }
+    .risk-tag.warning {
+      color: var(--warn);
+      background: #fff9ef;
+      border-color: rgba(183, 110, 0, 0.22);
+    }
+    .risk-tag.info {
+      color: var(--brand);
+      background: #f2fbfa;
+      border-color: rgba(11, 111, 104, 0.18);
+    }
+    .timeline-detail {
+      display: grid;
+      gap: 5px;
+      color: var(--muted);
+      font-size: 12px;
+      line-height: 1.45;
+    }
+    .timeline-detail strong {
+      color: var(--text);
+      font-size: 13px;
+    }
     @media (max-width: 980px) {
       .status-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .grid-2 { grid-template-columns: 1fr; }
@@ -17946,6 +18180,48 @@ MONITOR_PAGE = """<!doctype html>
                 </label>
               </div>
             </section>
+            <section class="runner-form-section full" data-runner-section="execution_regime">
+              <h3>执行区间判断（影子层）</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_execution_regime_enabled" type="checkbox" />
+                    <span>启用执行区间判断</span>
+                  </span>
+                </label>
+                <label>波动 p50
+                  <input id="runner_field_execution_regime_vol_p50_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>波动 p95
+                  <input id="runner_field_execution_regime_vol_p95_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>价差 p50 bps
+                  <input id="runner_field_execution_regime_spread_p50_bps" type="number" min="0" step="0.01" />
+                </label>
+                <label>价差 p95 bps
+                  <input id="runner_field_execution_regime_spread_p95_bps" type="number" min="0" step="0.01" />
+                </label>
+                <label>趋势 p50
+                  <input id="runner_field_execution_regime_trend_p50_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>趋势 p95
+                  <input id="runner_field_execution_regime_trend_p95_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>SAFE 分数上限
+                  <input id="runner_field_execution_regime_safe_score_upper" type="number" min="0" max="1" step="0.01" />
+                </label>
+                <label>NORMAL 分数上限
+                  <input id="runner_field_execution_regime_normal_score_upper" type="number" min="0" max="1" step="0.01" />
+                </label>
+                <label>CAUTION 分数上限
+                  <input id="runner_field_execution_regime_caution_score_upper" type="number" min="0" max="1" step="0.01" />
+                </label>
+                <label>进入谨慎确认轮数
+                  <input id="runner_field_execution_regime_confirm_normal_to_caution" type="number" min="1" step="1" />
+                </label>
+              </div>
+              <div class="runner-form-hint">这一层当前只输出状态和建议参数，不直接改变真实订单。真实生效的下单保护仍由软/硬阈值、分钟停买、volatility trigger 和 adaptive step 执行。</div>
+            </section>
             <section class="runner-form-section" data-runner-section="auto_regime">
               <h3>自动切换</h3>
               <div class="runner-form-fields">
@@ -18233,6 +18509,30 @@ MONITOR_PAGE = """<!doctype html>
 
     <section class="card monitor-section">
       <div class="panel-title">
+        <h2>参数生效时间线</h2>
+        <div class="tiny">执行区间、软硬阈值、adaptive step、分钟保护和仓位快照</div>
+      </div>
+      <div class="table-wrap">
+        <table class="timeline-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>轮次</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th class="wide">参数/原因</th>
+              <th>市场</th>
+              <th>仓位</th>
+              <th>阈值/step</th>
+            </tr>
+          </thead>
+          <tbody id="risk_timeline_body"></tbody>
+        </table>
+      </div>
+    </section>
+
+    <section class="card monitor-section">
+      <div class="panel-title">
         <h2>小时损益拆解</h2>
         <div class="tiny" id="hourly_meta">最近 24 小时</div>
       </div>
@@ -18359,6 +18659,7 @@ MONITOR_PAGE = """<!doctype html>
     const reduceStateBox = document.getElementById("reduce_state_box");
     const tradesBody = document.getElementById("trades_body");
     const eventsBody = document.getElementById("events_body");
+    const riskTimelineBody = document.getElementById("risk_timeline_body");
     const hourlyBody = document.getElementById("hourly_body");
     const hourlyMetaEl = document.getElementById("hourly_meta");
     const metaEl = document.getElementById("meta");
@@ -18524,6 +18825,28 @@ MONITOR_PAGE = """<!doctype html>
         },
       };
     }
+    const SOON_EXECUTION_REGIME_SHADOW_CONFIG = {
+      execution_regime_enabled: true,
+      execution_regime_vol_p50_ratio: 0.002,
+      execution_regime_vol_p95_ratio: 0.010,
+      execution_regime_spread_p50_bps: 3.0,
+      execution_regime_spread_p95_bps: 18.0,
+      execution_regime_trend_p50_ratio: 0.0015,
+      execution_regime_trend_p95_ratio: 0.008,
+      execution_regime_safe_score_upper: 0.35,
+      execution_regime_normal_score_upper: 0.60,
+      execution_regime_caution_score_upper: 0.80,
+      execution_regime_recover_exit_to_caution_score: 0.72,
+      execution_regime_recover_caution_to_normal_score: 0.52,
+      execution_regime_recover_normal_to_safe_score: 0.28,
+      execution_regime_confirm_normal_to_caution: 2,
+      execution_regime_confirm_exit_to_caution: 5,
+      execution_regime_confirm_caution_to_normal: 3,
+      execution_regime_confirm_normal_to_safe: 5,
+      execution_regime_vol_exit_q: 0.95,
+      execution_regime_spread_exit_q: 0.95,
+      execution_regime_depth_exit_q: 0.10,
+    };
     function competitionNeutralPingPongPreset(options) {
       const symbol = String(options.symbol || "").trim().toUpperCase();
       const levels = options.levels || 6;
@@ -20460,6 +20783,7 @@ MONITOR_PAGE = """<!doctype html>
           volatility_trigger_reduce_escalate_after_seconds: 900,
           volatility_trigger_reduce_escalate_abs_return_ratio: 0.02,
           volatility_trigger_stop_close_all_positions: true,
+          ...SOON_EXECUTION_REGIME_SHADOW_CONFIG,
           sleep_seconds: 5,
         },
       },
@@ -20548,6 +20872,7 @@ MONITOR_PAGE = """<!doctype html>
         maxActualNetNotional: 180.0,
         maxSyntheticDriftNotional: 90.0,
         levels: 8,
+        extraConfig: SOON_EXECUTION_REGIME_SHADOW_CONFIG,
       }),
       {
         key: "competition_inventory_grid_v1",
@@ -20724,6 +21049,17 @@ MONITOR_PAGE = """<!doctype html>
       { key: "adaptive_step_max_scale", id: "runner_field_adaptive_step_max_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_per_order_scale", id: "runner_field_adaptive_step_min_per_order_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_position_limit_scale", id: "runner_field_adaptive_step_min_position_limit_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_enabled", id: "runner_field_execution_regime_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_vol_p50_ratio", id: "runner_field_execution_regime_vol_p50_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_vol_p95_ratio", id: "runner_field_execution_regime_vol_p95_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_spread_p50_bps", id: "runner_field_execution_regime_spread_p50_bps", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_spread_p95_bps", id: "runner_field_execution_regime_spread_p95_bps", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_trend_p50_ratio", id: "runner_field_execution_regime_trend_p50_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_trend_p95_ratio", id: "runner_field_execution_regime_trend_p95_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_safe_score_upper", id: "runner_field_execution_regime_safe_score_upper", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_normal_score_upper", id: "runner_field_execution_regime_normal_score_upper", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_caution_score_upper", id: "runner_field_execution_regime_caution_score_upper", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "execution_regime_confirm_normal_to_caution", id: "runner_field_execution_regime_confirm_normal_to_caution", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_enabled", id: "runner_field_volatility_entry_pause_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_abs_return_ratio", id: "runner_field_volatility_entry_pause_30s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_amplitude_ratio", id: "runner_field_volatility_entry_pause_30s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -22192,6 +22528,15 @@ MONITOR_PAGE = """<!doctype html>
         lines.push(`候选状态连续满足 ${Math.max(Number(config.auto_regime_confirm_cycles) || 1, 1)} 轮后，才会真正切换到另一套参数，避免来回抖动。`);
       }
 
+      if (Boolean(config.execution_regime_enabled)) {
+        lines.push(
+          `execution_regime 已开启影子判断：波动 p50/p95=${fmtGuidePctFromRatio(config.execution_regime_vol_p50_ratio)} / ${fmtGuidePctFromRatio(config.execution_regime_vol_p95_ratio)}，价差 p50/p95=${fmtGuideNumber(config.execution_regime_spread_p50_bps, 2)} / ${fmtGuideNumber(config.execution_regime_spread_p95_bps, 2)}bps。`
+        );
+        lines.push(
+          `它会在 summary 和 /monitor 时间线里输出 SAFE/NORMAL/CAUTION/EXIT、risk score、建议 quote offset/refresh/size；当前不会直接改真实订单参数。`
+        );
+      }
+
       if (mode === "inventory_target_neutral") {
         lines.push("注意：inventory_target_neutral 当前真正生效的是 neutral_center_interval_minutes、三档 band offset / target ratio、max_position_notional / max_short_position_notional 和 neutral_hourly_scale。");
         lines.push("buy_levels、sell_levels、per_order_notional、base_position_notional、up_trigger_steps、down_trigger_steps、shift_steps 在这个模式里不会决定实际挂单位置。");
@@ -22839,6 +23184,13 @@ MONITOR_PAGE = """<!doctype html>
       const autoRegimeEnabled = Boolean(risk.auto_regime_enabled);
       const autoRegimeRegime = String(risk.auto_regime_regime || "--");
       const autoRegimePending = `${fmtNum(risk.auto_regime_pending_count || 0, 0)} / ${fmtNum(risk.auto_regime_confirm_cycles || 0, 0)}`;
+      const executionRegime = risk.execution_regime || {};
+      const executionRegimeEnabled = Boolean(risk.execution_regime_enabled || executionRegime.enabled);
+      const executionRegimeState = String(risk.execution_regime_state || executionRegime.state || "--");
+      const executionRegimeParams = risk.execution_regime_params || executionRegime.params || {};
+      const executionRegimeReasons = Array.isArray(risk.execution_regime_reason_codes)
+        ? risk.execution_regime_reason_codes
+        : (executionRegime.reason_codes || []);
       const xautAdaptiveEnabled = Boolean(risk.xaut_adaptive_enabled);
       const xautAdaptiveState = String(risk.xaut_adaptive_state || "--");
       const xautAdaptiveCandidateState = String(risk.xaut_adaptive_candidate_state || "--");
@@ -22894,6 +23246,8 @@ MONITOR_PAGE = """<!doctype html>
           ? `波动 ${formatVolumeTriggerWindowLabel(volatilityTrigger.window)}: 振幅 ${fmtPct(volatilityTrigger.current_amplitude_ratio || 0)} / 阈 ${fmtPct(volatilityTrigger.amplitude_ratio || 0)} · 绝对涨跌 ${fmtPct(Math.abs(volatilityTrigger.current_return_ratio || 0))} / 阈 ${fmtPct(volatilityTrigger.abs_return_ratio || 0)} · 自动恢复 ${volatilityTrigger.paused_by_trigger ? "待恢复" : "未挂起"}`
           : "波动自动暂停: 关闭",
         `停止原因: ${risk.stop_reason || "--"}`,
+        `执行区间: ${executionRegimeEnabled ? `${executionRegimeState} score=${fmtNum(risk.execution_regime_risk_score || executionRegime.risk_score || 0, 3)} quote=${fmtNum(executionRegimeParams.quote_offset_bps || 0, 2)}bps refresh=${fmtNum(executionRegimeParams.refresh_interval_ms || 0, 0)}ms size=${fmtNum(executionRegimeParams.order_size_pct || 0, 2)}%` : "关闭"}`,
+        executionRegimeReasons.length ? `执行区间原因: ${executionRegimeReasons.slice(0, 5).join(", ")}` : "执行区间原因: --",
         `自适应状态: ${autoRegimeEnabled ? `${autoRegimeRegime} (${autoRegimePending})` : "关闭"}`,
         `XAUT 三态: ${xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"}`,
         `中性小时缩放: ${neutralHourlyEnabled ? `${neutralHourlyRegime} x${neutralHourlyScale}` : "关闭"}`,
@@ -23091,6 +23445,9 @@ MONITOR_PAGE = """<!doctype html>
         ["冻结重心平移", risk.shift_frozen ? "是" : "否"],
         ["最新1m涨跌", fmtPct(risk.market_guard_return_ratio || 0)],
         ["最新1m振幅", fmtPct(risk.market_guard_amplitude_ratio || 0)],
+        ["执行区间", risk.execution_regime_enabled ? `${risk.execution_regime_state || "--"} · score ${fmtNum(risk.execution_regime_risk_score || 0, 3)} · ${risk.execution_regime_mode || "shadow"}` : "关闭"],
+        ["执行建议参数", risk.execution_regime_enabled ? `quote ${fmtNum(((risk.execution_regime_params || {}).quote_offset_bps || 0), 2)}bps · refresh ${fmtNum(((risk.execution_regime_params || {}).refresh_interval_ms || 0), 0)}ms · size ${fmtNum(((risk.execution_regime_params || {}).order_size_pct || 0), 2)}%` : "--"],
+        ["执行区间原因", (risk.execution_regime_reason_codes || []).length ? (risk.execution_regime_reason_codes || []).slice(0, 6).join(", ") : "--"],
         ["自适应状态", risk.auto_regime_enabled ? `${risk.auto_regime_regime || "--"} (${fmtNum(risk.auto_regime_pending_count || 0, 0)} / ${fmtNum(risk.auto_regime_confirm_cycles || 0, 0)})` : "关闭"],
         ["自适应原因", risk.auto_regime_reason || "--"],
         ["XAUT 三态状态", xautAdaptiveEnabled ? `${xautAdaptiveState} -> ${xautAdaptiveCandidateState} (pending ${xautAdaptivePending})` : "关闭"],
@@ -23232,6 +23589,66 @@ MONITOR_PAGE = """<!doctype html>
             <td>${fmtNum(row.open_order_count || 0, 0)}</td>
             <td>${action}</td>
             <td>${status}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    function timelineSeverityLabel(severity) {
+      if (severity === "critical") return "严重";
+      if (severity === "warning") return "警告";
+      return "提示";
+    }
+
+    function renderRiskTimeline(data) {
+      const rows = (Array.isArray(data.risk_timeline) ? data.risk_timeline : []).slice().reverse();
+      if (!rows.length) {
+        riskTimelineBody.innerHTML = '<tr><td colspan="8" class="empty">还没有参数生效记录。启动带 summary_jsonl 的 loop_runner 后，这里会展示 execution regime、软硬阈值、adaptive step 和分钟保护的变化。</td></tr>';
+        return;
+      }
+      riskTimelineBody.innerHTML = rows.map((row) => {
+        const severity = ["critical", "warning", "info"].includes(row.severity) ? row.severity : "info";
+        const market = row.market || {};
+        const pos = row.position || {};
+        const thresholds = row.thresholds || {};
+        const step = row.step || {};
+        const regime = row.execution_regime || {};
+        const regimeParams = regime.params || {};
+        const reasons = Array.isArray(row.reason_codes) && row.reason_codes.length
+          ? row.reason_codes
+          : (Array.isArray(regime.reason_codes) ? regime.reason_codes : []);
+        const marketText = [
+          `中价 ${fmtNum(market.mid_price || 0, 7)}`,
+          `涨跌 ${fmtPct(market.return_ratio || 0)}`,
+          `振幅 ${fmtPct(market.amplitude_ratio || 0)}`,
+          market.spread_bps ? `spread ${fmtNum(market.spread_bps, 2)}bps` : "",
+        ].filter(Boolean).join(" · ");
+        const positionText = [
+          `多 ${fmtNum(pos.current_long_notional || 0, 2)}`,
+          `空 ${fmtNum(pos.current_short_notional || 0, 2)}`,
+          `净 ${fmtNum(pos.actual_net_notional || pos.synthetic_net_notional || 0, 2)}`,
+        ].join(" · ");
+        const thresholdText = [
+          `软 ${fmtNum(thresholds.pause_buy_position_notional || 0, 1)} / ${fmtNum(thresholds.pause_short_position_notional || 0, 1)}`,
+          `硬 ${fmtNum(thresholds.max_position_notional || 0, 1)} / ${fmtNum(thresholds.max_short_position_notional || 0, 1)}`,
+          step.effective_step_price ? `step ${fmtNum(step.effective_step_price, 7)} x${fmtNum(step.scale || 0, 2)}` : "",
+          regimeParams.quote_offset_bps !== undefined ? `quote ${fmtNum(regimeParams.quote_offset_bps || 0, 2)}bps` : "",
+        ].filter(Boolean).join(" · ");
+        const detailLines = [
+          `<strong>${escapeHtml(row.label || row.type || "--")}</strong>`,
+          escapeHtml(String(row.detail || "--")),
+          reasons.length ? `原因: ${escapeHtml(reasons.slice(0, 6).join(", "))}` : "",
+        ].filter(Boolean).map((item) => `<div>${item}</div>`).join("");
+        return `
+          <tr>
+            <td>${fmtTs(row.ts)}</td>
+            <td>${fmtNum(row.cycle || 0, 0)}</td>
+            <td>${escapeHtml(String(row.type || "--"))}</td>
+            <td><span class="risk-tag ${severity}">${escapeHtml(String(row.state || timelineSeverityLabel(severity)))}</span></td>
+            <td><div class="timeline-detail">${detailLines}</div></td>
+            <td>${escapeHtml(marketText || "--")}</td>
+            <td>${escapeHtml(positionText)}</td>
+            <td>${escapeHtml(thresholdText || "--")}</td>
           </tr>
         `;
       }).join("");
@@ -23401,6 +23818,7 @@ MONITOR_PAGE = """<!doctype html>
           renderHourlyStats(data);
           renderTrades(data);
           renderEvents(data);
+          renderRiskTimeline(data);
           renderCharts(data);
           if (!runnerParamsEditorEl.value.trim()) {
             await loadRunningConfigToEditor(false);
@@ -23609,7 +24027,8 @@ MONITOR_PAGE = """<!doctype html>
     });
 
     async function initMonitorPage() {
-      await loadMonitorSymbols(symbolEl.value);
+      const requestedSymbol = new URLSearchParams(window.location.search).get("symbol") || symbolEl.value || "";
+      await loadMonitorSymbols(requestedSymbol);
       renderSprintPresetZone();
       clearCustomGridPreview();
       await loadMonitor();

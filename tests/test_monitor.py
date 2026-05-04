@@ -21,6 +21,7 @@ from grid_optimizer.monitor import (
     _read_runner_process,
     build_monitor_alerts,
     build_monitor_snapshot,
+    build_risk_activation_timeline,
     summarize_hourly_metrics,
     summarize_income,
     summarize_loop_events,
@@ -184,6 +185,83 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(summary["cycle_count"], 2)
         self.assertEqual(summary["error_count"], 0)
         self.assertEqual(summary["success_count"], 2)
+
+    def test_build_risk_activation_timeline_tracks_regime_thresholds_and_recovery(self) -> None:
+        base = datetime(2026, 5, 4, 8, 0, tzinfo=timezone.utc)
+        rows = [
+            {
+                "ts": base.isoformat(),
+                "cycle": 1,
+                "mid_price": 0.025,
+                "current_long_notional": 100.0,
+                "current_short_notional": 90.0,
+                "execution_regime_enabled": True,
+                "execution_regime_state": "SAFE",
+                "execution_regime_risk_score": 0.18,
+                "execution_regime_quote_offset_bps": 1.5,
+                "execution_regime_refresh_interval_ms": 500,
+                "execution_regime_order_size_pct": 120.0,
+            },
+            {
+                "ts": (base + timedelta(seconds=5)).isoformat(),
+                "cycle": 2,
+                "mid_price": 0.0251,
+                "current_long_notional": 220.0,
+                "current_short_notional": 110.0,
+                "pause_buy_position_notional": 220.0,
+                "max_position_notional": 260.0,
+                "buy_paused": True,
+                "pause_reasons": ["current_long_notional >= pause_buy_position_notional"],
+                "adaptive_step_controls_active": True,
+                "adaptive_step_base_step_price": 0.0002,
+                "adaptive_step_effective_step_price": 0.0006,
+                "adaptive_step_scale": 3.0,
+                "execution_regime_enabled": True,
+                "execution_regime_state": "CAUTION",
+                "execution_regime_risk_score": 0.71,
+                "execution_regime_hard_risk": False,
+                "execution_regime_reason_codes": ["risk_score:caution"],
+                "execution_regime_quote_offset_bps": 4.0,
+                "execution_regime_refresh_interval_ms": 1500,
+                "execution_regime_order_size_pct": 60.0,
+            },
+            {
+                "ts": (base + timedelta(seconds=10)).isoformat(),
+                "cycle": 3,
+                "mid_price": 0.0252,
+                "current_long_notional": 180.0,
+                "current_short_notional": 100.0,
+                "pause_buy_position_notional": 220.0,
+                "max_position_notional": 260.0,
+                "buy_paused": False,
+                "pause_reasons": [],
+                "adaptive_step_controls_active": False,
+                "adaptive_step_base_step_price": 0.0002,
+                "adaptive_step_effective_step_price": 0.0002,
+                "adaptive_step_scale": 1.0,
+                "execution_regime_enabled": True,
+                "execution_regime_state": "NORMAL",
+                "execution_regime_risk_score": 0.42,
+                "execution_regime_quote_offset_bps": 2.5,
+                "execution_regime_refresh_interval_ms": 1000,
+                "execution_regime_order_size_pct": 100.0,
+            },
+        ]
+
+        timeline = build_risk_activation_timeline(rows)
+
+        self.assertEqual([item["type"] for item in timeline], [
+            "execution_regime",
+            "execution_regime",
+            "adaptive_step",
+            "soft_threshold",
+            "execution_regime",
+            "adaptive_step",
+            "soft_threshold",
+        ])
+        self.assertEqual(timeline[1]["state"], "CAUTION")
+        self.assertEqual(timeline[-1]["state"], "RECOVERED")
+        self.assertAlmostEqual(timeline[2]["step"]["effective_step_price"], 0.0006)
 
     def test_build_monitor_alerts_maps_margin_error_and_pause_reason(self) -> None:
         loop_summary = {

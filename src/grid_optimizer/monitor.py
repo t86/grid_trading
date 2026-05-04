@@ -234,7 +234,13 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
         next_token = argv[i + 1] if i + 1 < len(argv) else None
         key = token.lstrip("-").replace("-", "_")
 
-        if token in {"--apply", "--cancel-stale", "--reset-state", "--fixed-center-enabled"}:
+        if token in {
+            "--apply",
+            "--cancel-stale",
+            "--reset-state",
+            "--fixed-center-enabled",
+            "--execution-regime-enabled",
+        }:
             config[key] = True
             i += 1
             continue
@@ -270,6 +276,33 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--max-cumulative-notional",
             "--max-mid-drift-steps",
             "--sleep-seconds",
+            "--execution-regime-vol-p50-ratio",
+            "--execution-regime-vol-p95-ratio",
+            "--execution-regime-spread-p50-bps",
+            "--execution-regime-spread-p95-bps",
+            "--execution-regime-trend-p50-ratio",
+            "--execution-regime-trend-p95-ratio",
+            "--execution-regime-depth-value",
+            "--execution-regime-depth-p10-notional",
+            "--execution-regime-depth-p50-notional",
+            "--execution-regime-impact-q",
+            "--execution-regime-anomaly-q",
+            "--execution-regime-safe-score-upper",
+            "--execution-regime-normal-score-upper",
+            "--execution-regime-caution-score-upper",
+            "--execution-regime-recover-exit-to-caution-score",
+            "--execution-regime-recover-caution-to-normal-score",
+            "--execution-regime-recover-normal-to-safe-score",
+            "--execution-regime-vol-exit-q",
+            "--execution-regime-spread-exit-q",
+            "--execution-regime-depth-exit-q",
+            "--execution-regime-latency-ms",
+            "--execution-regime-latency-ms-exit",
+            "--execution-regime-order-failure-rate",
+            "--execution-regime-order-failure-rate-exit",
+            "--execution-regime-inventory-notional-limit",
+            "--execution-regime-rolling-loss-abs",
+            "--execution-regime-rolling-loss-limit",
         }:
             config[key] = _safe_float(next_token)
             i += 2
@@ -284,6 +317,10 @@ def _parse_runner_args(args_text: str) -> dict[str, Any]:
             "--max-new-orders",
             "--inventory-tier-buy-levels",
             "--inventory-tier-sell-levels",
+            "--execution-regime-confirm-exit-to-caution",
+            "--execution-regime-confirm-caution-to-normal",
+            "--execution-regime-confirm-normal-to-safe",
+            "--execution-regime-confirm-normal-to-caution",
         }:
             try:
                 config[key] = int(next_token)
@@ -871,6 +908,395 @@ def build_hourly_diagnostics(
     }
 
 
+def _as_dict(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
+def _string_list(value: Any) -> list[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, tuple):
+        return [str(item).strip() for item in value if str(item).strip()]
+    text = str(value or "").strip()
+    return [text] if text else []
+
+
+def _execution_regime_from_sources(
+    *,
+    plan_report: dict[str, Any] | None,
+    latest_loop: dict[str, Any],
+    runner_config: dict[str, Any],
+) -> dict[str, Any]:
+    plan_regime = _as_dict((plan_report or {}).get("execution_regime"))
+    loop_regime = _as_dict(latest_loop.get("execution_regime"))
+    source = plan_regime if plan_regime else loop_regime
+    params = dict(_as_dict(source.get("params")))
+    if not params:
+        for row_key, param_key in (
+            ("execution_regime_quote_offset_bps", "quote_offset_bps"),
+            ("execution_regime_refresh_interval_ms", "refresh_interval_ms"),
+            ("execution_regime_order_size_pct", "order_size_pct"),
+        ):
+            if latest_loop.get(row_key) is not None:
+                params[param_key] = latest_loop.get(row_key)
+    enabled = bool(
+        source.get("enabled")
+        if "enabled" in source
+        else latest_loop.get("execution_regime_enabled") or runner_config.get("execution_regime_enabled")
+    )
+    state = str(source.get("state") or latest_loop.get("execution_regime_state") or "").strip()
+    raw_state = str(source.get("raw_state") or latest_loop.get("execution_regime_raw_state") or "").strip()
+    if not state:
+        state = "DISABLED" if not enabled else "UNKNOWN"
+    if not raw_state:
+        raw_state = state
+    config = {
+        key: value
+        for key, value in (runner_config or {}).items()
+        if str(key).startswith("execution_regime_")
+    }
+    return {
+        "enabled": enabled,
+        "mode": str(source.get("mode") or "shadow").strip() or "shadow",
+        "state": state,
+        "raw_state": raw_state,
+        "risk_score": _safe_float(source.get("risk_score") if source else latest_loop.get("execution_regime_risk_score")),
+        "hard_risk": bool(source.get("hard_risk") if source else latest_loop.get("execution_regime_hard_risk")),
+        "reason_codes": _string_list(source.get("reason_codes") if source else latest_loop.get("execution_regime_reason_codes")),
+        "missing_features": _string_list(source.get("missing_features")),
+        "params": params,
+        "features": dict(_as_dict(source.get("features"))),
+        "memory": dict(_as_dict(source.get("memory"))),
+        "applied": bool(source.get("applied")),
+        "config": config,
+    }
+
+
+def _execution_regime_from_event(item: dict[str, Any]) -> dict[str, Any]:
+    source = dict(_as_dict(item.get("execution_regime")))
+    params = dict(_as_dict(source.get("params")))
+    if not params:
+        for row_key, param_key in (
+            ("execution_regime_quote_offset_bps", "quote_offset_bps"),
+            ("execution_regime_refresh_interval_ms", "refresh_interval_ms"),
+            ("execution_regime_order_size_pct", "order_size_pct"),
+        ):
+            if item.get(row_key) is not None:
+                params[param_key] = item.get(row_key)
+    enabled = bool(
+        source.get("enabled")
+        if "enabled" in source
+        else item.get("execution_regime_enabled")
+    )
+    state = str(source.get("state") or item.get("execution_regime_state") or "").strip()
+    raw_state = str(source.get("raw_state") or item.get("execution_regime_raw_state") or "").strip()
+    if not state:
+        state = "DISABLED" if not enabled else "UNKNOWN"
+    if not raw_state:
+        raw_state = state
+    return {
+        "enabled": enabled,
+        "mode": str(source.get("mode") or "shadow").strip() or "shadow",
+        "state": state,
+        "raw_state": raw_state,
+        "risk_score": _safe_float(source.get("risk_score") if source else item.get("execution_regime_risk_score")),
+        "hard_risk": bool(source.get("hard_risk") if source else item.get("execution_regime_hard_risk")),
+        "reason_codes": _string_list(source.get("reason_codes") if source else item.get("execution_regime_reason_codes")),
+        "missing_features": _string_list(source.get("missing_features")),
+        "params": params,
+        "features": dict(_as_dict(source.get("features"))),
+        "memory": dict(_as_dict(source.get("memory"))),
+        "applied": bool(source.get("applied")),
+    }
+
+
+def _adaptive_step_from_event(item: dict[str, Any]) -> dict[str, Any]:
+    adaptive_step = _as_dict(item.get("adaptive_step"))
+    return {
+        "enabled": bool(adaptive_step.get("enabled") if adaptive_step else item.get("adaptive_step_enabled")),
+        "active": bool(adaptive_step.get("active") if adaptive_step else item.get("adaptive_step_active")),
+        "controls_active": bool(
+            adaptive_step.get("controls_active") if adaptive_step else item.get("adaptive_step_controls_active")
+        ),
+        "base_step_price": _safe_float(
+            adaptive_step.get("base_step_price") if adaptive_step else item.get("adaptive_step_base_step_price")
+        ),
+        "effective_step_price": _safe_float(
+            adaptive_step.get("effective_step_price") if adaptive_step else item.get("adaptive_step_effective_step_price")
+        ),
+        "scale": _safe_float(adaptive_step.get("scale") if adaptive_step else item.get("adaptive_step_scale")),
+        "raw_scale": _safe_float(adaptive_step.get("raw_scale") if adaptive_step else item.get("adaptive_step_raw_scale")),
+        "per_order_scale": _safe_float(
+            adaptive_step.get("per_order_scale") if adaptive_step else item.get("adaptive_step_per_order_scale")
+        ),
+        "position_limit_scale": _safe_float(
+            adaptive_step.get("position_limit_scale")
+            if adaptive_step
+            else item.get("adaptive_step_position_limit_scale")
+        ),
+        "dominant_window": adaptive_step.get("dominant_window") or item.get("adaptive_step_dominant_window"),
+        "dominant_metric": adaptive_step.get("dominant_metric") or item.get("adaptive_step_dominant_metric"),
+        "dominant_value": _safe_float(
+            adaptive_step.get("dominant_value") if adaptive_step else item.get("adaptive_step_dominant_value")
+        ),
+        "dominant_threshold": _safe_float(
+            adaptive_step.get("dominant_threshold")
+            if adaptive_step
+            else item.get("adaptive_step_dominant_threshold")
+        ),
+        "reason": adaptive_step.get("reason") or item.get("adaptive_step_reason"),
+    }
+
+
+def _timeline_context(item: dict[str, Any]) -> dict[str, Any]:
+    adaptive = _adaptive_step_from_event(item)
+    regime = _execution_regime_from_event(item)
+    return {
+        "market": {
+            "mid_price": _safe_float(item.get("mid_price")),
+            "return_ratio": _safe_float(item.get("market_guard_return_ratio")),
+            "amplitude_ratio": _safe_float(item.get("market_guard_amplitude_ratio")),
+            "spread_bps": _safe_float(regime.get("features", {}).get("spread_bps")),
+        },
+        "position": {
+            "current_long_qty": _safe_float(item.get("current_long_qty")),
+            "current_short_qty": _safe_float(item.get("current_short_qty")),
+            "current_long_notional": _safe_float(item.get("current_long_notional")),
+            "current_short_notional": _safe_float(item.get("current_short_notional")),
+            "actual_net_notional": _safe_float(item.get("actual_net_notional")),
+            "synthetic_net_notional": _safe_float(item.get("synthetic_net_notional")),
+        },
+        "thresholds": {
+            "pause_buy_position_notional": _safe_float(item.get("pause_buy_position_notional")),
+            "pause_short_position_notional": _safe_float(item.get("pause_short_position_notional")),
+            "max_position_notional": _safe_float(item.get("max_position_notional")),
+            "max_short_position_notional": _safe_float(item.get("max_short_position_notional")),
+            "rolling_hourly_loss": _safe_float(item.get("rolling_hourly_loss")),
+            "rolling_hourly_loss_limit": _safe_float(item.get("rolling_hourly_loss_limit")),
+            "cumulative_gross_notional": _safe_float(item.get("cumulative_gross_notional")),
+            "max_cumulative_notional": _safe_float(item.get("max_cumulative_notional")),
+        },
+        "step": adaptive,
+        "execution_regime": regime,
+    }
+
+
+def _push_timeline_row(
+    rows: list[dict[str, Any]],
+    item: dict[str, Any],
+    *,
+    row_type: str,
+    label: str,
+    state: str,
+    severity: str,
+    detail: str,
+    reason_codes: list[str] | None = None,
+) -> None:
+    rows.append(
+        {
+            "ts": item.get("ts"),
+            "cycle": item.get("cycle"),
+            "type": row_type,
+            "label": label,
+            "state": state,
+            "severity": severity,
+            "detail": detail,
+            "reason_codes": reason_codes or [],
+            **_timeline_context(item),
+        }
+    )
+
+
+def build_risk_activation_timeline(events: list[dict[str, Any]], *, limit: int = 120) -> list[dict[str, Any]]:
+    """Build a compact timeline for parameter activations and risk-state changes."""
+    rows: list[dict[str, Any]] = []
+    last_signatures: dict[str, Any] = {}
+    cycle_rows = [item for item in events if isinstance(item, dict) and "cycle" in item]
+
+    for item in cycle_rows:
+        regime = _execution_regime_from_event(item)
+        if regime["enabled"]:
+            state = str(regime.get("state") or "UNKNOWN").upper()
+            raw_state = str(regime.get("raw_state") or state).upper()
+            signature = (
+                state,
+                raw_state,
+                bool(regime.get("hard_risk")),
+                tuple(regime.get("reason_codes") or []),
+            )
+            if signature != last_signatures.get("execution_regime") or state in {"CAUTION", "EXIT"}:
+                params = regime.get("params") or {}
+                severity = "critical" if state == "EXIT" or regime.get("hard_risk") else ("warning" if state == "CAUTION" else "info")
+                _push_timeline_row(
+                    rows,
+                    item,
+                    row_type="execution_regime",
+                    label="执行区间判断",
+                    state=state,
+                    severity=severity,
+                    detail=(
+                        f"score={_safe_float(regime.get('risk_score')):.3f} "
+                        f"quote={_safe_float(params.get('quote_offset_bps')):.2f}bps "
+                        f"refresh={int(_safe_float(params.get('refresh_interval_ms')))}ms "
+                        f"size={_safe_float(params.get('order_size_pct')):.2f}% "
+                        f"mode={regime.get('mode') or 'shadow'}"
+                    ),
+                    reason_codes=list(regime.get("reason_codes") or []),
+                )
+            last_signatures["execution_regime"] = signature
+
+        adaptive = _adaptive_step_from_event(item)
+        adaptive_signature = (
+            bool(adaptive.get("controls_active")),
+            round(_safe_float(adaptive.get("effective_step_price")), 10),
+            round(_safe_float(adaptive.get("scale")), 4),
+            round(_safe_float(adaptive.get("per_order_scale")), 4),
+            round(_safe_float(adaptive.get("position_limit_scale")), 4),
+        )
+        previous_adaptive = last_signatures.get("adaptive_step")
+        if adaptive_signature != previous_adaptive and (
+            adaptive.get("controls_active")
+            or (previous_adaptive and previous_adaptive[0])
+        ):
+            active = bool(adaptive.get("controls_active"))
+            _push_timeline_row(
+                rows,
+                item,
+                row_type="adaptive_step",
+                label="adaptive step 缩放",
+                state="ACTIVE" if active else "BASE",
+                severity="warning" if active else "info",
+                detail=(
+                    f"base={_safe_float(adaptive.get('base_step_price')):.10f} "
+                    f"effective={_safe_float(adaptive.get('effective_step_price')):.10f} "
+                    f"scale={_safe_float(adaptive.get('scale')):.2f} "
+                    f"per_order={_safe_float(adaptive.get('per_order_scale')):.2f} "
+                    f"position_limit={_safe_float(adaptive.get('position_limit_scale')):.2f} "
+                    f"reason={adaptive.get('reason') or '--'}"
+                ),
+            )
+        last_signatures["adaptive_step"] = adaptive_signature
+
+        pause_signature = (
+            bool(item.get("buy_paused")),
+            tuple(_string_list(item.get("pause_reasons"))),
+            bool(item.get("short_paused")),
+            tuple(_string_list(item.get("short_pause_reasons"))),
+        )
+        previous_pause = last_signatures.get("soft_threshold")
+        if pause_signature != previous_pause and (any(pause_signature) or (previous_pause and any(previous_pause))):
+            parts = []
+            if item.get("buy_paused"):
+                parts.append("停买")
+            if item.get("short_paused"):
+                parts.append("停空")
+            _push_timeline_row(
+                rows,
+                item,
+                row_type="soft_threshold",
+                label="软阈值生效",
+                state="/".join(parts) or "RECOVERED",
+                severity="warning" if parts else "info",
+                detail="；".join(_string_list(item.get("pause_reasons")) + _string_list(item.get("short_pause_reasons"))) or "软阈值恢复",
+            )
+        last_signatures["soft_threshold"] = pause_signature
+
+        hard_signature = (bool(item.get("buy_cap_applied")), bool(item.get("short_cap_applied")))
+        previous_hard = last_signatures.get("hard_threshold")
+        if hard_signature != previous_hard and (any(hard_signature) or (previous_hard and any(previous_hard))):
+            parts = []
+            if item.get("buy_cap_applied"):
+                parts.append("多仓硬裁单")
+            if item.get("short_cap_applied"):
+                parts.append("空仓硬裁单")
+            _push_timeline_row(
+                rows,
+                item,
+                row_type="hard_threshold",
+                label="硬阈值裁剪",
+                state="/".join(parts) or "RECOVERED",
+                severity="warning" if parts else "info",
+                detail="计划订单超过硬上限，本轮已裁剪超出部分。" if parts else "硬阈值裁剪解除，本轮计划未再被硬上限裁剪。",
+            )
+        last_signatures["hard_threshold"] = hard_signature
+
+        market_guard_signature = (bool(item.get("volatility_buy_pause")), bool(item.get("shift_frozen")))
+        previous_market_guard = last_signatures.get("market_guard")
+        if market_guard_signature != previous_market_guard and (
+            any(market_guard_signature) or (previous_market_guard and any(previous_market_guard))
+        ):
+            parts = []
+            if item.get("volatility_buy_pause"):
+                parts.append("分钟停买")
+            if item.get("shift_frozen"):
+                parts.append("冻结迁移")
+            _push_timeline_row(
+                rows,
+                item,
+                row_type="market_guard",
+                label="分钟行情保护",
+                state="/".join(parts) or "RECOVERED",
+                severity="info",
+                detail=(
+                    f"return={_safe_float(item.get('market_guard_return_ratio')):.4%} "
+                    f"amplitude={_safe_float(item.get('market_guard_amplitude_ratio')):.4%}"
+                ),
+            )
+        last_signatures["market_guard"] = market_guard_signature
+
+        reduce_signature = (
+            bool(item.get("threshold_reduce_active")),
+            bool(item.get("adverse_reduce_active")),
+            bool(item.get("hard_loss_forced_reduce_active")),
+        )
+        previous_reduce = last_signatures.get("reduce_guard")
+        if reduce_signature != previous_reduce and (any(reduce_signature) or (previous_reduce and any(previous_reduce))):
+            parts = []
+            if item.get("threshold_reduce_active"):
+                parts.append("阈值减仓")
+            if item.get("adverse_reduce_active"):
+                parts.append("逆向减仓")
+            if item.get("hard_loss_forced_reduce_active"):
+                parts.append("硬损强减")
+            _push_timeline_row(
+                rows,
+                item,
+                row_type="reduce_guard",
+                label="减仓保护",
+                state="/".join(parts) or "RECOVERED",
+                severity="critical" if item.get("hard_loss_forced_reduce_active") else ("warning" if parts else "info"),
+                detail=str(
+                    item.get("hard_loss_forced_reduce_reason")
+                    or item.get("adverse_reduce_direction")
+                    or item.get("threshold_reduce_direction")
+                    or ("减仓保护已激活" if parts else "减仓保护解除")
+                ),
+            )
+        last_signatures["reduce_guard"] = reduce_signature
+
+        runtime_signature = (
+            str(item.get("runtime_status") or "running"),
+            bool(item.get("stop_triggered")),
+            str(item.get("stop_reason") or ""),
+        )
+        if runtime_signature != last_signatures.get("runtime_guard") and (
+            item.get("stop_triggered") or str(item.get("runtime_status") or "running") != "running"
+        ):
+            _push_timeline_row(
+                rows,
+                item,
+                row_type="runtime_guard",
+                label="运行停止保护",
+                state=str(item.get("runtime_status") or "stopped"),
+                severity="critical",
+                detail=str(item.get("stop_reason") or "runtime guard stopped the runner"),
+                reason_codes=_string_list(item.get("stop_reasons")),
+            )
+        last_signatures["runtime_guard"] = runtime_signature
+
+    return rows[-max(int(limit), 1):]
+
+
 def summarize_loop_events(events: list[dict[str, Any]]) -> dict[str, Any]:
     cycle_rows = [item for item in events if "cycle" in item]
     error_rows = [item for item in cycle_rows if item.get("error_message")]
@@ -1155,6 +1581,38 @@ def build_monitor_alerts(
             detail="最近 1 分钟波动超过 freeze_shift_abs_return_trigger_ratio，本轮不会继续追价移动中心。",
             action="这是为了防止急拉急杀里频繁追价，不代表策略停止运行。",
         )
+
+    if risk_controls.get("execution_regime_enabled"):
+        regime_state = str(risk_controls.get("execution_regime_state") or "").upper().strip()
+        regime_score = _safe_float(risk_controls.get("execution_regime_risk_score"))
+        regime_reasons = [
+            str(item).strip()
+            for item in (risk_controls.get("execution_regime_reason_codes") or [])
+            if str(item).strip()
+        ]
+        regime_detail = f"state={regime_state or '--'} score={regime_score:.3f}"
+        if regime_reasons:
+            regime_detail = f"{regime_detail} reason={', '.join(regime_reasons[:5])}"
+        if risk_controls.get("execution_regime_hard_risk") or regime_state == "EXIT":
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="execution_regime_exit",
+                severity="critical",
+                title="执行区间已进入退出/硬风险状态",
+                detail=regime_detail,
+                action="这是影子判断层；当前不会直接改下单，但应检查同一时间线里的市场振幅、价差、仓位和硬阈值。",
+            )
+        elif regime_state == "CAUTION":
+            _push_alert(
+                alerts,
+                seen_codes,
+                code="execution_regime_caution",
+                severity="warning",
+                title="执行区间进入谨慎状态",
+                detail=regime_detail,
+                action="建议观察时间线中 quote offset、刷新间隔和 adaptive step 是否同步放大，再决定是否收紧真实参数。",
+            )
 
     return alerts
 
@@ -1460,6 +1918,7 @@ def _build_monitor_snapshot_uncached(
         "diagnostics": {
             "hourly": build_hourly_diagnostics(events, None, limit=24),
         },
+        "risk_timeline": build_risk_activation_timeline(events, limit=120),
         "risk_controls": None,
         "warnings": [],
         "alerts": [],
@@ -1964,6 +2423,11 @@ def _build_monitor_snapshot_uncached(
     hard_loss_forced_reduce = (plan_report or {}).get("hard_loss_forced_reduce")
     if not isinstance(hard_loss_forced_reduce, dict):
         hard_loss_forced_reduce = {}
+    execution_regime = _execution_regime_from_sources(
+        plan_report=plan_report if isinstance(plan_report, dict) else {},
+        latest_loop=latest_loop,
+        runner_config=runner_config if isinstance(runner_config, dict) else {},
+    )
 
     if not isinstance(snapshot.get("position"), dict):
         snapshot["position"] = {}
@@ -2009,6 +2473,18 @@ def _build_monitor_snapshot_uncached(
         "market_guard_return_ratio": market_guard_return_ratio,
         "market_guard_amplitude_ratio": market_guard_amplitude_ratio,
         "market_guard_warning": market_guard.get("warning"),
+        "execution_regime": execution_regime,
+        "execution_regime_enabled": bool(execution_regime.get("enabled")),
+        "execution_regime_mode": execution_regime.get("mode"),
+        "execution_regime_state": execution_regime.get("state"),
+        "execution_regime_raw_state": execution_regime.get("raw_state"),
+        "execution_regime_risk_score": _safe_float(execution_regime.get("risk_score")),
+        "execution_regime_hard_risk": bool(execution_regime.get("hard_risk")),
+        "execution_regime_reason_codes": list(execution_regime.get("reason_codes") or []),
+        "execution_regime_missing_features": list(execution_regime.get("missing_features") or []),
+        "execution_regime_params": dict(execution_regime.get("params") or {}),
+        "execution_regime_features": dict(execution_regime.get("features") or {}),
+        "execution_regime_applied": bool(execution_regime.get("applied")),
         "auto_regime_enabled": auto_regime_enabled,
         "auto_regime_regime": auto_regime_regime,
         "auto_regime_reason": auto_regime_reason,
