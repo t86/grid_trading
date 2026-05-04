@@ -745,7 +745,123 @@ def summarize_hourly_metrics(
             if gross_notional > 0
             else 0.0
         )
+        bucket["loss_per_10k_abs"] = (
+            max(-float(bucket["net_after_fees_and_funding"]), 0.0) / gross_notional * 10000.0
+            if gross_notional > 0
+            else 0.0
+        )
         rows.append(bucket)
+
+    limited_rows = rows[: max(int(limit), 1)]
+    return {
+        "rows": limited_rows,
+        "row_count": len(limited_rows),
+        "available_hours": len(rows),
+    }
+
+
+def build_hourly_diagnostics(
+    events: list[dict[str, Any]],
+    hourly_summary: dict[str, Any] | None,
+    *,
+    limit: int = 24,
+) -> dict[str, Any]:
+    hourly_rows = list((hourly_summary or {}).get("rows") or [])
+    rows_by_hour = {str(row.get("hour_start") or ""): dict(row) for row in hourly_rows}
+    event_buckets: dict[datetime, dict[str, Any]] = {}
+
+    for item in events:
+        ts = _parse_iso_ts(item.get("ts"))
+        if ts is None:
+            continue
+        hour_start = _floor_hour(ts)
+        bucket = event_buckets.setdefault(
+            hour_start,
+            {
+                "count": 0,
+                "effective_step_sum": 0.0,
+                "effective_step_count": 0,
+                "min_effective_step": None,
+                "max_effective_step": None,
+                "base_step_price": None,
+                "adaptive_scale_sum": 0.0,
+                "adaptive_scale_count": 0,
+                "max_rolling_hourly_loss": 0.0,
+                "buy_pause_count": 0,
+                "volatility_entry_pause_count": 0,
+                "adverse_reduce_count": 0,
+            },
+        )
+        bucket["count"] += 1
+        adaptive_step = item.get("adaptive_step") if isinstance(item.get("adaptive_step"), dict) else {}
+        effective_step = _safe_float(
+            adaptive_step.get("effective_step_price")
+            or item.get("adaptive_step_effective_step_price")
+        )
+        if effective_step > 0:
+            bucket["effective_step_sum"] += effective_step
+            bucket["effective_step_count"] += 1
+            current_min = bucket["min_effective_step"]
+            current_max = bucket["max_effective_step"]
+            bucket["min_effective_step"] = (
+                effective_step if current_min is None else min(float(current_min), effective_step)
+            )
+            bucket["max_effective_step"] = (
+                effective_step if current_max is None else max(float(current_max), effective_step)
+            )
+        base_step = _safe_float(adaptive_step.get("base_step_price") or item.get("adaptive_step_base_step_price"))
+        if base_step > 0:
+            bucket["base_step_price"] = base_step
+        scale = _safe_float(adaptive_step.get("scale") or item.get("adaptive_step_scale"))
+        if scale > 0:
+            bucket["adaptive_scale_sum"] += scale
+            bucket["adaptive_scale_count"] += 1
+        bucket["max_rolling_hourly_loss"] = max(
+            float(bucket["max_rolling_hourly_loss"]),
+            _safe_float(item.get("rolling_hourly_loss")),
+        )
+        if item.get("buy_paused"):
+            bucket["buy_pause_count"] += 1
+        volatility_entry_pause = item.get("volatility_entry_pause")
+        if (
+            item.get("volatility_entry_pause_active")
+            or (isinstance(volatility_entry_pause, dict) and volatility_entry_pause.get("active"))
+        ):
+            bucket["volatility_entry_pause_count"] += 1
+        adverse_reduce = item.get("adverse_inventory_reduce")
+        if item.get("adverse_reduce_active") or (isinstance(adverse_reduce, dict) and adverse_reduce.get("active")):
+            bucket["adverse_reduce_count"] += 1
+
+    for hour_start, bucket in event_buckets.items():
+        key = hour_start.isoformat()
+        row = rows_by_hour.setdefault(key, {"hour_start": key})
+        step_count = int(bucket["effective_step_count"])
+        scale_count = int(bucket["adaptive_scale_count"])
+        row["event_count"] = int(bucket["count"])
+        row["effective_step_price"] = (
+            float(bucket["effective_step_sum"]) / step_count if step_count > 0 else 0.0
+        )
+        row["min_effective_step_price"] = bucket["min_effective_step"] or 0.0
+        row["max_effective_step_price"] = bucket["max_effective_step"] or 0.0
+        row["base_step_price"] = bucket["base_step_price"] or 0.0
+        row["adaptive_scale"] = float(bucket["adaptive_scale_sum"]) / scale_count if scale_count > 0 else 0.0
+        row["max_rolling_hourly_loss"] = float(bucket["max_rolling_hourly_loss"])
+        row["buy_pause_count"] = int(bucket["buy_pause_count"])
+        row["volatility_entry_pause_count"] = int(bucket["volatility_entry_pause_count"])
+        row["adverse_reduce_count"] = int(bucket["adverse_reduce_count"])
+
+    rows = []
+    for hour_key in sorted(rows_by_hour.keys(), reverse=True):
+        row = rows_by_hour[hour_key]
+        gross_notional = _safe_float(row.get("gross_notional"))
+        net_after_fees = _safe_float(row.get("net_after_fees_and_funding"))
+        row["loss_per_10k_abs"] = (
+            max(-net_after_fees, 0.0) / gross_notional * 10000.0
+            if gross_notional > 0
+            else 0.0
+        )
+        row["return_ratio_abs"] = abs(_safe_float(row.get("return_ratio")))
+        rows.append(row)
 
     limited_rows = rows[: max(int(limit), 1)]
     return {
@@ -1341,6 +1457,9 @@ def _build_monitor_snapshot_uncached(
         "trade_summary": None,
         "income_summary": None,
         "hourly_summary": None,
+        "diagnostics": {
+            "hourly": build_hourly_diagnostics(events, None, limit=24),
+        },
         "risk_controls": None,
         "warnings": [],
         "alerts": [],
@@ -1497,6 +1616,9 @@ def _build_monitor_snapshot_uncached(
             snapshot["trade_summary"] = trade_summary
             snapshot["income_summary"] = income_summary
             snapshot["hourly_summary"] = hourly_summary
+            snapshot["diagnostics"] = {
+                "hourly": build_hourly_diagnostics(events, hourly_summary, limit=24),
+            }
             snapshot["audit"]["trade_source"] = trade_meta
             snapshot["audit"]["income_source"] = income_meta
             snapshot["audit"]["trade_row_count"] = len(user_trades)

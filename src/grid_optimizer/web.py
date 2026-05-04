@@ -17408,6 +17408,29 @@ MONITOR_PAGE = """<!doctype html>
       overflow: hidden;
       position: relative;
     }
+    .diagnostic-chart {
+      height: 300px;
+    }
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .chart-legend-item {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+    .chart-legend-swatch {
+      width: 18px;
+      height: 3px;
+      border-radius: 999px;
+      background: currentColor;
+    }
     .chart svg { width: 100%; height: 100%; display: block; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { padding: 10px 8px; border-bottom: 1px solid var(--line); text-align: left; vertical-align: top; }
@@ -18201,6 +18224,15 @@ MONITOR_PAGE = """<!doctype html>
 
     <section class="card monitor-section">
       <div class="panel-title">
+        <h2>损耗诊断</h2>
+        <div class="tiny">小时级：涨跌幅、振幅、有效 step、万U损耗</div>
+      </div>
+      <div class="chart diagnostic-chart" id="diagnostic_chart"></div>
+      <div class="chart-legend" id="diagnostic_legend"></div>
+    </section>
+
+    <section class="card monitor-section">
+      <div class="panel-title">
         <h2>小时损益拆解</h2>
         <div class="tiny" id="hourly_meta">最近 24 小时</div>
       </div>
@@ -18212,6 +18244,7 @@ MONITOR_PAGE = """<!doctype html>
               <th>成交额</th>
               <th>笔数</th>
               <th>净损益</th>
+              <th>万U损耗</th>
               <th>已实现</th>
               <th>手续费</th>
               <th>资金费</th>
@@ -18319,6 +18352,8 @@ MONITOR_PAGE = """<!doctype html>
     const summaryEl = document.getElementById("summary");
     const tradeChartEl = document.getElementById("trade_chart");
     const loopChartEl = document.getElementById("loop_chart");
+    const diagnosticChartEl = document.getElementById("diagnostic_chart");
+    const diagnosticLegendEl = document.getElementById("diagnostic_legend");
     const openOrdersBody = document.getElementById("open_orders_body");
     const positionBox = document.getElementById("position_box");
     const reduceStateBox = document.getElementById("reduce_state_box");
@@ -23137,7 +23172,7 @@ MONITOR_PAGE = """<!doctype html>
         : "";
       hourlyMetaEl.textContent = `最近 ${hourly.row_count || 0} / ${hourly.available_hours || 0} 小时${statsStartText}`;
       if (!rows.length) {
-        hourlyBody.innerHTML = '<tr><td colspan="10" class="empty">当前没有小时级统计数据</td></tr>';
+        hourlyBody.innerHTML = '<tr><td colspan="11" class="empty">当前没有小时级统计数据</td></tr>';
         return;
       }
       hourlyBody.innerHTML = rows.map((row) => `
@@ -23146,6 +23181,7 @@ MONITOR_PAGE = """<!doctype html>
           <td>${fmtNum(row.gross_notional || 0, 4)}</td>
           <td>${fmtNum(row.trade_count || 0, 0)}</td>
           <td class="${statusClass(Number(row.net_after_fees_and_funding || 0))}">${fmtMoney(row.net_after_fees_and_funding || 0)}</td>
+          <td class="${Number(row.loss_per_10k_abs || 0) > 2 ? "bad" : "good"}">${fmtNum(row.loss_per_10k_abs || 0, 2)}</td>
           <td class="${statusClass(Number(row.realized_pnl || 0))}">${fmtMoney(row.realized_pnl || 0)}</td>
           <td class="bad">${fmtMoney(-Math.abs(Number(row.commission || 0)))}</td>
           <td class="${statusClass(Number(row.funding_fee || 0))}">${fmtMoney(row.funding_fee || 0)}</td>
@@ -23232,6 +23268,80 @@ MONITOR_PAGE = """<!doctype html>
       `;
     }
 
+    function makeDiagnosticChart(points) {
+      if (!points || !points.length) return '<div class="empty">暂无小时级诊断数据</div>';
+      const rows = points.slice().reverse();
+      const width = 920;
+      const height = 300;
+      const padX = 46;
+      const padY = 26;
+      const series = [
+        { key: "loss_per_10k_abs", label: "万U损耗", color: "#b42318", digits: 2 },
+        { key: "return_ratio_abs", label: "绝对涨跌幅", color: "#0b6f68", digits: 4, pct: true },
+        { key: "amplitude_ratio", label: "振幅", color: "#8b5a2b", digits: 4, pct: true },
+        { key: "effective_step_price", label: "有效 step", color: "#2557a7", digits: 7 },
+      ];
+      const stepX = rows.length > 1 ? (width - padX * 2) / (rows.length - 1) : 0;
+      const xFor = (idx) => padX + idx * stepX;
+      const yFor = (value, min, max) => {
+        const spread = max - min || 1;
+        return height - padY - ((value - min) / spread) * (height - padY * 2);
+      };
+      const grid = [0.25, 0.5, 0.75].map((ratio) => {
+        const y = padY + ratio * (height - padY * 2);
+        return `<line x1="${padX}" y1="${y}" x2="${width - padX}" y2="${y}" stroke="#e6dfd2" stroke-width="1"></line>`;
+      }).join("");
+      const lines = series.map((item) => {
+        const values = rows.map((row) => Math.max(Number(row[item.key] || 0), 0));
+        const max = Math.max(...values, 0);
+        const min = Math.min(...values, 0);
+        const coords = values.map((value, idx) => `${xFor(idx)},${yFor(value, min, max)}`).join(" ");
+        const latest = values[values.length - 1] || 0;
+        const latestText = item.pct ? fmtPct(latest) : fmtNum(latest, item.digits);
+        return `
+          <polyline points="${coords}" fill="none" stroke="${item.color}" stroke-width="3" stroke-linecap="round" stroke-linejoin="round"></polyline>
+          <circle cx="${xFor(values.length - 1)}" cy="${yFor(latest, min, max)}" r="4" fill="${item.color}"></circle>
+          <text x="${width - padX}" y="${20 + series.indexOf(item) * 17}" fill="${item.color}" font-size="12" text-anchor="end">${escapeHtml(item.label)} ${escapeHtml(latestText)}</text>
+        `;
+      }).join("");
+      const labels = rows.map((row, idx) => {
+        if (idx !== 0 && idx !== rows.length - 1 && idx % Math.max(Math.ceil(rows.length / 6), 1) !== 0) return "";
+        const dt = new Date(row.hour_start);
+        const label = Number.isNaN(dt.getTime())
+          ? String(row.hour_start || "")
+          : dt.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+        return `<text x="${xFor(idx)}" y="${height - 7}" fill="#6c685f" font-size="11" text-anchor="middle">${escapeHtml(label)}</text>`;
+      }).join("");
+      return `
+        <svg viewBox="0 0 ${width} ${height}" preserveAspectRatio="none">
+          <rect x="0" y="0" width="${width}" height="${height}" fill="transparent"></rect>
+          ${grid}
+          <line x1="${padX}" y1="${height - padY}" x2="${width - padX}" y2="${height - padY}" stroke="#d8cfbf" stroke-width="1"></line>
+          ${lines}
+          ${labels}
+        </svg>
+      `;
+    }
+
+    function renderDiagnosticChart(data) {
+      const rows = ((((data.diagnostics || {}).hourly || {}).rows) || [])
+        .filter((row) => row && row.hour_start)
+        .slice(0, 24);
+      diagnosticChartEl.innerHTML = makeDiagnosticChart(rows);
+      const legend = [
+        ["万U损耗", "#b42318"],
+        ["绝对涨跌幅", "#0b6f68"],
+        ["振幅", "#8b5a2b"],
+        ["有效 step", "#2557a7"],
+      ];
+      diagnosticLegendEl.innerHTML = legend.map(([label, color]) => `
+        <span class="chart-legend-item" style="color:${color}">
+          <span class="chart-legend-swatch"></span>
+          <span>${escapeHtml(label)}</span>
+        </span>
+      `).join("");
+    }
+
     function formatStopActionSummary(summary) {
       if (!summary) return "";
       const parts = [];
@@ -23287,6 +23397,7 @@ MONITOR_PAGE = """<!doctype html>
           renderPosition(data);
           renderReduceState(data);
           renderOpenOrders(data);
+          renderDiagnosticChart(data);
           renderHourlyStats(data);
           renderTrades(data);
           renderEvents(data);
