@@ -14,6 +14,7 @@ from grid_optimizer.monitor import (
     _MONITOR_CACHE,
     _MONITOR_CACHE_LOCK,
     _MONITOR_INFLIGHT,
+    _count_monitor_audit_lines,
     _filter_events_since,
     _filter_rows_since,
     _extract_futures_asset_snapshot,
@@ -609,6 +610,15 @@ class MonitorTests(unittest.TestCase):
 
         self.assertEqual(call_count, 1)
         self.assertEqual(result1, result2)
+
+    def test_count_monitor_audit_lines_skips_uncached_large_file(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            path = Path(tmpdir) / "large.jsonl"
+            with path.open("wb") as f:
+                f.truncate(128)
+
+            with mock.patch.dict("os.environ", {"GRID_MONITOR_AUDIT_COUNT_MAX_SCAN_BYTES": "64"}):
+                self.assertIsNone(_count_monitor_audit_lines(path))
 
     @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
     @patch("grid_optimizer.monitor.fetch_futures_open_orders", side_effect=AssertionError("should not fetch open orders"))

@@ -14,6 +14,7 @@ from grid_optimizer.web import (
     HTML_PAGE,
     STRATEGIES_PAGE,
     _Handler,
+    _build_running_status_api_body,
     _build_running_status,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
@@ -55,6 +56,7 @@ from grid_optimizer.web import (
     _volatility_reduce_escalation_reason,
     _volatility_trigger_orphan_recovery_action,
 )
+from grid_optimizer import web as web_module
 
 
 class WebSecurityTests(unittest.TestCase):
@@ -68,6 +70,17 @@ class WebSecurityTests(unittest.TestCase):
 
     def _mock_book(self) -> list[dict[str, str]]:
         return [{"bid_price": "1.2345", "ask_price": "1.2347"}]
+
+    def test_running_status_api_body_builds_payload_outside_cache_lock(self) -> None:
+        web_module.RUNNING_STATUS_API_RESPONSE_CACHE.clear()
+
+        def payload_factory() -> dict[str, bool]:
+            self.assertFalse(web_module.RUNNING_STATUS_API_RESPONSE_CACHE_LOCK.locked())
+            return {"ok": True}
+
+        body = _build_running_status_api_body("test-lock-scope", payload_factory)
+
+        self.assertEqual(json.loads(body.decode("utf-8")), {"ok": True})
 
     @patch("grid_optimizer.web.delete_futures_order")
     @patch("grid_optimizer.web.fetch_futures_open_orders")

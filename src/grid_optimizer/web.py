@@ -3584,10 +3584,12 @@ def _build_running_status_api_body(cache_key: str, payload_factory: Callable[[],
         cached = RUNNING_STATUS_API_RESPONSE_CACHE.get(cache_key)
         if ttl > 0 and cached is not None and now - cached[0] <= ttl:
             return cached[1]
-        body = json.dumps(payload_factory(), ensure_ascii=False).encode("utf-8")
-        if ttl > 0:
+
+    body = json.dumps(payload_factory(), ensure_ascii=False).encode("utf-8")
+    if ttl > 0:
+        with RUNNING_STATUS_API_RESPONSE_CACHE_LOCK:
             RUNNING_STATUS_API_RESPONSE_CACHE[cache_key] = (time.monotonic(), body)
-        return body
+    return body
 
 
 def _load_web_auth_credentials() -> tuple[str, str] | None:

@@ -180,7 +180,7 @@ def read_trade_audit_rows(
     return sorted_rows[-limit:] if limit > 0 else sorted_rows
 
 
-def count_jsonl_lines(path: Path) -> int:
+def count_jsonl_lines(path: Path, *, max_scan_bytes: int | None = None) -> int | None:
     if not path.exists():
         return 0
     try:
@@ -192,6 +192,8 @@ def count_jsonl_lines(path: Path) -> int:
     signature = (int(stat.st_mtime_ns), int(stat.st_size))
     if cached is not None and cached[:2] == signature:
         return int(cached[2])
+    if max_scan_bytes is not None and int(stat.st_size) > max_scan_bytes:
+        return None
 
     count = 0
     try:

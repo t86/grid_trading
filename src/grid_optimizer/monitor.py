@@ -1847,6 +1847,19 @@ def build_monitor_snapshot(
     return snapshot
 
 
+def _monitor_audit_count_max_scan_bytes() -> int:
+    raw = str(os.environ.get("GRID_MONITOR_AUDIT_COUNT_MAX_SCAN_BYTES") or "50000000").strip()
+    try:
+        value = int(raw)
+    except ValueError:
+        return 50_000_000
+    return max(0, value)
+
+
+def _count_monitor_audit_lines(path: Path) -> int | None:
+    return count_jsonl_lines(path, max_scan_bytes=_monitor_audit_count_max_scan_bytes())
+
+
 def _build_monitor_snapshot_uncached(
     *,
     symbol: str,
@@ -1903,9 +1916,9 @@ def _build_monitor_snapshot_uncached(
             "income_source": None,
             "trade_row_count": 0,
             "income_row_count": 0,
-            "order_event_count": count_jsonl_lines(audit_paths["order_audit"]),
-            "submit_event_count": count_jsonl_lines(audit_paths["submit_audit"]),
-            "plan_event_count": count_jsonl_lines(audit_paths["plan_audit"]),
+            "order_event_count": _count_monitor_audit_lines(audit_paths["order_audit"]),
+            "submit_event_count": _count_monitor_audit_lines(audit_paths["submit_audit"]),
+            "plan_event_count": _count_monitor_audit_lines(audit_paths["plan_audit"]),
         },
         "account_connected": False,
         "market": None,
