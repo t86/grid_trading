@@ -8,7 +8,12 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from grid_optimizer.audit import build_audit_paths
-from grid_optimizer.web import _build_hourly_symbol_report_email
+from grid_optimizer.web import (
+    _build_hourly_symbol_report_email,
+    _format_running_status_overview_email,
+    _hourly_symbol_email_enabled,
+    _running_status_overview_email_enabled,
+)
 
 
 class WebEmailReportTests(unittest.TestCase):
@@ -128,6 +133,74 @@ class WebEmailReportTests(unittest.TestCase):
             self.assertIn("剩余资产: USDT 可用 870.0000 · 钱包 920.0000", body)
             self.assertIn("当前委托单:", body)
             self.assertIn("BUY BOTH 价格 1.20500000 · 数量 50.0000 · 已成交 10.0000", body)
+
+    def test_hourly_symbol_email_defaults_off_and_overview_defaults_on(self) -> None:
+        with patch.dict("grid_optimizer.web.os.environ", {}, clear=True):
+            self.assertFalse(_hourly_symbol_email_enabled())
+            self.assertTrue(_running_status_overview_email_enabled())
+
+        with patch.dict(
+            "grid_optimizer.web.os.environ",
+            {
+                "GRID_HOURLY_SYMBOL_EMAIL_ENABLED": "1",
+                "GRID_RUNNING_STATUS_OVERVIEW_EMAIL_ENABLED": "0",
+            },
+            clear=True,
+        ):
+            self.assertTrue(_hourly_symbol_email_enabled())
+            self.assertFalse(_running_status_overview_email_enabled())
+
+    def test_format_running_status_overview_email_includes_full_rows(self) -> None:
+        now = datetime(2026, 5, 5, 3, 0, tzinfo=timezone.utc)
+        payload = {
+            "scope": "cross",
+            "summary": {
+                "server_count": 1,
+                "running_symbol_count": 1,
+                "futures_symbol_count": 1,
+                "spot_symbol_count": 0,
+                "total_volume": 1234.5,
+                "recent_hour_volume": 456.7,
+                "total_pnl": -1.2,
+                "trade_pnl": -0.9,
+                "unrealized_pnl": -0.3,
+                "fees": 0.04,
+                "funding_fee": 0.01,
+            },
+            "servers": [
+                {
+                    "ok": True,
+                    "label": "111",
+                    "url": "http://example",
+                    "symbols": [
+                        {
+                            "symbol": "BTCUSDC",
+                            "market_label": "合约",
+                            "is_running": True,
+                            "strategy_name": "btc_profile",
+                            "total_volume": 1234.5,
+                            "recent_hour_volume": 456.7,
+                            "total_pnl": -1.2,
+                            "trade_pnl": -0.9,
+                            "fees": 0.04,
+                            "position_summary": "long 100U",
+                            "open_order_count": 3,
+                        }
+                    ],
+                }
+            ],
+        }
+
+        with patch("grid_optimizer.web.alert_source_label", return_value="111"):
+            email = _format_running_status_overview_email(payload, now=now)
+
+        self.assertEqual(email["subject"], "[grid][111] running_status_overview 整点总览")
+        body = email["body"]
+        self.assertIn("运行币种: 1", body)
+        self.assertIn("最近1小时交易量: 456.7000 USDT", body)
+        self.assertIn("BTCUSDC 合约 running", body)
+        self.assertIn("strategy=btc_profile", body)
+        self.assertIn("pos=long 100U", body)
 
 
 if __name__ == "__main__":

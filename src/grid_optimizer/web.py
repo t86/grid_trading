@@ -181,6 +181,7 @@ _STATUS_COMMISSION_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 _STATUS_COMMISSION_PRICE_CACHE_TTL_SECONDS = 60.0
 RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
 HOURLY_EMAIL_REPORT_STATE_PATH = Path("output/hourly_email_report_state.json")
+RUNNING_STATUS_OVERVIEW_EMAIL_STATE_PATH = Path("output/running_status_overview_email_state.json")
 MONITOR_SYMBOL_OPTIONS = tuple(DEFAULT_SYMBOL_LISTS["monitor"])
 CUSTOM_RUNNER_PRESETS_PATH = Path("output/custom_runner_presets.json")
 MANUAL_TRADE_HISTORY_PATH = Path("output/manual_trade_history.json")
@@ -324,7 +325,7 @@ SOON_EXECUTION_REGIME_SHADOW_CONFIG: dict[str, Any] = {
     "execution_regime_vol_exit_q": 0.95,
     "execution_regime_spread_exit_q": 0.95,
     "execution_regime_depth_exit_q": 0.10,
-    "execution_regime_vol_protection_enabled": False,
+    "execution_regime_vol_protection_enabled": True,
     "execution_regime_vol_protection_min_scale": 0.2,
 }
 
@@ -3517,6 +3518,13 @@ def _competition_board_disabled_payload() -> dict[str, Any]:
     return {"ok": False, "error": "competition board is disabled"}
 
 
+def _env_flag_enabled(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _competition_board_auto_refresh_interval_seconds() -> float:
     raw = os.environ.get("GRID_COMPETITION_BOARD_REFRESH_SECONDS", "").strip()
     if not raw:
@@ -3577,8 +3585,13 @@ def _running_status_api_cache_seconds() -> float:
     return max(0.0, value)
 
 
-def _build_running_status_api_body(cache_key: str, payload_factory: Callable[[], dict[str, Any]]) -> bytes:
-    ttl = _running_status_api_cache_seconds()
+def _build_running_status_api_body(
+    cache_key: str,
+    payload_factory: Callable[[], dict[str, Any]],
+    *,
+    ttl_seconds: float | None = None,
+) -> bytes:
+    ttl = _running_status_api_cache_seconds() if ttl_seconds is None else max(0.0, float(ttl_seconds))
     now = time.monotonic()
     with RUNNING_STATUS_API_RESPONSE_CACHE_LOCK:
         cached = RUNNING_STATUS_API_RESPONSE_CACHE.get(cache_key)
@@ -3915,6 +3928,10 @@ def _send_hourly_symbol_report(config: dict[str, Any]) -> dict[str, Any] | None:
     return send_alert_email(subject=str(payload["subject"]), body=str(payload["body"]))
 
 
+def _hourly_symbol_email_enabled() -> bool:
+    return _env_flag_enabled("GRID_HOURLY_SYMBOL_EMAIL_ENABLED", default=False)
+
+
 def _run_hourly_email_report_loop(stop_event: threading.Event) -> None:
     while not stop_event.is_set():
         now = datetime.now(timezone.utc)
@@ -3941,6 +3958,100 @@ def _run_hourly_email_report_loop(stop_event: threading.Event) -> None:
                 changed = True
         if changed:
             _write_json_dict(HOURLY_EMAIL_REPORT_STATE_PATH, {"sent": sent_map, "updated_at": now.isoformat()})
+        stop_event.wait(60.0)
+
+
+def _running_status_overview_email_enabled() -> bool:
+    return _env_flag_enabled("GRID_RUNNING_STATUS_OVERVIEW_EMAIL_ENABLED", default=True)
+
+
+def _format_running_status_overview_email(payload: dict[str, Any], *, now: datetime | None = None) -> dict[str, str]:
+    current = _normalize_email_report_now(now)
+    summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
+    servers = payload.get("servers") if isinstance(payload.get("servers"), list) else []
+    lines = [
+        f"时间: {current.isoformat()}",
+        f"范围: {payload.get('scope') or 'cross'}",
+        "",
+        "汇总:",
+        f"- 服务器数: {int(_email_float(summary.get('server_count')))}",
+        f"- 运行币种: {int(_email_float(summary.get('running_symbol_count')))}",
+        f"- 合约币种: {int(_email_float(summary.get('futures_symbol_count')))}",
+        f"- 现货币种: {int(_email_float(summary.get('spot_symbol_count')))}",
+        f"- 总交易量: {_format_email_number(summary.get('total_volume'))} USDT",
+        f"- 最近1小时交易量: {_format_email_number(summary.get('recent_hour_volume'))} USDT",
+        f"- 总盈亏: {_format_email_signed(summary.get('total_pnl'))} USDT",
+        f"- 已实现: {_format_email_signed(summary.get('trade_pnl'))} USDT",
+        f"- 浮盈: {_format_email_signed(summary.get('unrealized_pnl'))} USDT",
+        f"- 手续费: {_format_email_number(summary.get('fees'))} USDT",
+        f"- 资金费: {_format_email_signed(summary.get('funding_fee'))} USDT",
+        "",
+        "服务器明细:",
+    ]
+    for server in servers:
+        if not isinstance(server, dict):
+            continue
+        label = str(server.get("label") or "--").strip() or "--"
+        ok = bool(server.get("ok"))
+        url = str(server.get("url") or "").strip()
+        symbols = server.get("symbols") if isinstance(server.get("symbols"), list) else []
+        lines.append(f"\n[{label}] ok={'yes' if ok else 'no'} url={url or '--'} symbols={len(symbols)}")
+        if not ok and server.get("error"):
+            lines.append(f"- error: {server.get('error')}")
+        errors = server.get("errors") if isinstance(server.get("errors"), list) else []
+        for error in errors[:5]:
+            lines.append(f"- warning: {error}")
+        for item in symbols:
+            if not isinstance(item, dict):
+                continue
+            symbol = str(item.get("symbol") or "--").upper().strip() or "--"
+            market = str(item.get("market_label") or item.get("market_type") or "--").strip() or "--"
+            strategy = str(item.get("strategy_name") or item.get("strategy_profile") or "--").strip() or "--"
+            running = item.get("is_running")
+            running_text = "running" if running is True else ("stopped" if running is False else "--")
+            lines.append(
+                "- "
+                f"{symbol} {market} {running_text} "
+                f"strategy={strategy} "
+                f"vol={_format_email_number(item.get('total_volume'))}U "
+                f"1h={_format_email_number(item.get('recent_hour_volume'))}U "
+                f"pnl={_format_email_signed(item.get('total_pnl'))}U "
+                f"trade={_format_email_signed(item.get('trade_pnl'))}U "
+                f"fees={_format_email_number(item.get('fees'))}U "
+                f"pos={item.get('position_summary') or item.get('current_position_display') or '--'} "
+                f"orders={item.get('open_order_count') if item.get('open_order_count') is not None else '--'}"
+            )
+    return {
+        "subject": f"[grid][{alert_source_label()}] running_status_overview 整点总览",
+        "body": "\n".join(lines),
+    }
+
+
+def _send_running_status_overview_email(now: datetime | None = None) -> dict[str, Any]:
+    current = _normalize_email_report_now(now)
+    payload = _build_running_status(scope="cross")
+    email_payload = _format_running_status_overview_email(payload, now=current)
+    result = send_alert_email(subject=email_payload["subject"], body=email_payload["body"])
+    result["summary"] = payload.get("summary")
+    return result
+
+
+def _run_running_status_overview_email_loop(stop_event: threading.Event) -> None:
+    while not stop_event.is_set():
+        now = datetime.now(timezone.utc)
+        report_bucket = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%MZ")
+        state = _read_json_dict(RUNNING_STATUS_OVERVIEW_EMAIL_STATE_PATH) or {}
+        if state.get("last_sent_bucket") != report_bucket:
+            result = _send_running_status_overview_email(now=now)
+            if bool(result.get("sent")) or str(result.get("error") or "") == "alert_email_disabled":
+                _write_json_dict(
+                    RUNNING_STATUS_OVERVIEW_EMAIL_STATE_PATH,
+                    {
+                        "last_sent_bucket": report_bucket,
+                        "last_result": result,
+                        "updated_at": now.isoformat(),
+                    },
+                )
         stop_event.wait(60.0)
 
 
@@ -8716,11 +8827,15 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         ("execution_regime_inventory_notional_limit", "--execution-regime-inventory-notional-limit"),
         ("execution_regime_rolling_loss_abs", "--execution-regime-rolling-loss-abs"),
         ("execution_regime_rolling_loss_limit", "--execution-regime-rolling-loss-limit"),
-        ("execution_regime_vol_protection_enabled", "--execution-regime-vol-protection-enabled"),
         ("execution_regime_vol_protection_min_scale", "--execution-regime-vol-protection-min-scale"),
     ):
         if config.get(config_key) is not None:
             command.extend([flag, str(config[config_key])])
+    command.append(
+        "--execution-regime-vol-protection-enabled"
+        if config.get("execution_regime_vol_protection_enabled", False)
+        else "--no-execution-regime-vol-protection-enabled"
+    )
     command.append(
         "--volatility-entry-pause-enabled"
         if config.get("volatility_entry_pause_enabled", False)
@@ -18861,7 +18976,7 @@ MONITOR_PAGE = """<!doctype html>
       execution_regime_vol_exit_q: 0.95,
       execution_regime_spread_exit_q: 0.95,
       execution_regime_depth_exit_q: 0.10,
-      execution_regime_vol_protection_enabled: false,
+      execution_regime_vol_protection_enabled: true,
       execution_regime_vol_protection_min_scale: 0.2,
     };
     function competitionNeutralPingPongPreset(options) {
@@ -30474,11 +30589,25 @@ def _legacy_running_status_server_from_payload(
     symbols = list(server.get("symbols") or [])
     if not symbols:
         groups = server.get("groups") if isinstance(server.get("groups"), dict) else {}
-        symbols = [
+        running_rows = [
             _legacy_running_status_item_from_card(item)
             for item in list(groups.get("running") or [])
             if isinstance(item, dict)
         ]
+        saved_rows = []
+        for item in list(groups.get("saved_idle") or []):
+            if not isinstance(item, dict):
+                continue
+            row = _legacy_running_status_item_from_card(item)
+            row["runner"] = {"pid": None, "elapsed": None}
+            row["open_order_count"] = 0
+            row["open_order_summary"] = "未启动"
+            row["position_summary"] = "未启动"
+            row["latest_trade_summary"] = "--"
+            row["strategy_name"] = row.get("strategy_name") or row.get("strategy_profile") or "--"
+            row["is_running"] = False
+            saved_rows.append(row)
+        symbols = running_rows + saved_rows
     return {
         "ok": True,
         "label": str(server.get("label") or server.get("server_label") or fallback_label),
@@ -30498,12 +30627,12 @@ def _running_status_remote_timeout_seconds() -> float:
 
 
 def _running_status_overview_cache_seconds(scope: str) -> float:
+    specific_key = f"GRID_RUNNING_STATUS_OVERVIEW_{scope.upper()}_CACHE_SECONDS"
+    raw_value = os.environ.get(specific_key) or os.environ.get("GRID_RUNNING_STATUS_OVERVIEW_CACHE_SECONDS")
+    if raw_value is None:
+        raw_value = "10"
     raw = str(
-        os.environ.get(f"GRID_RUNNING_STATUS_OVERVIEW_{scope.upper()}_CACHE_SECONDS")
-        or os.environ.get("GRID_RUNNING_STATUS_OVERVIEW_CACHE_SECONDS")
-        or os.environ.get(f"GRID_RUNNING_STATUS_{scope.upper()}_CACHE_SECONDS")
-        or os.environ.get("GRID_RUNNING_STATUS_CACHE_SECONDS")
-        or "10"
+        raw_value
     ).strip()
     try:
         value = float(raw)
@@ -30743,6 +30872,7 @@ class _Handler(BaseHTTPRequestHandler):
                 body = _build_running_status_api_body(
                     f"running_status_overview:scope={cache_scope}",
                     lambda: _run_running_status_overview_query(query),
+                    ttl_seconds=_running_status_overview_cache_seconds(cache_scope),
                 )
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
@@ -31597,6 +31727,7 @@ def main() -> None:
     volatility_trigger_thread.start()
     competition_refresh_stop_event = threading.Event()
     hourly_email_stop_event = threading.Event()
+    running_status_overview_email_stop_event = threading.Event()
     if _competition_board_auto_refresh_enabled():
         refresh_interval = _competition_board_auto_refresh_interval_seconds()
         competition_refresh_thread = threading.Thread(
@@ -31610,13 +31741,22 @@ def main() -> None:
             "[competition-board] auto refresh every "
             f"{refresh_interval / 60:.0f}m ({refresh_interval:.0f}s)"
         )
-    hourly_email_thread = threading.Thread(
-        target=_run_hourly_email_report_loop,
-        args=(hourly_email_stop_event,),
-        daemon=True,
-        name="hourly-email-report",
-    )
-    hourly_email_thread.start()
+    if _hourly_symbol_email_enabled():
+        hourly_email_thread = threading.Thread(
+            target=_run_hourly_email_report_loop,
+            args=(hourly_email_stop_event,),
+            daemon=True,
+            name="hourly-email-report",
+        )
+        hourly_email_thread.start()
+    if _running_status_overview_email_enabled():
+        running_status_overview_email_thread = threading.Thread(
+            target=_run_running_status_overview_email_loop,
+            args=(running_status_overview_email_stop_event,),
+            daemon=True,
+            name="running-status-overview-email",
+        )
+        running_status_overview_email_thread.start()
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     print(f"Grid Web UI running at http://{args.host}:{args.port}")
     print("Press Ctrl+C to stop.")
@@ -31629,6 +31769,7 @@ def main() -> None:
         volatility_trigger_stop_event.set()
         competition_refresh_stop_event.set()
         hourly_email_stop_event.set()
+        running_status_overview_email_stop_event.set()
         server.server_close()
 
 
