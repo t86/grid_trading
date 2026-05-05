@@ -5,6 +5,7 @@ from datetime import datetime, timedelta, timezone
 
 from grid_optimizer.submit_plan import (
     adjust_post_only_price,
+    apply_anti_chase_entry_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
     enforce_execution_action_limits,
@@ -124,6 +125,73 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_orders"][0]["qty"], 150.0)
         self.assertEqual(capped["place_orders"][1]["qty"], 50.0)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
+    def test_anti_chase_guard_drops_long_entries_but_keeps_reduce_only_sells(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 2.42, "qty": 10.0, "notional": 24.2, "role": "entry"},
+                {
+                    "side": "SELL",
+                    "price": 2.43,
+                    "qty": 10.0,
+                    "notional": 24.3,
+                    "role": "active_delever_long",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+            "place_notional": 48.5,
+        }
+        plan_report = {
+            "anti_chase_entry_guard": {
+                "enabled": True,
+                "block_long_entries": True,
+                "block_short_entries": False,
+                "long_reason": "window_1m return=0.30% >= 0.25%",
+            }
+        }
+
+        guarded = apply_anti_chase_entry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "active_delever_long")
+        self.assertEqual(guarded["anti_chase_entry_guard"]["dropped_order_count"], 1)
+
+    def test_anti_chase_guard_drops_short_entries_but_keeps_short_exits(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 2.30, "qty": 10.0, "notional": 23.0, "role": "entry_short"},
+                {"side": "BUY", "price": 2.29, "qty": 10.0, "notional": 22.9, "role": "take_profit_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+            "place_notional": 45.9,
+        }
+        plan_report = {
+            "anti_chase_entry_guard": {
+                "enabled": True,
+                "block_long_entries": False,
+                "block_short_entries": True,
+                "short_reason": "window_1m return=-0.30% <= -0.25%",
+            }
+        }
+
+        guarded = apply_anti_chase_entry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "take_profit_short")
+        self.assertEqual(guarded["anti_chase_entry_guard"]["dropped_order_count"], 1)
 
     def test_deferred_action_limits_allow_capped_reduce_only_orders(self) -> None:
         now = datetime(2026, 5, 5, 0, 20, tzinfo=timezone.utc)

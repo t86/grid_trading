@@ -3348,6 +3348,11 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volatility_entry_pause_3m_amplitude_ratio": 0.0,
     "volatility_entry_pause_5m_abs_return_ratio": 0.0,
     "volatility_entry_pause_5m_amplitude_ratio": 0.0,
+    "anti_chase_entry_guard_enabled": True,
+    "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
+    "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
+    "anti_chase_entry_guard_3m_abs_return_ratio": 0.006,
+    "anti_chase_entry_guard_3m_amplitude_ratio": 0.008,
     "synthetic_trend_follow_enabled": False,
     "synthetic_trend_follow_1m_abs_return_ratio": 0.0,
     "synthetic_trend_follow_1m_amplitude_ratio": 0.0,
@@ -7870,6 +7875,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volatility_entry_pause_3m_amplitude_ratio",
         "volatility_entry_pause_5m_abs_return_ratio",
         "volatility_entry_pause_5m_amplitude_ratio",
+        "anti_chase_entry_guard_1m_abs_return_ratio",
+        "anti_chase_entry_guard_1m_amplitude_ratio",
+        "anti_chase_entry_guard_3m_abs_return_ratio",
+        "anti_chase_entry_guard_3m_amplitude_ratio",
         "static_buy_offset_steps",
         "static_sell_offset_steps",
         "synthetic_trend_follow_1m_abs_return_ratio",
@@ -7982,6 +7991,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_enabled",
         "execution_regime_enabled",
         "volatility_entry_pause_enabled",
+        "anti_chase_entry_guard_enabled",
         "synthetic_trend_follow_enabled",
         "synthetic_flow_sleeve_enabled",
         "adverse_reduce_enabled",
@@ -8342,6 +8352,25 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             "1m 振幅暂停加仓阈值 volatility_entry_pause_1m_amplitude_ratio",
         )
 
+    def require_anti_chase_entry_guard() -> None:
+        require_enabled("anti_chase_entry_guard_enabled", "反追涨杀跌 anti_chase_entry_guard_enabled")
+        require_positive(
+            "anti_chase_entry_guard_1m_abs_return_ratio",
+            "1m 反追涨杀跌涨跌幅阈值 anti_chase_entry_guard_1m_abs_return_ratio",
+        )
+        require_positive(
+            "anti_chase_entry_guard_1m_amplitude_ratio",
+            "1m 反追涨杀跌振幅阈值 anti_chase_entry_guard_1m_amplitude_ratio",
+        )
+        require_positive(
+            "anti_chase_entry_guard_3m_abs_return_ratio",
+            "3m 反追涨杀跌涨跌幅阈值 anti_chase_entry_guard_3m_abs_return_ratio",
+        )
+        require_positive(
+            "anti_chase_entry_guard_3m_amplitude_ratio",
+            "3m 反追涨杀跌振幅阈值 anti_chase_entry_guard_3m_amplitude_ratio",
+        )
+
     def require_extreme_volatility_stop() -> None:
         require_enabled("volatility_trigger_enabled", "极端波动停机/减仓 volatility_trigger_enabled")
         require_positive("volatility_trigger_abs_return_ratio", "极端涨跌幅阈值 volatility_trigger_abs_return_ratio")
@@ -8381,6 +8410,7 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
 
     if strategy_mode == "one_way_long":
         require_fast_entry_pause()
+        require_anti_chase_entry_guard()
         require_extreme_volatility_stop()
         require_positive("pause_buy_position_notional", "多仓软阈值 pause_buy_position_notional")
         require_positive("buy_pause_amp_trigger_ratio", "下跌振幅暂停买入 buy_pause_amp_trigger_ratio")
@@ -8397,6 +8427,7 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
                     errors.append(f"{field} 必须低于 pause_buy_position_notional，确保能减到软阈值以下")
     elif strategy_mode == "one_way_short":
         require_fast_entry_pause()
+        require_anti_chase_entry_guard()
         require_extreme_volatility_stop()
         require_positive("pause_short_position_notional", "空仓软阈值 pause_short_position_notional")
         require_positive("threshold_position_notional", "空仓超时阈值 threshold_position_notional")
@@ -8412,6 +8443,7 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             errors.append("hard_loss_forced_reduce_target_notional 必须低于 pause_short_position_notional，确保能减到软阈值以下")
     elif strategy_mode in {"synthetic_neutral", "hedge_neutral", "inventory_target_neutral"}:
         require_fast_entry_pause()
+        require_anti_chase_entry_guard()
         require_extreme_volatility_stop()
         require_positive("pause_buy_position_notional", "多仓软阈值 pause_buy_position_notional")
         require_positive("pause_short_position_notional", "空仓软阈值 pause_short_position_notional")
@@ -8430,6 +8462,7 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         if target is not None and pauses and target >= min(pauses):
             errors.append("hard_loss_forced_reduce_target_notional 必须低于两侧软阈值，确保能减到软阈值以下")
     elif strategy_mode == "maker_volatility_inventory_v1":
+        require_anti_chase_entry_guard()
         require_positive("maker_order_notional")
         require_positive("maker_max_long_notional")
         require_positive("maker_max_short_notional")
@@ -8440,6 +8473,7 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             errors.append("maker_inventory_soft_ratio 必须 <= 1")
     else:
         require_fast_entry_pause()
+        require_anti_chase_entry_guard()
         require_extreme_volatility_stop()
         require_positive("threshold_position_notional", "软阈值 threshold_position_notional")
         require_hard_loss()
@@ -8881,6 +8915,23 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--volatility-entry-pause-5m-amplitude-ratio",
             str(config["volatility_entry_pause_5m_amplitude_ratio"]),
         ])
+    command.append(
+        "--anti-chase-entry-guard-enabled"
+        if config.get(
+            "anti_chase_entry_guard_enabled",
+            RUNNER_DEFAULT_CONFIG["anti_chase_entry_guard_enabled"],
+        )
+        else "--no-anti-chase-entry-guard-enabled"
+    )
+    for config_key, flag in (
+        ("anti_chase_entry_guard_1m_abs_return_ratio", "--anti-chase-entry-guard-1m-abs-return-ratio"),
+        ("anti_chase_entry_guard_1m_amplitude_ratio", "--anti-chase-entry-guard-1m-amplitude-ratio"),
+        ("anti_chase_entry_guard_3m_abs_return_ratio", "--anti-chase-entry-guard-3m-abs-return-ratio"),
+        ("anti_chase_entry_guard_3m_amplitude_ratio", "--anti-chase-entry-guard-3m-amplitude-ratio"),
+    ):
+        value = config.get(config_key, RUNNER_DEFAULT_CONFIG.get(config_key))
+        if value is not None:
+            command.extend([flag, str(value)])
     command.append(
         "--synthetic-trend-follow-enabled"
         if config.get("synthetic_trend_follow_enabled", False)

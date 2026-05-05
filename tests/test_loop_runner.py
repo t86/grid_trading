@@ -74,6 +74,7 @@ from grid_optimizer.loop_runner import (
     resolve_synthetic_trend_follow,
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
+    resolve_anti_chase_entry_guard,
     apply_synthetic_trend_follow_guard,
     remove_take_profit_exit_orders,
     sync_synthetic_ledger,
@@ -314,6 +315,62 @@ class LoopRunnerTests(unittest.TestCase):
         result = _filter_futures_strategy_orders(open_orders, "BTCUSDC")
 
         self.assertEqual(result, [{"clientOrderId": "gx-btcusdc-001", "orderId": 1}])
+
+    def test_resolve_anti_chase_entry_guard_blocks_directional_entries(self) -> None:
+        up_guard = resolve_anti_chase_entry_guard(
+            market_guard={
+                "window_1m": {"return_ratio": 0.003, "amplitude_ratio": 0.0036},
+                "window_3m": {"return_ratio": 0.004, "amplitude_ratio": 0.0045},
+            },
+            enabled=True,
+            window_1m_abs_return_ratio=0.0025,
+            window_1m_amplitude_ratio=0.0035,
+            window_3m_abs_return_ratio=0.006,
+            window_3m_amplitude_ratio=0.008,
+        )
+        down_guard = resolve_anti_chase_entry_guard(
+            market_guard={
+                "window_1m": {"return_ratio": -0.003, "amplitude_ratio": 0.0036},
+                "window_3m": {"return_ratio": -0.004, "amplitude_ratio": 0.0045},
+            },
+            enabled=True,
+            window_1m_abs_return_ratio=0.0025,
+            window_1m_amplitude_ratio=0.0035,
+            window_3m_abs_return_ratio=0.006,
+            window_3m_amplitude_ratio=0.008,
+        )
+
+        self.assertTrue(up_guard["active"])
+        self.assertTrue(up_guard["block_long_entries"])
+        self.assertFalse(up_guard["block_short_entries"])
+        self.assertTrue(down_guard["active"])
+        self.assertFalse(down_guard["block_long_entries"])
+        self.assertTrue(down_guard["block_short_entries"])
+
+    def test_resolve_anti_chase_entry_guard_requires_return_and_amplitude(self) -> None:
+        return_only = resolve_anti_chase_entry_guard(
+            market_guard={
+                "window_1m": {"return_ratio": 0.003, "amplitude_ratio": 0.002},
+            },
+            enabled=True,
+            window_1m_abs_return_ratio=0.0025,
+            window_1m_amplitude_ratio=0.0035,
+            window_3m_abs_return_ratio=0.006,
+            window_3m_amplitude_ratio=0.008,
+        )
+        amplitude_only = resolve_anti_chase_entry_guard(
+            market_guard={
+                "window_1m": {"return_ratio": 0.001, "amplitude_ratio": 0.004},
+            },
+            enabled=True,
+            window_1m_abs_return_ratio=0.0025,
+            window_1m_amplitude_ratio=0.0035,
+            window_3m_abs_return_ratio=0.006,
+            window_3m_amplitude_ratio=0.008,
+        )
+
+        self.assertFalse(return_only["active"])
+        self.assertFalse(amplitude_only["active"])
 
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")

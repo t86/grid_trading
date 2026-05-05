@@ -83,6 +83,7 @@ from .submit_plan import (
     _build_client_order_id,
     _ignore_noop_error,
     _is_reduce_only_reject,
+    apply_anti_chase_entry_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
@@ -737,6 +738,86 @@ def resolve_volatility_entry_pause(
             "reason": matched_reasons[0] if matched_reasons else None,
         }
     )
+    return report
+
+
+def resolve_anti_chase_entry_guard(
+    *,
+    market_guard: dict[str, Any] | None,
+    enabled: bool,
+    window_1m_abs_return_ratio: float | None,
+    window_1m_amplitude_ratio: float | None,
+    window_3m_abs_return_ratio: float | None,
+    window_3m_amplitude_ratio: float | None,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": bool(enabled),
+        "active": False,
+        "block_long_entries": False,
+        "block_short_entries": False,
+        "long_reason": None,
+        "short_reason": None,
+        "matched_reasons": [],
+        "reason": None,
+    }
+    if not enabled:
+        return report
+
+    thresholds = {
+        "window_1m": {
+            "abs_return_ratio": _safe_float(window_1m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_1m_amplitude_ratio),
+        },
+        "window_3m": {
+            "abs_return_ratio": _safe_float(window_3m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_3m_amplitude_ratio),
+        },
+    }
+    windows = {
+        "window_1m": (market_guard or {}).get("window_1m"),
+        "window_3m": (market_guard or {}).get("window_3m"),
+    }
+    matched: list[str] = []
+    for window_key, window_stats in windows.items():
+        if not isinstance(window_stats, dict):
+            continue
+        return_ratio = _safe_float(window_stats.get("return_ratio"))
+        amplitude_ratio = _safe_float(window_stats.get("amplitude_ratio"))
+        window_thresholds = thresholds.get(window_key) or {}
+        abs_return_threshold = _safe_float(window_thresholds.get("abs_return_ratio"))
+        amplitude_threshold = _safe_float(window_thresholds.get("amplitude_ratio"))
+        upward_shock = (
+            abs_return_threshold > 0
+            and amplitude_threshold > 0
+            and return_ratio >= abs_return_threshold
+            and amplitude_ratio >= amplitude_threshold
+        )
+        downward_shock = (
+            abs_return_threshold > 0
+            and amplitude_threshold > 0
+            and return_ratio <= -abs_return_threshold
+            and amplitude_ratio >= amplitude_threshold
+        )
+        if upward_shock:
+            report["block_long_entries"] = True
+            reason = (
+                f"{window_key} return={return_ratio * 100:.2f}% >= {abs_return_threshold * 100:.2f}% "
+                f"and amplitude={amplitude_ratio * 100:.2f}% >= {amplitude_threshold * 100:.2f}%"
+            )
+            report["long_reason"] = reason
+            matched.append(f"block_long_entries: {reason}")
+        if downward_shock:
+            report["block_short_entries"] = True
+            reason = (
+                f"{window_key} return={return_ratio * 100:.2f}% <= -{abs_return_threshold * 100:.2f}% "
+                f"and amplitude={amplitude_ratio * 100:.2f}% >= {amplitude_threshold * 100:.2f}%"
+            )
+            report["short_reason"] = reason
+            matched.append(f"block_short_entries: {reason}")
+
+    report["active"] = bool(report["block_long_entries"] or report["block_short_entries"])
+    report["matched_reasons"] = matched
+    report["reason"] = matched[0] if matched else None
     return report
 
 
@@ -8494,6 +8575,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         now=plan_now,
         force_fetch=bool(getattr(args, "execution_regime_enabled", False)),
     )
+    anti_chase_entry_guard = resolve_anti_chase_entry_guard(
+        market_guard=market_guard,
+        enabled=bool(getattr(effective_args, "anti_chase_entry_guard_enabled", False)),
+        window_1m_abs_return_ratio=getattr(effective_args, "anti_chase_entry_guard_1m_abs_return_ratio", None),
+        window_1m_amplitude_ratio=getattr(effective_args, "anti_chase_entry_guard_1m_amplitude_ratio", None),
+        window_3m_abs_return_ratio=getattr(effective_args, "anti_chase_entry_guard_3m_abs_return_ratio", None),
+        window_3m_amplitude_ratio=getattr(effective_args, "anti_chase_entry_guard_3m_amplitude_ratio", None),
+    )
     center_price = float(state["center_price"])
     shift_moves: list[dict[str, Any]] = []
     center_source: dict[str, Any] | None = None
@@ -10641,6 +10730,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
         controls["pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
         controls["short_pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+    if anti_chase_entry_guard.get("block_long_entries"):
+        controls["buy_paused"] = True
+        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+        controls["pause_reasons"].append(
+            "anti_chase_entry_guard: "
+            + str(anti_chase_entry_guard.get("long_reason") or anti_chase_entry_guard.get("reason") or "block_long_entries")
+        )
+    if anti_chase_entry_guard.get("block_short_entries"):
+        controls["short_paused"] = True
+        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
+        controls["short_pause_reasons"].append(
+            "anti_chase_entry_guard: "
+            + str(anti_chase_entry_guard.get("short_reason") or anti_chase_entry_guard.get("reason") or "block_short_entries")
+        )
 
     if bool(controls.get("buy_paused")):
         plan["bootstrap_orders"] = []
@@ -10782,6 +10885,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "execution_regime": execution_regime,
         "adaptive_step": adaptive_step,
         "volatility_entry_pause": volatility_entry_pause,
+        "anti_chase_entry_guard": anti_chase_entry_guard,
         "maker_volatility_inventory": maker_volatility_inventory,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
@@ -10980,6 +11084,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
+    validation["actions"] = apply_anti_chase_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
 
     report = {
         "plan_json": str(args.plan_json),
@@ -11132,6 +11241,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         strategy_mode=strategy_mode,
         current_actual_net_qty=current_actual_net_qty,
         current_open_orders=current_strategy_open_orders,
+    )
+    validation["actions"] = apply_anti_chase_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
     )
     validation = enforce_execution_action_limits(
         validation=validation,
@@ -11485,6 +11599,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--anti-chase-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--anti-chase-entry-guard-1m-abs-return-ratio", type=float, default=0.0025)
+    parser.add_argument("--anti-chase-entry-guard-1m-amplitude-ratio", type=float, default=0.0035)
+    parser.add_argument("--anti-chase-entry-guard-3m-abs-return-ratio", type=float, default=0.006)
+    parser.add_argument("--anti-chase-entry-guard-3m-amplitude-ratio", type=float, default=0.008)
     parser.add_argument("--volatility-alert-email-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--volatility-alert-1m-amplitude-ratio", type=float, default=0.0025)
     parser.add_argument("--volatility-alert-15m-amplitude-ratio", type=float, default=0.006)
@@ -12065,6 +12184,18 @@ def main() -> None:
         raise SystemExit("--volatility-entry-pause thresholds must be >= 0")
     if args.volatility_entry_pause_enabled and not any(threshold > 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("volatility entry pause requires at least one positive trigger threshold")
+    anti_chase_entry_guard_thresholds = (
+        args.anti_chase_entry_guard_1m_abs_return_ratio,
+        args.anti_chase_entry_guard_1m_amplitude_ratio,
+        args.anti_chase_entry_guard_3m_abs_return_ratio,
+        args.anti_chase_entry_guard_3m_amplitude_ratio,
+    )
+    if any(threshold < 0 for threshold in anti_chase_entry_guard_thresholds):
+        raise SystemExit("--anti-chase-entry-guard thresholds must be >= 0")
+    if not args.anti_chase_entry_guard_enabled:
+        raise SystemExit("--anti-chase-entry-guard-enabled is required for all futures strategies")
+    if not any(threshold > 0 for threshold in anti_chase_entry_guard_thresholds):
+        raise SystemExit("anti chase entry guard requires at least one positive trigger threshold")
     volatility_alert_thresholds = (
         args.volatility_alert_1m_amplitude_ratio,
         args.volatility_alert_15m_amplitude_ratio,

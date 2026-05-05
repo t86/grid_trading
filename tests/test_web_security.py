@@ -112,6 +112,11 @@ class WebSecurityTests(unittest.TestCase):
             "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
             "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
             "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "anti_chase_entry_guard_enabled": True,
+            "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
+            "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
+            "anti_chase_entry_guard_3m_abs_return_ratio": 0.006,
+            "anti_chase_entry_guard_3m_amplitude_ratio": 0.008,
             "volatility_trigger_enabled": True,
             "volatility_trigger_abs_return_ratio": 0.025,
             "volatility_trigger_amplitude_ratio": 0.04,
@@ -137,6 +142,11 @@ class WebSecurityTests(unittest.TestCase):
             "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
             "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
             "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "anti_chase_entry_guard_enabled": True,
+            "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
+            "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
+            "anti_chase_entry_guard_3m_abs_return_ratio": 0.006,
+            "anti_chase_entry_guard_3m_amplitude_ratio": 0.008,
             "volatility_trigger_enabled": True,
             "volatility_trigger_abs_return_ratio": 0.025,
             "volatility_trigger_amplitude_ratio": 0.04,
@@ -2302,6 +2312,11 @@ class WebSecurityTests(unittest.TestCase):
                 "maker_max_short_notional": 300.0,
                 "maker_inventory_soft_ratio": 0.7,
                 "maker_extreme_volatility_threshold": 0.012,
+                "anti_chase_entry_guard_enabled": True,
+                "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
+                "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
+                "anti_chase_entry_guard_3m_abs_return_ratio": 0.006,
+                "anti_chase_entry_guard_3m_amplitude_ratio": 0.008,
             }
         )
 
@@ -2359,6 +2374,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--maker-extreme-volatility-threshold", command)
         self.assertIn("--maker-directional-move-threshold", command)
         self.assertIn("--maker-cooldown-seconds", command)
+        self.assertIn("--anti-chase-entry-guard-enabled", command)
+        self.assertIn("--anti-chase-entry-guard-1m-abs-return-ratio", command)
 
     def test_runner_preset_payload_for_maker_volatility_inventory_v1(self) -> None:
         payload = _runner_preset_payload("maker_volatility_inventory_v1", {"symbol": "BARDUSDT"})
@@ -2368,6 +2385,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["maker_order_notional"], 30.0)
         self.assertEqual(payload["maker_max_long_notional"], 300.0)
         self.assertEqual(payload["maker_max_short_notional"], 300.0)
+        self.assertTrue(payload["anti_chase_entry_guard_enabled"])
 
     def test_build_runner_command_includes_custom_grid_arguments(self) -> None:
         command = _build_runner_command(
@@ -3245,6 +3263,17 @@ class WebSecurityTests(unittest.TestCase):
         }
 
         with self.assertRaisesRegex(ValueError, "快速波动暂停加仓"):
+            _validate_runner_required_risk_guards(config)
+
+    def test_validate_runner_required_risk_guards_blocks_missing_anti_chase_guard(self) -> None:
+        config = {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            **self._required_neutral_risk_guards(),
+            "anti_chase_entry_guard_enabled": False,
+        }
+
+        with self.assertRaisesRegex(ValueError, "反追涨杀跌"):
             _validate_runner_required_risk_guards(config)
 
     def test_validate_runner_required_risk_guards_blocks_missing_extreme_volatility_stop(self) -> None:

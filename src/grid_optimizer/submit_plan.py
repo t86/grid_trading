@@ -429,6 +429,63 @@ def cap_reduce_only_place_orders_to_position(
     return result
 
 
+def apply_anti_chase_entry_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+) -> dict[str, Any]:
+    """Drop new entry orders that would add risk in the same direction as a fast move."""
+    guard = plan_report.get("anti_chase_entry_guard")
+    if not isinstance(guard, dict) or not _truthy(guard.get("enabled")):
+        return actions
+
+    block_long_entries = bool(guard.get("block_long_entries"))
+    block_short_entries = bool(guard.get("block_short_entries"))
+    if not block_long_entries and not block_short_entries:
+        return actions
+
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        side = str(order.get("side", "")).upper().strip()
+        role = str(order.get("role", "entry")).strip()
+        reduce_only = _resolve_reduce_only_flag(strategy_mode=normalized_mode, side=side, role=role)
+        if order.get("force_reduce_only") is not None:
+            reduce_only = bool(order.get("force_reduce_only"))
+
+        should_drop = False
+        reason = None
+        if reduce_only is not True:
+            if side == "BUY" and block_long_entries:
+                should_drop = True
+                reason = guard.get("long_reason") or guard.get("reason") or "anti_chase_up"
+            elif side == "SELL" and block_short_entries:
+                should_drop = True
+                reason = guard.get("short_reason") or guard.get("reason") or "anti_chase_down"
+
+        if should_drop:
+            dropped = dict(order)
+            dropped["anti_chase_drop_reason"] = reason
+            dropped_orders.append(dropped)
+        else:
+            kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["anti_chase_entry_guard"] = {
+        "enabled": True,
+        "block_long_entries": block_long_entries,
+        "block_short_entries": block_short_entries,
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     symbol = str(plan_report.get("symbol", "")).upper().strip()
     bootstrap_orders = [
