@@ -126,6 +126,50 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_orders"][1]["qty"], 50.0)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
 
+    def test_urgent_reduce_only_displaces_existing_take_profit_capacity(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 2.382,
+                    "qty": 283.6,
+                    "notional": 675.5352,
+                    "role": "active_delever_short",
+                    "force_reduce_only": True,
+                    "execution_type": "maker_timeout_release",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        current_open_orders = [
+            {
+                "orderId": 1019001946,
+                "side": "BUY",
+                "price": "2.360000",
+                "origQty": "283.60",
+                "executedQty": "0",
+                "reduceOnly": True,
+                "clientOrderId": "gx-trumpusdc-takeprof-1-89452771",
+            }
+        ]
+
+        capped = cap_reduce_only_place_orders_to_position(
+            actions=actions,
+            strategy_mode="synthetic_neutral",
+            current_actual_net_qty=-283.6,
+            current_open_orders=current_open_orders,
+        )
+
+        self.assertEqual(capped["place_count"], 1)
+        self.assertEqual(capped["cancel_count"], 1)
+        self.assertEqual(capped["place_orders"][0]["role"], "active_delever_short")
+        self.assertEqual(capped["cancel_orders"][0]["orderId"], 1019001946)
+        self.assertEqual(capped["cancel_orders"][0]["cancel_reason"], "urgent_reduce_only_displaces_take_profit")
+        self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 0)
+        self.assertEqual(capped["reduce_only_position_cap"]["displaced_order_count"], 1)
+
     def test_anti_chase_guard_drops_long_entries_but_keeps_reduce_only_sells(self) -> None:
         actions = {
             "place_orders": [

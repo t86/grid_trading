@@ -333,6 +333,58 @@ def _order_matches_cancel(open_order: dict[str, Any], cancel_order: dict[str, An
     return bool(open_client_id and cancel_client_id and open_client_id == cancel_client_id)
 
 
+URGENT_REDUCE_ONLY_ROLES = {
+    "active_delever_long",
+    "active_delever_short",
+    "adverse_reduce_long",
+    "adverse_reduce_short",
+    "hard_delever_long",
+    "hard_delever_short",
+    "hard_loss_forced_reduce_long",
+    "hard_loss_forced_reduce_short",
+    "maker_reduce_long",
+    "maker_reduce_short",
+    "soft_delever_long",
+    "soft_delever_short",
+}
+
+
+def _compact_order_role(role: str) -> str:
+    return str(role or "").lower().replace("_", "")[:8]
+
+
+def _open_order_role(open_order: dict[str, Any]) -> str:
+    explicit = str(open_order.get("role", "") or "").strip().lower()
+    if explicit:
+        return explicit
+    client_order_id = str(open_order.get("clientOrderId", "") or "")
+    parts = client_order_id.split("-")
+    if len(parts) >= 3 and parts[0] == "gx":
+        compact_role = parts[2].strip().lower()
+        if compact_role == "takeprof":
+            return "take_profit"
+    return ""
+
+
+def _is_urgent_reduce_only_order(order: dict[str, Any], *, strategy_mode: str) -> bool:
+    if _reduce_only_cap_side(order=order, strategy_mode=strategy_mode) is None:
+        return False
+    role = str(order.get("role", "") or "").strip().lower()
+    if role in URGENT_REDUCE_ONLY_ROLES:
+        return True
+    execution_type = str(order.get("execution_type", "") or "").strip().lower()
+    return bool(order.get("force_reduce_only")) and execution_type in {"aggressive", "maker_timeout_release"}
+
+
+def _is_displaceable_reduce_only_open_order(open_order: dict[str, Any]) -> bool:
+    if not _truthy(open_order.get("reduceOnly")):
+        return False
+    role = _open_order_role(open_order)
+    if role.startswith("take_profit"):
+        return True
+    return _compact_order_role(role) == "takeprof"
+
+
 def _reduce_only_cap_side(
     *,
     order: dict[str, Any],
@@ -377,6 +429,16 @@ def cap_reduce_only_place_orders_to_position(
         "BUY": max(-net_qty, Decimal("0")),
         "SELL": max(net_qty, Decimal("0")),
     }
+    urgent_sides = {
+        side
+        for side in (
+            _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
+            for order in place_orders
+            if _is_urgent_reduce_only_order(order, strategy_mode=normalized_mode)
+        )
+        if side is not None
+    }
+    displaced_reduce_only_orders: list[dict[str, Any]] = []
     for open_order in current_open_orders:
         if not isinstance(open_order, dict):
             continue
@@ -384,6 +446,13 @@ def cap_reduce_only_place_orders_to_position(
             continue
         side = str(open_order.get("side", "")).upper().strip()
         if side in available_qty_by_side:
+            if side in urgent_sides and _is_displaceable_reduce_only_open_order(open_order):
+                if not any(_order_matches_cancel(open_order, existing) for existing in cancel_orders):
+                    displaced = dict(open_order)
+                    displaced["cancel_reason"] = "urgent_reduce_only_displaces_take_profit"
+                    cancel_orders.append(displaced)
+                    displaced_reduce_only_orders.append(displaced)
+                continue
             # Binance only releases reduce-only capacity after the exchange confirms
             # cancellation, so pending-cancel orders must still count this cycle.
             available_qty_by_side[side] = max(
@@ -425,6 +494,8 @@ def cap_reduce_only_place_orders_to_position(
         "remaining_sell_reduce_qty": float(available_qty_by_side["SELL"]),
         "dropped_order_count": dropped_count,
         "resized_order_count": resized_count,
+        "displaced_order_count": len(displaced_reduce_only_orders),
+        "displaced_orders": displaced_reduce_only_orders,
     }
     return result
 
