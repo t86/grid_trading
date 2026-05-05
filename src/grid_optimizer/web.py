@@ -30568,6 +30568,7 @@ def _build_local_running_status() -> dict[str, Any]:
     running_spot_symbols: list[str] = []
     rows: list[dict[str, Any]] = []
     errors: list[dict[str, str]] = []
+    local_label = os.environ.get("GRID_RUNNING_STATUS_LOCAL_LABEL", "本机")
     for symbol in symbols:
         try:
             runner = read_symbol_runner_process(symbol)
@@ -30605,6 +30606,7 @@ def _build_local_running_status() -> dict[str, Any]:
                 errors.append({"symbol": symbol, "error": f"{type(exc).__name__}: {exc}"})
                 continue
             if item is not None:
+                item["server_label"] = str(item.get("server_label") or local_label).strip() or None
                 rows.append(item)
     with ThreadPoolExecutor(max_workers=min(max(len(running_spot_symbols), 1), 4)) as executor:
         futures = {executor.submit(build_spot_item, symbol): symbol for symbol in running_spot_symbols}
@@ -30616,10 +30618,11 @@ def _build_local_running_status() -> dict[str, Any]:
                 errors.append({"symbol": symbol, "market_type": "spot", "error": f"{type(exc).__name__}: {exc}"})
                 continue
             if item is not None:
+                item["server_label"] = str(item.get("server_label") or local_label).strip() or None
                 rows.append(item)
     return {
         "ok": True,
-        "label": os.environ.get("GRID_RUNNING_STATUS_LOCAL_LABEL", "本机"),
+        "label": local_label,
         "url": "",
         "symbols": rows,
         "errors": errors,
