@@ -24359,6 +24359,31 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       if (num < 0) return "bad";
       return "warn";
     }
+    function serverRows(server) {
+      if (Array.isArray(server.symbols) && server.symbols.length) {
+        return server.symbols.map((item) => ({ ...item, is_running: item.is_running ?? true }));
+      }
+      const groups = server.groups || {};
+      const running = Array.isArray(groups.running) ? groups.running.map((item) => ({ ...item, is_running: true })) : [];
+      const savedIdle = Array.isArray(groups.saved_idle) ? groups.saved_idle.map((item) => ({ ...item, is_running: false })) : [];
+      return running.concat(savedIdle);
+    }
+    function statusText(item) {
+      if (item.is_running === true) return "运行";
+      if (item.last_run_state === "last_run") return "最近运行";
+      return "已保存";
+    }
+    function marketLabel(item) {
+      return item.market_label || (item.market_type === "spot" ? "现货" : "合约");
+    }
+    function openOrderSummary(item) {
+      if (item.open_order_summary) return item.open_order_summary;
+      if (item.open_order_count !== null && item.open_order_count !== undefined) return `${fmtNum(item.open_order_count, 0)} 笔`;
+      return "--";
+    }
+    function positionSummary(item) {
+      return item.position_summary || item.current_position_display || "--";
+    }
     function renderSummary(payload) {
       const summary = payload.summary || {};
       const cards = [
@@ -24377,11 +24402,12 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       `).join("");
     }
     function renderServer(server) {
-      const rows = Array.isArray(server.symbols) ? server.symbols : [];
+      const rows = serverRows(server);
+      const runningCount = rows.filter((item) => item.is_running === true).length;
       const body = rows.map((item) => `
         <tr>
-          <td><span class="pill">${escapeHtml(item.symbol)}</span></td>
-          <td>${escapeHtml(item.market_label || (item.market_type === "spot" ? "现货" : "合约"))}</td>
+          <td><span class="pill ${item.is_running === true ? "good" : "warn"}">${escapeHtml(item.symbol)} · ${escapeHtml(statusText(item))}</span></td>
+          <td>${escapeHtml(marketLabel(item))}</td>
           <td>${escapeHtml(item.strategy_name || item.strategy_profile || "--")}</td>
           <td>${escapeHtml(fmtNum(item.total_volume, 4))}</td>
           <td>${escapeHtml(fmtNum(item.recent_hour_volume, 4))}</td>
@@ -24391,12 +24417,12 @@ RUNNING_STATUS_PAGE = """<!doctype html>
           <td class="${moneyClass(-item.fees)}">${escapeHtml(fmtFeeMoney(item.fees))}</td>
           <td class="${moneyClass(item.funding_fee)}">${escapeHtml(fmtMoney(item.funding_fee))}</td>
           <td>${escapeHtml(item.latest_trade_summary || "--")}</td>
-          <td>${escapeHtml(item.open_order_summary || "--")}</td>
-          <td>${escapeHtml(item.position_summary || "--")}</td>
+          <td>${escapeHtml(openOrderSummary(item))}</td>
+          <td>${escapeHtml(positionSummary(item))}</td>
           <td>${escapeHtml(fmtTs(item.updated_at))}</td>
         </tr>
       `).join("");
-      const status = server.ok ? `${rows.length} 个运行中` : `读取失败：${server.error || "--"}`;
+      const status = server.ok ? `${runningCount} 个运行中 / ${rows.length} 个已配置` : `读取失败：${server.error || "--"}`;
       return `
         <section class="card">
           <div class="server-head">
