@@ -24469,10 +24469,10 @@ def _render_running_status_overview_page() -> str:
 
 
 def _run_running_status_overview_query(query: dict[str, list[str]]) -> dict[str, Any]:
-    scope = str((query.get("scope") or ["cross"])[0] or "cross").strip().lower()
-    if scope not in {"local", "cross"}:
-        raise ValueError("scope must be local or cross")
-    return _build_running_status(scope=scope)
+    normalized_query = dict(query)
+    if not str((normalized_query.get("scope") or [""])[0] or "").strip():
+        normalized_query["scope"] = ["cross"]
+    return _run_running_status_query(normalized_query)
 
 
 SPOT_RUNNER_PAGE = """<!doctype html>
