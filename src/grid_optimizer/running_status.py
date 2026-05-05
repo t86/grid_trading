@@ -658,6 +658,23 @@ def normalize_running_status_server_payload(payload: dict[str, Any], *, server: 
         if raw_server_base_url is not None
         else str(server.get("base_url") or "").strip().rstrip("/")
     )
+
+    def tag_row(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        row = dict(item)
+        row["server_id"] = str(row.get("server_id") or normalized.get("server_id") or "").strip() or None
+        row["server_label"] = str(row.get("server_label") or normalized.get("server_label") or "").strip() or None
+        row["server_base_url"] = (
+            str(row.get("server_base_url") or normalized.get("server_base_url") or "").strip().rstrip("/")
+        )
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol:
+            row["target_url"] = row.get("target_url") or running_status_target_url(symbol, row["server_base_url"])
+        return row
+
+    running = [tag_row(item) for item in running]
+    saved_idle = [tag_row(item) for item in saved_idle]
     normalized["groups"] = {
         "running": running,
         "saved_idle": saved_idle,
@@ -703,9 +720,9 @@ def build_running_status_cross_payload() -> dict[str, Any]:
                     server_label=str(server.get("label") or "").strip() or None,
                     server_base_url="",
                 )
-                payload = normalize_running_status_server_payload(payload, server=server)
             else:
                 payload = fetch_remote_running_status_payload(server)
+            payload = normalize_running_status_server_payload(payload, server=server)
         except Exception as exc:
             warnings.append(f"{server_id or 'unknown'} unavailable: {type(exc).__name__}: {exc}")
             payload = {

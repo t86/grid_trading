@@ -4612,6 +4612,23 @@ def _normalize_running_status_server_payload(payload: dict[str, Any], *, server:
         if raw_server_base_url is not None
         else str(server.get("base_url") or "").strip().rstrip("/")
     )
+
+    def tag_row(item: Any) -> Any:
+        if not isinstance(item, dict):
+            return item
+        row = dict(item)
+        row["server_id"] = str(row.get("server_id") or normalized.get("server_id") or "").strip() or None
+        row["server_label"] = str(row.get("server_label") or normalized.get("server_label") or "").strip() or None
+        row["server_base_url"] = (
+            str(row.get("server_base_url") or normalized.get("server_base_url") or "").strip().rstrip("/")
+        )
+        symbol = str(row.get("symbol") or "").upper().strip()
+        if symbol:
+            row["target_url"] = row.get("target_url") or _running_status_target_url(symbol, row["server_base_url"])
+        return row
+
+    running = [tag_row(item) for item in running]
+    saved_idle = [tag_row(item) for item in saved_idle]
     normalized["groups"] = {
         "running": running,
         "saved_idle": saved_idle,
@@ -24427,6 +24444,9 @@ RUNNING_STATUS_PAGE = """<!doctype html>
     function marketLabel(item) {
       return item.market_label || (item.market_type === "spot" ? "现货" : "合约");
     }
+    function serverLabel(server, item) {
+      return item.server_label || item.server_id || server.label || server.server_label || server.id || "--";
+    }
     function openOrderSummary(item) {
       if (item.open_order_summary) return item.open_order_summary;
       if (item.open_order_count !== null && item.open_order_count !== undefined) return `${fmtNum(item.open_order_count, 0)} 笔`;
@@ -24457,6 +24477,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       const runningCount = rows.filter((item) => item.is_running === true).length;
       const body = rows.map((item) => `
         <tr>
+          <td>${escapeHtml(serverLabel(server, item))}</td>
           <td><span class="pill ${item.is_running === true ? "good" : "warn"}">${escapeHtml(item.symbol)} · ${escapeHtml(statusText(item))}</span></td>
           <td>${escapeHtml(marketLabel(item))}</td>
           <td>${escapeHtml(item.strategy_name || item.strategy_profile || "--")}</td>
@@ -24488,7 +24509,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
               <table>
                 <thead>
                   <tr>
-                    <th>币种</th><th>市场</th><th>策略名称</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>最近成交</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
+                    <th>服务器</th><th>币种</th><th>市场</th><th>策略名称</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>最近成交</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
                   </tr>
                 </thead>
                 <tbody>${body}</tbody>
@@ -24549,7 +24570,10 @@ def _run_running_status_overview_query(query: dict[str, list[str]]) -> dict[str,
     normalized_query = dict(query)
     if not str((normalized_query.get("scope") or [""])[0] or "").strip():
         normalized_query["scope"] = ["cross"]
-    return _run_running_status_query(normalized_query)
+    scope = str((normalized_query.get("scope") or ["cross"])[0] or "cross").strip().lower()
+    if scope not in {"local", "cross"}:
+        raise ValueError("scope must be local or cross")
+    return _build_running_status(scope=scope)
 
 
 SPOT_RUNNER_PAGE = """<!doctype html>
@@ -30054,6 +30078,21 @@ def _running_status_server_entries() -> list[dict[str, str]]:
             if normalized_url and should_include(normalized_url):
                 entries.append({"label": label.strip() or normalized_url, "url": normalized_url})
         return entries
+    try:
+        registry = load_console_registry()
+    except Exception:
+        registry = {}
+    registry_entries: list[dict[str, str]] = []
+    for server in list(registry.get("servers") or []):
+        if not bool(server.get("enabled", True)):
+            continue
+        normalized_url = str(server.get("base_url") or "").strip().rstrip("/")
+        if not normalized_url or not should_include(normalized_url):
+            continue
+        label = str(server.get("label") or server.get("id") or normalized_url).strip()
+        registry_entries.append({"label": label or normalized_url, "url": normalized_url})
+    if registry_entries:
+        return registry_entries
     return [
         entry
         for entry in [
@@ -30685,11 +30724,20 @@ def _legacy_running_status_server_from_payload(
             row["is_running"] = False
             saved_rows.append(row)
         symbols = running_rows + saved_rows
+    server_label = str(server.get("label") or server.get("server_label") or fallback_label)
+    normalized_symbols: list[dict[str, Any]] = []
+    for item in symbols:
+        if not isinstance(item, dict):
+            continue
+        row = dict(item)
+        row["server_label"] = str(row.get("server_label") or server_label).strip() or None
+        row["server_base_url"] = str(row.get("server_base_url") or fallback_url).strip().rstrip("/")
+        normalized_symbols.append(row)
     return {
         "ok": True,
-        "label": str(server.get("label") or server.get("server_label") or fallback_label),
+        "label": server_label,
         "url": fallback_url,
-        "symbols": symbols,
+        "symbols": normalized_symbols,
         "errors": list(server.get("errors") or []),
     }
 

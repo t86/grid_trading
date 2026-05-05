@@ -3,7 +3,7 @@
     {
       "id": "srv_150",
       "label": "Main Entry A",
-      "base_url": "http://43.131.232.150:8788",
+      "base_url": "http://43.131.232.150:8789",
       "location": "Singapore",
       "enabled": true,
       "capabilities": ["futures_monitor", "competition_board", "strategies"],

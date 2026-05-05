@@ -665,6 +665,8 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["saved_idle_symbol_count"], 2)
         self.assertEqual([item["server_id"] for item in payload["servers"]], ["srv_114", "srv_111"])
         self.assertEqual(payload["servers"][0]["server_base_url"], "")
+        self.assertEqual(payload["servers"][0]["groups"]["running"][0]["server_label"], "114")
+        self.assertEqual(payload["servers"][1]["groups"]["running"][0]["server_label"], "111")
 
     def test_build_running_status_cross_payload_summarizes_running_cards_only(self) -> None:
         from grid_optimizer.running_status import build_running_status_cross_payload
@@ -741,6 +743,8 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload["summary"]["recent_hour_volume"], 25.0)
         self.assertEqual(payload["summary"]["total_pnl"], 5.0)
         self.assertEqual(payload["summary"]["total_fees"], 1.9)
+        self.assertEqual(payload["servers"][0]["groups"]["running"][0]["server_id"], "srv_114")
+        self.assertEqual(payload["servers"][1]["groups"]["running"][0]["server_id"], "srv_111")
 
     def test_run_running_status_query_uses_cross_scope(self) -> None:
         from grid_optimizer.web import _run_running_status_query

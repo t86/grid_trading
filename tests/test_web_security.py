@@ -276,6 +276,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/running_status_overview?scope=cross", page)
         self.assertIn("总成交量", page)
         self.assertIn("<th>市场</th>", page)
+        self.assertIn("<th>服务器</th>", page)
+        self.assertIn("function serverLabel(server, item)", page)
         self.assertIn("<th>最近成交</th>", page)
         self.assertIn("持仓状态", page)
         self.assertIn("summary.spot_symbol_count", page)
@@ -443,11 +445,63 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertTrue(server["ok"])
         self.assertEqual(server["label"], "114")
-        self.assertEqual(len(server["symbols"]), 1)
+        self.assertEqual(len(server["symbols"]), 2)
         self.assertEqual(server["symbols"][0]["symbol"], "SOONUSDT")
-        self.assertEqual(server["symbols"][0]["fees"], 2.0)
-        self.assertEqual(server["symbols"][0]["open_order_summary"], "7 笔")
-        self.assertEqual(server["symbols"][0]["position_summary"], "净 1 · 多 1 / 空 0")
+        self.assertEqual(server["symbols"][0]["server_label"], "114")
+        self.assertEqual(server["symbols"][1]["symbol"], "IDLEUSDT")
+
+    def test_legacy_running_status_server_from_new_local_payload_includes_saved_idle_rows(self) -> None:
+        server = _legacy_running_status_server_from_payload(
+            {
+                "ok": True,
+                "server_label": "111",
+                "groups": {
+                    "running": [
+                        {
+                            "symbol": "BTCUSDC",
+                            "strategy_name": "btc-profile",
+                            "total_volume": 12.3,
+                            "recent_hour_volume": 1.2,
+                            "total_pnl": 0.1,
+                            "trade_pnl": 0.1,
+                            "unrealized_pnl": 0.0,
+                            "total_fees": 0.0,
+                            "funding_fee": 0.0,
+                            "open_order_count": 3,
+                            "current_position_display": "净 0 · 多 0 / 空 0",
+                            "updated_at": "2026-05-05T00:00:00+00:00",
+                        }
+                    ],
+                    "saved_idle": [
+                        {
+                            "symbol": "BZUSDT",
+                            "strategy_name": "bz-profile",
+                            "total_volume": 0.0,
+                            "recent_hour_volume": 0.0,
+                            "total_pnl": 0.0,
+                            "trade_pnl": 0.0,
+                            "unrealized_pnl": 0.0,
+                            "total_fees": 0.0,
+                            "funding_fee": 0.0,
+                            "open_order_count": 5,
+                            "current_position_display": "净 0 · 多 0 / 空 0",
+                            "updated_at": "2026-05-05T00:00:00+00:00",
+                        }
+                    ],
+                },
+            },
+            fallback_label="fallback",
+            fallback_url="http://111",
+        )
+
+        self.assertEqual(len(server["symbols"]), 2)
+        self.assertEqual([item["symbol"] for item in server["symbols"]], ["BTCUSDC", "BZUSDT"])
+        self.assertFalse(server["symbols"][1]["is_running"])
+        self.assertEqual(server["symbols"][1]["open_order_summary"], "未启动")
+        self.assertEqual(server["symbols"][0]["fees"], 0.0)
+        self.assertEqual(server["symbols"][0]["open_order_summary"], "3 笔")
+        self.assertEqual(server["symbols"][0]["position_summary"], "净 0 · 多 0 / 空 0")
+        self.assertEqual(server["symbols"][0]["server_label"], "111")
 
     def test_monitor_page_does_not_reference_undefined_get_selected_symbol(self) -> None:
         if "getSelectedSymbol(" in MONITOR_PAGE:
