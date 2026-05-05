@@ -623,6 +623,7 @@ def validate_plan_report(
     max_plan_age_seconds: int,
     now: datetime,
     allow_dual_side_position: bool = False,
+    enforce_place_limits: bool = True,
 ) -> dict[str, Any]:
     errors: list[str] = []
     actions = build_execution_actions(plan_report)
@@ -638,12 +639,6 @@ def validate_plan_report(
         errors.append("plan contains stale orders; rerun with --cancel-stale or regenerate the plan")
     if actions["place_count"] <= 0 and actions["cancel_count"] <= 0:
         errors.append("plan contains no actions to execute")
-    if actions["place_count"] > max_new_orders:
-        errors.append(f"plan places {actions['place_count']} new orders, above max_new_orders={max_new_orders}")
-    if actions["place_notional"] > max_total_notional:
-        errors.append(
-            f"plan places total notional {_float(actions['place_notional'])}, above max_total_notional={_float(max_total_notional)}"
-        )
 
     generated_at = _parse_iso_ts(plan_report.get("generated_at"))
     if generated_at is None:
@@ -656,12 +651,39 @@ def validate_plan_report(
                 f"plan age is {plan_age_seconds:.1f}s, above max_plan_age_seconds={max_plan_age_seconds}"
             )
 
-    return {
+    validation = {
         "ok": not errors,
         "errors": errors,
         "actions": actions,
         "plan_age_seconds": plan_age_seconds,
     }
+    if enforce_place_limits:
+        validation = enforce_execution_action_limits(
+            validation=validation,
+            max_new_orders=max_new_orders,
+            max_total_notional=max_total_notional,
+        )
+    return validation
+
+
+def enforce_execution_action_limits(
+    *,
+    validation: dict[str, Any],
+    max_new_orders: int,
+    max_total_notional: float,
+) -> dict[str, Any]:
+    actions = validation.get("actions") if isinstance(validation.get("actions"), dict) else {}
+    errors = list(validation.get("errors") or [])
+    if actions.get("place_count", 0) > max_new_orders:
+        errors.append(f"plan places {actions['place_count']} new orders, above max_new_orders={max_new_orders}")
+    if _safe_float(actions.get("place_notional")) > max_total_notional:
+        errors.append(
+            f"plan places total notional {_float(actions['place_notional'])}, above max_total_notional={_float(max_total_notional)}"
+        )
+    result = dict(validation)
+    result["errors"] = errors
+    result["ok"] = not errors
+    return result
 
 
 def _ignore_noop_error(exc: RuntimeError, allowed_markers: tuple[str, ...]) -> bool:
@@ -767,6 +789,7 @@ def main() -> None:
         cancel_stale=args.cancel_stale,
         max_plan_age_seconds=args.max_plan_age_seconds,
         now=datetime.now(timezone.utc),
+        enforce_place_limits=not bool(args.apply),
     )
 
     symbol = str(plan_report.get("symbol", "")).upper().strip()
@@ -875,6 +898,12 @@ def main() -> None:
             current_actual_net_qty=current_actual_net_qty,
             current_open_orders=current_strategy_open_orders,
         )
+        validation = enforce_execution_action_limits(
+            validation=validation,
+            max_new_orders=args.max_new_orders,
+            max_total_notional=args.max_total_notional,
+        )
+        report["validation"] = validation
         report["reduce_only_position_cap"] = validation["actions"].get("reduce_only_position_cap")
         if validation["actions"]["place_count"] <= 0 and validation["actions"]["cancel_count"] <= 0:
             validation["errors"] = [
@@ -886,6 +915,9 @@ def main() -> None:
             print("No executable orders after reduce-only position cap.")
             print(f"JSON report saved: {report_path}")
             return
+        if not validation["ok"]:
+            report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+            raise SystemExit("Refusing to place orders because validation failed")
 
         margin_response: dict[str, Any] | None = None
         leverage_response: dict[str, Any] | None = None

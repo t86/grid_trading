@@ -7,6 +7,7 @@ from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
+    enforce_execution_action_limits,
     estimate_mid_drift_steps,
     filter_strategy_open_orders,
     preserve_queue_priority_in_execution_actions,
@@ -123,6 +124,60 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_orders"][0]["qty"], 150.0)
         self.assertEqual(capped["place_orders"][1]["qty"], 50.0)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
+    def test_deferred_action_limits_allow_capped_reduce_only_orders(self) -> None:
+        now = datetime(2026, 5, 5, 0, 20, tzinfo=timezone.utc)
+        report = {
+            "symbol": "CHIPUSDT",
+            "generated_at": now.isoformat(),
+            "dual_side_position": False,
+            "bootstrap_orders": [],
+            "missing_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.06064,
+                    "qty": 5904.0,
+                    "notional": 358.01856,
+                    "role": "active_delever_short",
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "BUY",
+                    "price": 0.06044,
+                    "qty": 5904.0,
+                    "notional": 356.83776,
+                    "role": "take_profit_short",
+                },
+            ],
+            "stale_orders": [],
+        }
+
+        validation = validate_plan_report(
+            plan_report=report,
+            allow_symbol="CHIPUSDT",
+            max_new_orders=10,
+            max_total_notional=360.0,
+            cancel_stale=True,
+            max_plan_age_seconds=60,
+            now=now,
+            enforce_place_limits=False,
+        )
+        validation["actions"] = cap_reduce_only_place_orders_to_position(
+            actions=validation["actions"],
+            strategy_mode="synthetic_neutral",
+            current_actual_net_qty=-5904.0,
+            current_open_orders=[],
+        )
+        validation = enforce_execution_action_limits(
+            validation=validation,
+            max_new_orders=10,
+            max_total_notional=360.0,
+        )
+
+        self.assertTrue(validation["ok"])
+        self.assertEqual(validation["actions"]["place_count"], 1)
+        self.assertAlmostEqual(validation["actions"]["place_notional"], 358.01856, places=8)
+        self.assertEqual(validation["actions"]["reduce_only_position_cap"]["dropped_order_count"], 1)
 
     def test_preserve_queue_priority_drops_replace_when_post_only_projects_back_to_same_bucket(self) -> None:
         actions = {

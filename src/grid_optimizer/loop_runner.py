@@ -88,6 +88,7 @@ from .submit_plan import (
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     validate_plan_report,
+    enforce_execution_action_limits,
 )
 from .dry_run import _round_order_price, _round_order_qty
 from .execution_regime import (
@@ -10945,6 +10946,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         max_plan_age_seconds=args.max_plan_age_seconds,
         now=datetime.now(timezone.utc),
         allow_dual_side_position=(strategy_mode == "hedge_neutral"),
+        enforce_place_limits=not bool(args.apply),
     )
 
     symbol = str(plan_report.get("symbol", "")).upper().strip()
@@ -11131,6 +11133,12 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         current_actual_net_qty=current_actual_net_qty,
         current_open_orders=current_strategy_open_orders,
     )
+    validation = enforce_execution_action_limits(
+        validation=validation,
+        max_new_orders=args.max_new_orders,
+        max_total_notional=effective_max_total_notional if effective_max_total_notional > 0 else args.max_total_notional,
+    )
+    report["validation"] = validation
     report["reduce_only_position_cap"] = validation["actions"].get("reduce_only_position_cap")
     if validation["actions"]["place_count"] <= 0 and validation["actions"]["cancel_count"] <= 0:
         validation["errors"] = [
@@ -11139,6 +11147,8 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         validation["ok"] = not validation["errors"]
         report["idle"] = True
         return report
+    if not validation["ok"]:
+        raise RuntimeError("Refusing to place orders because validation failed")
 
     if requested_margin_type != "KEEP":
         try:
