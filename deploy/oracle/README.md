@@ -211,9 +211,9 @@ START_NOW=1 \
 deploy/oracle/install_runner_systemd.sh
 ```
 
-The installer also enables `grid-loop-watchdog@SYMBOL.timer`. The watchdog only restarts an
-active runner whose `output/<symbol>_loop_events.jsonl` has stopped updating; it does not start a
-manually stopped runner.
+The installer also enables `grid-loop-watchdog@SYMBOL.timer`. When a control config exists, the
+watchdog starts an inactive runner and restarts an active runner whose
+`output/<symbol>_loop_events.jsonl` has stopped updating.
 
 Recommended pattern:
 

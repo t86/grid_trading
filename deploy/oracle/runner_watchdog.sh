@@ -33,7 +33,9 @@ if [ ! -f "$CONTROL_PATH" ]; then
 fi
 
 if ! systemctl is-active --quiet "$SERVICE_NAME"; then
-  echo "runner_watchdog: $SERVICE_NAME is not active; skip"
+  echo "runner_watchdog: $SERVICE_NAME is not active; start"
+  systemctl reset-failed "$SERVICE_NAME" || true
+  systemctl start "$SERVICE_NAME"
   exit 0
 fi
 
