@@ -173,6 +173,12 @@ VOLATILITY_TRIGGER_STATUS_CACHE: dict[str, dict[str, Any]] = {}
 VOLATILITY_TRIGGER_STATUS_LOCK = threading.Lock()
 RUNNING_STATUS_OVERVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 RUNNING_STATUS_OVERVIEW_CACHE_LOCK = threading.Lock()
+FUTURES_COMPETITION_VOLUME_WINDOWS: dict[str, tuple[datetime, datetime]] = {
+    "CHIPUSDT": (
+        datetime(2026, 4, 22, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+        datetime(2026, 5, 13, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),
+    ),
+}
 FUNDING_MARGIN_RATIO = 0.5
 GRID_PREVIEW_MAINTENANCE_MARGIN_RATIO = 0.05
 SECOND_INTERVAL_MAX_SPAN = timedelta(days=31)
@@ -24459,7 +24465,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       const summary = payload.summary || {};
       const cards = [
         ["运行币种", fmtNum(summary.running_symbol_count || 0, 0), `${fmtNum(summary.server_count || 0, 0)} 台服务器 · 合约 ${fmtNum(summary.futures_symbol_count || 0, 0)} / 现货 ${fmtNum(summary.spot_symbol_count || 0, 0)}`],
-        ["累计总成交量", fmtNum(summary.total_volume || 0, 4), "从交易审计记录开始累计"],
+        ["累计总成交量", fmtNum(summary.total_volume || 0, 4), "CHIP 按交易赛窗口累计"],
         ["最近一小时成交量", fmtNum(summary.recent_hour_volume || 0, 4), "取每个币种最新小时桶"],
         ["总盈亏", fmtMoney(summary.total_pnl || 0), `交易 ${fmtMoney(summary.trade_pnl || 0)} · 未实现 ${fmtMoney(summary.unrealized_pnl || 0)}`],
         ["手续费/资金费", fmtFeeMoney(summary.fees || 0), `资金费 ${fmtMoney(summary.funding_fee || 0)}`],
@@ -24481,7 +24487,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
           <td><span class="pill ${item.is_running === true ? "good" : "warn"}">${escapeHtml(item.symbol)} · ${escapeHtml(statusText(item))}</span></td>
           <td>${escapeHtml(marketLabel(item))}</td>
           <td>${escapeHtml(item.strategy_name || item.strategy_profile || "--")}</td>
-          <td>${escapeHtml(fmtNum(item.lifetime_total_volume ?? item.total_volume, 4))}</td>
+          <td title="${escapeHtml(item.competition_volume_start_at ? `${fmtTs(item.competition_volume_start_at)} → ${fmtTs(item.competition_volume_end_at)}` : "从交易审计记录开始累计")}">${escapeHtml(fmtNum(item.lifetime_total_volume ?? item.total_volume, 4))}</td>
           <td>${escapeHtml(fmtNum(item.recent_hour_volume, 4))}</td>
           <td class="${moneyClass(item.total_pnl)}">${escapeHtml(fmtMoney(item.total_pnl))}</td>
           <td class="${moneyClass(item.trade_pnl)}">${escapeHtml(fmtMoney(item.trade_pnl))}</td>
@@ -30214,6 +30220,9 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
         "lifetime_total_volume": _status_float(
             trade.get("lifetime_gross_notional") if isinstance(trade, dict) else None
         ),
+        "audit_lifetime_total_volume": _status_float(
+            trade.get("audit_lifetime_gross_notional") if isinstance(trade, dict) else None
+        ),
         "recent_hour_volume": _latest_hour_volume(snapshot),
         "total_pnl": total_pnl,
         "trade_pnl": trade_pnl,
@@ -30422,6 +30431,26 @@ def _running_status_trade_gross_notional(rows: list[dict[str, Any]]) -> float:
     return float(summarize_user_trades(rows).get("gross_notional") or 0.0)
 
 
+def _competition_volume_window_for_symbol(symbol: str) -> tuple[datetime, datetime] | None:
+    return FUTURES_COMPETITION_VOLUME_WINDOWS.get(str(symbol or "").upper().strip())
+
+
+def _filter_trade_rows_in_competition_window(
+    rows: list[dict[str, Any]],
+    symbol: str,
+    *,
+    now: datetime | None = None,
+) -> tuple[list[dict[str, Any]], tuple[datetime, datetime] | None]:
+    window = _competition_volume_window_for_symbol(symbol)
+    if window is None:
+        return rows, None
+    current = now or datetime.now(timezone.utc)
+    start, end = window
+    start_ms = int(start.astimezone(timezone.utc).timestamp() * 1000)
+    end_ms = int(min(end.astimezone(timezone.utc), current).timestamp() * 1000)
+    return [item for item in rows if start_ms <= trade_row_time_ms(item) <= end_ms], window
+
+
 def _build_status_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -30520,7 +30549,9 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
     audit_paths = build_audit_paths(event_path)
     trade_rows = _read_running_status_trade_rows(audit_paths["trade_audit"])
     income_rows = _read_running_status_audit_rows(audit_paths["income_audit"])
-    lifetime_gross_notional = _running_status_trade_gross_notional(trade_rows)
+    audit_lifetime_gross_notional = _running_status_trade_gross_notional(trade_rows)
+    competition_trade_rows, competition_window = _filter_trade_rows_in_competition_window(trade_rows, symbol)
+    lifetime_gross_notional = _running_status_trade_gross_notional(competition_trade_rows)
     stats_start_time = _fast_running_status_stats_start_time(runner)
     if stats_start_time is not None:
         stats_start_ms = int(stats_start_time.timestamp() * 1000)
@@ -30552,6 +30583,7 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         "trade_summary": {
             "gross_notional": float(trade.get("gross_notional") or 0.0),
             "lifetime_gross_notional": lifetime_gross_notional,
+            "audit_lifetime_gross_notional": audit_lifetime_gross_notional,
             "realized_pnl": trade_pnl,
             "commission": fees,
         },
@@ -30568,6 +30600,10 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         item["fees"] = fees
         item["funding_fee"] = funding_fee
         item["stats_start_time"] = stats_start_time.isoformat() if stats_start_time else None
+        if competition_window is not None:
+            item["competition_volume_start_at"] = competition_window[0].isoformat()
+            item["competition_volume_end_at"] = competition_window[1].isoformat()
+            item["audit_lifetime_total_volume"] = audit_lifetime_gross_notional
     return item
 
 
@@ -30689,6 +30725,9 @@ def _legacy_running_status_item_from_card(card: dict[str, Any]) -> dict[str, Any
         "lifetime_total_volume": _status_float(
             card.get("lifetime_total_volume") if card.get("lifetime_total_volume") is not None else card.get("total_volume")
         ),
+        "audit_lifetime_total_volume": _status_float(card.get("audit_lifetime_total_volume")),
+        "competition_volume_start_at": card.get("competition_volume_start_at"),
+        "competition_volume_end_at": card.get("competition_volume_end_at"),
         "recent_hour_volume": _status_float(card.get("recent_hour_volume")),
         "total_pnl": _status_float(card.get("total_pnl")),
         "trade_pnl": _status_float(card.get("trade_pnl")),

@@ -436,6 +436,67 @@ class RunningStatusTests(unittest.TestCase):
         self.assertAlmostEqual(card["total_pnl"], 9.5, places=8)
         self.assertAlmostEqual(card["total_fees"], 1.0, places=8)
 
+    def test_chip_lifetime_volume_uses_competition_window(self) -> None:
+        from grid_optimizer.running_status import build_running_status_local_payload
+
+        before_window_ms = int(datetime(2026, 4, 22, 9, 59, tzinfo=timezone.utc).timestamp() * 1000)
+        window_start_ms = int(datetime(2026, 4, 22, 10, 0, tzinfo=timezone.utc).timestamp() * 1000)
+        inside_window_ms = int(datetime(2026, 5, 6, 0, 0, tzinfo=timezone.utc).timestamp() * 1000)
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            (output_dir / "chipusdt_loop_runner_control.json").write_text(
+                json.dumps(
+                    {
+                        "symbol": "CHIPUSDT",
+                        "strategy_profile": "chip_profile",
+                        "strategy_mode": "synthetic_neutral",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "chipusdt_loop_trade_audit.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"symbol": "CHIPUSDT", "id": 1, "time": before_window_ms, "side": "BUY", "price": "10", "qty": "10", "commission": "0", "commissionAsset": "USDT"}),
+                        json.dumps({"symbol": "CHIPUSDT", "id": 2, "time": window_start_ms, "side": "BUY", "price": "20", "qty": "10", "commission": "0", "commissionAsset": "USDT"}),
+                        json.dumps({"symbol": "CHIPUSDT", "id": 3, "time": inside_window_ms, "side": "SELL", "price": "30", "qty": "10", "commission": "0", "commissionAsset": "USDT"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def fake_runner(symbol: str) -> dict[str, object]:
+                self.assertEqual(symbol, "CHIPUSDT")
+                return {
+                    "configured": True,
+                    "is_running": False,
+                    "pid": None,
+                    "config": {
+                        "symbol": "CHIPUSDT",
+                        "strategy_profile": "chip_profile",
+                        "strategy_mode": "synthetic_neutral",
+                    },
+                }
+
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                with patch("grid_optimizer.running_status.read_symbol_runner_process", side_effect=fake_runner):
+                    payload = build_running_status_local_payload(symbol="CHIPUSDT")
+            finally:
+                os.chdir(previous_cwd)
+
+        card = payload["groups"]["saved_idle"][0]
+        self.assertAlmostEqual(card["total_volume"], 600.0, places=8)
+        self.assertAlmostEqual(card["audit_lifetime_total_volume"], 600.0, places=8)
+        self.assertAlmostEqual(card["lifetime_total_volume"], 500.0, places=8)
+        self.assertEqual(card["competition_volume_start_at"], "2026-04-22T18:00:00+08:00")
+        self.assertEqual(card["competition_volume_end_at"], "2026-05-13T07:59:00+08:00")
+
     def test_build_running_status_local_payload_prefers_effective_runtime_values_for_running_cards(self) -> None:
         from grid_optimizer.running_status import build_running_status_local_payload
 

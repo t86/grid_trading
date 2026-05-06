@@ -31,6 +31,12 @@ RUNNING_STATUS_PAYLOAD_CACHE_LOCK = threading.Lock()
 STABLE_FEE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 FEE_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 FEE_ASSET_PRICE_CACHE_TTL_SECONDS = 60.0
+FUTURES_COMPETITION_VOLUME_WINDOWS: dict[str, tuple[datetime, datetime]] = {
+    "CHIPUSDT": (
+        datetime(2026, 4, 22, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+        datetime(2026, 5, 13, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),
+    ),
+}
 
 
 def _running_status_cache_seconds(scope: str) -> float:
@@ -160,6 +166,24 @@ def _parse_iso_datetime(value: Any) -> datetime | None:
         return datetime.fromisoformat(raw.replace("Z", "+00:00"))
     except ValueError:
         return None
+
+
+def _competition_volume_window_for_symbol(symbol: str) -> tuple[datetime, datetime] | None:
+    return FUTURES_COMPETITION_VOLUME_WINDOWS.get(str(symbol or "").upper().strip())
+
+
+def _filter_rows_in_window(
+    rows: list[dict[str, Any]],
+    *,
+    start: datetime,
+    end: datetime,
+    row_time_ms,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    current = now or datetime.now(timezone.utc)
+    start_ms = int(start.astimezone(timezone.utc).timestamp() * 1000)
+    end_ms = int(min(end.astimezone(timezone.utc), current).timestamp() * 1000)
+    return [item for item in rows if start_ms <= row_time_ms(item) <= end_ms]
 
 
 def _safe_int(value: Any) -> int | None:
@@ -296,12 +320,24 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
     session_start = _resolve_last_run_start(events, submit_report, runner)
     audit_paths = build_audit_paths(Path(runtime_paths["events_path"]))
     all_trade_rows = read_trade_audit_rows(audit_paths["trade_audit"], limit=0)
+    competition_window = _competition_volume_window_for_symbol(symbol)
+    competition_trade_rows = (
+        _filter_rows_in_window(
+            all_trade_rows,
+            start=competition_window[0],
+            end=competition_window[1],
+            row_time_ms=trade_row_time_ms,
+        )
+        if competition_window is not None
+        else all_trade_rows
+    )
     income_rows = _read_runtime_rows(audit_paths["income_audit"])
     trade_rows = all_trade_rows
     trade_rows = _filter_rows_since(trade_rows, since=session_start, row_time_ms=trade_row_time_ms)
     income_rows = _filter_rows_since(income_rows, since=session_start, row_time_ms=income_row_time_ms)
     trade_summary = summarize_user_trades(trade_rows)
     all_trade_summary = summarize_user_trades(all_trade_rows)
+    competition_trade_summary = summarize_user_trades(competition_trade_rows)
     income_summary = summarize_income(income_rows)
 
     recent_hour_floor_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
@@ -397,7 +433,10 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         "short_qty": short_qty if has_last_run else None,
         "unrealized_pnl": unrealized_pnl if has_last_run else None,
         "total_volume": _safe_float(trade_summary.get("gross_notional")) if has_last_run else None,
-        "lifetime_total_volume": _safe_float(all_trade_summary.get("gross_notional")) if has_last_run else None,
+        "lifetime_total_volume": _safe_float(competition_trade_summary.get("gross_notional")) if has_last_run else None,
+        "audit_lifetime_total_volume": _safe_float(all_trade_summary.get("gross_notional")) if has_last_run else None,
+        "competition_volume_start_at": competition_window[0].isoformat() if competition_window else None,
+        "competition_volume_end_at": competition_window[1].isoformat() if competition_window else None,
         "recent_hour_volume": _safe_float(recent_trade_summary.get("gross_notional")) if has_last_run else None,
         "total_pnl": total_pnl if has_last_run else None,
         "recent_hour_pnl": recent_hour_pnl if has_last_run else None,
@@ -527,6 +566,9 @@ def build_running_status_card(
         "unrealized_pnl": stats.get("unrealized_pnl"),
         "total_volume": stats.get("total_volume"),
         "lifetime_total_volume": stats.get("lifetime_total_volume"),
+        "audit_lifetime_total_volume": stats.get("audit_lifetime_total_volume"),
+        "competition_volume_start_at": stats.get("competition_volume_start_at"),
+        "competition_volume_end_at": stats.get("competition_volume_end_at"),
         "recent_hour_volume": stats.get("recent_hour_volume"),
         "total_pnl": stats.get("total_pnl"),
         "recent_hour_pnl": stats.get("recent_hour_pnl"),
