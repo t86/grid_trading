@@ -295,11 +295,13 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
     events = _read_runtime_rows(Path(runtime_paths["events_path"]))
     session_start = _resolve_last_run_start(events, submit_report, runner)
     audit_paths = build_audit_paths(Path(runtime_paths["events_path"]))
-    trade_rows = read_trade_audit_rows(audit_paths["trade_audit"], limit=0)
+    all_trade_rows = read_trade_audit_rows(audit_paths["trade_audit"], limit=0)
     income_rows = _read_runtime_rows(audit_paths["income_audit"])
+    trade_rows = all_trade_rows
     trade_rows = _filter_rows_since(trade_rows, since=session_start, row_time_ms=trade_row_time_ms)
     income_rows = _filter_rows_since(income_rows, since=session_start, row_time_ms=income_row_time_ms)
     trade_summary = summarize_user_trades(trade_rows)
+    all_trade_summary = summarize_user_trades(all_trade_rows)
     income_summary = summarize_income(income_rows)
 
     recent_hour_floor_ms = int((datetime.now(timezone.utc) - timedelta(hours=1)).timestamp() * 1000)
@@ -395,6 +397,7 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         "short_qty": short_qty if has_last_run else None,
         "unrealized_pnl": unrealized_pnl if has_last_run else None,
         "total_volume": _safe_float(trade_summary.get("gross_notional")) if has_last_run else None,
+        "lifetime_total_volume": _safe_float(all_trade_summary.get("gross_notional")) if has_last_run else None,
         "recent_hour_volume": _safe_float(recent_trade_summary.get("gross_notional")) if has_last_run else None,
         "total_pnl": total_pnl if has_last_run else None,
         "recent_hour_pnl": recent_hour_pnl if has_last_run else None,
@@ -523,6 +526,7 @@ def build_running_status_card(
         "short_qty": stats.get("short_qty"),
         "unrealized_pnl": stats.get("unrealized_pnl"),
         "total_volume": stats.get("total_volume"),
+        "lifetime_total_volume": stats.get("lifetime_total_volume"),
         "recent_hour_volume": stats.get("recent_hour_volume"),
         "total_pnl": stats.get("total_pnl"),
         "recent_hour_pnl": stats.get("recent_hour_pnl"),
@@ -601,7 +605,10 @@ def _running_cards(server_payloads: list[dict[str, Any]]) -> list[dict[str, Any]
 
 def _summarize_running_cards(running_rows: list[dict[str, Any]]) -> dict[str, float]:
     return {
-        "running_total_volume": sum(_safe_float(item.get("total_volume")) for item in running_rows),
+        "running_total_volume": sum(
+            _safe_float(item.get("lifetime_total_volume") if item.get("lifetime_total_volume") is not None else item.get("total_volume"))
+            for item in running_rows
+        ),
         "recent_hour_volume": sum(_safe_float(item.get("recent_hour_volume")) for item in running_rows),
         "total_pnl": sum(_safe_float(item.get("total_pnl")) for item in running_rows),
         "recent_hour_pnl": sum(_safe_float(item.get("recent_hour_pnl")) for item in running_rows),

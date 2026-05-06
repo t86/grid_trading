@@ -5681,7 +5681,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
               <div class="rs-stat-panel">
                 <div class="rs-stat-list">
                   <div class="rs-stat-row"><span>当前持仓</span><strong>${escapeHtml(card.current_position_display || "--")}</strong></div>
-                  <div class="rs-stat-row"><span>当前总量</span><strong>${fmtNum(card.total_volume)}</strong></div>
+                  <div class="rs-stat-row"><span>累计总量</span><strong>${fmtNum(card.lifetime_total_volume ?? card.total_volume)}</strong></div>
                   <div class="rs-stat-row"><span>最近一小时交易量</span><strong>${fmtNum(card.recent_hour_volume)}</strong></div>
                   <div class="rs-stat-row"><span>盈亏总额</span><strong>${fmtSigned(card.total_pnl, 4)}</strong></div>
                   <div class="rs-stat-row"><span>最近一小时盈亏</span><strong>${fmtSigned(card.recent_hour_pnl, 4)}</strong></div>
@@ -24459,7 +24459,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
       const summary = payload.summary || {};
       const cards = [
         ["运行币种", fmtNum(summary.running_symbol_count || 0, 0), `${fmtNum(summary.server_count || 0, 0)} 台服务器 · 合约 ${fmtNum(summary.futures_symbol_count || 0, 0)} / 现货 ${fmtNum(summary.spot_symbol_count || 0, 0)}`],
-        ["总成交量", fmtNum(summary.total_volume || 0, 4), "按交易赛/会话统计窗口"],
+        ["累计总成交量", fmtNum(summary.total_volume || 0, 4), "从交易审计记录开始累计"],
         ["最近一小时成交量", fmtNum(summary.recent_hour_volume || 0, 4), "取每个币种最新小时桶"],
         ["总盈亏", fmtMoney(summary.total_pnl || 0), `交易 ${fmtMoney(summary.trade_pnl || 0)} · 未实现 ${fmtMoney(summary.unrealized_pnl || 0)}`],
         ["手续费/资金费", fmtFeeMoney(summary.fees || 0), `资金费 ${fmtMoney(summary.funding_fee || 0)}`],
@@ -24481,7 +24481,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
           <td><span class="pill ${item.is_running === true ? "good" : "warn"}">${escapeHtml(item.symbol)} · ${escapeHtml(statusText(item))}</span></td>
           <td>${escapeHtml(marketLabel(item))}</td>
           <td>${escapeHtml(item.strategy_name || item.strategy_profile || "--")}</td>
-          <td>${escapeHtml(fmtNum(item.total_volume, 4))}</td>
+          <td>${escapeHtml(fmtNum(item.lifetime_total_volume ?? item.total_volume, 4))}</td>
           <td>${escapeHtml(fmtNum(item.recent_hour_volume, 4))}</td>
           <td class="${moneyClass(item.total_pnl)}">${escapeHtml(fmtMoney(item.total_pnl))}</td>
           <td class="${moneyClass(item.trade_pnl)}">${escapeHtml(fmtMoney(item.trade_pnl))}</td>
@@ -24509,7 +24509,7 @@ RUNNING_STATUS_PAGE = """<!doctype html>
               <table>
                 <thead>
                   <tr>
-                    <th>服务器</th><th>币种</th><th>市场</th><th>策略名称</th><th>总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>最近成交</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
+                    <th>服务器</th><th>币种</th><th>市场</th><th>策略名称</th><th>累计总成交量</th><th>最近一小时</th><th>总盈亏</th><th>交易盈亏</th><th>未实现</th><th>手续费</th><th>资金费</th><th>最近成交</th><th>挂单情况</th><th>持仓状态</th><th>更新时间</th>
                   </tr>
                 </thead>
                 <tbody>${body}</tbody>
@@ -30211,6 +30211,9 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
         "strategy_mode": str(snapshot.get("strategy_mode") or runner_config.get("strategy_mode") or "").strip(),
         "updated_at": snapshot.get("ts"),
         "total_volume": float(trade.get("gross_notional") or 0.0) if isinstance(trade, dict) else 0.0,
+        "lifetime_total_volume": _status_float(
+            trade.get("lifetime_gross_notional") if isinstance(trade, dict) else None
+        ),
         "recent_hour_volume": _latest_hour_volume(snapshot),
         "total_pnl": total_pnl,
         "trade_pnl": trade_pnl,
@@ -30290,6 +30293,7 @@ def _spot_snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str,
         "strategy_mode": strategy_mode,
         "updated_at": snapshot.get("latest_event", {}).get("ts") if isinstance(snapshot.get("latest_event"), dict) else None,
         "total_volume": _status_float(trade.get("gross_notional")),
+        "lifetime_total_volume": _status_float(trade.get("lifetime_gross_notional") or trade.get("gross_notional")),
         "recent_hour_volume": _latest_hour_spot_volume(snapshot),
         "total_pnl": net_pnl,
         "trade_pnl": trade_pnl,
@@ -30414,6 +30418,10 @@ def _read_running_status_trade_rows(path: Path) -> list[dict[str, Any]]:
     return read_trade_audit_rows(path, limit=0)
 
 
+def _running_status_trade_gross_notional(rows: list[dict[str, Any]]) -> float:
+    return float(summarize_user_trades(rows).get("gross_notional") or 0.0)
+
+
 def _build_status_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -30512,6 +30520,7 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
     audit_paths = build_audit_paths(event_path)
     trade_rows = _read_running_status_trade_rows(audit_paths["trade_audit"])
     income_rows = _read_running_status_audit_rows(audit_paths["income_audit"])
+    lifetime_gross_notional = _running_status_trade_gross_notional(trade_rows)
     stats_start_time = _fast_running_status_stats_start_time(runner)
     if stats_start_time is not None:
         stats_start_ms = int(stats_start_time.timestamp() * 1000)
@@ -30542,6 +30551,7 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         ).strip(),
         "trade_summary": {
             "gross_notional": float(trade.get("gross_notional") or 0.0),
+            "lifetime_gross_notional": lifetime_gross_notional,
             "realized_pnl": trade_pnl,
             "commission": fees,
         },
@@ -30642,7 +30652,17 @@ def _running_status_summary(servers: list[dict[str, Any]]) -> dict[str, Any]:
         "running_symbol_count": len(rows),
         "futures_symbol_count": sum(1 for item in rows if str(item.get("market_type") or "futures") != "spot"),
         "spot_symbol_count": sum(1 for item in rows if str(item.get("market_type") or "") == "spot"),
-        "total_volume": sum(float(item.get("total_volume") or 0.0) for item in rows),
+        "total_volume": sum(
+            float(
+                (
+                    item.get("lifetime_total_volume")
+                    if item.get("lifetime_total_volume") is not None
+                    else item.get("total_volume")
+                )
+                or 0.0
+            )
+            for item in rows
+        ),
         "recent_hour_volume": sum(float(item.get("recent_hour_volume") or 0.0) for item in rows),
         "total_pnl": sum(float(item.get("total_pnl") or 0.0) for item in rows),
         "trade_pnl": sum(float(item.get("trade_pnl") or 0.0) for item in rows),
@@ -30663,7 +30683,12 @@ def _legacy_running_status_item_from_card(card: dict[str, Any]) -> dict[str, Any
         "requested_strategy_profile": card.get("requested_strategy_profile") or card.get("strategy_profile"),
         "strategy_mode": str(card.get("strategy_mode") or "").strip(),
         "updated_at": card.get("updated_at"),
-        "total_volume": _status_float(card.get("total_volume")),
+        "total_volume": _status_float(
+            card.get("lifetime_total_volume") if card.get("lifetime_total_volume") is not None else card.get("total_volume")
+        ),
+        "lifetime_total_volume": _status_float(
+            card.get("lifetime_total_volume") if card.get("lifetime_total_volume") is not None else card.get("total_volume")
+        ),
         "recent_hour_volume": _status_float(card.get("recent_hour_volume")),
         "total_pnl": _status_float(card.get("total_pnl")),
         "trade_pnl": _status_float(card.get("trade_pnl")),

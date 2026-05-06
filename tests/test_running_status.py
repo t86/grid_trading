@@ -281,6 +281,7 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(card["short_qty"], 0.0)
         self.assertEqual(card["unrealized_pnl"], 0.0)
         self.assertAlmostEqual(card["total_volume"], 400.0, places=8)
+        self.assertAlmostEqual(card["lifetime_total_volume"], 400.0, places=8)
         self.assertAlmostEqual(card["recent_hour_volume"], 80.0, places=8)
         self.assertAlmostEqual(card["total_pnl"], 17.4, places=8)
         self.assertAlmostEqual(card["recent_hour_pnl"], -1.6, places=8)
@@ -431,6 +432,7 @@ class RunningStatusTests(unittest.TestCase):
         card = payload["groups"]["saved_idle"][0]
         self.assertEqual(card["last_run_state"], "last_run")
         self.assertAlmostEqual(card["total_volume"], 100.0, places=8)
+        self.assertAlmostEqual(card["lifetime_total_volume"], 1100.0, places=8)
         self.assertAlmostEqual(card["total_pnl"], 9.5, places=8)
         self.assertAlmostEqual(card["total_fees"], 1.0, places=8)
 
