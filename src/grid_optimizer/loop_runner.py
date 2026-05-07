@@ -106,6 +106,7 @@ from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_
 from .multi_timeframe_bias import (
     MultiTimeframeBiasConfig,
     apply_multi_timeframe_bias,
+    resolve_dynamic_side_scheduler,
     resolve_multi_timeframe_bias,
 )
 from .notifications import alert_source_label, send_alert_email
@@ -3502,6 +3503,49 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         multi_timeframe_bias_shock_amplitude_ratio=getattr(args, "multi_timeframe_bias_shock_amplitude_ratio", 0.025),
         multi_timeframe_bias_shock_step_scale=getattr(args, "multi_timeframe_bias_shock_step_scale", 1.5),
         multi_timeframe_bias_shock_notional_scale=getattr(args, "multi_timeframe_bias_shock_notional_scale", 0.70),
+        multi_timeframe_bias_scheduler_enabled=getattr(args, "multi_timeframe_bias_scheduler_enabled", True),
+        multi_timeframe_bias_scheduler_zone_weight=getattr(args, "multi_timeframe_bias_scheduler_zone_weight", 0.60),
+        multi_timeframe_bias_scheduler_trend_weight=getattr(args, "multi_timeframe_bias_scheduler_trend_weight", 0.25),
+        multi_timeframe_bias_scheduler_inventory_weight=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_inventory_weight",
+            0.55,
+        ),
+        multi_timeframe_bias_scheduler_min_budget_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_min_budget_scale",
+            0.20,
+        ),
+        multi_timeframe_bias_scheduler_max_budget_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_max_budget_scale",
+            1.15,
+        ),
+        multi_timeframe_bias_scheduler_inventory_skew_threshold=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_inventory_skew_threshold",
+            0.70,
+        ),
+        multi_timeframe_bias_scheduler_max_offset_steps=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_max_offset_steps",
+            2.0,
+        ),
+        multi_timeframe_bias_scheduler_defensive_notional_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_defensive_notional_scale",
+            0.60,
+        ),
+        multi_timeframe_bias_scheduler_defensive_step_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_defensive_step_scale",
+            1.35,
+        ),
+        multi_timeframe_bias_scheduler_reduce_max_order_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_reduce_max_order_scale",
+            0.65,
+        ),
         volatility_entry_pause_enabled=getattr(args, "volatility_entry_pause_enabled", False),
         volatility_entry_pause_30s_abs_return_ratio=getattr(args, "volatility_entry_pause_30s_abs_return_ratio", 0.0),
         volatility_entry_pause_30s_amplitude_ratio=getattr(args, "volatility_entry_pause_30s_amplitude_ratio", 0.0),
@@ -8126,6 +8170,21 @@ def _multi_timeframe_bias_config(args: argparse.Namespace) -> MultiTimeframeBias
         shock_amplitude_ratio=float(getattr(args, "multi_timeframe_bias_shock_amplitude_ratio", 0.025)),
         shock_step_scale=float(getattr(args, "multi_timeframe_bias_shock_step_scale", 1.5)),
         shock_notional_scale=float(getattr(args, "multi_timeframe_bias_shock_notional_scale", 0.70)),
+        scheduler_enabled=bool(getattr(args, "multi_timeframe_bias_scheduler_enabled", True)),
+        scheduler_zone_weight=float(getattr(args, "multi_timeframe_bias_scheduler_zone_weight", 0.60)),
+        scheduler_trend_weight=float(getattr(args, "multi_timeframe_bias_scheduler_trend_weight", 0.25)),
+        scheduler_inventory_weight=float(getattr(args, "multi_timeframe_bias_scheduler_inventory_weight", 0.55)),
+        scheduler_min_budget_scale=float(getattr(args, "multi_timeframe_bias_scheduler_min_budget_scale", 0.20)),
+        scheduler_max_budget_scale=float(getattr(args, "multi_timeframe_bias_scheduler_max_budget_scale", 1.15)),
+        scheduler_inventory_skew_threshold=float(
+            getattr(args, "multi_timeframe_bias_scheduler_inventory_skew_threshold", 0.70)
+        ),
+        scheduler_max_offset_steps=float(getattr(args, "multi_timeframe_bias_scheduler_max_offset_steps", 2.0)),
+        scheduler_defensive_notional_scale=float(
+            getattr(args, "multi_timeframe_bias_scheduler_defensive_notional_scale", 0.60)
+        ),
+        scheduler_defensive_step_scale=float(getattr(args, "multi_timeframe_bias_scheduler_defensive_step_scale", 1.35)),
+        scheduler_reduce_max_order_scale=float(getattr(args, "multi_timeframe_bias_scheduler_reduce_max_order_scale", 0.65)),
     )
 
 
@@ -8612,7 +8671,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "available": False,
         "regime": "disabled" if not multi_timeframe_bias_config.enabled else "not_evaluated",
         "applied": False,
+        "scheduler": {
+            "enabled": bool(multi_timeframe_bias_config.enabled and multi_timeframe_bias_config.scheduler_enabled),
+            "available": False,
+            "applied": False,
+        },
     }
+    multi_timeframe_adjustments: dict[str, Any] = {}
     if multi_timeframe_bias_config.enabled:
         try:
             multi_timeframe_bias = resolve_multi_timeframe_bias(
@@ -8896,6 +8961,65 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price = max(actual_cost_basis_price, 0.0)
     exchange_long_avg_price = current_long_avg_price
     exchange_short_avg_price = current_short_avg_price
+
+    def _apply_multi_timeframe_side_scheduler(*, long_notional: float, short_notional: float) -> None:
+        nonlocal effective_args, multi_timeframe_bias
+        if not bool(multi_timeframe_bias_config.enabled and multi_timeframe_bias_config.scheduler_enabled):
+            return
+        scheduler = resolve_dynamic_side_scheduler(
+            report=multi_timeframe_bias,
+            current_long_notional=long_notional,
+            current_short_notional=short_notional,
+            max_position_notional=getattr(effective_args, "max_position_notional", None),
+            max_short_position_notional=getattr(effective_args, "max_short_position_notional", None),
+            pause_buy_position_notional=getattr(effective_args, "pause_buy_position_notional", None),
+            pause_short_position_notional=getattr(effective_args, "pause_short_position_notional", None),
+            per_order_notional=getattr(effective_args, "per_order_notional", 0.0),
+            step_price=getattr(effective_args, "step_price", 0.0),
+            recent_loss_ratio=(
+                abs(_safe_float(runtime_guard_result.rolling_hourly_loss))
+                / max(_safe_float(runtime_guard_config.rolling_hourly_loss_limit), 1e-12)
+                if _safe_float(runtime_guard_config.rolling_hourly_loss_limit) > 0
+                else 0.0
+            ),
+            active_delever_loss_count=0,
+            config=multi_timeframe_bias_config,
+        )
+        multi_timeframe_bias["scheduler"] = dict(scheduler)
+        if not scheduler.get("applied"):
+            return
+        effective_args = argparse.Namespace(**vars(effective_args))
+        effective_args.per_order_notional = float(scheduler["per_order_notional"])
+        effective_args.step_price = float(scheduler["step_price"])
+        if getattr(effective_args, "max_position_notional", None) is not None:
+            effective_args.max_position_notional = float(scheduler["max_position_notional"])
+        if getattr(effective_args, "max_short_position_notional", None) is not None:
+            effective_args.max_short_position_notional = float(scheduler["max_short_position_notional"])
+        if getattr(effective_args, "pause_buy_position_notional", None) is not None:
+            effective_args.pause_buy_position_notional = float(scheduler["pause_buy_position_notional"])
+        if getattr(effective_args, "pause_short_position_notional", None) is not None:
+            effective_args.pause_short_position_notional = float(scheduler["pause_short_position_notional"])
+        effective_args.static_buy_offset_steps = (
+            float(getattr(effective_args, "static_buy_offset_steps", 0.0))
+            + float(scheduler.get("buy_offset_steps", 0.0))
+        )
+        effective_args.static_sell_offset_steps = (
+            float(getattr(effective_args, "static_sell_offset_steps", 0.0))
+            + float(scheduler.get("sell_offset_steps", 0.0))
+        )
+        if getattr(effective_args, "adverse_reduce_max_order_notional", None) is not None:
+            effective_args.adverse_reduce_max_order_notional = max(
+                _safe_float(effective_args.adverse_reduce_max_order_notional)
+                * _safe_float(scheduler.get("reduce_max_order_scale")),
+                0.0,
+            )
+        if getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None) is not None:
+            effective_args.hard_loss_forced_reduce_max_order_notional = max(
+                _safe_float(effective_args.hard_loss_forced_reduce_max_order_notional)
+                * _safe_float(scheduler.get("reduce_max_order_scale")),
+                0.0,
+            )
+
     synthetic_ledger_snapshot: dict[str, Any] | None = None
     excess_inventory_gate = {
         "enabled": bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
@@ -9417,6 +9541,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
             and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
         )
+        _apply_multi_timeframe_side_scheduler(
+            long_notional=current_long_notional,
+            short_notional=current_short_notional,
+        )
+        inventory_long_pause_active = (
+            _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) > 0
+            and current_long_notional >= _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) - 1e-12
+        )
+        inventory_short_pause_active = (
+            _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
+            and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
+        )
         inventory_long_probe_scale = (
             _clamp_ratio(float(getattr(effective_args, "inventory_pause_long_probe_scale", 0.0)))
             if inventory_long_pause_active
@@ -9622,6 +9758,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0)
         current_long_notional = current_long_qty * max(mid_price, 0.0)
         current_short_notional = current_short_qty * max(mid_price, 0.0)
+        _apply_multi_timeframe_side_scheduler(
+            long_notional=current_long_notional,
+            short_notional=current_short_notional,
+        )
         inventory_long_pause_active = (
             _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) > 0
             and current_long_notional >= _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) - 1e-12
@@ -11716,6 +11856,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--multi-timeframe-bias-shock-amplitude-ratio", type=float, default=0.025)
     parser.add_argument("--multi-timeframe-bias-shock-step-scale", type=float, default=1.5)
     parser.add_argument("--multi-timeframe-bias-shock-notional-scale", type=float, default=0.70)
+    parser.add_argument("--multi-timeframe-bias-scheduler-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--multi-timeframe-bias-scheduler-zone-weight", type=float, default=0.60)
+    parser.add_argument("--multi-timeframe-bias-scheduler-trend-weight", type=float, default=0.25)
+    parser.add_argument("--multi-timeframe-bias-scheduler-inventory-weight", type=float, default=0.55)
+    parser.add_argument("--multi-timeframe-bias-scheduler-min-budget-scale", type=float, default=0.20)
+    parser.add_argument("--multi-timeframe-bias-scheduler-max-budget-scale", type=float, default=1.15)
+    parser.add_argument("--multi-timeframe-bias-scheduler-inventory-skew-threshold", type=float, default=0.70)
+    parser.add_argument("--multi-timeframe-bias-scheduler-max-offset-steps", type=float, default=2.0)
+    parser.add_argument("--multi-timeframe-bias-scheduler-defensive-notional-scale", type=float, default=0.60)
+    parser.add_argument("--multi-timeframe-bias-scheduler-defensive-step-scale", type=float, default=1.35)
+    parser.add_argument("--multi-timeframe-bias-scheduler-reduce-max-order-scale", type=float, default=0.65)
     parser.add_argument("--volatility-entry-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--volatility-entry-pause-30s-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-30s-amplitude-ratio", type=float, default=0.0)
@@ -12331,6 +12482,32 @@ def main() -> None:
         raise SystemExit("--multi-timeframe-bias-shock-step-scale must be >= 1")
     if args.multi_timeframe_bias_shock_notional_scale <= 0 or args.multi_timeframe_bias_shock_notional_scale > 1:
         raise SystemExit("--multi-timeframe-bias-shock-notional-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_scheduler_zone_weight < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-zone-weight must be >= 0")
+    if args.multi_timeframe_bias_scheduler_trend_weight < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-trend-weight must be >= 0")
+    if args.multi_timeframe_bias_scheduler_inventory_weight < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-inventory-weight must be >= 0")
+    if args.multi_timeframe_bias_scheduler_min_budget_scale <= 0 or args.multi_timeframe_bias_scheduler_min_budget_scale > 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-min-budget-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_scheduler_max_budget_scale < 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-max-budget-scale must be >= 1")
+    if (
+        args.multi_timeframe_bias_scheduler_inventory_skew_threshold < 0
+        or args.multi_timeframe_bias_scheduler_inventory_skew_threshold > 1
+    ):
+        raise SystemExit("--multi-timeframe-bias-scheduler-inventory-skew-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_scheduler_max_offset_steps < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-max-offset-steps must be >= 0")
+    if (
+        args.multi_timeframe_bias_scheduler_defensive_notional_scale <= 0
+        or args.multi_timeframe_bias_scheduler_defensive_notional_scale > 1
+    ):
+        raise SystemExit("--multi-timeframe-bias-scheduler-defensive-notional-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_scheduler_defensive_step_scale < 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-defensive-step-scale must be >= 1")
+    if args.multi_timeframe_bias_scheduler_reduce_max_order_scale <= 0 or args.multi_timeframe_bias_scheduler_reduce_max_order_scale > 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-reduce-max-order-scale must be within (0, 1]")
     if args.multi_timeframe_bias_enabled and str(args.strategy_mode).strip() != "synthetic_neutral":
         raise SystemExit("--multi-timeframe-bias-enabled currently requires --strategy-mode synthetic_neutral")
     volatility_entry_pause_thresholds = (
@@ -12795,6 +12972,27 @@ def main() -> None:
                     ),
                     "multi_timeframe_bias_shock_active": bool(
                         (plan_report.get("multi_timeframe_bias") or {}).get("shock_active")
+                    ),
+                    "multi_timeframe_scheduler_applied": bool(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("applied")
+                    ),
+                    "multi_timeframe_scheduler_defensive": bool(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("defensive_mode")
+                    ),
+                    "multi_timeframe_scheduler_long_budget_scale": _safe_float(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("long_budget_scale")
+                    ),
+                    "multi_timeframe_scheduler_short_budget_scale": _safe_float(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("short_budget_scale")
+                    ),
+                    "multi_timeframe_scheduler_long_permission": _safe_float(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("long_permission")
+                    ),
+                    "multi_timeframe_scheduler_short_permission": _safe_float(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("short_permission")
+                    ),
+                    "multi_timeframe_scheduler_reasons": list(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("reasons") or []
                     ),
                     "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
                     "current_long_notional": _safe_float(plan_report.get("current_long_notional")),

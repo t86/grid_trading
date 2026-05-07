@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from grid_optimizer.multi_timeframe_bias import (
     MultiTimeframeBiasConfig,
     apply_multi_timeframe_bias,
+    resolve_dynamic_side_scheduler,
     resolve_multi_timeframe_bias,
 )
 from grid_optimizer.types import Candle
@@ -109,6 +110,133 @@ class MultiTimeframeBiasTests(unittest.TestCase):
         self.assertTrue(report["shock_active"])
         self.assertGreater(adjusted["step_price"], 1.0)
         self.assertLess(adjusted["per_order_notional"], 100.0)
+
+    def test_scheduler_restricts_short_accumulation_when_low_zone_already_short_heavy(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=91.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 91.4, 91.6, 90.8, 91.0)],
+                "15m": [_candle(0, 94.0, 95.0, 90.0, 91.0)],
+                "1h": [_candle(0, 96.0, 98.0, 90.0, 91.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 91.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True),
+        )
+
+        scheduler = resolve_dynamic_side_scheduler(
+            report=report,
+            current_long_notional=120.0,
+            current_short_notional=820.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=1000.0,
+            pause_buy_position_notional=800.0,
+            pause_short_position_notional=800.0,
+            per_order_notional=100.0,
+            step_price=1.0,
+        )
+
+        self.assertTrue(scheduler["applied"])
+        self.assertLess(scheduler["short_budget_scale"], 0.35)
+        self.assertGreater(scheduler["long_budget_scale"], 0.85)
+        self.assertGreater(scheduler["sell_offset_steps"], 1.0)
+        self.assertLess(scheduler["per_order_notional_scale"], 1.0)
+        self.assertIn("short_inventory_skew", scheduler["reasons"])
+
+    def test_scheduler_restricts_long_accumulation_when_high_zone_already_long_heavy(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=109.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 108.4, 109.2, 108.3, 109.0)],
+                "15m": [_candle(0, 106.0, 110.0, 105.0, 109.0)],
+                "1h": [_candle(0, 103.0, 110.0, 100.0, 109.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 109.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True),
+        )
+
+        scheduler = resolve_dynamic_side_scheduler(
+            report=report,
+            current_long_notional=830.0,
+            current_short_notional=100.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=1000.0,
+            pause_buy_position_notional=800.0,
+            pause_short_position_notional=800.0,
+            per_order_notional=100.0,
+            step_price=1.0,
+        )
+
+        self.assertTrue(scheduler["applied"])
+        self.assertLess(scheduler["long_budget_scale"], 0.35)
+        self.assertGreater(scheduler["short_budget_scale"], 0.85)
+        self.assertGreater(scheduler["buy_offset_steps"], 1.0)
+        self.assertIn("long_inventory_skew", scheduler["reasons"])
+
+    def test_scheduler_keeps_middle_zone_balanced(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=100.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 100.1, 100.3, 99.9, 100.0)],
+                "15m": [_candle(0, 100.0, 102.0, 98.0, 100.0)],
+                "1h": [_candle(0, 100.0, 104.0, 96.0, 100.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 100.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True),
+        )
+
+        scheduler = resolve_dynamic_side_scheduler(
+            report=report,
+            current_long_notional=300.0,
+            current_short_notional=320.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=1000.0,
+            pause_buy_position_notional=800.0,
+            pause_short_position_notional=800.0,
+            per_order_notional=100.0,
+            step_price=1.0,
+        )
+
+        self.assertTrue(scheduler["applied"])
+        self.assertGreater(scheduler["long_budget_scale"], 0.85)
+        self.assertGreater(scheduler["short_budget_scale"], 0.85)
+        self.assertLess(abs(scheduler["buy_offset_steps"]), 0.5)
+        self.assertLess(abs(scheduler["sell_offset_steps"]), 0.5)
+
+    def test_scheduler_defensive_mode_on_shock_or_loss_state(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=96.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 100.0, 100.5, 95.8, 96.0)],
+                "15m": [_candle(0, 100.0, 101.0, 95.0, 96.0)],
+                "1h": [_candle(0, 100.0, 102.0, 94.0, 96.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 96.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True),
+        )
+
+        scheduler = resolve_dynamic_side_scheduler(
+            report=report,
+            current_long_notional=400.0,
+            current_short_notional=400.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=1000.0,
+            pause_buy_position_notional=800.0,
+            pause_short_position_notional=800.0,
+            per_order_notional=100.0,
+            step_price=1.0,
+            recent_loss_ratio=0.85,
+            active_delever_loss_count=2,
+        )
+
+        self.assertTrue(scheduler["defensive_mode"])
+        self.assertGreater(scheduler["step_scale"], 1.0)
+        self.assertLess(scheduler["per_order_notional_scale"], 0.75)
+        self.assertLess(scheduler["reduce_max_order_scale"], 1.0)
+        self.assertIn("loss_state", scheduler["reasons"])
 
 
 if __name__ == "__main__":
