@@ -7,6 +7,7 @@ from typing import Any
 @dataclass(frozen=True)
 class MultiTimeframeBiasConfig:
     enabled: bool = False
+    mode_adapter: str = "auto"
     low_zone_threshold: float = 0.35
     high_zone_threshold: float = 0.65
     strong_bias_threshold: float = 0.50
@@ -29,6 +30,11 @@ def _safe_float(value: Any) -> float:
 
 def _clamp(value: float, lower: float, upper: float) -> float:
     return min(max(value, lower), upper)
+
+
+def _normalized_adapter(value: str | None) -> str:
+    adapter = str(value or "auto").strip() or "auto"
+    return "synthetic_neutral" if adapter == "auto" else adapter
 
 
 def _latest_window(candles: list[Any]) -> dict[str, float] | None:
@@ -146,8 +152,10 @@ def apply_multi_timeframe_bias(
     config: MultiTimeframeBiasConfig | None = None,
 ) -> dict[str, Any]:
     cfg = config or MultiTimeframeBiasConfig(enabled=bool(report.get("enabled")))
+    adapter = _normalized_adapter(cfg.mode_adapter)
     if not report.get("available"):
         return {
+            "adapter": adapter,
             "buy_levels": int(buy_levels),
             "sell_levels": int(sell_levels),
             "per_order_notional": float(per_order_notional),
@@ -163,29 +171,85 @@ def apply_multi_timeframe_bias(
     level_delta = int(round(abs(direction_score) * max(int(cfg.max_level_delta), 0)))
     base_buy = max(int(buy_levels), 0)
     base_sell = max(int(sell_levels), 0)
+    base_notional = max(float(per_order_notional), 0.0)
+    base_step = max(float(step_price), 0.0)
+    base_long_cap = max(float(max_position_notional), 0.0)
+    base_short_cap = max(float(max_short_position_notional), 0.0)
     long_scale = 1.0
     short_scale = 1.0
-    if direction_score < 0:
+    buy_offset_steps = 0.0
+    sell_offset_steps = 0.0
+    if adapter == "one_way_long":
+        long_bias = _clamp(_safe_float(report.get("long_bias_score")), 0.0, 1.0)
+        short_bias = _clamp(_safe_float(report.get("short_bias_score")), 0.0, 1.0)
+        if long_bias >= short_bias and direction_score < 0:
+            base_buy += level_delta
+            long_scale = cfg.favored_position_scale
+            buy_offset_steps = direction_score * cfg.max_offset_steps
+        elif short_bias > 0:
+            de_risk = _clamp(short_bias, 0.0, 1.0)
+            base_buy = max(base_buy - max(level_delta, 1), 1)
+            base_notional *= max(cfg.unfavored_position_scale, 0.0)
+            long_scale = cfg.unfavored_position_scale
+            buy_offset_steps = de_risk * cfg.max_offset_steps
+    elif adapter == "one_way_short":
+        long_bias = _clamp(_safe_float(report.get("long_bias_score")), 0.0, 1.0)
+        short_bias = _clamp(_safe_float(report.get("short_bias_score")), 0.0, 1.0)
+        if short_bias >= long_bias and direction_score > 0:
+            base_sell += level_delta
+            short_scale = cfg.favored_position_scale
+            sell_offset_steps = -direction_score * cfg.max_offset_steps
+        elif long_bias > 0:
+            de_risk = _clamp(long_bias, 0.0, 1.0)
+            base_sell = max(base_sell - max(level_delta, 1), 1)
+            base_notional *= max(cfg.unfavored_position_scale, 0.0)
+            short_scale = cfg.unfavored_position_scale
+            sell_offset_steps = -de_risk * cfg.max_offset_steps
+    elif adapter == "inventory_grid":
+        conservative_delta = min(level_delta, 1 if level_delta > 0 else 0)
+        if direction_score < 0:
+            base_buy += conservative_delta
+            base_sell = max(base_sell - conservative_delta, 1)
+            long_scale = 1.0 + ((cfg.favored_position_scale - 1.0) * 0.5)
+            short_scale = 1.0 + ((cfg.unfavored_position_scale - 1.0) * 0.5)
+            buy_offset_steps = direction_score * cfg.max_offset_steps * 0.5
+            sell_offset_steps = -direction_score * cfg.max_offset_steps * 0.5
+        elif direction_score > 0:
+            base_sell += conservative_delta
+            base_buy = max(base_buy - conservative_delta, 1)
+            short_scale = 1.0 + ((cfg.favored_position_scale - 1.0) * 0.5)
+            long_scale = 1.0 + ((cfg.unfavored_position_scale - 1.0) * 0.5)
+            buy_offset_steps = direction_score * cfg.max_offset_steps * 0.5
+            sell_offset_steps = -direction_score * cfg.max_offset_steps * 0.5
+    elif direction_score < 0:
         base_buy += level_delta
         base_sell = max(base_sell - level_delta, 1)
         long_scale = cfg.favored_position_scale
         short_scale = cfg.unfavored_position_scale
+        buy_offset_steps = direction_score * cfg.max_offset_steps
+        sell_offset_steps = -direction_score * cfg.max_offset_steps
     elif direction_score > 0:
         base_sell += level_delta
         base_buy = max(base_buy - level_delta, 1)
         short_scale = cfg.favored_position_scale
         long_scale = cfg.unfavored_position_scale
+        buy_offset_steps = direction_score * cfg.max_offset_steps
+        sell_offset_steps = -direction_score * cfg.max_offset_steps
 
     notional_scale = cfg.shock_notional_scale if report.get("shock_active") else 1.0
     step_scale = cfg.shock_step_scale if report.get("shock_active") else 1.0
+    if report.get("shock_active"):
+        long_scale = min(long_scale, 1.0)
+        short_scale = min(short_scale, 1.0)
     return {
+        "adapter": adapter,
         "buy_levels": base_buy,
         "sell_levels": base_sell,
-        "per_order_notional": max(float(per_order_notional) * notional_scale, 0.0),
-        "step_price": max(float(step_price) * step_scale, 0.0),
-        "max_position_notional": max(float(max_position_notional) * long_scale, 0.0),
-        "max_short_position_notional": max(float(max_short_position_notional) * short_scale, 0.0),
-        "buy_offset_steps": direction_score * cfg.max_offset_steps,
-        "sell_offset_steps": -direction_score * cfg.max_offset_steps,
+        "per_order_notional": max(base_notional * notional_scale, 0.0),
+        "step_price": max(base_step * step_scale, 0.0),
+        "max_position_notional": max(base_long_cap * long_scale, 0.0),
+        "max_short_position_notional": max(base_short_cap * short_scale, 0.0),
+        "buy_offset_steps": buy_offset_steps,
+        "sell_offset_steps": sell_offset_steps,
         "applied": True,
     }

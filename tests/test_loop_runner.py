@@ -14,6 +14,7 @@ from grid_optimizer.loop_runner import (
     AUTO_REGIME_PROFILE_LABELS,
     AUDIT_SYNC_MIN_INTERVAL_SECONDS,
     _build_parser,
+    _validate_multi_timeframe_bias_args,
     _should_sync_account_audit,
     _uses_entry_price_cost_basis,
     _uses_synthetic_lot_cost_guard,
@@ -6442,6 +6443,8 @@ class LoopRunnerTests(unittest.TestCase):
         args = _build_parser().parse_args(
             [
                 "--multi-timeframe-bias-enabled",
+                "--multi-timeframe-bias-mode-adapter",
+                "one_way_long",
                 "--multi-timeframe-bias-max-level-delta",
                 "5",
                 "--multi-timeframe-bias-max-offset-steps",
@@ -6456,11 +6459,39 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertTrue(args.multi_timeframe_bias_enabled)
+        self.assertEqual(args.multi_timeframe_bias_mode_adapter, "one_way_long")
         self.assertEqual(args.multi_timeframe_bias_max_level_delta, 5)
         self.assertEqual(args.multi_timeframe_bias_max_offset_steps, 1.25)
         self.assertEqual(args.multi_timeframe_bias_shock_abs_return_ratio, 0.012)
         self.assertEqual(args.multi_timeframe_bias_shock_amplitude_ratio, 0.02)
         self.assertEqual(args.multi_timeframe_bias_shock_notional_scale, 0.6)
+
+    def test_multi_timeframe_bias_validation_allows_one_way_modes_with_auto_adapter(self) -> None:
+        for strategy_mode in ("synthetic_neutral", "one_way_long", "one_way_short", "competition_inventory_grid"):
+            with self.subTest(strategy_mode=strategy_mode):
+                args = _build_parser().parse_args(
+                    [
+                        "--strategy-mode",
+                        strategy_mode,
+                        "--multi-timeframe-bias-enabled",
+                    ]
+                )
+
+                _validate_multi_timeframe_bias_args(args)
+
+    def test_multi_timeframe_bias_validation_rejects_incompatible_explicit_adapter(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--strategy-mode",
+                "one_way_long",
+                "--multi-timeframe-bias-enabled",
+                "--multi-timeframe-bias-mode-adapter",
+                "one_way_short",
+            ]
+        )
+
+        with self.assertRaises(SystemExit):
+            _validate_multi_timeframe_bias_args(args)
 
     def test_resolve_adaptive_step_uses_5m_amplitude_for_choppy_expansion(self) -> None:
         now = datetime(2026, 4, 30, 6, 0, tzinfo=timezone.utc)

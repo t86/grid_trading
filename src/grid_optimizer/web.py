@@ -3314,6 +3314,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adaptive_step_min_per_order_scale": 1.0,
     "adaptive_step_min_position_limit_scale": 1.0,
     "multi_timeframe_bias_enabled": False,
+    "multi_timeframe_bias_mode_adapter": "auto",
     "multi_timeframe_bias_low_zone_threshold": 0.35,
     "multi_timeframe_bias_high_zone_threshold": 0.65,
     "multi_timeframe_bias_strong_threshold": 0.50,
@@ -8062,6 +8063,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     str_fields = {
         "strategy_profile",
         "strategy_mode",
+        "multi_timeframe_bias_mode_adapter",
         "symbol",
         "maker_volatility_window",
         "margin_type",
@@ -8875,6 +8877,12 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--multi-timeframe-bias-enabled"
         if config.get("multi_timeframe_bias_enabled", False)
         else "--no-multi-timeframe-bias-enabled"
+    )
+    command.extend(
+        [
+            "--multi-timeframe-bias-mode-adapter",
+            str(config.get("multi_timeframe_bias_mode_adapter", "auto") or "auto"),
+        ]
     )
     for key, flag in (
         ("multi_timeframe_bias_low_zone_threshold", "--multi-timeframe-bias-low-zone-threshold"),

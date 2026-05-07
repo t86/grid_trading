@@ -3491,6 +3491,7 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         adaptive_step_min_per_order_scale=getattr(args, "adaptive_step_min_per_order_scale", 1.0),
         adaptive_step_min_position_limit_scale=getattr(args, "adaptive_step_min_position_limit_scale", 1.0),
         multi_timeframe_bias_enabled=getattr(args, "multi_timeframe_bias_enabled", False),
+        multi_timeframe_bias_mode_adapter=getattr(args, "multi_timeframe_bias_mode_adapter", "auto"),
         multi_timeframe_bias_low_zone_threshold=getattr(args, "multi_timeframe_bias_low_zone_threshold", 0.35),
         multi_timeframe_bias_high_zone_threshold=getattr(args, "multi_timeframe_bias_high_zone_threshold", 0.65),
         multi_timeframe_bias_strong_threshold=getattr(args, "multi_timeframe_bias_strong_threshold", 0.50),
@@ -8115,6 +8116,7 @@ def apply_inventory_tiering(
 def _multi_timeframe_bias_config(args: argparse.Namespace) -> MultiTimeframeBiasConfig:
     return MultiTimeframeBiasConfig(
         enabled=bool(getattr(args, "multi_timeframe_bias_enabled", False)),
+        mode_adapter=str(getattr(args, "multi_timeframe_bias_mode_adapter", "auto") or "auto"),
         low_zone_threshold=float(getattr(args, "multi_timeframe_bias_low_zone_threshold", 0.35)),
         high_zone_threshold=float(getattr(args, "multi_timeframe_bias_high_zone_threshold", 0.65)),
         strong_bias_threshold=float(getattr(args, "multi_timeframe_bias_strong_threshold", 0.50)),
@@ -8127,6 +8129,43 @@ def _multi_timeframe_bias_config(args: argparse.Namespace) -> MultiTimeframeBias
         shock_step_scale=float(getattr(args, "multi_timeframe_bias_shock_step_scale", 1.5)),
         shock_notional_scale=float(getattr(args, "multi_timeframe_bias_shock_notional_scale", 0.70)),
     )
+
+
+def _resolve_multi_timeframe_bias_adapter(strategy_mode: str, requested_adapter: str) -> str:
+    mode = str(strategy_mode or "").strip()
+    adapter = str(requested_adapter or "auto").strip() or "auto"
+    if adapter == "auto":
+        if mode in {"synthetic_neutral", "one_way_long", "one_way_short"}:
+            return mode
+        if mode == "competition_inventory_grid":
+            return "inventory_grid"
+        return adapter
+    return adapter
+
+
+def _validate_multi_timeframe_bias_args(args: argparse.Namespace) -> None:
+    if not bool(getattr(args, "multi_timeframe_bias_enabled", False)):
+        return
+    strategy_mode = str(getattr(args, "strategy_mode", "") or "").strip()
+    requested_adapter = str(getattr(args, "multi_timeframe_bias_mode_adapter", "auto") or "auto").strip() or "auto"
+    adapter = _resolve_multi_timeframe_bias_adapter(strategy_mode, requested_adapter)
+    allowed_by_mode = {
+        "synthetic_neutral": "synthetic_neutral",
+        "one_way_long": "one_way_long",
+        "one_way_short": "one_way_short",
+        "competition_inventory_grid": "inventory_grid",
+    }
+    expected = allowed_by_mode.get(strategy_mode)
+    if expected is None:
+        raise SystemExit(
+            "--multi-timeframe-bias-enabled supports strategy modes: "
+            "synthetic_neutral, one_way_long, one_way_short, competition_inventory_grid"
+        )
+    if adapter != expected:
+        raise SystemExit(
+            f"--multi-timeframe-bias-mode-adapter {requested_adapter!r} is incompatible with "
+            f"--strategy-mode {strategy_mode}; expected {expected!r}"
+        )
 
 
 def _fetch_multi_timeframe_bias_windows(
@@ -8607,10 +8646,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             effective_args.max_total_notional = float(adaptive_step["effective_max_total_notional"])
 
     multi_timeframe_bias_config = _multi_timeframe_bias_config(effective_args)
+    resolved_multi_timeframe_bias_adapter = _resolve_multi_timeframe_bias_adapter(
+        requested_strategy_mode,
+        multi_timeframe_bias_config.mode_adapter,
+    )
+    multi_timeframe_bias_config = MultiTimeframeBiasConfig(
+        **{**multi_timeframe_bias_config.__dict__, "mode_adapter": resolved_multi_timeframe_bias_adapter}
+    )
     multi_timeframe_bias = {
         "enabled": bool(multi_timeframe_bias_config.enabled),
         "available": False,
         "regime": "disabled" if not multi_timeframe_bias_config.enabled else "not_evaluated",
+        "adapter": resolved_multi_timeframe_bias_adapter,
         "applied": False,
     }
     if multi_timeframe_bias_config.enabled:
@@ -8621,6 +8668,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 windows=_fetch_multi_timeframe_bias_windows(symbol=symbol, now=plan_now),
                 config=multi_timeframe_bias_config,
             )
+            multi_timeframe_bias["adapter"] = resolved_multi_timeframe_bias_adapter
             multi_timeframe_adjustments = apply_multi_timeframe_bias(
                 buy_levels=int(getattr(effective_args, "buy_levels", 0)),
                 sell_levels=int(getattr(effective_args, "sell_levels", 0)),
@@ -8656,6 +8704,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "enabled": True,
                 "available": False,
                 "regime": "error",
+                "adapter": resolved_multi_timeframe_bias_adapter,
                 "applied": False,
                 "warning": f"{exc.__class__.__name__}: {exc}",
             }
@@ -11705,6 +11754,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
     parser.add_argument("--multi-timeframe-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument(
+        "--multi-timeframe-bias-mode-adapter",
+        choices=("auto", "synthetic_neutral", "one_way_long", "one_way_short", "inventory_grid"),
+        default="auto",
+    )
     parser.add_argument("--multi-timeframe-bias-low-zone-threshold", type=float, default=0.35)
     parser.add_argument("--multi-timeframe-bias-high-zone-threshold", type=float, default=0.65)
     parser.add_argument("--multi-timeframe-bias-strong-threshold", type=float, default=0.50)
@@ -11956,6 +12010,7 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         print(
             "  mtf_bias: "
             f"{mtf_bias.get('regime', '--')} "
+            f"adapter={mtf_bias.get('adapter', '--')} "
             f"long={_safe_float(mtf_bias.get('long_bias_score')):.2f} "
             f"short={_safe_float(mtf_bias.get('short_bias_score')):.2f} "
             f"zone={_safe_float(mtf_bias.get('zone_score')):.2f} "
@@ -12331,8 +12386,7 @@ def main() -> None:
         raise SystemExit("--multi-timeframe-bias-shock-step-scale must be >= 1")
     if args.multi_timeframe_bias_shock_notional_scale <= 0 or args.multi_timeframe_bias_shock_notional_scale > 1:
         raise SystemExit("--multi-timeframe-bias-shock-notional-scale must be within (0, 1]")
-    if args.multi_timeframe_bias_enabled and str(args.strategy_mode).strip() != "synthetic_neutral":
-        raise SystemExit("--multi-timeframe-bias-enabled currently requires --strategy-mode synthetic_neutral")
+    _validate_multi_timeframe_bias_args(args)
     volatility_entry_pause_thresholds = (
         args.volatility_entry_pause_30s_abs_return_ratio,
         args.volatility_entry_pause_30s_amplitude_ratio,
@@ -12780,6 +12834,9 @@ def main() -> None:
                     "multi_timeframe_bias_applied": bool((plan_report.get("multi_timeframe_bias") or {}).get("applied")),
                     "multi_timeframe_bias_regime": str(
                         ((plan_report.get("multi_timeframe_bias") or {}).get("regime", "") or "")
+                    ),
+                    "multi_timeframe_bias_adapter": str(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("adapter", "") or "")
                     ),
                     "multi_timeframe_bias_long_score": _safe_float(
                         (plan_report.get("multi_timeframe_bias") or {}).get("long_bias_score")

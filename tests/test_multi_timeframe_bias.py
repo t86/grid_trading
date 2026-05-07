@@ -110,6 +110,183 @@ class MultiTimeframeBiasTests(unittest.TestCase):
         self.assertGreater(adjusted["step_price"], 1.0)
         self.assertLess(adjusted["per_order_notional"], 100.0)
 
+    def test_one_way_long_low_zone_accelerates_long_entries(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=91.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 91.5, 92.0, 90.8, 91.0)],
+                "15m": [_candle(0, 94.0, 95.0, 90.0, 91.0)],
+                "1h": [_candle(0, 96.0, 98.0, 90.0, 91.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 91.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+
+        adjusted = apply_multi_timeframe_bias(
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=100.0,
+            step_price=1.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=0.0,
+            report=report,
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+
+        self.assertEqual(adjusted["adapter"], "one_way_long")
+        self.assertGreater(adjusted["buy_levels"], 8)
+        self.assertEqual(adjusted["sell_levels"], 8)
+        self.assertGreater(adjusted["max_position_notional"], 1000.0)
+        self.assertEqual(adjusted["max_short_position_notional"], 0.0)
+        self.assertLess(adjusted["buy_offset_steps"], 0.0)
+        self.assertEqual(adjusted["sell_offset_steps"], 0.0)
+
+    def test_one_way_long_high_zone_de_risks_long_entries(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=109.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 108.5, 109.2, 108.0, 109.0)],
+                "15m": [_candle(0, 106.0, 110.0, 105.0, 109.0)],
+                "1h": [_candle(0, 103.0, 110.0, 100.0, 109.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 109.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+
+        adjusted = apply_multi_timeframe_bias(
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=100.0,
+            step_price=1.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=0.0,
+            report=report,
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+
+        self.assertLess(adjusted["buy_levels"], 8)
+        self.assertLess(adjusted["per_order_notional"], 100.0)
+        self.assertLess(adjusted["max_position_notional"], 1000.0)
+        self.assertGreater(adjusted["buy_offset_steps"], 0.0)
+        self.assertEqual(adjusted["max_short_position_notional"], 0.0)
+
+    def test_one_way_short_high_zone_accelerates_short_entries(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=109.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 108.5, 109.2, 108.0, 109.0)],
+                "15m": [_candle(0, 106.0, 110.0, 105.0, 109.0)],
+                "1h": [_candle(0, 103.0, 110.0, 100.0, 109.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 109.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_short"),
+        )
+
+        adjusted = apply_multi_timeframe_bias(
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=100.0,
+            step_price=1.0,
+            max_position_notional=0.0,
+            max_short_position_notional=1000.0,
+            report=report,
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_short"),
+        )
+
+        self.assertEqual(adjusted["adapter"], "one_way_short")
+        self.assertEqual(adjusted["buy_levels"], 8)
+        self.assertGreater(adjusted["sell_levels"], 8)
+        self.assertEqual(adjusted["max_position_notional"], 0.0)
+        self.assertGreater(adjusted["max_short_position_notional"], 1000.0)
+        self.assertLess(adjusted["sell_offset_steps"], 0.0)
+        self.assertEqual(adjusted["buy_offset_steps"], 0.0)
+
+    def test_inventory_grid_adapter_keeps_both_sides_present(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=109.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 108.5, 109.2, 108.0, 109.0)],
+                "15m": [_candle(0, 106.0, 110.0, 105.0, 109.0)],
+                "1h": [_candle(0, 103.0, 110.0, 100.0, 109.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 109.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="inventory_grid"),
+        )
+
+        adjusted = apply_multi_timeframe_bias(
+            buy_levels=2,
+            sell_levels=2,
+            per_order_notional=100.0,
+            step_price=1.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=1000.0,
+            report=report,
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="inventory_grid"),
+        )
+
+        self.assertEqual(adjusted["adapter"], "inventory_grid")
+        self.assertGreaterEqual(adjusted["buy_levels"], 1)
+        self.assertGreaterEqual(adjusted["sell_levels"], 1)
+        self.assertGreater(adjusted["sell_levels"], adjusted["buy_levels"])
+        self.assertLess(adjusted["max_position_notional"], 1000.0)
+        self.assertGreater(adjusted["max_short_position_notional"], 1000.0)
+
+    def test_unavailable_candles_return_base_values(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=100.0,
+            step_price=1.0,
+            windows={"1m": [_candle(0, 100.0, 101.0, 99.0, 100.0)]},
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+        adjusted = apply_multi_timeframe_bias(
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=100.0,
+            step_price=1.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=0.0,
+            report=report,
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+
+        self.assertFalse(report["available"])
+        self.assertFalse(adjusted["applied"])
+        self.assertEqual(adjusted["adapter"], "one_way_long")
+        self.assertEqual(adjusted["buy_levels"], 8)
+        self.assertEqual(adjusted["per_order_notional"], 100.0)
+
+    def test_shock_does_not_increase_risk_for_one_way_long(self) -> None:
+        report = resolve_multi_timeframe_bias(
+            current_price=91.0,
+            step_price=1.0,
+            windows={
+                "1m": [_candle(0, 95.0, 95.2, 90.8, 91.0)],
+                "15m": [_candle(0, 94.0, 95.0, 90.0, 91.0)],
+                "1h": [_candle(0, 96.0, 98.0, 90.0, 91.0)],
+                "4h": [_candle(0, 100.0, 110.0, 90.0, 91.0)],
+            },
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+        adjusted = apply_multi_timeframe_bias(
+            buy_levels=8,
+            sell_levels=8,
+            per_order_notional=100.0,
+            step_price=1.0,
+            max_position_notional=1000.0,
+            max_short_position_notional=0.0,
+            report=report,
+            config=MultiTimeframeBiasConfig(enabled=True, mode_adapter="one_way_long"),
+        )
+
+        self.assertTrue(report["shock_active"])
+        self.assertLess(adjusted["per_order_notional"], 100.0)
+        self.assertGreater(adjusted["step_price"], 1.0)
+        self.assertLessEqual(adjusted["max_position_notional"], 1000.0)
+
 
 if __name__ == "__main__":
     unittest.main()

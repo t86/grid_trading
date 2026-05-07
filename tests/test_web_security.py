@@ -2767,6 +2767,7 @@ class WebSecurityTests(unittest.TestCase):
                 "per_order_notional": 90.0,
                 "base_position_notional": 0.0,
                 "multi_timeframe_bias_enabled": True,
+                "multi_timeframe_bias_mode_adapter": "synthetic_neutral",
                 "multi_timeframe_bias_low_zone_threshold": 0.32,
                 "multi_timeframe_bias_high_zone_threshold": 0.68,
                 "multi_timeframe_bias_strong_threshold": 0.45,
@@ -2797,6 +2798,8 @@ class WebSecurityTests(unittest.TestCase):
         )
 
         self.assertIn("--multi-timeframe-bias-enabled", command)
+        self.assertIn("--multi-timeframe-bias-mode-adapter", command)
+        self.assertIn("synthetic_neutral", command)
         self.assertIn("--multi-timeframe-bias-low-zone-threshold", command)
         self.assertIn("--multi-timeframe-bias-high-zone-threshold", command)
         self.assertIn("--multi-timeframe-bias-strong-threshold", command)
