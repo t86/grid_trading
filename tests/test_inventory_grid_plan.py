@@ -624,6 +624,53 @@ def test_spot_long_active_sell_levels_are_capped_by_held_qty() -> None:
     assert round(sum(item["qty"] for item in plan["sell_orders"]), 8) <= 0.25
 
 
+def test_spot_long_active_notusdt_sell_tail_below_min_notional_is_skipped() -> None:
+    runtime = new_inventory_grid_runtime(market_type="spot")
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.000619
+    runtime["position_lots"] = [
+        {
+            "lot_id": "l1",
+            "side": "long",
+            "qty": 76000.0,
+            "entry_price": 0.000619,
+            "opened_at_ms": 1,
+            "source_role": "bootstrap_entry",
+        },
+        {
+            "lot_id": "tail",
+            "side": "long",
+            "qty": 76.0,
+            "entry_price": 0.000619,
+            "opened_at_ms": 2,
+            "source_role": "grid_entry",
+        },
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.000618,
+        ask_price=0.000619,
+        step_price=0.000001,
+        per_order_notional=30.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=700.0,
+        max_order_position_notional=900.0,
+        max_position_notional=1300.0,
+        buy_levels=3,
+        tick_size=0.000001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+        sell_levels=3,
+    )
+
+    sell_orders = plan["sell_orders"]
+    assert sell_orders
+    assert all(order["qty"] * order["price"] >= 5.0 for order in sell_orders)
+    assert all(order["qty"] != 76.0 for order in sell_orders)
+
+
 def test_grid_exit_is_capped_to_held_qty_for_short_side() -> None:
     runtime = new_inventory_grid_runtime(market_type="futures")
     runtime["direction_state"] = "short_active"

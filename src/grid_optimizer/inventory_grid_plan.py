@@ -53,6 +53,46 @@ def _order_meets_mins(*, qty: float, price: float, min_qty: float | None, min_no
     return True
 
 
+def _filter_orders_meeting_mins(
+    orders: list[dict[str, Any]],
+    *,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> list[dict[str, Any]]:
+    filtered: list[dict[str, Any]] = []
+    for order in orders:
+        qty = max(_safe_float(order.get("qty")), 0.0)
+        price = max(_safe_float(order.get("price")), 0.0)
+        if _order_meets_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+            filtered.append(order)
+    return filtered
+
+
+def _finalize_inventory_grid_plan(
+    *,
+    risk_state: str,
+    bootstrap_orders: list[dict[str, Any]],
+    buy_orders: list[dict[str, Any]],
+    sell_orders: list[dict[str, Any]],
+    forced_reduce_orders: list[dict[str, Any]],
+    tail_cleanup_active: bool,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    bootstrap_orders = _filter_orders_meeting_mins(bootstrap_orders, min_qty=min_qty, min_notional=min_notional)
+    buy_orders = _filter_orders_meeting_mins(buy_orders, min_qty=min_qty, min_notional=min_notional)
+    sell_orders = _filter_orders_meeting_mins(sell_orders, min_qty=min_qty, min_notional=min_notional)
+    forced_reduce_orders = [order for order in sell_orders + buy_orders if order.get("role") == "forced_reduce"]
+    return {
+        "risk_state": risk_state,
+        "bootstrap_orders": bootstrap_orders,
+        "buy_orders": buy_orders,
+        "sell_orders": sell_orders,
+        "forced_reduce_orders": forced_reduce_orders,
+        "tail_cleanup_active": tail_cleanup_active,
+    }
+
+
 def _normalized_recovery_mode(*, runtime: dict[str, Any]) -> str:
     return str(runtime.get("recovery_mode", "live")).strip().lower()
 
@@ -392,14 +432,16 @@ def build_inventory_grid_orders(
 
     if direction_state == "flat":
         if recovery_mode != "live":
-            return {
-                "risk_state": runtime_risk_state,
-                "bootstrap_orders": bootstrap_orders,
-                "buy_orders": buy_orders,
-                "sell_orders": sell_orders,
-                "forced_reduce_orders": forced_reduce_orders,
-                "tail_cleanup_active": False,
-            }
+            return _finalize_inventory_grid_plan(
+                risk_state=runtime_risk_state,
+                bootstrap_orders=bootstrap_orders,
+                buy_orders=buy_orders,
+                sell_orders=sell_orders,
+                forced_reduce_orders=forced_reduce_orders,
+                tail_cleanup_active=False,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
         if market_type == "spot":
             bootstrap_levels = 1 if warmup_notional > EPSILON else buy_levels
             bootstrap_orders = _build_buy_ladder_orders(
@@ -428,14 +470,16 @@ def build_inventory_grid_orders(
                 min_qty=min_qty,
                 min_notional=min_notional,
             )
-        return {
-            "risk_state": "normal",
-            "bootstrap_orders": bootstrap_orders,
-            "buy_orders": buy_orders,
-            "sell_orders": sell_orders,
-            "forced_reduce_orders": forced_reduce_orders,
-            "tail_cleanup_active": False,
-        }
+        return _finalize_inventory_grid_plan(
+            risk_state="normal",
+            bootstrap_orders=bootstrap_orders,
+            buy_orders=buy_orders,
+            sell_orders=sell_orders,
+            forced_reduce_orders=forced_reduce_orders,
+            tail_cleanup_active=False,
+            min_qty=min_qty,
+            min_notional=min_notional,
+        )
 
     inventory_notional = _position_notional(runtime=runtime, mid_price=mid_price)
     held_qty = _held_qty(runtime=runtime)
@@ -490,14 +534,16 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-            return {
-                "risk_state": risk_state,
-                "bootstrap_orders": bootstrap_orders,
-                "buy_orders": buy_orders,
-                "sell_orders": sell_orders,
-                "forced_reduce_orders": forced_reduce_orders,
-                "tail_cleanup_active": True,
-            }
+            return _finalize_inventory_grid_plan(
+                risk_state=risk_state,
+                bootstrap_orders=bootstrap_orders,
+                buy_orders=buy_orders,
+                sell_orders=sell_orders,
+                forced_reduce_orders=forced_reduce_orders,
+                tail_cleanup_active=True,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
 
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         planned_closing_qty = 0.0
@@ -652,14 +698,16 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-            return {
-                "risk_state": risk_state,
-                "bootstrap_orders": bootstrap_orders,
-                "buy_orders": buy_orders,
-                "sell_orders": sell_orders,
-                "forced_reduce_orders": forced_reduce_orders,
-                "tail_cleanup_active": True,
-            }
+            return _finalize_inventory_grid_plan(
+                risk_state=risk_state,
+                bootstrap_orders=bootstrap_orders,
+                buy_orders=buy_orders,
+                sell_orders=sell_orders,
+                forced_reduce_orders=forced_reduce_orders,
+                tail_cleanup_active=True,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
 
         exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
@@ -717,11 +765,13 @@ def build_inventory_grid_orders(
                         buy_orders.append(order)
                         forced_reduce_orders.append(order)
 
-    return {
-        "risk_state": risk_state,
-        "bootstrap_orders": bootstrap_orders,
-        "buy_orders": buy_orders,
-        "sell_orders": sell_orders,
-        "forced_reduce_orders": forced_reduce_orders,
-        "tail_cleanup_active": tail_cleanup_active,
-    }
+    return _finalize_inventory_grid_plan(
+        risk_state=risk_state,
+        bootstrap_orders=bootstrap_orders,
+        buy_orders=buy_orders,
+        sell_orders=sell_orders,
+        forced_reduce_orders=forced_reduce_orders,
+        tail_cleanup_active=tail_cleanup_active,
+        min_qty=min_qty,
+        min_notional=min_notional,
+    )
