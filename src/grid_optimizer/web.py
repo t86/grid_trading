@@ -31650,8 +31650,7 @@ def _set_cached_running_status_overview_payload(key: str, payload: dict[str, Any
         )
 
 
-def _fetch_remote_running_status(entry: dict[str, str], timeout: float | None = None) -> dict[str, Any]:
-    url = f"{entry['url'].rstrip('/')}/api/running_status_overview?scope=local"
+def _running_status_auth_headers() -> dict[str, str]:
     headers = {"Accept": "application/json"}
     remote_auth = os.environ.get("GRID_RUNNING_STATUS_AUTH", "")
     remote_username, sep, remote_password = remote_auth.partition(":")
@@ -31663,17 +31662,107 @@ def _fetch_remote_running_status(entry: dict[str, str], timeout: float | None = 
     if credentials is not None:
         token = base64.b64encode(f"{credentials[0]}:{credentials[1]}".encode("utf-8")).decode("ascii")
         headers["Authorization"] = f"Basic {token}"
-    request = Request(url, headers=headers)
+    return headers
+
+
+def _fetch_remote_json_payload(url: str, *, timeout: float | None = None) -> dict[str, Any]:
+    request = Request(url, headers=_running_status_auth_headers())
+    with urlopen(request, timeout=timeout or _running_status_remote_timeout_seconds()) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def _fetch_remote_spot_running_status(
+    entry: dict[str, str],
+    symbols: list[str],
+    *,
+    timeout: float | None = None,
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    rows: list[dict[str, Any]] = []
+    errors: list[dict[str, str]] = []
+    seen: set[str] = set()
+    base_url = entry["url"].rstrip("/")
+    for raw_symbol in symbols:
+        symbol = str(raw_symbol or "").upper().strip()
+        if not symbol or symbol in seen:
+            continue
+        seen.add(symbol)
+        url = f"{base_url}/api/spot_runner/status?symbol={quote(symbol)}"
+        try:
+            payload = _fetch_remote_json_payload(
+                url,
+                timeout=timeout or min(_running_status_remote_timeout_seconds(), 2.0),
+            )
+        except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
+            errors.append({"symbol": symbol, "market_type": "spot", "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        snapshot = payload.get("snapshot") if isinstance(payload, dict) else None
+        if not isinstance(snapshot, dict):
+            continue
+        item = _spot_snapshot_to_running_status_item(snapshot)
+        if item is None:
+            continue
+        item["server_label"] = str(item.get("server_label") or entry["label"]).strip() or None
+        item["server_base_url"] = base_url
+        rows.append(item)
+    return rows, errors
+
+
+def _merge_remote_spot_status_rows(
+    server: dict[str, Any],
+    spot_rows: list[dict[str, Any]],
+    spot_errors: list[dict[str, str]],
+) -> dict[str, Any]:
+    if not spot_rows and not spot_errors:
+        return server
+    merged = dict(server)
+    existing = [item for item in list(merged.get("symbols") or []) if isinstance(item, dict)]
+    spot_keys = {
+        (str(item.get("server_label") or merged.get("label") or "").strip(), str(item.get("symbol") or "").upper().strip())
+        for item in spot_rows
+    }
+    kept = [
+        item
+        for item in existing
+        if not (
+            str(item.get("market_type") or "").strip() == "spot"
+            and (
+                str(item.get("server_label") or merged.get("label") or "").strip(),
+                str(item.get("symbol") or "").upper().strip(),
+            )
+            in spot_keys
+        )
+    ]
+    merged["symbols"] = kept + spot_rows
+    if spot_rows and not merged.get("ok"):
+        merged["ok"] = True
+    errors = list(merged.get("errors") or [])
+    if merged.get("error"):
+        errors.append({"error": str(merged.get("error"))})
+    errors.extend(spot_errors)
+    merged["errors"] = errors
+    return merged
+
+
+def _fetch_remote_running_status(
+    entry: dict[str, str],
+    timeout: float | None = None,
+    spot_symbols: list[str] | None = None,
+) -> dict[str, Any]:
+    url = f"{entry['url'].rstrip('/')}/api/running_status_overview?scope=local"
     try:
-        with urlopen(request, timeout=timeout or _running_status_remote_timeout_seconds()) as response:
-            payload = json.loads(response.read().decode("utf-8"))
+        payload = _fetch_remote_json_payload(url, timeout=timeout)
     except (HTTPError, URLError, TimeoutError, OSError, json.JSONDecodeError) as exc:
-        return {"ok": False, "label": entry["label"], "url": entry["url"], "symbols": [], "error": f"{type(exc).__name__}: {exc}"}
-    return _legacy_running_status_server_from_payload(
-        payload,
-        fallback_label=entry["label"],
-        fallback_url=entry["url"],
-    )
+        server = {"ok": False, "label": entry["label"], "url": entry["url"], "symbols": [], "error": f"{type(exc).__name__}: {exc}"}
+    else:
+        server = _legacy_running_status_server_from_payload(
+            payload,
+            fallback_label=entry["label"],
+            fallback_url=entry["url"],
+        )
+    if spot_symbols:
+        spot_rows, spot_errors = _fetch_remote_spot_running_status(entry, spot_symbols)
+        server = _merge_remote_spot_status_rows(server, spot_rows, spot_errors)
+    return server
 
 
 def _build_running_status(scope: str = "cross") -> dict[str, Any]:
@@ -31689,8 +31778,9 @@ def _build_running_status(scope: str = "cross") -> dict[str, Any]:
     servers = [local]
     if scope != "local":
         entries = _running_status_server_entries()
+        spot_symbols = _running_status_spot_symbols()
         with ThreadPoolExecutor(max_workers=min(max(len(entries), 1), 4)) as executor:
-            futures = [executor.submit(_fetch_remote_running_status, entry) for entry in entries]
+            futures = [executor.submit(_fetch_remote_running_status, entry, None, spot_symbols) for entry in entries]
             for future in as_completed(futures):
                 servers.append(future.result())
     payload = {

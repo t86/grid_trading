@@ -426,6 +426,44 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(row["fees"], 0.12)
         self.assertIn("BUY", row["latest_trade_summary"])
 
+    def test_fetch_remote_running_status_backfills_spot_rows_when_overview_times_out(self) -> None:
+        from grid_optimizer.web import _fetch_remote_running_status
+
+        entry = {"label": "114", "url": "http://114"}
+
+        def fake_fetch(url: str, *, timeout: float | None = None) -> dict[str, object]:
+            if "running_status_overview" in url:
+                raise TimeoutError("timed out")
+            self.assertIn("/api/spot_runner/status?symbol=NOTUSDT", url)
+            return {
+                "ok": True,
+                "snapshot": {
+                    "symbol": "NOTUSDT",
+                    "runner": {"is_running": True, "pid": 123, "elapsed": "00:10"},
+                    "config": {"symbol": "NOTUSDT", "strategy_mode": "spot_competition_inventory_grid"},
+                    "trade_summary": {
+                        "gross_notional": 1000.0,
+                        "realized_pnl": -1.0,
+                        "unrealized_pnl": 0.25,
+                        "net_pnl_estimate": -0.75,
+                        "commission_quote": 0.5,
+                        "recent_trades": [],
+                    },
+                    "latest_event": {"ts": "2026-05-07T00:00:00+00:00"},
+                    "open_orders": [],
+                },
+            }
+
+        with patch("grid_optimizer.web._fetch_remote_json_payload", side_effect=fake_fetch):
+            payload = _fetch_remote_running_status(entry, spot_symbols=["NOTUSDT"])
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["label"], "114")
+        self.assertEqual(payload["symbols"][0]["symbol"], "NOTUSDT")
+        self.assertEqual(payload["symbols"][0]["market_type"], "spot")
+        self.assertEqual(payload["symbols"][0]["server_label"], "114")
+        self.assertIn("TimeoutError", payload["errors"][0]["error"])
+
     def test_legacy_running_status_server_from_new_local_payload_uses_running_cards(self) -> None:
         server = _legacy_running_status_server_from_payload(
             {
