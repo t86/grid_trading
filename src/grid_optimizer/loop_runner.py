@@ -8976,12 +8976,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             pause_short_position_notional=getattr(effective_args, "pause_short_position_notional", None),
             per_order_notional=getattr(effective_args, "per_order_notional", 0.0),
             step_price=getattr(effective_args, "step_price", 0.0),
-            recent_loss_ratio=(
-                abs(_safe_float(runtime_guard_result.rolling_hourly_loss))
-                / max(_safe_float(runtime_guard_config.rolling_hourly_loss_limit), 1e-12)
-                if _safe_float(runtime_guard_config.rolling_hourly_loss_limit) > 0
-                else 0.0
-            ),
+            recent_loss_ratio=0.0,
             active_delever_loss_count=0,
             config=multi_timeframe_bias_config,
         )
