@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from grid_optimizer.inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from grid_optimizer.spot_loop_runner import (
+    _auto_flatten_on_runtime_guard,
     _build_parser,
     _build_spot_competition_inventory_grid_orders,
     _load_state,
@@ -65,6 +66,10 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.runtime_guard_stats_start_time, "2026-04-05T00:00:00+00:00")
         self.assertEqual(args.max_order_position_notional, 300.0)
         self.assertEqual(args.max_position_notional, 400.0)
+
+    def test_runtime_guard_does_not_auto_flatten_spot_competition_inventory_grid(self) -> None:
+        self.assertFalse(_auto_flatten_on_runtime_guard("spot_competition_inventory_grid"))
+        self.assertTrue(_auto_flatten_on_runtime_guard("spot_one_way_long"))
 
     def test_build_spot_competition_inventory_grid_orders_places_only_buy_bootstrap_when_flat(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(

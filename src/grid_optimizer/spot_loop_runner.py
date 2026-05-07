@@ -1378,6 +1378,10 @@ def _available_new_funds(
     return quote_free, base_free
 
 
+def _auto_flatten_on_runtime_guard(strategy_mode: str) -> bool:
+    return str(strategy_mode or "").strip() != "spot_competition_inventory_grid"
+
+
 def _spot_order_meets_exchange_mins(
     *,
     qty: float,
@@ -1796,9 +1800,10 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
                 orders=strategy_open_orders,
             )
         flatten_result = {"started": False, "already_running": False}
-        flatten_snapshot = load_live_spot_flatten_snapshot(symbol, api_key, api_secret)
-        if list(flatten_snapshot.get("orders", [])):
-            flatten_result = _start_spot_flatten_process(symbol)
+        if _auto_flatten_on_runtime_guard(strategy_mode):
+            flatten_snapshot = load_live_spot_flatten_snapshot(symbol, api_key, api_secret)
+            if list(flatten_snapshot.get("orders", [])):
+                flatten_result = _start_spot_flatten_process(symbol)
         quote_free, base_free = _available_new_funds(account_info, base_asset, quote_asset)
         summary = _build_runtime_guard_summary(
             args=args,
