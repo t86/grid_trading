@@ -3822,6 +3822,191 @@ def _build_hourly_email_monitor_snapshot(symbol: str, config: dict[str, Any]) ->
     )
 
 
+def _competition_volume_parse_dt(value: Any) -> datetime | None:
+    if value in {"", None}:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _competition_volume_row_time(row: dict[str, Any], *, income: bool = False) -> datetime | None:
+    ts_ms = income_row_time_ms(row) if income else trade_row_time_ms(row)
+    if ts_ms <= 0:
+        return None
+    return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+
+
+def _competition_volume_summary_path(symbol: str, output_dir: Path = Path("output")) -> Path:
+    config = _load_runner_control_config(symbol)
+    summary = str(config.get("summary_jsonl") or "").strip()
+    if summary:
+        return Path(summary)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", symbol.strip()).strip("_").lower()
+    return output_dir / f"{slug}_loop_events.jsonl"
+
+
+def _list_competition_volume_symbols(*, output_dir: Path = Path("output")) -> dict[str, Any]:
+    symbols: set[str] = set()
+    for config in _iter_saved_runner_control_configs():
+        symbol = str(config.get("symbol", "")).upper().strip()
+        if symbol:
+            symbols.add(symbol)
+    for path in sorted(output_dir.glob("*_loop_runner_control.json")):
+        data = _read_json_dict(path)
+        symbol = str(data.get("symbol", "")).upper().strip()
+        if symbol:
+            symbols.add(symbol)
+    return {"server": os.uname().nodename, "symbols": sorted(symbols)}
+
+
+def _iter_competition_volume_trades(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> list[dict[str, Any]]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    start = _competition_volume_parse_dt(competition_start_at)
+    audit_paths = build_audit_paths(summary_path)
+    rows: list[dict[str, Any]] = []
+    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    for row in iter_jsonl(audit_paths["trade_audit"]):
+        row_symbol = str(row.get("symbol", "")).upper().strip()
+        if normalized_symbol and row_symbol and row_symbol != normalized_symbol:
+            continue
+        ts = _competition_volume_row_time(row)
+        if ts is None or (start is not None and ts < start):
+            continue
+        price = _email_float(row.get("price"))
+        qty = abs(_email_float(row.get("qty")))
+        commission = (
+            abs(_email_float(row.get("commission")))
+            if str(row.get("commissionAsset", "")).upper().strip() in stable_assets
+            else 0.0
+        )
+        rows.append(
+            {
+                "ts": ts.isoformat(),
+                "symbol": row_symbol or normalized_symbol,
+                "side": str(row.get("side", "")).upper().strip(),
+                "price": price,
+                "qty": qty,
+                "notional": price * qty,
+                "realized_pnl": _email_float(row.get("realizedPnl")),
+                "commission": commission,
+                "commission_asset": str(row.get("commissionAsset", "")).upper().strip(),
+                "maker": bool(row.get("maker") or row.get("isMaker")),
+                "order_id": row.get("orderId") or row.get("order_id"),
+                "client_order_id": row.get("clientOrderId") or row.get("client_order_id"),
+                "position_side": row.get("positionSide") or row.get("position_side"),
+            }
+        )
+    rows.sort(key=lambda item: str(item.get("ts") or ""))
+    return rows
+
+
+def _iter_competition_volume_income(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> list[dict[str, Any]]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    start = _competition_volume_parse_dt(competition_start_at)
+    audit_paths = build_audit_paths(summary_path)
+    rows: list[dict[str, Any]] = []
+    for row in iter_jsonl(audit_paths["income_audit"]):
+        row_symbol = str(row.get("symbol", "")).upper().strip()
+        if normalized_symbol and row_symbol and row_symbol != normalized_symbol:
+            continue
+        ts = _competition_volume_row_time(row, income=True)
+        if ts is None or (start is not None and ts < start):
+            continue
+        rows.append({"ts": ts.isoformat(), "income": _email_float(row.get("income"))})
+    rows.sort(key=lambda item: str(item.get("ts") or ""))
+    return rows
+
+
+def _build_competition_volume_summary(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> dict[str, Any]:
+    trades = _iter_competition_volume_trades(
+        symbol=symbol,
+        summary_path=summary_path,
+        competition_start_at=competition_start_at,
+    )
+    income_rows = _iter_competition_volume_income(
+        symbol=symbol,
+        summary_path=summary_path,
+        competition_start_at=competition_start_at,
+    )
+    gross = sum(_email_float(row.get("notional")) for row in trades)
+    commission = sum(_email_float(row.get("commission")) for row in trades)
+    net_pnl = sum(_email_float(row.get("realized_pnl")) - _email_float(row.get("commission")) for row in trades)
+    net_pnl += sum(_email_float(row.get("income")) for row in income_rows)
+    maker_count = sum(1 for row in trades if row.get("maker"))
+    latest_event = _read_last_jsonl_row(summary_path) or {}
+    elastic = latest_event.get("elastic_volume") if isinstance(latest_event.get("elastic_volume"), dict) else {}
+    return {
+        "symbol": str(symbol or "").upper().strip(),
+        "server": os.uname().nodename,
+        "competition_gross_notional": gross,
+        "competition_net_pnl": net_pnl,
+        "competition_commission": commission,
+        "trade_count": len(trades),
+        "maker_ratio": maker_count / len(trades) if trades else 0.0,
+        "elastic_regime": str(elastic.get("regime") or latest_event.get("elastic_volume_regime") or ""),
+        "latest_event": latest_event,
+    }
+
+
+def _build_competition_volume_fills(*, symbol: str, summary_path: Path, limit: int = 200) -> dict[str, Any]:
+    trades = _iter_competition_volume_trades(symbol=symbol, summary_path=summary_path)
+    return {"symbol": str(symbol or "").upper().strip(), "fills": list(reversed(trades[-max(int(limit), 1) :]))}
+
+
+def _build_competition_volume_chart(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> dict[str, Any]:
+    trades = _iter_competition_volume_trades(
+        symbol=symbol,
+        summary_path=summary_path,
+        competition_start_at=competition_start_at,
+    )
+    cumulative_notional = 0.0
+    cumulative_net_pnl = 0.0
+    cumulative_commission = 0.0
+    points: list[dict[str, Any]] = []
+    for row in trades:
+        cumulative_notional += _email_float(row.get("notional"))
+        cumulative_commission += _email_float(row.get("commission"))
+        cumulative_net_pnl += _email_float(row.get("realized_pnl")) - _email_float(row.get("commission"))
+        points.append(
+            {
+                "ts": row.get("ts"),
+                "price": _email_float(row.get("price")),
+                "cumulative_notional": cumulative_notional,
+                "cumulative_net_pnl": cumulative_net_pnl,
+                "cumulative_commission": cumulative_commission,
+            }
+        )
+    return {"symbol": str(symbol or "").upper().strip(), "points": points}
+
+
 def _first_email_float(row: dict[str, Any], keys: tuple[str, ...], default: float = 0.0) -> float:
     for key in keys:
         value = row.get(key)
@@ -24458,6 +24643,149 @@ RUNNER_SETTINGS_PAGE = (
     )
 )
 
+COMPETITION_VOLUME_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>合约交易赛实时成交监控</title>
+  <style>
+    :root { color-scheme: light; --line:#d9e2ef; --text:#102235; --muted:#60758a; --green:#07855b; --red:#b42318; --blue:#2563eb; --purple:#7c3aed; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#f5f7fb; color:var(--text); }
+    .wrap { max-width: 1480px; margin: 0 auto; padding: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:end; gap:16px; margin-bottom:14px; }
+    h1 { font-size:22px; margin:0 0 4px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .controls { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+    label { display:grid; gap:5px; font-size:12px; color:var(--muted); font-weight:700; }
+    select { height:34px; border:1px solid #cbd7e5; border-radius:6px; padding:0 28px 0 10px; background:#fff; color:var(--text); }
+    .grid { display:grid; grid-template-columns: 1.05fr 1.65fr; gap:16px; align-items:start; }
+    .panel { border:1px solid var(--line); border-radius:8px; background:#fff; padding:12px; }
+    .kpis { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:10px; }
+    .kpi { border:1px solid var(--line); border-radius:8px; background:#fff; padding:10px; min-height:72px; }
+    .label { color:var(--muted); font-size:11px; font-weight:800; text-transform:uppercase; }
+    .value { font-size:21px; font-weight:800; margin-top:5px; white-space:nowrap; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th, td { padding:8px 7px; border-bottom:1px solid #eef3f8; text-align:right; white-space:nowrap; }
+    th:first-child, td:first-child { text-align:left; }
+    th { color:var(--muted); font-size:11px; }
+    .buy { color:var(--green); font-weight:700; }
+    .sell { color:var(--red); font-weight:700; }
+    .chart { height:260px; display:grid; grid-template-columns:48px 1fr 54px; gap:10px; margin-top:8px; }
+    .axis { display:flex; flex-direction:column; justify-content:space-between; font-size:11px; color:var(--muted); text-align:right; }
+    .plot { position:relative; border-left:1px solid #d7e1ed; border-bottom:1px solid #d7e1ed; background:linear-gradient(to bottom,#f8fbff,#fff); overflow:hidden; }
+    .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; font-size:12px; color:var(--muted); }
+    .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
+    @media (max-width: 1100px) { .grid { grid-template-columns:1fr; } .kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>合约交易赛实时成交监控</h1>
+        <div class="muted">当前服务器: <span id="server_label">-</span> · 只读监控 · 本机数据</div>
+      </div>
+      <div class="controls">
+        <label>Symbol
+          <select id="symbol_select"></select>
+        </label>
+        <label>Window
+          <select id="window_select">
+            <option value="competition">比赛周期</option>
+            <option value="15m">15m</option>
+            <option value="5m">5m</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="kpis" id="kpis"></div>
+    <div class="grid" style="margin-top:14px">
+      <section class="panel">
+        <div class="label">Live Fills</div>
+        <h2 style="font-size:18px;margin:4px 0 10px">每笔成交列表</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Qty</th><th>Notional</th><th>Fee</th><th>PnL</th><th>Maker</th></tr></thead>
+          <tbody id="fills_body"></tbody>
+        </table>
+      </section>
+      <section class="panel">
+        <div style="display:flex;justify-content:space-between;gap:12px">
+          <div><div class="label">交易额 · 总盈亏 · 手续费 · 成交价格</div></div>
+          <div class="muted">刷新 2s</div>
+        </div>
+        <div class="chart">
+          <div class="axis"><span>Price</span><span></span><span></span><span></span></div>
+          <div class="plot"><svg id="chart_svg" viewBox="0 0 600 240" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%"></svg></div>
+          <div class="axis" style="text-align:left"><span>Total</span><span></span><span></span><span>0</span></div>
+        </div>
+        <div class="legend">
+          <span><span class="dot" style="background:var(--blue)"></span>成交价格</span>
+          <span><span class="dot" style="background:var(--green)"></span>周期成交额</span>
+          <span><span class="dot" style="background:var(--red)"></span>周期盈亏</span>
+          <span><span class="dot" style="background:var(--purple)"></span>手续费</span>
+        </div>
+      </section>
+    </div>
+  </div>
+  <script>
+    const symbolSelect = document.getElementById("symbol_select");
+    const serverLabel = document.getElementById("server_label");
+    const kpis = document.getElementById("kpis");
+    const fillsBody = document.getElementById("fills_body");
+    const chartSvg = document.getElementById("chart_svg");
+    const fmt = (v, d=2) => Number(v || 0).toLocaleString(undefined, { maximumFractionDigits:d });
+    function line(points, key, color) {
+      if (!points.length) return "";
+      const xs = points.map((_, i) => points.length === 1 ? 0 : i / (points.length - 1) * 600);
+      const vals = points.map(p => Number(p[key] || 0));
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const span = Math.max(max - min, 1e-12);
+      const coords = vals.map((v, i) => `${xs[i].toFixed(1)},${(220 - ((v - min) / span) * 200).toFixed(1)}`).join(" ");
+      return `<polyline points="${coords}" fill="none" stroke="${color}" stroke-width="3"/>`;
+    }
+    async function loadSymbols() {
+      const resp = await fetch("/api/competition-volume/symbols");
+      const data = await resp.json();
+      serverLabel.textContent = data.server || "-";
+      symbolSelect.innerHTML = (data.symbols || []).map(s => `<option value="${s}">${s}</option>`).join("");
+    }
+    async function refresh() {
+      const symbol = symbolSelect.value;
+      if (!symbol) return;
+      const [summary, fills, chart] = await Promise.all([
+        fetch(`/api/competition-volume/summary?symbol=${encodeURIComponent(symbol)}`).then(r => r.json()),
+        fetch(`/api/competition-volume/fills?symbol=${encodeURIComponent(symbol)}&limit=120`).then(r => r.json()),
+        fetch(`/api/competition-volume/chart?symbol=${encodeURIComponent(symbol)}`).then(r => r.json()),
+      ]);
+      kpis.innerHTML = [
+        ["周期成交额", fmt(summary.competition_gross_notional, 0)],
+        ["周期盈亏", fmt(summary.competition_net_pnl, 2)],
+        ["手续费", fmt(summary.competition_commission, 2)],
+        ["Maker Ratio", `${fmt((summary.maker_ratio || 0) * 100, 1)}%`],
+        ["成交笔数", fmt(summary.trade_count, 0)],
+        ["Regime", summary.elastic_regime || "-"],
+        ["Symbol", symbol],
+      ].map(([label, value]) => `<div class="kpi"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
+      fillsBody.innerHTML = (fills.fills || []).map(f => `<tr><td>${String(f.ts || "").slice(11,19)}</td><td class="${f.side === "BUY" ? "buy" : "sell"}">${f.side || ""}</td><td>${fmt(f.price, 8)}</td><td>${fmt(f.qty, 4)}</td><td>${fmt(f.notional, 2)}</td><td>${fmt(f.commission, 4)}</td><td>${fmt(f.realized_pnl, 4)}</td><td>${f.maker ? "Y" : "N"}</td></tr>`).join("");
+      const pts = chart.points || [];
+      chartSvg.innerHTML = [
+        line(pts, "price", "#2563eb"),
+        line(pts, "cumulative_notional", "#079669"),
+        line(pts, "cumulative_net_pnl", "#dc2626"),
+        line(pts, "cumulative_commission", "#7c3aed"),
+      ].join("");
+    }
+    symbolSelect.addEventListener("change", refresh);
+    loadSymbols().then(refresh);
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
+"""
+
+
 RUNNING_STATUS_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -31216,6 +31544,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/running_status_overview", "/running_status_overview.html"}:
             self._send_html(_render_running_status_overview_page(), status=HTTPStatus.OK)
             return
+        if path in {"/competition_volume", "/competition_volume.html"}:
+            self._send_html(COMPETITION_VOLUME_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/monitor", "/monitor.html"}:
             self._send_html(MONITOR_PAGE, status=HTTPStatus.OK)
             return
@@ -31289,6 +31620,44 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("application/json; charset=utf-8", len(body))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if path == "/api/competition-volume/symbols":
+            self._send_json(_list_competition_volume_symbols(), status=HTTPStatus.OK)
+            return
+        if path in {
+            "/api/competition-volume/summary",
+            "/api/competition-volume/fills",
+            "/api/competition-volume/chart",
+        }:
+            symbol = str(query.get("symbol", [""])[0]).upper().strip()
+            if not symbol:
+                self._send_json({"ok": False, "error": "symbol is required"}, status=400)
+                return
+            summary_path = _competition_volume_summary_path(symbol)
+            competition_start_at = query.get("competition_start_at", [None])[0]
+            try:
+                if path.endswith("/summary"):
+                    payload = _build_competition_volume_summary(
+                        symbol=symbol,
+                        summary_path=summary_path,
+                        competition_start_at=competition_start_at,
+                    )
+                elif path.endswith("/fills"):
+                    payload = _build_competition_volume_fills(
+                        symbol=symbol,
+                        summary_path=summary_path,
+                        limit=int(query.get("limit", ["200"])[0] or 200),
+                    )
+                else:
+                    payload = _build_competition_volume_chart(
+                        symbol=symbol,
+                        summary_path=summary_path,
+                        competition_start_at=competition_start_at,
+                    )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
             return
         if path == "/api/master_sprint_board":
             refresh = str(query.get("refresh", ["0"])[0]).strip() == "1"

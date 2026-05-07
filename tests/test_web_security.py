@@ -10,6 +10,7 @@ from tempfile import TemporaryDirectory
 from unittest.mock import Mock, patch
 
 from grid_optimizer.web import (
+    COMPETITION_VOLUME_PAGE,
     MONITOR_PAGE,
     HTML_PAGE,
     STRATEGIES_PAGE,
@@ -233,6 +234,17 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("手续费总额", page)
         self.assertIn("/api/running_status", page)
         self.assertIn('id="status_drawer"', page)
+
+    def test_competition_volume_page_contains_local_dashboard_sections(self) -> None:
+        self.assertIn("当前服务器", COMPETITION_VOLUME_PAGE)
+        self.assertIn('id="symbol_select"', COMPETITION_VOLUME_PAGE)
+        self.assertIn("周期成交额", COMPETITION_VOLUME_PAGE)
+        self.assertIn("周期盈亏", COMPETITION_VOLUME_PAGE)
+        self.assertIn("手续费", COMPETITION_VOLUME_PAGE)
+        self.assertIn("每笔成交列表", COMPETITION_VOLUME_PAGE)
+        self.assertIn("/api/competition-volume/summary", COMPETITION_VOLUME_PAGE)
+        self.assertIn("/api/competition-volume/fills", COMPETITION_VOLUME_PAGE)
+        self.assertIn("/api/competition-volume/chart", COMPETITION_VOLUME_PAGE)
 
     def test_running_status_page_contains_local_control_actions(self) -> None:
         page = _render_running_status_page(symbol="CHIPUSDT")
