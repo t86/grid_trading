@@ -93,6 +93,12 @@ from .dry_run import _round_order_price, _round_order_qty
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
+from .multi_timeframe_bias import (
+    MultiTimeframeBiasConfig,
+    apply_multi_timeframe_bias,
+    resolve_dynamic_side_scheduler,
+    resolve_multi_timeframe_bias,
+)
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
 AUTO_REGIME_DEFENSIVE_PROFILE = "volatility_defensive_v1"
@@ -472,6 +478,8 @@ def resolve_adaptive_step_price(
     window_3m_abs_return_ratio: float | None,
     window_5m_abs_return_ratio: float | None,
     max_scale: float,
+    window_3m_amplitude_ratio: float | None = None,
+    window_5m_amplitude_ratio: float | None = None,
     base_per_order_notional: float | None = None,
     base_base_position_notional: float | None = None,
     base_inventory_tier_start_notional: float | None = None,
@@ -555,9 +563,11 @@ def resolve_adaptive_step_price(
         },
         "window_3m": {
             "abs_return_ratio": _safe_float(window_3m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_3m_amplitude_ratio),
         },
         "window_5m": {
             "abs_return_ratio": _safe_float(window_5m_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_5m_amplitude_ratio),
         },
     }
     candidates: list[tuple[float, str, str, float, float]] = []
@@ -1072,6 +1082,10 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
         "soon_high_vol_short_grid_v1",
         "soon_volume_neutral_ping_pong_v1",
         "soonusdt_competition_neutral_ping_pong_v1",
+        "bzusdt_competition_maker_neutral_v1",
+        "bzusdt_competition_maker_neutral_conservative_v1",
+        "clusdt_competition_maker_neutral_v1",
+        "clusdt_competition_maker_neutral_conservative_v1",
         "ethusdc_um_volume_long_v1",
     } or normalized_profile.endswith("_competition_neutral_ping_pong_v1")
 
@@ -3264,10 +3278,67 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         adaptive_step_1m_abs_return_ratio=getattr(args, "adaptive_step_1m_abs_return_ratio", 0.0),
         adaptive_step_1m_amplitude_ratio=getattr(args, "adaptive_step_1m_amplitude_ratio", 0.0),
         adaptive_step_3m_abs_return_ratio=getattr(args, "adaptive_step_3m_abs_return_ratio", 0.0),
+        adaptive_step_3m_amplitude_ratio=getattr(args, "adaptive_step_3m_amplitude_ratio", 0.0),
         adaptive_step_5m_abs_return_ratio=getattr(args, "adaptive_step_5m_abs_return_ratio", 0.0),
+        adaptive_step_5m_amplitude_ratio=getattr(args, "adaptive_step_5m_amplitude_ratio", 0.0),
         adaptive_step_max_scale=getattr(args, "adaptive_step_max_scale", 1.0),
         adaptive_step_min_per_order_scale=getattr(args, "adaptive_step_min_per_order_scale", 1.0),
         adaptive_step_min_position_limit_scale=getattr(args, "adaptive_step_min_position_limit_scale", 1.0),
+        multi_timeframe_bias_enabled=getattr(args, "multi_timeframe_bias_enabled", False),
+        multi_timeframe_bias_low_zone_threshold=getattr(args, "multi_timeframe_bias_low_zone_threshold", 0.35),
+        multi_timeframe_bias_high_zone_threshold=getattr(args, "multi_timeframe_bias_high_zone_threshold", 0.65),
+        multi_timeframe_bias_strong_threshold=getattr(args, "multi_timeframe_bias_strong_threshold", 0.50),
+        multi_timeframe_bias_max_level_delta=getattr(args, "multi_timeframe_bias_max_level_delta", 4),
+        multi_timeframe_bias_max_offset_steps=getattr(args, "multi_timeframe_bias_max_offset_steps", 1.0),
+        multi_timeframe_bias_favored_position_scale=getattr(args, "multi_timeframe_bias_favored_position_scale", 1.25),
+        multi_timeframe_bias_unfavored_position_scale=getattr(args, "multi_timeframe_bias_unfavored_position_scale", 0.75),
+        multi_timeframe_bias_shock_abs_return_ratio=getattr(args, "multi_timeframe_bias_shock_abs_return_ratio", 0.018),
+        multi_timeframe_bias_shock_amplitude_ratio=getattr(args, "multi_timeframe_bias_shock_amplitude_ratio", 0.025),
+        multi_timeframe_bias_shock_step_scale=getattr(args, "multi_timeframe_bias_shock_step_scale", 1.5),
+        multi_timeframe_bias_shock_notional_scale=getattr(args, "multi_timeframe_bias_shock_notional_scale", 0.70),
+        multi_timeframe_bias_scheduler_enabled=getattr(args, "multi_timeframe_bias_scheduler_enabled", True),
+        multi_timeframe_bias_scheduler_zone_weight=getattr(args, "multi_timeframe_bias_scheduler_zone_weight", 0.60),
+        multi_timeframe_bias_scheduler_trend_weight=getattr(args, "multi_timeframe_bias_scheduler_trend_weight", 0.25),
+        multi_timeframe_bias_scheduler_inventory_weight=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_inventory_weight",
+            0.55,
+        ),
+        multi_timeframe_bias_scheduler_min_budget_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_min_budget_scale",
+            0.20,
+        ),
+        multi_timeframe_bias_scheduler_max_budget_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_max_budget_scale",
+            1.15,
+        ),
+        multi_timeframe_bias_scheduler_inventory_skew_threshold=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_inventory_skew_threshold",
+            0.70,
+        ),
+        multi_timeframe_bias_scheduler_max_offset_steps=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_max_offset_steps",
+            2.0,
+        ),
+        multi_timeframe_bias_scheduler_defensive_notional_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_defensive_notional_scale",
+            0.60,
+        ),
+        multi_timeframe_bias_scheduler_defensive_step_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_defensive_step_scale",
+            1.35,
+        ),
+        multi_timeframe_bias_scheduler_reduce_max_order_scale=getattr(
+            args,
+            "multi_timeframe_bias_scheduler_reduce_max_order_scale",
+            0.65,
+        ),
         synthetic_trend_follow_enabled=getattr(args, "synthetic_trend_follow_enabled", False),
         synthetic_trend_follow_1m_abs_return_ratio=getattr(args, "synthetic_trend_follow_1m_abs_return_ratio", 0.0),
         synthetic_trend_follow_1m_amplitude_ratio=getattr(args, "synthetic_trend_follow_1m_amplitude_ratio", 0.0),
@@ -7479,6 +7550,63 @@ def apply_inventory_tiering(
     }
 
 
+def _multi_timeframe_bias_config(args: argparse.Namespace) -> MultiTimeframeBiasConfig:
+    return MultiTimeframeBiasConfig(
+        enabled=bool(getattr(args, "multi_timeframe_bias_enabled", False)),
+        low_zone_threshold=float(getattr(args, "multi_timeframe_bias_low_zone_threshold", 0.35)),
+        high_zone_threshold=float(getattr(args, "multi_timeframe_bias_high_zone_threshold", 0.65)),
+        strong_bias_threshold=float(getattr(args, "multi_timeframe_bias_strong_threshold", 0.50)),
+        max_level_delta=int(getattr(args, "multi_timeframe_bias_max_level_delta", 4)),
+        max_offset_steps=float(getattr(args, "multi_timeframe_bias_max_offset_steps", 1.0)),
+        favored_position_scale=float(getattr(args, "multi_timeframe_bias_favored_position_scale", 1.25)),
+        unfavored_position_scale=float(getattr(args, "multi_timeframe_bias_unfavored_position_scale", 0.75)),
+        shock_abs_return_ratio=float(getattr(args, "multi_timeframe_bias_shock_abs_return_ratio", 0.018)),
+        shock_amplitude_ratio=float(getattr(args, "multi_timeframe_bias_shock_amplitude_ratio", 0.025)),
+        shock_step_scale=float(getattr(args, "multi_timeframe_bias_shock_step_scale", 1.5)),
+        shock_notional_scale=float(getattr(args, "multi_timeframe_bias_shock_notional_scale", 0.70)),
+        scheduler_enabled=bool(getattr(args, "multi_timeframe_bias_scheduler_enabled", True)),
+        scheduler_zone_weight=float(getattr(args, "multi_timeframe_bias_scheduler_zone_weight", 0.60)),
+        scheduler_trend_weight=float(getattr(args, "multi_timeframe_bias_scheduler_trend_weight", 0.25)),
+        scheduler_inventory_weight=float(getattr(args, "multi_timeframe_bias_scheduler_inventory_weight", 0.55)),
+        scheduler_min_budget_scale=float(getattr(args, "multi_timeframe_bias_scheduler_min_budget_scale", 0.20)),
+        scheduler_max_budget_scale=float(getattr(args, "multi_timeframe_bias_scheduler_max_budget_scale", 1.15)),
+        scheduler_inventory_skew_threshold=float(
+            getattr(args, "multi_timeframe_bias_scheduler_inventory_skew_threshold", 0.70)
+        ),
+        scheduler_max_offset_steps=float(getattr(args, "multi_timeframe_bias_scheduler_max_offset_steps", 2.0)),
+        scheduler_defensive_notional_scale=float(
+            getattr(args, "multi_timeframe_bias_scheduler_defensive_notional_scale", 0.60)
+        ),
+        scheduler_defensive_step_scale=float(getattr(args, "multi_timeframe_bias_scheduler_defensive_step_scale", 1.35)),
+        scheduler_reduce_max_order_scale=float(getattr(args, "multi_timeframe_bias_scheduler_reduce_max_order_scale", 0.65)),
+    )
+
+
+def _fetch_multi_timeframe_bias_windows(
+    *,
+    symbol: str,
+    now: datetime,
+) -> dict[str, list[Any]]:
+    end_ms = int(now.timestamp() * 1000)
+    specs = {
+        "1m": ("1m", timedelta(minutes=4), 6),
+        "15m": ("15m", timedelta(minutes=60), 6),
+        "1h": ("1h", timedelta(hours=4), 6),
+        "4h": ("4h", timedelta(hours=16), 6),
+    }
+    windows: dict[str, list[Any]] = {}
+    for name, (interval, lookback, limit) in specs.items():
+        candles = fetch_futures_klines(
+            symbol=symbol,
+            interval=interval,
+            start_ms=int((now - lookback).timestamp() * 1000),
+            end_ms=end_ms,
+            limit=limit,
+        )
+        windows[name] = [item for item in candles if item.close_time <= now]
+    return windows
+
+
 def _trim_order_to_notional(
     *,
     order: dict[str, Any],
@@ -7889,6 +8017,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         window_3m_abs_return_ratio=getattr(effective_args, "adaptive_step_3m_abs_return_ratio", None),
         window_5m_abs_return_ratio=getattr(effective_args, "adaptive_step_5m_abs_return_ratio", None),
         max_scale=float(getattr(effective_args, "adaptive_step_max_scale", 1.0)),
+        window_3m_amplitude_ratio=getattr(effective_args, "adaptive_step_3m_amplitude_ratio", None),
+        window_5m_amplitude_ratio=getattr(effective_args, "adaptive_step_5m_amplitude_ratio", None),
         base_per_order_notional=getattr(effective_args, "per_order_notional", None),
         base_base_position_notional=getattr(effective_args, "base_position_notional", None),
         base_inventory_tier_start_notional=getattr(effective_args, "inventory_tier_start_notional", None),
@@ -7928,6 +8058,66 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             effective_args.max_short_position_notional = float(adaptive_step["effective_max_short_position_notional"])
         if adaptive_step.get("effective_max_total_notional") is not None:
             effective_args.max_total_notional = float(adaptive_step["effective_max_total_notional"])
+
+    multi_timeframe_bias_config = _multi_timeframe_bias_config(effective_args)
+    multi_timeframe_bias = {
+        "enabled": bool(multi_timeframe_bias_config.enabled),
+        "available": False,
+        "regime": "disabled" if not multi_timeframe_bias_config.enabled else "not_evaluated",
+        "applied": False,
+        "scheduler": {
+            "enabled": bool(multi_timeframe_bias_config.enabled and multi_timeframe_bias_config.scheduler_enabled),
+            "available": False,
+            "applied": False,
+        },
+    }
+    multi_timeframe_adjustments: dict[str, Any] = {}
+    if multi_timeframe_bias_config.enabled:
+        try:
+            multi_timeframe_bias = resolve_multi_timeframe_bias(
+                current_price=mid_price,
+                step_price=effective_args.step_price,
+                windows=_fetch_multi_timeframe_bias_windows(symbol=symbol, now=plan_now),
+                config=multi_timeframe_bias_config,
+            )
+            multi_timeframe_adjustments = apply_multi_timeframe_bias(
+                buy_levels=int(getattr(effective_args, "buy_levels", 0)),
+                sell_levels=int(getattr(effective_args, "sell_levels", 0)),
+                per_order_notional=float(getattr(effective_args, "per_order_notional", 0.0)),
+                step_price=float(getattr(effective_args, "step_price", 0.0)),
+                max_position_notional=float(getattr(effective_args, "max_position_notional", 0.0) or 0.0),
+                max_short_position_notional=float(getattr(effective_args, "max_short_position_notional", 0.0) or 0.0),
+                report=multi_timeframe_bias,
+                config=multi_timeframe_bias_config,
+            )
+            if multi_timeframe_adjustments.get("applied"):
+                effective_args = argparse.Namespace(**vars(effective_args))
+                effective_args.buy_levels = int(multi_timeframe_adjustments["buy_levels"])
+                effective_args.sell_levels = int(multi_timeframe_adjustments["sell_levels"])
+                effective_args.per_order_notional = float(multi_timeframe_adjustments["per_order_notional"])
+                effective_args.step_price = float(multi_timeframe_adjustments["step_price"])
+                if getattr(effective_args, "max_position_notional", None) is not None:
+                    effective_args.max_position_notional = float(multi_timeframe_adjustments["max_position_notional"])
+                if getattr(effective_args, "max_short_position_notional", None) is not None:
+                    effective_args.max_short_position_notional = float(multi_timeframe_adjustments["max_short_position_notional"])
+                effective_args.static_buy_offset_steps = (
+                    float(getattr(effective_args, "static_buy_offset_steps", 0.0))
+                    + float(multi_timeframe_adjustments.get("buy_offset_steps", 0.0))
+                )
+                effective_args.static_sell_offset_steps = (
+                    float(getattr(effective_args, "static_sell_offset_steps", 0.0))
+                    + float(multi_timeframe_adjustments.get("sell_offset_steps", 0.0))
+                )
+                multi_timeframe_bias["applied"] = True
+                multi_timeframe_bias["adjustments"] = dict(multi_timeframe_adjustments)
+        except Exception as exc:
+            multi_timeframe_bias = {
+                "enabled": True,
+                "available": False,
+                "regime": "error",
+                "applied": False,
+                "warning": f"{exc.__class__.__name__}: {exc}",
+            }
 
     effective_args = argparse.Namespace(**vars(effective_args))
     effective_args.take_profit_min_profit_ratio = _resolve_effective_take_profit_min_profit_ratio(
@@ -8105,6 +8295,64 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price = max(actual_cost_basis_price, 0.0)
     exchange_long_avg_price = current_long_avg_price
     exchange_short_avg_price = current_short_avg_price
+
+    def _apply_multi_timeframe_side_scheduler(*, long_notional: float, short_notional: float) -> None:
+        nonlocal effective_args, multi_timeframe_bias
+        if not bool(multi_timeframe_bias_config.enabled and multi_timeframe_bias_config.scheduler_enabled):
+            return
+        scheduler = resolve_dynamic_side_scheduler(
+            report=multi_timeframe_bias,
+            current_long_notional=long_notional,
+            current_short_notional=short_notional,
+            max_position_notional=getattr(effective_args, "max_position_notional", None),
+            max_short_position_notional=getattr(effective_args, "max_short_position_notional", None),
+            pause_buy_position_notional=getattr(effective_args, "pause_buy_position_notional", None),
+            pause_short_position_notional=getattr(effective_args, "pause_short_position_notional", None),
+            per_order_notional=getattr(effective_args, "per_order_notional", 0.0),
+            step_price=getattr(effective_args, "step_price", 0.0),
+            recent_loss_ratio=(
+                abs(_safe_float(runtime_guard_result.rolling_hourly_loss))
+                / max(_safe_float(runtime_guard_config.rolling_hourly_loss_limit), 1e-12)
+                if _safe_float(runtime_guard_config.rolling_hourly_loss_limit) > 0
+                else 0.0
+            ),
+            active_delever_loss_count=0,
+            config=multi_timeframe_bias_config,
+        )
+        multi_timeframe_bias["scheduler"] = dict(scheduler)
+        if not scheduler.get("applied"):
+            return
+        effective_args = argparse.Namespace(**vars(effective_args))
+        effective_args.per_order_notional = float(scheduler["per_order_notional"])
+        effective_args.step_price = float(scheduler["step_price"])
+        if getattr(effective_args, "max_position_notional", None) is not None:
+            effective_args.max_position_notional = float(scheduler["max_position_notional"])
+        if getattr(effective_args, "max_short_position_notional", None) is not None:
+            effective_args.max_short_position_notional = float(scheduler["max_short_position_notional"])
+        if getattr(effective_args, "pause_buy_position_notional", None) is not None:
+            effective_args.pause_buy_position_notional = float(scheduler["pause_buy_position_notional"])
+        if getattr(effective_args, "pause_short_position_notional", None) is not None:
+            effective_args.pause_short_position_notional = float(scheduler["pause_short_position_notional"])
+        effective_args.static_buy_offset_steps = (
+            float(getattr(effective_args, "static_buy_offset_steps", 0.0))
+            + float(scheduler.get("buy_offset_steps", 0.0))
+        )
+        effective_args.static_sell_offset_steps = (
+            float(getattr(effective_args, "static_sell_offset_steps", 0.0))
+            + float(scheduler.get("sell_offset_steps", 0.0))
+        )
+        if getattr(effective_args, "adverse_reduce_max_order_notional", None) is not None:
+            effective_args.adverse_reduce_max_order_notional = max(
+                _safe_float(effective_args.adverse_reduce_max_order_notional)
+                * _safe_float(scheduler.get("reduce_max_order_scale")),
+                0.0,
+            )
+        if getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None) is not None:
+            effective_args.hard_loss_forced_reduce_max_order_notional = max(
+                _safe_float(effective_args.hard_loss_forced_reduce_max_order_notional)
+                * _safe_float(scheduler.get("reduce_max_order_scale")),
+                0.0,
+            )
     synthetic_ledger_snapshot: dict[str, Any] | None = None
     excess_inventory_gate = {
         "enabled": bool(getattr(args, "excess_inventory_reduce_only_enabled", False)),
@@ -8632,6 +8880,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
             and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
         )
+        _apply_multi_timeframe_side_scheduler(
+            long_notional=current_long_notional,
+            short_notional=current_short_notional,
+        )
+        inventory_long_pause_active = (
+            _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) > 0
+            and current_long_notional >= _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) - 1e-12
+        )
+        inventory_short_pause_active = (
+            _safe_float(getattr(effective_args, "pause_short_position_notional", None)) > 0
+            and current_short_notional >= _safe_float(getattr(effective_args, "pause_short_position_notional", None)) - 1e-12
+        )
         inventory_long_probe_scale = (
             _clamp_ratio(float(getattr(effective_args, "inventory_pause_long_probe_scale", 0.0)))
             if inventory_long_pause_active
@@ -8837,6 +9097,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0)
         current_long_notional = current_long_qty * max(mid_price, 0.0)
         current_short_notional = current_short_qty * max(mid_price, 0.0)
+        _apply_multi_timeframe_side_scheduler(
+            long_notional=current_long_notional,
+            short_notional=current_short_notional,
+        )
         inventory_long_pause_active = (
             _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) > 0
             and current_long_notional >= _safe_float(getattr(effective_args, "pause_buy_position_notional", None)) - 1e-12
@@ -10171,6 +10435,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "shift_moves": shift_moves,
         "market_guard": market_guard,
         "adaptive_step": adaptive_step,
+        "multi_timeframe_bias": multi_timeframe_bias,
         "maker_volatility_inventory": maker_volatility_inventory,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
@@ -10848,10 +11113,35 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-1m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-3m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-5m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--adaptive-step-5m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--multi-timeframe-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--multi-timeframe-bias-low-zone-threshold", type=float, default=0.35)
+    parser.add_argument("--multi-timeframe-bias-high-zone-threshold", type=float, default=0.65)
+    parser.add_argument("--multi-timeframe-bias-strong-threshold", type=float, default=0.50)
+    parser.add_argument("--multi-timeframe-bias-max-level-delta", type=int, default=4)
+    parser.add_argument("--multi-timeframe-bias-max-offset-steps", type=float, default=1.0)
+    parser.add_argument("--multi-timeframe-bias-favored-position-scale", type=float, default=1.25)
+    parser.add_argument("--multi-timeframe-bias-unfavored-position-scale", type=float, default=0.75)
+    parser.add_argument("--multi-timeframe-bias-shock-abs-return-ratio", type=float, default=0.018)
+    parser.add_argument("--multi-timeframe-bias-shock-amplitude-ratio", type=float, default=0.025)
+    parser.add_argument("--multi-timeframe-bias-shock-step-scale", type=float, default=1.5)
+    parser.add_argument("--multi-timeframe-bias-shock-notional-scale", type=float, default=0.70)
+    parser.add_argument("--multi-timeframe-bias-scheduler-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--multi-timeframe-bias-scheduler-zone-weight", type=float, default=0.60)
+    parser.add_argument("--multi-timeframe-bias-scheduler-trend-weight", type=float, default=0.25)
+    parser.add_argument("--multi-timeframe-bias-scheduler-inventory-weight", type=float, default=0.55)
+    parser.add_argument("--multi-timeframe-bias-scheduler-min-budget-scale", type=float, default=0.20)
+    parser.add_argument("--multi-timeframe-bias-scheduler-max-budget-scale", type=float, default=1.15)
+    parser.add_argument("--multi-timeframe-bias-scheduler-inventory-skew-threshold", type=float, default=0.70)
+    parser.add_argument("--multi-timeframe-bias-scheduler-max-offset-steps", type=float, default=2.0)
+    parser.add_argument("--multi-timeframe-bias-scheduler-defensive-notional-scale", type=float, default=0.60)
+    parser.add_argument("--multi-timeframe-bias-scheduler-defensive-step-scale", type=float, default=1.35)
+    parser.add_argument("--multi-timeframe-bias-scheduler-reduce-max-order-scale", type=float, default=0.65)
     parser.add_argument("--synthetic-trend-follow-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--synthetic-trend-follow-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--synthetic-trend-follow-1m-amplitude-ratio", type=float, default=0.0)
@@ -11017,6 +11307,17 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             "  adaptive_risk: "
             f"per_order_scale={_safe_float(adaptive_step.get('per_order_scale')):.2f} "
             f"position_limit_scale={_safe_float(adaptive_step.get('position_limit_scale')):.2f}"
+        )
+    mtf_bias = summary.get("multi_timeframe_bias") if isinstance(summary.get("multi_timeframe_bias"), dict) else {}
+    if mtf_bias.get("enabled"):
+        print(
+            "  mtf_bias: "
+            f"{mtf_bias.get('regime', '--')} "
+            f"long={_safe_float(mtf_bias.get('long_bias_score')):.2f} "
+            f"short={_safe_float(mtf_bias.get('short_bias_score')):.2f} "
+            f"zone={_safe_float(mtf_bias.get('zone_score')):.2f} "
+            f"shock={'yes' if mtf_bias.get('shock_active') else 'no'} "
+            f"applied={'yes' if mtf_bias.get('applied') else 'no'}"
         )
     if summary.get("max_position_notional"):
         print(
@@ -11324,8 +11625,10 @@ def main() -> None:
         raise SystemExit("--adaptive-step 30s thresholds must be >= 0")
     if args.adaptive_step_1m_abs_return_ratio < 0 or args.adaptive_step_1m_amplitude_ratio < 0:
         raise SystemExit("--adaptive-step 1m thresholds must be >= 0")
-    if args.adaptive_step_3m_abs_return_ratio < 0 or args.adaptive_step_5m_abs_return_ratio < 0:
-        raise SystemExit("--adaptive-step trend thresholds must be >= 0")
+    if args.adaptive_step_3m_abs_return_ratio < 0 or args.adaptive_step_3m_amplitude_ratio < 0:
+        raise SystemExit("--adaptive-step 3m thresholds must be >= 0")
+    if args.adaptive_step_5m_abs_return_ratio < 0 or args.adaptive_step_5m_amplitude_ratio < 0:
+        raise SystemExit("--adaptive-step 5m thresholds must be >= 0")
     if args.adaptive_step_enabled and args.adaptive_step_max_scale <= 1.0:
         raise SystemExit("--adaptive-step-max-scale must be > 1 when adaptive step is enabled")
     if args.adaptive_step_min_per_order_scale <= 0 or args.adaptive_step_min_per_order_scale > 1.0:
@@ -11340,10 +11643,64 @@ def main() -> None:
             args.adaptive_step_1m_abs_return_ratio,
             args.adaptive_step_1m_amplitude_ratio,
             args.adaptive_step_3m_abs_return_ratio,
+            args.adaptive_step_3m_amplitude_ratio,
             args.adaptive_step_5m_abs_return_ratio,
+            args.adaptive_step_5m_amplitude_ratio,
         )
     ):
         raise SystemExit("adaptive step requires at least one positive shock/trend trigger threshold")
+    if args.multi_timeframe_bias_low_zone_threshold < 0 or args.multi_timeframe_bias_low_zone_threshold > 1:
+        raise SystemExit("--multi-timeframe-bias-low-zone-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_high_zone_threshold < 0 or args.multi_timeframe_bias_high_zone_threshold > 1:
+        raise SystemExit("--multi-timeframe-bias-high-zone-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_low_zone_threshold >= args.multi_timeframe_bias_high_zone_threshold:
+        raise SystemExit("--multi-timeframe-bias-low-zone-threshold must be < high-zone-threshold")
+    if args.multi_timeframe_bias_strong_threshold < 0 or args.multi_timeframe_bias_strong_threshold > 1:
+        raise SystemExit("--multi-timeframe-bias-strong-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_max_level_delta < 0:
+        raise SystemExit("--multi-timeframe-bias-max-level-delta must be >= 0")
+    if args.multi_timeframe_bias_max_offset_steps < 0:
+        raise SystemExit("--multi-timeframe-bias-max-offset-steps must be >= 0")
+    if args.multi_timeframe_bias_favored_position_scale <= 0:
+        raise SystemExit("--multi-timeframe-bias-favored-position-scale must be > 0")
+    if args.multi_timeframe_bias_unfavored_position_scale <= 0:
+        raise SystemExit("--multi-timeframe-bias-unfavored-position-scale must be > 0")
+    if args.multi_timeframe_bias_shock_abs_return_ratio < 0:
+        raise SystemExit("--multi-timeframe-bias-shock-abs-return-ratio must be >= 0")
+    if args.multi_timeframe_bias_shock_amplitude_ratio < 0:
+        raise SystemExit("--multi-timeframe-bias-shock-amplitude-ratio must be >= 0")
+    if args.multi_timeframe_bias_shock_step_scale < 1:
+        raise SystemExit("--multi-timeframe-bias-shock-step-scale must be >= 1")
+    if args.multi_timeframe_bias_shock_notional_scale <= 0 or args.multi_timeframe_bias_shock_notional_scale > 1:
+        raise SystemExit("--multi-timeframe-bias-shock-notional-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_scheduler_zone_weight < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-zone-weight must be >= 0")
+    if args.multi_timeframe_bias_scheduler_trend_weight < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-trend-weight must be >= 0")
+    if args.multi_timeframe_bias_scheduler_inventory_weight < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-inventory-weight must be >= 0")
+    if args.multi_timeframe_bias_scheduler_min_budget_scale <= 0 or args.multi_timeframe_bias_scheduler_min_budget_scale > 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-min-budget-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_scheduler_max_budget_scale < 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-max-budget-scale must be >= 1")
+    if (
+        args.multi_timeframe_bias_scheduler_inventory_skew_threshold < 0
+        or args.multi_timeframe_bias_scheduler_inventory_skew_threshold > 1
+    ):
+        raise SystemExit("--multi-timeframe-bias-scheduler-inventory-skew-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_scheduler_max_offset_steps < 0:
+        raise SystemExit("--multi-timeframe-bias-scheduler-max-offset-steps must be >= 0")
+    if (
+        args.multi_timeframe_bias_scheduler_defensive_notional_scale <= 0
+        or args.multi_timeframe_bias_scheduler_defensive_notional_scale > 1
+    ):
+        raise SystemExit("--multi-timeframe-bias-scheduler-defensive-notional-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_scheduler_defensive_step_scale < 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-defensive-step-scale must be >= 1")
+    if args.multi_timeframe_bias_scheduler_reduce_max_order_scale <= 0 or args.multi_timeframe_bias_scheduler_reduce_max_order_scale > 1:
+        raise SystemExit("--multi-timeframe-bias-scheduler-reduce-max-order-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_enabled and str(args.strategy_mode).strip() != "synthetic_neutral":
+        raise SystemExit("--multi-timeframe-bias-enabled currently requires --strategy-mode synthetic_neutral")
     if args.synthetic_trend_follow_1m_abs_return_ratio < 0 or args.synthetic_trend_follow_1m_amplitude_ratio < 0:
         raise SystemExit("--synthetic-trend-follow 1m thresholds must be >= 0")
     if args.synthetic_trend_follow_3m_abs_return_ratio < 0 or args.synthetic_trend_follow_3m_amplitude_ratio < 0:
@@ -11719,6 +12076,49 @@ def main() -> None:
                 ),
                 "adaptive_step_window_5m_amplitude_ratio": _safe_float(
                     (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("amplitude_ratio")
+                ),
+                "multi_timeframe_bias": dict(plan_report.get("multi_timeframe_bias") or {}),
+                "multi_timeframe_bias_enabled": bool((plan_report.get("multi_timeframe_bias") or {}).get("enabled")),
+                "multi_timeframe_bias_available": bool((plan_report.get("multi_timeframe_bias") or {}).get("available")),
+                "multi_timeframe_bias_applied": bool((plan_report.get("multi_timeframe_bias") or {}).get("applied")),
+                "multi_timeframe_bias_regime": str(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("regime", "") or "")
+                ),
+                "multi_timeframe_bias_long_score": _safe_float(
+                    (plan_report.get("multi_timeframe_bias") or {}).get("long_bias_score")
+                ),
+                "multi_timeframe_bias_short_score": _safe_float(
+                    (plan_report.get("multi_timeframe_bias") or {}).get("short_bias_score")
+                ),
+                "multi_timeframe_bias_zone_score": _safe_float(
+                    (plan_report.get("multi_timeframe_bias") or {}).get("zone_score")
+                ),
+                "multi_timeframe_bias_direction_score": _safe_float(
+                    (plan_report.get("multi_timeframe_bias") or {}).get("direction_score")
+                ),
+                "multi_timeframe_bias_shock_active": bool(
+                    (plan_report.get("multi_timeframe_bias") or {}).get("shock_active")
+                ),
+                "multi_timeframe_scheduler_applied": bool(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("applied")
+                ),
+                "multi_timeframe_scheduler_defensive": bool(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("defensive_mode")
+                ),
+                "multi_timeframe_scheduler_long_budget_scale": _safe_float(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("long_budget_scale")
+                ),
+                "multi_timeframe_scheduler_short_budget_scale": _safe_float(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("short_budget_scale")
+                ),
+                "multi_timeframe_scheduler_long_permission": _safe_float(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("long_permission")
+                ),
+                "multi_timeframe_scheduler_short_permission": _safe_float(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("short_permission")
+                ),
+                "multi_timeframe_scheduler_reasons": list(
+                    ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("reasons") or []
                 ),
                 "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
                 "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
