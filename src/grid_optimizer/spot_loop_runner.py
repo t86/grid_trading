@@ -1378,6 +1378,22 @@ def _available_new_funds(
     return quote_free, base_free
 
 
+def _spot_order_meets_exchange_mins(
+    *,
+    qty: float,
+    price: float,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> bool:
+    if qty <= EPSILON or price <= EPSILON:
+        return False
+    if min_qty is not None and qty + EPSILON < float(min_qty):
+        return False
+    if min_notional is not None and qty * price + EPSILON < float(min_notional):
+        return False
+    return True
+
+
 def _cancel_orders(
     *,
     symbol: str,
@@ -1877,10 +1893,13 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
 
     placed_count = 0
     placement_errors: list[str] = []
+    skipped_below_exchange_mins: list[str] = []
     quote_free, base_free = _available_new_funds(account_info, base_asset, quote_asset)
     remaining_quote_free = quote_free
     remaining_base_free = base_free
     max_single_cycle_new_orders = max(_safe_int(getattr(args, "max_single_cycle_new_orders", 0)), 0)
+    min_qty = symbol_info.get("min_qty")
+    min_notional = symbol_info.get("min_notional")
     for order in diff["missing_orders"]:
         if max_single_cycle_new_orders > 0 and placed_count >= max_single_cycle_new_orders:
             break
@@ -1888,6 +1907,9 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         qty = float(order["qty"])
         price = float(order["price"])
         notional = qty * price
+        if not _spot_order_meets_exchange_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
+            skipped_below_exchange_mins.append(f"{side} {price:.8f} x {qty:.8f}")
+            continue
         if side == "BUY":
             if notional > remaining_quote_free + 1e-8:
                 continue
@@ -1963,6 +1985,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "canceled_count": canceled_count,
         "open_strategy_orders": len(strategy_open_orders),
         "placement_errors": placement_errors,
+        "skipped_below_exchange_mins": skipped_below_exchange_mins,
         "gross_notional": _safe_float(metrics.get("gross_notional")),
         "buy_notional": _safe_float(metrics.get("buy_notional")),
         "sell_notional": _safe_float(metrics.get("sell_notional")),

@@ -12,6 +12,7 @@ from grid_optimizer.spot_loop_runner import (
     _build_spot_competition_inventory_grid_orders,
     _load_state,
     _normalize_commission_quote,
+    _spot_order_meets_exchange_mins,
     _sync_volume_shift_trades,
 )
 
@@ -515,6 +516,24 @@ class SpotLoopRunnerTests(unittest.TestCase):
             quote_asset="USDT",
         )
         self.assertAlmostEqual(fee, 0.015, places=10)
+
+    def test_spot_order_meets_exchange_mins_rejects_notusdt_dust_sell(self) -> None:
+        self.assertFalse(
+            _spot_order_meets_exchange_mins(
+                qty=76.0,
+                price=0.00062,
+                min_qty=1.0,
+                min_notional=5.0,
+            )
+        )
+        self.assertTrue(
+            _spot_order_meets_exchange_mins(
+                qty=50000.0,
+                price=0.00062,
+                min_qty=1.0,
+                min_notional=5.0,
+            )
+        )
 
     def test_normalize_commission_quote_handles_base_asset(self) -> None:
         fee = _normalize_commission_quote(
