@@ -19,6 +19,9 @@ class MultiTimeframeBiasConfig:
     shock_amplitude_ratio: float = 0.025
     shock_step_scale: float = 1.5
     shock_notional_scale: float = 0.70
+    defensive_notional_scale: float = 0.70
+    defensive_position_scale: float = 0.70
+    recovery_notional_scale: float = 0.50
 
 
 def _safe_float(value: Any) -> float:
@@ -114,8 +117,49 @@ def resolve_multi_timeframe_bias(
         abs(_safe_float(one_min.get("return_ratio"))) >= config.shock_abs_return_ratio
         or _safe_float(one_min.get("amplitude_ratio")) >= config.shock_amplitude_ratio
     )
+    fifteen_return = _safe_float(fifteen.get("return_ratio"))
+    one_hour_return = _safe_float(one_hour.get("return_ratio"))
+    four_hour_return = _safe_float(four_hour.get("return_ratio"))
+    one_min_return = _safe_float(one_min.get("return_ratio"))
+    one_min_zone = _safe_float(one_min.get("zone"))
+    recovery_probe_active = (
+        not shock_active
+        and four_hour_return <= -0.04
+        and one_min_return > 0.0
+        and one_min_zone >= 0.65
+        and (config.low_zone_threshold * 0.75) < zone_score < config.high_zone_threshold
+    )
+    downtrend_defensive_active = (
+        not recovery_probe_active
+        and zone_score <= config.low_zone_threshold
+        and trend_score <= -0.45
+        and four_hour_return <= -0.025
+        and fifteen_return < 0.0
+        and one_hour_return < 0.0
+    )
+    uptrend_defensive_active = (
+        zone_score >= config.high_zone_threshold
+        and trend_score >= 0.45
+        and four_hour_return >= 0.025
+        and fifteen_return > 0.0
+        and one_hour_return > 0.0
+    )
 
-    if long_bias_score >= config.strong_bias_threshold and long_bias_score >= short_bias_score:
+    if shock_active:
+        regime = "shock_defensive"
+    elif downtrend_defensive_active:
+        regime = "downtrend_defensive"
+        long_bias_score = min(long_bias_score, config.strong_bias_threshold * 0.5)
+        short_bias_score = max(short_bias_score, min(0.35, 1.0))
+    elif uptrend_defensive_active:
+        regime = "uptrend_defensive"
+        short_bias_score = min(short_bias_score, config.strong_bias_threshold * 0.5)
+        long_bias_score = max(long_bias_score, min(0.35, 1.0))
+    elif recovery_probe_active:
+        regime = "recovery_probe"
+        long_bias_score = min(long_bias_score, config.strong_bias_threshold * 0.5)
+        short_bias_score = min(short_bias_score, config.strong_bias_threshold * 0.5)
+    elif long_bias_score >= config.strong_bias_threshold and long_bias_score >= short_bias_score:
         regime = "low_long_bias"
     elif short_bias_score >= config.strong_bias_threshold:
         regime = "high_short_bias"
@@ -135,6 +179,9 @@ def resolve_multi_timeframe_bias(
                 if shock_active
                 else None
             ),
+            "downtrend_defensive_active": downtrend_defensive_active,
+            "uptrend_defensive_active": uptrend_defensive_active,
+            "recovery_probe_active": recovery_probe_active,
         }
     )
     return report
@@ -179,7 +226,34 @@ def apply_multi_timeframe_bias(
     short_scale = 1.0
     buy_offset_steps = 0.0
     sell_offset_steps = 0.0
-    if adapter == "one_way_long":
+    regime = str(report.get("regime") or "")
+    if regime == "shock_defensive":
+        base_buy = max(base_buy - max(level_delta, 1), 1)
+        base_sell = max(base_sell - max(level_delta, 1), 1)
+        long_scale = min(cfg.defensive_position_scale, 1.0)
+        short_scale = min(cfg.defensive_position_scale, 1.0)
+        base_notional *= min(cfg.defensive_notional_scale, 1.0)
+    elif regime == "downtrend_defensive":
+        base_buy = max(base_buy - max(level_delta, 1), 1)
+        long_scale = min(cfg.defensive_position_scale, 1.0)
+        base_notional *= min(cfg.defensive_notional_scale, 1.0)
+        buy_offset_steps = abs(direction_score) * cfg.max_offset_steps
+        if adapter in {"synthetic_neutral", "inventory_grid"}:
+            base_sell += min(level_delta, 1 if level_delta > 0 else 0)
+            short_scale = max(1.0, 1.0 + ((cfg.favored_position_scale - 1.0) * 0.25))
+    elif regime == "uptrend_defensive":
+        base_sell = max(base_sell - max(level_delta, 1), 1)
+        short_scale = min(cfg.defensive_position_scale, 1.0)
+        base_notional *= min(cfg.defensive_notional_scale, 1.0)
+        sell_offset_steps = -abs(direction_score) * cfg.max_offset_steps
+        if adapter in {"synthetic_neutral", "inventory_grid"}:
+            base_buy += min(level_delta, 1 if level_delta > 0 else 0)
+            long_scale = max(1.0, 1.0 + ((cfg.favored_position_scale - 1.0) * 0.25))
+    elif regime == "recovery_probe":
+        base_notional *= min(cfg.recovery_notional_scale, 1.0)
+        long_scale = min(1.0, 1.0 + ((cfg.favored_position_scale - 1.0) * 0.25))
+        short_scale = min(1.0, 1.0 + ((cfg.favored_position_scale - 1.0) * 0.25))
+    elif adapter == "one_way_long":
         long_bias = _clamp(_safe_float(report.get("long_bias_score")), 0.0, 1.0)
         short_bias = _clamp(_safe_float(report.get("short_bias_score")), 0.0, 1.0)
         if long_bias >= short_bias and direction_score < 0:
