@@ -10429,6 +10429,65 @@ def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
     return {"symbol": symbol, "plan": plan, "orders": responses, "history": history, "snapshot": _manual_trade_snapshot(symbol)}
 
 
+def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_symbol = str(payload.get("symbol", "")).upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    normalized_side = str(payload.get("side", "")).upper().strip()
+    if normalized_side not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    safe_notional = float(payload.get("notional", 0) or 0)
+    if safe_notional <= 0:
+        raise ValueError("notional must be > 0")
+    creds = load_binance_api_credentials()
+    if creds is None:
+        raise RuntimeError("Binance API credentials are not configured")
+    api_key, api_secret = creds
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    if _truthy(position_mode.get("dualSidePosition")):
+        raise ValueError("manual trade requires one-way position mode")
+    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
+    symbol_info = fetch_futures_symbol_config(normalized_symbol)
+    price = bid_price if normalized_side == "BUY" else ask_price
+    rounded_price = _round_order_price(price, symbol_info.get("tick_size"), normalized_side)
+    quantity = _round_order_qty(safe_notional / rounded_price, symbol_info.get("step_size"))
+    if quantity <= 0:
+        raise ValueError("quantity rounds to zero")
+    min_qty = symbol_info.get("min_qty")
+    if min_qty is not None and quantity < float(min_qty):
+        raise ValueError("quantity is below minimum quantity")
+    min_notional = symbol_info.get("min_notional")
+    if min_notional is not None and quantity * rounded_price < float(min_notional):
+        raise ValueError("order notional is below minimum notional")
+    prefix = _manual_trade_client_order_prefix(normalized_symbol)
+    role = "book_buy" if normalized_side == "BUY" else "book_sell"
+    client_order_id = _manual_trade_order_id(prefix, role, normalized_side)
+    response = post_futures_order(
+        symbol=normalized_symbol,
+        side=normalized_side,
+        quantity=quantity,
+        price=rounded_price,
+        api_key=api_key,
+        api_secret=api_secret,
+        time_in_force="GTX",
+        reduce_only=None,
+        new_client_order_id=client_order_id,
+    )
+    return {
+        "symbol": normalized_symbol,
+        "limit_order": {
+            "side": normalized_side,
+            "quantity": quantity,
+            "price": rounded_price,
+            "notional": quantity * rounded_price,
+            "time_in_force": "GTX",
+            "client_order_id": client_order_id,
+        },
+        "order": response,
+        "snapshot": _manual_trade_snapshot(normalized_symbol),
+    }
+
+
 def _manual_trade_chase_leg(
     *,
     symbol: str,
@@ -16916,6 +16975,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <div class="actions">
           <button id="maker_buy_btn" class="buy">Maker 买入追盘</button>
           <button id="maker_sell_btn" class="sell">Maker 卖出追盘</button>
+          <button id="book_buy_btn" class="buy">买一挂买</button>
+          <button id="book_sell_btn" class="sell">卖一挂卖</button>
           <button id="take_buy_btn">Take 买入市价</button>
           <button id="take_sell_btn">Take 卖出市价</button>
         </div>
@@ -17151,10 +17212,17 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ symbol: symbolEl.value, side, notional: Number(notionalEl.value || 0), margin_mode: marginModeEl.value || "KEEP" }),
       }, 5000);
-      actionMetaEl.textContent = endpoint.includes("take") ? "Take 市价单已提交。" : "Maker 追盘任务已启动。";
+      if (endpoint.includes("take")) {
+        actionMetaEl.textContent = "Take 市价单已提交。";
+      } else if (endpoint.includes("book_limit")) {
+        const order = data.limit_order || {};
+        actionMetaEl.textContent = `静态挂盘已提交：${side} ${fmt(order.quantity, 8)} @ ${fmt(order.price, 8)}`;
+      } else {
+        actionMetaEl.textContent = "Maker 追盘任务已启动。";
+      }
       if (data.snapshot) renderSnapshot(data.snapshot);
       if (data.task) renderTask(data.task);
-      if (endpoint.includes("take")) {
+      if (endpoint.includes("take") || endpoint.includes("book_limit")) {
         await refreshStatus({ force: true });
       } else {
         setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500);
@@ -17188,6 +17256,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     document.getElementById("refresh_btn").addEventListener("click", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "SELL").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("book_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/book_limit", "BUY").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("book_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/book_limit", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
@@ -31494,6 +31564,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {
             "/api/manual_trade/maker",
+            "/api/manual_trade/book_limit",
             "/api/manual_trade/take",
             "/api/manual_trade/cancel",
             "/api/manual_trade/history/delete",
@@ -31519,6 +31590,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if path.endswith("/maker"):
                     result = _manual_trade_start_maker(payload)
                     self._send_json({"ok": True, **result}, status=202)
+                elif path.endswith("/book_limit"):
+                    result = _manual_trade_place_book_limit(payload)
+                    self._send_json({"ok": True, **result}, status=200)
                 elif path.endswith("/take"):
                     result = _manual_trade_execute_take(payload)
                     self._send_json({"ok": True, **result}, status=200)
