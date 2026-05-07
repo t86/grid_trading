@@ -3313,6 +3313,18 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adaptive_step_max_scale": 1.0,
     "adaptive_step_min_per_order_scale": 1.0,
     "adaptive_step_min_position_limit_scale": 1.0,
+    "multi_timeframe_bias_enabled": False,
+    "multi_timeframe_bias_low_zone_threshold": 0.35,
+    "multi_timeframe_bias_high_zone_threshold": 0.65,
+    "multi_timeframe_bias_strong_threshold": 0.50,
+    "multi_timeframe_bias_max_level_delta": 4,
+    "multi_timeframe_bias_max_offset_steps": 1.0,
+    "multi_timeframe_bias_favored_position_scale": 1.25,
+    "multi_timeframe_bias_unfavored_position_scale": 0.75,
+    "multi_timeframe_bias_shock_abs_return_ratio": 0.018,
+    "multi_timeframe_bias_shock_amplitude_ratio": 0.025,
+    "multi_timeframe_bias_shock_step_scale": 1.5,
+    "multi_timeframe_bias_shock_notional_scale": 0.70,
     "execution_regime_enabled": False,
     "execution_regime_vol_p50_ratio": 0.003,
     "execution_regime_vol_p95_ratio": 0.012,
@@ -7863,6 +7875,16 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "multi_timeframe_bias_low_zone_threshold",
+        "multi_timeframe_bias_high_zone_threshold",
+        "multi_timeframe_bias_strong_threshold",
+        "multi_timeframe_bias_max_offset_steps",
+        "multi_timeframe_bias_favored_position_scale",
+        "multi_timeframe_bias_unfavored_position_scale",
+        "multi_timeframe_bias_shock_abs_return_ratio",
+        "multi_timeframe_bias_shock_amplitude_ratio",
+        "multi_timeframe_bias_shock_step_scale",
+        "multi_timeframe_bias_shock_notional_scale",
         "execution_regime_vol_p50_ratio",
         "execution_regime_vol_p95_ratio",
         "execution_regime_spread_p50_bps",
@@ -7994,6 +8016,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_confirm_caution_to_normal",
         "execution_regime_confirm_normal_to_safe",
         "execution_regime_confirm_normal_to_caution",
+        "multi_timeframe_bias_max_level_delta",
         "synthetic_flow_sleeve_levels",
         "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
@@ -8012,6 +8035,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_enabled",
         "take_profit_enabled",
         "adaptive_step_enabled",
+        "multi_timeframe_bias_enabled",
         "execution_regime_enabled",
         "volatility_entry_pause_enabled",
         "anti_chase_entry_guard_enabled",
@@ -8847,6 +8871,26 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--adaptive-step-min-per-order-scale", str(config["adaptive_step_min_per_order_scale"])])
     if config.get("adaptive_step_min_position_limit_scale") is not None:
         command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
+    command.append(
+        "--multi-timeframe-bias-enabled"
+        if config.get("multi_timeframe_bias_enabled", False)
+        else "--no-multi-timeframe-bias-enabled"
+    )
+    for key, flag in (
+        ("multi_timeframe_bias_low_zone_threshold", "--multi-timeframe-bias-low-zone-threshold"),
+        ("multi_timeframe_bias_high_zone_threshold", "--multi-timeframe-bias-high-zone-threshold"),
+        ("multi_timeframe_bias_strong_threshold", "--multi-timeframe-bias-strong-threshold"),
+        ("multi_timeframe_bias_max_level_delta", "--multi-timeframe-bias-max-level-delta"),
+        ("multi_timeframe_bias_max_offset_steps", "--multi-timeframe-bias-max-offset-steps"),
+        ("multi_timeframe_bias_favored_position_scale", "--multi-timeframe-bias-favored-position-scale"),
+        ("multi_timeframe_bias_unfavored_position_scale", "--multi-timeframe-bias-unfavored-position-scale"),
+        ("multi_timeframe_bias_shock_abs_return_ratio", "--multi-timeframe-bias-shock-abs-return-ratio"),
+        ("multi_timeframe_bias_shock_amplitude_ratio", "--multi-timeframe-bias-shock-amplitude-ratio"),
+        ("multi_timeframe_bias_shock_step_scale", "--multi-timeframe-bias-shock-step-scale"),
+        ("multi_timeframe_bias_shock_notional_scale", "--multi-timeframe-bias-shock-notional-scale"),
+    ):
+        if config.get(key) is not None:
+            command.extend([flag, str(config[key])])
     command.append(
         "--execution-regime-enabled"
         if config.get("execution_regime_enabled", False)

@@ -6438,6 +6438,30 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.adaptive_step_3m_amplitude_ratio, 0.006)
         self.assertEqual(args.adaptive_step_5m_amplitude_ratio, 0.01)
 
+    def test_build_parser_accepts_multi_timeframe_bias_controls(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--multi-timeframe-bias-enabled",
+                "--multi-timeframe-bias-max-level-delta",
+                "5",
+                "--multi-timeframe-bias-max-offset-steps",
+                "1.25",
+                "--multi-timeframe-bias-shock-abs-return-ratio",
+                "0.012",
+                "--multi-timeframe-bias-shock-amplitude-ratio",
+                "0.02",
+                "--multi-timeframe-bias-shock-notional-scale",
+                "0.6",
+            ]
+        )
+
+        self.assertTrue(args.multi_timeframe_bias_enabled)
+        self.assertEqual(args.multi_timeframe_bias_max_level_delta, 5)
+        self.assertEqual(args.multi_timeframe_bias_max_offset_steps, 1.25)
+        self.assertEqual(args.multi_timeframe_bias_shock_abs_return_ratio, 0.012)
+        self.assertEqual(args.multi_timeframe_bias_shock_amplitude_ratio, 0.02)
+        self.assertEqual(args.multi_timeframe_bias_shock_notional_scale, 0.6)
+
     def test_resolve_adaptive_step_uses_5m_amplitude_for_choppy_expansion(self) -> None:
         now = datetime(2026, 4, 30, 6, 0, tzinfo=timezone.utc)
         state = {

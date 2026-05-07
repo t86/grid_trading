@@ -103,6 +103,11 @@ from .execution_regime import (
 from .inventory_grid_plan import build_inventory_grid_orders
 from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
+from .multi_timeframe_bias import (
+    MultiTimeframeBiasConfig,
+    apply_multi_timeframe_bias,
+    resolve_multi_timeframe_bias,
+)
 from .notifications import alert_source_label, send_alert_email
 
 AUTO_REGIME_STABLE_PROFILE = "volume_long_v4"
@@ -3485,6 +3490,18 @@ def _planner_namespace(args: argparse.Namespace) -> argparse.Namespace:
         adaptive_step_max_scale=getattr(args, "adaptive_step_max_scale", 1.0),
         adaptive_step_min_per_order_scale=getattr(args, "adaptive_step_min_per_order_scale", 1.0),
         adaptive_step_min_position_limit_scale=getattr(args, "adaptive_step_min_position_limit_scale", 1.0),
+        multi_timeframe_bias_enabled=getattr(args, "multi_timeframe_bias_enabled", False),
+        multi_timeframe_bias_low_zone_threshold=getattr(args, "multi_timeframe_bias_low_zone_threshold", 0.35),
+        multi_timeframe_bias_high_zone_threshold=getattr(args, "multi_timeframe_bias_high_zone_threshold", 0.65),
+        multi_timeframe_bias_strong_threshold=getattr(args, "multi_timeframe_bias_strong_threshold", 0.50),
+        multi_timeframe_bias_max_level_delta=getattr(args, "multi_timeframe_bias_max_level_delta", 4),
+        multi_timeframe_bias_max_offset_steps=getattr(args, "multi_timeframe_bias_max_offset_steps", 1.0),
+        multi_timeframe_bias_favored_position_scale=getattr(args, "multi_timeframe_bias_favored_position_scale", 1.25),
+        multi_timeframe_bias_unfavored_position_scale=getattr(args, "multi_timeframe_bias_unfavored_position_scale", 0.75),
+        multi_timeframe_bias_shock_abs_return_ratio=getattr(args, "multi_timeframe_bias_shock_abs_return_ratio", 0.018),
+        multi_timeframe_bias_shock_amplitude_ratio=getattr(args, "multi_timeframe_bias_shock_amplitude_ratio", 0.025),
+        multi_timeframe_bias_shock_step_scale=getattr(args, "multi_timeframe_bias_shock_step_scale", 1.5),
+        multi_timeframe_bias_shock_notional_scale=getattr(args, "multi_timeframe_bias_shock_notional_scale", 0.70),
         volatility_entry_pause_enabled=getattr(args, "volatility_entry_pause_enabled", False),
         volatility_entry_pause_30s_abs_return_ratio=getattr(args, "volatility_entry_pause_30s_abs_return_ratio", 0.0),
         volatility_entry_pause_30s_amplitude_ratio=getattr(args, "volatility_entry_pause_30s_amplitude_ratio", 0.0),
@@ -8095,6 +8112,48 @@ def apply_inventory_tiering(
     }
 
 
+def _multi_timeframe_bias_config(args: argparse.Namespace) -> MultiTimeframeBiasConfig:
+    return MultiTimeframeBiasConfig(
+        enabled=bool(getattr(args, "multi_timeframe_bias_enabled", False)),
+        low_zone_threshold=float(getattr(args, "multi_timeframe_bias_low_zone_threshold", 0.35)),
+        high_zone_threshold=float(getattr(args, "multi_timeframe_bias_high_zone_threshold", 0.65)),
+        strong_bias_threshold=float(getattr(args, "multi_timeframe_bias_strong_threshold", 0.50)),
+        max_level_delta=int(getattr(args, "multi_timeframe_bias_max_level_delta", 4)),
+        max_offset_steps=float(getattr(args, "multi_timeframe_bias_max_offset_steps", 1.0)),
+        favored_position_scale=float(getattr(args, "multi_timeframe_bias_favored_position_scale", 1.25)),
+        unfavored_position_scale=float(getattr(args, "multi_timeframe_bias_unfavored_position_scale", 0.75)),
+        shock_abs_return_ratio=float(getattr(args, "multi_timeframe_bias_shock_abs_return_ratio", 0.018)),
+        shock_amplitude_ratio=float(getattr(args, "multi_timeframe_bias_shock_amplitude_ratio", 0.025)),
+        shock_step_scale=float(getattr(args, "multi_timeframe_bias_shock_step_scale", 1.5)),
+        shock_notional_scale=float(getattr(args, "multi_timeframe_bias_shock_notional_scale", 0.70)),
+    )
+
+
+def _fetch_multi_timeframe_bias_windows(
+    *,
+    symbol: str,
+    now: datetime,
+) -> dict[str, list[Any]]:
+    end_ms = int(now.timestamp() * 1000)
+    specs = {
+        "1m": ("1m", timedelta(minutes=4), 6),
+        "15m": ("15m", timedelta(minutes=60), 6),
+        "1h": ("1h", timedelta(hours=4), 6),
+        "4h": ("4h", timedelta(hours=16), 6),
+    }
+    windows: dict[str, list[Any]] = {}
+    for name, (interval, lookback, limit) in specs.items():
+        candles = fetch_futures_klines(
+            symbol=symbol,
+            interval=interval,
+            start_ms=int((now - lookback).timestamp() * 1000),
+            end_ms=end_ms,
+            limit=limit,
+        )
+        windows[name] = [item for item in candles if item.close_time <= now]
+    return windows
+
+
 def _trim_order_to_notional(
     *,
     order: dict[str, Any],
@@ -8546,6 +8605,60 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             effective_args.max_short_position_notional = float(adaptive_step["effective_max_short_position_notional"])
         if adaptive_step.get("effective_max_total_notional") is not None:
             effective_args.max_total_notional = float(adaptive_step["effective_max_total_notional"])
+
+    multi_timeframe_bias_config = _multi_timeframe_bias_config(effective_args)
+    multi_timeframe_bias = {
+        "enabled": bool(multi_timeframe_bias_config.enabled),
+        "available": False,
+        "regime": "disabled" if not multi_timeframe_bias_config.enabled else "not_evaluated",
+        "applied": False,
+    }
+    if multi_timeframe_bias_config.enabled:
+        try:
+            multi_timeframe_bias = resolve_multi_timeframe_bias(
+                current_price=mid_price,
+                step_price=effective_args.step_price,
+                windows=_fetch_multi_timeframe_bias_windows(symbol=symbol, now=plan_now),
+                config=multi_timeframe_bias_config,
+            )
+            multi_timeframe_adjustments = apply_multi_timeframe_bias(
+                buy_levels=int(getattr(effective_args, "buy_levels", 0)),
+                sell_levels=int(getattr(effective_args, "sell_levels", 0)),
+                per_order_notional=float(getattr(effective_args, "per_order_notional", 0.0)),
+                step_price=float(getattr(effective_args, "step_price", 0.0)),
+                max_position_notional=float(getattr(effective_args, "max_position_notional", 0.0) or 0.0),
+                max_short_position_notional=float(getattr(effective_args, "max_short_position_notional", 0.0) or 0.0),
+                report=multi_timeframe_bias,
+                config=multi_timeframe_bias_config,
+            )
+            if multi_timeframe_adjustments.get("applied"):
+                effective_args = argparse.Namespace(**vars(effective_args))
+                effective_args.buy_levels = int(multi_timeframe_adjustments["buy_levels"])
+                effective_args.sell_levels = int(multi_timeframe_adjustments["sell_levels"])
+                effective_args.per_order_notional = float(multi_timeframe_adjustments["per_order_notional"])
+                effective_args.step_price = float(multi_timeframe_adjustments["step_price"])
+                if getattr(effective_args, "max_position_notional", None) is not None:
+                    effective_args.max_position_notional = float(multi_timeframe_adjustments["max_position_notional"])
+                if getattr(effective_args, "max_short_position_notional", None) is not None:
+                    effective_args.max_short_position_notional = float(multi_timeframe_adjustments["max_short_position_notional"])
+                effective_args.static_buy_offset_steps = (
+                    float(getattr(effective_args, "static_buy_offset_steps", 0.0))
+                    + float(multi_timeframe_adjustments.get("buy_offset_steps", 0.0))
+                )
+                effective_args.static_sell_offset_steps = (
+                    float(getattr(effective_args, "static_sell_offset_steps", 0.0))
+                    + float(multi_timeframe_adjustments.get("sell_offset_steps", 0.0))
+                )
+                multi_timeframe_bias["applied"] = True
+                multi_timeframe_bias["adjustments"] = dict(multi_timeframe_adjustments)
+        except Exception as exc:
+            multi_timeframe_bias = {
+                "enabled": True,
+                "available": False,
+                "regime": "error",
+                "applied": False,
+                "warning": f"{exc.__class__.__name__}: {exc}",
+            }
 
     volatility_entry_pause = resolve_volatility_entry_pause(
         adaptive_step=adaptive_step,
@@ -10884,6 +10997,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "market_guard": market_guard,
         "execution_regime": execution_regime,
         "adaptive_step": adaptive_step,
+        "multi_timeframe_bias": multi_timeframe_bias,
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
         "maker_volatility_inventory": maker_volatility_inventory,
@@ -11590,6 +11704,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--multi-timeframe-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--multi-timeframe-bias-low-zone-threshold", type=float, default=0.35)
+    parser.add_argument("--multi-timeframe-bias-high-zone-threshold", type=float, default=0.65)
+    parser.add_argument("--multi-timeframe-bias-strong-threshold", type=float, default=0.50)
+    parser.add_argument("--multi-timeframe-bias-max-level-delta", type=int, default=4)
+    parser.add_argument("--multi-timeframe-bias-max-offset-steps", type=float, default=1.0)
+    parser.add_argument("--multi-timeframe-bias-favored-position-scale", type=float, default=1.25)
+    parser.add_argument("--multi-timeframe-bias-unfavored-position-scale", type=float, default=0.75)
+    parser.add_argument("--multi-timeframe-bias-shock-abs-return-ratio", type=float, default=0.018)
+    parser.add_argument("--multi-timeframe-bias-shock-amplitude-ratio", type=float, default=0.025)
+    parser.add_argument("--multi-timeframe-bias-shock-step-scale", type=float, default=1.5)
+    parser.add_argument("--multi-timeframe-bias-shock-notional-scale", type=float, default=0.70)
     parser.add_argument("--volatility-entry-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--volatility-entry-pause-30s-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-30s-amplitude-ratio", type=float, default=0.0)
@@ -11824,6 +11950,17 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             "  adaptive_risk: "
             f"per_order_scale={_safe_float(adaptive_step.get('per_order_scale')):.2f} "
             f"position_limit_scale={_safe_float(adaptive_step.get('position_limit_scale')):.2f}"
+        )
+    mtf_bias = summary.get("multi_timeframe_bias") if isinstance(summary.get("multi_timeframe_bias"), dict) else {}
+    if mtf_bias.get("enabled"):
+        print(
+            "  mtf_bias: "
+            f"{mtf_bias.get('regime', '--')} "
+            f"long={_safe_float(mtf_bias.get('long_bias_score')):.2f} "
+            f"short={_safe_float(mtf_bias.get('short_bias_score')):.2f} "
+            f"zone={_safe_float(mtf_bias.get('zone_score')):.2f} "
+            f"shock={'yes' if mtf_bias.get('shock_active') else 'no'} "
+            f"applied={'yes' if mtf_bias.get('applied') else 'no'}"
         )
     volatility_entry_pause = (
         summary.get("volatility_entry_pause") if isinstance(summary.get("volatility_entry_pause"), dict) else {}
@@ -12170,6 +12307,32 @@ def main() -> None:
         )
     ):
         raise SystemExit("adaptive step requires at least one positive shock/trend trigger threshold")
+    if args.multi_timeframe_bias_low_zone_threshold < 0 or args.multi_timeframe_bias_low_zone_threshold > 1:
+        raise SystemExit("--multi-timeframe-bias-low-zone-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_high_zone_threshold < 0 or args.multi_timeframe_bias_high_zone_threshold > 1:
+        raise SystemExit("--multi-timeframe-bias-high-zone-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_low_zone_threshold >= args.multi_timeframe_bias_high_zone_threshold:
+        raise SystemExit("--multi-timeframe-bias-low-zone-threshold must be < high-zone-threshold")
+    if args.multi_timeframe_bias_strong_threshold < 0 or args.multi_timeframe_bias_strong_threshold > 1:
+        raise SystemExit("--multi-timeframe-bias-strong-threshold must be within [0, 1]")
+    if args.multi_timeframe_bias_max_level_delta < 0:
+        raise SystemExit("--multi-timeframe-bias-max-level-delta must be >= 0")
+    if args.multi_timeframe_bias_max_offset_steps < 0:
+        raise SystemExit("--multi-timeframe-bias-max-offset-steps must be >= 0")
+    if args.multi_timeframe_bias_favored_position_scale <= 0:
+        raise SystemExit("--multi-timeframe-bias-favored-position-scale must be > 0")
+    if args.multi_timeframe_bias_unfavored_position_scale <= 0:
+        raise SystemExit("--multi-timeframe-bias-unfavored-position-scale must be > 0")
+    if args.multi_timeframe_bias_shock_abs_return_ratio < 0:
+        raise SystemExit("--multi-timeframe-bias-shock-abs-return-ratio must be >= 0")
+    if args.multi_timeframe_bias_shock_amplitude_ratio < 0:
+        raise SystemExit("--multi-timeframe-bias-shock-amplitude-ratio must be >= 0")
+    if args.multi_timeframe_bias_shock_step_scale < 1:
+        raise SystemExit("--multi-timeframe-bias-shock-step-scale must be >= 1")
+    if args.multi_timeframe_bias_shock_notional_scale <= 0 or args.multi_timeframe_bias_shock_notional_scale > 1:
+        raise SystemExit("--multi-timeframe-bias-shock-notional-scale must be within (0, 1]")
+    if args.multi_timeframe_bias_enabled and str(args.strategy_mode).strip() != "synthetic_neutral":
+        raise SystemExit("--multi-timeframe-bias-enabled currently requires --strategy-mode synthetic_neutral")
     volatility_entry_pause_thresholds = (
         args.volatility_entry_pause_30s_abs_return_ratio,
         args.volatility_entry_pause_30s_amplitude_ratio,
@@ -12610,6 +12773,28 @@ def main() -> None:
                     ),
                     "adaptive_step_window_5m_amplitude_ratio": _safe_float(
                         (((plan_report.get("adaptive_step") or {}).get("metrics") or {}).get("window_5m") or {}).get("amplitude_ratio")
+                    ),
+                    "multi_timeframe_bias": dict(plan_report.get("multi_timeframe_bias") or {}),
+                    "multi_timeframe_bias_enabled": bool((plan_report.get("multi_timeframe_bias") or {}).get("enabled")),
+                    "multi_timeframe_bias_available": bool((plan_report.get("multi_timeframe_bias") or {}).get("available")),
+                    "multi_timeframe_bias_applied": bool((plan_report.get("multi_timeframe_bias") or {}).get("applied")),
+                    "multi_timeframe_bias_regime": str(
+                        ((plan_report.get("multi_timeframe_bias") or {}).get("regime", "") or "")
+                    ),
+                    "multi_timeframe_bias_long_score": _safe_float(
+                        (plan_report.get("multi_timeframe_bias") or {}).get("long_bias_score")
+                    ),
+                    "multi_timeframe_bias_short_score": _safe_float(
+                        (plan_report.get("multi_timeframe_bias") or {}).get("short_bias_score")
+                    ),
+                    "multi_timeframe_bias_zone_score": _safe_float(
+                        (plan_report.get("multi_timeframe_bias") or {}).get("zone_score")
+                    ),
+                    "multi_timeframe_bias_direction_score": _safe_float(
+                        (plan_report.get("multi_timeframe_bias") or {}).get("direction_score")
+                    ),
+                    "multi_timeframe_bias_shock_active": bool(
+                        (plan_report.get("multi_timeframe_bias") or {}).get("shock_active")
                     ),
                     "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
                     "current_long_notional": _safe_float(plan_report.get("current_long_notional")),

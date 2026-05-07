@@ -2755,6 +2755,60 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adaptive-step-min-per-order-scale", command)
         self.assertIn("--adaptive-step-min-position-limit-scale", command)
 
+    def test_build_runner_command_includes_multi_timeframe_bias_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "CHIPUSDT",
+                "strategy_profile": "chip_low_wear_guarded_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0001,
+                "buy_levels": 9,
+                "sell_levels": 10,
+                "per_order_notional": 90.0,
+                "base_position_notional": 0.0,
+                "multi_timeframe_bias_enabled": True,
+                "multi_timeframe_bias_low_zone_threshold": 0.32,
+                "multi_timeframe_bias_high_zone_threshold": 0.68,
+                "multi_timeframe_bias_strong_threshold": 0.45,
+                "multi_timeframe_bias_max_level_delta": 3,
+                "multi_timeframe_bias_max_offset_steps": 0.75,
+                "multi_timeframe_bias_favored_position_scale": 1.15,
+                "multi_timeframe_bias_unfavored_position_scale": 0.85,
+                "multi_timeframe_bias_shock_abs_return_ratio": 0.012,
+                "multi_timeframe_bias_shock_amplitude_ratio": 0.020,
+                "multi_timeframe_bias_shock_step_scale": 1.4,
+                "multi_timeframe_bias_shock_notional_scale": 0.65,
+                "margin_type": "KEEP",
+                "leverage": 3,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 4,
+                "max_new_orders": 18,
+                "max_total_notional": 1800.0,
+                "sleep_seconds": 2.0,
+                "state_path": "output/chipusdt_loop_state.json",
+                "plan_json": "output/chipusdt_loop_latest_plan.json",
+                "submit_report_json": "output/chipusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/chipusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": False,
+            }
+        )
+
+        self.assertIn("--multi-timeframe-bias-enabled", command)
+        self.assertIn("--multi-timeframe-bias-low-zone-threshold", command)
+        self.assertIn("--multi-timeframe-bias-high-zone-threshold", command)
+        self.assertIn("--multi-timeframe-bias-strong-threshold", command)
+        self.assertIn("--multi-timeframe-bias-max-level-delta", command)
+        self.assertIn("--multi-timeframe-bias-max-offset-steps", command)
+        self.assertIn("--multi-timeframe-bias-favored-position-scale", command)
+        self.assertIn("--multi-timeframe-bias-unfavored-position-scale", command)
+        self.assertIn("--multi-timeframe-bias-shock-abs-return-ratio", command)
+        self.assertIn("--multi-timeframe-bias-shock-amplitude-ratio", command)
+        self.assertIn("--multi-timeframe-bias-shock-step-scale", command)
+        self.assertIn("--multi-timeframe-bias-shock-notional-scale", command)
+
     def test_build_runner_command_includes_execution_regime_arguments(self) -> None:
         config = _runner_preset_payload("soon_volume_neutral_ping_pong_v1", {"symbol": "SOONUSDT"})
 
