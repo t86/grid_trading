@@ -1340,6 +1340,37 @@ def post_spot_order(
     return data
 
 
+def fetch_spot_order(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    order_id: int | None = None,
+    orig_client_order_id: str | None = None,
+    recv_window: int = 5000,
+) -> dict[str, Any]:
+    if order_id is None and not str(orig_client_order_id or "").strip():
+        raise ValueError("order_id or orig_client_order_id is required")
+    params: dict[str, str | int] = {
+        "symbol": symbol.upper(),
+        "recvWindow": recv_window,
+    }
+    if order_id is not None:
+        params["orderId"] = int(order_id)
+    if orig_client_order_id:
+        params["origClientOrderId"] = str(orig_client_order_id).strip()
+    data = _http_signed_request_json(
+        f"{_spot_trade_base_url()}/api/v3/order",
+        params,
+        api_key,
+        api_secret,
+        method="GET",
+    )
+    if not isinstance(data, dict):
+        raise RuntimeError("Unexpected spot order response")
+    return data
+
+
 def delete_spot_order(
     *,
     symbol: str,

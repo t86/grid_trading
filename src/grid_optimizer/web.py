@@ -64,6 +64,7 @@ from .data import (
     fetch_futures_open_orders,
     fetch_futures_position_mode,
     fetch_spot_account_info,
+    fetch_spot_order,
     fetch_spot_latest_price,
     fetch_spot_open_orders,
     fetch_spot_symbol_config,
@@ -84,6 +85,7 @@ from .data import (
     post_futures_change_margin_type,
     post_futures_market_order,
     post_futures_order,
+    post_spot_order,
     fetch_recent_funding_records,
     fetch_spot_book_tickers,
     fetch_spot_klines,
@@ -10169,9 +10171,32 @@ MANUAL_TRADE_MIN_REPRICE_SECONDS = _env_float("GRID_MANUAL_TRADE_MIN_REPRICE_SEC
 MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS = _env_float("GRID_MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS", 12.0, minimum=3.0)
 
 
-def _manual_trade_client_order_prefix(symbol: str) -> str:
+def _manual_trade_market_type(value: Any = "futures") -> str:
+    normalized = str(value or "futures").strip().lower()
+    if normalized in {"futures", "future", "contract", "合约"}:
+        return "futures"
+    if normalized in {"spot", "现货"}:
+        return "spot"
+    raise ValueError("market_type must be futures or spot")
+
+
+def _manual_trade_history_symbol_key(symbol: str, market_type: str = "futures") -> str:
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_market = _manual_trade_market_type(market_type)
+    if normalized_market == "futures":
+        return normalized_symbol
+    return f"SPOT:{normalized_symbol}" if normalized_symbol else ""
+
+
+def _manual_trade_display_symbol(key: str) -> str:
+    text = str(key or "").upper().strip()
+    return text.split(":", 1)[1] if text.startswith("SPOT:") else text
+
+
+def _manual_trade_client_order_prefix(symbol: str, market_type: str = "futures") -> str:
     normalized = re.sub(r"[^A-Za-z0-9]+", "_", str(symbol or "").strip().lower()).strip("_")
-    return f"mt_{(normalized or 'symbol')[:18]}"
+    market_prefix = "mts" if _manual_trade_market_type(market_type) == "spot" else "mt"
+    return f"{market_prefix}_{(normalized or 'symbol')[:18]}"
 
 
 def _strategy_client_order_prefix(symbol: str) -> str:
@@ -10286,8 +10311,8 @@ def _build_manual_trade_plan(
     }
 
 
-def _manual_trade_task_key(symbol: str) -> str:
-    return str(symbol or "").upper().strip()
+def _manual_trade_task_key(symbol: str, market_type: str = "futures") -> str:
+    return _manual_trade_history_symbol_key(symbol, market_type)
 
 
 def _manual_trade_public_task(task: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -10304,7 +10329,7 @@ def _manual_trade_history_map() -> dict[str, list[dict[str, Any]]]:
     raw_symbols = payload.get("symbols")
     if isinstance(raw_symbols, dict):
         for raw_symbol, raw_items in raw_symbols.items():
-            key = _manual_trade_task_key(str(raw_symbol))
+            key = _manual_trade_history_symbol_key(str(raw_symbol), "futures")
             if not key or not isinstance(raw_items, list):
                 continue
             result[key] = [dict(item) for item in raw_items if isinstance(item, dict)]
@@ -10313,7 +10338,10 @@ def _manual_trade_history_map() -> dict[str, list[dict[str, Any]]]:
         for item in legacy_items:
             if not isinstance(item, dict):
                 continue
-            key = _manual_trade_task_key(str(item.get("symbol", "")))
+            key = _manual_trade_history_symbol_key(
+                str(item.get("symbol", "")),
+                str(item.get("market_type", "futures")),
+            )
             if not key:
                 continue
             result.setdefault(key, []).append(dict(item))
@@ -10323,7 +10351,7 @@ def _manual_trade_history_map() -> dict[str, list[dict[str, Any]]]:
 def _write_manual_trade_history_map(symbols: dict[str, list[dict[str, Any]]]) -> None:
     clean_symbols: dict[str, list[dict[str, Any]]] = {}
     for raw_symbol, raw_items in symbols.items():
-        key = _manual_trade_task_key(raw_symbol)
+        key = _manual_trade_history_symbol_key(raw_symbol, "futures")
         if not key:
             continue
         clean_symbols[key] = [dict(item) for item in raw_items if isinstance(item, dict)]
@@ -10333,26 +10361,31 @@ def _write_manual_trade_history_map(symbols: dict[str, list[dict[str, Any]]]) ->
     )
 
 
-def _manual_trade_history_for_symbol(symbol: str) -> list[dict[str, Any]]:
-    key = _manual_trade_task_key(symbol)
+def _manual_trade_history_for_symbol(symbol: str, market_type: str = "futures") -> list[dict[str, Any]]:
+    key = _manual_trade_task_key(symbol, market_type)
     with MANUAL_TRADE_HISTORY_LOCK:
         symbols = _manual_trade_history_map()
     return [dict(item) for item in symbols.get(key, [])]
 
 
 def _manual_trade_public_history_item(item: dict[str, Any]) -> dict[str, Any]:
-    return {field: item[field] for field in MANUAL_TRADE_STATUS_HISTORY_FIELDS if field in item}
+    public = {field: item[field] for field in MANUAL_TRADE_STATUS_HISTORY_FIELDS if field in item}
+    public["symbol"] = _manual_trade_display_symbol(str(public.get("symbol", "")))
+    if "market_type" in item:
+        public["market_type"] = item["market_type"]
+    return public
 
 
-def _manual_trade_public_history_for_symbol(symbol: str) -> list[dict[str, Any]]:
-    history = _manual_trade_history_for_symbol(symbol)
+def _manual_trade_public_history_for_symbol(symbol: str, market_type: str = "futures") -> list[dict[str, Any]]:
+    history = _manual_trade_history_for_symbol(symbol, market_type)
     recent = history[-MANUAL_TRADE_STATUS_HISTORY_LIMIT:]
     return [_manual_trade_public_history_item(item) for item in recent]
 
 
 def _manual_trade_append_history(item: dict[str, Any]) -> dict[str, Any]:
     record = dict(item)
-    record["symbol"] = _manual_trade_task_key(str(record.get("symbol", "")))
+    record["market_type"] = _manual_trade_market_type(record.get("market_type", "futures"))
+    record["symbol"] = _manual_trade_task_key(str(record.get("symbol", "")), record["market_type"])
     record.setdefault("id", uuid.uuid4().hex)
     record.setdefault("completed_at", datetime.now(timezone.utc).isoformat())
     with MANUAL_TRADE_HISTORY_LOCK:
@@ -10362,8 +10395,8 @@ def _manual_trade_append_history(item: dict[str, Any]) -> dict[str, Any]:
     return dict(record)
 
 
-def _manual_trade_delete_history(symbol: str, record_id: str) -> dict[str, Any]:
-    key = _manual_trade_task_key(symbol)
+def _manual_trade_delete_history(symbol: str, record_id: str, market_type: str = "futures") -> dict[str, Any]:
+    key = _manual_trade_task_key(symbol, market_type)
     clean_id = str(record_id or "").strip()
     if not key:
         raise ValueError("symbol is required")
@@ -10404,6 +10437,7 @@ def _manual_trade_history_from_filled_task(task: dict[str, Any]) -> dict[str, An
         "id": str(task.get("id") or uuid.uuid4().hex),
         "source": "maker",
         "symbol": str(task.get("symbol", "")),
+        "market_type": _manual_trade_market_type(task.get("market_type", "futures")),
         "side": str(task.get("side", "")),
         "status": str(task.get("status", "")),
         "target_notional": float(task.get("notional", 0) or 0),
@@ -10435,6 +10469,7 @@ def _manual_trade_history_from_take_orders(symbol: str, plan: dict[str, Any], or
         "id": uuid.uuid4().hex,
         "source": "take",
         "symbol": symbol,
+        "market_type": _manual_trade_market_type(plan.get("market_type", "futures")),
         "side": str(plan.get("side", "")),
         "status": "filled",
         "target_notional": float(plan.get("notional", 0) or 0),
@@ -10450,18 +10485,21 @@ def _manual_trade_history_from_take_orders(symbol: str, plan: dict[str, Any], or
     }
 
 
-def _manual_trade_set_task(symbol: str, patch: dict[str, Any]) -> dict[str, Any]:
-    key = _manual_trade_task_key(symbol)
+def _manual_trade_set_task(symbol: str, patch: dict[str, Any], market_type: str = "futures") -> dict[str, Any]:
+    normalized_market = _manual_trade_market_type(patch.get("market_type", market_type))
+    key = _manual_trade_task_key(symbol, normalized_market)
     with MANUAL_TRADE_TASKS_LOCK:
         current = dict(MANUAL_TRADE_TASKS.get(key) or {})
         current.update(patch)
-        current["symbol"] = key
+        current["symbol"] = _manual_trade_display_symbol(key)
+        current["market_type"] = normalized_market
         current["updated_at"] = datetime.now(timezone.utc).isoformat()
         MANUAL_TRADE_TASKS[key] = current
         return dict(current)
 
 
-def _manual_trade_initialize_task(symbol: str, patch: dict[str, Any]) -> dict[str, Any]:
+def _manual_trade_initialize_task(symbol: str, patch: dict[str, Any], market_type: str = "futures") -> dict[str, Any]:
+    normalized_market = _manual_trade_market_type(patch.get("market_type", market_type))
     clean = {
         "legs_done": [],
         "current_leg": None,
@@ -10475,9 +10513,10 @@ def _manual_trade_initialize_task(symbol: str, patch: dict[str, Any]) -> dict[st
         "snapshot": None,
     }
     clean.update(patch)
-    key = _manual_trade_task_key(symbol)
+    key = _manual_trade_task_key(symbol, normalized_market)
     with MANUAL_TRADE_TASKS_LOCK:
-        clean["symbol"] = key
+        clean["symbol"] = _manual_trade_display_symbol(key)
+        clean["market_type"] = normalized_market
         now = datetime.now(timezone.utc).isoformat()
         clean.setdefault("created_at", now)
         clean["updated_at"] = now
@@ -10485,20 +10524,21 @@ def _manual_trade_initialize_task(symbol: str, patch: dict[str, Any]) -> dict[st
         return dict(clean)
 
 
-def _manual_trade_current_task(symbol: str) -> dict[str, Any] | None:
-    key = _manual_trade_task_key(symbol)
+def _manual_trade_current_task(symbol: str, market_type: str = "futures") -> dict[str, Any] | None:
+    key = _manual_trade_task_key(symbol, market_type)
     with MANUAL_TRADE_TASKS_LOCK:
         task = MANUAL_TRADE_TASKS.get(key)
         return dict(task) if task else None
 
 
-def _manual_trade_cancel_requested(symbol: str) -> bool:
-    task = _manual_trade_current_task(symbol)
+def _manual_trade_cancel_requested(symbol: str, market_type: str = "futures") -> bool:
+    task = _manual_trade_current_task(symbol, market_type)
     return bool(task and task.get("cancel_requested"))
 
 
-def _manual_trade_book_prices(symbol: str) -> tuple[float, float]:
-    book = fetch_futures_book_tickers(symbol=symbol)
+def _manual_trade_book_prices(symbol: str, market_type: str = "futures") -> tuple[float, float]:
+    normalized_market = _manual_trade_market_type(market_type)
+    book = fetch_spot_book_tickers(symbol=symbol) if normalized_market == "spot" else fetch_futures_book_tickers(symbol=symbol)
     if not book:
         raise RuntimeError(f"{symbol} missing book ticker")
     bid_price = _safe_numeric(book[0].get("bid_price"))
@@ -10506,6 +10546,28 @@ def _manual_trade_book_prices(symbol: str) -> tuple[float, float]:
     if bid_price <= 0 or ask_price <= 0:
         raise RuntimeError(f"{symbol} invalid book ticker")
     return bid_price, ask_price
+
+
+def _manual_trade_spot_position_amt(account_info: dict[str, Any], symbol_info: dict[str, Any]) -> float:
+    base_asset = str(symbol_info.get("base_asset") or "").upper().strip()
+    if not base_asset:
+        return 0.0
+    base_free, base_locked = _extract_spot_balance(account_info, base_asset)
+    return base_free + base_locked
+
+
+def _manual_trade_validate_spot_sell_balance(
+    *,
+    account_info: dict[str, Any],
+    symbol_info: dict[str, Any],
+    quantity: float,
+) -> None:
+    base_asset = str(symbol_info.get("base_asset") or "").upper().strip() or "BASE"
+    base_free, _base_locked = _extract_spot_balance(account_info, base_asset)
+    if float(quantity) > base_free + 1e-12:
+        raise ValueError(
+            f"spot SELL requires available {base_asset} balance; free={base_free:.12g}, required={float(quantity):.12g}"
+        )
 
 
 def _manual_trade_position_amt(account_info: dict[str, Any], symbol: str) -> float:
@@ -10550,20 +10612,35 @@ def _manual_trade_ensure_isolated(
         raise
 
 
-def _manual_trade_cancel_open_orders(symbol: str, api_key: str, api_secret: str, prefix: str) -> dict[str, Any]:
+def _manual_trade_cancel_open_orders(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    prefix: str,
+    market_type: str = "futures",
+) -> dict[str, Any]:
+    normalized_market = _manual_trade_market_type(market_type)
     result = {"attempted": 0, "success": 0, "errors": []}
-    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
+    open_orders = (
+        fetch_spot_open_orders(symbol, api_key, api_secret)
+        if normalized_market == "spot"
+        else fetch_futures_open_orders(symbol, api_key, api_secret)
+    )
     ours = [order for order in open_orders if isinstance(order, dict) and _is_manual_trade_order(order, prefix)]
     result["attempted"] = len(ours)
     for order in ours:
         try:
-            delete_futures_order(
-                symbol=symbol,
-                api_key=api_key,
-                api_secret=api_secret,
-                order_id=int(order["orderId"]) if order.get("orderId") is not None else None,
-                orig_client_order_id=str(order.get("clientOrderId", "")).strip() or None,
-            )
+            delete_kwargs = {
+                "symbol": symbol,
+                "api_key": api_key,
+                "api_secret": api_secret,
+                "order_id": int(order["orderId"]) if order.get("orderId") is not None else None,
+                "orig_client_order_id": str(order.get("clientOrderId", "")).strip() or None,
+            }
+            if normalized_market == "spot":
+                delete_spot_order(**delete_kwargs)
+            else:
+                delete_futures_order(**delete_kwargs)
             result["success"] += 1
         except Exception as exc:
             result["errors"].append(
@@ -10576,22 +10653,58 @@ def _manual_trade_cancel_open_orders(symbol: str, api_key: str, api_secret: str,
     return result
 
 
-def _manual_trade_snapshot(symbol: str) -> dict[str, Any]:
+def _manual_trade_snapshot(symbol: str, market_type: str = "futures") -> dict[str, Any]:
+    normalized_market = _manual_trade_market_type(market_type)
     normalized_symbol = str(symbol or "BTCUSDT").upper().strip() or "BTCUSDT"
     creds = load_binance_api_credentials()
     if creds is None:
         raise RuntimeError("Binance API credentials are not configured")
     api_key, api_secret = creds
-    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
+    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol, normalized_market)
+    prefix = _manual_trade_client_order_prefix(normalized_symbol, normalized_market)
+    if normalized_market == "spot":
+        symbol_info = fetch_spot_symbol_config(normalized_symbol)
+        account_info = fetch_spot_account_info(api_key, api_secret)
+        open_orders = fetch_spot_open_orders(normalized_symbol, api_key, api_secret)
+        manual_orders = [order for order in open_orders if isinstance(order, dict) and _is_manual_trade_order(order, prefix)]
+        base_asset = str(symbol_info.get("base_asset") or "").upper().strip()
+        quote_asset = str(symbol_info.get("quote_asset") or "").upper().strip()
+        base_free, base_locked = _extract_spot_balance(account_info, base_asset)
+        quote_free, quote_locked = _extract_spot_balance(account_info, quote_asset)
+        return {
+            "market_type": normalized_market,
+            "symbol": normalized_symbol,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "position": {},
+            "position_amt": base_free + base_locked,
+            "entry_price": 0.0,
+            "break_even_price": 0.0,
+            "isolated": None,
+            "dual_side_position": False,
+            "one_way_position": True,
+            "base_asset": base_asset,
+            "quote_asset": quote_asset,
+            "base_free": base_free,
+            "base_locked": base_locked,
+            "quote_free": quote_free,
+            "quote_locked": quote_locked,
+            "open_order_count": len(open_orders),
+            "manual_open_order_count": len(manual_orders),
+            "manual_prefix": prefix,
+            "runner": _read_spot_runner_process_for_symbol(normalized_symbol),
+            "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol, normalized_market)),
+            "history": _manual_trade_public_history_for_symbol(normalized_symbol, normalized_market),
+        }
     account_info = fetch_futures_account_info_v3(api_key, api_secret)
     position_mode = fetch_futures_position_mode(api_key, api_secret)
     position = _extract_futures_position(account_info, normalized_symbol)
     open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
-    prefix = _manual_trade_client_order_prefix(normalized_symbol)
     manual_orders = [order for order in open_orders if isinstance(order, dict) and _is_manual_trade_order(order, prefix)]
     dual_side = _truthy(position_mode.get("dualSidePosition"))
     runner = _read_runner_process_for_symbol(normalized_symbol)
     return {
+        "market_type": normalized_market,
         "symbol": normalized_symbol,
         "bid_price": bid_price,
         "ask_price": ask_price,
@@ -10606,8 +10719,8 @@ def _manual_trade_snapshot(symbol: str) -> dict[str, Any]:
         "manual_open_order_count": len(manual_orders),
         "manual_prefix": prefix,
         "runner": runner,
-        "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol)),
-        "history": _manual_trade_public_history_for_symbol(normalized_symbol),
+        "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol, normalized_market)),
+        "history": _manual_trade_public_history_for_symbol(normalized_symbol, normalized_market),
     }
 
 
@@ -10616,7 +10729,9 @@ def _manual_trade_prepare_plan(
     side: str,
     notional: float,
     margin_mode: str = "KEEP",
+    market_type: str = "futures",
 ) -> tuple[str, str, str, dict[str, Any], str, str]:
+    normalized_market = _manual_trade_market_type(market_type)
     normalized_symbol = str(symbol or "").upper().strip()
     if not normalized_symbol:
         raise ValueError("symbol is required")
@@ -10629,12 +10744,19 @@ def _manual_trade_prepare_plan(
     api_key, api_secret = creds
     executor = ThreadPoolExecutor(max_workers=4)
     started_at = time.monotonic()
-    futures = {
-        "position mode": executor.submit(fetch_futures_position_mode, api_key, api_secret),
-        "account info": executor.submit(fetch_futures_account_info_v3, api_key, api_secret),
-        "book ticker": executor.submit(_manual_trade_book_prices, normalized_symbol),
-        "symbol config": executor.submit(fetch_futures_symbol_config, normalized_symbol),
-    }
+    if normalized_market == "spot":
+        futures = {
+            "account info": executor.submit(fetch_spot_account_info, api_key, api_secret),
+            "book ticker": executor.submit(_manual_trade_book_prices, normalized_symbol, normalized_market),
+            "symbol config": executor.submit(fetch_spot_symbol_config, normalized_symbol),
+        }
+    else:
+        futures = {
+            "position mode": executor.submit(fetch_futures_position_mode, api_key, api_secret),
+            "account info": executor.submit(fetch_futures_account_info_v3, api_key, api_secret),
+            "book ticker": executor.submit(_manual_trade_book_prices, normalized_symbol, normalized_market),
+            "symbol config": executor.submit(fetch_futures_symbol_config, normalized_symbol),
+        }
 
     def _prepare_result(name: str) -> Any:
         elapsed = time.monotonic() - started_at
@@ -10648,9 +10770,10 @@ def _manual_trade_prepare_plan(
             ) from exc
 
     try:
-        position_mode = _prepare_result("position mode")
-        if _truthy(position_mode.get("dualSidePosition")):
-            raise ValueError("manual trade requires one-way position mode")
+        if normalized_market == "futures":
+            position_mode = _prepare_result("position mode")
+            if _truthy(position_mode.get("dualSidePosition")):
+                raise ValueError("manual trade requires one-way position mode")
         account_info = _prepare_result("account info")
         bid_price, ask_price = _prepare_result("book ticker")
         symbol_info = _prepare_result("symbol config")
@@ -10659,7 +10782,9 @@ def _manual_trade_prepare_plan(
     normalized_margin_mode = str(margin_mode or "KEEP").upper().strip()
     if normalized_margin_mode not in {"KEEP", "ISOLATED"}:
         raise ValueError("margin_mode must be KEEP or ISOLATED")
-    if normalized_margin_mode == "ISOLATED":
+    if normalized_market == "spot" and normalized_margin_mode != "KEEP":
+        raise ValueError("spot manual trade does not support margin mode changes")
+    if normalized_market == "futures" and normalized_margin_mode == "ISOLATED":
         _manual_trade_ensure_isolated(normalized_symbol, api_key, api_secret, account_info=account_info)
     plan = _build_manual_trade_plan(
         symbol=normalized_symbol,
@@ -10667,24 +10792,55 @@ def _manual_trade_prepare_plan(
         notional=float(notional),
         bid_price=bid_price,
         ask_price=ask_price,
-        position_amt=_manual_trade_position_amt(account_info, normalized_symbol),
+        position_amt=(
+            _manual_trade_spot_position_amt(account_info, symbol_info)
+            if normalized_market == "spot"
+            else _manual_trade_position_amt(account_info, normalized_symbol)
+        ),
         symbol_info=symbol_info,
     )
+    plan["market_type"] = normalized_market
+    if normalized_market == "spot":
+        plan["base_asset"] = symbol_info.get("base_asset")
+        plan["quote_asset"] = symbol_info.get("quote_asset")
+        for leg in plan["legs"]:
+            if str(leg.get("side", "")).upper() == "SELL":
+                _manual_trade_validate_spot_sell_balance(
+                    account_info=account_info,
+                    symbol_info=symbol_info,
+                    quantity=float(leg.get("quantity", 0) or 0),
+                )
     return normalized_symbol, api_key, api_secret, plan, str(symbol_info.get("tick_size")), str(symbol_info.get("step_size"))
 
 
 def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
+    market_type = _manual_trade_market_type(payload.get("market_type", "futures"))
     symbol, api_key, api_secret, plan, _tick_size, _step_size = _manual_trade_prepare_plan(
         str(payload.get("symbol", "")),
         str(payload.get("side", "")),
         float(payload.get("notional", 0) or 0),
         str(payload.get("margin_mode", "KEEP")),
+        market_type,
     )
-    prefix = _manual_trade_client_order_prefix(symbol)
+    prefix = _manual_trade_client_order_prefix(symbol, market_type)
     responses = []
     for leg in plan["legs"]:
-        responses.append(
-            post_futures_market_order(
+        if market_type == "spot":
+            responses.append(
+                post_spot_order(
+                    symbol=symbol,
+                    side=str(leg["side"]),
+                    quantity=float(leg["quantity"]),
+                    price=0.0,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    order_type="MARKET",
+                    new_client_order_id=_manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"])),
+                )
+            )
+        else:
+            responses.append(
+                post_futures_market_order(
                 symbol=symbol,
                 side=str(leg["side"]),
                 quantity=float(leg["quantity"]),
@@ -10692,13 +10848,14 @@ def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
                 api_secret=api_secret,
                 reduce_only=bool(leg.get("reduce_only")),
                 new_client_order_id=_manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"])),
+                )
             )
-        )
     history = _manual_trade_append_history(_manual_trade_history_from_take_orders(symbol, plan, responses))
-    return {"symbol": symbol, "plan": plan, "orders": responses, "history": history, "snapshot": _manual_trade_snapshot(symbol)}
+    return {"symbol": symbol, "market_type": market_type, "plan": plan, "orders": responses, "history": history, "snapshot": _manual_trade_snapshot(symbol, market_type)}
 
 
 def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
+    market_type = _manual_trade_market_type(payload.get("market_type", "futures"))
     normalized_symbol = str(payload.get("symbol", "")).upper().strip()
     if not normalized_symbol:
         raise ValueError("symbol is required")
@@ -10712,11 +10869,10 @@ def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
     if creds is None:
         raise RuntimeError("Binance API credentials are not configured")
     api_key, api_secret = creds
-    position_mode = fetch_futures_position_mode(api_key, api_secret)
-    if _truthy(position_mode.get("dualSidePosition")):
+    if market_type == "futures" and _truthy(fetch_futures_position_mode(api_key, api_secret).get("dualSidePosition")):
         raise ValueError("manual trade requires one-way position mode")
-    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol)
-    symbol_info = fetch_futures_symbol_config(normalized_symbol)
+    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol, market_type)
+    symbol_info = fetch_spot_symbol_config(normalized_symbol) if market_type == "spot" else fetch_futures_symbol_config(normalized_symbol)
     price = bid_price if normalized_side == "BUY" else ask_price
     rounded_price = _round_order_price(price, symbol_info.get("tick_size"), normalized_side)
     quantity = _round_order_qty(safe_notional / rounded_price, symbol_info.get("step_size"))
@@ -10728,32 +10884,54 @@ def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
     min_notional = symbol_info.get("min_notional")
     if min_notional is not None and quantity * rounded_price < float(min_notional):
         raise ValueError("order notional is below minimum notional")
-    prefix = _manual_trade_client_order_prefix(normalized_symbol)
+    if market_type == "spot" and normalized_side == "SELL":
+        account_info = fetch_spot_account_info(api_key, api_secret)
+        _manual_trade_validate_spot_sell_balance(
+            account_info=account_info,
+            symbol_info=symbol_info,
+            quantity=quantity,
+        )
+    prefix = _manual_trade_client_order_prefix(normalized_symbol, market_type)
     role = "book_buy" if normalized_side == "BUY" else "book_sell"
     client_order_id = _manual_trade_order_id(prefix, role, normalized_side)
-    response = post_futures_order(
-        symbol=normalized_symbol,
-        side=normalized_side,
-        quantity=quantity,
-        price=rounded_price,
-        api_key=api_key,
-        api_secret=api_secret,
-        time_in_force="GTX",
-        reduce_only=None,
-        new_client_order_id=client_order_id,
-    )
+    if market_type == "spot":
+        response = post_spot_order(
+            symbol=normalized_symbol,
+            side=normalized_side,
+            quantity=quantity,
+            price=rounded_price,
+            api_key=api_key,
+            api_secret=api_secret,
+            order_type="LIMIT_MAKER",
+            new_client_order_id=client_order_id,
+        )
+        time_in_force = "LIMIT_MAKER"
+    else:
+        response = post_futures_order(
+            symbol=normalized_symbol,
+            side=normalized_side,
+            quantity=quantity,
+            price=rounded_price,
+            api_key=api_key,
+            api_secret=api_secret,
+            time_in_force="GTX",
+            reduce_only=None,
+            new_client_order_id=client_order_id,
+        )
+        time_in_force = "GTX"
     return {
         "symbol": normalized_symbol,
+        "market_type": market_type,
         "limit_order": {
             "side": normalized_side,
             "quantity": quantity,
             "price": rounded_price,
             "notional": quantity * rounded_price,
-            "time_in_force": "GTX",
+            "time_in_force": time_in_force,
             "client_order_id": client_order_id,
         },
         "order": response,
-        "snapshot": _manual_trade_snapshot(normalized_symbol),
+        "snapshot": _manual_trade_snapshot(normalized_symbol, market_type),
     }
 
 
@@ -10764,7 +10942,9 @@ def _manual_trade_chase_leg(
     api_secret: str,
     prefix: str,
     leg: dict[str, Any],
+    market_type: str = "futures",
 ) -> dict[str, Any]:
+    normalized_market = _manual_trade_market_type(market_type)
     remaining_qty = float(leg["quantity"])
     executed_qty = 0.0
     attempts = 0
@@ -10775,27 +10955,32 @@ def _manual_trade_chase_leg(
     current_order_submitted_at = 0.0
     last_order: dict[str, Any] | None = None
     while remaining_qty > 0:
-        if _manual_trade_cancel_requested(symbol):
+        if _manual_trade_cancel_requested(symbol, normalized_market):
             if current_order_id is not None or current_client_order_id:
                 try:
-                    delete_futures_order(
-                        symbol=symbol,
-                        api_key=api_key,
-                        api_secret=api_secret,
-                        order_id=current_order_id,
-                        orig_client_order_id=current_client_order_id,
-                    )
+                    delete_kwargs = {
+                        "symbol": symbol,
+                        "api_key": api_key,
+                        "api_secret": api_secret,
+                        "order_id": current_order_id,
+                        "orig_client_order_id": current_client_order_id,
+                    }
+                    if normalized_market == "spot":
+                        delete_spot_order(**delete_kwargs)
+                    else:
+                        delete_futures_order(**delete_kwargs)
                 except Exception:
                     pass
             raise RuntimeError("manual trade canceled")
         if current_order_id is not None or current_client_order_id:
-            order = fetch_futures_order(
-                symbol=symbol,
-                api_key=api_key,
-                api_secret=api_secret,
-                order_id=current_order_id,
-                orig_client_order_id=current_client_order_id,
-            )
+            fetch_kwargs = {
+                "symbol": symbol,
+                "api_key": api_key,
+                "api_secret": api_secret,
+                "order_id": current_order_id,
+                "orig_client_order_id": current_client_order_id,
+            }
+            order = fetch_spot_order(**fetch_kwargs) if normalized_market == "spot" else fetch_futures_order(**fetch_kwargs)
             last_order = order
             order_executed = _safe_numeric(order.get("executedQty"))
             executed_delta = max(order_executed - current_order_executed_qty, 0.0)
@@ -10811,7 +10996,7 @@ def _manual_trade_chase_leg(
                 current_order_executed_qty = 0.0
                 current_order_submitted_at = 0.0
                 break
-            bid_price, ask_price = _manual_trade_book_prices(symbol)
+            bid_price, ask_price = _manual_trade_book_prices(symbol, normalized_market)
             target_price = bid_price if str(leg["side"]).upper() == "BUY" else ask_price
             order_price = _safe_numeric(order.get("price")) or current_order_price
             order_age_seconds = max(time.monotonic() - current_order_submitted_at, 0.0) if current_order_submitted_at > 0 else MANUAL_TRADE_MIN_REPRICE_SECONDS
@@ -10825,6 +11010,7 @@ def _manual_trade_chase_leg(
                 _manual_trade_set_task(
                     symbol,
                     {
+                        "market_type": normalized_market,
                         "status": "running",
                         "current_leg": leg,
                         "current_order": order,
@@ -10837,34 +11023,51 @@ def _manual_trade_chase_leg(
                 time.sleep(MANUAL_TRADE_SLEEP_SECONDS)
                 continue
             try:
-                delete_futures_order(
-                    symbol=symbol,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    order_id=current_order_id,
-                    orig_client_order_id=current_client_order_id,
-                )
+                delete_kwargs = {
+                    "symbol": symbol,
+                    "api_key": api_key,
+                    "api_secret": api_secret,
+                    "order_id": current_order_id,
+                    "orig_client_order_id": current_client_order_id,
+                }
+                if normalized_market == "spot":
+                    delete_spot_order(**delete_kwargs)
+                else:
+                    delete_futures_order(**delete_kwargs)
             except Exception:
                 pass
+            current_order_executed_qty = order_executed
             current_order_id = None
             current_client_order_id = None
             current_order_price = 0.0
             current_order_executed_qty = 0.0
             current_order_submitted_at = 0.0
-        bid_price, ask_price = _manual_trade_book_prices(symbol)
+        bid_price, ask_price = _manual_trade_book_prices(symbol, normalized_market)
         price = bid_price if str(leg["side"]).upper() == "BUY" else ask_price
         client_order_id = _manual_trade_order_id(prefix, str(leg["role"]), str(leg["side"]))
-        response = post_futures_order(
-            symbol=symbol,
-            side=str(leg["side"]),
-            quantity=remaining_qty,
-            price=price,
-            api_key=api_key,
-            api_secret=api_secret,
-            time_in_force="GTX",
-            reduce_only=bool(leg.get("reduce_only")),
-            new_client_order_id=client_order_id,
-        )
+        if normalized_market == "spot":
+            response = post_spot_order(
+                symbol=symbol,
+                side=str(leg["side"]),
+                quantity=remaining_qty,
+                price=price,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_type="LIMIT_MAKER",
+                new_client_order_id=client_order_id,
+            )
+        else:
+            response = post_futures_order(
+                symbol=symbol,
+                side=str(leg["side"]),
+                quantity=remaining_qty,
+                price=price,
+                api_key=api_key,
+                api_secret=api_secret,
+                time_in_force="GTX",
+                reduce_only=bool(leg.get("reduce_only")),
+                new_client_order_id=client_order_id,
+            )
         attempts += 1
         current_order_id = int(response["orderId"]) if response.get("orderId") is not None else None
         current_client_order_id = str(response.get("clientOrderId") or client_order_id)
@@ -10874,6 +11077,7 @@ def _manual_trade_chase_leg(
         _manual_trade_set_task(
             symbol,
             {
+                "market_type": normalized_market,
                 "status": "running",
                 "current_leg": leg,
                 "current_order": response,
@@ -10893,6 +11097,7 @@ def _manual_trade_chase_leg(
 
 
 def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
+    market_type = _manual_trade_market_type(payload.get("market_type", "futures"))
     symbol = str(payload.get("symbol", "")).upper().strip()
     try:
         if symbol:
@@ -10900,6 +11105,7 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
                 symbol,
                 {
                     "id": task_id,
+                    "market_type": market_type,
                     "status": "preparing",
                     "side": str(payload.get("side", "")).upper().strip(),
                     "notional": float(payload.get("notional", 0) or 0),
@@ -10912,12 +11118,14 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
             str(payload.get("side", "")),
             float(payload.get("notional", 0) or 0),
             str(payload.get("margin_mode", "KEEP")),
+            market_type,
         )
-        prefix = _manual_trade_client_order_prefix(symbol)
+        prefix = _manual_trade_client_order_prefix(symbol, market_type)
         _manual_trade_set_task(
             symbol,
             {
                 "id": task_id,
+                "market_type": market_type,
                 "status": "running",
                 "side": plan["side"],
                 "notional": plan["notional"],
@@ -10937,9 +11145,10 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
                     api_secret=api_secret,
                     prefix=prefix,
                     leg=leg,
+                    market_type=market_type,
                 )
             )
-            _manual_trade_set_task(symbol, {"legs_done": legs_done})
+            _manual_trade_set_task(symbol, {"market_type": market_type, "legs_done": legs_done})
         executed_total = sum(float(item.get("executed_qty", 0) or 0) for item in legs_done)
         attempts_total = sum(int(item.get("attempts", 0) or 0) for item in legs_done)
         fill_notional = 0.0
@@ -10956,6 +11165,7 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
             symbol,
             {
                 "status": "filled",
+                "market_type": market_type,
                 "side": plan["side"],
                 "notional": plan["notional"],
                 "plan": plan,
@@ -10968,7 +11178,7 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
                 "remaining_qty": 0.0,
                 "attempts": attempts_total,
                 "message": "all manual maker legs filled",
-                "snapshot": _manual_trade_snapshot(symbol),
+                "snapshot": _manual_trade_snapshot(symbol, market_type),
             },
         )
         _manual_trade_append_history(_manual_trade_history_from_filled_task(final_task))
@@ -10978,6 +11188,7 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
             _manual_trade_set_task(
                 symbol,
                 {
+                    "market_type": market_type,
                     "status": status,
                     "error": f"{type(exc).__name__}: {exc}",
                     "message": str(exc),
@@ -10986,10 +11197,11 @@ def _manual_trade_maker_worker(task_id: str, payload: dict[str, Any]) -> None:
 
 
 def _manual_trade_start_maker(payload: dict[str, Any]) -> dict[str, Any]:
+    market_type = _manual_trade_market_type(payload.get("market_type", "futures"))
     symbol = str(payload.get("symbol", "")).upper().strip()
     if not symbol:
         raise ValueError("symbol is required")
-    existing = _manual_trade_current_task(symbol)
+    existing = _manual_trade_current_task(symbol, market_type)
     if existing and str(existing.get("status", "")).lower() in {"pending", "running"}:
         raise ValueError(f"{symbol} manual maker task is already running")
     task_id = uuid.uuid4().hex
@@ -10997,6 +11209,7 @@ def _manual_trade_start_maker(payload: dict[str, Any]) -> dict[str, Any]:
         symbol,
         {
             "id": task_id,
+            "market_type": market_type,
             "status": "pending",
             "side": str(payload.get("side", "")).upper().strip(),
             "notional": float(payload.get("notional", 0) or 0),
@@ -11006,31 +11219,33 @@ def _manual_trade_start_maker(payload: dict[str, Any]) -> dict[str, Any]:
     )
     thread = threading.Thread(target=_manual_trade_maker_worker, args=(task_id, dict(payload)), daemon=True)
     thread.start()
-    return {"symbol": symbol, "task": _manual_trade_public_task(_manual_trade_current_task(symbol))}
+    return {"symbol": symbol, "market_type": market_type, "task": _manual_trade_public_task(_manual_trade_current_task(symbol, market_type))}
 
 
 def _manual_trade_cancel(payload: dict[str, Any]) -> dict[str, Any]:
+    market_type = _manual_trade_market_type(payload.get("market_type", "futures"))
     symbol = str(payload.get("symbol", "")).upper().strip()
     if not symbol:
         raise ValueError("symbol is required")
-    prefix = _manual_trade_client_order_prefix(symbol)
-    _manual_trade_set_task(symbol, {"cancel_requested": True, "status": "canceling", "message": "cancel requested"})
+    prefix = _manual_trade_client_order_prefix(symbol, market_type)
+    _manual_trade_set_task(symbol, {"market_type": market_type, "cancel_requested": True, "status": "canceling", "message": "cancel requested"})
     cleanup = {"attempted": 0, "success": 0, "errors": []}
     creds = load_binance_api_credentials()
     if creds is not None:
-        cleanup = _manual_trade_cancel_open_orders(symbol, creds[0], creds[1], prefix)
+        cleanup = _manual_trade_cancel_open_orders(symbol, creds[0], creds[1], prefix, market_type)
     if not cleanup.get("errors"):
         _manual_trade_set_task(
             symbol,
             {
                 "status": "canceled",
+                "market_type": market_type,
                 "current_order": None,
                 "current_leg": None,
                 "remaining_qty": 0.0,
                 "message": "manual maker task canceled",
             },
         )
-    return {"symbol": symbol, "cleanup": cleanup, "task": _manual_trade_public_task(_manual_trade_current_task(symbol))}
+    return {"symbol": symbol, "market_type": market_type, "cleanup": cleanup, "task": _manual_trade_public_task(_manual_trade_current_task(symbol, market_type))}
 
 
 def _extract_futures_position(
@@ -17186,6 +17401,9 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     a, button { font:inherit; }
     .links { display:flex; flex-wrap:wrap; gap:10px; margin-top:12px; }
     .links a, button { min-height:38px; padding:0 14px; border-radius:10px; border:1px solid var(--line); background:#f7f5ef; color:#0f423f; text-decoration:none; font-weight:700; cursor:pointer; }
+    .tabs { display:inline-flex; gap:4px; margin-top:14px; padding:4px; border:1px solid var(--line); border-radius:10px; background:#f7f5ef; }
+    .tab-btn { min-height:32px; border-radius:8px; background:transparent; border:0; color:var(--muted); }
+    .tab-btn.active { background:#fff; color:var(--brand); box-shadow:0 1px 4px rgba(16,24,40,.08); }
     button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
     button.buy { background:var(--good); border-color:var(--good); color:#fff; }
     button.sell { background:var(--bad); border-color:var(--bad); color:#fff; }
@@ -17214,12 +17432,16 @@ MANUAL_TRADE_PAGE = """<!doctype html>
   <div class="wrap">
     <section class="card">
       <h1>手动追盘交易</h1>
-      <p>本页面只操作当前服务器配置的 Binance U 本位合约账户。Maker 按买一/卖一撤旧重挂直到全部成交、取消或报错；Take 使用 MARKET 市价单。</p>
+      <p>本页面操作当前服务器配置的 Binance 账户。Maker 按买一/卖一撤旧重挂直到全部成交、取消或报错；Take 使用 MARKET 市价单。</p>
       <div class="links">
         <a href="/console">返回控制台</a>
         <a href="/monitor">打开监控页</a>
         <a href="/strategies">打开策略总览</a>
         <button id="refresh_btn" class="primary">刷新状态</button>
+      </div>
+      <div class="tabs" role="tablist">
+        <button class="tab-btn active" type="button" data-market-tab="futures">合约</button>
+        <button class="tab-btn" type="button" data-market-tab="spot">现货</button>
       </div>
       <div id="top_meta" class="meta">等待状态...</div>
     </section>
@@ -17228,13 +17450,13 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       <section class="card">
         <h2>下单</h2>
         <div class="fields">
-          <label>合约币种
+          <label><span id="symbol_label">合约币种</span>
             <select id="manual_symbol"></select>
           </label>
           <label>USDT 名义额
             <input id="manual_notional" type="number" min="0" step="0.01" value="100" />
           </label>
-          <label>保证金模式
+          <label id="margin_mode_field">保证金模式
             <select id="manual_margin_mode">
               <option value="KEEP" selected>保持当前保证金模式</option>
               <option value="ISOLATED">尝试切逐仓</option>
@@ -17252,17 +17474,17 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <div class="actions">
           <button id="cancel_btn" class="danger">取消当前 Maker 任务</button>
         </div>
-        <div class="warnbox">默认保持当前保证金模式，适合和全仓策略共存；只有选择“尝试切逐仓”时才会调用切换接口。如果账户是双向持仓模式会拒绝下单。允许和已有委托共存，本页面只撤换 <code id="prefix_code">mt_</code> 前缀订单。</div>
+        <div class="warnbox" id="manual_note">默认保持当前保证金模式，适合和全仓策略共存；只有选择“尝试切逐仓”时才会调用切换接口。如果账户是双向持仓模式会拒绝下单。允许和已有委托共存，本页面只撤换 <code id="prefix_code">mt_</code> 前缀订单。</div>
         <div id="action_meta" class="meta"></div>
       </section>
 
       <section class="card">
         <h2>当前币种状态</h2>
         <div class="stats">
-          <div class="stat"><span>持仓模式</span><strong id="position_mode_value">--</strong></div>
-          <div class="stat"><span>保证金</span><strong id="margin_value">--</strong></div>
-          <div class="stat"><span>positionAmt</span><strong id="position_amt_value">--</strong></div>
-          <div class="stat"><span>开仓 / 保本</span><strong id="entry_value">--</strong></div>
+          <div class="stat"><span id="position_mode_label">持仓模式</span><strong id="position_mode_value">--</strong></div>
+          <div class="stat"><span id="margin_label">保证金</span><strong id="margin_value">--</strong></div>
+          <div class="stat"><span id="position_amt_label">positionAmt</span><strong id="position_amt_value">--</strong></div>
+          <div class="stat"><span id="entry_label">开仓 / 保本</span><strong id="entry_value">--</strong></div>
           <div class="stat"><span>买一</span><strong id="bid_value">--</strong></div>
           <div class="stat"><span>卖一</span><strong id="ask_value">--</strong></div>
           <div class="stat"><span>未成交委托</span><strong id="orders_value">--</strong></div>
@@ -17299,6 +17521,10 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     const actionMetaEl = document.getElementById("action_meta");
     const topMetaEl = document.getElementById("top_meta");
     const riskBoxEl = document.getElementById("risk_box");
+    const marginModeFieldEl = document.getElementById("margin_mode_field");
+    const manualNoteEl = document.getElementById("manual_note");
+    const symbolLabelEl = document.getElementById("symbol_label");
+    let activeMarketType = "futures";
     let symbols = [];
     let refreshTimer = null;
     let refreshInFlight = false;
@@ -17312,11 +17538,29 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       if (!Number.isFinite(num)) return "--";
       return num.toLocaleString(undefined, { maximumFractionDigits: digits });
     }
-    function manualPrefixForSymbol(symbol) {
-      return `mt_${String(symbol || "").toLowerCase().replace(/[^a-z0-9_]/g, "")}`;
+    function manualPrefixForSymbol(symbol, marketType = activeMarketType) {
+      const prefix = marketType === "spot" ? "mts" : "mt";
+      return `${prefix}_${String(symbol || "").toLowerCase().replace(/[^a-z0-9_]/g, "")}`;
+    }
+    function updateMarketUi() {
+      document.querySelectorAll("[data-market-tab]").forEach((button) => {
+        button.classList.toggle("active", button.dataset.marketTab === activeMarketType);
+      });
+      const isSpot = activeMarketType === "spot";
+      symbolLabelEl.textContent = isSpot ? "现货币种" : "合约币种";
+      marginModeFieldEl.style.display = isSpot ? "none" : "grid";
+      marginModeEl.value = isSpot ? "KEEP" : (marginModeEl.value || "KEEP");
+      document.getElementById("position_mode_label").textContent = isSpot ? "市场" : "持仓模式";
+      document.getElementById("margin_label").textContent = isSpot ? "Quote 可用" : "保证金";
+      document.getElementById("position_amt_label").textContent = isSpot ? "Base 余额" : "positionAmt";
+      document.getElementById("entry_label").textContent = isSpot ? "Base / Quote" : "开仓 / 保本";
+      manualNoteEl.innerHTML = isSpot
+        ? `现货不使用借贷卖出；如果可用 Base 余额不足，卖出追盘、卖一挂卖和市价卖出会直接报错。允许和已有委托共存，本页面只撤换 <code id="prefix_code">mts_</code> 前缀订单。`
+        : `默认保持当前保证金模式，适合和全仓策略共存；只有选择“尝试切逐仓”时才会调用切换接口。如果账户是双向持仓模式会拒绝下单。允许和已有委托共存，本页面只撤换 <code id="prefix_code">mt_</code> 前缀订单。`;
     }
     function clearSnapshotForSymbol(symbol, message = "等待状态刷新...") {
-      document.getElementById("prefix_code").textContent = manualPrefixForSymbol(symbol);
+      const prefixCodeEl = document.getElementById("prefix_code");
+      if (prefixCodeEl) prefixCodeEl.textContent = manualPrefixForSymbol(symbol);
       document.getElementById("position_mode_value").textContent = "--";
       document.getElementById("margin_value").textContent = "--";
       document.getElementById("position_amt_value").textContent = "--";
@@ -17359,29 +17603,36 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       }
     }
     async function loadSymbols() {
-      const resp = await fetch("/api/symbols?market_type=futures&contract_type=usdm");
+      const marketType = activeMarketType;
+      const resp = await fetch(`/api/symbols?market_type=${encodeURIComponent(marketType)}${marketType === "futures" ? "&contract_type=usdm" : ""}`);
       const data = await readJson(resp);
       symbols = Array.isArray(data.symbols) ? data.symbols : [];
       const requested = new URLSearchParams(window.location.search).get("symbol");
       const previous = (symbolEl.value || requested || "").toUpperCase();
       symbolEl.innerHTML = symbols.map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)}</option>`).join("");
-      symbolEl.value = symbols.includes(previous) ? previous : (symbols.includes("BTCUSDC") ? "BTCUSDC" : symbols[0] || "BTCUSDT");
+      const preferred = marketType === "spot"
+        ? (symbols.includes("BTCUSDT") ? "BTCUSDT" : symbols[0] || "BTCUSDT")
+        : (symbols.includes("BTCUSDC") ? "BTCUSDC" : symbols[0] || "BTCUSDT");
+      symbolEl.value = symbols.includes(previous) ? previous : preferred;
       clearSnapshotForSymbol(symbolEl.value);
     }
     function renderSnapshot(snapshot) {
       if (snapshot.symbol && symbolEl.value && snapshot.symbol !== symbolEl.value) return;
-      document.getElementById("prefix_code").textContent = snapshot.manual_prefix || "mt_";
-      document.getElementById("position_mode_value").textContent = snapshot.one_way_position ? "单向" : "双向";
-      document.getElementById("margin_value").textContent = snapshot.isolated ? "逐仓" : "非逐仓";
-      document.getElementById("position_amt_value").textContent = fmt(snapshot.position_amt, 8);
-      document.getElementById("entry_value").textContent = `${fmt(snapshot.entry_price, 8)} / ${fmt(snapshot.break_even_price, 8)}`;
+      const prefixCodeEl = document.getElementById("prefix_code");
+      if (prefixCodeEl) prefixCodeEl.textContent = snapshot.manual_prefix || manualPrefixForSymbol(snapshot.symbol);
+      const isSpot = (snapshot.market_type || activeMarketType) === "spot";
+      document.getElementById("position_mode_value").textContent = isSpot ? "现货" : (snapshot.one_way_position ? "单向" : "双向");
+      document.getElementById("margin_value").textContent = isSpot ? `${fmt(snapshot.quote_free, 4)} ${snapshot.quote_asset || "QUOTE"}` : (snapshot.isolated ? "逐仓" : "非逐仓");
+      document.getElementById("position_amt_value").textContent = isSpot ? `${fmt(snapshot.base_free, 8)} 可用 / ${fmt(snapshot.position_amt, 8)} 总` : fmt(snapshot.position_amt, 8);
+      document.getElementById("entry_value").textContent = isSpot ? `${escapeHtml(snapshot.base_asset || "BASE")} / ${escapeHtml(snapshot.quote_asset || "QUOTE")}` : `${fmt(snapshot.entry_price, 8)} / ${fmt(snapshot.break_even_price, 8)}`;
       document.getElementById("bid_value").textContent = fmt(snapshot.bid_price, 8);
       document.getElementById("ask_value").textContent = fmt(snapshot.ask_price, 8);
       document.getElementById("orders_value").textContent = `${snapshot.open_order_count || 0} 总 / ${snapshot.manual_open_order_count || 0} 手动`;
       document.getElementById("runner_value").textContent = snapshot.runner && snapshot.runner.is_running ? "运行中" : "未运行";
       const risks = [];
-      if (!snapshot.one_way_position) risks.push("当前账户是双向持仓模式，手动下单会被拒绝。");
-      if (!snapshot.isolated && marginModeEl.value === "ISOLATED") risks.push("当前币种状态显示非逐仓；选择尝试切逐仓时，如果已有未成交委托，币安可能拒绝切换。");
+      if (!isSpot && !snapshot.one_way_position) risks.push("当前账户是双向持仓模式，手动下单会被拒绝。");
+      if (!isSpot && !snapshot.isolated && marginModeEl.value === "ISOLATED") risks.push("当前币种状态显示非逐仓；选择尝试切逐仓时，如果已有未成交委托，币安可能拒绝切换。");
+      if (isSpot && Number(snapshot.base_free || 0) <= 0) risks.push("现货可用 Base 余额为 0，卖出追盘/挂卖/市价卖出会直接报错。");
       if (snapshot.runner && snapshot.runner.is_running) risks.push("同币种 runner 正在运行，可能与手动订单互相影响。");
       if ((snapshot.open_order_count || 0) > (snapshot.manual_open_order_count || 0)) risks.push("当前存在非手动未成交委托，本页面不会主动撤销它们。");
       riskBoxEl.style.display = risks.length ? "block" : "none";
@@ -17462,7 +17713,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const timeoutId = setTimeout(() => controller.abort(), 5000);
       const symbol = symbolEl.value || "BTCUSDT";
       try {
-        const resp = await fetch(`/api/manual_trade/status?symbol=${encodeURIComponent(symbol)}`, { signal: controller.signal });
+        const resp = await fetch(`/api/manual_trade/status?symbol=${encodeURIComponent(symbol)}&market_type=${encodeURIComponent(activeMarketType)}`, { signal: controller.signal });
         const data = await readJson(resp);
         renderSnapshot(data.snapshot);
         topMetaEl.textContent = `状态已刷新：${new Date().toLocaleString()}`;
@@ -17479,7 +17730,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const data = await fetchJsonWithTimeout(endpoint, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: symbolEl.value, side, notional: Number(notionalEl.value || 0), margin_mode: marginModeEl.value || "KEEP" }),
+        body: JSON.stringify({ symbol: symbolEl.value, market_type: activeMarketType, side, notional: Number(notionalEl.value || 0), margin_mode: activeMarketType === "spot" ? "KEEP" : (marginModeEl.value || "KEEP") }),
       }, 5000);
       if (endpoint.includes("take")) {
         actionMetaEl.textContent = "Take 市价单已提交。";
@@ -17502,7 +17753,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const resp = await fetch("/api/manual_trade/cancel", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: symbolEl.value }),
+        body: JSON.stringify({ symbol: symbolEl.value, market_type: activeMarketType }),
       });
       const data = await readJson(resp);
       actionMetaEl.textContent = `已请求取消，撤单 ${data.cleanup ? data.cleanup.success : 0}/${data.cleanup ? data.cleanup.attempted : 0}`;
@@ -17516,7 +17767,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const data = await fetchJsonWithTimeout("/api/manual_trade/history/delete", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ symbol: symbolEl.value, id: recordId }),
+        body: JSON.stringify({ symbol: symbolEl.value, market_type: activeMarketType, id: recordId }),
       }, 5000);
       actionMetaEl.textContent = "成交历史已删除。";
       if (data.snapshot) renderSnapshot(data.snapshot);
@@ -17530,10 +17781,23 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
+    document.querySelectorAll("[data-market-tab]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const next = button.dataset.marketTab || "futures";
+        if (next === activeMarketType) return;
+        activeMarketType = next;
+        updateMarketUi();
+        cancelStatusRefresh();
+        loadSymbols()
+          .then(() => refreshStatus({ force: true }))
+          .catch((err) => actionMetaEl.textContent = err.message);
+      });
+    });
     symbolEl.addEventListener("change", () => {
       clearSnapshotForSymbol(symbolEl.value);
       refreshStatus({ force: true }).catch((err) => actionMetaEl.textContent = err.message);
     });
+    updateMarketUi();
     loadSymbols()
       .then(refreshStatus)
       .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 8000); })
@@ -31679,8 +31943,9 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/manual_trade/status":
             symbol = str(query.get("symbol", ["BTCUSDT"])[0]).upper().strip() or "BTCUSDT"
+            market_type = str(query.get("market_type", ["futures"])[0]).strip() or "futures"
             try:
-                snapshot = _manual_trade_snapshot(symbol)
+                snapshot = _manual_trade_snapshot(symbol, market_type)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
@@ -32051,9 +32316,10 @@ class _Handler(BaseHTTPRequestHandler):
                     self._send_json({"ok": True, **result}, status=200)
                 elif path.endswith("/history/delete"):
                     symbol = str(payload.get("symbol", "")).upper().strip()
-                    deleted = _manual_trade_delete_history(symbol, str(payload.get("id", "")))
+                    market_type = str(payload.get("market_type", "futures"))
+                    deleted = _manual_trade_delete_history(symbol, str(payload.get("id", "")), market_type)
                     self._send_json(
-                        {"ok": True, "symbol": symbol, "deleted": deleted, "snapshot": _manual_trade_snapshot(symbol)},
+                        {"ok": True, "symbol": symbol, "market_type": _manual_trade_market_type(market_type), "deleted": deleted, "snapshot": _manual_trade_snapshot(symbol, market_type)},
                         status=200,
                     )
                 else:

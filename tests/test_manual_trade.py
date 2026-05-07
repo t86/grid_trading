@@ -191,6 +191,10 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("renderHistory(snapshot.history || [])", MANUAL_TRADE_PAGE)
         self.assertIn("history-delete-btn", MANUAL_TRADE_PAGE)
         self.assertIn("deleteHistory", MANUAL_TRADE_PAGE)
+        self.assertIn('data-market-tab="futures"', MANUAL_TRADE_PAGE)
+        self.assertIn('data-market-tab="spot"', MANUAL_TRADE_PAGE)
+        self.assertIn('market_type: activeMarketType', MANUAL_TRADE_PAGE)
+        self.assertIn("现货不使用借贷卖出", MANUAL_TRADE_PAGE)
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.post_futures_order")
@@ -258,6 +262,70 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(kwargs["price"], 2.02)
         self.assertEqual(kwargs["quantity"], 39.6)
         self.assertEqual(kwargs["time_in_force"], "GTX")
+
+    @patch("grid_optimizer.web.fetch_spot_symbol_config")
+    @patch("grid_optimizer.web.fetch_spot_account_info")
+    @patch("grid_optimizer.web.fetch_spot_book_tickers")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_spot_prepare_plan_rejects_sell_without_available_base(
+        self,
+        mock_credentials,
+        mock_book,
+        mock_account_info,
+        mock_symbol_config,
+    ) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_book.return_value = [{"bid_price": "2.0", "ask_price": "2.02"}]
+        mock_symbol_config.return_value = {
+            **self._symbol_info(),
+            "base_asset": "BARD",
+            "quote_asset": "USDT",
+        }
+        mock_account_info.return_value = {"balances": [{"asset": "BARD", "free": "0", "locked": "0"}]}
+
+        with self.assertRaisesRegex(ValueError, "spot SELL requires available BARD balance"):
+            _manual_trade_prepare_plan("BARDUSDT", "SELL", 80.0, market_type="spot")
+
+    @patch("grid_optimizer.web._manual_trade_snapshot")
+    @patch("grid_optimizer.web.post_spot_order")
+    @patch("grid_optimizer.web.fetch_spot_account_info")
+    @patch("grid_optimizer.web.fetch_spot_symbol_config")
+    @patch("grid_optimizer.web.fetch_spot_book_tickers")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_spot_book_limit_sell_places_limit_maker_when_balance_exists(
+        self,
+        mock_credentials,
+        mock_book,
+        mock_symbol_config,
+        mock_account_info,
+        mock_post_order,
+        mock_snapshot,
+    ) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_book.return_value = [{"bid_price": "2.0", "ask_price": "2.02"}]
+        mock_symbol_config.return_value = {
+            **self._symbol_info(),
+            "base_asset": "BARD",
+            "quote_asset": "USDT",
+        }
+        mock_account_info.return_value = {"balances": [{"asset": "BARD", "free": "100", "locked": "0"}]}
+        mock_post_order.return_value = {"orderId": 789, "clientOrderId": "mts_bardusdt_booksell_s_1"}
+        mock_snapshot.return_value = {"symbol": "BARDUSDT", "market_type": "spot"}
+
+        result = _manual_trade_place_book_limit(
+            {"symbol": "BARDUSDT", "market_type": "spot", "side": "SELL", "notional": 80.0}
+        )
+
+        mock_post_order.assert_called_once()
+        kwargs = mock_post_order.call_args.kwargs
+        self.assertEqual(kwargs["symbol"], "BARDUSDT")
+        self.assertEqual(kwargs["side"], "SELL")
+        self.assertEqual(kwargs["price"], 2.02)
+        self.assertAlmostEqual(kwargs["quantity"], 39.6)
+        self.assertEqual(kwargs["order_type"], "LIMIT_MAKER")
+        self.assertIn("mts_bardusdt", kwargs["new_client_order_id"])
+        self.assertEqual(result["market_type"], "spot")
+        self.assertEqual(result["limit_order"]["time_in_force"], "LIMIT_MAKER")
 
     def test_manual_trade_history_is_symbol_scoped(self) -> None:
         _manual_trade_append_history(
