@@ -33,6 +33,7 @@ from .audit import (
     write_json as _write_json,
 )
 from .backtest import build_grid_levels
+from .competition_elastic_volume import ElasticVolumeConfig, ElasticVolumeInputs, resolve_elastic_volume_control
 from .data import (
     FuturesMarketStream,
     delete_futures_order,
@@ -8226,6 +8227,86 @@ def _validate_multi_timeframe_bias_args(args: argparse.Namespace) -> None:
         )
 
 
+def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
+    return ElasticVolumeConfig(
+        enabled=bool(getattr(args, "elastic_volume_enabled", False)),
+        loss_per_10k_sprint=float(getattr(args, "elastic_loss_per_10k_sprint", 0.3)),
+        loss_per_10k_cruise=float(getattr(args, "elastic_loss_per_10k_cruise", 0.8)),
+        loss_per_10k_defensive=float(getattr(args, "elastic_loss_per_10k_defensive", 1.2)),
+        loss_per_10k_cooldown=float(getattr(args, "elastic_loss_per_10k_cooldown", 1.8)),
+        inventory_soft_ratio=float(getattr(args, "elastic_inventory_soft_ratio", 0.6)),
+        inventory_hard_ratio=float(getattr(args, "elastic_inventory_hard_ratio", 0.9)),
+        step_scale_sprint=float(getattr(args, "elastic_step_scale_sprint", 0.8)),
+        step_scale_defensive=float(getattr(args, "elastic_step_scale_defensive", 1.8)),
+        step_scale_cooldown=float(getattr(args, "elastic_step_scale_cooldown", 3.0)),
+        per_order_scale_sprint=float(getattr(args, "elastic_per_order_scale_sprint", 1.25)),
+        per_order_scale_defensive=float(getattr(args, "elastic_per_order_scale_defensive", 0.65)),
+        levels_scale_sprint=float(getattr(args, "elastic_levels_scale_sprint", 1.25)),
+        levels_scale_defensive=float(getattr(args, "elastic_levels_scale_defensive", 0.65)),
+        cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
+        state_confirm_cycles=int(getattr(args, "elastic_state_confirm_cycles", 3)),
+    )
+
+
+def _summarize_elastic_volume_windows(
+    summary_path: Path,
+    *,
+    symbol: str,
+    now: datetime,
+    competition_start_time: datetime | None = None,
+) -> dict[str, float]:
+    audit_paths = build_audit_paths(summary_path)
+    normalized_symbol = str(symbol or "").upper().strip()
+    window_15m_start = now.astimezone(timezone.utc) - timedelta(minutes=15)
+    competition_start = competition_start_time.astimezone(timezone.utc) if competition_start_time else None
+    metrics = {
+        "gross_notional_15m": 0.0,
+        "net_pnl_15m": 0.0,
+        "commission_15m": 0.0,
+        "competition_gross_notional": 0.0,
+        "competition_net_pnl": 0.0,
+        "competition_commission": 0.0,
+    }
+
+    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    for row in read_jsonl(audit_paths["trade_audit"], limit=0):
+        if normalized_symbol and str(row.get("symbol", "")).upper().strip() not in {"", normalized_symbol}:
+            continue
+        trade_time_ms = trade_row_time_ms(row)
+        if trade_time_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc)
+        notional = _safe_float(row.get("price")) * abs(_safe_float(row.get("qty")))
+        commission = (
+            abs(_safe_float(row.get("commission")))
+            if str(row.get("commissionAsset", "")).upper().strip() in stable_assets
+            else 0.0
+        )
+        net = _safe_float(row.get("realizedPnl")) - commission
+        if ts >= window_15m_start:
+            metrics["gross_notional_15m"] += notional
+            metrics["net_pnl_15m"] += net
+            metrics["commission_15m"] += commission
+        if competition_start is None or ts >= competition_start:
+            metrics["competition_gross_notional"] += notional
+            metrics["competition_net_pnl"] += net
+            metrics["competition_commission"] += commission
+
+    for row in read_jsonl(audit_paths["income_audit"], limit=0):
+        if normalized_symbol and str(row.get("symbol", "")).upper().strip() not in {"", normalized_symbol}:
+            continue
+        income_time_ms = income_row_time_ms(row)
+        if income_time_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(income_time_ms / 1000.0, tz=timezone.utc)
+        income = _safe_float(row.get("income"))
+        if ts >= window_15m_start:
+            metrics["net_pnl_15m"] += income
+        if competition_start is None or ts >= competition_start:
+            metrics["competition_net_pnl"] += income
+    return metrics
+
+
 def _fetch_multi_timeframe_bias_windows(
     *,
     symbol: str,
@@ -8785,6 +8866,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
         window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
     )
+    elastic_volume: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "elastic_volume_enabled", False)),
+        "regime": "disabled" if not bool(getattr(effective_args, "elastic_volume_enabled", False)) else "not_evaluated",
+        "applied": False,
+        "reasons": [],
+    }
 
     effective_args = argparse.Namespace(**vars(effective_args))
     effective_args.take_profit_min_profit_ratio = _resolve_effective_take_profit_min_profit_ratio(
@@ -9009,6 +9096,74 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price = max(actual_cost_basis_price, 0.0)
     exchange_long_avg_price = current_long_avg_price
     exchange_short_avg_price = current_short_avg_price
+
+    elastic_volume_config = _elastic_volume_config(effective_args)
+    if elastic_volume_config.enabled:
+        competition_start_time = None
+        try:
+            competition_start_time = normalize_runtime_guard_config(vars(args)).runtime_guard_stats_start_time
+        except Exception:
+            competition_start_time = None
+        elastic_metrics = _summarize_elastic_volume_windows(
+            summary_path,
+            symbol=symbol,
+            now=plan_now,
+            competition_start_time=competition_start_time,
+        )
+        elastic_volume = resolve_elastic_volume_control(
+            config=elastic_volume_config,
+            inputs=ElasticVolumeInputs(
+                now=plan_now,
+                last_state=state.get("elastic_volume") if isinstance(state.get("elastic_volume"), dict) else {},
+                gross_notional_15m=elastic_metrics["gross_notional_15m"],
+                net_pnl_15m=elastic_metrics["net_pnl_15m"],
+                competition_gross_notional=elastic_metrics["competition_gross_notional"],
+                competition_net_pnl=elastic_metrics["competition_net_pnl"],
+                competition_commission=elastic_metrics["competition_commission"],
+                long_notional=current_long_notional,
+                short_notional=current_short_notional,
+                max_long_notional=_safe_float(getattr(effective_args, "max_position_notional", None)),
+                max_short_notional=_safe_float(getattr(effective_args, "max_short_position_notional", None)),
+                actual_net_notional=actual_net_qty * max(mid_price, 0.0),
+                adaptive_step_raw_scale=_safe_float(adaptive_step.get("raw_scale")),
+                multi_timeframe_bias_regime=str(multi_timeframe_bias.get("regime") or "balanced"),
+            ),
+        )
+        elastic_volume["applied"] = True
+        if elastic_volume.get("enabled"):
+            effective_args = argparse.Namespace(**vars(effective_args))
+            effective_args.step_price = max(
+                _safe_float(getattr(effective_args, "step_price", 0.0)) * _safe_float(elastic_volume.get("step_scale")),
+                0.0,
+            )
+            effective_args.per_order_notional = max(
+                _safe_float(getattr(effective_args, "per_order_notional", 0.0))
+                * _safe_float(elastic_volume.get("per_order_scale")),
+                0.0,
+            )
+            effective_args.buy_levels = max(
+                int(round(int(getattr(effective_args, "buy_levels", 0)) * _safe_float(elastic_volume.get("levels_scale")))),
+                0,
+            )
+            effective_args.sell_levels = max(
+                int(round(int(getattr(effective_args, "sell_levels", 0)) * _safe_float(elastic_volume.get("levels_scale")))),
+                0,
+            )
+            position_limit_scale = _safe_float(elastic_volume.get("position_limit_scale")) or 1.0
+            if getattr(effective_args, "max_position_notional", None) is not None:
+                effective_args.max_position_notional = max(_safe_float(effective_args.max_position_notional) * position_limit_scale, 0.0)
+            if getattr(effective_args, "max_short_position_notional", None) is not None:
+                effective_args.max_short_position_notional = max(
+                    _safe_float(effective_args.max_short_position_notional) * position_limit_scale,
+                    0.0,
+                )
+            if not bool(elastic_volume.get("entry_allowed")):
+                effective_args.buy_levels = 0
+                effective_args.sell_levels = 0
+            elif not bool(elastic_volume.get("allow_entry_long")) and current_long_notional >= current_short_notional:
+                effective_args.buy_levels = 0
+            elif not bool(elastic_volume.get("allow_entry_short")) and current_short_notional > current_long_notional:
+                effective_args.sell_levels = 0
 
     def _apply_multi_timeframe_side_scheduler(*, long_notional: float, short_notional: float) -> None:
         nonlocal effective_args, multi_timeframe_bias
@@ -11140,6 +11295,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state["last_mid_price"] = mid_price
     state["updated_at"] = state_now
     state["version"] = STATE_VERSION
+    if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
+        state["elastic_volume"] = {
+            "regime": elastic_volume.get("regime"),
+            "cooldown_until": elastic_volume.get("cooldown_until"),
+            "updated_at": state_now,
+        }
+    else:
+        state.pop("elastic_volume", None)
     if sticky_exit_mode["key"]:
         state["sticky_exit_mode_key"] = sticky_exit_mode["key"]
     else:
@@ -11181,6 +11344,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "execution_regime": execution_regime,
         "adaptive_step": adaptive_step,
         "multi_timeframe_bias": multi_timeframe_bias,
+        "elastic_volume": elastic_volume,
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
         "maker_volatility_inventory": maker_volatility_inventory,
@@ -11887,6 +12051,24 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adaptive-step-max-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-per-order-scale", type=float, default=1.0)
     parser.add_argument("--adaptive-step-min-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--elastic-volume-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--elastic-volume-mode", type=str, default="competition_elastic_volume_v1")
+    parser.add_argument("--elastic-loss-per-10k-sprint", type=float, default=0.3)
+    parser.add_argument("--elastic-loss-per-10k-cruise", type=float, default=0.8)
+    parser.add_argument("--elastic-loss-per-10k-defensive", type=float, default=1.2)
+    parser.add_argument("--elastic-loss-per-10k-cooldown", type=float, default=1.8)
+    parser.add_argument("--elastic-inventory-soft-ratio", type=float, default=0.6)
+    parser.add_argument("--elastic-inventory-hard-ratio", type=float, default=0.9)
+    parser.add_argument("--elastic-step-scale-sprint", type=float, default=0.8)
+    parser.add_argument("--elastic-step-scale-defensive", type=float, default=1.8)
+    parser.add_argument("--elastic-step-scale-cooldown", type=float, default=3.0)
+    parser.add_argument("--elastic-per-order-scale-sprint", type=float, default=1.25)
+    parser.add_argument("--elastic-per-order-scale-defensive", type=float, default=0.65)
+    parser.add_argument("--elastic-levels-scale-sprint", type=float, default=1.25)
+    parser.add_argument("--elastic-levels-scale-defensive", type=float, default=0.65)
+    parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
+    parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
+    parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--multi-timeframe-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--multi-timeframe-bias-mode-adapter",
@@ -12558,6 +12740,33 @@ def main() -> None:
     if args.multi_timeframe_bias_scheduler_reduce_max_order_scale <= 0 or args.multi_timeframe_bias_scheduler_reduce_max_order_scale > 1:
         raise SystemExit("--multi-timeframe-bias-scheduler-reduce-max-order-scale must be within (0, 1]")
     _validate_multi_timeframe_bias_args(args)
+    if args.elastic_volume_enabled and str(args.elastic_volume_mode).strip() != "competition_elastic_volume_v1":
+        raise SystemExit("--elastic-volume-mode must be competition_elastic_volume_v1")
+    if args.elastic_loss_per_10k_sprint < 0 or args.elastic_loss_per_10k_cruise < 0:
+        raise SystemExit("--elastic-loss-per-10k sprint/cruise thresholds must be >= 0")
+    if args.elastic_loss_per_10k_defensive < 0 or args.elastic_loss_per_10k_cooldown < 0:
+        raise SystemExit("--elastic-loss-per-10k defensive/cooldown thresholds must be >= 0")
+    if not (
+        args.elastic_loss_per_10k_sprint
+        <= args.elastic_loss_per_10k_cruise
+        <= args.elastic_loss_per_10k_defensive
+        <= args.elastic_loss_per_10k_cooldown
+    ):
+        raise SystemExit("--elastic-loss-per-10k thresholds must be ordered sprint <= cruise <= defensive <= cooldown")
+    if args.elastic_inventory_soft_ratio < 0 or args.elastic_inventory_hard_ratio < 0:
+        raise SystemExit("--elastic-inventory ratios must be >= 0")
+    if args.elastic_inventory_soft_ratio > args.elastic_inventory_hard_ratio:
+        raise SystemExit("--elastic-inventory-soft-ratio must be <= hard-ratio")
+    if args.elastic_step_scale_sprint <= 0 or args.elastic_step_scale_defensive <= 0 or args.elastic_step_scale_cooldown <= 0:
+        raise SystemExit("--elastic-step-scale values must be > 0")
+    if args.elastic_per_order_scale_sprint <= 0 or args.elastic_per_order_scale_defensive <= 0:
+        raise SystemExit("--elastic-per-order-scale values must be > 0")
+    if args.elastic_levels_scale_sprint < 0 or args.elastic_levels_scale_defensive < 0:
+        raise SystemExit("--elastic-levels-scale values must be >= 0")
+    if args.elastic_cooldown_seconds < 0:
+        raise SystemExit("--elastic-cooldown-seconds must be >= 0")
+    if args.elastic_state_confirm_cycles < 1:
+        raise SystemExit("--elastic-state-confirm-cycles must be >= 1")
     volatility_entry_pause_thresholds = (
         args.volatility_entry_pause_30s_abs_return_ratio,
         args.volatility_entry_pause_30s_amplitude_ratio,
@@ -13045,6 +13254,30 @@ def main() -> None:
                     "multi_timeframe_scheduler_reasons": list(
                         ((plan_report.get("multi_timeframe_bias") or {}).get("scheduler") or {}).get("reasons") or []
                     ),
+                    "elastic_volume": dict(plan_report.get("elastic_volume") or {}),
+                    "elastic_volume_enabled": bool((plan_report.get("elastic_volume") or {}).get("enabled")),
+                    "elastic_volume_regime": str((plan_report.get("elastic_volume") or {}).get("regime") or ""),
+                    "elastic_volume_reasons": list((plan_report.get("elastic_volume") or {}).get("reasons") or []),
+                    "elastic_volume_loss_per_10k_15m": _safe_float(
+                        ((plan_report.get("elastic_volume") or {}).get("metrics") or {}).get("loss_per_10k_15m")
+                    ),
+                    "elastic_volume_competition_gross_notional": _safe_float(
+                        ((plan_report.get("elastic_volume") or {}).get("metrics") or {}).get("competition_gross_notional")
+                    ),
+                    "elastic_volume_competition_net_pnl": _safe_float(
+                        ((plan_report.get("elastic_volume") or {}).get("metrics") or {}).get("competition_net_pnl")
+                    ),
+                    "elastic_volume_competition_commission": _safe_float(
+                        ((plan_report.get("elastic_volume") or {}).get("metrics") or {}).get("competition_commission")
+                    ),
+                    "elastic_volume_inventory_ratio": _safe_float(
+                        ((plan_report.get("elastic_volume") or {}).get("metrics") or {}).get("inventory_ratio")
+                    ),
+                    "elastic_volume_step_scale": _safe_float((plan_report.get("elastic_volume") or {}).get("step_scale")),
+                    "elastic_volume_per_order_scale": _safe_float(
+                        (plan_report.get("elastic_volume") or {}).get("per_order_scale")
+                    ),
+                    "elastic_volume_levels_scale": _safe_float((plan_report.get("elastic_volume") or {}).get("levels_scale")),
                     "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
                     "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
                     "current_short_qty": _safe_float(plan_report.get("current_short_qty")),

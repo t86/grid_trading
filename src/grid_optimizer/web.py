@@ -3313,6 +3313,24 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adaptive_step_max_scale": 1.0,
     "adaptive_step_min_per_order_scale": 1.0,
     "adaptive_step_min_position_limit_scale": 1.0,
+    "elastic_volume_enabled": False,
+    "elastic_volume_mode": "competition_elastic_volume_v1",
+    "elastic_loss_per_10k_sprint": 0.3,
+    "elastic_loss_per_10k_cruise": 0.8,
+    "elastic_loss_per_10k_defensive": 1.2,
+    "elastic_loss_per_10k_cooldown": 1.8,
+    "elastic_inventory_soft_ratio": 0.6,
+    "elastic_inventory_hard_ratio": 0.9,
+    "elastic_step_scale_sprint": 0.8,
+    "elastic_step_scale_defensive": 1.8,
+    "elastic_step_scale_cooldown": 3.0,
+    "elastic_per_order_scale_sprint": 1.25,
+    "elastic_per_order_scale_defensive": 0.65,
+    "elastic_levels_scale_sprint": 1.25,
+    "elastic_levels_scale_defensive": 0.65,
+    "elastic_cooldown_seconds": 120.0,
+    "elastic_state_confirm_cycles": 3,
+    "elastic_cancel_stale_entries_on_cooldown": True,
     "multi_timeframe_bias_enabled": False,
     "multi_timeframe_bias_mode_adapter": "auto",
     "multi_timeframe_bias_low_zone_threshold": 0.35,
@@ -5700,7 +5718,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
               <div class="rs-stat-panel">
                 <div class="rs-stat-list">
                   <div class="rs-stat-row"><span>当前持仓</span><strong>${escapeHtml(card.current_position_display || "--")}</strong></div>
-                  <div class="rs-stat-row"><span>累计总量</span><strong>${fmtNum(card.lifetime_total_volume ?? card.total_volume)}</strong></div>
+                  <div class="rs-stat-row"><span>当前总量</span><strong>${fmtNum(card.lifetime_total_volume ?? card.total_volume)}</strong></div>
                   <div class="rs-stat-row"><span>最近一小时交易量</span><strong>${fmtNum(card.recent_hour_volume)}</strong></div>
                   <div class="rs-stat-row"><span>盈亏总额</span><strong>${fmtSigned(card.total_pnl, 4)}</strong></div>
                   <div class="rs-stat-row"><span>最近一小时盈亏</span><strong>${fmtSigned(card.recent_hour_pnl, 4)}</strong></div>
@@ -7876,6 +7894,20 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "elastic_loss_per_10k_sprint",
+        "elastic_loss_per_10k_cruise",
+        "elastic_loss_per_10k_defensive",
+        "elastic_loss_per_10k_cooldown",
+        "elastic_inventory_soft_ratio",
+        "elastic_inventory_hard_ratio",
+        "elastic_step_scale_sprint",
+        "elastic_step_scale_defensive",
+        "elastic_step_scale_cooldown",
+        "elastic_per_order_scale_sprint",
+        "elastic_per_order_scale_defensive",
+        "elastic_levels_scale_sprint",
+        "elastic_levels_scale_defensive",
+        "elastic_cooldown_seconds",
         "multi_timeframe_bias_low_zone_threshold",
         "multi_timeframe_bias_high_zone_threshold",
         "multi_timeframe_bias_strong_threshold",
@@ -8018,6 +8050,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_confirm_normal_to_safe",
         "execution_regime_confirm_normal_to_caution",
         "multi_timeframe_bias_max_level_delta",
+        "elastic_state_confirm_cycles",
         "synthetic_flow_sleeve_levels",
         "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
@@ -8036,6 +8069,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_enabled",
         "take_profit_enabled",
         "adaptive_step_enabled",
+        "elastic_volume_enabled",
+        "elastic_cancel_stale_entries_on_cooldown",
         "multi_timeframe_bias_enabled",
         "execution_regime_enabled",
         "volatility_entry_pause_enabled",
@@ -8064,6 +8099,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "strategy_profile",
         "strategy_mode",
         "multi_timeframe_bias_mode_adapter",
+        "elastic_volume_mode",
         "symbol",
         "maker_volatility_window",
         "margin_type",
@@ -8104,6 +8140,20 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "elastic_loss_per_10k_sprint",
+        "elastic_loss_per_10k_cruise",
+        "elastic_loss_per_10k_defensive",
+        "elastic_loss_per_10k_cooldown",
+        "elastic_inventory_soft_ratio",
+        "elastic_inventory_hard_ratio",
+        "elastic_step_scale_sprint",
+        "elastic_step_scale_defensive",
+        "elastic_step_scale_cooldown",
+        "elastic_per_order_scale_sprint",
+        "elastic_per_order_scale_defensive",
+        "elastic_levels_scale_sprint",
+        "elastic_levels_scale_defensive",
+        "elastic_cooldown_seconds",
         "execution_regime_vol_p50_ratio",
         "execution_regime_vol_p95_ratio",
         "execution_regime_spread_p50_bps",
@@ -8873,6 +8923,32 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--adaptive-step-min-per-order-scale", str(config["adaptive_step_min_per_order_scale"])])
     if config.get("adaptive_step_min_position_limit_scale") is not None:
         command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
+    command.append("--elastic-volume-enabled" if config.get("elastic_volume_enabled", False) else "--no-elastic-volume-enabled")
+    for key, flag in (
+        ("elastic_volume_mode", "--elastic-volume-mode"),
+        ("elastic_loss_per_10k_sprint", "--elastic-loss-per-10k-sprint"),
+        ("elastic_loss_per_10k_cruise", "--elastic-loss-per-10k-cruise"),
+        ("elastic_loss_per_10k_defensive", "--elastic-loss-per-10k-defensive"),
+        ("elastic_loss_per_10k_cooldown", "--elastic-loss-per-10k-cooldown"),
+        ("elastic_inventory_soft_ratio", "--elastic-inventory-soft-ratio"),
+        ("elastic_inventory_hard_ratio", "--elastic-inventory-hard-ratio"),
+        ("elastic_step_scale_sprint", "--elastic-step-scale-sprint"),
+        ("elastic_step_scale_defensive", "--elastic-step-scale-defensive"),
+        ("elastic_step_scale_cooldown", "--elastic-step-scale-cooldown"),
+        ("elastic_per_order_scale_sprint", "--elastic-per-order-scale-sprint"),
+        ("elastic_per_order_scale_defensive", "--elastic-per-order-scale-defensive"),
+        ("elastic_levels_scale_sprint", "--elastic-levels-scale-sprint"),
+        ("elastic_levels_scale_defensive", "--elastic-levels-scale-defensive"),
+        ("elastic_cooldown_seconds", "--elastic-cooldown-seconds"),
+        ("elastic_state_confirm_cycles", "--elastic-state-confirm-cycles"),
+    ):
+        if config.get(key) is not None:
+            command.extend([flag, str(config[key])])
+    command.append(
+        "--elastic-cancel-stale-entries-on-cooldown"
+        if config.get("elastic_cancel_stale_entries_on_cooldown", True)
+        else "--no-elastic-cancel-stale-entries-on-cooldown"
+    )
     command.append(
         "--multi-timeframe-bias-enabled"
         if config.get("multi_timeframe_bias_enabled", False)

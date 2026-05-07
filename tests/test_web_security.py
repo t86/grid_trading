@@ -950,6 +950,51 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["adaptive_step_min_per_order_scale"], 0.35)
         self.assertEqual(payload["adaptive_step_min_position_limit_scale"], 0.45)
 
+    def test_normalize_runner_control_payload_supports_elastic_volume_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "CHIPUSDT",
+                "strategy_profile": "chipusdt_competition_neutral_ping_pong_v1",
+                "elastic_volume_enabled": True,
+                "elastic_volume_mode": "competition_elastic_volume_v1",
+                "elastic_loss_per_10k_sprint": 0.25,
+                "elastic_loss_per_10k_cruise": 0.75,
+                "elastic_loss_per_10k_defensive": 1.15,
+                "elastic_loss_per_10k_cooldown": 1.75,
+                "elastic_inventory_soft_ratio": 0.55,
+                "elastic_inventory_hard_ratio": 0.88,
+                "elastic_step_scale_sprint": 0.85,
+                "elastic_step_scale_defensive": 1.7,
+                "elastic_step_scale_cooldown": 2.8,
+                "elastic_per_order_scale_sprint": 1.2,
+                "elastic_per_order_scale_defensive": 0.6,
+                "elastic_levels_scale_sprint": 1.15,
+                "elastic_levels_scale_defensive": 0.7,
+                "elastic_cooldown_seconds": 90.0,
+                "elastic_state_confirm_cycles": 4,
+                "elastic_cancel_stale_entries_on_cooldown": True,
+            }
+        )
+
+        self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertEqual(payload["elastic_volume_mode"], "competition_elastic_volume_v1")
+        self.assertEqual(payload["elastic_loss_per_10k_sprint"], 0.25)
+        self.assertEqual(payload["elastic_loss_per_10k_cruise"], 0.75)
+        self.assertEqual(payload["elastic_loss_per_10k_defensive"], 1.15)
+        self.assertEqual(payload["elastic_loss_per_10k_cooldown"], 1.75)
+        self.assertEqual(payload["elastic_inventory_soft_ratio"], 0.55)
+        self.assertEqual(payload["elastic_inventory_hard_ratio"], 0.88)
+        self.assertEqual(payload["elastic_step_scale_sprint"], 0.85)
+        self.assertEqual(payload["elastic_step_scale_defensive"], 1.7)
+        self.assertEqual(payload["elastic_step_scale_cooldown"], 2.8)
+        self.assertEqual(payload["elastic_per_order_scale_sprint"], 1.2)
+        self.assertEqual(payload["elastic_per_order_scale_defensive"], 0.6)
+        self.assertEqual(payload["elastic_levels_scale_sprint"], 1.15)
+        self.assertEqual(payload["elastic_levels_scale_defensive"], 0.7)
+        self.assertEqual(payload["elastic_cooldown_seconds"], 90.0)
+        self.assertEqual(payload["elastic_state_confirm_cycles"], 4)
+        self.assertTrue(payload["elastic_cancel_stale_entries_on_cooldown"])
+
     def test_normalize_runner_control_payload_supports_synthetic_trend_follow_fields(self) -> None:
         payload = _normalize_runner_control_payload(
             {
