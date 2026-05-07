@@ -986,7 +986,8 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "short_cover_pause_down_return_trigger_ratio": -0.0022,
             "take_profit_min_profit_ratio": 0.0001,
             "freeze_shift_abs_return_trigger_ratio": 0.006,
-            "adaptive_step_enabled": False,
+            "adaptive_step_enabled": True,
+            "adaptive_step_max_scale": 2.5,
             "synthetic_trend_follow_enabled": False,
             "runtime_guard_stats_start_time": "2026-03-31T18:00:00+08:00",
             "rolling_hourly_loss_limit": 6.0,
@@ -2605,9 +2606,11 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "adaptive_step_30s_abs_return_ratio": 0.0025,
             "adaptive_step_30s_amplitude_ratio": 0.0040,
             "adaptive_step_1m_abs_return_ratio": 0.0040,
-            "adaptive_step_1m_amplitude_ratio": 0.0060,
+            "adaptive_step_1m_amplitude_ratio": 0.00375,
             "adaptive_step_3m_abs_return_ratio": 0.0090,
+            "adaptive_step_3m_amplitude_ratio": 0.0060,
             "adaptive_step_5m_abs_return_ratio": 0.0130,
+            "adaptive_step_5m_amplitude_ratio": 0.0080,
             "adaptive_step_max_scale": 2.5,
             "adaptive_step_min_per_order_scale": 0.70,
             "adaptive_step_min_position_limit_scale": 0.75,
@@ -3230,10 +3233,42 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adaptive_step_1m_abs_return_ratio": 0.0,
     "adaptive_step_1m_amplitude_ratio": 0.0,
     "adaptive_step_3m_abs_return_ratio": 0.0,
+    "adaptive_step_3m_amplitude_ratio": 0.0,
     "adaptive_step_5m_abs_return_ratio": 0.0,
+    "adaptive_step_5m_amplitude_ratio": 0.0,
     "adaptive_step_max_scale": 1.0,
     "adaptive_step_min_per_order_scale": 1.0,
     "adaptive_step_min_position_limit_scale": 1.0,
+    "elastic_volume_enabled": False,
+    "elastic_volume_mode": "competition_elastic_volume_v1",
+    "elastic_loss_per_10k_sprint": 0.3,
+    "elastic_loss_per_10k_cruise": 0.8,
+    "elastic_loss_per_10k_defensive": 1.2,
+    "elastic_loss_per_10k_cooldown": 1.8,
+    "elastic_inventory_soft_ratio": 0.6,
+    "elastic_inventory_hard_ratio": 0.9,
+    "elastic_step_scale_sprint": 0.8,
+    "elastic_step_scale_defensive": 1.8,
+    "elastic_step_scale_cooldown": 3.0,
+    "elastic_per_order_scale_sprint": 1.25,
+    "elastic_per_order_scale_defensive": 0.65,
+    "elastic_levels_scale_sprint": 1.25,
+    "elastic_levels_scale_defensive": 0.65,
+    "elastic_cooldown_seconds": 120.0,
+    "elastic_state_confirm_cycles": 3,
+    "elastic_cancel_stale_entries_on_cooldown": True,
+    "multi_timeframe_bias_enabled": False,
+    "multi_timeframe_bias_low_zone_threshold": 0.35,
+    "multi_timeframe_bias_high_zone_threshold": 0.65,
+    "multi_timeframe_bias_strong_threshold": 0.50,
+    "multi_timeframe_bias_max_level_delta": 4,
+    "multi_timeframe_bias_max_offset_steps": 1.0,
+    "multi_timeframe_bias_favored_position_scale": 1.25,
+    "multi_timeframe_bias_unfavored_position_scale": 0.75,
+    "multi_timeframe_bias_shock_abs_return_ratio": 0.018,
+    "multi_timeframe_bias_shock_amplitude_ratio": 0.025,
+    "multi_timeframe_bias_shock_step_scale": 1.5,
+    "multi_timeframe_bias_shock_notional_scale": 0.70,
     "synthetic_trend_follow_enabled": False,
     "synthetic_trend_follow_1m_abs_return_ratio": 0.0,
     "synthetic_trend_follow_1m_amplitude_ratio": 0.0,
@@ -3577,6 +3612,191 @@ def _build_hourly_email_monitor_snapshot(symbol: str, config: dict[str, Any]) ->
         summary_limit=500,
         runner_process=runner,
     )
+
+
+def _competition_volume_parse_dt(value: Any) -> datetime | None:
+    if value in {"", None}:
+        return None
+    if isinstance(value, datetime):
+        dt = value
+    else:
+        try:
+            dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        except ValueError:
+            return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _competition_volume_row_time(row: dict[str, Any], *, income: bool = False) -> datetime | None:
+    ts_ms = income_row_time_ms(row) if income else trade_row_time_ms(row)
+    if ts_ms <= 0:
+        return None
+    return datetime.fromtimestamp(ts_ms / 1000.0, tz=timezone.utc)
+
+
+def _competition_volume_summary_path(symbol: str, output_dir: Path = Path("output")) -> Path:
+    config = _load_runner_control_config(symbol)
+    summary = str(config.get("summary_jsonl") or "").strip()
+    if summary:
+        return Path(summary)
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", symbol.strip()).strip("_").lower()
+    return output_dir / f"{slug}_loop_events.jsonl"
+
+
+def _list_competition_volume_symbols(*, output_dir: Path = Path("output")) -> dict[str, Any]:
+    symbols: set[str] = set()
+    for config in _iter_saved_runner_control_configs():
+        symbol = str(config.get("symbol", "")).upper().strip()
+        if symbol:
+            symbols.add(symbol)
+    for path in sorted(output_dir.glob("*_loop_runner_control.json")):
+        data = _read_json_dict(path)
+        symbol = str(data.get("symbol", "")).upper().strip()
+        if symbol:
+            symbols.add(symbol)
+    return {"server": os.uname().nodename, "symbols": sorted(symbols)}
+
+
+def _iter_competition_volume_trades(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> list[dict[str, Any]]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    start = _competition_volume_parse_dt(competition_start_at)
+    audit_paths = build_audit_paths(summary_path)
+    rows: list[dict[str, Any]] = []
+    stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    for row in iter_jsonl(audit_paths["trade_audit"]):
+        row_symbol = str(row.get("symbol", "")).upper().strip()
+        if normalized_symbol and row_symbol and row_symbol != normalized_symbol:
+            continue
+        ts = _competition_volume_row_time(row)
+        if ts is None or (start is not None and ts < start):
+            continue
+        price = _email_float(row.get("price"))
+        qty = abs(_email_float(row.get("qty")))
+        commission = (
+            abs(_email_float(row.get("commission")))
+            if str(row.get("commissionAsset", "")).upper().strip() in stable_assets
+            else 0.0
+        )
+        rows.append(
+            {
+                "ts": ts.isoformat(),
+                "symbol": row_symbol or normalized_symbol,
+                "side": str(row.get("side", "")).upper().strip(),
+                "price": price,
+                "qty": qty,
+                "notional": price * qty,
+                "realized_pnl": _email_float(row.get("realizedPnl")),
+                "commission": commission,
+                "commission_asset": str(row.get("commissionAsset", "")).upper().strip(),
+                "maker": bool(row.get("maker") or row.get("isMaker")),
+                "order_id": row.get("orderId") or row.get("order_id"),
+                "client_order_id": row.get("clientOrderId") or row.get("client_order_id"),
+                "position_side": row.get("positionSide") or row.get("position_side"),
+            }
+        )
+    rows.sort(key=lambda item: str(item.get("ts") or ""))
+    return rows
+
+
+def _iter_competition_volume_income(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> list[dict[str, Any]]:
+    normalized_symbol = str(symbol or "").upper().strip()
+    start = _competition_volume_parse_dt(competition_start_at)
+    audit_paths = build_audit_paths(summary_path)
+    rows: list[dict[str, Any]] = []
+    for row in iter_jsonl(audit_paths["income_audit"]):
+        row_symbol = str(row.get("symbol", "")).upper().strip()
+        if normalized_symbol and row_symbol and row_symbol != normalized_symbol:
+            continue
+        ts = _competition_volume_row_time(row, income=True)
+        if ts is None or (start is not None and ts < start):
+            continue
+        rows.append({"ts": ts.isoformat(), "income": _email_float(row.get("income"))})
+    rows.sort(key=lambda item: str(item.get("ts") or ""))
+    return rows
+
+
+def _build_competition_volume_summary(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> dict[str, Any]:
+    trades = _iter_competition_volume_trades(
+        symbol=symbol,
+        summary_path=summary_path,
+        competition_start_at=competition_start_at,
+    )
+    income_rows = _iter_competition_volume_income(
+        symbol=symbol,
+        summary_path=summary_path,
+        competition_start_at=competition_start_at,
+    )
+    gross = sum(_email_float(row.get("notional")) for row in trades)
+    commission = sum(_email_float(row.get("commission")) for row in trades)
+    net_pnl = sum(_email_float(row.get("realized_pnl")) - _email_float(row.get("commission")) for row in trades)
+    net_pnl += sum(_email_float(row.get("income")) for row in income_rows)
+    maker_count = sum(1 for row in trades if row.get("maker"))
+    latest_event = _read_last_jsonl_row(summary_path) or {}
+    elastic = latest_event.get("elastic_volume") if isinstance(latest_event.get("elastic_volume"), dict) else {}
+    return {
+        "symbol": str(symbol or "").upper().strip(),
+        "server": os.uname().nodename,
+        "competition_gross_notional": gross,
+        "competition_net_pnl": net_pnl,
+        "competition_commission": commission,
+        "trade_count": len(trades),
+        "maker_ratio": maker_count / len(trades) if trades else 0.0,
+        "elastic_regime": str(elastic.get("regime") or latest_event.get("elastic_volume_regime") or ""),
+        "latest_event": latest_event,
+    }
+
+
+def _build_competition_volume_fills(*, symbol: str, summary_path: Path, limit: int = 200) -> dict[str, Any]:
+    trades = _iter_competition_volume_trades(symbol=symbol, summary_path=summary_path)
+    return {"symbol": str(symbol or "").upper().strip(), "fills": list(reversed(trades[-max(int(limit), 1) :]))}
+
+
+def _build_competition_volume_chart(
+    *,
+    symbol: str,
+    summary_path: Path,
+    competition_start_at: Any = None,
+) -> dict[str, Any]:
+    trades = _iter_competition_volume_trades(
+        symbol=symbol,
+        summary_path=summary_path,
+        competition_start_at=competition_start_at,
+    )
+    cumulative_notional = 0.0
+    cumulative_net_pnl = 0.0
+    cumulative_commission = 0.0
+    points: list[dict[str, Any]] = []
+    for row in trades:
+        cumulative_notional += _email_float(row.get("notional"))
+        cumulative_commission += _email_float(row.get("commission"))
+        cumulative_net_pnl += _email_float(row.get("realized_pnl")) - _email_float(row.get("commission"))
+        points.append(
+            {
+                "ts": row.get("ts"),
+                "price": _email_float(row.get("price")),
+                "cumulative_notional": cumulative_notional,
+                "cumulative_net_pnl": cumulative_net_pnl,
+                "cumulative_commission": cumulative_commission,
+            }
+        )
+    return {"symbol": str(symbol or "").upper().strip(), "points": points}
 
 
 def _first_email_float(row: dict[str, Any], keys: tuple[str, ...], default: float = 0.0) -> float:
@@ -7527,10 +7747,36 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_1m_abs_return_ratio",
         "adaptive_step_1m_amplitude_ratio",
         "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_3m_amplitude_ratio",
         "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_5m_amplitude_ratio",
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "elastic_loss_per_10k_sprint",
+        "elastic_loss_per_10k_cruise",
+        "elastic_loss_per_10k_defensive",
+        "elastic_loss_per_10k_cooldown",
+        "elastic_inventory_soft_ratio",
+        "elastic_inventory_hard_ratio",
+        "elastic_step_scale_sprint",
+        "elastic_step_scale_defensive",
+        "elastic_step_scale_cooldown",
+        "elastic_per_order_scale_sprint",
+        "elastic_per_order_scale_defensive",
+        "elastic_levels_scale_sprint",
+        "elastic_levels_scale_defensive",
+        "elastic_cooldown_seconds",
+        "multi_timeframe_bias_low_zone_threshold",
+        "multi_timeframe_bias_high_zone_threshold",
+        "multi_timeframe_bias_strong_threshold",
+        "multi_timeframe_bias_max_offset_steps",
+        "multi_timeframe_bias_favored_position_scale",
+        "multi_timeframe_bias_unfavored_position_scale",
+        "multi_timeframe_bias_shock_abs_return_ratio",
+        "multi_timeframe_bias_shock_amplitude_ratio",
+        "multi_timeframe_bias_shock_step_scale",
+        "multi_timeframe_bias_shock_notional_scale",
         "static_buy_offset_steps",
         "static_sell_offset_steps",
         "synthetic_trend_follow_1m_abs_return_ratio",
@@ -7619,6 +7865,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "near_market_reentry_confirm_cycles",
         "auto_regime_confirm_cycles",
         "market_bias_regime_switch_confirm_cycles",
+        "multi_timeframe_bias_max_level_delta",
+        "elastic_state_confirm_cycles",
         "synthetic_flow_sleeve_levels",
         "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
@@ -7636,6 +7884,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_strong_short_pause_enabled",
         "market_bias_regime_switch_enabled",
         "adaptive_step_enabled",
+        "elastic_volume_enabled",
+        "elastic_cancel_stale_entries_on_cooldown",
+        "multi_timeframe_bias_enabled",
         "synthetic_trend_follow_enabled",
         "synthetic_flow_sleeve_enabled",
         "adverse_reduce_enabled",
@@ -7659,6 +7910,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
     str_fields = {
         "strategy_profile",
         "strategy_mode",
+        "elastic_volume_mode",
         "symbol",
         "maker_volatility_window",
         "margin_type",
@@ -7693,10 +7945,36 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_1m_abs_return_ratio",
         "adaptive_step_1m_amplitude_ratio",
         "adaptive_step_3m_abs_return_ratio",
+        "adaptive_step_3m_amplitude_ratio",
         "adaptive_step_5m_abs_return_ratio",
+        "adaptive_step_5m_amplitude_ratio",
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "elastic_loss_per_10k_sprint",
+        "elastic_loss_per_10k_cruise",
+        "elastic_loss_per_10k_defensive",
+        "elastic_loss_per_10k_cooldown",
+        "elastic_inventory_soft_ratio",
+        "elastic_inventory_hard_ratio",
+        "elastic_step_scale_sprint",
+        "elastic_step_scale_defensive",
+        "elastic_step_scale_cooldown",
+        "elastic_per_order_scale_sprint",
+        "elastic_per_order_scale_defensive",
+        "elastic_levels_scale_sprint",
+        "elastic_levels_scale_defensive",
+        "elastic_cooldown_seconds",
+        "multi_timeframe_bias_low_zone_threshold",
+        "multi_timeframe_bias_high_zone_threshold",
+        "multi_timeframe_bias_strong_threshold",
+        "multi_timeframe_bias_max_offset_steps",
+        "multi_timeframe_bias_favored_position_scale",
+        "multi_timeframe_bias_unfavored_position_scale",
+        "multi_timeframe_bias_shock_abs_return_ratio",
+        "multi_timeframe_bias_shock_amplitude_ratio",
+        "multi_timeframe_bias_shock_step_scale",
+        "multi_timeframe_bias_shock_notional_scale",
         "static_buy_offset_steps",
         "static_sell_offset_steps",
         "synthetic_trend_follow_1m_abs_return_ratio",
@@ -8342,14 +8620,38 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--adaptive-step-1m-amplitude-ratio", str(config["adaptive_step_1m_amplitude_ratio"])])
     if config.get("adaptive_step_3m_abs_return_ratio") is not None:
         command.extend(["--adaptive-step-3m-abs-return-ratio", str(config["adaptive_step_3m_abs_return_ratio"])])
+    if config.get("adaptive_step_3m_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-3m-amplitude-ratio", str(config["adaptive_step_3m_amplitude_ratio"])])
     if config.get("adaptive_step_5m_abs_return_ratio") is not None:
         command.extend(["--adaptive-step-5m-abs-return-ratio", str(config["adaptive_step_5m_abs_return_ratio"])])
+    if config.get("adaptive_step_5m_amplitude_ratio") is not None:
+        command.extend(["--adaptive-step-5m-amplitude-ratio", str(config["adaptive_step_5m_amplitude_ratio"])])
     if config.get("adaptive_step_max_scale") is not None:
         command.extend(["--adaptive-step-max-scale", str(config["adaptive_step_max_scale"])])
     if config.get("adaptive_step_min_per_order_scale") is not None:
         command.extend(["--adaptive-step-min-per-order-scale", str(config["adaptive_step_min_per_order_scale"])])
     if config.get("adaptive_step_min_position_limit_scale") is not None:
         command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
+    command.append(
+        "--multi-timeframe-bias-enabled"
+        if config.get("multi_timeframe_bias_enabled", False)
+        else "--no-multi-timeframe-bias-enabled"
+    )
+    for key, flag in (
+        ("multi_timeframe_bias_low_zone_threshold", "--multi-timeframe-bias-low-zone-threshold"),
+        ("multi_timeframe_bias_high_zone_threshold", "--multi-timeframe-bias-high-zone-threshold"),
+        ("multi_timeframe_bias_strong_threshold", "--multi-timeframe-bias-strong-threshold"),
+        ("multi_timeframe_bias_max_level_delta", "--multi-timeframe-bias-max-level-delta"),
+        ("multi_timeframe_bias_max_offset_steps", "--multi-timeframe-bias-max-offset-steps"),
+        ("multi_timeframe_bias_favored_position_scale", "--multi-timeframe-bias-favored-position-scale"),
+        ("multi_timeframe_bias_unfavored_position_scale", "--multi-timeframe-bias-unfavored-position-scale"),
+        ("multi_timeframe_bias_shock_abs_return_ratio", "--multi-timeframe-bias-shock-abs-return-ratio"),
+        ("multi_timeframe_bias_shock_amplitude_ratio", "--multi-timeframe-bias-shock-amplitude-ratio"),
+        ("multi_timeframe_bias_shock_step_scale", "--multi-timeframe-bias-shock-step-scale"),
+        ("multi_timeframe_bias_shock_notional_scale", "--multi-timeframe-bias-shock-notional-scale"),
+    ):
+        if config.get(key) is not None:
+            command.extend([flag, str(config[key])])
     command.append(
         "--synthetic-trend-follow-enabled"
         if config.get("synthetic_trend_follow_enabled", False)
@@ -8673,7 +8975,9 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "adaptive_step_1m_abs_return_ratio",
             "adaptive_step_1m_amplitude_ratio",
             "adaptive_step_3m_abs_return_ratio",
+            "adaptive_step_3m_amplitude_ratio",
             "adaptive_step_5m_abs_return_ratio",
+            "adaptive_step_5m_amplitude_ratio",
             "adaptive_step_max_scale",
             "adaptive_step_min_per_order_scale",
             "adaptive_step_min_position_limit_scale",
@@ -9192,8 +9496,8 @@ def _safe_numeric(value: Any) -> float:
 
 MANUAL_TRADE_TASKS: dict[str, dict[str, Any]] = {}
 MANUAL_TRADE_TASKS_LOCK = threading.Lock()
-MANUAL_TRADE_SLEEP_SECONDS = 5.0
-MANUAL_TRADE_MIN_REPRICE_SECONDS = 5.0
+MANUAL_TRADE_SLEEP_SECONDS = 2.0
+MANUAL_TRADE_MIN_REPRICE_SECONDS = 2.0
 
 
 def _manual_trade_client_order_prefix(symbol: str) -> str:
@@ -9550,6 +9854,71 @@ def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
             )
         )
     return {"symbol": symbol, "plan": plan, "orders": responses, "snapshot": _manual_trade_snapshot(symbol)}
+
+
+def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
+    normalized_symbol = str(payload.get("symbol", "")).upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    normalized_side = str(payload.get("side", "")).upper().strip()
+    if normalized_side not in {"BUY", "SELL"}:
+        raise ValueError("side must be BUY or SELL")
+    safe_notional = float(payload.get("notional", 0) or 0)
+    if safe_notional <= 0:
+        raise ValueError("notional must be > 0")
+    creds = load_binance_api_credentials()
+    if creds is None:
+        raise RuntimeError("Binance API credentials are not configured")
+    api_key, api_secret = creds
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    if _truthy(position_mode.get("dualSidePosition")):
+        raise ValueError("manual trade requires one-way position mode")
+    book = fetch_futures_book_tickers(symbol=normalized_symbol)
+    if not book:
+        raise RuntimeError(f"{normalized_symbol} missing book ticker")
+    bid_price = _safe_numeric(book[0].get("bid_price"))
+    ask_price = _safe_numeric(book[0].get("ask_price"))
+    if bid_price <= 0 or ask_price <= 0:
+        raise RuntimeError(f"{normalized_symbol} invalid book ticker")
+    symbol_info = fetch_futures_symbol_config(normalized_symbol)
+    price = bid_price if normalized_side == "BUY" else ask_price
+    rounded_price = _round_order_price(price, symbol_info.get("tick_size"), normalized_side)
+    quantity = _round_order_qty(safe_notional / rounded_price, symbol_info.get("step_size"))
+    if quantity <= 0:
+        raise ValueError("quantity rounds to zero")
+    min_qty = symbol_info.get("min_qty")
+    if min_qty is not None and quantity < float(min_qty):
+        raise ValueError("quantity is below minimum quantity")
+    min_notional = symbol_info.get("min_notional")
+    if min_notional is not None and quantity * rounded_price < float(min_notional):
+        raise ValueError("order notional is below minimum notional")
+    prefix = _manual_trade_client_order_prefix(normalized_symbol)
+    role = "book_buy" if normalized_side == "BUY" else "book_sell"
+    client_order_id = _manual_trade_order_id(prefix, role, normalized_side)
+    response = post_futures_order(
+        symbol=normalized_symbol,
+        side=normalized_side,
+        quantity=quantity,
+        price=rounded_price,
+        api_key=api_key,
+        api_secret=api_secret,
+        time_in_force="GTX",
+        reduce_only=None,
+        new_client_order_id=client_order_id,
+    )
+    return {
+        "symbol": normalized_symbol,
+        "limit_order": {
+            "side": normalized_side,
+            "quantity": quantity,
+            "price": rounded_price,
+            "notional": quantity * rounded_price,
+            "time_in_force": "GTX",
+            "client_order_id": client_order_id,
+        },
+        "order": response,
+        "snapshot": _manual_trade_snapshot(normalized_symbol),
+    }
 
 
 def _manual_trade_chase_leg(
@@ -15966,7 +16335,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
   <div class="wrap">
     <section class="card">
       <h1>手动追盘交易</h1>
-      <p>本页面只操作当前服务器配置的 Binance U 本位合约账户。Maker 按买一/卖一撤旧重挂直到全部成交、取消或报错；Take 使用 MARKET 市价单。</p>
+      <p>本页面只操作当前服务器配置的 Binance U 本位合约账户。Maker 按买一/卖一撤旧重挂直到全部成交、取消或报错；买一/卖一挂盘提交静态 GTX 限价单，可重复点击挂多笔；Take 使用 MARKET 市价单。</p>
       <div class="links">
         <a href="/console">返回控制台</a>
         <a href="/monitor">打开监控页</a>
@@ -15996,6 +16365,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         <div class="actions">
           <button id="maker_buy_btn" class="buy">Maker 买入追盘</button>
           <button id="maker_sell_btn" class="sell">Maker 卖出追盘</button>
+          <button id="book_buy_btn" class="buy">买一挂买</button>
+          <button id="book_sell_btn" class="sell">卖一挂卖</button>
           <button id="take_buy_btn">Take 买入市价</button>
           <button id="take_sell_btn">Take 卖出市价</button>
         </div>
@@ -16130,7 +16501,14 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         body: JSON.stringify({ symbol: symbolEl.value, side, notional: Number(notionalEl.value || 0), margin_mode: marginModeEl.value || "KEEP" }),
       });
       const data = await readJson(resp);
-      actionMetaEl.textContent = endpoint.includes("take") ? "Take 市价单已提交。" : "Maker 追盘任务已启动。";
+      if (endpoint.includes("take")) {
+        actionMetaEl.textContent = "Take 市价单已提交。";
+      } else if (endpoint.includes("book_limit")) {
+        const order = data.limit_order || {};
+        actionMetaEl.textContent = `静态挂盘已提交：${side} ${fmt(order.quantity, 8)} @ ${fmt(order.price, 8)}`;
+      } else {
+        actionMetaEl.textContent = "Maker 追盘任务已启动。";
+      }
       if (data.snapshot) renderSnapshot(data.snapshot);
       if (data.task) renderTask(data.task);
       await refreshStatus();
@@ -16150,13 +16528,15 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     document.getElementById("refresh_btn").addEventListener("click", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "SELL").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("book_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/book_limit", "BUY").catch((err) => actionMetaEl.textContent = err.message));
+    document.getElementById("book_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/book_limit", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
     symbolEl.addEventListener("change", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
     loadSymbols()
       .then(refreshStatus)
-      .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 3000); })
+      .then(() => { refreshTimer = setInterval(() => refreshStatus().catch(() => {}), 8000); })
       .catch((err) => { actionMetaEl.textContent = err.message; });
   </script>
 </body>
@@ -17259,8 +17639,14 @@ MONITOR_PAGE = """<!doctype html>
                 <label>3 分钟绝对涨跌阈值
                   <input id="runner_field_adaptive_step_3m_abs_return_ratio" type="number" min="0" step="0.000001" />
                 </label>
+                <label>3 分钟振幅阈值
+                  <input id="runner_field_adaptive_step_3m_amplitude_ratio" type="number" min="0" step="0.000001" />
+                </label>
                 <label>5 分钟绝对涨跌阈值
                   <input id="runner_field_adaptive_step_5m_abs_return_ratio" type="number" min="0" step="0.000001" />
+                </label>
+                <label>5 分钟振幅阈值
+                  <input id="runner_field_adaptive_step_5m_amplitude_ratio" type="number" min="0" step="0.000001" />
                 </label>
                 <label>最大放大倍数
                   <input id="runner_field_adaptive_step_max_scale" type="number" min="0" step="0.01" />
@@ -17902,6 +18288,7 @@ MONITOR_PAGE = """<!doctype html>
           maker_retries: 2,
           max_new_orders: Math.max((levels * 2) + 4, 16),
           autotune_symbol_enabled: false,
+          ...(options.extraConfig || {}),
         },
       };
     }
@@ -18587,7 +18974,8 @@ MONITOR_PAGE = """<!doctype html>
           short_cover_pause_down_return_trigger_ratio: -0.0022,
           take_profit_min_profit_ratio: 0.0001,
           freeze_shift_abs_return_trigger_ratio: 0.006,
-          adaptive_step_enabled: false,
+          adaptive_step_enabled: true,
+          adaptive_step_max_scale: 2.5,
           synthetic_trend_follow_enabled: false,
           runtime_guard_stats_start_time: "2026-03-31T18:00:00+08:00",
           rolling_hourly_loss_limit: 6.0,
@@ -19237,6 +19625,20 @@ MONITOR_PAGE = """<!doctype html>
         maxActualNetNotional: 90.0,
         maxSyntheticDriftNotional: 50.0,
         levels: 6,
+        extraConfig: {
+          adaptive_step_enabled: true,
+          adaptive_step_30s_abs_return_ratio: 0.0025,
+          adaptive_step_30s_amplitude_ratio: 0.004,
+          adaptive_step_1m_abs_return_ratio: 0.004,
+          adaptive_step_1m_amplitude_ratio: 0.00375,
+          adaptive_step_3m_abs_return_ratio: 0.009,
+          adaptive_step_3m_amplitude_ratio: 0.006,
+          adaptive_step_5m_abs_return_ratio: 0.013,
+          adaptive_step_5m_amplitude_ratio: 0.008,
+          adaptive_step_max_scale: 2.5,
+          adaptive_step_min_per_order_scale: 0.7,
+          adaptive_step_min_position_limit_scale: 0.75,
+        },
       }),
       competitionSprintPreset({
         key: "btcusdc_competition_maker_neutral_conservative_v1",
@@ -20007,7 +20409,9 @@ MONITOR_PAGE = """<!doctype html>
       { key: "adaptive_step_1m_abs_return_ratio", id: "runner_field_adaptive_step_1m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_1m_amplitude_ratio", id: "runner_field_adaptive_step_1m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_3m_abs_return_ratio", id: "runner_field_adaptive_step_3m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_3m_amplitude_ratio", id: "runner_field_adaptive_step_3m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_5m_abs_return_ratio", id: "runner_field_adaptive_step_5m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "adaptive_step_5m_amplitude_ratio", id: "runner_field_adaptive_step_5m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_max_scale", id: "runner_field_adaptive_step_max_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_per_order_scale", id: "runner_field_adaptive_step_min_per_order_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_position_limit_scale", id: "runner_field_adaptive_step_min_position_limit_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -22835,6 +23239,148 @@ RUNNER_SETTINGS_PAGE = (
     )
 )
 
+COMPETITION_VOLUME_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>合约交易赛实时成交监控</title>
+  <style>
+    :root { color-scheme: light; --line:#d9e2ef; --text:#102235; --muted:#60758a; --green:#07855b; --red:#b42318; --blue:#2563eb; --purple:#7c3aed; }
+    * { box-sizing: border-box; }
+    body { margin:0; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; background:#f5f7fb; color:var(--text); }
+    .wrap { max-width: 1480px; margin: 0 auto; padding: 18px; }
+    .top { display:flex; justify-content:space-between; align-items:end; gap:16px; margin-bottom:14px; }
+    h1 { font-size:22px; margin:0 0 4px; }
+    .muted { color:var(--muted); font-size:13px; }
+    .controls { display:flex; gap:10px; align-items:end; flex-wrap:wrap; }
+    label { display:grid; gap:5px; font-size:12px; color:var(--muted); font-weight:700; }
+    select { height:34px; border:1px solid #cbd7e5; border-radius:6px; padding:0 28px 0 10px; background:#fff; color:var(--text); }
+    .grid { display:grid; grid-template-columns: 1.05fr 1.65fr; gap:16px; align-items:start; }
+    .panel { border:1px solid var(--line); border-radius:8px; background:#fff; padding:12px; }
+    .kpis { display:grid; grid-template-columns:repeat(7,minmax(0,1fr)); gap:10px; }
+    .kpi { border:1px solid var(--line); border-radius:8px; background:#fff; padding:10px; min-height:72px; }
+    .label { color:var(--muted); font-size:11px; font-weight:800; text-transform:uppercase; }
+    .value { font-size:21px; font-weight:800; margin-top:5px; white-space:nowrap; }
+    table { width:100%; border-collapse:collapse; font-size:12px; }
+    th, td { padding:8px 7px; border-bottom:1px solid #eef3f8; text-align:right; white-space:nowrap; }
+    th:first-child, td:first-child { text-align:left; }
+    th { color:var(--muted); font-size:11px; }
+    .buy { color:var(--green); font-weight:700; }
+    .sell { color:var(--red); font-weight:700; }
+    .chart { height:260px; display:grid; grid-template-columns:48px 1fr 54px; gap:10px; margin-top:8px; }
+    .axis { display:flex; flex-direction:column; justify-content:space-between; font-size:11px; color:var(--muted); text-align:right; }
+    .plot { position:relative; border-left:1px solid #d7e1ed; border-bottom:1px solid #d7e1ed; background:linear-gradient(to bottom,#f8fbff,#fff); overflow:hidden; }
+    .legend { display:flex; gap:14px; flex-wrap:wrap; margin-top:8px; font-size:12px; color:var(--muted); }
+    .dot { display:inline-block; width:9px; height:9px; border-radius:50%; margin-right:5px; }
+    @media (max-width: 1100px) { .grid { grid-template-columns:1fr; } .kpis { grid-template-columns:repeat(2,minmax(0,1fr)); } }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="top">
+      <div>
+        <h1>合约交易赛实时成交监控</h1>
+        <div class="muted">当前服务器: <span id="server_label">-</span> · 只读监控 · 本机数据</div>
+      </div>
+      <div class="controls">
+        <label>Symbol
+          <select id="symbol_select"></select>
+        </label>
+        <label>Window
+          <select id="window_select">
+            <option value="competition">比赛周期</option>
+            <option value="15m">15m</option>
+            <option value="5m">5m</option>
+          </select>
+        </label>
+      </div>
+    </div>
+    <div class="kpis" id="kpis"></div>
+    <div class="grid" style="margin-top:14px">
+      <section class="panel">
+        <div class="label">Live Fills</div>
+        <h2 style="font-size:18px;margin:4px 0 10px">每笔成交列表</h2>
+        <table>
+          <thead><tr><th>Time</th><th>Side</th><th>Price</th><th>Qty</th><th>Notional</th><th>Fee</th><th>PnL</th><th>Maker</th></tr></thead>
+          <tbody id="fills_body"></tbody>
+        </table>
+      </section>
+      <section class="panel">
+        <div style="display:flex;justify-content:space-between;gap:12px">
+          <div><div class="label">交易额 · 总盈亏 · 手续费 · 成交价格</div></div>
+          <div class="muted">刷新 2s</div>
+        </div>
+        <div class="chart">
+          <div class="axis"><span>Price</span><span></span><span></span><span></span></div>
+          <div class="plot"><svg id="chart_svg" viewBox="0 0 600 240" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%"></svg></div>
+          <div class="axis" style="text-align:left"><span>Total</span><span></span><span></span><span>0</span></div>
+        </div>
+        <div class="legend">
+          <span><span class="dot" style="background:var(--blue)"></span>成交价格</span>
+          <span><span class="dot" style="background:var(--green)"></span>周期成交额</span>
+          <span><span class="dot" style="background:var(--red)"></span>周期盈亏</span>
+          <span><span class="dot" style="background:var(--purple)"></span>手续费</span>
+        </div>
+      </section>
+    </div>
+  </div>
+  <script>
+    const symbolSelect = document.getElementById("symbol_select");
+    const serverLabel = document.getElementById("server_label");
+    const kpis = document.getElementById("kpis");
+    const fillsBody = document.getElementById("fills_body");
+    const chartSvg = document.getElementById("chart_svg");
+    const fmt = (v, d=2) => Number(v || 0).toLocaleString(undefined, { maximumFractionDigits:d });
+    function line(points, key, color) {
+      if (!points.length) return "";
+      const xs = points.map((_, i) => points.length === 1 ? 0 : i / (points.length - 1) * 600);
+      const vals = points.map(p => Number(p[key] || 0));
+      const min = Math.min(...vals), max = Math.max(...vals);
+      const span = Math.max(max - min, 1e-12);
+      const coords = vals.map((v, i) => `${xs[i].toFixed(1)},${(220 - ((v - min) / span) * 200).toFixed(1)}`).join(" ");
+      return `<polyline points="${coords}" fill="none" stroke="${color}" stroke-width="3"/>`;
+    }
+    async function loadSymbols() {
+      const resp = await fetch("/api/competition-volume/symbols");
+      const data = await resp.json();
+      serverLabel.textContent = data.server || "-";
+      symbolSelect.innerHTML = (data.symbols || []).map(s => `<option value="${s}">${s}</option>`).join("");
+    }
+    async function refresh() {
+      const symbol = symbolSelect.value;
+      if (!symbol) return;
+      const [summary, fills, chart] = await Promise.all([
+        fetch(`/api/competition-volume/summary?symbol=${encodeURIComponent(symbol)}`).then(r => r.json()),
+        fetch(`/api/competition-volume/fills?symbol=${encodeURIComponent(symbol)}&limit=120`).then(r => r.json()),
+        fetch(`/api/competition-volume/chart?symbol=${encodeURIComponent(symbol)}`).then(r => r.json()),
+      ]);
+      kpis.innerHTML = [
+        ["周期成交额", fmt(summary.competition_gross_notional, 0)],
+        ["周期盈亏", fmt(summary.competition_net_pnl, 2)],
+        ["手续费", fmt(summary.competition_commission, 2)],
+        ["Maker Ratio", `${fmt((summary.maker_ratio || 0) * 100, 1)}%`],
+        ["成交笔数", fmt(summary.trade_count, 0)],
+        ["Regime", summary.elastic_regime || "-"],
+        ["Symbol", symbol],
+      ].map(([label, value]) => `<div class="kpi"><div class="label">${label}</div><div class="value">${value}</div></div>`).join("");
+      fillsBody.innerHTML = (fills.fills || []).map(f => `<tr><td>${String(f.ts || "").slice(11,19)}</td><td class="${f.side === "BUY" ? "buy" : "sell"}">${f.side || ""}</td><td>${fmt(f.price, 8)}</td><td>${fmt(f.qty, 4)}</td><td>${fmt(f.notional, 2)}</td><td>${fmt(f.commission, 4)}</td><td>${fmt(f.realized_pnl, 4)}</td><td>${f.maker ? "Y" : "N"}</td></tr>`).join("");
+      const pts = chart.points || [];
+      chartSvg.innerHTML = [
+        line(pts, "price", "#2563eb"),
+        line(pts, "cumulative_notional", "#079669"),
+        line(pts, "cumulative_net_pnl", "#dc2626"),
+        line(pts, "cumulative_commission", "#7c3aed"),
+      ].join("");
+    }
+    symbolSelect.addEventListener("change", refresh);
+    loadSymbols().then(refresh);
+    setInterval(refresh, 2000);
+  </script>
+</body>
+</html>
+"""
+
 RUNNING_STATUS_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -24148,6 +24694,23 @@ SPOT_STRATEGIES_PAGE = """<!doctype html>
       color: var(--muted);
       font-size: 14px;
     }
+    .subhead {
+      margin-top: 20px;
+      display: flex;
+      align-items: flex-end;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .subhead h2 {
+      margin: 0;
+      font-size: 22px;
+    }
+    .subhead p {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 14px;
+      line-height: 1.6;
+    }
     .grid {
       margin-top: 18px;
       display: grid;
@@ -24804,12 +25367,22 @@ STRATEGIES_PAGE = """<!doctype html>
       </div>
     </section>
     <div id="cards" class="grid"></div>
+    <section class="subhead">
+      <div>
+        <h2>现货策略</h2>
+        <p>列出现货 runner 的运行状态、成交额、库存、挂单和损耗估算。</p>
+      </div>
+      <a href="/spot_strategies">打开现货总览</a>
+    </section>
+    <div id="spot_cards" class="grid"></div>
   </div>
 
   <script>
     const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
+    const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"];
     const cardsEl = document.getElementById("cards");
+    const spotCardsEl = document.getElementById("spot_cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");
     const refreshBtn = document.getElementById("refresh_btn");
@@ -25144,6 +25717,79 @@ STRATEGIES_PAGE = """<!doctype html>
       `;
     }
 
+    function spotLossRateBps(snapshot) {
+      const trade = snapshot.trade_summary || {};
+      const gross = Number(trade.gross_notional || 0);
+      if (!gross) return null;
+      return -Number(trade.net_pnl_estimate || 0) / gross * 10000;
+    }
+
+    function renderSpotCard(snapshot) {
+      const runner = snapshot.runner || {};
+      const config = snapshot.config || {};
+      const state = snapshot.state || {};
+      const trade = snapshot.trade_summary || {};
+      const risk = snapshot.risk_controls || {};
+      const balances = snapshot.balances || {};
+      const market = snapshot.market || {};
+      const currentPrice = Number(market.mid_price || ((Number(market.bid_price || 0) + Number(market.ask_price || 0)) / 2) || 0);
+      const inventoryQty = Number(state.inventory_qty || 0);
+      const inventoryNotional = inventoryQty * currentPrice;
+      const isRunning = Boolean(runner.is_running);
+      const hasExposure = inventoryQty > 0 || Number(balances.base_locked || 0) > 0 || (snapshot.open_orders || []).length > 0;
+      const stateLabel = isRunning ? "运行中" : (hasExposure ? "停机但仍有库存/挂单" : "未运行");
+      const stateClass = isRunning ? "good" : (hasExposure ? "warn" : "bad");
+      const lossRate = spotLossRateBps(snapshot);
+      const buyCount = (snapshot.open_orders || []).filter((item) => item.side === "BUY").length;
+      const sellCount = (snapshot.open_orders || []).filter((item) => item.side === "SELL").length;
+      const makerRate = Number(trade.trade_count || 0) > 0 ? Number(trade.maker_count || 0) / Number(trade.trade_count || 1) : null;
+      return `
+        <section class="card strategy-card">
+          <div class="topline">
+            <div class="title">
+              <h2>${escapeHtml(snapshot.symbol || "--")}</h2>
+              <p>${escapeHtml(String(config.strategy_mode || "--"))}</p>
+            </div>
+            <div class="badges">
+              <span class="badge ${stateClass}">${escapeHtml(stateLabel)}</span>
+              <span class="badge warn">Spot</span>
+              <span class="badge good">step ${escapeHtml(fmtNum(config.step_price || 0, 6))}</span>
+            </div>
+          </div>
+          <div class="metrics">
+            <div class="metric">
+              <div class="label">现货库存</div>
+              <div class="value">${escapeHtml(fmtNum(inventoryQty, 4))}</div>
+              <div class="sub">约 ${escapeHtml(fmtNum(inventoryNotional, 4))}U · 均价 ${escapeHtml(fmtNum(state.inventory_avg_cost || 0, 6))}</div>
+            </div>
+            <div class="metric">
+              <div class="label">当前挂单</div>
+              <div class="value">${escapeHtml(fmtNum((snapshot.open_orders || []).length, 0))}</div>
+              <div class="sub">买/卖 ${escapeHtml(fmtNum(buyCount, 0))} / ${escapeHtml(fmtNum(sellCount, 0))}</div>
+            </div>
+            <div class="metric">
+              <div class="label">累计成交额</div>
+              <div class="value">${escapeHtml(fmtNum(trade.gross_notional || 0, 2))}</div>
+              <div class="sub">买 ${escapeHtml(fmtNum(trade.buy_notional || 0, 2))} / 卖 ${escapeHtml(fmtNum(trade.sell_notional || 0, 2))}</div>
+            </div>
+            <div class="metric">
+              <div class="label">净损耗估算</div>
+              <div class="value ${statusClass(Number(trade.net_pnl_estimate || 0))}">${escapeHtml(fmtMoney(trade.net_pnl_estimate || 0))}</div>
+              <div class="sub">损耗 ${escapeHtml(lossRate === null ? "--" : fmtNum(lossRate, 2))} bps · maker ${escapeHtml(makerRate === null ? "--" : fmtPct(makerRate))}</div>
+            </div>
+          </div>
+          <table>
+            <tbody>
+              <tr><th>当前中价</th><td>${escapeHtml(fmtNum(currentPrice, 7))}</td><th>成交笔数</th><td>${escapeHtml(fmtNum(trade.trade_count || 0, 0))}</td></tr>
+              <tr><th>手续费</th><td>${escapeHtml(fmtMoney(-(trade.commission_quote || 0)))}</td><th>已实现</th><td>${escapeHtml(fmtMoney(trade.realized_pnl || 0))}</td></tr>
+              <tr><th>小时亏损</th><td>${escapeHtml(fmtNum(risk.rolling_hourly_loss || 0, 4))} / ${escapeHtml(fmtNum(risk.rolling_hourly_loss_limit || 0, 4))}</td><th>累计上限</th><td>${escapeHtml(fmtNum(risk.cumulative_gross_notional || 0, 2))} / ${escapeHtml(fmtNum(risk.max_cumulative_notional || 0, 2))}</td></tr>
+              <tr><th>可用余额</th><td>${escapeHtml(fmtNum(balances.quote_free || 0, 4))} ${escapeHtml(balances.quote_asset || "")}</td><th>锁定</th><td>${escapeHtml(fmtNum(balances.quote_locked || 0, 4))} ${escapeHtml(balances.quote_asset || "")} / ${escapeHtml(fmtNum(balances.base_locked || 0, 4))} ${escapeHtml(balances.base_asset || "")}</td></tr>
+            </tbody>
+          </table>
+        </section>
+      `;
+    }
+
     async function fetchStrategySnapshots(symbols, concurrency = 1) {
       const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
       const results = new Array(symbols.length);
@@ -25170,6 +25816,32 @@ STRATEGIES_PAGE = """<!doctype html>
       return results;
     }
 
+    async function fetchSpotStrategySnapshots(symbols, concurrency = 1) {
+      const normalizedConcurrency = Math.max(1, Number(concurrency || 1));
+      const results = new Array(symbols.length);
+      let nextIndex = 0;
+
+      async function worker() {
+        while (true) {
+          const currentIndex = nextIndex;
+          nextIndex += 1;
+          if (currentIndex >= symbols.length) {
+            return;
+          }
+          const symbol = symbols[currentIndex];
+          const resp = await fetch(`/api/spot_runner/status?symbol=${encodeURIComponent(symbol)}`);
+          const data = await resp.json();
+          if (!resp.ok || !data.ok) {
+            throw new Error(`${symbol}: ${data.error || `HTTP ${resp.status}`}`);
+          }
+          results[currentIndex] = data.snapshot || data;
+        }
+      }
+
+      await Promise.all(Array.from({ length: Math.min(normalizedConcurrency, symbols.length) }, () => worker()));
+      return results;
+    }
+
     async function loadStrategies() {
       if (strategiesLoadPromise) {
         return strategiesLoadPromise;
@@ -25185,13 +25857,18 @@ STRATEGIES_PAGE = """<!doctype html>
             return;
           }
           const results = await fetchStrategySnapshots(symbols, 1);
+          const spotResults = await fetchSpotStrategySnapshots(DEFAULT_SPOT_SYMBOLS, 1);
           const runningCount = results.filter((item) => Boolean((item.runner || {}).is_running)).length;
           const exposureCount = results.filter((item) => Math.abs(Number(((item.position || {}).position_amt) || 0)) > 0 || (item.open_orders || []).length > 0).length;
-          summaryEl.textContent = `当前拉取 ${results.length} 个币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。`;
+          const spotRunningCount = spotResults.filter((item) => Boolean((item.runner || {}).is_running)).length;
+          const spotGross = spotResults.reduce((total, item) => total + Number(((item.trade_summary || {}).gross_notional) || 0), 0);
+          summaryEl.textContent = `当前拉取 ${results.length} 个合约币种；正在运行 ${runningCount} 个；仍有仓位或挂单暴露 ${exposureCount} 个。现货 ${spotResults.length} 个；运行 ${spotRunningCount} 个；成交额 ${fmtNum(spotGross, 2)}U。`;
           cardsEl.innerHTML = results.map(renderCard).join("");
+          spotCardsEl.innerHTML = spotResults.map(renderSpotCard).join("");
           metaEl.textContent = `最后刷新：${fmtTs(new Date().toISOString())}`;
         } catch (err) {
           cardsEl.innerHTML = `<div class="empty">加载失败：${escapeHtml(err)}</div>`;
+          spotCardsEl.innerHTML = `<div class="empty">现货加载失败：${escapeHtml(err)}</div>`;
           metaEl.textContent = `刷新失败：${err}`;
         }
       })();
@@ -29180,6 +29857,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/running_status_overview", "/running_status_overview.html"}:
             self._send_html(_render_running_status_overview_page(), status=HTTPStatus.OK)
             return
+        if path in {"/competition_volume", "/competition_volume.html"}:
+            self._send_html(COMPETITION_VOLUME_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/monitor", "/monitor.html"}:
             self._send_html(MONITOR_PAGE, status=HTTPStatus.OK)
             return
@@ -29231,6 +29911,44 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
             self._send_json({"ok": True, "snapshot": snapshot}, status=HTTPStatus.OK)
+            return
+        if path == "/api/competition-volume/symbols":
+            self._send_json(_list_competition_volume_symbols(), status=HTTPStatus.OK)
+            return
+        if path in {
+            "/api/competition-volume/summary",
+            "/api/competition-volume/fills",
+            "/api/competition-volume/chart",
+        }:
+            symbol = str(query.get("symbol", [""])[0]).upper().strip()
+            if not symbol:
+                self._send_json({"ok": False, "error": "symbol is required"}, status=400)
+                return
+            summary_path = _competition_volume_summary_path(symbol)
+            competition_start_at = query.get("competition_start_at", [None])[0]
+            try:
+                if path.endswith("/summary"):
+                    payload = _build_competition_volume_summary(
+                        symbol=symbol,
+                        summary_path=summary_path,
+                        competition_start_at=competition_start_at,
+                    )
+                elif path.endswith("/fills"):
+                    payload = _build_competition_volume_fills(
+                        symbol=symbol,
+                        summary_path=summary_path,
+                        limit=int(query.get("limit", ["200"])[0] or 200),
+                    )
+                else:
+                    payload = _build_competition_volume_chart(
+                        symbol=symbol,
+                        summary_path=summary_path,
+                        competition_start_at=competition_start_at,
+                    )
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
             return
         if path == "/api/spot_runner/status":
             symbol = str(query.get("symbol", [SPOT_RUNNER_DEFAULT_CONFIG["symbol"]])[0]).upper().strip()
@@ -29560,7 +30278,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = parsed.path
         if not self._authorize_request():
             return
-        if path in {"/api/manual_trade/maker", "/api/manual_trade/take", "/api/manual_trade/cancel"}:
+        if path in {"/api/manual_trade/maker", "/api/manual_trade/book_limit", "/api/manual_trade/take", "/api/manual_trade/cancel"}:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -29582,6 +30300,9 @@ class _Handler(BaseHTTPRequestHandler):
                 if path.endswith("/maker"):
                     result = _manual_trade_start_maker(payload)
                     self._send_json({"ok": True, **result}, status=202)
+                elif path.endswith("/book_limit"):
+                    result = _manual_trade_place_book_limit(payload)
+                    self._send_json({"ok": True, **result}, status=200)
                 elif path.endswith("/take"):
                     result = _manual_trade_execute_take(payload)
                     self._send_json({"ok": True, **result}, status=200)

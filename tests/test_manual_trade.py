@@ -14,6 +14,8 @@ from grid_optimizer.web import (
     _manual_trade_ensure_isolated,
     _manual_trade_maker_worker,
     MANUAL_TRADE_SLEEP_SECONDS,
+    MANUAL_TRADE_MIN_REPRICE_SECONDS,
+    _manual_trade_place_book_limit,
     _manual_trade_set_task,
     _manual_trade_prepare_plan,
 )
@@ -33,8 +35,9 @@ class ManualTradeTests(unittest.TestCase):
             "min_notional": 5.0,
         }
 
-    def test_manual_maker_chase_checks_every_five_seconds(self) -> None:
-        self.assertEqual(MANUAL_TRADE_SLEEP_SECONDS, 5.0)
+    def test_manual_maker_chase_checks_every_two_seconds(self) -> None:
+        self.assertEqual(MANUAL_TRADE_SLEEP_SECONDS, 2.0)
+        self.assertEqual(MANUAL_TRADE_MIN_REPRICE_SECONDS, 2.0)
 
     def test_manual_trade_prefix_is_symbol_scoped(self) -> None:
         prefix = _manual_trade_client_order_prefix("BARDUSDT")
@@ -149,8 +152,79 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn('<option value="KEEP" selected>保持当前保证金模式</option>', MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/status", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/maker", MANUAL_TRADE_PAGE)
+        self.assertIn("/api/manual_trade/book_limit", MANUAL_TRADE_PAGE)
+        self.assertIn('id="book_buy_btn"', MANUAL_TRADE_PAGE)
+        self.assertIn('id="book_sell_btn"', MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
+        self.assertIn("setInterval(() => refreshStatus().catch(() => {}), 8000)", MANUAL_TRADE_PAGE)
+
+    @patch("grid_optimizer.web._manual_trade_snapshot")
+    @patch("grid_optimizer.web.post_futures_order")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_book_limit_buy_places_static_gtx_order_at_bid(
+        self,
+        mock_credentials,
+        mock_position_mode,
+        mock_book,
+        mock_symbol_config,
+        mock_post_order,
+        mock_snapshot,
+    ) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_book.return_value = [{"bid_price": "2.0", "ask_price": "2.02"}]
+        mock_symbol_config.return_value = self._symbol_info()
+        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "mt_bardusdt_bookbuy_b_1"}
+        mock_snapshot.return_value = {"symbol": "BARDUSDT"}
+
+        result = _manual_trade_place_book_limit({"symbol": "BARDUSDT", "side": "BUY", "notional": 80.0})
+
+        mock_post_order.assert_called_once()
+        kwargs = mock_post_order.call_args.kwargs
+        self.assertEqual(kwargs["symbol"], "BARDUSDT")
+        self.assertEqual(kwargs["side"], "BUY")
+        self.assertEqual(kwargs["price"], 2.0)
+        self.assertEqual(kwargs["quantity"], 40.0)
+        self.assertEqual(kwargs["time_in_force"], "GTX")
+        self.assertIsNone(kwargs["reduce_only"])
+        self.assertIn("_bookbuy_b_", kwargs["new_client_order_id"])
+        self.assertEqual(result["order"]["orderId"], 123)
+        self.assertEqual(result["limit_order"]["price"], 2.0)
+        self.assertEqual(result["snapshot"], {"symbol": "BARDUSDT"})
+
+    @patch("grid_optimizer.web._manual_trade_snapshot")
+    @patch("grid_optimizer.web.post_futures_order")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_book_limit_sell_places_static_gtx_order_at_ask(
+        self,
+        mock_credentials,
+        mock_position_mode,
+        mock_book,
+        mock_symbol_config,
+        mock_post_order,
+        mock_snapshot,
+    ) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_book.return_value = [{"bid_price": "2.0", "ask_price": "2.02"}]
+        mock_symbol_config.return_value = self._symbol_info()
+        mock_post_order.return_value = {"orderId": 456, "clientOrderId": "mt_bardusdt_booksell_s_1"}
+        mock_snapshot.return_value = {"symbol": "BARDUSDT"}
+
+        _manual_trade_place_book_limit({"symbol": "BARDUSDT", "side": "SELL", "notional": 80.0})
+
+        kwargs = mock_post_order.call_args.kwargs
+        self.assertEqual(kwargs["side"], "SELL")
+        self.assertEqual(kwargs["price"], 2.02)
+        self.assertEqual(kwargs["quantity"], 39.6)
+        self.assertEqual(kwargs["time_in_force"], "GTX")
 
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     @patch("grid_optimizer.web.fetch_futures_account_info_v3")

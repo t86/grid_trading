@@ -327,6 +327,10 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(_uses_entry_price_cost_basis("soon_volume_neutral_ping_pong_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("soonusdt_competition_neutral_ping_pong_v1"))
 
+    def test_defi_competition_maker_neutral_profiles_use_entry_price_cost_basis(self) -> None:
+        self.assertTrue(_uses_entry_price_cost_basis("bzusdt_competition_maker_neutral_v1"))
+        self.assertTrue(_uses_entry_price_cost_basis("clusdt_competition_maker_neutral_conservative_v1"))
+
     def test_trumpusdc_volume_long_profile_uses_v4_cost_guards(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("trumpusdc_volume_long_v4"))
         self.assertTrue(_uses_volume_long_v4_staged_delever("trumpusdc_volume_long_v4"))
@@ -6338,6 +6342,79 @@ class LoopRunnerTests(unittest.TestCase):
         args = _build_parser().parse_args(["--take-profit-min-profit-ratio", "0.0005"])
 
         self.assertEqual(args.take_profit_min_profit_ratio, 0.0005)
+
+    def test_build_parser_accepts_adaptive_step_long_window_amplitude_thresholds(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--adaptive-step-3m-amplitude-ratio",
+                "0.006",
+                "--adaptive-step-5m-amplitude-ratio",
+                "0.01",
+            ]
+        )
+
+        self.assertEqual(args.adaptive_step_3m_amplitude_ratio, 0.006)
+        self.assertEqual(args.adaptive_step_5m_amplitude_ratio, 0.01)
+
+    def test_build_parser_accepts_multi_timeframe_bias_controls(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--multi-timeframe-bias-enabled",
+                "--multi-timeframe-bias-max-level-delta",
+                "5",
+                "--multi-timeframe-bias-max-offset-steps",
+                "1.25",
+                "--multi-timeframe-bias-shock-abs-return-ratio",
+                "0.012",
+                "--multi-timeframe-bias-shock-amplitude-ratio",
+                "0.02",
+                "--multi-timeframe-bias-shock-notional-scale",
+                "0.6",
+            ]
+        )
+
+        self.assertTrue(args.multi_timeframe_bias_enabled)
+        self.assertEqual(args.multi_timeframe_bias_max_level_delta, 5)
+        self.assertEqual(args.multi_timeframe_bias_max_offset_steps, 1.25)
+        self.assertEqual(args.multi_timeframe_bias_shock_abs_return_ratio, 0.012)
+        self.assertEqual(args.multi_timeframe_bias_shock_amplitude_ratio, 0.02)
+        self.assertEqual(args.multi_timeframe_bias_shock_notional_scale, 0.6)
+
+    def test_resolve_adaptive_step_uses_5m_amplitude_for_choppy_expansion(self) -> None:
+        now = datetime(2026, 4, 30, 6, 0, tzinfo=timezone.utc)
+        state = {
+            "adaptive_step_history": [
+                {"ts": (now - timedelta(seconds=300)).isoformat(), "mid_price": 4.3000},
+                {"ts": (now - timedelta(seconds=240)).isoformat(), "mid_price": 4.2800},
+                {"ts": (now - timedelta(seconds=180)).isoformat(), "mid_price": 4.3184},
+                {"ts": (now - timedelta(seconds=120)).isoformat(), "mid_price": 4.3000},
+                {"ts": (now - timedelta(seconds=60)).isoformat(), "mid_price": 4.2950},
+            ]
+        }
+
+        report = resolve_adaptive_step_price(
+            state=state,
+            now=now,
+            mid_price=4.3000,
+            base_step_price=0.001,
+            tick_size=0.001,
+            enabled=True,
+            window_30s_abs_return_ratio=0.0,
+            window_30s_amplitude_ratio=0.0,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_3m_amplitude_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            window_5m_amplitude_ratio=0.005,
+            max_scale=2.5,
+        )
+
+        self.assertTrue(report["controls_active"])
+        self.assertEqual(report["dominant_window"], "window_5m")
+        self.assertEqual(report["dominant_metric"], "amplitude_ratio")
+        self.assertAlmostEqual(report["effective_step_price"], 0.002)
+        self.assertAlmostEqual(report["scale"], 2.0)
 
     def test_assess_synthetic_tp_only_watchdog_activates_after_persistent_tp_only_gap(self) -> None:
         state: dict[str, object] = {}

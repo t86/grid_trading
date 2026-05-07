@@ -22,3 +22,6 @@ output/*
 # Temp files
 *.log
 *.tmp
+
+# Local worktrees
+.worktrees/

@@ -11,6 +11,7 @@ from unittest.mock import Mock, patch
 
 from grid_optimizer.web import (
     MONITOR_PAGE,
+    COMPETITION_VOLUME_PAGE,
     HTML_PAGE,
     STRATEGIES_PAGE,
     _Handler,
@@ -186,6 +187,17 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("手续费总额", page)
         self.assertIn("/api/running_status", page)
         self.assertIn('id="status_drawer"', page)
+
+    def test_competition_volume_page_contains_local_dashboard_sections(self) -> None:
+        self.assertIn("当前服务器", COMPETITION_VOLUME_PAGE)
+        self.assertIn('id="symbol_select"', COMPETITION_VOLUME_PAGE)
+        self.assertIn("周期成交额", COMPETITION_VOLUME_PAGE)
+        self.assertIn("周期盈亏", COMPETITION_VOLUME_PAGE)
+        self.assertIn("手续费", COMPETITION_VOLUME_PAGE)
+        self.assertIn("每笔成交列表", COMPETITION_VOLUME_PAGE)
+        self.assertIn("/api/competition-volume/summary", COMPETITION_VOLUME_PAGE)
+        self.assertIn("/api/competition-volume/fills", COMPETITION_VOLUME_PAGE)
+        self.assertIn("/api/competition-volume/chart", COMPETITION_VOLUME_PAGE)
 
     def test_running_status_page_contains_local_control_actions(self) -> None:
         page = _render_running_status_page(symbol="CHIPUSDT")
@@ -707,7 +719,9 @@ class WebSecurityTests(unittest.TestCase):
                 "adaptive_step_1m_abs_return_ratio": 0.0045,
                 "adaptive_step_1m_amplitude_ratio": 0.0065,
                 "adaptive_step_3m_abs_return_ratio": 0.0100,
+                "adaptive_step_3m_amplitude_ratio": 0.0080,
                 "adaptive_step_5m_abs_return_ratio": 0.0140,
+                "adaptive_step_5m_amplitude_ratio": 0.0100,
                 "adaptive_step_max_scale": 3.0,
                 "adaptive_step_min_per_order_scale": 0.35,
                 "adaptive_step_min_position_limit_scale": 0.45,
@@ -724,6 +738,51 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["adaptive_step_max_scale"], 3.0)
         self.assertEqual(payload["adaptive_step_min_per_order_scale"], 0.35)
         self.assertEqual(payload["adaptive_step_min_position_limit_scale"], 0.45)
+
+    def test_normalize_runner_control_payload_supports_elastic_volume_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "symbol": "CHIPUSDT",
+                "strategy_profile": "chipusdt_competition_neutral_ping_pong_v1",
+                "elastic_volume_enabled": True,
+                "elastic_volume_mode": "competition_elastic_volume_v1",
+                "elastic_loss_per_10k_sprint": 0.25,
+                "elastic_loss_per_10k_cruise": 0.75,
+                "elastic_loss_per_10k_defensive": 1.15,
+                "elastic_loss_per_10k_cooldown": 1.75,
+                "elastic_inventory_soft_ratio": 0.55,
+                "elastic_inventory_hard_ratio": 0.88,
+                "elastic_step_scale_sprint": 0.85,
+                "elastic_step_scale_defensive": 1.7,
+                "elastic_step_scale_cooldown": 2.8,
+                "elastic_per_order_scale_sprint": 1.2,
+                "elastic_per_order_scale_defensive": 0.6,
+                "elastic_levels_scale_sprint": 1.15,
+                "elastic_levels_scale_defensive": 0.7,
+                "elastic_cooldown_seconds": 90.0,
+                "elastic_state_confirm_cycles": 4,
+                "elastic_cancel_stale_entries_on_cooldown": True,
+            }
+        )
+
+        self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertEqual(payload["elastic_volume_mode"], "competition_elastic_volume_v1")
+        self.assertEqual(payload["elastic_loss_per_10k_sprint"], 0.25)
+        self.assertEqual(payload["elastic_loss_per_10k_cruise"], 0.75)
+        self.assertEqual(payload["elastic_loss_per_10k_defensive"], 1.15)
+        self.assertEqual(payload["elastic_loss_per_10k_cooldown"], 1.75)
+        self.assertEqual(payload["elastic_inventory_soft_ratio"], 0.55)
+        self.assertEqual(payload["elastic_inventory_hard_ratio"], 0.88)
+        self.assertEqual(payload["elastic_step_scale_sprint"], 0.85)
+        self.assertEqual(payload["elastic_step_scale_defensive"], 1.7)
+        self.assertEqual(payload["elastic_step_scale_cooldown"], 2.8)
+        self.assertEqual(payload["elastic_per_order_scale_sprint"], 1.2)
+        self.assertEqual(payload["elastic_per_order_scale_defensive"], 0.6)
+        self.assertEqual(payload["elastic_levels_scale_sprint"], 1.15)
+        self.assertEqual(payload["elastic_levels_scale_defensive"], 0.7)
+        self.assertEqual(payload["elastic_cooldown_seconds"], 90.0)
+        self.assertEqual(payload["elastic_state_confirm_cycles"], 4)
+        self.assertTrue(payload["elastic_cancel_stale_entries_on_cooldown"])
 
     def test_normalize_runner_control_payload_supports_synthetic_trend_follow_fields(self) -> None:
         payload = _normalize_runner_control_payload(
@@ -1582,6 +1641,9 @@ class WebSecurityTests(unittest.TestCase):
                 if profile == "ordiusdc_competition_neutral_ping_pong_v1":
                     self.assertTrue(payload["adaptive_step_enabled"])
                     self.assertEqual(payload["adaptive_step_max_scale"], 2.5)
+                    self.assertAlmostEqual(payload["adaptive_step_1m_amplitude_ratio"], 0.00375)
+                    self.assertAlmostEqual(payload["adaptive_step_3m_amplitude_ratio"], 0.006)
+                    self.assertAlmostEqual(payload["adaptive_step_5m_amplitude_ratio"], 0.008)
                 else:
                     self.assertFalse(payload["adaptive_step_enabled"])
                 if profile == "btcusdc_competition_neutral_ping_pong_v1":
@@ -1918,7 +1980,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(config["max_short_position_notional"], 320.0)
         self.assertEqual(config["max_total_notional"], 2200.0)
         self.assertEqual(config["leverage"], 10)
-        self.assertFalse(config["adaptive_step_enabled"])
+        self.assertTrue(config["adaptive_step_enabled"])
         self.assertFalse(config["synthetic_trend_follow_enabled"])
         self.assertFalse(config["autotune_symbol_enabled"])
 
@@ -2453,7 +2515,9 @@ class WebSecurityTests(unittest.TestCase):
                 "adaptive_step_1m_abs_return_ratio": 0.0045,
                 "adaptive_step_1m_amplitude_ratio": 0.0065,
                 "adaptive_step_3m_abs_return_ratio": 0.0100,
+                "adaptive_step_3m_amplitude_ratio": 0.0080,
                 "adaptive_step_5m_abs_return_ratio": 0.0140,
+                "adaptive_step_5m_amplitude_ratio": 0.0100,
                 "adaptive_step_max_scale": 3.0,
                 "adaptive_step_min_per_order_scale": 0.35,
                 "adaptive_step_min_position_limit_scale": 0.45,
@@ -2481,10 +2545,66 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adaptive-step-1m-abs-return-ratio", command)
         self.assertIn("--adaptive-step-1m-amplitude-ratio", command)
         self.assertIn("--adaptive-step-3m-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-3m-amplitude-ratio", command)
         self.assertIn("--adaptive-step-5m-abs-return-ratio", command)
+        self.assertIn("--adaptive-step-5m-amplitude-ratio", command)
         self.assertIn("--adaptive-step-max-scale", command)
         self.assertIn("--adaptive-step-min-per-order-scale", command)
         self.assertIn("--adaptive-step-min-position-limit-scale", command)
+
+    def test_build_runner_command_includes_multi_timeframe_bias_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "CHIPUSDT",
+                "strategy_profile": "chip_low_wear_guarded_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.0001,
+                "buy_levels": 9,
+                "sell_levels": 10,
+                "per_order_notional": 90.0,
+                "base_position_notional": 0.0,
+                "multi_timeframe_bias_enabled": True,
+                "multi_timeframe_bias_low_zone_threshold": 0.32,
+                "multi_timeframe_bias_high_zone_threshold": 0.68,
+                "multi_timeframe_bias_strong_threshold": 0.45,
+                "multi_timeframe_bias_max_level_delta": 3,
+                "multi_timeframe_bias_max_offset_steps": 0.75,
+                "multi_timeframe_bias_favored_position_scale": 1.15,
+                "multi_timeframe_bias_unfavored_position_scale": 0.85,
+                "multi_timeframe_bias_shock_abs_return_ratio": 0.012,
+                "multi_timeframe_bias_shock_amplitude_ratio": 0.020,
+                "multi_timeframe_bias_shock_step_scale": 1.4,
+                "multi_timeframe_bias_shock_notional_scale": 0.65,
+                "margin_type": "KEEP",
+                "leverage": 3,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 4,
+                "max_new_orders": 18,
+                "max_total_notional": 1800.0,
+                "sleep_seconds": 2.0,
+                "state_path": "output/chipusdt_loop_state.json",
+                "plan_json": "output/chipusdt_loop_latest_plan.json",
+                "submit_report_json": "output/chipusdt_loop_latest_submit.json",
+                "summary_jsonl": "output/chipusdt_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": False,
+            }
+        )
+
+        self.assertIn("--multi-timeframe-bias-enabled", command)
+        self.assertIn("--multi-timeframe-bias-low-zone-threshold", command)
+        self.assertIn("--multi-timeframe-bias-high-zone-threshold", command)
+        self.assertIn("--multi-timeframe-bias-strong-threshold", command)
+        self.assertIn("--multi-timeframe-bias-max-level-delta", command)
+        self.assertIn("--multi-timeframe-bias-max-offset-steps", command)
+        self.assertIn("--multi-timeframe-bias-favored-position-scale", command)
+        self.assertIn("--multi-timeframe-bias-unfavored-position-scale", command)
+        self.assertIn("--multi-timeframe-bias-shock-abs-return-ratio", command)
+        self.assertIn("--multi-timeframe-bias-shock-amplitude-ratio", command)
+        self.assertIn("--multi-timeframe-bias-shock-step-scale", command)
+        self.assertIn("--multi-timeframe-bias-shock-notional-scale", command)
 
     def test_build_runner_command_includes_synthetic_trend_follow_arguments(self) -> None:
         command = _build_runner_command(
@@ -3805,6 +3925,17 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
         self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
+
+    def test_monitor_page_ordiusdc_ping_pong_includes_adaptive_step_amplitude_controls(self) -> None:
+        self.assertIn("adaptive_step_1m_amplitude_ratio: 0.00375", MONITOR_PAGE)
+        self.assertIn("adaptive_step_3m_amplitude_ratio: 0.006", MONITOR_PAGE)
+        self.assertIn("adaptive_step_5m_amplitude_ratio: 0.008", MONITOR_PAGE)
+
+    def test_strategies_page_contains_spot_strategy_overview(self) -> None:
+        self.assertIn("现货策略", STRATEGIES_PAGE)
+        self.assertIn('id="spot_cards"', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"]', STRATEGIES_PAGE)
+        self.assertIn("/api/spot_runner/status", STRATEGIES_PAGE)
 
     @patch("grid_optimizer.web._read_runner_process_for_symbol")
     def test_start_runner_process_returns_already_running_when_config_matches(self, mock_read_runner) -> None:
