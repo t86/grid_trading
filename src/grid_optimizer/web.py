@@ -25374,6 +25374,309 @@ def _run_running_status_overview_query(query: dict[str, list[str]]) -> dict[str,
     return _build_running_status(scope=scope)
 
 
+def build_strategy_workspace_payload(running_status_payload: dict[str, Any]) -> dict[str, Any]:
+    from .strategy_workspace import build_strategy_workspace_payload as _build_strategy_workspace_payload
+
+    return _build_strategy_workspace_payload(running_status_payload)
+
+
+def _strategy_workspace_controller_state() -> dict[str, Any]:
+    explicit_read_only = str(os.environ.get("GRID_CONTROLLER_READ_ONLY", "")).strip().lower()
+    forced_read_only = explicit_read_only in {"1", "true", "yes", "on"}
+    has_local_credentials = load_binance_api_credentials() is not None
+    controller_read_only = forced_read_only or not has_local_credentials
+    return {
+        "controller_read_only": controller_read_only,
+        "local_trading_enabled": not controller_read_only,
+        "controller_mode": "read_only" if controller_read_only else "local_trading",
+        "has_local_credentials": has_local_credentials,
+    }
+
+
+def _run_strategy_workspace_query(query: dict[str, list[str]]) -> dict[str, Any]:
+    running_status_payload = _run_running_status_query({"scope": ["cross"]})
+    payload = build_strategy_workspace_payload(running_status_payload)
+    payload.update(_strategy_workspace_controller_state())
+    return payload
+
+
+def _render_strategy_workspace_page() -> str:
+    return STRATEGY_WORKSPACE_PAGE
+
+
+STRATEGY_WORKSPACE_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>策略运行工作台</title>
+  <style>
+    :root {
+      --bg:#f6f4ef; --panel:#fffefa; --line:#ded8cb; --text:#1f2937; --muted:#667085;
+      --brand:#0f766e; --brand-soft:#e6f6f4; --good:#15803d; --warn:#b76e00; --bad:#b42318;
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; color:var(--text); background:#f6f4ef; font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
+    .shell { max-width:1520px; margin:0 auto; padding:18px 16px 40px; display:grid; gap:14px; }
+    .topbar,.panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .topbar { display:flex; justify-content:space-between; gap:16px; align-items:flex-start; }
+    h1 { margin:0 0 6px; font-size:26px; line-height:1.15; }
+    p,.meta { margin:0; color:var(--muted); font-size:13px; line-height:1.55; }
+    .nav,.chips,.actions,.tabs,.server-tabs { display:flex; flex-wrap:wrap; gap:8px; align-items:center; }
+    .nav a,.chip,button { min-height:34px; border:1px solid var(--line); border-radius:8px; padding:0 10px; background:#fff; color:var(--text); text-decoration:none; font-weight:700; font-size:13px; cursor:pointer; }
+    button.primary,.chip.active { background:var(--brand); color:#fff; border-color:var(--brand); }
+    button.danger { background:var(--bad); color:#fff; border-color:var(--bad); }
+    button.warn { background:#fff8eb; color:#8a4b00; border-color:#e7c98f; }
+    button:disabled { opacity:.55; cursor:not-allowed; }
+    .layout { display:grid; grid-template-columns:minmax(0,1fr) 440px; gap:14px; align-items:start; }
+    .summary { display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:10px; }
+    .metric { border:1px solid var(--line); border-radius:8px; padding:12px; background:#fff; }
+    .metric span { display:block; color:var(--muted); font-size:12px; }
+    .metric strong { display:block; margin-top:5px; font-size:22px; }
+    .table-wrap { overflow:auto; }
+    table { width:100%; min-width:1080px; border-collapse:collapse; font-size:13px; }
+    th,td { padding:9px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-size:12px; white-space:nowrap; }
+    tr.selected { background:#f0faf8; }
+    .symbol { font-weight:900; font-size:15px; }
+    .badge { display:inline-flex; min-height:22px; align-items:center; border-radius:999px; padding:0 7px; font-size:12px; font-weight:800; background:#eef2f7; color:#475467; }
+    .badge.good { background:#eaf7ee; color:var(--good); }
+    .badge.warn { background:#fff6e5; color:var(--warn); }
+    .badge.bad { background:#fff0ee; color:var(--bad); }
+    .server-cell { display:grid; gap:4px; min-width:145px; }
+    .server-cell strong { font-size:12px; }
+    .server-cell span { color:var(--muted); font-size:12px; line-height:1.35; }
+    .drawer { position:sticky; top:14px; display:grid; gap:12px; }
+    .drawer-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
+    .drawer h2 { margin:0; font-size:20px; }
+    .tabs button,.server-tabs button { background:#fff; }
+    .tabs button.active,.server-tabs button.active { background:var(--brand-soft); border-color:#9ed8d0; color:#0b4f49; }
+    .form-grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    label { display:grid; gap:5px; color:var(--muted); font-size:12px; font-weight:700; }
+    input { height:36px; border:1px solid var(--line); border-radius:8px; padding:0 9px; background:#fff; color:var(--text); }
+    .diff,.warning { border:1px solid var(--line); border-radius:8px; padding:10px; background:#fff; color:var(--muted); font-size:12px; line-height:1.5; }
+    .warning { border-color:#e7c98f; background:#fff9ef; color:#8a4b00; }
+    .manual-grid { display:grid; grid-template-columns:1fr 1fr; gap:8px; }
+    .empty { color:var(--muted); border:1px dashed var(--line); border-radius:8px; padding:16px; text-align:center; background:#fff; }
+    @media (max-width:1180px){ .layout{grid-template-columns:1fr;} .drawer{position:static;} .summary{grid-template-columns:repeat(2,minmax(0,1fr));} }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="topbar">
+      <div>
+        <h1>策略运行工作台</h1>
+        <p>按币种聚合多个服务器的策略状态，集中比较参数、仓位、成交量、盈亏和风控；总控只读模式下只保留查看和目标服务器跳转。</p>
+        <div class="nav">
+          <a href="/running_status">运行控制台</a>
+          <a href="/running_status_overview">跨服表格</a>
+          <a href="/manual_trade">手动介入</a>
+          <a href="/monitor">单币监控</a>
+        </div>
+      </div>
+      <div class="chips">
+        <span class="chip active">跨服视图</span>
+        <span id="mode_chip" class="chip">总控只读模式</span>
+        <span id="refresh_chip" class="chip">自动刷新 20s</span>
+        <span id="server_chip" class="chip">服务器 --</span>
+      </div>
+    </section>
+    <section id="summary" class="summary"></section>
+    <section class="layout">
+      <section class="panel">
+        <div class="drawer-head">
+          <div>
+            <h2>按币种聚合</h2>
+            <p id="meta">等待数据...</p>
+          </div>
+          <div class="actions">
+            <button id="refresh_btn" class="primary">刷新</button>
+            <button id="toggle_btn">暂停自动刷新</button>
+          </div>
+        </div>
+        <div id="server_errors" class="warning" style="display:none"></div>
+        <div class="table-wrap">
+          <table>
+            <thead>
+              <tr><th>币种</th><th>聚合状态</th><th>服务器</th><th>总成交量</th><th>近1小时</th><th>总盈亏</th><th>风控/持仓</th></tr>
+            </thead>
+            <tbody id="symbol_body"><tr><td colspan="7"><div class="empty">暂无数据</div></td></tr></tbody>
+          </table>
+        </div>
+      </section>
+      <aside class="panel drawer" id="drawer">
+        <div class="drawer-head">
+          <div>
+            <h2 id="drawer_title">参数与操作</h2>
+            <p id="drawer_meta">选择左侧币种后编辑。</p>
+          </div>
+        </div>
+        <div class="server-tabs" id="server_tabs"></div>
+        <div id="readonly_notice" class="warning" style="display:none">总控只读模式：当前页面不会在本机启动、停止、保存策略，也不会打开本机手动交易。请进入目标服务器控制台执行交易操作。</div>
+        <div class="tabs">
+          <button class="active" type="button">参数</button><button type="button">操作</button><button type="button">手动</button><button type="button">日志</button>
+        </div>
+        <div class="form-grid" id="param_form"></div>
+        <div class="diff" id="diff_box">当前值 → 新值</div>
+        <div class="actions" id="local_action_bar">
+          <button id="save_btn">保存</button>
+          <button id="apply_btn" class="primary">保存并重启生效</button>
+          <button id="stop_btn" class="warn">停止</button>
+          <button id="flatten_btn" class="danger">停止并清仓</button>
+        </div>
+        <div class="actions" id="readonly_action_bar" style="display:none">
+          <button id="open_target_btn" class="primary">打开目标控制台</button>
+        </div>
+        <div>
+          <h2>手动介入</h2>
+          <p id="manual_warning" class="warning">同币种 runner 正在运行，手动介入前建议暂停策略。</p>
+          <div class="manual-grid" id="manual_action_grid">
+            <button data-manual="maker-buy">Maker 买入</button>
+            <button data-manual="maker-sell">Maker 卖出</button>
+            <button data-manual="book-buy">买一挂买</button>
+            <button data-manual="book-sell">卖一挂卖</button>
+            <button data-manual="take-buy">Take 买入</button>
+            <button data-manual="cancel">取消任务</button>
+          </div>
+        </div>
+      </aside>
+    </section>
+  </main>
+  <script>
+    const bodyEl = document.getElementById("symbol_body");
+    const summaryEl = document.getElementById("summary");
+    const metaEl = document.getElementById("meta");
+    const serverErrorsEl = document.getElementById("server_errors");
+    const modeChipEl = document.getElementById("mode_chip");
+    const serverChipEl = document.getElementById("server_chip");
+    const drawerTitleEl = document.getElementById("drawer_title");
+    const drawerMetaEl = document.getElementById("drawer_meta");
+    const serverTabsEl = document.getElementById("server_tabs");
+    const readonlyNoticeEl = document.getElementById("readonly_notice");
+    const localActionBarEl = document.getElementById("local_action_bar");
+    const readonlyActionBarEl = document.getElementById("readonly_action_bar");
+    const manualWarningEl = document.getElementById("manual_warning");
+    const manualActionGridEl = document.getElementById("manual_action_grid");
+    const paramFormEl = document.getElementById("param_form");
+    const diffBoxEl = document.getElementById("diff_box");
+    const fields = ["step_price","per_order_notional","buy_levels","sell_levels","pause_buy_position_notional","pause_short_position_notional","max_total_notional","static_buy_offset_steps","static_sell_offset_steps"];
+    const labels = {step_price:"step_price",per_order_notional:"单笔金额",buy_levels:"买格数",sell_levels:"卖格数",pause_buy_position_notional:"多软阈值",pause_short_position_notional:"空软阈值",max_total_notional:"最大总名义",static_buy_offset_steps:"买偏移",static_sell_offset_steps:"卖偏移"};
+    let state = { payload:null, selectedSymbol:null, selectedCell:null, timer:null, paused:false };
+    const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
+    const num = (v, d=4) => Number.isFinite(Number(v)) ? Number(v).toLocaleString("zh-CN",{maximumFractionDigits:d}) : "--";
+    const signed = (v) => Number.isFinite(Number(v)) ? `${Number(v)>0?"+":""}${num(v)}` : "--";
+    function badge(status) {
+      if (status === "running") return '<span class="badge good">运行中</span>';
+      if (status === "saved_idle") return '<span class="badge warn">已保存</span>';
+      if (status === "offline") return '<span class="badge bad">离线</span>';
+      return '<span class="badge">空闲</span>';
+    }
+    function cellHtml(cell) {
+      const status = cell.ok === false ? "offline" : (cell.is_running ? "running" : (cell.status || "idle"));
+      return `<div class="server-cell"><strong>${esc(cell.server_label || cell.server_id || "--")} ${badge(status)}</strong><span>${esc(cell.strategy_name || cell.strategy_profile || "--")}</span><span>${esc(cell.position_summary || "--")}</span><span>挂单 ${esc(cell.open_order_count ?? "--")} · PnL ${esc(signed(cell.total_pnl))}</span></div>`;
+    }
+    function renderSummary(payload) {
+      const summary = payload.summary || {};
+      const cards = [["币种数", (payload.symbols || []).length],["服务器", summary.server_count ?? "--"],["运行中", summary.running_symbol_count ?? "--"],["总成交量", num(summary.total_volume)],["总盈亏", signed(summary.total_pnl)]];
+      summaryEl.innerHTML = cards.map(([k,v]) => `<div class="metric"><span>${esc(k)}</span><strong>${esc(v)}</strong></div>`).join("");
+      serverChipEl.textContent = `服务器 ${summary.server_count ?? "--"}`;
+      modeChipEl.textContent = payload.controller_read_only ? "总控只读模式" : "本机交易模式";
+    }
+    function renderRows(payload) {
+      const groups = payload.symbols_by_symbol || [];
+      const errors = payload.server_errors || [];
+      serverErrorsEl.style.display = errors.length ? "block" : "none";
+      serverErrorsEl.innerHTML = errors.length ? `<strong>服务器连接异常</strong><br>${errors.map((item) => `${esc(item.server_label || item.server_id || item.server_base_url || "--")}: ${esc(item.error || "--")}`).join("<br>")}` : "";
+      if (!groups.length) { bodyEl.innerHTML = '<tr><td colspan="7"><div class="empty">暂无策略运行数据。</div></td></tr>'; return; }
+      bodyEl.innerHTML = groups.map((group) => `<tr data-symbol="${esc(group.symbol)}" class="${state.selectedSymbol===group.symbol?"selected":""}"><td><div class="symbol">${esc(group.symbol)}</div></td><td>${badge(group.status)}</td><td>${(group.servers || []).map(cellHtml).join("")}</td><td>${esc(num((group.totals||{}).total_volume))}</td><td>${esc(num((group.totals||{}).recent_hour_volume))}</td><td>${esc(signed((group.totals||{}).total_pnl))}</td><td>${esc(((group.servers||[])[0]||{}).position_summary || "--")}</td></tr>`).join("");
+      bodyEl.querySelectorAll("tr[data-symbol]").forEach((row) => row.addEventListener("click", () => selectSymbol(row.getAttribute("data-symbol"))));
+    }
+    function selectSymbol(symbol) {
+      const group = (state.payload?.symbols_by_symbol || []).find((item) => item.symbol === symbol);
+      if (!group) return;
+      state.selectedSymbol = symbol;
+      state.selectedCell = (group.servers || []).find((cell) => cell.server_base_url === "" || !cell.server_base_url) || (group.servers || [])[0] || null;
+      renderRows(state.payload);
+      renderDrawer(group);
+    }
+    function renderDrawer(group) {
+      const cell = state.selectedCell || {};
+      const readOnly = !!state.payload?.controller_read_only;
+      drawerTitleEl.textContent = `${group.symbol} · 参数与操作`;
+      drawerMetaEl.textContent = `${cell.server_label || cell.server_id || "--"} · ${cell.is_running ? "运行中" : "非运行"} · ${cell.strategy_name || cell.strategy_profile || "--"}`;
+      readonlyNoticeEl.style.display = readOnly ? "block" : "none";
+      localActionBarEl.style.display = readOnly ? "none" : "flex";
+      readonlyActionBarEl.style.display = readOnly ? "flex" : "none";
+      manualActionGridEl.style.display = readOnly ? "none" : "grid";
+      manualWarningEl.textContent = readOnly ? "总控只读模式下不在本机执行手动交易。请打开目标服务器控制台后再介入。" : "同币种 runner 正在运行，手动介入前建议暂停策略。";
+      serverTabsEl.innerHTML = (group.servers || []).map((item, idx) => `<button type="button" data-server-idx="${idx}" class="${item===cell?"active":""}">${esc(item.server_label || item.server_id || "--")}</button>`).join("");
+      serverTabsEl.querySelectorAll("button").forEach((btn) => btn.addEventListener("click", () => { state.selectedCell = group.servers[Number(btn.getAttribute("data-server-idx"))]; renderDrawer(group); }));
+      const config = cell.config || {};
+      paramFormEl.innerHTML = fields.map((field) => `<label>${esc(labels[field] || field)}<input data-param="${esc(field)}" value="${esc(config[field] ?? "")}" /></label>`).join("");
+      paramFormEl.querySelectorAll("input").forEach((input) => input.addEventListener("input", renderDiff));
+      renderDiff();
+    }
+    function currentPayloadFromForm() {
+      const base = {...((state.selectedCell || {}).config || {})};
+      paramFormEl.querySelectorAll("input").forEach((input) => {
+        const key = input.getAttribute("data-param");
+        if (!key) return;
+        const raw = input.value.trim();
+        base[key] = raw === "" ? null : (Number.isFinite(Number(raw)) ? Number(raw) : raw);
+      });
+      base.symbol = state.selectedSymbol || base.symbol;
+      return base;
+    }
+    function renderDiff() {
+      const cell = state.selectedCell || {};
+      const config = cell.config || {};
+      const next = currentPayloadFromForm();
+      const changed = fields.filter((field) => String(config[field] ?? "") !== String(next[field] ?? ""));
+      diffBoxEl.textContent = changed.length ? changed.map((field) => `${field}: ${config[field] ?? "--"} → ${next[field] ?? "--"}`).join("；") : "当前值 → 新值：暂无变化";
+    }
+    async function postRunner(url, payload) {
+      const resp = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const data = await resp.json();
+      if (!resp.ok || data.ok === false) throw new Error(data.error || `HTTP ${resp.status}`);
+      metaEl.textContent = "操作已提交，正在刷新...";
+      await load();
+    }
+    function openTargetConsole() {
+      const cell = state.selectedCell || {};
+      const url = cell.target_url || (cell.server_base_url ? `${String(cell.server_base_url).replace(/\\/$/, "")}/running_status?symbol=${encodeURIComponent(state.selectedSymbol || "")}` : "");
+      if (!url) {
+        metaEl.textContent = "目标服务器链接不可用。";
+        return;
+      }
+      window.open(url, "_blank", "noopener,noreferrer");
+    }
+    async function load() {
+      const resp = await fetch("/api/strategy_workspace");
+      const payload = await resp.json();
+      if (!resp.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${resp.status}`);
+      state.payload = payload;
+      renderSummary(payload);
+      if (!state.selectedSymbol && (payload.symbols_by_symbol || [])[0]) state.selectedSymbol = payload.symbols_by_symbol[0].symbol;
+      renderRows(payload);
+      if (state.selectedSymbol) selectSymbol(state.selectedSymbol);
+      metaEl.textContent = `最后刷新 ${new Date().toLocaleString("zh-CN")}`;
+    }
+    document.getElementById("refresh_btn").addEventListener("click", () => load().catch((err) => metaEl.textContent = err.message));
+    document.getElementById("save_btn").addEventListener("click", () => postRunner("/api/runner/save", currentPayloadFromForm()).catch((err) => metaEl.textContent = err.message));
+    document.getElementById("apply_btn").addEventListener("click", () => postRunner("/api/runner/start", currentPayloadFromForm()).catch((err) => metaEl.textContent = err.message));
+    document.getElementById("stop_btn").addEventListener("click", () => postRunner("/api/runner/stop", {symbol:state.selectedSymbol}).catch((err) => metaEl.textContent = err.message));
+    document.getElementById("flatten_btn").addEventListener("click", () => postRunner("/api/runner/stop", {symbol:state.selectedSymbol,cancel_open_orders:true,close_all_positions:true}).catch((err) => metaEl.textContent = err.message));
+    document.getElementById("open_target_btn").addEventListener("click", openTargetConsole);
+    document.querySelectorAll("[data-manual]").forEach((btn) => btn.addEventListener("click", () => { window.location.href = `/manual_trade?symbol=${encodeURIComponent(state.selectedSymbol || "")}`; }));
+    document.getElementById("toggle_btn").addEventListener("click", (event) => { state.paused = !state.paused; event.target.textContent = state.paused ? "恢复自动刷新" : "暂停自动刷新"; });
+    load().catch((err) => metaEl.textContent = err.message);
+    state.timer = setInterval(() => { if (!state.paused) load().catch(() => {}); }, 20000);
+  </script>
+</body>
+</html>
+"""
+
+
 SPOT_RUNNER_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -31900,6 +32203,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/running_status_overview", "/running_status_overview.html"}:
             self._send_html(_render_running_status_overview_page(), status=HTTPStatus.OK)
             return
+        if path in {"/strategy_workspace", "/strategy_workspace.html"}:
+            self._send_html(_render_strategy_workspace_page(), status=HTTPStatus.OK)
+            return
         if path in {"/competition_volume", "/competition_volume.html"}:
             self._send_html(COMPETITION_VOLUME_PAGE, status=HTTPStatus.OK)
             return
@@ -31961,6 +32267,17 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("application/json; charset=utf-8", len(body))
             self.end_headers()
             self.wfile.write(body)
+            return
+        if path == "/api/strategy_workspace":
+            try:
+                payload = _run_strategy_workspace_query(query)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
             return
         if path == "/api/competition_board":
             if not _competition_board_enabled():
@@ -32287,6 +32604,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/strategy_workspace", "/strategy_workspace.html"}:
+            body = _render_strategy_workspace_page().encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/monitor", "/monitor.html"}:
             body = MONITOR_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -32335,6 +32658,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/price"
             or path == "/api/running_status"
             or path == "/api/running_status_overview"
+            or path == "/api/strategy_workspace"
             or path.startswith("/api/loop_monitor")
             or path == "/api/running_status"
             or path == "/api/grid_preview"
