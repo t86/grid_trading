@@ -175,6 +175,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("/api/manual_trade/book_limit", MANUAL_TRADE_PAGE)
         self.assertIn('id="book_buy_btn"', MANUAL_TRADE_PAGE)
         self.assertIn('id="book_sell_btn"', MANUAL_TRADE_PAGE)
+        self.assertIn('const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["CHIPUSDT"]', MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/history/delete", MANUAL_TRADE_PAGE)

@@ -17524,6 +17524,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     const marginModeFieldEl = document.getElementById("margin_mode_field");
     const manualNoteEl = document.getElementById("manual_note");
     const symbolLabelEl = document.getElementById("symbol_label");
+    const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["CHIPUSDT"];
     let activeMarketType = "futures";
     let symbols = [];
     let refreshTimer = null;
@@ -17606,7 +17607,8 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       const marketType = activeMarketType;
       const resp = await fetch(`/api/symbols?market_type=${encodeURIComponent(marketType)}${marketType === "futures" ? "&contract_type=usdm" : ""}`);
       const data = await readJson(resp);
-      symbols = Array.isArray(data.symbols) ? data.symbols : [];
+      const extraSymbols = marketType === "futures" ? MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS : [];
+      symbols = Array.from(new Set([...(Array.isArray(data.symbols) ? data.symbols : []), ...extraSymbols].map((symbol) => String(symbol || "").trim().toUpperCase()).filter(Boolean))).sort();
       const requested = new URLSearchParams(window.location.search).get("symbol");
       const previous = (symbolEl.value || requested || "").toUpperCase();
       symbolEl.innerHTML = symbols.map((symbol) => `<option value="${escapeHtml(symbol)}">${escapeHtml(symbol)}</option>`).join("");
