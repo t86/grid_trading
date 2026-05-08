@@ -1948,6 +1948,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 5.0)
         self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 12.0)
 
+    def test_runner_preset_payload_applies_billusdt_competition_neutral_ping_pong_guards(self) -> None:
+        payload = _runner_preset_payload("billusdt_competition_neutral_ping_pong_v1", {"symbol": "BILLUSDT"})
+        self.assertEqual(payload["strategy_profile"], "billusdt_competition_neutral_ping_pong_v1")
+        self.assertEqual(payload["symbol"], "BILLUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 0.00005)
+        self.assertEqual(payload["buy_levels"], 6)
+        self.assertEqual(payload["sell_levels"], 6)
+        self.assertAlmostEqual(payload["per_order_notional"], 35.0)
+        self.assertEqual(payload["leverage"], 20)
+        self.assertTrue(payload["flat_start_enabled"])
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertAlmostEqual(payload["adaptive_step_1m_amplitude_ratio"], 0.008)
+        self.assertTrue(payload["adverse_reduce_enabled"])
+        self.assertAlmostEqual(payload["adverse_reduce_long_trigger_ratio"], 0.008)
+        self.assertTrue(payload["hard_loss_forced_reduce_enabled"])
+        self.assertAlmostEqual(payload["hard_loss_forced_reduce_target_notional"], 70.0)
+        self.assertTrue(payload["volatility_trigger_enabled"])
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+        self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 10.0)
+        self.assertEqual(payload["volatility_trigger_fast_windows"][0]["window"], "1m")
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 10.0)
+
     def test_runner_preset_payload_rejects_competition_neutral_ping_pong_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUUSDT"):
             _runner_preset_payload("xauusdt_competition_neutral_ping_pong_v1", {"symbol": "BTCUSDC"})
