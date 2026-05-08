@@ -19360,30 +19360,6 @@ MONITOR_PAGE = """<!doctype html>
 
     <section class="card monitor-section">
       <div class="panel-title">
-        <h2>参数生效时间线</h2>
-        <div class="tiny">执行区间、软硬阈值、adaptive step、分钟保护和仓位快照</div>
-      </div>
-      <div class="table-wrap">
-        <table class="timeline-table">
-          <thead>
-            <tr>
-              <th>时间</th>
-              <th>轮次</th>
-              <th>类型</th>
-              <th>状态</th>
-              <th class="wide">参数/原因</th>
-              <th>市场</th>
-              <th>仓位</th>
-              <th>阈值/step</th>
-            </tr>
-          </thead>
-          <tbody id="risk_timeline_body"></tbody>
-        </table>
-      </div>
-    </section>
-
-    <section class="card monitor-section">
-      <div class="panel-title">
         <h2>小时损益拆解</h2>
         <div class="tiny" id="hourly_meta">最近 24 小时</div>
       </div>
@@ -19495,6 +19471,30 @@ MONITOR_PAGE = """<!doctype html>
             <tbody id="events_body"></tbody>
           </table>
         </div>
+      </div>
+    </section>
+
+    <section class="card monitor-section">
+      <div class="panel-title">
+        <h2>参数生效时间线</h2>
+        <div class="tiny">执行区间、软硬阈值、adaptive step、分钟保护和仓位快照</div>
+      </div>
+      <div class="table-wrap">
+        <table class="timeline-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>轮次</th>
+              <th>类型</th>
+              <th>状态</th>
+              <th class="wide">参数/原因</th>
+              <th>市场</th>
+              <th>仓位</th>
+              <th>阈值/step</th>
+            </tr>
+          </thead>
+          <tbody id="risk_timeline_body"></tbody>
+        </table>
       </div>
     </section>
   </div>

@@ -4270,6 +4270,14 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("function ensureMonitorSymbolOption(symbol)", MONITOR_PAGE)
         self.assertIn('data-sprint-preset-key="${escapeHtml(preset.key)}"', MONITOR_PAGE)
 
+    def test_monitor_page_places_parameter_timeline_at_monitor_bottom(self) -> None:
+        recent_loop_index = MONITOR_PAGE.index("<h2>最近循环</h2>")
+        timeline_index = MONITOR_PAGE.index("<h2>参数生效时间线</h2>")
+        script_index = MONITOR_PAGE.index('const riskTimelineBody = document.getElementById("risk_timeline_body");')
+
+        self.assertGreater(timeline_index, recent_loop_index)
+        self.assertLess(timeline_index, script_index)
+
     def test_strategies_page_contains_manual_symbol_list_controls(self) -> None:
         self.assertIn('id="monitor_symbol_input"', STRATEGIES_PAGE)
         self.assertIn('id="competition_symbol_input"', STRATEGIES_PAGE)
