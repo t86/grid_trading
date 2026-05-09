@@ -17613,6 +17613,10 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     .tabs { display:inline-flex; gap:4px; margin-top:14px; padding:4px; border:1px solid var(--line); border-radius:10px; background:#f7f5ef; }
     .tab-btn { min-height:32px; border-radius:8px; background:transparent; border:0; color:var(--muted); }
     .tab-btn.active { background:#fff; color:var(--brand); box-shadow:0 1px 4px rgba(16,24,40,.08); }
+    .section-head { display:flex; justify-content:space-between; gap:12px; align-items:start; flex-wrap:wrap; margin-bottom:12px; }
+    .section-head h2 { margin-bottom:0; }
+    .filters { display:flex; flex-wrap:wrap; gap:10px; align-items:end; }
+    .filters label { min-width:132px; }
     button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
     button.buy { background:var(--good); border-color:var(--good); color:#fff; }
     button.sell { background:var(--bad); border-color:var(--bad); color:#fff; }
@@ -17714,7 +17718,37 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     </section>
 
     <section class="card">
-      <h2>成交历史</h2>
+      <div class="section-head">
+        <h2>成交历史</h2>
+        <div class="filters">
+          <label>类型
+            <select id="history_type_filter">
+              <option value="">全部类型</option>
+              <option value="maker">Maker 追盘</option>
+              <option value="take">Take 市价</option>
+              <option value="book_limit">买一/卖一挂单</option>
+            </select>
+          </label>
+          <label>方向
+            <select id="history_side_filter">
+              <option value="">全部方向</option>
+              <option value="BUY">BUY</option>
+              <option value="SELL">SELL</option>
+            </select>
+          </label>
+          <label>委托角色
+            <select id="history_role_filter">
+              <option value="">全部角色</option>
+              <option value="open_long">开多</option>
+              <option value="close_short">平空</option>
+              <option value="open_short">开空</option>
+              <option value="close_long">平多</option>
+              <option value="book_buy">买一挂买</option>
+              <option value="book_sell">卖一挂卖</option>
+            </select>
+          </label>
+        </div>
+      </div>
       <div class="table-wrap">
         <table>
           <thead><tr><th>时间</th><th>类型</th><th>方向</th><th>目标</th><th>预计挂单</th><th>成交额</th><th>成交均价</th><th>最后价格</th><th>成交数量</th><th>尝试次数</th><th>操作</th></tr></thead>
@@ -17733,9 +17767,13 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     const marginModeFieldEl = document.getElementById("margin_mode_field");
     const manualNoteEl = document.getElementById("manual_note");
     const symbolLabelEl = document.getElementById("symbol_label");
+    const historyTypeFilterEl = document.getElementById("history_type_filter");
+    const historySideFilterEl = document.getElementById("history_side_filter");
+    const historyRoleFilterEl = document.getElementById("history_role_filter");
     const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["BILLUSDT", "CHIPUSDT"];
     let activeMarketType = "futures";
     let symbols = [];
+    let currentHistory = [];
     let refreshTimer = null;
     let refreshInFlight = false;
     let refreshAbortController = null;
@@ -17889,9 +17927,36 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       if (Number.isNaN(date.getTime())) return String(value);
       return date.toLocaleString();
     }
+    function normalizeHistorySource(source) {
+      return String(source || "").trim().toLowerCase();
+    }
+    function historyItemRoles(item) {
+      const roles = new Set();
+      const side = String(item && item.side || "").toUpperCase();
+      if (normalizeHistorySource(item && item.source) === "book_limit") {
+        roles.add(side === "BUY" ? "book_buy" : "book_sell");
+      }
+      const legs = Array.isArray(item && item.legs_done) ? item.legs_done : [];
+      legs.forEach((done) => {
+        const leg = done && typeof done === "object" ? done.leg : null;
+        const role = leg && typeof leg === "object" ? String(leg.role || "").trim() : "";
+        if (role) roles.add(role);
+      });
+      return roles;
+    }
+    function historyItemMatchesFilters(item) {
+      const selectedType = normalizeHistorySource(historyTypeFilterEl.value);
+      const selectedSide = String(historySideFilterEl.value || "").trim().toUpperCase();
+      const selectedRole = String(historyRoleFilterEl.value || "").trim();
+      if (selectedType && normalizeHistorySource(item && item.source) !== selectedType) return false;
+      if (selectedSide && String(item && item.side || "").toUpperCase() !== selectedSide) return false;
+      if (selectedRole && !historyItemRoles(item).has(selectedRole)) return false;
+      return true;
+    }
     function renderHistory(history) {
       const body = document.getElementById("history_body");
-      const rows = Array.isArray(history) ? [...history].reverse() : [];
+      currentHistory = Array.isArray(history) ? [...history] : [];
+      const rows = currentHistory.filter(historyItemMatchesFilters).reverse();
       if (!rows.length) {
         body.innerHTML = '<tr><td colspan="11">暂无成交历史</td></tr>';
         return;
@@ -17992,6 +18057,9 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
+    [historyTypeFilterEl, historySideFilterEl, historyRoleFilterEl].forEach((filterEl) => {
+      filterEl.addEventListener("change", () => renderHistory(currentHistory));
+    });
     document.querySelectorAll("[data-market-tab]").forEach((button) => {
       button.addEventListener("click", () => {
         const next = button.dataset.marketTab || "futures";
