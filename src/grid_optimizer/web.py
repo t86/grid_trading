@@ -11134,108 +11134,151 @@ def _manual_trade_execute_take(payload: dict[str, Any]) -> dict[str, Any]:
 
 def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
     market_type = _manual_trade_market_type(payload.get("market_type", "futures"))
+    started_at = time.perf_counter()
+    stage_started_at = started_at
+    stage_durations: dict[str, float] = {}
     normalized_symbol = str(payload.get("symbol", "")).upper().strip()
+    normalized_side = str(payload.get("side", "")).upper().strip()
+
+    def record_stage(name: str) -> None:
+        nonlocal stage_started_at
+        now = time.perf_counter()
+        stage_durations[name] = now - stage_started_at
+        stage_started_at = now
+
+    def emit_log(status: str, error: Exception | None = None) -> None:
+        total_elapsed = time.perf_counter() - started_at
+        message = (
+            f"[manual-trade] book_limit symbol={normalized_symbol or '--'} "
+            f"side={normalized_side or '--'} status={status} total={total_elapsed:.3f}s"
+        )
+        for stage_name in (
+            "position_mode",
+            "book_ticker",
+            "symbol_config",
+            "post_order",
+            "snapshot",
+        ):
+            duration = stage_durations.get(stage_name)
+            if duration is not None:
+                message += f" stage_{stage_name}={duration:.3f}s"
+        if error is not None:
+            message += f" error={type(error).__name__}: {error}"
+        print(message)
+
     if not normalized_symbol:
         raise ValueError("symbol is required")
-    normalized_side = str(payload.get("side", "")).upper().strip()
     if normalized_side not in {"BUY", "SELL"}:
         raise ValueError("side must be BUY or SELL")
-    safe_notional = float(payload.get("notional", 0) or 0)
-    if safe_notional <= 0:
-        raise ValueError("notional must be > 0")
-    creds = load_binance_api_credentials()
-    if creds is None:
-        raise RuntimeError("Binance API credentials are not configured")
-    api_key, api_secret = creds
-    if market_type == "futures" and _truthy(fetch_futures_position_mode(api_key, api_secret).get("dualSidePosition")):
-        raise ValueError("manual trade requires one-way position mode")
-    bid_price, ask_price = _manual_trade_book_prices(normalized_symbol, market_type)
-    symbol_info = fetch_spot_symbol_config(normalized_symbol) if market_type == "spot" else fetch_futures_symbol_config(normalized_symbol)
-    price = bid_price if normalized_side == "BUY" else ask_price
-    rounded_price = _round_order_price(price, symbol_info.get("tick_size"), normalized_side)
-    quantity = _round_order_qty(safe_notional / rounded_price, symbol_info.get("step_size"))
-    if quantity <= 0:
-        raise ValueError("quantity rounds to zero")
-    min_qty = symbol_info.get("min_qty")
-    if min_qty is not None and quantity < float(min_qty):
-        raise ValueError("quantity is below minimum quantity")
-    min_notional = symbol_info.get("min_notional")
-    if min_notional is not None and quantity * rounded_price < float(min_notional):
-        raise ValueError("order notional is below minimum notional")
-    if market_type == "spot" and normalized_side == "SELL":
-        account_info = fetch_spot_account_info(api_key, api_secret)
-        _manual_trade_validate_spot_sell_balance(
-            account_info=account_info,
-            symbol_info=symbol_info,
-            quantity=quantity,
-        )
-    prefix = _manual_trade_client_order_prefix(normalized_symbol, market_type)
-    role = "book_buy" if normalized_side == "BUY" else "book_sell"
-    client_order_id = _manual_trade_order_id(prefix, role, normalized_side)
-    if market_type == "spot":
-        response = post_spot_order(
-            symbol=normalized_symbol,
-            side=normalized_side,
-            quantity=quantity,
-            price=rounded_price,
-            api_key=api_key,
-            api_secret=api_secret,
-            order_type="LIMIT_MAKER",
-            new_client_order_id=client_order_id,
-        )
-        time_in_force = "LIMIT_MAKER"
-    else:
-        response = post_futures_order(
-            symbol=normalized_symbol,
-            side=normalized_side,
-            quantity=quantity,
-            price=rounded_price,
-            api_key=api_key,
-            api_secret=api_secret,
-            time_in_force="GTX",
-            reduce_only=None,
-            new_client_order_id=client_order_id,
-        )
-        time_in_force = "GTX"
-    limit_order = {
-        "side": normalized_side,
-        "quantity": quantity,
-        "price": rounded_price,
-        "notional": quantity * rounded_price,
-        "time_in_force": time_in_force,
-        "client_order_id": client_order_id,
-    }
-    _manual_trade_initialize_task(
-        normalized_symbol,
-        {
-            "id": str(response.get("orderId") or client_order_id),
-            "source": "book_limit",
-            "market_type": market_type,
-            "status": str(response.get("status") or "submitted").lower(),
+    try:
+        safe_notional = float(payload.get("notional", 0) or 0)
+        if safe_notional <= 0:
+            raise ValueError("notional must be > 0")
+        creds = load_binance_api_credentials()
+        if creds is None:
+            raise RuntimeError("Binance API credentials are not configured")
+        api_key, api_secret = creds
+        if market_type == "futures":
+            position_mode = fetch_futures_position_mode(api_key, api_secret)
+            record_stage("position_mode")
+            if _truthy(position_mode.get("dualSidePosition")):
+                raise ValueError("manual trade requires one-way position mode")
+        bid_price, ask_price = _manual_trade_book_prices(normalized_symbol, market_type)
+        record_stage("book_ticker")
+        symbol_info = fetch_spot_symbol_config(normalized_symbol) if market_type == "spot" else fetch_futures_symbol_config(normalized_symbol)
+        record_stage("symbol_config")
+        price = bid_price if normalized_side == "BUY" else ask_price
+        rounded_price = _round_order_price(price, symbol_info.get("tick_size"), normalized_side)
+        quantity = _round_order_qty(safe_notional / rounded_price, symbol_info.get("step_size"))
+        if quantity <= 0:
+            raise ValueError("quantity rounds to zero")
+        min_qty = symbol_info.get("min_qty")
+        if min_qty is not None and quantity < float(min_qty):
+            raise ValueError("quantity is below minimum quantity")
+        min_notional = symbol_info.get("min_notional")
+        if min_notional is not None and quantity * rounded_price < float(min_notional):
+            raise ValueError("order notional is below minimum notional")
+        if market_type == "spot" and normalized_side == "SELL":
+            account_info = fetch_spot_account_info(api_key, api_secret)
+            _manual_trade_validate_spot_sell_balance(
+                account_info=account_info,
+                symbol_info=symbol_info,
+                quantity=quantity,
+            )
+        prefix = _manual_trade_client_order_prefix(normalized_symbol, market_type)
+        role = "book_buy" if normalized_side == "BUY" else "book_sell"
+        client_order_id = _manual_trade_order_id(prefix, role, normalized_side)
+        if market_type == "spot":
+            response = post_spot_order(
+                symbol=normalized_symbol,
+                side=normalized_side,
+                quantity=quantity,
+                price=rounded_price,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_type="LIMIT_MAKER",
+                new_client_order_id=client_order_id,
+            )
+            time_in_force = "LIMIT_MAKER"
+        else:
+            response = post_futures_order(
+                symbol=normalized_symbol,
+                side=normalized_side,
+                quantity=quantity,
+                price=rounded_price,
+                api_key=api_key,
+                api_secret=api_secret,
+                time_in_force="GTX",
+                reduce_only=None,
+                new_client_order_id=client_order_id,
+            )
+            time_in_force = "GTX"
+        record_stage("post_order")
+        limit_order = {
             "side": normalized_side,
-            "notional": safe_notional,
             "quantity": quantity,
+            "price": rounded_price,
+            "notional": quantity * rounded_price,
+            "time_in_force": time_in_force,
+            "client_order_id": client_order_id,
+        }
+        _manual_trade_initialize_task(
+            normalized_symbol,
+            {
+                "id": str(response.get("orderId") or client_order_id),
+                "source": "book_limit",
+                "market_type": market_type,
+                "status": str(response.get("status") or "submitted").lower(),
+                "side": normalized_side,
+                "notional": safe_notional,
+                "quantity": quantity,
+                "limit_order": limit_order,
+                "order_id": int(response["orderId"]) if response.get("orderId") is not None else None,
+                "client_order_id": str(response.get("clientOrderId") or client_order_id),
+                "current_order": response,
+                "executed_qty": _safe_numeric(response.get("executedQty")),
+                "remaining_qty": max(quantity - _safe_numeric(response.get("executedQty")), 0.0),
+                "avg_fill_price": 0.0,
+                "last_fill_price": 0.0,
+                "attempts": 1,
+                "message": "book limit order submitted",
+                "history_recorded": False,
+            },
+            market_type,
+        )
+        snapshot = _manual_trade_snapshot(normalized_symbol, market_type)
+        record_stage("snapshot")
+        emit_log("ok")
+        return {
+            "symbol": normalized_symbol,
+            "market_type": market_type,
             "limit_order": limit_order,
-            "order_id": int(response["orderId"]) if response.get("orderId") is not None else None,
-            "client_order_id": str(response.get("clientOrderId") or client_order_id),
-            "current_order": response,
-            "executed_qty": _safe_numeric(response.get("executedQty")),
-            "remaining_qty": max(quantity - _safe_numeric(response.get("executedQty")), 0.0),
-            "avg_fill_price": 0.0,
-            "last_fill_price": 0.0,
-            "attempts": 1,
-            "message": "book limit order submitted",
-            "history_recorded": False,
-        },
-        market_type,
-    )
-    return {
-        "symbol": normalized_symbol,
-        "market_type": market_type,
-        "limit_order": limit_order,
-        "order": response,
-        "snapshot": _manual_trade_snapshot(normalized_symbol, market_type),
-    }
+            "order": response,
+            "snapshot": snapshot,
+        }
+    except Exception as exc:
+        emit_log("error", exc)
+        raise
 
 
 def _manual_trade_chase_leg(

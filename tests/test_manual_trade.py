@@ -213,6 +213,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("现货不使用借贷卖出", MANUAL_TRADE_PAGE)
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
+    @patch("grid_optimizer.web.print")
     @patch("grid_optimizer.web.post_futures_order")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
@@ -225,6 +226,7 @@ class ManualTradeTests(unittest.TestCase):
         mock_book,
         mock_symbol_config,
         mock_post_order,
+        mock_print,
         mock_snapshot,
     ) -> None:
         mock_credentials.return_value = ("key", "secret")
@@ -253,6 +255,15 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(task["status"], "submitted")
         self.assertEqual(task["client_order_id"], "mt_bardusdt_bookbuy_b_1")
         self.assertEqual(task["limit_order"]["price"], 2.0)
+        mock_print.assert_called_once()
+        log_line = mock_print.call_args.args[0]
+        self.assertIn("[manual-trade] book_limit symbol=BARDUSDT side=BUY", log_line)
+        self.assertIn("status=ok", log_line)
+        self.assertIn("stage_position_mode=", log_line)
+        self.assertIn("stage_book_ticker=", log_line)
+        self.assertIn("stage_symbol_config=", log_line)
+        self.assertIn("stage_post_order=", log_line)
+        self.assertIn("stage_snapshot=", log_line)
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.post_futures_order")
