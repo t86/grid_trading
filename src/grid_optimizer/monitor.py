@@ -62,9 +62,11 @@ RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
 STABLE_QUOTE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 MONITOR_CACHE_TTL_SECONDS = 2.0
 LOCAL_RUNTIME_SNAPSHOT_MAX_AGE_SECONDS = 180.0
+LIVE_ACCOUNT_SNAPSHOT_TTL_SECONDS = float(os.environ.get("GRID_MONITOR_LIVE_ACCOUNT_TTL_SECONDS", "60.0"))
 _MONITOR_CACHE_LOCK = threading.Lock()
 _MONITOR_CACHE: dict[tuple[str, str, str, str, int], tuple[float, dict[str, Any]]] = {}
 _MONITOR_INFLIGHT: dict[tuple[str, str, str, str, int], "_InflightMonitorSnapshot"] = {}
+_LIVE_ACCOUNT_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
 
 class _InflightMonitorSnapshot:
@@ -1785,6 +1787,92 @@ def _build_local_runtime_snapshot(
     }
 
 
+def _build_live_account_snapshot(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol).upper().strip()
+    cache_key = (api_key.strip(), normalized_symbol)
+    now = time.time()
+    ttl = max(float(LIVE_ACCOUNT_SNAPSHOT_TTL_SECONDS), 0.0)
+    with _MONITOR_CACHE_LOCK:
+        cached = _LIVE_ACCOUNT_CACHE.get(cache_key)
+        if cached is not None and (now - cached[0]) <= ttl:
+            snapshot = dict(cached[1])
+            snapshot["cache_hit"] = True
+            return snapshot
+
+    account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
+    dual_side_position = _truthy(position_mode.get("dualSidePosition"))
+    if dual_side_position:
+        long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
+        short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
+        long_qty = abs(_safe_float(long_position.get("positionAmt")))
+        short_qty = abs(_safe_float(short_position.get("positionAmt")))
+        long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
+        short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
+        unrealized_pnl = long_unrealized + short_unrealized
+        position_amt = long_qty - short_qty
+        position = long_position if long_qty >= short_qty else short_position
+        entry_price = _safe_float(position.get("entryPrice"))
+        break_even_price = _safe_float(position.get("breakEvenPrice"))
+    else:
+        position = extract_symbol_position(account_info, normalized_symbol)
+        position_amt = _safe_float(position.get("positionAmt"))
+        long_qty = max(position_amt, 0.0)
+        short_qty = max(-position_amt, 0.0)
+        unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
+        entry_price = _safe_float(position.get("entryPrice"))
+        break_even_price = _safe_float(position.get("breakEvenPrice"))
+
+    snapshot = {
+        "source": "binance_futures_account",
+        "cache_hit": False,
+        "ttl_seconds": ttl,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "position": {
+            "source": "binance_futures_account",
+            "position_amt": position_amt,
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+            "entry_price": entry_price,
+            "break_even_price": break_even_price,
+            "unrealized_pnl": unrealized_pnl,
+            "isolated": _truthy(position.get("isolated")),
+            "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
+            "one_way_mode": not dual_side_position,
+            "available_balance": _safe_float(account_info.get("availableBalance")),
+            "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
+            "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
+        },
+        "account_assets": {
+            "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
+            "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
+        },
+        "open_orders": [
+            {
+                "order_id": item.get("orderId"),
+                "client_order_id": item.get("clientOrderId"),
+                "side": str(item.get("side", "")).upper().strip(),
+                "price": _safe_float(item.get("price")),
+                "orig_qty": _safe_float(item.get("origQty")),
+                "executed_qty": _safe_float(item.get("executedQty")),
+                "reduce_only": _truthy(item.get("reduceOnly")),
+                "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
+                "time": int(item.get("time", 0) or 0),
+            }
+            for item in open_orders
+        ],
+    }
+    with _MONITOR_CACHE_LOCK:
+        _LIVE_ACCOUNT_CACHE[cache_key] = (time.time(), snapshot)
+    return snapshot
+
+
 def build_monitor_snapshot(
     *,
     symbol: str,
@@ -1925,6 +2013,7 @@ def _build_monitor_snapshot_uncached(
         "position": None,
         "account_assets": {},
         "open_orders": [],
+        "live_account": None,
         "trade_summary": None,
         "income_summary": None,
         "hourly_summary": None,
@@ -1975,61 +2064,17 @@ def _build_monitor_snapshot_uncached(
         snapshot["account_connected"] = True
         try:
             unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
-            if local_runtime_snapshot is None:
-                account_info = fetch_futures_account_info_v3(api_key, api_secret)
-                position_mode = fetch_futures_position_mode(api_key, api_secret)
-                open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
-                dual_side_position = _truthy(position_mode.get("dualSidePosition"))
-                if dual_side_position:
-                    long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
-                    short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
-                    long_qty = abs(_safe_float(long_position.get("positionAmt")))
-                    short_qty = abs(_safe_float(short_position.get("positionAmt")))
-                    long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
-                    short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
-                    unrealized_pnl = long_unrealized + short_unrealized
-                    position_amt = long_qty - short_qty
-                    position = long_position if long_qty >= short_qty else short_position
-                    entry_price = _safe_float(position.get("entryPrice"))
-                    break_even_price = _safe_float(position.get("breakEvenPrice"))
-                else:
-                    position = extract_symbol_position(account_info, normalized_symbol)
-                    unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
-                    entry_price = _safe_float(position.get("entryPrice"))
-                    break_even_price = _safe_float(position.get("breakEvenPrice"))
-                    position_amt = _safe_float(position.get("positionAmt"))
-                snapshot["position"] = {
-                    "position_amt": position_amt,
-                    "long_qty": long_qty if dual_side_position else max(position_amt, 0.0),
-                    "short_qty": short_qty if dual_side_position else 0.0,
-                    "entry_price": entry_price,
-                    "break_even_price": break_even_price,
-                    "unrealized_pnl": unrealized_pnl,
-                    "isolated": _truthy(position.get("isolated")),
-                    "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
-                    "one_way_mode": not dual_side_position,
-                    "available_balance": _safe_float(account_info.get("availableBalance")),
-                    "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
-                    "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
-                }
-                snapshot["account_assets"] = {
-                    "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
-                    "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
-                }
-                snapshot["open_orders"] = [
-                    {
-                        "order_id": item.get("orderId"),
-                        "client_order_id": item.get("clientOrderId"),
-                        "side": str(item.get("side", "")).upper().strip(),
-                        "price": _safe_float(item.get("price")),
-                        "orig_qty": _safe_float(item.get("origQty")),
-                        "executed_qty": _safe_float(item.get("executedQty")),
-                        "reduce_only": _truthy(item.get("reduceOnly")),
-                        "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
-                        "time": int(item.get("time", 0) or 0),
-                    }
-                    for item in open_orders
-                ]
+            live_account = _build_live_account_snapshot(
+                symbol=normalized_symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+            )
+            snapshot["live_account"] = live_account
+            if local_runtime_snapshot is None or not bool(runner.get("is_running")):
+                snapshot["position"] = live_account["position"]
+                snapshot["account_assets"] = live_account["account_assets"]
+                snapshot["open_orders"] = live_account["open_orders"]
+                unrealized_pnl = _safe_float(live_account["position"].get("unrealized_pnl"))
             user_trades, trade_meta = _load_or_fetch_trade_rows(
                 audit_path=audit_paths["trade_audit"],
                 symbol=normalized_symbol,
