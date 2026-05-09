@@ -10568,6 +10568,34 @@ def _manual_trade_history_from_take_orders(symbol: str, plan: dict[str, Any], or
     }
 
 
+def _manual_trade_history_from_book_order(task: dict[str, Any], order: dict[str, Any]) -> dict[str, Any]:
+    limit_order = task.get("limit_order") if isinstance(task.get("limit_order"), dict) else {}
+    executed_qty = _safe_numeric(order.get("executedQty"))
+    fill_price = _manual_trade_fill_price_from_order(order, executed_qty)
+    fill_notional = executed_qty * fill_price if executed_qty > 0 and fill_price > 0 else 0.0
+    client_order_id = str(order.get("clientOrderId") or limit_order.get("client_order_id") or "").strip()
+    order_id = str(order.get("orderId") or "").strip()
+    record_id = order_id or client_order_id or uuid.uuid4().hex
+    return {
+        "id": f"book:{_manual_trade_market_type(task.get('market_type', 'futures'))}:{task.get('symbol', '')}:{record_id}",
+        "source": "book_limit",
+        "symbol": str(task.get("symbol", "")),
+        "market_type": _manual_trade_market_type(task.get("market_type", "futures")),
+        "side": str(task.get("side", "")),
+        "status": str(order.get("status") or task.get("status") or ""),
+        "target_notional": float(task.get("notional", 0) or 0),
+        "planned_notional": float(limit_order.get("notional", 0) or 0),
+        "executed_qty": executed_qty,
+        "avg_fill_price": fill_price,
+        "last_fill_price": fill_price,
+        "fill_notional": fill_notional,
+        "attempts": 1,
+        "orders": [dict(order)],
+        "started_at": str(task.get("created_at") or ""),
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _manual_trade_set_task(symbol: str, patch: dict[str, Any], market_type: str = "futures") -> dict[str, Any]:
     normalized_market = _manual_trade_market_type(patch.get("market_type", market_type))
     key = _manual_trade_task_key(symbol, normalized_market)
@@ -10736,6 +10764,78 @@ def _manual_trade_cancel_open_orders(
     return result
 
 
+def _manual_trade_refresh_book_limit_task(
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    market_type: str = "futures",
+) -> dict[str, Any] | None:
+    normalized_market = _manual_trade_market_type(market_type)
+    task = _manual_trade_current_task(symbol, normalized_market)
+    if not task or str(task.get("source", "")).lower() != "book_limit":
+        return task
+    if task.get("history_recorded") and str(task.get("status", "")).lower() in {
+        "filled",
+        "partially_filled",
+        "canceled",
+        "expired",
+        "rejected",
+    }:
+        return task
+    order_id = task.get("order_id")
+    client_order_id = str(task.get("client_order_id") or "").strip()
+    if order_id is None and not client_order_id:
+        return task
+    try:
+        fetch_kwargs = {
+            "symbol": symbol,
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "order_id": int(order_id) if order_id is not None else None,
+            "orig_client_order_id": client_order_id or None,
+        }
+        order = fetch_spot_order(**fetch_kwargs) if normalized_market == "spot" else fetch_futures_order(**fetch_kwargs)
+    except Exception as exc:
+        return _manual_trade_set_task(
+            symbol,
+            {
+                "market_type": normalized_market,
+                "message": f"book limit order status refresh failed: {type(exc).__name__}: {exc}",
+            },
+        )
+    executed_qty = _safe_numeric(order.get("executedQty"))
+    status = str(order.get("status", "")).upper().strip()
+    fill_price = _manual_trade_fill_price_from_order(order, executed_qty)
+    patch: dict[str, Any] = {
+        "market_type": normalized_market,
+        "current_order": order,
+        "executed_qty": executed_qty,
+        "avg_fill_price": fill_price if executed_qty > 0 else 0.0,
+        "last_fill_price": fill_price if executed_qty > 0 else 0.0,
+        "remaining_qty": max(float(task.get("quantity", 0) or 0) - executed_qty, 0.0),
+        "message": f"book limit order {status or 'UNKNOWN'}",
+    }
+    if status == "FILLED":
+        patch["status"] = "filled"
+    elif status in {"PARTIALLY_FILLED", "CANCELED", "EXPIRED"} and executed_qty > 0:
+        patch["status"] = "partially_filled"
+    elif status in {"CANCELED", "EXPIRED", "REJECTED"}:
+        patch["status"] = status.lower()
+    refreshed = _manual_trade_set_task(symbol, patch)
+    if executed_qty > 0 and not refreshed.get("history_recorded"):
+        history = _manual_trade_append_history(_manual_trade_history_from_book_order(refreshed, order))
+        refreshed = _manual_trade_set_task(
+            symbol,
+            {
+                "market_type": normalized_market,
+                "history_recorded": True,
+                "history_id": history["id"],
+                "completed_at": history["completed_at"],
+            },
+        )
+    return refreshed
+
+
 def _manual_trade_snapshot(symbol: str, market_type: str = "futures") -> dict[str, Any]:
     normalized_market = _manual_trade_market_type(market_type)
     normalized_symbol = str(symbol or "BTCUSDT").upper().strip() or "BTCUSDT"
@@ -10745,6 +10845,7 @@ def _manual_trade_snapshot(symbol: str, market_type: str = "futures") -> dict[st
     api_key, api_secret = creds
     bid_price, ask_price = _manual_trade_book_prices(normalized_symbol, normalized_market)
     prefix = _manual_trade_client_order_prefix(normalized_symbol, normalized_market)
+    task = _manual_trade_refresh_book_limit_task(normalized_symbol, api_key, api_secret, normalized_market)
     if normalized_market == "spot":
         symbol_info = fetch_spot_symbol_config(normalized_symbol)
         account_info = fetch_spot_account_info(api_key, api_secret)
@@ -10776,7 +10877,7 @@ def _manual_trade_snapshot(symbol: str, market_type: str = "futures") -> dict[st
             "manual_open_order_count": len(manual_orders),
             "manual_prefix": prefix,
             "runner": _read_spot_runner_process_for_symbol(normalized_symbol),
-            "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol, normalized_market)),
+            "task": _manual_trade_public_task(task or _manual_trade_current_task(normalized_symbol, normalized_market)),
             "history": _manual_trade_public_history_for_symbol(normalized_symbol, normalized_market),
         }
     account_info = fetch_futures_account_info_v3(api_key, api_secret)
@@ -10802,7 +10903,7 @@ def _manual_trade_snapshot(symbol: str, market_type: str = "futures") -> dict[st
         "manual_open_order_count": len(manual_orders),
         "manual_prefix": prefix,
         "runner": runner,
-        "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol, normalized_market)),
+        "task": _manual_trade_public_task(task or _manual_trade_current_task(normalized_symbol, normalized_market)),
         "history": _manual_trade_public_history_for_symbol(normalized_symbol, normalized_market),
     }
 
@@ -11002,17 +11103,42 @@ def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
             new_client_order_id=client_order_id,
         )
         time_in_force = "GTX"
+    limit_order = {
+        "side": normalized_side,
+        "quantity": quantity,
+        "price": rounded_price,
+        "notional": quantity * rounded_price,
+        "time_in_force": time_in_force,
+        "client_order_id": client_order_id,
+    }
+    _manual_trade_initialize_task(
+        normalized_symbol,
+        {
+            "id": str(response.get("orderId") or client_order_id),
+            "source": "book_limit",
+            "market_type": market_type,
+            "status": str(response.get("status") or "submitted").lower(),
+            "side": normalized_side,
+            "notional": safe_notional,
+            "quantity": quantity,
+            "limit_order": limit_order,
+            "order_id": int(response["orderId"]) if response.get("orderId") is not None else None,
+            "client_order_id": str(response.get("clientOrderId") or client_order_id),
+            "current_order": response,
+            "executed_qty": _safe_numeric(response.get("executedQty")),
+            "remaining_qty": max(quantity - _safe_numeric(response.get("executedQty")), 0.0),
+            "avg_fill_price": 0.0,
+            "last_fill_price": 0.0,
+            "attempts": 1,
+            "message": "book limit order submitted",
+            "history_recorded": False,
+        },
+        market_type,
+    )
     return {
         "symbol": normalized_symbol,
         "market_type": market_type,
-        "limit_order": {
-            "side": normalized_side,
-            "quantity": quantity,
-            "price": rounded_price,
-            "notional": quantity * rounded_price,
-            "time_in_force": time_in_force,
-            "client_order_id": client_order_id,
-        },
+        "limit_order": limit_order,
         "order": response,
         "snapshot": _manual_trade_snapshot(normalized_symbol, market_type),
     }

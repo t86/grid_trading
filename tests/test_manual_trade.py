@@ -18,6 +18,7 @@ from grid_optimizer.web import (
     _manual_trade_delete_history,
     _manual_trade_history_for_symbol,
     _manual_trade_public_history_for_symbol,
+    _manual_trade_refresh_book_limit_task,
     _manual_trade_maker_worker,
     _manual_trade_place_book_limit,
     MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS,
@@ -233,6 +234,11 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(result["order"]["orderId"], 123)
         self.assertEqual(result["limit_order"]["price"], 2.0)
         self.assertEqual(result["snapshot"], {"symbol": "BARDUSDT"})
+        task = _manual_trade_current_task("BARDUSDT")
+        self.assertEqual(task["source"], "book_limit")
+        self.assertEqual(task["status"], "submitted")
+        self.assertEqual(task["client_order_id"], "mt_bardusdt_bookbuy_b_1")
+        self.assertEqual(task["limit_order"]["price"], 2.0)
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.post_futures_order")
@@ -327,6 +333,52 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("mts_bardusdt", kwargs["new_client_order_id"])
         self.assertEqual(result["market_type"], "spot")
         self.assertEqual(result["limit_order"]["time_in_force"], "LIMIT_MAKER")
+
+    @patch("grid_optimizer.web.fetch_futures_order")
+    def test_book_limit_refresh_records_filled_order_history_once(self, mock_fetch_order) -> None:
+        _manual_trade_set_task(
+            "BARDUSDT",
+            {
+                "source": "book_limit",
+                "market_type": "futures",
+                "status": "submitted",
+                "side": "SELL",
+                "notional": 80.0,
+                "quantity": 39.6,
+                "limit_order": {
+                    "side": "SELL",
+                    "quantity": 39.6,
+                    "price": 2.02,
+                    "notional": 79.992,
+                    "time_in_force": "GTX",
+                    "client_order_id": "mt_bardusdt_booksell_s_1",
+                },
+                "order_id": 456,
+                "client_order_id": "mt_bardusdt_booksell_s_1",
+                "history_recorded": False,
+            },
+        )
+        mock_fetch_order.return_value = {
+            "orderId": 456,
+            "clientOrderId": "mt_bardusdt_booksell_s_1",
+            "status": "FILLED",
+            "executedQty": "39.6",
+            "avgPrice": "2.02",
+            "price": "2.02",
+        }
+
+        task = _manual_trade_refresh_book_limit_task("BARDUSDT", "key", "secret")
+        task_again = _manual_trade_refresh_book_limit_task("BARDUSDT", "key", "secret")
+
+        history = _manual_trade_history_for_symbol("BARDUSDT")
+        self.assertEqual(task["status"], "filled")
+        self.assertEqual(task_again["history_recorded"], True)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["source"], "book_limit")
+        self.assertEqual(history[0]["side"], "SELL")
+        self.assertAlmostEqual(history[0]["executed_qty"], 39.6)
+        self.assertAlmostEqual(history[0]["avg_fill_price"], 2.02)
+        self.assertAlmostEqual(history[0]["fill_notional"], 79.992)
 
     def test_manual_trade_history_is_symbol_scoped(self) -> None:
         _manual_trade_append_history(
