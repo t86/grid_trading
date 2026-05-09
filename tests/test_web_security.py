@@ -280,6 +280,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("server_errors", STRATEGY_WORKSPACE_PAGE)
         self.assertIn("服务器连接异常", STRATEGY_WORKSPACE_PAGE)
         self.assertIn("controller_read_only", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("来源：", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("serverIdentity", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("serverHost", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("source-badge", STRATEGY_WORKSPACE_PAGE)
 
     @patch.dict("grid_optimizer.web.os.environ", {"GRID_CONTROLLER_READ_ONLY": "1"}, clear=False)
     @patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret"))

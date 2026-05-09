@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from urllib.parse import urlparse
 from typing import Any
 
 
@@ -45,6 +46,23 @@ def _server_base_url(server: dict[str, Any]) -> str | None:
     return _normalized_text(server.get("server_base_url") or server.get("base_url") or server.get("url"))
 
 
+def _server_host(server: dict[str, Any]) -> str | None:
+    base_url = _server_base_url(server)
+    if not base_url:
+        return None
+    parsed = urlparse(base_url if "://" in base_url else f"http://{base_url}")
+    return _normalized_text(parsed.netloc or parsed.path)
+
+
+def _server_source(server: dict[str, Any]) -> str:
+    parts = [
+        part
+        for part in (_server_label(server), _server_id(server), _server_host(server))
+        if part
+    ]
+    return " / ".join(parts) or "--"
+
+
 def _card_status(card: dict[str, Any], default_status: str) -> str:
     if bool(card.get("is_running") or card.get("running")):
         return "running"
@@ -77,6 +95,8 @@ def _normalize_cell(server: dict[str, Any], card: dict[str, Any], default_status
         "server_id": _server_id(server),
         "server_label": _server_label(server),
         "server_base_url": _server_base_url(server),
+        "server_host": _server_host(server),
+        "server_source": _server_source(server),
         "ok": ok,
         "status": "offline" if not ok else status,
         "is_running": bool(card.get("is_running") or card.get("running")),

@@ -93,6 +93,8 @@ class StrategyWorkspaceTests(unittest.TestCase):
         self.assertEqual(first_cell["server_id"], "srv_114")
         self.assertEqual(first_cell["server_label"], "114")
         self.assertEqual(first_cell["server_base_url"], "http://114")
+        self.assertEqual(first_cell["server_host"], "114")
+        self.assertEqual(first_cell["server_source"], "114 / srv_114 / 114")
         self.assertEqual(first_cell["status"], "running")
         self.assertEqual(first_cell["position_summary"], "long 1")
         self.assertEqual(first_cell["raw"]["strategy_profile"], "soon-fast")

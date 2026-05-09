@@ -25443,9 +25443,11 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
     .badge.good { background:#eaf7ee; color:var(--good); }
     .badge.warn { background:#fff6e5; color:var(--warn); }
     .badge.bad { background:#fff0ee; color:var(--bad); }
-    .server-cell { display:grid; gap:4px; min-width:145px; }
+    .server-cell { display:grid; gap:4px; min-width:210px; }
     .server-cell strong { font-size:12px; }
     .server-cell span { color:var(--muted); font-size:12px; line-height:1.35; }
+    .source-badge { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid #9ed8d0; border-radius:999px; padding:2px 8px; background:#e6f6f4; color:#0b4f49; font-size:12px; font-weight:900; }
+    .source-host { color:#475467; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11px; }
     .drawer { position:sticky; top:14px; display:grid; gap:12px; }
     .drawer-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
     .drawer h2 { margin:0; font-size:20px; }
@@ -25565,6 +25567,22 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
     const esc = (v) => String(v ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch]));
     const num = (v, d=4) => Number.isFinite(Number(v)) ? Number(v).toLocaleString("zh-CN",{maximumFractionDigits:d}) : "--";
     const signed = (v) => Number.isFinite(Number(v)) ? `${Number(v)>0?"+":""}${num(v)}` : "--";
+    function serverHost(cell) {
+      if (cell.server_host) return String(cell.server_host);
+      const raw = String(cell.server_base_url || "").trim();
+      if (!raw) return "";
+      try {
+        return new URL(raw.includes("://") ? raw : `http://${raw}`).host;
+      } catch {
+        return raw.replace(/^https?:\\/\\//, "").replace(/\\/$/, "");
+      }
+    }
+    function serverIdentity(cell) {
+      return [cell.server_label, cell.server_id, serverHost(cell)].map((part) => String(part || "").trim()).filter(Boolean).join(" / ") || "--";
+    }
+    function serverSourceBadge(cell) {
+      return `<span class="source-badge" title="${esc(serverIdentity(cell))}">来源：${esc(cell.server_label || cell.server_id || serverHost(cell) || "--")}</span>`;
+    }
     function badge(status) {
       if (status === "running") return '<span class="badge good">运行中</span>';
       if (status === "saved_idle") return '<span class="badge warn">已保存</span>';
@@ -25573,7 +25591,8 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
     }
     function cellHtml(cell) {
       const status = cell.ok === false ? "offline" : (cell.is_running ? "running" : (cell.status || "idle"));
-      return `<div class="server-cell"><strong>${esc(cell.server_label || cell.server_id || "--")} ${badge(status)}</strong><span>${esc(cell.strategy_name || cell.strategy_profile || "--")}</span><span>${esc(cell.position_summary || "--")}</span><span>挂单 ${esc(cell.open_order_count ?? "--")} · PnL ${esc(signed(cell.total_pnl))}</span></div>`;
+      const host = serverHost(cell);
+      return `<div class="server-cell">${serverSourceBadge(cell)}<strong>${esc(cell.server_label || cell.server_id || "--")} ${badge(status)}</strong><span class="source-host">${esc([cell.server_id, host].filter(Boolean).join(" · "))}</span><span>${esc(cell.strategy_name || cell.strategy_profile || "--")}</span><span>${esc(cell.position_summary || "--")}</span><span>挂单 ${esc(cell.open_order_count ?? "--")} · PnL ${esc(signed(cell.total_pnl))}</span></div>`;
     }
     function renderSummary(payload) {
       const summary = payload.summary || {};
@@ -25603,13 +25622,13 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
       const cell = state.selectedCell || {};
       const readOnly = !!state.payload?.controller_read_only;
       drawerTitleEl.textContent = `${group.symbol} · 参数与操作`;
-      drawerMetaEl.textContent = `${cell.server_label || cell.server_id || "--"} · ${cell.is_running ? "运行中" : "非运行"} · ${cell.strategy_name || cell.strategy_profile || "--"}`;
+      drawerMetaEl.textContent = `来源：${serverIdentity(cell)} · ${cell.is_running ? "运行中" : "非运行"} · ${cell.strategy_name || cell.strategy_profile || "--"}`;
       readonlyNoticeEl.style.display = readOnly ? "block" : "none";
       localActionBarEl.style.display = readOnly ? "none" : "flex";
       readonlyActionBarEl.style.display = readOnly ? "flex" : "none";
       manualActionGridEl.style.display = readOnly ? "none" : "grid";
       manualWarningEl.textContent = readOnly ? "总控只读模式下不在本机执行手动交易。请打开目标服务器控制台后再介入。" : "同币种 runner 正在运行，手动介入前建议暂停策略。";
-      serverTabsEl.innerHTML = (group.servers || []).map((item, idx) => `<button type="button" data-server-idx="${idx}" class="${item===cell?"active":""}">${esc(item.server_label || item.server_id || "--")}</button>`).join("");
+      serverTabsEl.innerHTML = (group.servers || []).map((item, idx) => `<button type="button" data-server-idx="${idx}" class="${item===cell?"active":""}" title="${esc(serverIdentity(item))}">来源：${esc(item.server_label || item.server_id || serverHost(item) || "--")}</button>`).join("");
       serverTabsEl.querySelectorAll("button").forEach((btn) => btn.addEventListener("click", () => { state.selectedCell = group.servers[Number(btn.getAttribute("data-server-idx"))]; renderDrawer(group); }));
       const config = cell.config || {};
       paramFormEl.innerHTML = fields.map((field) => `<label>${esc(labels[field] || field)}<input data-param="${esc(field)}" value="${esc(config[field] ?? "")}" /></label>`).join("");
