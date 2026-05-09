@@ -32982,6 +32982,30 @@ class _Handler(BaseHTTPRequestHandler):
                 self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
                 return
             try:
+                if MANUAL_TRADE_RECEIVE_ONLY and path in {
+                    "/api/manual_trade/maker",
+                    "/api/manual_trade/take",
+                    "/api/manual_trade/cancel",
+                }:
+                    symbol = str(payload.get("symbol", "")).upper().strip()
+                    side = str(payload.get("side", "")).upper().strip()
+                    market_type = _manual_trade_market_type(payload.get("market_type", "futures"))
+                    print(
+                        f"[manual-trade] receive_only path={path} "
+                        f"symbol={symbol or '--'} side={side or '--'}"
+                    )
+                    self._send_json(
+                        {
+                            "ok": True,
+                            "symbol": symbol,
+                            "market_type": market_type,
+                            "receive_only": True,
+                            "order": {"status": "RECEIVED"},
+                            "message": "manual trade request received; live action disabled",
+                        },
+                        status=200,
+                    )
+                    return
                 if path.endswith("/maker"):
                     result = _manual_trade_start_maker(payload)
                     self._send_json({"ok": True, **result}, status=202)

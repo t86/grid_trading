@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.web import (
+    _Handler,
     MANUAL_TRADE_PAGE,
     _build_manual_trade_plan,
     _is_manual_trade_order,
@@ -26,6 +29,21 @@ from grid_optimizer.web import (
     _manual_trade_set_task,
     _manual_trade_prepare_plan,
 )
+
+
+class _JsonCaptureHandler(_Handler):
+    def __init__(self) -> None:
+        self.headers = {"Content-Length": "0"}
+        self.path = "/"
+        self.status = None
+        self.payload = None
+
+    def _authorize_request(self) -> bool:
+        return True
+
+    def _send_json(self, payload, status=200):  # type: ignore[no-untyped-def]
+        self.status = status
+        self.payload = payload
 
 
 class ManualTradeTests(unittest.TestCase):
@@ -288,6 +306,23 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(task["status"], "received")
         self.assertEqual(task["message"], "book limit request received; live order disabled")
         self.assertIn("status=received", mock_print.call_args.args[0])
+
+    @patch("grid_optimizer.web.MANUAL_TRADE_RECEIVE_ONLY", True)
+    @patch("grid_optimizer.web._manual_trade_execute_take")
+    def test_receive_only_blocks_take_endpoint_before_live_execution(self, mock_take) -> None:
+        payload = {"symbol": "BARDUSDT", "market_type": "futures", "side": "BUY", "notional": 80.0}
+        raw = json.dumps(payload).encode("utf-8")
+        handler = _JsonCaptureHandler()
+        handler.path = "/api/manual_trade/take"
+        handler.headers = {"Content-Length": str(len(raw))}
+        handler.rfile = io.BytesIO(raw)
+
+        handler.do_POST()
+
+        mock_take.assert_not_called()
+        self.assertEqual(handler.status, 200)
+        self.assertTrue(handler.payload["receive_only"])
+        self.assertEqual(handler.payload["message"], "manual trade request received; live action disabled")
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.post_futures_order")
