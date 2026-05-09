@@ -25448,6 +25448,9 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
     .server-cell span { color:var(--muted); font-size:12px; line-height:1.35; }
     .source-badge { display:inline-flex; align-items:center; width:max-content; max-width:100%; border:1px solid #9ed8d0; border-radius:999px; padding:2px 8px; background:#e6f6f4; color:#0b4f49; font-size:12px; font-weight:900; }
     .source-host { color:#475467; font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; font-size:11px; }
+    .source-metrics { display:grid; gap:8px; min-width:150px; }
+    .source-metric { display:grid; gap:2px; align-content:start; min-height:86px; }
+    .source-value { font-weight:800; font-variant-numeric:tabular-nums; }
     .drawer { position:sticky; top:14px; display:grid; gap:12px; }
     .drawer-head { display:flex; justify-content:space-between; gap:10px; align-items:flex-start; }
     .drawer h2 { margin:0; font-size:20px; }
@@ -25594,6 +25597,9 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
       const host = serverHost(cell);
       return `<div class="server-cell">${serverSourceBadge(cell)}<strong>${esc(cell.server_label || cell.server_id || "--")} ${badge(status)}</strong><span class="source-host">${esc([cell.server_id, host].filter(Boolean).join(" · "))}</span><span>${esc(cell.strategy_name || cell.strategy_profile || "--")}</span><span>${esc(cell.position_summary || "--")}</span><span>挂单 ${esc(cell.open_order_count ?? "--")} · PnL ${esc(signed(cell.total_pnl))}</span></div>`;
     }
+    function sourceMetricHtml(cells, valueFn) {
+      return `<div class="source-metrics">${(cells || []).map((cell) => `<div class="source-metric">${serverSourceBadge(cell)}<span class="source-value">${esc(valueFn(cell))}</span></div>`).join("")}</div>`;
+    }
     function renderSummary(payload) {
       const summary = payload.summary || {};
       const cards = [["币种数", (payload.symbols || []).length],["服务器", summary.server_count ?? "--"],["运行中", summary.running_symbol_count ?? "--"],["总成交量", num(summary.total_volume)],["总盈亏", signed(summary.total_pnl)]];
@@ -25607,7 +25613,10 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
       serverErrorsEl.style.display = errors.length ? "block" : "none";
       serverErrorsEl.innerHTML = errors.length ? `<strong>服务器连接异常</strong><br>${errors.map((item) => `${esc(item.server_label || item.server_id || item.server_base_url || "--")}: ${esc(item.error || "--")}`).join("<br>")}` : "";
       if (!groups.length) { bodyEl.innerHTML = '<tr><td colspan="7"><div class="empty">暂无策略运行数据。</div></td></tr>'; return; }
-      bodyEl.innerHTML = groups.map((group) => `<tr data-symbol="${esc(group.symbol)}" class="${state.selectedSymbol===group.symbol?"selected":""}"><td><div class="symbol">${esc(group.symbol)}</div></td><td>${badge(group.status)}</td><td>${(group.servers || []).map(cellHtml).join("")}</td><td>${esc(num((group.totals||{}).total_volume))}</td><td>${esc(num((group.totals||{}).recent_hour_volume))}</td><td>${esc(signed((group.totals||{}).total_pnl))}</td><td>${esc(((group.servers||[])[0]||{}).position_summary || "--")}</td></tr>`).join("");
+      bodyEl.innerHTML = groups.map((group) => {
+        const cells = group.servers || [];
+        return `<tr data-symbol="${esc(group.symbol)}" class="${state.selectedSymbol===group.symbol?"selected":""}"><td><div class="symbol">${esc(group.symbol)}</div></td><td>${badge(group.status)}</td><td>${cells.map(cellHtml).join("")}</td><td>${sourceMetricHtml(cells, (cell) => num(cell.total_volume))}</td><td>${sourceMetricHtml(cells, (cell) => num(cell.recent_hour_volume))}</td><td>${sourceMetricHtml(cells, (cell) => signed(cell.total_pnl))}</td><td>${sourceMetricHtml(cells, (cell) => cell.position_summary || "--")}</td></tr>`;
+      }).join("");
       bodyEl.querySelectorAll("tr[data-symbol]").forEach((row) => row.addEventListener("click", () => selectSymbol(row.getAttribute("data-symbol"))));
     }
     function selectSymbol(symbol) {
