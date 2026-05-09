@@ -10934,6 +10934,45 @@ def _manual_trade_refresh_book_limit_task(
 def _manual_trade_snapshot(symbol: str, market_type: str = "futures") -> dict[str, Any]:
     normalized_market = _manual_trade_market_type(market_type)
     normalized_symbol = str(symbol or "BTCUSDT").upper().strip() or "BTCUSDT"
+    if MANUAL_TRADE_RECEIVE_ONLY:
+        prefix = _manual_trade_client_order_prefix(normalized_symbol, normalized_market)
+        runner = (
+            _read_spot_runner_process_for_symbol(normalized_symbol)
+            if normalized_market == "spot"
+            else _read_runner_process_for_symbol(normalized_symbol)
+        )
+        snapshot = {
+            "market_type": normalized_market,
+            "symbol": normalized_symbol,
+            "bid_price": 0.0,
+            "ask_price": 0.0,
+            "position": {},
+            "position_amt": 0.0,
+            "entry_price": 0.0,
+            "break_even_price": 0.0,
+            "isolated": None,
+            "dual_side_position": False,
+            "one_way_position": True,
+            "open_order_count": 0,
+            "manual_open_order_count": 0,
+            "manual_prefix": prefix,
+            "runner": runner,
+            "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol, normalized_market)),
+            "history": _manual_trade_public_history_for_symbol(normalized_symbol, normalized_market),
+            "receive_only": True,
+        }
+        if normalized_market == "spot":
+            snapshot.update(
+                {
+                    "base_asset": normalized_symbol[:-4] if normalized_symbol.endswith("USDT") else "",
+                    "quote_asset": "USDT" if normalized_symbol.endswith("USDT") else "",
+                    "base_free": 0.0,
+                    "base_locked": 0.0,
+                    "quote_free": 0.0,
+                    "quote_locked": 0.0,
+                }
+            )
+        return snapshot
     creds = load_binance_api_credentials()
     if creds is None:
         raise RuntimeError("Binance API credentials are not configured")

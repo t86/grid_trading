@@ -24,6 +24,7 @@ from grid_optimizer.web import (
     _manual_trade_refresh_book_limit_task,
     _manual_trade_maker_worker,
     _manual_trade_place_book_limit,
+    _manual_trade_snapshot,
     MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS,
     MANUAL_TRADE_SLEEP_SECONDS,
     _manual_trade_set_task,
@@ -323,6 +324,40 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(handler.status, 200)
         self.assertTrue(handler.payload["receive_only"])
         self.assertEqual(handler.payload["message"], "manual trade request received; live action disabled")
+
+    @patch("grid_optimizer.web.MANUAL_TRADE_RECEIVE_ONLY", True)
+    @patch("grid_optimizer.web.fetch_futures_open_orders")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.web._manual_trade_book_prices")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_receive_only_snapshot_is_local_and_fast(
+        self,
+        mock_credentials,
+        mock_book_prices,
+        mock_account_info,
+        mock_position_mode,
+        mock_open_orders,
+    ) -> None:
+        _manual_trade_set_task(
+            "BARDUSDT",
+            {"market_type": "futures", "status": "received", "message": "book limit request received"},
+        )
+
+        snapshot = _manual_trade_snapshot("BARDUSDT", "futures")
+
+        mock_credentials.assert_not_called()
+        mock_book_prices.assert_not_called()
+        mock_account_info.assert_not_called()
+        mock_position_mode.assert_not_called()
+        mock_open_orders.assert_not_called()
+        self.assertTrue(snapshot["receive_only"])
+        self.assertEqual(snapshot["symbol"], "BARDUSDT")
+        self.assertEqual(snapshot["bid_price"], 0.0)
+        self.assertEqual(snapshot["ask_price"], 0.0)
+        self.assertEqual(snapshot["open_order_count"], 0)
+        self.assertEqual(snapshot["manual_open_order_count"], 0)
+        self.assertEqual(snapshot["task"]["status"], "received")
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.post_futures_order")
