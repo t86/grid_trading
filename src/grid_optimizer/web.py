@@ -17617,6 +17617,9 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     .section-head h2 { margin-bottom:0; }
     .filters { display:flex; flex-wrap:wrap; gap:10px; align-items:end; }
     .filters label { min-width:132px; }
+    .bulk-actions { display:flex; flex-wrap:wrap; gap:10px; align-items:center; margin-bottom:8px; }
+    .bulk-actions .meta { margin-left:auto; }
+    .history-select-col { width:38px; }
     button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
     button.buy { background:var(--good); border-color:var(--good); color:#fff; }
     button.sell { background:var(--bad); border-color:var(--bad); color:#fff; }
@@ -17749,10 +17752,14 @@ MANUAL_TRADE_PAGE = """<!doctype html>
           </label>
         </div>
       </div>
+      <div class="bulk-actions">
+        <button id="history_delete_selected_btn" class="danger" disabled>删除选中</button>
+        <span id="history_selection_meta" class="meta">未选择</span>
+      </div>
       <div class="table-wrap">
         <table>
-          <thead><tr><th>时间</th><th>类型</th><th>方向</th><th>目标</th><th>预计挂单</th><th>成交额</th><th>成交均价</th><th>最后价格</th><th>成交数量</th><th>尝试次数</th><th>操作</th></tr></thead>
-          <tbody id="history_body"><tr><td colspan="11">暂无成交历史</td></tr></tbody>
+          <thead><tr><th class="history-select-col"><input id="history_select_all" type="checkbox" aria-label="全选当前筛选成交历史" /></th><th>时间</th><th>类型</th><th>方向</th><th>目标</th><th>预计挂单</th><th>成交额</th><th>成交均价</th><th>最后价格</th><th>成交数量</th><th>尝试次数</th><th>操作</th></tr></thead>
+          <tbody id="history_body"><tr><td colspan="12">暂无成交历史</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -17770,10 +17777,14 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     const historyTypeFilterEl = document.getElementById("history_type_filter");
     const historySideFilterEl = document.getElementById("history_side_filter");
     const historyRoleFilterEl = document.getElementById("history_role_filter");
+    const historySelectAllEl = document.getElementById("history_select_all");
+    const historyDeleteSelectedBtn = document.getElementById("history_delete_selected_btn");
+    const historySelectionMetaEl = document.getElementById("history_selection_meta");
     const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["BILLUSDT", "CHIPUSDT"];
     let activeMarketType = "futures";
     let symbols = [];
     let currentHistory = [];
+    let selectedHistoryIds = new Set();
     let refreshTimer = null;
     let refreshInFlight = false;
     let refreshAbortController = null;
@@ -17953,15 +17964,30 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       if (selectedRole && !historyItemRoles(item).has(selectedRole)) return false;
       return true;
     }
+    function visibleHistoryRows() {
+      return currentHistory.filter(historyItemMatchesFilters).reverse();
+    }
+    function syncHistorySelectionControls(rows = visibleHistoryRows()) {
+      const visibleIds = rows.map((item) => String(item.id || "")).filter(Boolean);
+      selectedHistoryIds = new Set([...selectedHistoryIds].filter((id) => visibleIds.includes(id)));
+      const selectedVisibleCount = visibleIds.filter((id) => selectedHistoryIds.has(id)).length;
+      historySelectAllEl.checked = visibleIds.length > 0 && selectedVisibleCount === visibleIds.length;
+      historySelectAllEl.indeterminate = selectedVisibleCount > 0 && selectedVisibleCount < visibleIds.length;
+      historySelectAllEl.disabled = visibleIds.length === 0;
+      historyDeleteSelectedBtn.disabled = selectedVisibleCount === 0;
+      historySelectionMetaEl.textContent = selectedVisibleCount > 0 ? `已选择 ${selectedVisibleCount} 条` : "未选择";
+    }
     function renderHistory(history) {
       const body = document.getElementById("history_body");
       currentHistory = Array.isArray(history) ? [...history] : [];
-      const rows = currentHistory.filter(historyItemMatchesFilters).reverse();
+      const rows = visibleHistoryRows();
+      syncHistorySelectionControls(rows);
       if (!rows.length) {
-        body.innerHTML = '<tr><td colspan="11">暂无成交历史</td></tr>';
+        body.innerHTML = '<tr><td colspan="12">暂无成交历史</td></tr>';
         return;
       }
       body.innerHTML = rows.map((item) => `<tr>
+        <td><input class="history-select-checkbox" type="checkbox" data-history-id="${escapeHtml(item.id || "")}" ${selectedHistoryIds.has(String(item.id || "")) ? "checked" : ""} aria-label="选择成交历史记录" /></td>
         <td>${escapeHtml(fmtTime(item.completed_at))}</td>
         <td>${escapeHtml((item.source || "--").toUpperCase())}</td>
         <td>${escapeHtml(item.side || "--")}</td>
@@ -17976,6 +18002,15 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       </tr>`).join("");
       body.querySelectorAll(".history-delete-btn").forEach((button) => {
         button.addEventListener("click", () => deleteHistory(String(button.dataset.historyId || "")).catch((err) => actionMetaEl.textContent = err.message));
+      });
+      body.querySelectorAll(".history-select-checkbox").forEach((checkbox) => {
+        checkbox.addEventListener("change", () => {
+          const recordId = String(checkbox.dataset.historyId || "");
+          if (!recordId) return;
+          if (checkbox.checked) selectedHistoryIds.add(recordId);
+          else selectedHistoryIds.delete(recordId);
+          syncHistorySelectionControls(rows);
+        });
       });
     }
     async function refreshStatus({ force = false } = {}) {
@@ -18049,6 +18084,24 @@ MANUAL_TRADE_PAGE = """<!doctype html>
       if (data.snapshot) renderSnapshot(data.snapshot);
       else await refreshStatus({ force: true });
     }
+    async function deleteSelectedHistory() {
+      const recordIds = [...selectedHistoryIds];
+      if (!recordIds.length) return;
+      if (!window.confirm(`确认删除选中的 ${recordIds.length} 条成交历史记录？`)) return;
+      actionMetaEl.textContent = `删除选中成交历史中... 0/${recordIds.length}`;
+      historyDeleteSelectedBtn.disabled = true;
+      for (const [index, recordId] of recordIds.entries()) {
+        await fetchJsonWithTimeout("/api/manual_trade/history/delete", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: symbolEl.value, market_type: activeMarketType, id: recordId }),
+        }, 5000);
+        actionMetaEl.textContent = `删除选中成交历史中... ${index + 1}/${recordIds.length}`;
+      }
+      selectedHistoryIds.clear();
+      actionMetaEl.textContent = `已删除 ${recordIds.length} 条成交历史。`;
+      await refreshStatus({ force: true });
+    }
     document.getElementById("refresh_btn").addEventListener("click", () => refreshStatus().catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("maker_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/maker", "SELL").catch((err) => actionMetaEl.textContent = err.message));
@@ -18057,6 +18110,17 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     document.getElementById("take_buy_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "BUY").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("take_sell_btn").addEventListener("click", () => submitAction("/api/manual_trade/take", "SELL").catch((err) => actionMetaEl.textContent = err.message));
     document.getElementById("cancel_btn").addEventListener("click", () => cancelTask().catch((err) => actionMetaEl.textContent = err.message));
+    historySelectAllEl.addEventListener("change", () => {
+      const rows = visibleHistoryRows();
+      rows.forEach((item) => {
+        const recordId = String(item.id || "");
+        if (!recordId) return;
+        if (historySelectAllEl.checked) selectedHistoryIds.add(recordId);
+        else selectedHistoryIds.delete(recordId);
+      });
+      renderHistory(currentHistory);
+    });
+    historyDeleteSelectedBtn.addEventListener("click", () => deleteSelectedHistory().catch((err) => actionMetaEl.textContent = err.message));
     [historyTypeFilterEl, historySideFilterEl, historyRoleFilterEl].forEach((filterEl) => {
       filterEl.addEventListener("change", () => renderHistory(currentHistory));
     });
