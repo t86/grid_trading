@@ -10346,6 +10346,7 @@ MANUAL_TRADE_HISTORY_LOCK = threading.Lock()
 MANUAL_TRADE_SLEEP_SECONDS = _env_float("GRID_MANUAL_TRADE_SLEEP_SECONDS", 1.0)
 MANUAL_TRADE_MIN_REPRICE_SECONDS = _env_float("GRID_MANUAL_TRADE_MIN_REPRICE_SECONDS", 1.0)
 MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS = _env_float("GRID_MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS", 12.0, minimum=3.0)
+MANUAL_TRADE_RECEIVE_ONLY = _env_flag_enabled("GRID_MANUAL_TRADE_RECEIVE_ONLY", default=False)
 
 
 def _manual_trade_market_type(value: Any = "futures") -> str:
@@ -11174,6 +11175,49 @@ def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
         safe_notional = float(payload.get("notional", 0) or 0)
         if safe_notional <= 0:
             raise ValueError("notional must be > 0")
+        if MANUAL_TRADE_RECEIVE_ONLY:
+            limit_order = {
+                "side": normalized_side,
+                "quantity": 0.0,
+                "price": 0.0,
+                "notional": safe_notional,
+                "time_in_force": "RECEIVE_ONLY",
+                "client_order_id": "",
+            }
+            _manual_trade_initialize_task(
+                normalized_symbol,
+                {
+                    "id": f"receive-only-{int(time.time() * 1000)}",
+                    "source": "book_limit",
+                    "market_type": market_type,
+                    "status": "received",
+                    "side": normalized_side,
+                    "notional": safe_notional,
+                    "quantity": 0.0,
+                    "limit_order": limit_order,
+                    "order_id": None,
+                    "client_order_id": "",
+                    "current_order": {},
+                    "executed_qty": 0.0,
+                    "remaining_qty": 0.0,
+                    "avg_fill_price": 0.0,
+                    "last_fill_price": 0.0,
+                    "attempts": 0,
+                    "message": "book limit request received; live order disabled",
+                    "history_recorded": False,
+                },
+                market_type,
+            )
+            record_stage("post_order")
+            emit_log("received")
+            return {
+                "symbol": normalized_symbol,
+                "market_type": market_type,
+                "receive_only": True,
+                "limit_order": limit_order,
+                "order": {"status": "RECEIVED"},
+                "task": _manual_trade_public_task(_manual_trade_current_task(normalized_symbol, market_type)),
+            }
         creds = load_binance_api_credentials()
         if creds is None:
             raise RuntimeError("Binance API credentials are not configured")
@@ -18184,14 +18228,16 @@ MANUAL_TRADE_PAGE = """<!doctype html>
         actionMetaEl.textContent = "Take 市价单已提交。";
       } else if (endpoint.includes("book_limit")) {
         const order = data.limit_order || {};
-        actionMetaEl.textContent = `静态挂盘已提交：${side} ${fmt(order.quantity, 8)} @ ${fmt(order.price, 8)}`;
+        actionMetaEl.textContent = data.receive_only
+          ? `静态挂盘请求已收到（安全验证模式，未发真实委托）：${side}`
+          : `静态挂盘已提交：${side} ${fmt(order.quantity, 8)} @ ${fmt(order.price, 8)}`;
       } else {
         actionMetaEl.textContent = "Maker 追盘任务已启动。";
       }
       if (data.snapshot) renderSnapshot(data.snapshot);
       if (data.task) renderTask(data.task);
       if (endpoint.includes("take") || endpoint.includes("book_limit")) {
-        await refreshStatus({ force: true });
+        setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500);
       } else {
         setTimeout(() => refreshStatus({ force: true }).catch(() => {}), 500);
       }

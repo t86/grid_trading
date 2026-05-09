@@ -265,6 +265,30 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("stage_post_order=", log_line)
         self.assertIn("stage_snapshot=", log_line)
 
+    @patch("grid_optimizer.web.MANUAL_TRADE_RECEIVE_ONLY", True)
+    @patch("grid_optimizer.web.print")
+    @patch("grid_optimizer.web.post_futures_order")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_book_limit_receive_only_records_without_live_order(
+        self,
+        mock_credentials,
+        mock_position_mode,
+        mock_post_order,
+        mock_print,
+    ) -> None:
+        result = _manual_trade_place_book_limit({"symbol": "BARDUSDT", "side": "BUY", "notional": 80.0})
+
+        mock_credentials.assert_not_called()
+        mock_position_mode.assert_not_called()
+        mock_post_order.assert_not_called()
+        self.assertEqual(result["order"]["status"], "RECEIVED")
+        self.assertTrue(result["receive_only"])
+        task = _manual_trade_current_task("BARDUSDT")
+        self.assertEqual(task["status"], "received")
+        self.assertEqual(task["message"], "book limit request received; live order disabled")
+        self.assertIn("status=received", mock_print.call_args.args[0])
+
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.post_futures_order")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
