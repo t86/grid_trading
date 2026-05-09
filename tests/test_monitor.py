@@ -17,6 +17,7 @@ from grid_optimizer.monitor import (
     _count_monitor_audit_lines,
     _filter_events_since,
     _filter_rows_since,
+    _load_or_fetch_trade_rows,
     _extract_futures_asset_snapshot,
     _read_event_window,
     _read_runner_process,
@@ -101,6 +102,50 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(summary["commission"], 0.75, places=8)
         self.assertAlmostEqual(summary["commission_raw_by_asset"]["BNB"], 0.001, places=8)
         self.assertAlmostEqual(summary["recent_trades"][0]["commission_usdt"], 0.75, places=8)
+
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_trade_rows_merges_audit_and_api_manual_trades(self, mock_fetch_time_paged) -> None:
+        session_start = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
+        audit_trade = {
+            "id": 10,
+            "symbol": "CHIPUSDT",
+            "time": int((session_start + timedelta(minutes=5)).timestamp() * 1000),
+            "side": "BUY",
+            "price": "1.00",
+            "qty": "3",
+        }
+        manual_trade = {
+            "id": 11,
+            "symbol": "CHIPUSDT",
+            "time": int((session_start + timedelta(minutes=20)).timestamp() * 1000),
+            "side": "SELL",
+            "price": "1.10",
+            "qty": "2",
+            "realizedPnl": "0.2",
+        }
+        duplicate_audit_trade = dict(audit_trade)
+        duplicate_audit_trade["price"] = "999"
+        mock_fetch_time_paged.return_value = [manual_trade, duplicate_audit_trade]
+
+        with TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "chipusdt_loop_trade_audit.jsonl"
+            audit_path.write_text(json.dumps(audit_trade) + "\n", encoding="utf-8")
+
+            rows, meta = _load_or_fetch_trade_rows(
+                audit_path=audit_path,
+                symbol="CHIPUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=session_start,
+            )
+
+        self.assertEqual([item["id"] for item in rows], [10, 11])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 1)
+        self.assertEqual(meta["api_row_count"], 2)
+        self.assertEqual(meta["merged_row_count"], 2)
+        self.assertEqual(meta["deduped_row_count"], 1)
+        self.assertAlmostEqual(summarize_user_trades(rows)["gross_notional"], 5.2, places=8)
 
     def test_summarize_hourly_metrics_combines_trades_income_and_candles(self) -> None:
         hour0 = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
@@ -361,6 +406,70 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(bnb["available_balance"], 0.31, places=8)
 
         self.assertIsNone(_extract_futures_asset_snapshot(account_info, "ETH"))
+
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch(
+        "grid_optimizer.monitor._load_or_fetch_trade_rows",
+        return_value=(
+            [
+                {"id": 1, "time": 1778222400000, "side": "BUY", "price": "0.05", "qty": "100", "realizedPnl": "0", "commission": "0.01"},
+                {"id": 2, "time": 1778222460000, "side": "SELL", "price": "0.06", "qty": "50", "realizedPnl": "0.5", "commission": "0.01"},
+            ],
+            {"source": "audit+api", "row_count": 2},
+        ),
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [{"symbol": "CHIPUSDT", "positionAmt": "0", "entryPrice": "0", "breakEvenPrice": "0", "unRealizedProfit": "0"}],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "0.05"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "0.05", "ask_price": "0.051"}])
+    def test_build_monitor_snapshot_uses_merged_trade_volume_for_risk_cumulative(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_competition,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "chipusdt_loop_events.jsonl"
+            plan_path = root / "chipusdt_loop_latest_plan.json"
+            submit_path = root / "chipusdt_loop_latest_submit.json"
+            events_path.write_text(
+                json.dumps({"ts": "2026-05-08T06:00:00+00:00", "cycle": 1, "cumulative_gross_notional": 1.0}) + "\n",
+                encoding="utf-8",
+            )
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="CHIPUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={"configured": True, "is_running": False, "config": {"symbol": "CHIPUSDT"}},
+            )
+
+        self.assertAlmostEqual(snapshot["trade_summary"]["gross_notional"], 8.0, places=8)
+        self.assertAlmostEqual(snapshot["risk_controls"]["cumulative_gross_notional"], 8.0, places=8)
+        self.assertEqual(snapshot["audit"]["trade_source"]["source"], "audit+api")
 
     @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
     @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))

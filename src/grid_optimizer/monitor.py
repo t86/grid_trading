@@ -499,33 +499,61 @@ def _load_or_fetch_trade_rows(
         limit=0,
         predicate=lambda item: int(trade_row_time_ms(item) or 0) >= floor_ms,
     )
-    if audit_rows:
+
+    start_time_ms = int(effective_start.timestamp() * 1000)
+    end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    try:
+        api_rows = fetch_time_paged(
+            fetch_page=lambda **params: fetch_futures_user_trades(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                **params,
+            ),
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=1000,
+            row_time_ms=trade_row_time_ms,
+            row_key=trade_row_key,
+        )
+    except Exception:
+        if not audit_rows:
+            raise
         return audit_rows, {
             "source": "audit",
             "path": str(audit_path),
             "row_count": len(audit_rows),
             "start_time": effective_start.isoformat(),
+            "api_error": "fetch_failed",
         }
 
-    start_time_ms = int(effective_start.timestamp() * 1000)
-    end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    rows = fetch_time_paged(
-        fetch_page=lambda **params: fetch_futures_user_trades(
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            **params,
-        ),
-        start_time_ms=start_time_ms,
-        end_time_ms=end_time_ms,
-        limit=1000,
-        row_time_ms=trade_row_time_ms,
-        row_key=trade_row_key,
-    )
-    return rows, {
-        "source": "api",
-        "path": None,
-        "row_count": len(rows),
+    if not audit_rows:
+        return api_rows, {
+            "source": "api",
+            "path": None,
+            "row_count": len(api_rows),
+            "start_time": effective_start.isoformat(),
+        }
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    duplicate_count = 0
+    for row in [*audit_rows, *api_rows]:
+        key = (int(trade_row_time_ms(row) or 0), trade_row_key(row))
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+        merged.append(row)
+    merged.sort(key=lambda item: (int(trade_row_time_ms(item) or 0), trade_row_key(item)))
+    return merged, {
+        "source": "audit+api",
+        "path": str(audit_path),
+        "row_count": len(merged),
+        "audit_row_count": len(audit_rows),
+        "api_row_count": len(api_rows),
+        "merged_row_count": len(merged),
+        "deduped_row_count": duplicate_count,
         "start_time": effective_start.isoformat(),
     }
 
@@ -2655,7 +2683,11 @@ def _build_monitor_snapshot_uncached(
         "runtime_guard_stats_start_time": latest_loop.get("runtime_guard_stats_start_time"),
         "rolling_hourly_loss": _safe_float(latest_loop.get("rolling_hourly_loss")),
         "rolling_hourly_loss_limit": _safe_float(runner_config.get("rolling_hourly_loss_limit")),
-        "cumulative_gross_notional": _safe_float(latest_loop.get("cumulative_gross_notional")),
+        "cumulative_gross_notional": _safe_float(
+            (snapshot.get("trade_summary") or {}).get("gross_notional")
+            if isinstance(snapshot.get("trade_summary"), dict)
+            else latest_loop.get("cumulative_gross_notional")
+        ),
         "max_cumulative_notional": _safe_float(runner_config.get("max_cumulative_notional")),
         "custom_grid_runtime_min_price": custom_grid_runtime_min_price,
         "custom_grid_runtime_max_price": custom_grid_runtime_max_price,
