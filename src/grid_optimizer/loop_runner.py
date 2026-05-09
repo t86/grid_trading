@@ -11607,6 +11607,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def _mark_submit_report_blocked(report: dict[str, Any], *, reason: str = "validation_failed") -> dict[str, Any]:
+    validation = report.get("validation") or {}
+    actions = validation.get("actions") or {}
+    report["blocked"] = True
+    report["idle"] = (
+        _safe_float(actions.get("place_count")) <= 0
+        and _safe_float(actions.get("cancel_count")) <= 0
+    )
+    report["error"] = {
+        "reason": reason,
+        "errors": list(validation.get("errors") or []),
+    }
+    return report
+
+
 def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
     strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
     effective_max_total_notional = _safe_float(plan_report.get("effective_max_total_notional"))
@@ -11720,7 +11735,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         return report
 
     if not validation["ok"]:
-        raise RuntimeError("Refusing to place orders because validation failed")
+        return _mark_submit_report_blocked(report)
 
     credentials = load_binance_api_credentials()
     if credentials is None:
@@ -11831,7 +11846,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         report["idle"] = True
         return report
     if not validation["ok"]:
-        raise RuntimeError("Refusing to place orders because validation failed")
+        return _mark_submit_report_blocked(report)
 
     if requested_margin_type != "KEEP":
         try:

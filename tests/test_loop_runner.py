@@ -6037,6 +6037,111 @@ class LoopRunnerTests(unittest.TestCase):
         mock_update_synthetic_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 
+    @patch("grid_optimizer.loop_runner.enforce_execution_action_limits")
+    @patch("grid_optimizer.loop_runner.apply_anti_chase_entry_guard_to_actions")
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_returns_blocked_report_after_runtime_guard_filters_actions(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_update_inventory_grid_refs,
+        mock_update_synthetic_refs,
+        mock_anti_chase,
+        mock_enforce_limits,
+    ) -> None:
+        initial_actions = {
+            "place_count": 1,
+            "cancel_count": 0,
+            "cancel_orders": [],
+            "place_orders": [{"role": "entry_short", "side": "SELL", "qty": 100.0, "price": 0.067}],
+        }
+        filtered_actions = {
+            "place_count": 1,
+            "cancel_count": 0,
+            "cancel_orders": [],
+            "place_orders": [{"role": "entry_short", "side": "SELL", "qty": 100.0, "price": 0.067}],
+            "anti_chase_entry_guard": {
+                "enabled": True,
+                "block_short_entries": True,
+                "dropped_order_count": 0,
+            },
+        }
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": initial_actions,
+        }
+        mock_anti_chase.return_value = filtered_actions
+        mock_enforce_limits.return_value = {
+            "ok": False,
+            "errors": ["max total notional exceeded"],
+            "actions": filtered_actions,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.0669", "ask_price": "0.0670"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "CHIPUSDT", "positionAmt": "-73", "entryPrice": "0.0680"}],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 3}
+
+        args = Namespace(
+            symbol="CHIPUSDT",
+            strategy_mode="synthetic_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/chipusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=3,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/chipusdt_loop_state.json",
+        )
+        plan_report = {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "mid_price": 0.0670,
+            "step_price": 0.00013,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 73.0,
+            "actual_net_qty": -73.0,
+            "symbol_info": {
+                "tick_size": 0.00001,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertFalse(report["executed"])
+        self.assertTrue(report["blocked"])
+        self.assertFalse(report["idle"])
+        self.assertEqual(report["error"]["reason"], "validation_failed")
+        self.assertEqual(report["validation"]["errors"], ["max total notional exceeded"])
+        mock_update_synthetic_refs.assert_not_called()
+        mock_update_inventory_grid_refs.assert_not_called()
+
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
     @patch("grid_optimizer.loop_runner.post_futures_order")
