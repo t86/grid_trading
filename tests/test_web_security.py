@@ -1884,6 +1884,27 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["adverse_reduce_enabled"])
         self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
 
+    def test_runner_preset_payload_applies_btcusdc_best_quote_maker_volume_profile(self) -> None:
+        payload = _runner_preset_payload("btcusdc_best_quote_maker_volume_v1", {"symbol": "BTCUSDC"})
+        self.assertEqual(payload["strategy_profile"], "btcusdc_best_quote_maker_volume_v1")
+        self.assertEqual(payload["symbol"], "BTCUSDC")
+        self.assertEqual(payload["strategy_mode"], "best_quote_maker_volume_v1")
+        self.assertTrue(payload["best_quote_maker_volume_enabled"])
+        self.assertAlmostEqual(payload["best_quote_maker_volume_cycle_budget_notional"], 400.0)
+        self.assertEqual(payload["best_quote_maker_volume_quote_offset_ticks"], 0)
+        self.assertEqual(payload["best_quote_maker_volume_defensive_offset_ticks"], 3)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_max_long_notional"], 1200.0)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_max_short_notional"], 1200.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 1600.0)
+        self.assertEqual(payload["max_new_orders"], 6)
+        self.assertAlmostEqual(payload["sleep_seconds"], 1.4)
+        self.assertFalse(payload["volatility_trigger_enabled"])
+        self.assertFalse(payload["volume_trigger_enabled"])
+
+    def test_runner_preset_payload_rejects_btcusdc_best_quote_maker_volume_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
+            _runner_preset_payload("btcusdc_best_quote_maker_volume_v1", {"symbol": "ETHUSDC"})
+
     def test_runner_preset_payload_rejects_btcusdc_best_quote_long_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
             _runner_preset_payload("btcusdc_best_quote_long_ping_pong_v1", {"symbol": "ETHUSDC"})
@@ -2474,6 +2495,34 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["maker_directional_move_threshold"], 0.005)
         self.assertEqual(payload["maker_cooldown_seconds"], 45.0)
 
+    def test_normalize_runner_control_payload_keeps_best_quote_maker_volume_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "strategy_profile": "btcusdc_best_quote_maker_volume_v1",
+                "strategy_mode": "best_quote_maker_volume_v1",
+                "symbol": "BTCUSDC",
+                "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_cycle_budget_notional": "400",
+                "best_quote_maker_volume_quote_offset_ticks": "0",
+                "best_quote_maker_volume_defensive_offset_ticks": "3",
+                "best_quote_maker_volume_max_long_notional": "1500",
+                "best_quote_maker_volume_max_short_notional": "1500",
+                "best_quote_maker_volume_inventory_soft_ratio": "0.6",
+                "best_quote_maker_volume_loss_per_10k_15m": "0.2",
+                "best_quote_maker_volume_loss_per_10k_soft": "0.5",
+                "best_quote_maker_volume_loss_per_10k_hard": "0.8",
+                "best_quote_maker_volume_soft_loss_budget_scale": "0.5",
+            }
+        )
+
+        self.assertTrue(payload["best_quote_maker_volume_enabled"])
+        self.assertEqual(payload["best_quote_maker_volume_cycle_budget_notional"], 400.0)
+        self.assertEqual(payload["best_quote_maker_volume_quote_offset_ticks"], 0)
+        self.assertEqual(payload["best_quote_maker_volume_defensive_offset_ticks"], 3)
+        self.assertEqual(payload["best_quote_maker_volume_max_long_notional"], 1500.0)
+        self.assertEqual(payload["best_quote_maker_volume_max_short_notional"], 1500.0)
+        self.assertEqual(payload["best_quote_maker_volume_loss_per_10k_hard"], 0.8)
+
     def test_validate_runner_required_risk_guards_allows_maker_inventory_limits(self) -> None:
         _validate_runner_required_risk_guards(
             {
@@ -2548,6 +2597,55 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--maker-cooldown-seconds", command)
         self.assertIn("--anti-chase-entry-guard-enabled", command)
         self.assertIn("--anti-chase-entry-guard-1m-abs-return-ratio", command)
+
+    def test_build_runner_command_includes_best_quote_maker_volume_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BTCUSDC",
+                "strategy_profile": "btcusdc_best_quote_maker_volume_v1",
+                "strategy_mode": "best_quote_maker_volume_v1",
+                "step_price": 0.1,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 30.0,
+                "base_position_notional": 0.0,
+                "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_cycle_budget_notional": 400.0,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+                "best_quote_maker_volume_defensive_offset_ticks": 3,
+                "best_quote_maker_volume_max_long_notional": 1500.0,
+                "best_quote_maker_volume_max_short_notional": 1500.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.6,
+                "best_quote_maker_volume_loss_per_10k_15m": 0.2,
+                "best_quote_maker_volume_loss_per_10k_soft": 0.5,
+                "best_quote_maker_volume_loss_per_10k_hard": 0.8,
+                "best_quote_maker_volume_soft_loss_budget_scale": 0.5,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 4,
+                "max_total_notional": 700.0,
+                "sleep_seconds": 3,
+                "state_path": "output/btcusdc_loop_state.json",
+                "plan_json": "output/btcusdc_loop_latest_plan.json",
+                "submit_report_json": "output/btcusdc_loop_latest_submit.json",
+                "summary_jsonl": "output/btcusdc_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+
+        self.assertIn("--best-quote-maker-volume-enabled", command)
+        self.assertIn("--best-quote-maker-volume-cycle-budget-notional", command)
+        self.assertIn("400.0", command)
+        self.assertIn("--best-quote-maker-volume-quote-offset-ticks", command)
+        self.assertIn("--best-quote-maker-volume-defensive-offset-ticks", command)
+        self.assertIn("--best-quote-maker-volume-max-long-notional", command)
+        self.assertIn("--best-quote-maker-volume-max-short-notional", command)
+        self.assertIn("--best-quote-maker-volume-loss-per-10k-hard", command)
 
     def test_runner_preset_payload_for_maker_volatility_inventory_v1(self) -> None:
         payload = _runner_preset_payload("maker_volatility_inventory_v1", {"symbol": "BARDUSDT"})

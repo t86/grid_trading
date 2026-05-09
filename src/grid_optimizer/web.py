@@ -380,6 +380,51 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "max_total_notional": 700.0,
         },
     },
+    "btcusdc_best_quote_maker_volume_v1": {
+        "label": "BTCUSDC Best Quote Maker 冲量 v1",
+        "description": "BTCUSDC 专用单币种 maker 冲量策略。正常态贴 best bid/ask，库存或损耗触发后退档并只做减仓方向。",
+        "startable": True,
+        "kind": "maker",
+        "symbol": "BTCUSDC",
+        "config": {
+            "symbol": "BTCUSDC",
+            "strategy_mode": "best_quote_maker_volume_v1",
+            "step_price": 0.1,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "per_order_notional": 120.0,
+            "base_position_notional": 0.0,
+            "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_cycle_budget_notional": 400.0,
+            "best_quote_maker_volume_target_remaining_notional": 1_000_000.0,
+            "best_quote_maker_volume_quote_offset_ticks": 0,
+            "best_quote_maker_volume_defensive_offset_ticks": 3,
+            "best_quote_maker_volume_max_long_notional": 1_200.0,
+            "best_quote_maker_volume_max_short_notional": 1_200.0,
+            "best_quote_maker_volume_inventory_soft_ratio": 0.60,
+            "best_quote_maker_volume_loss_per_10k_15m": 0.0,
+            "best_quote_maker_volume_loss_per_10k_soft": 0.5,
+            "best_quote_maker_volume_loss_per_10k_hard": 0.8,
+            "best_quote_maker_volume_soft_loss_budget_scale": 0.50,
+            "best_quote_maker_volume_min_cycle_budget_notional": 20.0,
+            "flat_start_enabled": False,
+            "warm_start_enabled": True,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+            "volume_trigger_enabled": False,
+            "volume_trigger_stop_close_all_positions": False,
+            "volatility_trigger_enabled": False,
+            "volatility_trigger_stop_close_all_positions": False,
+            "adverse_reduce_enabled": False,
+            "hard_loss_forced_reduce_enabled": False,
+            "exposure_escalation_enabled": False,
+            "sleep_seconds": 1.4,
+            "leverage": 5,
+            "maker_retries": 2,
+            "max_new_orders": 6,
+            "max_total_notional": 1_600.0,
+        },
+    },
     "volume_long_v4": {
         "label": "量优先做多 v4",
         "description": "当前实盘主策略。偏多滚动微网格，保留成交量，带分钟熔断和库存分层。",
@@ -3284,6 +3329,7 @@ RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
         "btcusdc_competition_maker_neutral_aggressive_v1",
         "btcusdc_competition_neutral_ping_pong_v1",
         "btcusdc_best_quote_long_ping_pong_v1",
+        "btcusdc_best_quote_maker_volume_v1",
         "billusdt_competition_neutral_ping_pong_v1",
         "chipusdt_competition_neutral_ping_pong_v1",
         "ethusdc_competition_maker_neutral_v1",
@@ -8301,6 +8347,16 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volatility_trigger_blocked_reduce_relax_target_notional",
         "volatility_trigger_blocked_reduce_relax_max_loss_ratio",
         "sleep_seconds",
+        "best_quote_maker_volume_cycle_budget_notional",
+        "best_quote_maker_volume_target_remaining_notional",
+        "best_quote_maker_volume_max_long_notional",
+        "best_quote_maker_volume_max_short_notional",
+        "best_quote_maker_volume_inventory_soft_ratio",
+        "best_quote_maker_volume_loss_per_10k_15m",
+        "best_quote_maker_volume_loss_per_10k_soft",
+        "best_quote_maker_volume_loss_per_10k_hard",
+        "best_quote_maker_volume_soft_loss_budget_scale",
+        "best_quote_maker_volume_min_cycle_budget_notional",
     }
     int_fields = {
         "buy_levels",
@@ -8326,6 +8382,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "neutral_center_interval_minutes",
         "inventory_tier_buy_levels",
         "inventory_tier_sell_levels",
+        "best_quote_maker_volume_quote_offset_ticks",
+        "best_quote_maker_volume_defensive_offset_ticks",
     }
     bool_fields = {
         "cancel_stale",
@@ -8339,6 +8397,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_enabled",
         "take_profit_enabled",
         "adaptive_step_enabled",
+        "best_quote_maker_volume_enabled",
         "elastic_volume_enabled",
         "elastic_cancel_stale_entries_on_cooldown",
         "multi_timeframe_bias_enabled",
@@ -8840,6 +8899,14 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         soft_ratio = number("maker_inventory_soft_ratio")
         if soft_ratio is not None and soft_ratio > 1:
             errors.append("maker_inventory_soft_ratio 必须 <= 1")
+    elif strategy_mode == "best_quote_maker_volume_v1":
+        require_positive("best_quote_maker_volume_cycle_budget_notional")
+        require_positive("best_quote_maker_volume_max_long_notional")
+        require_positive("best_quote_maker_volume_max_short_notional")
+        require_positive("best_quote_maker_volume_inventory_soft_ratio")
+        soft_ratio = number("best_quote_maker_volume_inventory_soft_ratio")
+        if soft_ratio is not None and soft_ratio > 1:
+            errors.append("best_quote_maker_volume_inventory_soft_ratio 必须 <= 1")
     else:
         require_fast_entry_pause()
         require_anti_chase_entry_guard()
@@ -8946,6 +9013,33 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("maker_directional_move_threshold", 0.004)),
         "--maker-cooldown-seconds",
         str(config.get("maker_cooldown_seconds", 30.0)),
+        "--best-quote-maker-volume-enabled"
+        if config.get("best_quote_maker_volume_enabled", False)
+        else "--no-best-quote-maker-volume-enabled",
+        "--best-quote-maker-volume-cycle-budget-notional",
+        str(config.get("best_quote_maker_volume_cycle_budget_notional", 400.0)),
+        "--best-quote-maker-volume-target-remaining-notional",
+        str(config.get("best_quote_maker_volume_target_remaining_notional", 0.0)),
+        "--best-quote-maker-volume-quote-offset-ticks",
+        str(config.get("best_quote_maker_volume_quote_offset_ticks", 0)),
+        "--best-quote-maker-volume-defensive-offset-ticks",
+        str(config.get("best_quote_maker_volume_defensive_offset_ticks", 3)),
+        "--best-quote-maker-volume-max-long-notional",
+        str(config.get("best_quote_maker_volume_max_long_notional", 1_500.0)),
+        "--best-quote-maker-volume-max-short-notional",
+        str(config.get("best_quote_maker_volume_max_short_notional", 1_500.0)),
+        "--best-quote-maker-volume-inventory-soft-ratio",
+        str(config.get("best_quote_maker_volume_inventory_soft_ratio", 0.60)),
+        "--best-quote-maker-volume-loss-per-10k-15m",
+        str(config.get("best_quote_maker_volume_loss_per_10k_15m", 0.0)),
+        "--best-quote-maker-volume-loss-per-10k-soft",
+        str(config.get("best_quote_maker_volume_loss_per_10k_soft", 0.5)),
+        "--best-quote-maker-volume-loss-per-10k-hard",
+        str(config.get("best_quote_maker_volume_loss_per_10k_hard", 0.8)),
+        "--best-quote-maker-volume-soft-loss-budget-scale",
+        str(config.get("best_quote_maker_volume_soft_loss_budget_scale", 0.50)),
+        "--best-quote-maker-volume-min-cycle-budget-notional",
+        str(config.get("best_quote_maker_volume_min_cycle_budget_notional", 20.0)),
         "--margin-type",
         str(config.get("margin_type", "KEEP")),
         "--leverage",

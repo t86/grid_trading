@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+import unittest
+
+from grid_optimizer.best_quote_maker_volume import (
+    BestQuoteMakerVolumeConfig,
+    BestQuoteMakerVolumeInputs,
+    build_best_quote_maker_volume_plan,
+)
+
+
+def _inputs(**overrides):
+    data = {
+        "bid_price": 80400.0,
+        "ask_price": 80400.1,
+        "mid_price": 80400.05,
+        "current_net_qty": 0.0,
+        "cycle_budget_notional": 400.0,
+        "loss_per_10k_15m": 0.2,
+        "target_volume_remaining": 10_000.0,
+        "tick_size": 0.1,
+        "step_size": 0.001,
+        "min_qty": 0.001,
+        "min_notional": 5.0,
+    }
+    data.update(overrides)
+    return BestQuoteMakerVolumeInputs(**data)
+
+
+class BestQuoteMakerVolumeTests(unittest.TestCase):
+    def test_flat_inventory_quotes_both_sides_near_best_quote(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True),
+            inputs=_inputs(),
+        )
+
+        self.assertEqual(plan["regime"], "normal")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["price"], 80400.0)
+        self.assertEqual(plan["sell_orders"][0]["price"], 80400.1)
+        self.assertEqual(plan["buy_orders"][0]["execution_type"], "maker")
+        self.assertTrue(plan["buy_orders"][0]["post_only"])
+
+    def test_long_inventory_biases_toward_reduce_long(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True, max_long_notional=1_000.0),
+            inputs=_inputs(current_net_qty=0.009),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_recover")
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertEqual(plan["sell_orders"][0]["price"], 80400.4)
+        self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
+
+    def test_high_loss_switches_to_defensive_and_keeps_only_reduce_side(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True, loss_per_10k_hard=0.8),
+            inputs=_inputs(current_net_qty=-0.006, loss_per_10k_15m=0.95),
+        )
+
+        self.assertEqual(plan["regime"], "loss_defensive")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_soft_loss_widens_quotes_and_reduces_budget(self) -> None:
+        normal = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True),
+            inputs=_inputs(loss_per_10k_15m=0.2),
+        )
+        soft = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True, loss_per_10k_soft=0.5),
+            inputs=_inputs(loss_per_10k_15m=0.6),
+        )
+
+        self.assertEqual(soft["regime"], "loss_soft")
+        self.assertLess(soft["planned_notional"], normal["planned_notional"])
+        self.assertLess(soft["buy_orders"][0]["price"], normal["buy_orders"][0]["price"])
+        self.assertGreater(soft["sell_orders"][0]["price"], normal["sell_orders"][0]["price"])
+
+
+if __name__ == "__main__":
+    unittest.main()

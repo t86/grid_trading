@@ -33,6 +33,11 @@ from .audit import (
     write_json as _write_json,
 )
 from .backtest import build_grid_levels
+from .best_quote_maker_volume import (
+    BestQuoteMakerVolumeConfig,
+    BestQuoteMakerVolumeInputs,
+    build_best_quote_maker_volume_plan,
+)
 from .competition_elastic_volume import ElasticVolumeConfig, ElasticVolumeInputs, resolve_elastic_volume_control
 from .data import (
     FuturesMarketStream,
@@ -2297,6 +2302,10 @@ def _is_competition_inventory_grid_mode(strategy_mode: str) -> bool:
 
 def _is_maker_volatility_inventory_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "maker_volatility_inventory_v1"
+
+
+def _is_best_quote_maker_volume_mode(strategy_mode: str) -> bool:
+    return str(strategy_mode).strip() == "best_quote_maker_volume_v1"
 
 
 def _is_custom_grid_mode(args: argparse.Namespace) -> bool:
@@ -8566,6 +8575,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "inventory_target_neutral",
         "competition_inventory_grid",
         "maker_volatility_inventory_v1",
+        "best_quote_maker_volume_v1",
     }:
         raise RuntimeError(f"Unsupported strategy_mode: {requested_strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
@@ -8675,6 +8685,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "regime": "not_applicable",
         "blocked_reason": None,
         "reasons": [],
+    }
+    best_quote_maker_volume: dict[str, Any] = {
+        "enabled": bool(getattr(args, "best_quote_maker_volume_enabled", False)),
+        "regime": (
+            "disabled"
+            if not bool(getattr(args, "best_quote_maker_volume_enabled", False))
+            else "not_evaluated"
+        ),
+        "reasons": [],
+        "metrics": {},
     }
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
@@ -9027,6 +9047,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         _is_inventory_target_neutral_mode(requested_strategy_mode)
         or _is_competition_inventory_grid_mode(requested_strategy_mode)
         or _is_maker_volatility_inventory_mode(requested_strategy_mode)
+        or _is_best_quote_maker_volume_mode(requested_strategy_mode)
     ):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
@@ -9507,7 +9528,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if requested_strategy_mode == "synthetic_neutral" and strategy_mode != "synthetic_neutral":
             state["synthetic_ledger_resync_required"] = True
 
-    if _is_inventory_target_neutral_mode(strategy_mode) or _is_maker_volatility_inventory_mode(strategy_mode):
+    if (
+        _is_inventory_target_neutral_mode(strategy_mode)
+        or _is_maker_volatility_inventory_mode(strategy_mode)
+        or _is_best_quote_maker_volume_mode(strategy_mode)
+    ):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
     elif strategy_mode == "hedge_neutral":
@@ -10619,6 +10644,88 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         }
         target_base_qty = 0.0
         bootstrap_qty = 0.0
+    elif _is_best_quote_maker_volume_mode(strategy_mode):
+        if dual_side_position:
+            raise RuntimeError("best quote maker volume 策略要求账户处于单向持仓模式")
+        cycle_budget = _safe_float(getattr(effective_args, "best_quote_maker_volume_cycle_budget_notional", 0.0))
+        if cycle_budget <= 0:
+            cycle_budget = max(_safe_float(getattr(effective_args, "max_total_notional", 0.0)), 0.0)
+        target_remaining = max(_safe_float(getattr(effective_args, "best_quote_maker_volume_target_remaining_notional", 0.0)), 0.0)
+        if target_remaining <= 0:
+            target_remaining = max(_safe_float(getattr(effective_args, "max_total_notional", 0.0)), cycle_budget)
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
+                quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
+                defensive_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_defensive_offset_ticks", 3)),
+                max_long_notional=float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 1_500.0)),
+                max_short_notional=float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 1_500.0)),
+                inventory_soft_ratio=float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)),
+                loss_per_10k_soft=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_soft", 0.5)),
+                loss_per_10k_hard=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_hard", 0.8)),
+                soft_loss_budget_scale=float(getattr(effective_args, "best_quote_maker_volume_soft_loss_budget_scale", 0.50)),
+                min_cycle_budget_notional=float(getattr(effective_args, "best_quote_maker_volume_min_cycle_budget_notional", 20.0)),
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=bid_price,
+                ask_price=ask_price,
+                mid_price=mid_price,
+                current_net_qty=actual_net_qty,
+                cycle_budget_notional=cycle_budget,
+                loss_per_10k_15m=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_15m", 0.0)),
+                target_volume_remaining=target_remaining,
+                tick_size=symbol_info.get("tick_size"),
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+            ),
+        )
+        best_quote_maker_volume = {
+            "enabled": bool(plan.get("enabled")),
+            "regime": str(plan.get("regime") or ""),
+            "reasons": list(plan.get("reasons") or []),
+            "metrics": dict(plan.get("metrics") or {}),
+        }
+        inventory_tier = {
+            "enabled": False,
+            "active": False,
+            "ratio": 0.0,
+            "start_notional": None,
+            "end_notional": None,
+            "effective_buy_levels": len(plan.get("buy_orders", [])),
+            "effective_sell_levels": len(plan.get("sell_orders", [])),
+            "effective_per_order_notional": cycle_budget,
+            "effective_base_position_notional": 0.0,
+        }
+        controls = {
+            "buy_paused": not bool(plan.get("buy_orders")),
+            "pause_reasons": list(best_quote_maker_volume.get("reasons") or []),
+            "short_paused": not bool(plan.get("sell_orders")),
+            "short_pause_reasons": list(best_quote_maker_volume.get("reasons") or []),
+            "current_long_notional": current_long_notional,
+            "current_short_notional": current_short_notional,
+        }
+        cap_controls = {
+            "cap_applied": False,
+            "buy_cap_applied": False,
+            "short_cap_applied": False,
+            "buy_budget_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0))
+                - current_long_notional,
+                0.0,
+            ),
+            "short_budget_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0))
+                - current_short_notional,
+                0.0,
+            ),
+            "planned_buy_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("buy_orders", []))),
+            "planned_short_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("sell_orders", []))),
+            "max_position_notional": getattr(effective_args, "best_quote_maker_volume_max_long_notional", None),
+            "max_short_position_notional": getattr(effective_args, "best_quote_maker_volume_max_short_notional", None),
+        }
+        target_base_qty = 0.0
+        bootstrap_qty = 0.0
     elif _is_competition_inventory_grid_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("competition inventory grid 策略要求账户处于单向持仓模式")
@@ -11348,6 +11455,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
         "maker_volatility_inventory": maker_volatility_inventory,
+        "best_quote_maker_volume": best_quote_maker_volume,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
         "adverse_inventory_reduce": adverse_inventory_reduce,
@@ -11940,6 +12048,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "inventory_target_neutral",
             "competition_inventory_grid",
             "maker_volatility_inventory_v1",
+            "best_quote_maker_volume_v1",
         ),
     )
     parser.add_argument("--step-price", type=float, default=0.00002)
@@ -11959,6 +12068,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--maker-extreme-volatility-threshold", type=float, default=0.012)
     parser.add_argument("--maker-directional-move-threshold", type=float, default=0.004)
     parser.add_argument("--maker-cooldown-seconds", type=float, default=30.0)
+    parser.add_argument("--best-quote-maker-volume-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-cycle-budget-notional", type=float, default=400.0)
+    parser.add_argument("--best-quote-maker-volume-target-remaining-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-quote-offset-ticks", type=int, default=0)
+    parser.add_argument("--best-quote-maker-volume-defensive-offset-ticks", type=int, default=3)
+    parser.add_argument("--best-quote-maker-volume-max-long-notional", type=float, default=1_500.0)
+    parser.add_argument("--best-quote-maker-volume-max-short-notional", type=float, default=1_500.0)
+    parser.add_argument("--best-quote-maker-volume-inventory-soft-ratio", type=float, default=0.60)
+    parser.add_argument("--best-quote-maker-volume-loss-per-10k-15m", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-loss-per-10k-soft", type=float, default=0.5)
+    parser.add_argument("--best-quote-maker-volume-loss-per-10k-hard", type=float, default=0.8)
+    parser.add_argument("--best-quote-maker-volume-soft-loss-budget-scale", type=float, default=0.50)
+    parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
     parser.add_argument("--sticky-entry-levels", type=int, default=None)
     parser.add_argument("--synthetic-residual-long-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-residual-short-flat-notional", type=float, default=None)

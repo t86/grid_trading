@@ -9,6 +9,11 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from grid_optimizer.audit import build_audit_paths
+from grid_optimizer.best_quote_maker_volume import (
+    BestQuoteMakerVolumeConfig,
+    BestQuoteMakerVolumeInputs,
+    build_best_quote_maker_volume_plan,
+)
 from grid_optimizer.inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from grid_optimizer.loop_runner import (
     AUTO_REGIME_PROFILE_LABELS,
@@ -222,6 +227,29 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(plan["sell_orders"], [])
 
+    def test_best_quote_maker_volume_quotes_best_bid_ask(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=80400.0,
+                ask_price=80400.1,
+                mid_price=80400.05,
+                current_net_qty=0.0,
+                cycle_budget_notional=400.0,
+                loss_per_10k_15m=0.2,
+                target_volume_remaining=10_000.0,
+                tick_size=0.1,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=5.0,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "normal")
+        self.assertEqual(plan["buy_orders"][0]["price"], 80400.0)
+        self.assertEqual(plan["sell_orders"][0]["price"], 80400.1)
+        self.assertTrue(plan["buy_orders"][0]["post_only"])
+
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -303,6 +331,73 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(report["sell_orders"]), 1)
         self.assertEqual(report["buy_orders"][0]["role"], "maker_entry_long")
         self.assertEqual(report["sell_orders"][0]["role"], "maker_entry_short")
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_maker_volume_generate_plan_report_builds_post_only_orders(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "80400.0", "ask_price": "80400.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BTCUSDC", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BTCUSDC",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="btcusdc_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=400.0,
+                best_quote_maker_volume_max_long_notional=1_500.0,
+                best_quote_maker_volume_max_short_notional=1_500.0,
+                best_quote_maker_volume_loss_per_10k_15m=0.2,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["strategy_mode"], "best_quote_maker_volume_v1")
+        self.assertEqual(report["best_quote_maker_volume"]["regime"], "normal")
+        self.assertEqual(len(report["buy_orders"]), 1)
+        self.assertEqual(len(report["sell_orders"]), 1)
+        self.assertEqual(report["buy_orders"][0]["price"], 80400.0)
+        self.assertEqual(report["sell_orders"][0]["price"], 80400.1)
+        self.assertTrue(report["buy_orders"][0]["post_only"])
+        self.assertEqual(report["buy_orders"][0]["execution_type"], "maker")
 
     def test_filter_futures_strategy_orders_ignores_manual_and_flatten_orders(self) -> None:
         open_orders = [
