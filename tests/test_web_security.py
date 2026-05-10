@@ -13,6 +13,7 @@ from grid_optimizer.web import (
     COMPETITION_VOLUME_PAGE,
     MONITOR_PAGE,
     HTML_PAGE,
+    STRATEGY_WORKSPACE_PAGE,
     STRATEGIES_PAGE,
     _Handler,
     _build_running_status_api_body,
@@ -42,6 +43,8 @@ from grid_optimizer.web import (
     _render_running_status_page,
     _run_loop_monitor_query,
     _run_running_status_overview_query,
+    _run_strategy_workspace_query,
+    _strategy_workspace_controller_state,
     _reconcile_runner_volatility_trigger,
     _runtime_guard_input_summary,
     _running_status_stats_start_time,
@@ -257,6 +260,79 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("close_all_positions: true", page)
         self.assertIn("高级 JSON", page)
         self.assertIn("strategy_mode", page)
+
+    def test_strategy_workspace_page_contains_cross_server_control_surface(self) -> None:
+        self.assertIn("策略运行工作台", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("按币种聚合", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("参数与操作", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("总控只读模式", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("打开目标控制台", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("保存并重启生效", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("停止并清仓", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("Maker 买入", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("Take 买入", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("/api/strategy_workspace", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("/api/runner/save", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("/api/runner/start", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("/api/runner/stop", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("/manual_trade?symbol=", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("symbols_by_symbol", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("server_errors", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("服务器连接异常", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("controller_read_only", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("来源：", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("serverIdentity", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("serverHost", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("source-badge", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("sourceMetricHtml", STRATEGY_WORKSPACE_PAGE)
+        self.assertIn("source-metrics", STRATEGY_WORKSPACE_PAGE)
+
+    @patch.dict("grid_optimizer.web.os.environ", {"GRID_CONTROLLER_READ_ONLY": "1"}, clear=False)
+    @patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret"))
+    def test_strategy_workspace_controller_state_respects_explicit_read_only(self, _mock_credentials) -> None:
+        state = _strategy_workspace_controller_state()
+
+        self.assertTrue(state["controller_read_only"])
+        self.assertFalse(state["local_trading_enabled"])
+        self.assertEqual(state["controller_mode"], "read_only")
+
+    @patch.dict("grid_optimizer.web.os.environ", {"GRID_CONTROLLER_READ_ONLY": "0"}, clear=False)
+    @patch("grid_optimizer.web.load_binance_api_credentials", return_value=None)
+    def test_strategy_workspace_controller_state_defaults_read_only_without_credentials(self, _mock_credentials) -> None:
+        state = _strategy_workspace_controller_state()
+
+        self.assertTrue(state["controller_read_only"])
+        self.assertFalse(state["local_trading_enabled"])
+        self.assertEqual(state["controller_mode"], "read_only")
+
+    @patch.dict("grid_optimizer.web.os.environ", {"GRID_CONTROLLER_READ_ONLY": "0"}, clear=False)
+    @patch("grid_optimizer.web.load_binance_api_credentials", return_value=("key", "secret"))
+    def test_strategy_workspace_controller_state_allows_local_trading_with_credentials(self, _mock_credentials) -> None:
+        state = _strategy_workspace_controller_state()
+
+        self.assertFalse(state["controller_read_only"])
+        self.assertTrue(state["local_trading_enabled"])
+        self.assertEqual(state["controller_mode"], "local_trading")
+
+    @patch("grid_optimizer.web.build_strategy_workspace_payload")
+    @patch("grid_optimizer.web._run_running_status_query")
+    def test_run_strategy_workspace_query_builds_from_cross_running_status(
+        self,
+        mock_running_status,
+        mock_workspace_payload,
+    ) -> None:
+        running_payload = {"ok": True, "view_mode": "cross", "servers": []}
+        workspace_payload = {"ok": True, "symbols": []}
+        mock_running_status.return_value = running_payload
+        mock_workspace_payload.return_value = workspace_payload
+
+        payload = _run_strategy_workspace_query({})
+
+        self.assertEqual(payload["symbols"], [])
+        self.assertIn("controller_read_only", payload)
+        self.assertIn("local_trading_enabled", payload)
+        mock_running_status.assert_called_once_with({"scope": ["cross"]})
+        mock_workspace_payload.assert_called_once_with(running_payload)
 
     @patch("grid_optimizer.web._stop_runner_process")
     def test_handler_routes_runner_stop_with_flatten_flags(self, mock_stop_runner) -> None:
@@ -4361,7 +4437,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("硬上限", MONITOR_PAGE)
 
     def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', MONITOR_PAGE)
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', MONITOR_PAGE)
 
     def test_monitor_page_keeps_raw_json_in_advanced_panel(self) -> None:
         self.assertIn('id="runner_params_advanced_panel"', MONITOR_PAGE)
@@ -4418,7 +4494,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
 
     def test_monitor_page_ordiusdc_ping_pong_includes_adaptive_step_amplitude_controls(self) -> None:
         self.assertIn("adaptive_step_1m_amplitude_ratio: 0.00375", MONITOR_PAGE)

@@ -228,6 +228,29 @@ sudo systemctl status grid-web-health-watchdog.timer --no-pager
 sudo journalctl -u grid-web-health-watchdog.service -n 50 --no-pager
 ```
 
+## 4.4) Controller Cross Watchdog
+
+For the `110` controller, install a second watchdog that checks the aggregated cross payload instead
+of only the local web process. This catches "controller is up but one upstream node is missing"
+incidents early.
+
+```bash
+APP_DIR=/home/ubuntu/wangge \
+RUNNER_CODE_DIR=/home/ubuntu/wangge \
+AUTH_USERNAME=admin \
+AUTH_PASSWORD='your-basic-auth-password' \
+HOST_LABEL=110 \
+CONTROLLER_CROSS_STATUS_URL='http://127.0.0.1:8787/api/running_status?scope=cross' \
+deploy/oracle/install_controller_cross_watchdog.sh
+```
+
+Notes:
+
+- The watchdog writes state under `/var/tmp/grid-controller-cross-watchdog/state.json`.
+- It logs to journald under `grid-controller-cross-watchdog.service`.
+- If alert email is configured through `output/alert_notifier_config.json` or `GRID_ALERT_*`, it
+  sends an email after repeated failures and only re-alerts on a new summary or after recovery.
+
 ## 4.2) Saved Runner systemd Template
 
 For production runners that should survive process exits and host reboots, install the symbol-level

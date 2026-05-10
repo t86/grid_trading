@@ -809,6 +809,49 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload["servers"][0]["groups"]["running"][0]["server_id"], "srv_114")
         self.assertEqual(payload["servers"][1]["groups"]["running"][0]["server_id"], "srv_111")
 
+    def test_legacy_running_status_server_from_payload_accepts_cross_style_response(self) -> None:
+        from grid_optimizer.web import _legacy_running_status_server_from_payload
+
+        payload = {
+            "ok": True,
+            "scope": "cross",
+            "servers": [
+                {
+                    "ok": True,
+                    "label": "111",
+                    "url": "http://111",
+                    "symbols": [
+                        {
+                            "symbol": "CHIPUSDT",
+                            "market_type": "futures",
+                            "total_volume": 123.0,
+                            "recent_hour_volume": 12.0,
+                            "total_pnl": 3.0,
+                            "trade_pnl": 2.0,
+                            "unrealized_pnl": 1.0,
+                            "fees": 0.5,
+                            "funding_fee": -0.1,
+                            "open_order_count": 4,
+                            "position_summary": "净 1",
+                            "latest_trade_summary": "BUY 1",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        server = _legacy_running_status_server_from_payload(
+            payload,
+            fallback_label="111",
+            fallback_url="http://111",
+        )
+
+        self.assertTrue(server["ok"])
+        self.assertEqual(server["label"], "111")
+        self.assertEqual(len(server["symbols"]), 1)
+        self.assertEqual(server["symbols"][0]["symbol"], "CHIPUSDT")
+        self.assertEqual(server["symbols"][0]["server_base_url"], "http://111")
+
     def test_run_running_status_query_uses_cross_scope(self) -> None:
         from grid_optimizer.web import _run_running_status_query
 
@@ -837,3 +880,74 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload["focused_symbol"], "CHIPUSDT")
         local_mock.assert_called_once_with(symbol="CHIPUSDT")
         cross_mock.assert_not_called()
+
+    def test_fetch_remote_running_status_payload_uses_overview_local_endpoint(self) -> None:
+        from grid_optimizer.web import _fetch_remote_running_status_payload
+
+        server = {"label": "111", "base_url": "http://111"}
+        fake_payload = {"ok": True, "server": {"groups": {"running": [], "saved_idle": []}, "summary": {}}}
+        with patch("grid_optimizer.web._fetch_remote_json", return_value=fake_payload) as fetch_mock:
+            with patch("grid_optimizer.web._normalize_running_status_server_payload", return_value={"ok": True}) as normalize_mock:
+                payload = _fetch_remote_running_status_payload(server)
+
+        self.assertEqual(payload, {"ok": True})
+        fetch_mock.assert_called_once_with(server, "/api/running_status_overview", params={"scope": "local"})
+        normalize_mock.assert_called_once_with(fake_payload, server=server)
+
+    def test_running_status_module_fetch_remote_uses_overview_local_endpoint(self) -> None:
+        from grid_optimizer.running_status import fetch_remote_running_status_payload
+
+        server = {"label": "111", "base_url": "http://111"}
+        fake_payload = {"ok": True, "server": {"groups": {"running": [], "saved_idle": []}, "summary": {}}}
+        with patch("grid_optimizer.running_status._fetch_remote_json", return_value=fake_payload) as fetch_mock:
+            with patch(
+                "grid_optimizer.running_status.normalize_running_status_server_payload",
+                return_value={"ok": True},
+            ) as normalize_mock:
+                payload = fetch_remote_running_status_payload(server)
+
+        self.assertEqual(payload, {"ok": True})
+        fetch_mock.assert_called_once_with(server, "/api/running_status_overview", params={"scope": "local"})
+        normalize_mock.assert_called_once_with(fake_payload, server=server)
+
+    def test_normalize_running_status_server_payload_maps_overview_symbols_to_groups(self) -> None:
+        from grid_optimizer.running_status import normalize_running_status_server_payload
+
+        payload = {
+            "ok": True,
+            "symbols": [
+                {"symbol": "BTCUSDC", "is_running": True, "total_volume": 10.0},
+                {"symbol": "ETHUSDC", "is_running": False, "total_volume": 2.0},
+            ],
+            "summary": {"running_symbol_count": 1, "saved_idle_symbol_count": 1},
+        }
+
+        normalized = normalize_running_status_server_payload(
+            payload,
+            server={"id": "srv_111", "label": "111", "base_url": "http://111"},
+        )
+
+        self.assertEqual([item["symbol"] for item in normalized["groups"]["running"]], ["BTCUSDC"])
+        self.assertEqual([item["symbol"] for item in normalized["groups"]["saved_idle"]], ["ETHUSDC"])
+        self.assertEqual(normalized["groups"]["running"][0]["server_label"], "111")
+        self.assertEqual(normalized["groups"]["running"][0]["target_url"], "http://111/running_status?symbol=BTCUSDC")
+
+    def test_normalize_running_status_server_payload_maps_nested_overview_server_symbols_to_groups(self) -> None:
+        from grid_optimizer.running_status import normalize_running_status_server_payload
+
+        payload = {
+            "ok": True,
+            "server": {
+                "ok": True,
+                "label": "111",
+                "symbols": [{"symbol": "SOONUSDT", "is_running": True, "total_volume": 10.0}],
+            },
+            "summary": {"running_symbol_count": 1, "saved_idle_symbol_count": 0},
+        }
+
+        normalized = normalize_running_status_server_payload(
+            payload,
+            server={"id": "srv_111", "label": "111", "base_url": "http://111"},
+        )
+
+        self.assertEqual([item["symbol"] for item in normalized["groups"]["running"]], ["SOONUSDT"])
