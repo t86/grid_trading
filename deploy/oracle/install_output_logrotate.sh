@@ -48,7 +48,6 @@ ${OUTPUT_DIR}/*_spot_flatten_events.jsonl
     notifempty
     copytruncate
     compress
-    delaycompress
     dateext
     dateformat -%Y%m%d-%s
     create 0644 ${SERVICE_USER} ${SERVICE_USER}

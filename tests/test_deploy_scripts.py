@@ -39,5 +39,6 @@ def test_output_logrotate_installer_uses_copytruncate_timer() -> None:
     assert "*_loop_plan_audit.jsonl" in script
     assert "copytruncate" in script
     assert "compress" in script
+    assert "delaycompress" not in script
     assert "OnUnitActiveSec=${ON_UNIT_ACTIVE_SEC}" in script
     assert "logrotate -s" in script
