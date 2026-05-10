@@ -893,3 +893,19 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload, {"ok": True})
         fetch_mock.assert_called_once_with(server, "/api/running_status_overview", params={"scope": "local"})
         normalize_mock.assert_called_once_with(fake_payload, server=server)
+
+    def test_running_status_module_fetch_remote_uses_overview_local_endpoint(self) -> None:
+        from grid_optimizer.running_status import fetch_remote_running_status_payload
+
+        server = {"label": "111", "base_url": "http://111"}
+        fake_payload = {"ok": True, "server": {"groups": {"running": [], "saved_idle": []}, "summary": {}}}
+        with patch("grid_optimizer.running_status._fetch_remote_json", return_value=fake_payload) as fetch_mock:
+            with patch(
+                "grid_optimizer.running_status.normalize_running_status_server_payload",
+                return_value={"ok": True},
+            ) as normalize_mock:
+                payload = fetch_remote_running_status_payload(server)
+
+        self.assertEqual(payload, {"ok": True})
+        fetch_mock.assert_called_once_with(server, "/api/running_status_overview", params={"scope": "local"})
+        normalize_mock.assert_called_once_with(fake_payload, server=server)
