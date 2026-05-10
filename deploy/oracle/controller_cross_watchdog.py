@@ -66,6 +66,43 @@ def _send_alert(subject: str, body: str) -> dict[str, Any]:
     return send_alert_email(subject=subject, body=body)
 
 
+def _format_alert_body(
+    *,
+    host_label: str,
+    now: str,
+    controller_url: str,
+    summary: str,
+    details: list[str],
+    consecutive_failures: int,
+    failure_threshold: int,
+) -> str:
+    lines = [
+        f"结论: Controller {host_label} 聚合状态异常",
+        f"时间: {now}",
+        f"连续失败: {consecutive_failures}/{failure_threshold}",
+        f"检查地址: {controller_url}",
+        "",
+        "异常摘要",
+        f"- {summary}",
+        "",
+        "异常节点 / 详情",
+    ]
+    if details:
+        lines.extend(f"- {item}" for item in details)
+    else:
+        lines.append("- 无")
+    lines.extend(
+        [
+            "",
+            "建议动作",
+            "- 先看 110 的 /api/running_status?scope=cross 是否仍有 warnings",
+            "- 再看异常节点本机 /api/health 和 /api/running_status?scope=local",
+            "- 若本机接口超时或 5xx，优先重启对应 web service",
+        ]
+    )
+    return "\n".join(lines)
+
+
 def main() -> int:
     controller_url = _env("CONTROLLER_CROSS_STATUS_URL", "http://127.0.0.1:8787/api/running_status?scope=cross")
     auth_username = _env("AUTH_USERNAME")
@@ -123,21 +160,17 @@ def main() -> int:
     if not should_alert:
         return 1
 
-    body_lines = [
-        f"Host: {host_label}",
-        f"Time: {now}",
-        f"URL: {controller_url}",
-        "",
-        "Cross running status is unhealthy.",
-        "",
-        f"Summary: {summary}",
-    ]
-    if details:
-        body_lines.extend(["", "Details:"])
-        body_lines.extend(f"- {item}" for item in details)
     result = _send_alert(
         subject=f"[grid][{host_label}] controller cross status unhealthy",
-        body="\n".join(body_lines),
+        body=_format_alert_body(
+            host_label=host_label,
+            now=now,
+            controller_url=controller_url,
+            summary=summary,
+            details=details,
+            consecutive_failures=consecutive_failures,
+            failure_threshold=failure_threshold,
+        ),
     )
     logging.info("alert send result: sent=%s error=%s", result.get("sent"), result.get("error"))
     return 1
