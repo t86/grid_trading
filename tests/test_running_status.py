@@ -809,6 +809,49 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload["servers"][0]["groups"]["running"][0]["server_id"], "srv_114")
         self.assertEqual(payload["servers"][1]["groups"]["running"][0]["server_id"], "srv_111")
 
+    def test_legacy_running_status_server_from_payload_accepts_cross_style_response(self) -> None:
+        from grid_optimizer.web import _legacy_running_status_server_from_payload
+
+        payload = {
+            "ok": True,
+            "scope": "cross",
+            "servers": [
+                {
+                    "ok": True,
+                    "label": "111",
+                    "url": "http://111",
+                    "symbols": [
+                        {
+                            "symbol": "CHIPUSDT",
+                            "market_type": "futures",
+                            "total_volume": 123.0,
+                            "recent_hour_volume": 12.0,
+                            "total_pnl": 3.0,
+                            "trade_pnl": 2.0,
+                            "unrealized_pnl": 1.0,
+                            "fees": 0.5,
+                            "funding_fee": -0.1,
+                            "open_order_count": 4,
+                            "position_summary": "净 1",
+                            "latest_trade_summary": "BUY 1",
+                        }
+                    ],
+                }
+            ],
+        }
+
+        server = _legacy_running_status_server_from_payload(
+            payload,
+            fallback_label="111",
+            fallback_url="http://111",
+        )
+
+        self.assertTrue(server["ok"])
+        self.assertEqual(server["label"], "111")
+        self.assertEqual(len(server["symbols"]), 1)
+        self.assertEqual(server["symbols"][0]["symbol"], "CHIPUSDT")
+        self.assertEqual(server["symbols"][0]["server_base_url"], "http://111")
+
     def test_run_running_status_query_uses_cross_scope(self) -> None:
         from grid_optimizer.web import _run_running_status_query
 
