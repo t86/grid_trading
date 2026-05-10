@@ -31872,8 +31872,19 @@ def _read_running_status_audit_rows(path: Path) -> list[dict[str, Any]]:
     return _read_running_status_jsonl_tail(path, limit=_running_status_audit_limit())
 
 
+def _running_status_trade_limit() -> int:
+    raw = str(os.environ.get("GRID_RUNNING_STATUS_TRADE_LIMIT") or "").strip()
+    if not raw:
+        return _running_status_audit_limit()
+    try:
+        value = int(raw)
+    except ValueError:
+        return _running_status_audit_limit()
+    return max(100, value)
+
+
 def _read_running_status_trade_rows(path: Path) -> list[dict[str, Any]]:
-    return read_trade_audit_rows(path, limit=0)
+    return read_trade_audit_rows(path, limit=_running_status_trade_limit())
 
 
 def _running_status_trade_gross_notional(rows: list[dict[str, Any]]) -> float:

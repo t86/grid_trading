@@ -369,6 +369,17 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertEqual(symbols, ["TONUSDT"])
 
+    def test_read_running_status_trade_rows_uses_configured_limit(self) -> None:
+        from grid_optimizer.web import _read_running_status_trade_rows
+
+        with patch.dict("grid_optimizer.web.os.environ", {"GRID_RUNNING_STATUS_TRADE_LIMIT": "321"}, clear=False):
+            with patch("grid_optimizer.web.read_trade_audit_rows", return_value=[]) as trade_mock:
+                rows = _read_running_status_trade_rows(Path("/tmp/trade.jsonl"))
+
+        self.assertEqual(rows, [])
+        trade_mock.assert_called_once()
+        self.assertEqual(trade_mock.call_args.kwargs.get("limit"), 321)
+
     @patch("grid_optimizer.web._build_running_status")
     def test_run_running_status_overview_query_uses_legacy_cross_payload(self, mock_build) -> None:
         mock_build.return_value = {"ok": True, "scope": "cross", "servers": []}
