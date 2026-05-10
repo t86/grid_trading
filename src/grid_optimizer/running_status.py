@@ -32,6 +32,10 @@ STABLE_FEE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 FEE_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 FEE_ASSET_PRICE_CACHE_TTL_SECONDS = 60.0
 FUTURES_COMPETITION_VOLUME_WINDOWS: dict[str, tuple[datetime, datetime]] = {
+    "BILLUSDT": (
+        datetime(2026, 5, 8, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+        datetime(2026, 5, 19, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),
+    ),
     "CHIPUSDT": (
         datetime(2026, 4, 22, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
         datetime(2026, 5, 13, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),

@@ -17,6 +17,7 @@ from grid_optimizer.monitor import (
     _count_monitor_audit_lines,
     _filter_events_since,
     _filter_rows_since,
+    _load_or_fetch_income_rows,
     _load_or_fetch_trade_rows,
     _extract_futures_asset_snapshot,
     _read_event_window,
@@ -146,6 +147,47 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(meta["merged_row_count"], 2)
         self.assertEqual(meta["deduped_row_count"], 1)
         self.assertAlmostEqual(summarize_user_trades(rows)["gross_notional"], 5.2, places=8)
+
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_income_rows_merges_audit_and_api_funding(self, mock_fetch_time_paged) -> None:
+        session_start = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        audit_income = {
+            "symbol": "BILLUSDT",
+            "incomeType": "FUNDING_FEE",
+            "income": "0.03",
+            "time": int((session_start + timedelta(hours=6)).timestamp() * 1000),
+            "tranId": 100,
+        }
+        api_income = {
+            "symbol": "BILLUSDT",
+            "incomeType": "FUNDING_FEE",
+            "income": "-0.02",
+            "time": int((session_start + timedelta(hours=2)).timestamp() * 1000),
+            "tranId": 99,
+        }
+        duplicate_audit_income = dict(audit_income)
+        duplicate_audit_income["income"] = "999"
+        mock_fetch_time_paged.return_value = [api_income, duplicate_audit_income]
+
+        with TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "billusdt_loop_income_audit.jsonl"
+            audit_path.write_text(json.dumps(audit_income) + "\n", encoding="utf-8")
+
+            rows, meta = _load_or_fetch_income_rows(
+                audit_path=audit_path,
+                symbol="BILLUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=session_start,
+            )
+
+        self.assertEqual([item["tranId"] for item in rows], [99, 100])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 1)
+        self.assertEqual(meta["api_row_count"], 2)
+        self.assertEqual(meta["merged_row_count"], 2)
+        self.assertEqual(meta["deduped_row_count"], 1)
+        self.assertAlmostEqual(summarize_income(rows)["funding_fee"], 0.01, places=8)
 
     def test_summarize_hourly_metrics_combines_trades_income_and_candles(self) -> None:
         hour0 = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)

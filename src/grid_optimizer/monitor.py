@@ -573,34 +573,62 @@ def _load_or_fetch_income_rows(
         limit=0,
         predicate=lambda item: int(income_row_time_ms(item) or 0) >= floor_ms,
     )
-    if audit_rows:
+
+    start_time_ms = int(effective_start.timestamp() * 1000)
+    end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    try:
+        api_rows = fetch_time_paged(
+            fetch_page=lambda **params: fetch_futures_income_history(
+                symbol=symbol,
+                income_type="FUNDING_FEE",
+                api_key=api_key,
+                api_secret=api_secret,
+                **params,
+            ),
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=1000,
+            row_time_ms=income_row_time_ms,
+            row_key=income_row_key,
+        )
+    except Exception:
+        if not audit_rows:
+            raise
         return audit_rows, {
             "source": "audit",
             "path": str(audit_path),
             "row_count": len(audit_rows),
             "start_time": effective_start.isoformat(),
+            "api_error": "fetch_failed",
         }
 
-    start_time_ms = int(effective_start.timestamp() * 1000)
-    end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    rows = fetch_time_paged(
-        fetch_page=lambda **params: fetch_futures_income_history(
-            symbol=symbol,
-            income_type="FUNDING_FEE",
-            api_key=api_key,
-            api_secret=api_secret,
-            **params,
-        ),
-        start_time_ms=start_time_ms,
-        end_time_ms=end_time_ms,
-        limit=1000,
-        row_time_ms=income_row_time_ms,
-        row_key=income_row_key,
-    )
-    return rows, {
-        "source": "api",
-        "path": None,
-        "row_count": len(rows),
+    if not audit_rows:
+        return api_rows, {
+            "source": "api",
+            "path": None,
+            "row_count": len(api_rows),
+            "start_time": effective_start.isoformat(),
+        }
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    duplicate_count = 0
+    for row in [*audit_rows, *api_rows]:
+        key = (int(income_row_time_ms(row) or 0), income_row_key(row))
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+        merged.append(row)
+    merged.sort(key=lambda item: (int(income_row_time_ms(item) or 0), income_row_key(item)))
+    return merged, {
+        "source": "audit+api",
+        "path": str(audit_path),
+        "row_count": len(merged),
+        "audit_row_count": len(audit_rows),
+        "api_row_count": len(api_rows),
+        "merged_row_count": len(merged),
+        "deduped_row_count": duplicate_count,
         "start_time": effective_start.isoformat(),
     }
 

@@ -176,6 +176,10 @@ VOLATILITY_TRIGGER_STATUS_LOCK = threading.Lock()
 RUNNING_STATUS_OVERVIEW_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
 RUNNING_STATUS_OVERVIEW_CACHE_LOCK = threading.Lock()
 FUTURES_COMPETITION_VOLUME_WINDOWS: dict[str, tuple[datetime, datetime]] = {
+    "BILLUSDT": (
+        datetime(2026, 5, 8, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+        datetime(2026, 5, 19, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),
+    ),
     "CHIPUSDT": (
         datetime(2026, 4, 22, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
         datetime(2026, 5, 13, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),
