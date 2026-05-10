@@ -196,11 +196,14 @@ class WebEmailReportTests(unittest.TestCase):
 
         self.assertEqual(email["subject"], "[grid][111] running_status_overview 整点总览")
         body = email["body"]
-        self.assertIn("运行币种: 1", body)
+        self.assertIn("状态: 全部正常", body)
+        self.assertIn("服务器: 1/1 正常", body)
         self.assertIn("最近1小时交易量: 456.7000 USDT", body)
-        self.assertIn("BTCUSDC 合约 running", body)
-        self.assertIn("strategy=btc_profile", body)
-        self.assertIn("pos=long 100U", body)
+        self.assertIn("异常\n- 无", body)
+        self.assertIn("111: 正常 | 币种 1 | 运行中 1", body)
+        self.assertIn("[111] BTCUSDC / 合约 / 运行中", body)
+        self.assertIn("策略: btc_profile", body)
+        self.assertIn("持仓: long 100U | 挂单: 3", body)
 
 
 if __name__ == "__main__":

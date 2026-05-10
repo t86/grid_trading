@@ -4327,25 +4327,10 @@ def _format_running_status_overview_email(payload: dict[str, Any], *, now: datet
     current = _normalize_email_report_now(now)
     summary = payload.get("summary") if isinstance(payload.get("summary"), dict) else {}
     servers = payload.get("servers") if isinstance(payload.get("servers"), list) else []
-    lines = [
-        f"时间: {current.isoformat()}",
-        f"范围: {payload.get('scope') or 'cross'}",
-        "",
-        "汇总:",
-        f"- 服务器数: {int(_email_float(summary.get('server_count')))}",
-        f"- 运行币种: {int(_email_float(summary.get('running_symbol_count')))}",
-        f"- 合约币种: {int(_email_float(summary.get('futures_symbol_count')))}",
-        f"- 现货币种: {int(_email_float(summary.get('spot_symbol_count')))}",
-        f"- 总交易量: {_format_email_number(summary.get('total_volume'))} USDT",
-        f"- 最近1小时交易量: {_format_email_number(summary.get('recent_hour_volume'))} USDT",
-        f"- 总盈亏: {_format_email_signed(summary.get('total_pnl'))} USDT",
-        f"- 已实现: {_format_email_signed(summary.get('trade_pnl'))} USDT",
-        f"- 浮盈: {_format_email_signed(summary.get('unrealized_pnl'))} USDT",
-        f"- 手续费: {_format_email_number(summary.get('fees'))} USDT",
-        f"- 资金费: {_format_email_signed(summary.get('funding_fee'))} USDT",
-        "",
-        "服务器明细:",
-    ]
+    healthy_servers = 0
+    unhealthy_lines: list[str] = []
+    server_lines: list[str] = []
+    symbol_lines: list[str] = []
     for server in servers:
         if not isinstance(server, dict):
             continue
@@ -4353,12 +4338,20 @@ def _format_running_status_overview_email(payload: dict[str, Any], *, now: datet
         ok = bool(server.get("ok"))
         url = str(server.get("url") or "").strip()
         symbols = server.get("symbols") if isinstance(server.get("symbols"), list) else []
-        lines.append(f"\n[{label}] ok={'yes' if ok else 'no'} url={url or '--'} symbols={len(symbols)}")
+        running_symbols = 0
+        futures_symbols = 0
+        spot_symbols = 0
+        total_volume = 0.0
+        recent_hour_volume = 0.0
+        total_pnl = 0.0
+        fees = 0.0
+        if ok:
+            healthy_servers += 1
         if not ok and server.get("error"):
-            lines.append(f"- error: {server.get('error')}")
+            unhealthy_lines.append(f"- {label}: {server.get('error')}")
         errors = server.get("errors") if isinstance(server.get("errors"), list) else []
         for error in errors[:5]:
-            lines.append(f"- warning: {error}")
+            unhealthy_lines.append(f"- {label}: {error}")
         for item in symbols:
             if not isinstance(item, dict):
                 continue
@@ -4366,19 +4359,59 @@ def _format_running_status_overview_email(payload: dict[str, Any], *, now: datet
             market = str(item.get("market_label") or item.get("market_type") or "--").strip() or "--"
             strategy = str(item.get("strategy_name") or item.get("strategy_profile") or "--").strip() or "--"
             running = item.get("is_running")
-            running_text = "running" if running is True else ("stopped" if running is False else "--")
-            lines.append(
-                "- "
-                f"{symbol} {market} {running_text} "
-                f"strategy={strategy} "
-                f"vol={_format_email_number(item.get('total_volume'))}U "
-                f"1h={_format_email_number(item.get('recent_hour_volume'))}U "
-                f"pnl={_format_email_signed(item.get('total_pnl'))}U "
-                f"trade={_format_email_signed(item.get('trade_pnl'))}U "
-                f"fees={_format_email_number(item.get('fees'))}U "
-                f"pos={item.get('position_summary') or item.get('current_position_display') or '--'} "
-                f"orders={item.get('open_order_count') if item.get('open_order_count') is not None else '--'}"
+            running_text = "运行中" if running is True else ("已停止" if running is False else "未知")
+            if running is True:
+                running_symbols += 1
+            market_text = market
+            if "合约" in market_text:
+                futures_symbols += 1
+            elif "现货" in market_text:
+                spot_symbols += 1
+            total_volume += _email_float(item.get("total_volume"))
+            recent_hour_volume += _email_float(item.get("recent_hour_volume"))
+            total_pnl += _email_float(item.get("total_pnl"))
+            fees += _email_float(item.get("fees"))
+            symbol_lines.append(
+                f"- [{label}] {symbol} / {market_text} / {running_text}\n"
+                f"  策略: {strategy}\n"
+                f"  交易量: 总 {_format_email_number(item.get('total_volume'))} U | 1h {_format_email_number(item.get('recent_hour_volume'))} U\n"
+                f"  盈亏: 总 {_format_email_signed(item.get('total_pnl'))} U | 已实现 {_format_email_signed(item.get('trade_pnl'))} U | 手续费 {_format_email_number(item.get('fees'))} U\n"
+                f"  持仓: {item.get('position_summary') or item.get('current_position_display') or '--'} | 挂单: {item.get('open_order_count') if item.get('open_order_count') is not None else '--'}"
             )
+        server_lines.append(
+            f"- {label}: {'正常' if ok else '异常'} | 币种 {len(symbols)} | 运行中 {running_symbols} | 合约 {futures_symbols} | 现货 {spot_symbols} | "
+            f"总交易量 {_format_email_number(total_volume)} U | 1h {_format_email_number(recent_hour_volume)} U | 总盈亏 {_format_email_signed(total_pnl)} U | 手续费 {_format_email_number(fees)} U"
+            + (f" | 地址 {url}" if url else "")
+        )
+    scope = str(payload.get("scope") or "cross").strip() or "cross"
+    total_servers = int(_email_float(summary.get("server_count")))
+    unhealthy_count = max(total_servers - healthy_servers, 0)
+    status_text = "全部正常" if unhealthy_count == 0 else f"{unhealthy_count} 台异常"
+    lines = [
+        f"时间: {current.isoformat()}",
+        f"范围: {scope}",
+        f"状态: {status_text}",
+        "",
+        "总览",
+        f"- 服务器: {healthy_servers}/{total_servers} 正常",
+        f"- 运行币种: {int(_email_float(summary.get('running_symbol_count')))}",
+        f"- 合约 / 现货: {int(_email_float(summary.get('futures_symbol_count')))} / {int(_email_float(summary.get('spot_symbol_count')))}",
+        f"- 总交易量: {_format_email_number(summary.get('total_volume'))} USDT",
+        f"- 最近1小时交易量: {_format_email_number(summary.get('recent_hour_volume'))} USDT",
+        f"- 总盈亏: {_format_email_signed(summary.get('total_pnl'))} USDT",
+        f"- 已实现 / 浮盈: {_format_email_signed(summary.get('trade_pnl'))} / {_format_email_signed(summary.get('unrealized_pnl'))} USDT",
+        f"- 手续费 / 资金费: {_format_email_number(summary.get('fees'))} / {_format_email_signed(summary.get('funding_fee'))} USDT",
+        "",
+        "异常",
+    ]
+    if unhealthy_lines:
+        lines.extend(unhealthy_lines)
+    else:
+        lines.append("- 无")
+    lines.extend(["", "节点摘要"])
+    lines.extend(server_lines or ["- 无"])
+    lines.extend(["", "币种明细"])
+    lines.extend(symbol_lines or ["- 无"])
     return {
         "subject": f"[grid][{alert_source_label()}] running_status_overview 整点总览",
         "body": "\n".join(lines),
@@ -32177,6 +32210,31 @@ def _legacy_running_status_server_from_payload(
             "error": str(error),
         }
     server = payload.get("server") if isinstance(payload.get("server"), dict) else payload
+    if (
+        server is payload
+        and not isinstance(server.get("groups"), dict)
+        and not isinstance(server.get("symbols"), list)
+    ):
+        servers = payload.get("servers") if isinstance(payload.get("servers"), list) else []
+        for candidate in servers:
+            if not isinstance(candidate, dict):
+                continue
+            candidate_label = str(candidate.get("label") or candidate.get("server_label") or "").strip()
+            candidate_url = str(candidate.get("url") or "").strip().rstrip("/")
+            fallback_url_normalized = str(fallback_url).strip().rstrip("/")
+            if candidate_url and candidate_url == fallback_url_normalized:
+                server = candidate
+                break
+            if candidate_label and candidate_label == str(fallback_label).strip():
+                server = candidate
+                break
+        else:
+            for candidate in servers:
+                if isinstance(candidate, dict) and (
+                    isinstance(candidate.get("groups"), dict) or isinstance(candidate.get("symbols"), list)
+                ):
+                    server = candidate
+                    break
     if not isinstance(server, dict):
         return {
             "ok": False,
