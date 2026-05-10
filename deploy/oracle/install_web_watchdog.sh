@@ -14,6 +14,8 @@ FAILURE_THRESHOLD="${FAILURE_THRESHOLD:-3}"
 ON_BOOT_SEC="${ON_BOOT_SEC:-2min}"
 ON_UNIT_ACTIVE_SEC="${ON_UNIT_ACTIVE_SEC:-1min}"
 ALERT_EMAIL_TO="${ALERT_EMAIL_TO:-}"
+AUTH_USERNAME="${AUTH_USERNAME:-}"
+AUTH_PASSWORD="${AUTH_PASSWORD:-}"
 
 if ! command -v sudo >/dev/null 2>&1; then
   echo "sudo is required for systemd installation." >&2
@@ -52,6 +54,8 @@ Environment=CONNECT_TIMEOUT_SECONDS=${CONNECT_TIMEOUT_SECONDS}
 Environment=MAX_TIME_SECONDS=${MAX_TIME_SECONDS}
 Environment=FAILURE_THRESHOLD=${FAILURE_THRESHOLD}
 Environment=ALERT_EMAIL_TO=${ALERT_EMAIL_TO}
+Environment=AUTH_USERNAME=${AUTH_USERNAME}
+Environment=AUTH_PASSWORD=${AUTH_PASSWORD}
 Environment=PYTHONPATH=${RUNNER_CODE_DIR}/src
 ExecStart=${RUNNER_CODE_DIR}/deploy/oracle/web_health_watchdog.sh
 EOF
