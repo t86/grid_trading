@@ -175,6 +175,58 @@ ssh <host> '/usr/local/bin/grid-saved-runner-api2 restart SOONUSDT'
 ssh <host> '/usr/local/bin/grid-saved-runner-api2 status SOONUSDT'
 ```
 
+## 4.3) Web Health Watchdog
+
+For hosts where `grid-web` may stay `active` but stop answering local HTTP requests, install the
+tracked web watchdog. It probes local health endpoints every minute and restarts the service after
+repeated failures.
+
+Primary or controller host:
+
+```bash
+APP_DIR=/home/ubuntu/wangge \
+RUNNER_CODE_DIR=/home/ubuntu/wangge \
+SERVICE_NAME=grid-web \
+HEALTHCHECK_URL=http://127.0.0.1:8788/api/health \
+STATUS_URL=http://127.0.0.1:8788/api/running_status?scope=local \
+deploy/oracle/install_web_watchdog.sh
+```
+
+Controller host on port `8787`:
+
+```bash
+APP_DIR=/home/ubuntu/wangge \
+RUNNER_CODE_DIR=/home/ubuntu/wangge \
+SERVICE_NAME=grid-web-controller \
+HEALTHCHECK_URL=http://127.0.0.1:8787/api/health \
+STATUS_URL=http://127.0.0.1:8787/api/running_status?scope=cross \
+deploy/oracle/install_web_watchdog.sh
+```
+
+API2 host:
+
+```bash
+APP_DIR=/home/ubuntu/wangge_api2 \
+RUNNER_CODE_DIR=/home/ubuntu/wangge_api2_repo \
+SERVICE_NAME=grid-web-api2 \
+HEALTHCHECK_URL=http://127.0.0.1:8789/api/health \
+STATUS_URL=http://127.0.0.1:8789/api/running_status?scope=local \
+deploy/oracle/install_web_watchdog.sh
+```
+
+Optional knobs:
+
+- `FAILURE_THRESHOLD=3`: restart only after 3 consecutive failures
+- `ON_UNIT_ACTIVE_SEC=1min`: watchdog frequency
+- `ALERT_EMAIL_TO=you@example.com`: send an alert email on automatic restart
+
+Verify after install:
+
+```bash
+sudo systemctl status grid-web-health-watchdog.timer --no-pager
+sudo journalctl -u grid-web-health-watchdog.service -n 50 --no-pager
+```
+
 ## 4.2) Saved Runner systemd Template
 
 For production runners that should survive process exits and host reboots, install the symbol-level
