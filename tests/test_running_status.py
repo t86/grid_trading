@@ -880,3 +880,16 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload["focused_symbol"], "CHIPUSDT")
         local_mock.assert_called_once_with(symbol="CHIPUSDT")
         cross_mock.assert_not_called()
+
+    def test_fetch_remote_running_status_payload_uses_overview_local_endpoint(self) -> None:
+        from grid_optimizer.web import _fetch_remote_running_status_payload
+
+        server = {"label": "111", "base_url": "http://111"}
+        fake_payload = {"ok": True, "server": {"groups": {"running": [], "saved_idle": []}, "summary": {}}}
+        with patch("grid_optimizer.web._fetch_remote_json", return_value=fake_payload) as fetch_mock:
+            with patch("grid_optimizer.web._normalize_running_status_server_payload", return_value={"ok": True}) as normalize_mock:
+                payload = _fetch_remote_running_status_payload(server)
+
+        self.assertEqual(payload, {"ok": True})
+        fetch_mock.assert_called_once_with(server, "/api/running_status_overview", params={"scope": "local"})
+        normalize_mock.assert_called_once_with(fake_payload, server=server)

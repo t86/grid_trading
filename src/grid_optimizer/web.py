@@ -4898,7 +4898,7 @@ def _normalize_running_status_server_payload(payload: dict[str, Any], *, server:
 
 
 def _fetch_remote_running_status_payload(server: dict[str, Any]) -> dict[str, Any]:
-    payload = _fetch_remote_json(server, "/api/running_status", params={"scope": "local"})
+    payload = _fetch_remote_json(server, "/api/running_status_overview", params={"scope": "local"})
     return _normalize_running_status_server_payload(payload, server=server)
 
 
