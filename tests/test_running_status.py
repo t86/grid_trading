@@ -909,3 +909,25 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(payload, {"ok": True})
         fetch_mock.assert_called_once_with(server, "/api/running_status_overview", params={"scope": "local"})
         normalize_mock.assert_called_once_with(fake_payload, server=server)
+
+    def test_normalize_running_status_server_payload_maps_overview_symbols_to_groups(self) -> None:
+        from grid_optimizer.running_status import normalize_running_status_server_payload
+
+        payload = {
+            "ok": True,
+            "symbols": [
+                {"symbol": "BTCUSDC", "is_running": True, "total_volume": 10.0},
+                {"symbol": "ETHUSDC", "is_running": False, "total_volume": 2.0},
+            ],
+            "summary": {"running_symbol_count": 1, "saved_idle_symbol_count": 1},
+        }
+
+        normalized = normalize_running_status_server_payload(
+            payload,
+            server={"id": "srv_111", "label": "111", "base_url": "http://111"},
+        )
+
+        self.assertEqual([item["symbol"] for item in normalized["groups"]["running"]], ["BTCUSDC"])
+        self.assertEqual([item["symbol"] for item in normalized["groups"]["saved_idle"]], ["ETHUSDC"])
+        self.assertEqual(normalized["groups"]["running"][0]["server_label"], "111")
+        self.assertEqual(normalized["groups"]["running"][0]["target_url"], "http://111/running_status?symbol=BTCUSDC")

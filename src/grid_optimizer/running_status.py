@@ -695,6 +695,10 @@ def normalize_running_status_server_payload(payload: dict[str, Any], *, server: 
     groups = normalized.get("groups") if isinstance(normalized.get("groups"), dict) else {}
     running = list(groups.get("running") or [])
     saved_idle = list(groups.get("saved_idle") or [])
+    symbols = normalized.get("symbols") if isinstance(normalized.get("symbols"), list) else []
+    if not running and not saved_idle and symbols:
+        running = [item for item in symbols if isinstance(item, dict) and item.get("is_running") is not False]
+        saved_idle = [item for item in symbols if isinstance(item, dict) and item.get("is_running") is False]
     summary = normalized.get("summary") if isinstance(normalized.get("summary"), dict) else {}
     raw_server_base_url = normalized["server_base_url"] if "server_base_url" in normalized else None
     normalized["ok"] = bool(normalized.get("ok", True))
