@@ -57,7 +57,7 @@ Environment=ALERT_EMAIL_TO=${ALERT_EMAIL_TO}
 Environment=AUTH_USERNAME=${AUTH_USERNAME}
 Environment=AUTH_PASSWORD=${AUTH_PASSWORD}
 Environment=PYTHONPATH=${RUNNER_CODE_DIR}/src
-ExecStart=${RUNNER_CODE_DIR}/deploy/oracle/web_health_watchdog.sh
+ExecStart=/usr/bin/env bash ${RUNNER_CODE_DIR}/deploy/oracle/web_health_watchdog.sh
 EOF
 
 sudo tee "${WATCHDOG_TIMER_FILE}" >/dev/null <<EOF

@@ -56,7 +56,7 @@ Environment=MAX_SERVICE_RSS_MB=${MAX_SERVICE_RSS_MB}
 Environment=MAX_PROBE_SECONDS=${MAX_PROBE_SECONDS}
 Environment=ALERT_EMAIL_TO=${ALERT_EMAIL_TO}
 Environment=PYTHONPATH=${RUNNER_CODE_DIR}/src
-ExecStart=${RUNNER_CODE_DIR}/deploy/oracle/host_pressure_watchdog.sh
+ExecStart=/usr/bin/env bash ${RUNNER_CODE_DIR}/deploy/oracle/host_pressure_watchdog.sh
 EOF
 
 sudo tee "${WATCHDOG_TIMER_FILE}" >/dev/null <<EOF

@@ -32,6 +32,27 @@ def test_disk_pressure_installer_wires_timer_environment() -> None:
     assert "Environment=ALERT_EMAIL_TO=${ALERT_EMAIL_TO}" in script
 
 
+def test_watchdog_installers_execute_scripts_via_bash() -> None:
+    installers = [
+        (
+            "deploy/oracle/install_web_watchdog.sh",
+            "web_health_watchdog.sh",
+        ),
+        (
+            "deploy/oracle/install_host_pressure_watchdog.sh",
+            "host_pressure_watchdog.sh",
+        ),
+        (
+            "deploy/oracle/install_disk_pressure_watchdog.sh",
+            "disk_pressure_watchdog.sh",
+        ),
+    ]
+
+    for installer_path, script_name in installers:
+        installer = Path(installer_path).read_text(encoding="utf-8")
+        assert f"ExecStart=/usr/bin/env bash ${{RUNNER_CODE_DIR}}/deploy/oracle/{script_name}" in installer
+
+
 def test_output_logrotate_installer_uses_copytruncate_timer() -> None:
     script = Path("deploy/oracle/install_output_logrotate.sh").read_text(encoding="utf-8")
 

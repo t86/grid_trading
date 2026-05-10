@@ -62,7 +62,7 @@ Environment=DOCKER_PRUNE_UNTIL_HOURS=${DOCKER_PRUNE_UNTIL_HOURS}
 Environment=FAILURE_THRESHOLD=${FAILURE_THRESHOLD}
 Environment=ALERT_EMAIL_TO=${ALERT_EMAIL_TO}
 Environment=PYTHONPATH=${RUNNER_CODE_DIR}/src
-ExecStart=${RUNNER_CODE_DIR}/deploy/oracle/disk_pressure_watchdog.sh
+ExecStart=/usr/bin/env bash ${RUNNER_CODE_DIR}/deploy/oracle/disk_pressure_watchdog.sh
 EOF
 
 sudo tee "${WATCHDOG_TIMER_FILE}" >/dev/null <<EOF
