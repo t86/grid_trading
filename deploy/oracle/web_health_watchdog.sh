@@ -9,6 +9,8 @@ MAX_TIME_SECONDS="${MAX_TIME_SECONDS:-8}"
 STATE_DIR="${STATE_DIR:-/var/tmp/grid-web-watchdog}"
 FAILURE_THRESHOLD="${FAILURE_THRESHOLD:-3}"
 ALERT_EMAIL_TO="${ALERT_EMAIL_TO:-}"
+AUTH_USERNAME="${AUTH_USERNAME:-}"
+AUTH_PASSWORD="${AUTH_PASSWORD:-}"
 
 mkdir -p "${STATE_DIR}"
 STATE_FILE="${STATE_DIR}/${SERVICE_NAME}.state"
@@ -17,9 +19,14 @@ LOG_FILE="${STATE_DIR}/${SERVICE_NAME}.log"
 run_probe() {
   local url="$1"
   [ -n "${url}" ] || return 0
+  local auth_args=()
+  if [ -n "${AUTH_USERNAME}" ] || [ -n "${AUTH_PASSWORD}" ]; then
+    auth_args=(-u "${AUTH_USERNAME}:${AUTH_PASSWORD}")
+  fi
   curl -fsS \
     --connect-timeout "${CONNECT_TIMEOUT_SECONDS}" \
     --max-time "${MAX_TIME_SECONDS}" \
+    "${auth_args[@]}" \
     "${url}" >/dev/null
 }
 

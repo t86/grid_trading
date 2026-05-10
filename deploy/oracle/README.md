@@ -218,6 +218,7 @@ Optional knobs:
 
 - `FAILURE_THRESHOLD=3`: restart only after 3 consecutive failures
 - `ON_UNIT_ACTIVE_SEC=1min`: watchdog frequency
+- `AUTH_USERNAME` / `AUTH_PASSWORD`: for protected local status endpoints
 - `ALERT_EMAIL_TO=you@example.com`: send an alert email on automatic restart
 
 Verify after install:
