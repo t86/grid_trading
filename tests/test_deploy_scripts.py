@@ -53,6 +53,16 @@ def test_watchdog_installers_execute_scripts_via_bash() -> None:
         assert f"ExecStart=/usr/bin/env bash ${{RUNNER_CODE_DIR}}/deploy/oracle/{script_name}" in installer
 
 
+def test_watchdogs_do_not_mark_systemd_failed_before_threshold() -> None:
+    for script_path in [
+        "deploy/oracle/web_health_watchdog.sh",
+        "deploy/oracle/host_pressure_watchdog.sh",
+        "deploy/oracle/disk_pressure_watchdog.sh",
+    ]:
+        script = Path(script_path).read_text(encoding="utf-8")
+        assert 'if [ "${fail_count}" -lt "${FAILURE_THRESHOLD}" ]; then\n  exit 0\nfi' in script
+
+
 def test_output_logrotate_installer_uses_copytruncate_timer() -> None:
     script = Path("deploy/oracle/install_output_logrotate.sh").read_text(encoding="utf-8")
 

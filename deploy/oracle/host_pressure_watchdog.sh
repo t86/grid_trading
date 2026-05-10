@@ -148,7 +148,7 @@ reason_text="$(IFS='; '; echo "${reasons[*]}")"
 log_line "pressure detected (${fail_count}/${FAILURE_THRESHOLD}): ${reason_text}"
 
 if [ "${fail_count}" -lt "${FAILURE_THRESHOLD}" ]; then
-  exit 1
+  exit 0
 fi
 
 log_line "threshold reached; restarting ${SERVICE_NAME}.service"

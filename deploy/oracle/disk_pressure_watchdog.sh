@@ -154,7 +154,7 @@ before_report="$(top_disk_report)"
 log_line "disk pressure detected (${fail_count}/${FAILURE_THRESHOLD}): ${reason_text}"
 
 if [ "${fail_count}" -lt "${FAILURE_THRESHOLD}" ]; then
-  exit 1
+  exit 0
 fi
 
 log_line "threshold reached; running disk cleanup"
