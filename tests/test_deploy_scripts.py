@@ -30,3 +30,14 @@ def test_disk_pressure_installer_wires_timer_environment() -> None:
     assert "Environment=MAX_ROOT_USE_PCT=${MAX_ROOT_USE_PCT}" in script
     assert "Environment=MAX_OUTPUT_SIZE_MB=${MAX_OUTPUT_SIZE_MB}" in script
     assert "Environment=ALERT_EMAIL_TO=${ALERT_EMAIL_TO}" in script
+
+
+def test_output_logrotate_installer_uses_copytruncate_timer() -> None:
+    script = Path("deploy/oracle/install_output_logrotate.sh").read_text(encoding="utf-8")
+
+    assert "*_loop_events.jsonl" in script
+    assert "*_loop_plan_audit.jsonl" in script
+    assert "copytruncate" in script
+    assert "compress" in script
+    assert "OnUnitActiveSec=${ON_UNIT_ACTIVE_SEC}" in script
+    assert "logrotate -s" in script
