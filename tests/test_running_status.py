@@ -931,3 +931,23 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual([item["symbol"] for item in normalized["groups"]["saved_idle"]], ["ETHUSDC"])
         self.assertEqual(normalized["groups"]["running"][0]["server_label"], "111")
         self.assertEqual(normalized["groups"]["running"][0]["target_url"], "http://111/running_status?symbol=BTCUSDC")
+
+    def test_normalize_running_status_server_payload_maps_nested_overview_server_symbols_to_groups(self) -> None:
+        from grid_optimizer.running_status import normalize_running_status_server_payload
+
+        payload = {
+            "ok": True,
+            "server": {
+                "ok": True,
+                "label": "111",
+                "symbols": [{"symbol": "SOONUSDT", "is_running": True, "total_volume": 10.0}],
+            },
+            "summary": {"running_symbol_count": 1, "saved_idle_symbol_count": 0},
+        }
+
+        normalized = normalize_running_status_server_payload(
+            payload,
+            server={"id": "srv_111", "label": "111", "base_url": "http://111"},
+        )
+
+        self.assertEqual([item["symbol"] for item in normalized["groups"]["running"]], ["SOONUSDT"])

@@ -696,6 +696,9 @@ def normalize_running_status_server_payload(payload: dict[str, Any], *, server: 
     running = list(groups.get("running") or [])
     saved_idle = list(groups.get("saved_idle") or [])
     symbols = normalized.get("symbols") if isinstance(normalized.get("symbols"), list) else []
+    nested_server = normalized.get("server") if isinstance(normalized.get("server"), dict) else {}
+    if not symbols and isinstance(nested_server.get("symbols"), list):
+        symbols = list(nested_server.get("symbols") or [])
     if not running and not saved_idle and symbols:
         running = [item for item in symbols if isinstance(item, dict) and item.get("is_running") is not False]
         saved_idle = [item for item in symbols if isinstance(item, dict) and item.get("is_running") is False]
