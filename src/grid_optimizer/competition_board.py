@@ -347,6 +347,13 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.binance.com/zh-CN/activity/trading-competition/futures-chip-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="futures_bill",
+        symbol="BILL",
+        market="futures",
+        label="BILL 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-bill-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
         slug="futures_tradfi_week1",
         symbol="TRADFI",
         market="futures",
@@ -1400,6 +1407,45 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
 平分 900,000 CHIP
 第 51 - 200 名
 平分 1,800,000 CHIP
+""",
+            }
+        ]
+    },
+    "futures_bill": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 54211,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BILL",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/08 18:00 - 2026/05/19 07:59",
+                "activityEndAt": "2026-05-19T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/08 18:00 - 2026/05/19 07:59
+累计 BILL U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 4,000,000 BILL
+第 1 名
+600,000 BILL
+第 2 名
+480,000 BILL
+第 3 名
+280,000 BILL
+第 4 名
+160,000 BILL
+第 5 名
+80,000 BILL
+第 6 - 20 名
+平分 600,000 BILL
+第 21 - 50 名
+平分 600,000 BILL
+第 51 - 200 名
+平分 1,200,000 BILL
 """,
             }
         ]

@@ -202,6 +202,7 @@ class CompetitionBoardTests(unittest.TestCase):
                 "spot_vana",
                 "futures_soon",
                 "futures_chip",
+                "futures_bill",
                 "futures_tradfi_week1",
                 "futures_altcoins_week1",
                 "futures_um_week1",
@@ -215,6 +216,7 @@ class CompetitionBoardTests(unittest.TestCase):
             "spot_ton": (49996, "USDC", "2026-04-29T20:00:00+08:00"),
             "spot_vana": (51242, "BNB", "2026-05-07T19:00:00+08:00"),
             "futures_chip": (51201, "CHIP", "2026-05-13T07:59:00+08:00"),
+            "futures_bill": (54211, "BILL", "2026-05-19T07:59:00+08:00"),
         }
         for slug, (resource_id, reward_unit, end_at) in expected.items():
             source = next(item for item in COMPETITION_SOURCES if item.slug == slug)
@@ -225,6 +227,36 @@ class CompetitionBoardTests(unittest.TestCase):
             self.assertEqual(boards[0].get("resourceId"), resource_id)
             self.assertEqual(boards[0]["rewardUnit"], reward_unit)
             self.assertEqual(boards[0]["activityEndAt"], end_at)
+
+    def test_bill_reward_volume_targets_use_live_rank_segments(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_bill")
+        hinted = _hinted_boards_for_source(source)
+        self.assertIsNotNone(hinted)
+        meta, boards = hinted or ({}, [])
+        board = competition_board._compose_board(
+            source,
+            boards[0],
+            {
+                "eligible_user_count": 0,
+                "eligible_metric_total": 0.0,
+                "updated_time_ms": 0,
+                "rows_truncated": False,
+                "last_rank_fetched": 0,
+                "rows": [],
+            },
+            meta,
+        )
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.004):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 5, 10, tzinfo=timezone.utc))
+        self.assertIsNotNone(targets)
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        rank_200, rank_50, rank_20 = targets["tiers"]
+        self.assertAlmostEqual(rank_200["reward_value_usdt"], 32.0, places=8)
+        self.assertAlmostEqual(rank_50["reward_value_usdt"], 80.0, places=8)
+        self.assertAlmostEqual(rank_20["reward_value_usdt"], 160.0, places=8)
+        self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["3"], 106666.66666666667, places=8)
+        self.assertAlmostEqual(rank_50["volumes_by_loss_rate"]["4"], 200000.0, places=8)
+        self.assertAlmostEqual(rank_20["volumes_by_loss_rate"]["5"], 320000.0, places=8)
 
     def test_hinted_soon_two_stage_boards_include_real_resource_ids(self) -> None:
         source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_soon")
