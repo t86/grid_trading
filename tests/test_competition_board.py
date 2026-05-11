@@ -88,10 +88,11 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertAlmostEqual(floor_21["cumulative_gap"], 870.0, places=8)
         bands = result["displacement_bands"]
         self.assertEqual([item["label"] for item in bands], ["第 1 名 -> 第 2 名", "第 2 名 -> 第 3 名", "第 21 名 -> 第 51 名", "第 51 名 -> 第 201 名"])
+        self.assertAlmostEqual(bands[0]["cumulative_gap"], 100.0, places=8)
         band_21 = next(item for item in bands if item["from_rank"] == 21)
         self.assertEqual(band_21["target_rank"], 51)
-        self.assertEqual(band_21["last_included_rank"], 50)
-        self.assertAlmostEqual(band_21["cumulative_gap"], 250.0, places=8)
+        self.assertEqual(band_21["last_included_rank"], 51)
+        self.assertAlmostEqual(band_21["cumulative_gap"], 470.0, places=8)
 
     def test_build_reward_volume_targets_maps_20_50_200_loss_targets(self) -> None:
         board = {

@@ -3470,10 +3470,11 @@ def build_competition_displacement_volume(
             )
         next_rank = min(int(end_rank) + 1, int(target_rank) + 1)
         if int(start_rank) < next_rank:
+            included_rank = next_rank if next_rank <= int(target_rank) else next_rank - 1
             displacement_bands.append(
                 _gap_summary(
                     int(start_rank),
-                    next_rank - 1,
+                    included_rank,
                     float(start_row["value"]),
                     label=f"第 {int(start_rank)} 名 -> 第 {int(next_rank)} 名",
                     result_rank=next_rank,
