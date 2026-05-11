@@ -43,6 +43,7 @@ systemd_escape_env() {
   printf '%s' "${value}"
 }
 
+REMOTE_LABEL_ESCAPED="$(systemd_escape_env "${REMOTE_LABEL}")"
 REMEDIATION_COMMAND_ESCAPED="$(systemd_escape_env "${REMEDIATION_COMMAND}")"
 
 sudo tee "${WATCHDOG_SERVICE_FILE}" >/dev/null <<EOF
@@ -57,7 +58,7 @@ User=${SERVICE_USER}
 Group=${SERVICE_USER}
 WorkingDirectory=${APP_DIR}
 Environment=WATCHDOG_NAME=${WATCHDOG_NAME}
-Environment=REMOTE_LABEL=${REMOTE_LABEL}
+Environment="REMOTE_LABEL=${REMOTE_LABEL_ESCAPED}"
 Environment=HEALTHCHECK_URL=${HEALTHCHECK_URL}
 Environment=STATUS_URL=${STATUS_URL}
 Environment=CONNECT_TIMEOUT_SECONDS=${CONNECT_TIMEOUT_SECONDS}
