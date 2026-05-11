@@ -3582,6 +3582,31 @@ def _competition_board_auto_refresh_interval_seconds() -> float:
     return max(COMPETITION_BOARD_AUTO_REFRESH_MIN_SECONDS, value)
 
 
+def _background_loop_enabled(env_name: str, *, default: bool = True) -> bool:
+    raw = os.environ.get(env_name, "").strip().lower()
+    if not raw:
+        return default
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _background_loop_interval_seconds(
+    env_name: str,
+    *,
+    default: float,
+    minimum: float,
+) -> float:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value <= 0:
+        return default
+    return max(minimum, value)
+
+
 def _competition_board_api_cache_seconds() -> float:
     raw = os.environ.get("GRID_COMPETITION_BOARD_API_CACHE_SECONDS", "30").strip()
     try:
@@ -4162,6 +4187,11 @@ def _hourly_symbol_email_enabled() -> bool:
 
 
 def _run_hourly_email_report_loop(stop_event: threading.Event) -> None:
+    poll_seconds = _background_loop_interval_seconds(
+        "GRID_HOURLY_EMAIL_POLL_SECONDS",
+        default=60.0,
+        minimum=30.0,
+    )
     while not stop_event.is_set():
         now = datetime.now(timezone.utc)
         report_bucket = now.replace(minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%MZ")
@@ -4187,7 +4217,7 @@ def _run_hourly_email_report_loop(stop_event: threading.Event) -> None:
                 changed = True
         if changed:
             _write_json_dict(HOURLY_EMAIL_REPORT_STATE_PATH, {"sent": sent_map, "updated_at": now.isoformat()})
-        stop_event.wait(60.0)
+        stop_event.wait(poll_seconds)
 
 
 def _running_status_overview_email_enabled() -> bool:
@@ -6793,6 +6823,11 @@ def _reconcile_runner_volume_trigger(config: dict[str, Any]) -> None:
 
 
 def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
+    poll_seconds = _background_loop_interval_seconds(
+        "GRID_VOLUME_TRIGGER_POLL_SECONDS",
+        default=VOLUME_TRIGGER_POLL_SECONDS,
+        minimum=5.0,
+    )
     while not stop_event.is_set():
         for config in _iter_saved_runner_control_configs():
             if not config.get("volume_trigger_enabled"):
@@ -6811,7 +6846,7 @@ def _run_volume_trigger_loop(stop_event: threading.Event) -> None:
                         "last_error": f"{type(exc).__name__}: {exc}",
                     },
                 )
-        stop_event.wait(VOLUME_TRIGGER_POLL_SECONDS)
+        stop_event.wait(poll_seconds)
 
 
 def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
@@ -7186,6 +7221,11 @@ def _reconcile_runner_volatility_trigger(config: dict[str, Any]) -> None:
 
 
 def _run_volatility_trigger_loop(stop_event: threading.Event) -> None:
+    poll_seconds = _background_loop_interval_seconds(
+        "GRID_VOLATILITY_TRIGGER_POLL_SECONDS",
+        default=VOLATILITY_TRIGGER_POLL_SECONDS,
+        minimum=5.0,
+    )
     while not stop_event.is_set():
         for config in _iter_saved_runner_control_configs():
             if not config.get("volatility_trigger_enabled"):
@@ -7205,7 +7245,7 @@ def _run_volatility_trigger_loop(stop_event: threading.Event) -> None:
                         "last_error": f"{type(exc).__name__}: {exc}",
                     },
                 )
-        stop_event.wait(VOLATILITY_TRIGGER_POLL_SECONDS)
+        stop_event.wait(poll_seconds)
 
 
 def _run_competition_board_auto_refresh_loop(stop_event: threading.Event, interval_seconds: float) -> None:
@@ -33241,21 +33281,23 @@ def main() -> None:
     args = parser.parse_args()
 
     volume_trigger_stop_event = threading.Event()
-    volume_trigger_thread = threading.Thread(
-        target=_run_volume_trigger_loop,
-        args=(volume_trigger_stop_event,),
-        daemon=True,
-        name="runner-volume-trigger",
-    )
-    volume_trigger_thread.start()
+    if _background_loop_enabled("GRID_VOLUME_TRIGGER_LOOP_ENABLED", default=True):
+        volume_trigger_thread = threading.Thread(
+            target=_run_volume_trigger_loop,
+            args=(volume_trigger_stop_event,),
+            daemon=True,
+            name="runner-volume-trigger",
+        )
+        volume_trigger_thread.start()
     volatility_trigger_stop_event = threading.Event()
-    volatility_trigger_thread = threading.Thread(
-        target=_run_volatility_trigger_loop,
-        args=(volatility_trigger_stop_event,),
-        daemon=True,
-        name="runner-volatility-trigger",
-    )
-    volatility_trigger_thread.start()
+    if _background_loop_enabled("GRID_VOLATILITY_TRIGGER_LOOP_ENABLED", default=True):
+        volatility_trigger_thread = threading.Thread(
+            target=_run_volatility_trigger_loop,
+            args=(volatility_trigger_stop_event,),
+            daemon=True,
+            name="runner-volatility-trigger",
+        )
+        volatility_trigger_thread.start()
     competition_refresh_stop_event = threading.Event()
     hourly_email_stop_event = threading.Event()
     running_status_overview_email_stop_event = threading.Event()
@@ -33272,7 +33314,7 @@ def main() -> None:
             "[competition-board] auto refresh every "
             f"{refresh_interval / 60:.0f}m ({refresh_interval:.0f}s)"
         )
-    if _hourly_symbol_email_enabled():
+    if _hourly_symbol_email_enabled() and _background_loop_enabled("GRID_HOURLY_EMAIL_REPORT_ENABLED", default=True):
         hourly_email_thread = threading.Thread(
             target=_run_hourly_email_report_loop,
             args=(hourly_email_stop_event,),
