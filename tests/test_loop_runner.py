@@ -83,6 +83,7 @@ from grid_optimizer.loop_runner import (
     resolve_xaut_adaptive_state,
     resolve_anti_chase_entry_guard,
     apply_synthetic_trend_follow_guard,
+    apply_entry_permission_gate,
     remove_take_profit_exit_orders,
     sync_synthetic_ledger,
     update_synthetic_order_refs,
@@ -759,6 +760,62 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(order["price"], 0.1778)
         self.assertLessEqual(order["notional"], 400.0)
         self.assertEqual(plan["forced_reduce_orders"], [order])
+
+    def test_apply_entry_permission_gate_prunes_short_entries_only(self) -> None:
+        plan = {
+            "bootstrap_orders": [
+                {"side": "SELL", "role": "bootstrap_short"},
+                {"side": "BUY", "role": "bootstrap_long"},
+            ],
+            "buy_orders": [
+                {"side": "BUY", "role": "take_profit_short"},
+                {"side": "BUY", "role": "entry_long"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "entry_short"},
+                {"side": "SELL", "role": "take_profit_long"},
+            ],
+        }
+
+        report = apply_entry_permission_gate(plan, allow_entry_short=False)
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["pruned_bootstrap_orders"], 1)
+        self.assertEqual(report["pruned_sell_orders"], 1)
+        self.assertEqual(plan["bootstrap_orders"], [{"side": "BUY", "role": "bootstrap_long"}])
+        self.assertEqual(
+            plan["buy_orders"],
+            [{"side": "BUY", "role": "take_profit_short"}, {"side": "BUY", "role": "entry_long"}],
+        )
+        self.assertEqual(plan["sell_orders"], [{"side": "SELL", "role": "take_profit_long"}])
+
+    def test_apply_entry_permission_gate_prunes_long_entries_only(self) -> None:
+        plan = {
+            "bootstrap_orders": [
+                {"side": "SELL", "role": "bootstrap_short"},
+                {"side": "BUY", "role": "bootstrap_long"},
+            ],
+            "buy_orders": [
+                {"side": "BUY", "role": "entry_long"},
+                {"side": "BUY", "role": "take_profit_short"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "entry_short"},
+                {"side": "SELL", "role": "take_profit_long"},
+            ],
+        }
+
+        report = apply_entry_permission_gate(plan, allow_entry_long=False)
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["pruned_bootstrap_orders"], 1)
+        self.assertEqual(report["pruned_buy_orders"], 1)
+        self.assertEqual(plan["bootstrap_orders"], [{"side": "SELL", "role": "bootstrap_short"}])
+        self.assertEqual(plan["buy_orders"], [{"side": "BUY", "role": "take_profit_short"}])
+        self.assertEqual(
+            plan["sell_orders"],
+            [{"side": "SELL", "role": "entry_short"}, {"side": "SELL", "role": "take_profit_long"}],
+        )
 
     def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
         plan = {

@@ -2000,6 +2000,62 @@ def _is_short_exit_order(order: dict[str, Any]) -> bool:
     return _order_role(order) in {"take_profit_short", "active_delever_short", "flow_sleeve_short"}
 
 
+def apply_entry_permission_gate(
+    plan: dict[str, Any],
+    *,
+    allow_entry_long: bool = True,
+    allow_entry_short: bool = True,
+) -> dict[str, Any]:
+    """Prune entry orders after late sticky/preservation passes."""
+    report = {
+        "enabled": not allow_entry_long or not allow_entry_short,
+        "allow_entry_long": bool(allow_entry_long),
+        "allow_entry_short": bool(allow_entry_short),
+        "pruned_bootstrap_orders": 0,
+        "pruned_buy_orders": 0,
+        "pruned_sell_orders": 0,
+        "applied": False,
+    }
+    if not report["enabled"]:
+        return report
+
+    bootstrap_before = len(plan.get("bootstrap_orders", []))
+    buy_before = len(plan.get("buy_orders", []))
+    sell_before = len(plan.get("sell_orders", []))
+
+    if not allow_entry_long:
+        plan["bootstrap_orders"] = [
+            item
+            for item in plan.get("bootstrap_orders", [])
+            if not (isinstance(item, dict) and _is_long_entry_order(item))
+        ]
+        plan["buy_orders"] = [
+            item
+            for item in plan.get("buy_orders", [])
+            if not (isinstance(item, dict) and _is_long_entry_order(item))
+        ]
+    if not allow_entry_short:
+        plan["bootstrap_orders"] = [
+            item
+            for item in plan.get("bootstrap_orders", [])
+            if not (isinstance(item, dict) and _is_short_entry_order(item))
+        ]
+        plan["sell_orders"] = [
+            item
+            for item in plan.get("sell_orders", [])
+            if not (isinstance(item, dict) and _is_short_entry_order(item))
+        ]
+
+    report["pruned_bootstrap_orders"] = bootstrap_before - len(plan.get("bootstrap_orders", []))
+    report["pruned_buy_orders"] = buy_before - len(plan.get("buy_orders", []))
+    report["pruned_sell_orders"] = sell_before - len(plan.get("sell_orders", []))
+    report["applied"] = any(
+        int(report[key] or 0) > 0
+        for key in ("pruned_bootstrap_orders", "pruned_buy_orders", "pruned_sell_orders")
+    )
+    return report
+
+
 
 def _resolve_reduce_only_flag(
     *,
@@ -9334,6 +9390,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "short_cover_paused": False,
         "short_cover_pause_reasons": [],
     }
+    entry_permission_gate = {
+        "enabled": False,
+        "allow_entry_long": True,
+        "allow_entry_short": True,
+        "pruned_bootstrap_orders": 0,
+        "pruned_buy_orders": 0,
+        "pruned_sell_orders": 0,
+        "applied": False,
+    }
     take_profit_guard = {
         "enabled": True,
         "min_profit_ratio": getattr(effective_args, "take_profit_min_profit_ratio", None),
@@ -11474,6 +11539,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         state.pop("synthetic_tp_only_watchdog_state", None)
+    if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            allow_entry_long=bool(elastic_volume.get("allow_entry_long", True)),
+            allow_entry_short=bool(elastic_volume.get("allow_entry_short", True)),
+        )
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
     state_now = _isoformat(_utc_now())
@@ -11536,6 +11612,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "elastic_volume": elastic_volume,
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
+        "entry_permission_gate": entry_permission_gate,
         "maker_volatility_inventory": maker_volatility_inventory,
         "best_quote_maker_volume": best_quote_maker_volume,
         "synthetic_trend_follow": synthetic_trend_follow,
