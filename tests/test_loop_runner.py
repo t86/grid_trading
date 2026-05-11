@@ -32,6 +32,7 @@ from grid_optimizer.loop_runner import (
     _generate_competition_inventory_grid_plan,
     _filter_futures_strategy_orders,
     _elastic_volume_config,
+    _elastic_volume_state_snapshot,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_synthetic_resync_price,
@@ -7676,6 +7677,23 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(config.threshold_scale_wide_step, 1.5)
         self.assertEqual(config.pause_scale_defensive, 1.8)
         self.assertEqual(config.max_total_scale_defensive, 1.6)
+
+    def test_elastic_volume_state_snapshot_preserves_recovery_confirmation(self) -> None:
+        snapshot = _elastic_volume_state_snapshot(
+            {
+                "regime": "wide-step",
+                "cooldown_until": None,
+                "pending_regime": "ping-pong-safe",
+                "pending_count": 2,
+            },
+            updated_at="2026-05-11T14:30:00+00:00",
+        )
+
+        self.assertEqual(snapshot["regime"], "wide-step")
+        self.assertIsNone(snapshot["cooldown_until"])
+        self.assertEqual(snapshot["pending_regime"], "ping-pong-safe")
+        self.assertEqual(snapshot["pending_count"], 2)
+        self.assertEqual(snapshot["updated_at"], "2026-05-11T14:30:00+00:00")
 
 
 if __name__ == "__main__":

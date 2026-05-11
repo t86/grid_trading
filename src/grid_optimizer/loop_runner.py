@@ -8356,6 +8356,16 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
     )
 
 
+def _elastic_volume_state_snapshot(elastic_volume: dict[str, Any], *, updated_at: str) -> dict[str, Any]:
+    return {
+        "regime": elastic_volume.get("regime"),
+        "cooldown_until": elastic_volume.get("cooldown_until"),
+        "pending_regime": elastic_volume.get("pending_regime"),
+        "pending_count": int(_safe_float(elastic_volume.get("pending_count"))),
+        "updated_at": updated_at,
+    }
+
+
 def _summarize_elastic_volume_windows(
     summary_path: Path,
     *,
@@ -11561,11 +11571,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state["updated_at"] = state_now
     state["version"] = STATE_VERSION
     if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
-        state["elastic_volume"] = {
-            "regime": elastic_volume.get("regime"),
-            "cooldown_until": elastic_volume.get("cooldown_until"),
-            "updated_at": state_now,
-        }
+        state["elastic_volume"] = _elastic_volume_state_snapshot(elastic_volume, updated_at=state_now)
     else:
         state.pop("elastic_volume", None)
     if sticky_exit_mode["key"]:
