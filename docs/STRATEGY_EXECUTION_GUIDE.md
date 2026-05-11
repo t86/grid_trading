@@ -105,6 +105,35 @@
 - 如果不是通过 web 端拉起，而是手工 `nohup` runner，先在同一 shell 里加载匹配账号的 `binance_api*.env`。否则很容易出现“进程已启动但立即因缺少 API key 退出”的假成功。
 - 如果需要跨电脑查看 `KAT` 巡检结果，使用 [`docs/KAT_GUARD_AUTOMATION.md`](./KAT_GUARD_AUTOMATION.md) 里约定的远端落盘路径，不要依赖本机 automation 列表。
 
+### 定时巡检与 Heartbeat 开发标准
+
+所有定时巡检、heartbeat、自动化监控任务都必须做“规则反推”，不能只复述 latest plan 的当前字段。
+
+每次巡检至少要完成以下判断：
+
+1. 读取当前实际生效参数。
+   - 以 `output/*_loop_latest_plan.json` 为准读取实际 `step_price`、`effective_per_order_notional`、`effective_buy_levels`、`effective_sell_levels`、open orders、actual/synthetic net notional、pause/max/max_total、loss guard。
+   - 同时读取 `output/*_loop_runner_control.json` 和 runner 命令行，区分“启动基准参数”和“动态后实际参数”。
+   - 对动态策略，必须读取对应的内部状态对象，例如 `adaptive_step`、`elastic_volume`、`execution_regime`、`market_bias`、`anti_chase_entry_guard`、`entry_permission_gate`。
+
+2. 按代码规则推导“应该处于什么状态”。
+   - 巡检人必须知道当前策略使用的状态机和阈值来源，必要时直接查代码，而不是凭经验判断。
+   - 对 `competition_elastic_volume_v1`，至少要用当前 `1m/5m amplitude`、库存比例、loss_per_10k、`state_confirm_cycles` 反推候选状态应是 `defensive`、`wide-step`、`ping-pong-safe` 还是 `ping-pong-fast`。
+   - 对 `wide-step`、`defensive` 这类半防守状态，必须说明是否按代码限制了单边 entry，例如已有空仓时 `allow_entry_short=false` 会剪掉 sell entry，已有多仓时 `allow_entry_long=false` 会剪掉 buy entry。
+
+3. 对比“实际状态”和“应有状态”，解释为什么没有切换。
+   - 如果实际状态与代码规则推导一致，要写明触发它的具体指标，例如 `5m amplitude > wide-step threshold`、`inventory_ratio >= hard ratio`、`loss_per_10k > defensive threshold`。
+   - 如果市场条件已经满足恢复，但状态仍停在旧状态，必须检查 `pending_regime`、`pending_count`、`candidate_state`、`last_state`、`state` 文件写回字段是否连续推进。
+   - 任何状态机的确认计数都不能只看 plan；必须核对 runner state 文件是否保存了下一轮需要读取的字段。若 `pending_count` 连续多轮不增长，要当作代码或状态持久化异常排查。
+   - 如果出现 `Unknown order`、持续 reconcile diff、submit validation_failed、Post Only reject 频繁、plan 新鲜但 submit 不执行，都不能只报“runner active”，必须判断是否影响下一轮状态机、订单 diff 或真实挂单。
+
+4. 汇报必须包含决策结论。
+   - 如果无需动作，要说明“为什么无需动作”，例如指标还未满足恢复条件、确认计数正在正常推进、或保护状态符合代码规则。
+   - 如果需要动作，要说明“为什么需要动作”，并列出最小改动范围，例如修复状态写回、调整 control 参数、重启 runner、或等待波动窗口自然滚出。
+   - 若发现代码规则与策略目标冲突，例如目标是高波动刷量但 `wide-step` 实际单边限流，必须明确指出这是策略设计问题，而不是误判为参数不足。
+
+这条标准适用于所有生产巡检任务。任何“只检查进程 active、latest_plan 新鲜、loss 未超标”的巡检都不合格，因为它无法发现状态机卡住、动态参数没有按代码预期切换、或恢复确认计数没有持久化的问题。
+
 原因：
 
 - 当前页面和 web 进程在生产上默认由 `ubuntu` 运行。
