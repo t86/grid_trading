@@ -51,6 +51,12 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(result["current"]["users_count"], 100)
         self.assertAlmostEqual(result["current"]["cumulative_gap"], 50_500.0, places=8)
 
+    def test_chip_futures_hint_uses_live_leaderboard_resource_id(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_chip")
+        _meta, boards = _hinted_boards_for_source(source)
+
+        self.assertEqual(boards[0]["resourceId"], 51202)
+
     def test_build_competition_displacement_volume_reports_adjacent_and_reward_floor_steps(self) -> None:
         board = {
             "leaderboard_unit": "USDT",
