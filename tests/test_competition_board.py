@@ -22,6 +22,7 @@ from grid_optimizer.competition_board import (
     CompetitionSource,
     build_competition_displacement_volume,
     build_reward_volume_targets,
+    competition_board_daily_refresh_due,
     resolve_active_competition_board,
     upsert_competition_entry,
     build_competition_board_snapshot,
@@ -56,6 +57,28 @@ class CompetitionBoardTests(unittest.TestCase):
         _meta, boards = _hinted_boards_for_source(source)
 
         self.assertEqual(boards[0]["resourceId"], 51202)
+
+    def test_competition_board_daily_refresh_due_allows_final_15_cst_after_end(self) -> None:
+        board = {"activity_end_at": "2026-05-10T08:00:00+08:00"}
+
+        self.assertTrue(
+            competition_board_daily_refresh_due(
+                board,
+                now=datetime(2026, 5, 10, 15, 0, tzinfo=competition_board.UTC_PLUS_8),
+            )
+        )
+        self.assertFalse(
+            competition_board_daily_refresh_due(
+                board,
+                now=datetime(2026, 5, 11, 15, 0, tzinfo=competition_board.UTC_PLUS_8),
+            )
+        )
+
+    def test_bill_futures_hint_uses_live_leaderboard_resource_id(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_bill")
+        _meta, boards = _hinted_boards_for_source(source)
+
+        self.assertEqual(boards[0]["resourceId"], 54211)
 
     def test_build_competition_displacement_volume_reports_adjacent_and_reward_floor_steps(self) -> None:
         board = {

@@ -25,6 +25,7 @@ REWARD_PRICE_CACHE_PATH = Path("output/competition_reward_price_cache.json")
 CACHE_TTL_SECONDS = 1800
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 DAILY_STRATEGY_SAMPLE_CUTOFF_HOUR_CST = 14
+COMPETITION_BOARD_TARGET_REFRESH_HOUR_CST = 15
 DAILY_STRATEGY_TRACKED_RANKS = (20, 50, 100, 200, 500)
 FUTURES_MASTER_ARENA_BASE_URL = "https://www.binance.com"
 
@@ -2821,6 +2822,33 @@ def _history_entry_datetime(entry: dict[str, Any]) -> datetime | None:
         if parsed is not None:
             return parsed
     return None
+
+
+def competition_board_daily_refresh_due(
+    board: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    current = (now or datetime.now(UTC_PLUS_8)).astimezone(UTC_PLUS_8)
+    cutoff = current.replace(
+        hour=COMPETITION_BOARD_TARGET_REFRESH_HOUR_CST,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if current < cutoff:
+        return False
+    if not isinstance(board, dict):
+        return True
+    end_at = _parse_iso_datetime(board.get("activity_end_at"))
+    if end_at is None:
+        return True
+    end_cst = end_at.astimezone(UTC_PLUS_8)
+    if current.date() < end_cst.date():
+        return True
+    if current.date() == end_cst.date():
+        return True
+    return False
 
 
 def _normalize_history_index_payload(boards: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:

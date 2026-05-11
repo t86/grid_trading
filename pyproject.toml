@@ -20,6 +20,7 @@ platform-db = [
 [project.scripts]
 grid-opt = "grid_optimizer.cli:main"
 grid-competition-report = "grid_optimizer.competition_report:main"
+grid-competition-board-refresh = "grid_optimizer.competition_board_refresh:main"
 grid-web = "grid_optimizer.web:main"
 grid-dry-run = "grid_optimizer.dry_run:main"
 grid-live-check = "grid_optimizer.live_check:main"
