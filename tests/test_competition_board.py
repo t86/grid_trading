@@ -20,6 +20,7 @@ from grid_optimizer.competition_board import (
     _parse_segments,
     _per_user_reward_from_segment,
     CompetitionSource,
+    build_competition_displacement_volume,
     build_reward_volume_targets,
     resolve_active_competition_board,
     upsert_competition_entry,
@@ -28,6 +29,64 @@ from grid_optimizer.competition_board import (
 
 
 class CompetitionBoardTests(unittest.TestCase):
+    def test_build_competition_displacement_volume_sums_users_needed_to_push_current_out(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [{"rank": rank, "value": 1_000.0 - rank * 10.0} for rank in range(1, 201)],
+            "segments": [
+                {"start_rank": 1, "end_rank": 1, "rank_label": "第 1 名"},
+                {"start_rank": 2, "end_rank": 2, "rank_label": "第 2 名"},
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名"},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名"},
+            ],
+        }
+
+        result = build_competition_displacement_volume(board, current_volume=0.0, target_rank=200)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["current_rank"], 100)
+        self.assertEqual(result["current"]["from_rank"], 100)
+        self.assertEqual(result["current"]["target_rank"], 201)
+        self.assertEqual(result["current"]["last_included_rank"], 200)
+        self.assertEqual(result["current"]["users_count"], 100)
+        self.assertAlmostEqual(result["current"]["cumulative_gap"], 50_500.0, places=8)
+
+    def test_build_competition_displacement_volume_reports_adjacent_and_reward_floor_steps(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [
+                {"rank": 1, "value": 1_000.0},
+                {"rank": 2, "value": 900.0},
+                {"rank": 3, "value": 700.0},
+                {"rank": 21, "value": 500.0},
+                {"rank": 22, "value": 450.0},
+                {"rank": 50, "value": 300.0},
+                {"rank": 51, "value": 280.0},
+                {"rank": 200, "value": 100.0},
+            ],
+            "segments": [
+                {"start_rank": 1, "end_rank": 1, "rank_label": "第 1 名"},
+                {"start_rank": 2, "end_rank": 2, "rank_label": "第 2 名"},
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名"},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名"},
+            ],
+        }
+
+        result = build_competition_displacement_volume(board, current_volume=950.0, target_rank=200)
+
+        self.assertEqual(result["rank_steps"][0]["label"], "第 1 名 -> 第 2 名")
+        self.assertAlmostEqual(result["rank_steps"][0]["cumulative_gap"], 100.0, places=8)
+        floor_21 = next(item for item in result["reward_floor_steps"] if item["from_rank"] == 21)
+        self.assertEqual(floor_21["label"], "第 21 名 -> 第 200 名")
+        self.assertEqual(floor_21["users_count"], 4)
+        self.assertAlmostEqual(floor_21["cumulative_gap"], 870.0, places=8)
+        bands = result["displacement_bands"]
+        self.assertEqual([item["label"] for item in bands], ["第 1 名 -> 第 2 名", "第 2 名 -> 第 3 名", "第 21 名 -> 第 51 名", "第 51 名 -> 第 201 名"])
+        band_21 = next(item for item in bands if item["from_rank"] == 21)
+        self.assertEqual(band_21["target_rank"], 51)
+        self.assertEqual(band_21["last_included_rank"], 50)
+        self.assertAlmostEqual(band_21["cumulative_gap"], 250.0, places=8)
+
     def test_build_reward_volume_targets_maps_20_50_200_loss_targets(self) -> None:
         board = {
             "label": "KAT 合约交易挑战赛",

@@ -24675,6 +24675,50 @@ MONITOR_PAGE = """<!doctype html>
       };
     }
 
+    function buildCompetitionDisplacementCard(displacement) {
+      const payload = (displacement && typeof displacement === "object") ? displacement : {};
+      const current = (payload.current && typeof payload.current === "object") ? payload.current : null;
+      const bands = Array.isArray(payload.displacement_bands) ? payload.displacement_bands.slice(0, 8) : [];
+      const rewardSteps = Array.isArray(payload.reward_floor_steps) ? payload.reward_floor_steps.slice(0, 2) : [];
+      const message = String(payload.message || "").trim();
+      if (!current && !bands.length && !rewardSteps.length && !message) {
+        return null;
+      }
+      const unit = String(payload.leaderboard_unit || "USDT").trim() || "USDT";
+      const rowHtml = [];
+      if (current) {
+        rowHtml.push(`
+          <div class="metric-line">
+            <strong><span class="inline-badge">当前</span>${escapeHtml(current.label || "当前排位")}</strong><br />
+            ${fmtWanVolume(current.cumulative_gap)} ${escapeHtml(unit)} · 需第 ${fmtNum((current.from_rank || 0) + 1, 0)}-${fmtNum(current.last_included_rank || 0, 0)} 名共 ${fmtNum(current.users_count || 0, 0)} 人超过
+          </div>
+        `);
+      }
+      rewardSteps.forEach((item) => {
+        rowHtml.push(`
+          <div class="metric-line">
+            <strong><span class="inline-badge">跨档</span>${escapeHtml(item.label || "--")}</strong><br />
+            ${fmtWanVolume(item.cumulative_gap)} ${escapeHtml(unit)} · 覆盖 ${fmtNum(item.users_count || 0, 0)} 人
+          </div>
+        `);
+      });
+      bands.forEach((item) => {
+        rowHtml.push(`
+          <div class="metric-line">
+            <strong><span class="inline-badge">区段</span>${escapeHtml(item.label || "--")}</strong><br />
+            ${fmtWanVolume(item.cumulative_gap)} ${escapeHtml(unit)} · 覆盖 ${fmtNum(item.users_count || 0, 0)} 人
+          </div>
+        `);
+      });
+      return {
+        label: "挤出奖励区量",
+        value: payload.current_rank ? `当前第 ${fmtNum(payload.current_rank, 0)} 名` : "--",
+        cls: "",
+        sub: `按后续用户逐个超过当前成交量累计 · 当前成交 ${fmtNum(payload.current_volume || 0, 4)} ${unit}`,
+        bodyHtml: `<div class="metric-lines">${rowHtml.join("") || `<div class="metric-line">${escapeHtml(message || "当前没有可用的排位挤出量。")}</div>`}</div>`,
+      };
+    }
+
     function renderCards(data) {
       const trade = data.trade_summary || {};
       const income = data.income_summary || {};
@@ -24690,6 +24734,7 @@ MONITOR_PAGE = """<!doctype html>
       const runnerCfg = runner.config || {};
       const competitionWindow = data.competition_window || {};
       const competitionRewardTargets = data.competition_reward_targets || {};
+      const competitionDisplacement = data.competition_displacement_volume || {};
       const volumeTrigger = data.volume_trigger || {};
       const volatilityTrigger = data.volatility_trigger || {};
       const liveAccount = data.live_account || {};
@@ -24773,13 +24818,6 @@ MONITOR_PAGE = """<!doctype html>
         `分钟停买: ${risk.volatility_buy_pause ? "是" : "否"}`,
         `冻轴: ${risk.shift_frozen ? "是" : "否"}`,
       ].join(" · ");
-      const runnerLabel = runner.is_running ? `PID ${runner.pid}` : (runner.pid ? `PID ${runner.pid} 未运行` : "未检测到");
-      const runnerDetail = [
-        `运行时长: ${runner.elapsed || "--"}`,
-        `apply: ${runnerCfg.apply ? "是" : "否"}`,
-        `间隔: ${fmtNum(runnerCfg.sleep_seconds, 0)}s`,
-        `杠杆: ${runnerCfg.leverage ? `${runnerCfg.leverage}x` : "--"}`,
-      ].join(" · ");
       const competitionWindowStart = competitionWindow.activity_start_at || competitionWindow.stats_start_at || "";
       const competitionWindowEnd = competitionWindow.activity_end_at || "";
       const statsWindowLabel = competitionWindow.label
@@ -24790,23 +24828,22 @@ MONITOR_PAGE = """<!doctype html>
         : "未匹配到交易赛窗口，默认按当前会话统计";
       const cards = [
         { label: "策略状态", value: strategyRunning ? "运行中" : "未活跃", cls: strategyRunning ? "good" : "warn", sub: strategyDetail },
-        { label: "执行进程", value: runnerLabel, cls: runner.is_running ? "good" : "warn", sub: runnerDetail },
         { label: "交易赛窗口", value: statsWindowLabel, cls: "", sub: statsWindowSub },
         { label: "风控硬限制", value: riskValue, cls: riskStatusClass, sub: riskDetail },
-        { label: "会话成交笔数", value: fmtNum(trade.trade_count || 0, 0), cls: "", sub: `Maker: ${fmtNum(trade.maker_count || 0, 0)} · 买/卖: ${fmtNum(trade.buy_count || 0, 0)} / ${fmtNum(trade.sell_count || 0, 0)}` },
         { label: "累计成交额", value: fmtNum(trade.gross_notional || 0, 4), cls: "", sub: `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}` },
         { label: "净收益估算", value: fmtMoney(trade.net_pnl_estimate || 0), cls: statusClass(trade.net_pnl_estimate || 0), sub: `已实现: ${fmtMoney(trade.realized_pnl || 0)} · 浮盈: ${fmtMoney(pos.unrealized_pnl || 0)}` },
         { label: "手续费 / 资金费", value: `${fmtMoney(-(trade.commission || 0))} / ${fmtMoney(income.funding_fee || 0)}`, cls: "", sub: `左侧为折算 USDT 后的累计手续费 · 原始资产: ${escapeHtml(JSON.stringify(trade.commission_raw_by_asset || {}))}` },
-        { label: "审计日志", value: `成交 ${fmtNum(audit.trade_row_count || 0, 0)} / 资金费 ${fmtNum(audit.income_row_count || 0, 0)}`, cls: "", sub: `委托事件: ${fmtNum(audit.order_event_count || 0, 0)} · 提交轮次: ${fmtNum(audit.submit_event_count || 0, 0)} · 计划轮次: ${fmtNum(audit.plan_event_count || 0, 0)}` },
         { label: "当前仓位", value: isNeutralMode ? `净 ${fmtNum(netQty, 0)}` : fmtNum(pos.position_amt || 0, 0), cls: "", sub: `${isNeutralMode ? `Long/Short: ${fmtNum(longQty, 0)} / ${fmtNum(shortQty, 0)} · ${centerLabelText} · 中价名义: ${fmtNum((longQty + shortQty) * (market.mid_price || 0), 4)}` : `开仓均价: ${fmtNum(pos.entry_price || 0, 7)} · ${centerLabelText} · 持仓名义: ${fmtNum(Math.abs(pos.position_amt || 0) * (market.mid_price || 0), 4)}`} · 来源: ${liveAccount.fetched_at ? `账户实时(${fmtTs(liveAccount.fetched_at)})` : "runner快照"}` },
         { label: "当前挂单数", value: fmtNum((data.open_orders || []).length, 0), cls: "", sub: `买/卖: ${fmtNum((data.open_orders || []).filter(x => x.side === "BUY").length, 0)} / ${fmtNum((data.open_orders || []).filter(x => x.side === "SELL").length, 0)} · 来源: ${liveAccount.fetched_at ? "账户实时" : "runner快照"}` },
-        { label: "合约 USDT", value: usdtAsset ? fmtNum(usdtAsset.wallet_balance || 0, 4) : "--", cls: "", sub: usdtAsset ? `可用: ${fmtNum(usdtAsset.available_balance || 0, 4)} · 可提: ${fmtNum(usdtAsset.max_withdraw_amount || 0, 4)}` : "未读到 USDT 资产" },
-        { label: "合约 BNB", value: bnbAsset ? fmtNum(bnbAsset.wallet_balance || 0, 6) : "--", cls: "", sub: bnbAsset ? `可用: ${fmtNum(bnbAsset.available_balance || 0, 6)} · 可提: ${fmtNum(bnbAsset.max_withdraw_amount || 0, 6)}` : "未读到 BNB 资产" },
         { label: "市场", value: `${fmtNum(market.bid_price || 0, 7)} / ${fmtNum(market.ask_price || 0, 7)}`, cls: "", sub: `中价: ${fmtNum(market.mid_price || 0, 7)} · Funding: ${fmtPct(market.funding_rate || 0)}` },
       ];
       const rewardTargetCard = buildCompetitionRewardTargetCard(competitionRewardTargets);
       if (rewardTargetCard) {
         cards.splice(6, 0, rewardTargetCard);
+      }
+      const displacementCard = buildCompetitionDisplacementCard(competitionDisplacement);
+      if (displacementCard) {
+        cards.splice(rewardTargetCard ? 7 : 6, 0, displacementCard);
       }
       summaryEl.innerHTML = cards.map((item) => {
         const label = String(item.label || "");

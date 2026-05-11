@@ -188,6 +188,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("合约 USDT", MONITOR_PAGE)
         self.assertIn("合约 BNB", MONITOR_PAGE)
         self.assertIn("奖励回本量", MONITOR_PAGE)
+        self.assertIn("挤出奖励区量", MONITOR_PAGE)
+        self.assertIn("按后续用户逐个超过当前成交量累计", MONITOR_PAGE)
         self.assertIn("万3", MONITOR_PAGE)
         self.assertIn("万4", MONITOR_PAGE)
         self.assertIn("万5", MONITOR_PAGE)

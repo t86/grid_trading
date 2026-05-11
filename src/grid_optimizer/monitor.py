@@ -40,7 +40,11 @@ from .data import (
     load_binance_api_credentials,
 )
 from .live_check import extract_symbol_position
-from .competition_board import build_reward_volume_targets, resolve_active_competition_board
+from .competition_board import (
+    build_competition_displacement_volume,
+    build_reward_volume_targets,
+    resolve_active_competition_board,
+)
 
 
 def _safe_float(value: Any) -> float:
@@ -2053,6 +2057,7 @@ def _build_monitor_snapshot_uncached(
             "submit_report": submit_report,
         },
         "competition_reward_targets": build_reward_volume_targets(competition_board),
+        "competition_displacement_volume": None,
         "runner": runner,
         "audit": {
             "paths": {key: str(path) for key, path in audit_paths.items()},
@@ -2187,6 +2192,10 @@ def _build_monitor_snapshot_uncached(
             )
             trade_summary["net_pnl_estimate"] = net_pnl_est
             snapshot["trade_summary"] = trade_summary
+            snapshot["competition_displacement_volume"] = build_competition_displacement_volume(
+                competition_board,
+                current_volume=trade_summary.get("gross_notional"),
+            )
             snapshot["income_summary"] = income_summary
             snapshot["hourly_summary"] = hourly_summary
             snapshot["diagnostics"] = {

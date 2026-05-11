@@ -3359,6 +3359,140 @@ def build_reward_volume_targets(
     }
 
 
+def build_competition_displacement_volume(
+    board: dict[str, Any] | None,
+    *,
+    current_volume: float | int | None,
+    target_rank: int = 200,
+) -> dict[str, Any] | None:
+    if not isinstance(board, dict):
+        return None
+    current = _safe_float(current_volume)
+    if current is None or current < 0:
+        current = 0.0
+    rows = [
+        {"rank": int(item["rank"]), "value": float(item["value"])}
+        for item in board.get("rows", [])
+        if isinstance(item, dict)
+        and _safe_int(item.get("rank")) is not None
+        and _safe_float(item.get("value")) is not None
+    ]
+    if not rows:
+        return {
+            "leaderboard_unit": str(board.get("leaderboard_unit", "")).strip(),
+            "current_volume": float(current),
+            "current_rank": None,
+            "current": None,
+            "rank_steps": [],
+            "reward_floor_steps": [],
+            "displacement_bands": [],
+            "message": "当前榜单没有可用排名数据，暂时无法估算挤出排位需要的交易量。",
+        }
+    rows.sort(key=lambda item: item["rank"])
+    current_rank = sum(1 for item in rows if item["value"] > float(current)) + 1
+
+    def _label_for_rank(rank: int) -> str:
+        return f"第 {int(rank)} 名"
+
+    def _gap_summary(
+        from_rank: int,
+        to_rank: int,
+        base_value: float,
+        *,
+        label: str,
+        result_rank: int | None = None,
+    ) -> dict[str, Any]:
+        start = int(from_rank) + 1
+        end = int(to_rank)
+        selected = [item for item in rows if start <= item["rank"] <= end]
+        cumulative = sum(max(0.0, float(base_value) - item["value"]) for item in selected)
+        return {
+            "label": label,
+            "from_rank": int(from_rank),
+            "target_rank": int(result_rank if result_rank is not None else to_rank),
+            "last_included_rank": int(to_rank),
+            "base_value": float(base_value),
+            "users_count": len(selected),
+            "cumulative_gap": float(cumulative),
+            "cumulative_gap_text": f"{float(cumulative):,.2f}",
+        }
+
+    current_summary = None
+    if current_rank <= int(target_rank):
+        current_summary = _gap_summary(
+            current_rank,
+            int(target_rank),
+            float(current),
+            label=f"当前第 {int(current_rank)} 名 -> 第 {int(target_rank) + 1} 名",
+            result_rank=int(target_rank) + 1,
+        )
+
+    rank_steps: list[dict[str, Any]] = []
+    for row in rows:
+        rank = int(row["rank"])
+        if rank >= int(target_rank):
+            continue
+        next_rank = rank + 1
+        if not any(int(item["rank"]) == next_rank for item in rows):
+            continue
+        rank_steps.append(
+            _gap_summary(
+                rank,
+                next_rank,
+                float(row["value"]),
+                label=f"{_label_for_rank(rank)} -> {_label_for_rank(next_rank)}",
+            )
+        )
+
+    reward_floor_steps: list[dict[str, Any]] = []
+    displacement_bands: list[dict[str, Any]] = []
+    for segment in board.get("segments", []):
+        if not isinstance(segment, dict):
+            continue
+        start_rank = _safe_int(segment.get("start_rank"))
+        end_rank = _safe_int(segment.get("end_rank"))
+        if start_rank is None or end_rank is None:
+            continue
+        if start_rank > int(target_rank):
+            continue
+        start_row = next((item for item in rows if int(item["rank"]) == int(start_rank)), None)
+        if start_row is None:
+            continue
+        if start_rank < end_rank:
+            floor_rank = int(target_rank) if int(start_rank) <= int(target_rank) else min(int(end_rank), int(target_rank))
+            reward_floor_steps.append(
+                _gap_summary(
+                    int(start_rank),
+                    floor_rank,
+                    float(start_row["value"]),
+                    label=f"第 {int(start_rank)} 名 -> 第 {int(floor_rank)} 名",
+                )
+            )
+        next_rank = min(int(end_rank) + 1, int(target_rank) + 1)
+        if int(start_rank) < next_rank:
+            displacement_bands.append(
+                _gap_summary(
+                    int(start_rank),
+                    next_rank - 1,
+                    float(start_row["value"]),
+                    label=f"第 {int(start_rank)} 名 -> 第 {int(next_rank)} 名",
+                    result_rank=next_rank,
+                )
+            )
+
+    return {
+        "leaderboard_unit": str(board.get("leaderboard_unit", "")).strip(),
+        "current_volume": float(current),
+        "current_rank": int(current_rank),
+        "target_rank": int(target_rank),
+        "current": current_summary,
+        "rank_steps": rank_steps,
+        "reward_floor_steps": reward_floor_steps,
+        "displacement_bands": displacement_bands,
+        "message": "" if current_summary or rank_steps or reward_floor_steps else "榜单数据不足，暂时无法估算挤出排位需要的交易量。",
+    }
+
+
 def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any]:
     history_index = _load_history_index()
     now = datetime.now(timezone.utc)
