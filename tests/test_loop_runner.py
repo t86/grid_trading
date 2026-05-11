@@ -818,6 +818,46 @@ class LoopRunnerTests(unittest.TestCase):
             [{"side": "SELL", "role": "entry_short"}, {"side": "SELL", "role": "take_profit_long"}],
         )
 
+    def test_apply_entry_permission_gate_limits_entry_order_count(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "role": "entry_long", "price": 1.0},
+                {"side": "BUY", "role": "take_profit_short", "price": 1.1},
+                {"side": "BUY", "role": "entry_long", "price": 0.9},
+                {"side": "BUY", "role": "entry_long", "price": 0.8},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "role": "entry_short", "price": 1.2},
+                {"side": "SELL", "role": "entry_short", "price": 1.3},
+                {"side": "SELL", "role": "take_profit_long", "price": 1.1},
+            ],
+        }
+
+        report = apply_entry_permission_gate(
+            plan,
+            max_entry_long_orders=1,
+            max_entry_short_orders=1,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["pruned_buy_orders"], 2)
+        self.assertEqual(report["pruned_sell_orders"], 1)
+        self.assertEqual(
+            plan["buy_orders"],
+            [
+                {"side": "BUY", "role": "entry_long", "price": 1.0},
+                {"side": "BUY", "role": "take_profit_short", "price": 1.1},
+            ],
+        )
+        self.assertEqual(
+            plan["sell_orders"],
+            [
+                {"side": "SELL", "role": "entry_short", "price": 1.2},
+                {"side": "SELL", "role": "take_profit_long", "price": 1.1},
+            ],
+        )
+
     def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
         plan = {
             "bootstrap_orders": [],

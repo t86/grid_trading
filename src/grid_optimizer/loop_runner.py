@@ -2005,12 +2005,18 @@ def apply_entry_permission_gate(
     *,
     allow_entry_long: bool = True,
     allow_entry_short: bool = True,
+    max_entry_long_orders: int | None = None,
+    max_entry_short_orders: int | None = None,
 ) -> dict[str, Any]:
     """Prune entry orders after late sticky/preservation passes."""
+    long_limit = None if max_entry_long_orders is None else max(int(max_entry_long_orders), 0)
+    short_limit = None if max_entry_short_orders is None else max(int(max_entry_short_orders), 0)
     report = {
-        "enabled": not allow_entry_long or not allow_entry_short,
+        "enabled": not allow_entry_long or not allow_entry_short or long_limit is not None or short_limit is not None,
         "allow_entry_long": bool(allow_entry_long),
         "allow_entry_short": bool(allow_entry_short),
+        "max_entry_long_orders": long_limit,
+        "max_entry_short_orders": short_limit,
         "pruned_bootstrap_orders": 0,
         "pruned_buy_orders": 0,
         "pruned_sell_orders": 0,
@@ -2045,6 +2051,26 @@ def apply_entry_permission_gate(
             for item in plan.get("sell_orders", [])
             if not (isinstance(item, dict) and _is_short_entry_order(item))
         ]
+    if long_limit is not None:
+        kept_long_entries = 0
+        limited_buy_orders = []
+        for item in plan.get("buy_orders", []):
+            if isinstance(item, dict) and _is_long_entry_order(item):
+                if kept_long_entries >= long_limit:
+                    continue
+                kept_long_entries += 1
+            limited_buy_orders.append(item)
+        plan["buy_orders"] = limited_buy_orders
+    if short_limit is not None:
+        kept_short_entries = 0
+        limited_sell_orders = []
+        for item in plan.get("sell_orders", []):
+            if isinstance(item, dict) and _is_short_entry_order(item):
+                if kept_short_entries >= short_limit:
+                    continue
+                kept_short_entries += 1
+            limited_sell_orders.append(item)
+        plan["sell_orders"] = limited_sell_orders
 
     report["pruned_bootstrap_orders"] = bootstrap_before - len(plan.get("bootstrap_orders", []))
     report["pruned_buy_orders"] = buy_before - len(plan.get("buy_orders", []))
@@ -8350,6 +8376,10 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         max_total_scale_ping_pong_safe=float(getattr(args, "elastic_max_total_scale_ping_pong_safe", 1.1)),
         max_total_scale_wide_step=float(getattr(args, "elastic_max_total_scale_wide_step", 1.35)),
         max_total_scale_defensive=float(getattr(args, "elastic_max_total_scale_defensive", 1.6)),
+        max_entry_orders_ping_pong_fast=int(getattr(args, "elastic_max_entry_orders_ping_pong_fast", 6)),
+        max_entry_orders_ping_pong_safe=int(getattr(args, "elastic_max_entry_orders_ping_pong_safe", 4)),
+        max_entry_orders_wide_step=int(getattr(args, "elastic_max_entry_orders_wide_step", 3)),
+        max_entry_orders_defensive=int(getattr(args, "elastic_max_entry_orders_defensive", 2)),
         cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
         state_confirm_cycles=int(getattr(args, "elastic_state_confirm_cycles", 3)),
         cancel_stale_entries_on_cooldown=bool(getattr(args, "elastic_cancel_stale_entries_on_cooldown", True)),
@@ -11554,6 +11584,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             plan,
             allow_entry_long=bool(elastic_volume.get("allow_entry_long", True)),
             allow_entry_short=bool(elastic_volume.get("allow_entry_short", True)),
+            max_entry_long_orders=elastic_volume.get("max_entry_long_orders"),
+            max_entry_short_orders=elastic_volume.get("max_entry_short_orders"),
         )
         if entry_permission_gate.get("applied"):
             desired_orders = [
@@ -12398,6 +12430,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-max-total-scale-ping-pong-safe", type=float, default=1.1)
     parser.add_argument("--elastic-max-total-scale-wide-step", type=float, default=1.35)
     parser.add_argument("--elastic-max-total-scale-defensive", type=float, default=1.6)
+    parser.add_argument("--elastic-max-entry-orders-ping-pong-fast", type=int, default=6)
+    parser.add_argument("--elastic-max-entry-orders-ping-pong-safe", type=int, default=4)
+    parser.add_argument("--elastic-max-entry-orders-wide-step", type=int, default=3)
+    parser.add_argument("--elastic-max-entry-orders-defensive", type=int, default=2)
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
