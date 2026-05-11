@@ -57,6 +57,12 @@ from .data import (
     post_futures_order,
     resolve_futures_market_snapshot,
 )
+from .regime_entry_budget import (
+    RegimeEntryBudgetConfig,
+    RegimeEntryBudgetInputs,
+    regime_entry_budget_state_snapshot,
+    resolve_regime_entry_budget_control,
+)
 from .live_check import extract_symbol_position
 from .maker_flatten_runner import (
     flatten_client_order_prefix,
@@ -2080,6 +2086,34 @@ def apply_entry_permission_gate(
         for key in ("pruned_bootstrap_orders", "pruned_buy_orders", "pruned_sell_orders")
     )
     return report
+
+
+def _summarize_open_entry_exposure(open_orders: Iterable[Any]) -> dict[str, Any]:
+    long_notional = 0.0
+    short_notional = 0.0
+    long_count = 0
+    short_count = 0
+    for item in open_orders:
+        if not isinstance(item, dict):
+            continue
+        qty = abs(_safe_float(item.get("origQty") or item.get("quantity") or item.get("qty")))
+        price = _safe_float(item.get("price"))
+        if price <= 0:
+            price = _safe_float(item.get("stopPrice"))
+        notional = max(qty * price, _safe_float(item.get("notional")))
+        if _is_long_entry_order(item):
+            long_count += 1
+            long_notional += max(notional, 0.0)
+        elif _is_short_entry_order(item):
+            short_count += 1
+            short_notional += max(notional, 0.0)
+    return {
+        "open_entry_long_notional": long_notional,
+        "open_entry_short_notional": short_notional,
+        "open_entry_long_count": long_count,
+        "open_entry_short_count": short_count,
+        "open_non_reduce_entry_orders": long_count + short_count,
+    }
 
 
 
@@ -8386,6 +8420,26 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
     )
 
 
+def _regime_entry_budget_config(args: argparse.Namespace) -> RegimeEntryBudgetConfig:
+    return RegimeEntryBudgetConfig(
+        enabled=bool(getattr(args, "regime_entry_budget_enabled", False)),
+        report_only=bool(getattr(args, "regime_entry_budget_report_only", True)),
+        base_per_order_notional=float(getattr(args, "regime_entry_budget_base_per_order_notional", 60.0)),
+        base_step_ratio=float(getattr(args, "regime_entry_budget_base_step_ratio", 0.0025)),
+        switch_reconcile_confirm_cycles=int(getattr(args, "regime_entry_budget_switch_reconcile_confirm_cycles", 2)),
+        shock_reconcile_confirm_cycles=int(getattr(args, "regime_entry_budget_shock_reconcile_confirm_cycles", 3)),
+        shock_30s_abs_return_ratio=float(getattr(args, "regime_entry_budget_shock_30s_abs_return_ratio", 0.016)),
+        shock_30s_amplitude_ratio=float(getattr(args, "regime_entry_budget_shock_30s_amplitude_ratio", 0.024)),
+        shock_1m_abs_return_ratio=float(getattr(args, "regime_entry_budget_shock_1m_abs_return_ratio", 0.025)),
+        shock_1m_amplitude_ratio=float(getattr(args, "regime_entry_budget_shock_1m_amplitude_ratio", 0.030)),
+        defensive_loss_per_10k_15m=float(getattr(args, "regime_entry_budget_defensive_loss_per_10k_15m", 8.0)),
+        defensive_inventory_usage_ratio=float(getattr(args, "regime_entry_budget_defensive_inventory_usage_ratio", 0.80)),
+        defensive_min_gross_notional_15m=float(getattr(args, "regime_entry_budget_defensive_min_gross_notional_15m", 1000.0)),
+        tick_dominated_ratio=float(getattr(args, "regime_entry_budget_tick_dominated_ratio", 0.0035)),
+        coarse_tick_ratio=float(getattr(args, "regime_entry_budget_coarse_tick_ratio", 0.0080)),
+    )
+
+
 def _elastic_volume_state_snapshot(elastic_volume: dict[str, Any], *, updated_at: str) -> dict[str, Any]:
     return {
         "regime": elastic_volume.get("regime"),
@@ -9037,6 +9091,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "enabled": bool(getattr(effective_args, "elastic_volume_enabled", False)),
         "regime": "disabled" if not bool(getattr(effective_args, "elastic_volume_enabled", False)) else "not_evaluated",
         "applied": False,
+        "reasons": [],
+    }
+    regime_entry_budget: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "regime_entry_budget_enabled", False)),
+        "report_only": bool(getattr(effective_args, "regime_entry_budget_report_only", True)),
+        "state": "disabled" if not bool(getattr(effective_args, "regime_entry_budget_enabled", False)) else "not_evaluated",
         "reasons": [],
     }
 
@@ -11579,6 +11639,63 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         state.pop("synthetic_tp_only_watchdog_state", None)
+    regime_entry_budget_config = _regime_entry_budget_config(effective_args)
+    if regime_entry_budget_config.enabled:
+        open_entry_exposure = _summarize_open_entry_exposure(open_orders_for_diff)
+        elastic_metrics_for_budget = elastic_volume.get("metrics") if isinstance(elastic_volume.get("metrics"), dict) else {}
+        adaptive_metrics_for_budget = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
+        window_30s_for_budget = (
+            adaptive_metrics_for_budget.get("window_30s")
+            if isinstance(adaptive_metrics_for_budget.get("window_30s"), dict)
+            else {}
+        )
+        window_1m_for_budget = (
+            adaptive_metrics_for_budget.get("window_1m")
+            if isinstance(adaptive_metrics_for_budget.get("window_1m"), dict)
+            else {}
+        )
+        window_5m_for_budget = (
+            adaptive_metrics_for_budget.get("window_5m")
+            if isinstance(adaptive_metrics_for_budget.get("window_5m"), dict)
+            else {}
+        )
+        regime_entry_budget = resolve_regime_entry_budget_control(
+            config=regime_entry_budget_config,
+            inputs=RegimeEntryBudgetInputs(
+                now=plan_now,
+                last_state=state.get("regime_entry_budget") if isinstance(state.get("regime_entry_budget"), dict) else {},
+                candidate_regime=str(elastic_volume.get("regime") or "ping-pong-safe"),
+                mid_price=mid_price,
+                tick_size=_safe_float(symbol_info.get("tick_size")),
+                current_long_notional=current_long_notional,
+                current_short_notional=current_short_notional,
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
+                open_non_reduce_entry_orders=int(open_entry_exposure.get("open_non_reduce_entry_orders", 0) or 0),
+                reconcile_ok=True,
+                reconcile_diff_count=0,
+                gross_notional_15m=_safe_float(elastic_metrics_for_budget.get("gross_notional_15m")),
+                loss_per_10k_15m=_safe_float(elastic_metrics_for_budget.get("loss_per_10k_15m")),
+                abs_return_30s_ratio=_safe_float(window_30s_for_budget.get("abs_return_ratio")),
+                amplitude_30s_ratio=_safe_float(window_30s_for_budget.get("amplitude_ratio")),
+                abs_return_1m_ratio=_safe_float(window_1m_for_budget.get("abs_return_ratio")),
+                amplitude_1m_ratio=_safe_float(window_1m_for_budget.get("amplitude_ratio")),
+                amplitude_5m_ratio=_safe_float(window_5m_for_budget.get("amplitude_ratio")),
+            ),
+        )
+        if not bool(regime_entry_budget.get("report_only", True)):
+            entry_permission_gate = apply_entry_permission_gate(
+                plan,
+                allow_entry_long=bool(regime_entry_budget.get("allow_entry_long", True)),
+                allow_entry_short=bool(regime_entry_budget.get("allow_entry_short", True)),
+                max_entry_long_orders=regime_entry_budget.get("long_entry_capacity"),
+                max_entry_short_orders=regime_entry_budget.get("short_entry_capacity"),
+            )
+            if entry_permission_gate.get("applied"):
+                desired_orders = [
+                    *plan["buy_orders"],
+                    *plan["sell_orders"],
+                ]
     if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
         entry_permission_gate = apply_entry_permission_gate(
             plan,
@@ -11606,6 +11723,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         state["elastic_volume"] = _elastic_volume_state_snapshot(elastic_volume, updated_at=state_now)
     else:
         state.pop("elastic_volume", None)
+    if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled"):
+        state["regime_entry_budget"] = regime_entry_budget_state_snapshot(regime_entry_budget, updated_at=state_now)
+    else:
+        state.pop("regime_entry_budget", None)
     if sticky_exit_mode["key"]:
         state["sticky_exit_mode_key"] = sticky_exit_mode["key"]
     else:
@@ -11648,6 +11769,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "adaptive_step": adaptive_step,
         "multi_timeframe_bias": multi_timeframe_bias,
         "elastic_volume": elastic_volume,
+        "regime_entry_budget": regime_entry_budget,
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
         "entry_permission_gate": entry_permission_gate,
@@ -12437,6 +12559,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--regime-entry-budget-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--regime-entry-budget-report-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--regime-entry-budget-base-per-order-notional", type=float, default=60.0)
+    parser.add_argument("--regime-entry-budget-base-step-ratio", type=float, default=0.0025)
+    parser.add_argument("--regime-entry-budget-switch-reconcile-confirm-cycles", type=int, default=2)
+    parser.add_argument("--regime-entry-budget-shock-reconcile-confirm-cycles", type=int, default=3)
+    parser.add_argument("--regime-entry-budget-shock-30s-abs-return-ratio", type=float, default=0.016)
+    parser.add_argument("--regime-entry-budget-shock-30s-amplitude-ratio", type=float, default=0.024)
+    parser.add_argument("--regime-entry-budget-shock-1m-abs-return-ratio", type=float, default=0.025)
+    parser.add_argument("--regime-entry-budget-shock-1m-amplitude-ratio", type=float, default=0.030)
+    parser.add_argument("--regime-entry-budget-defensive-loss-per-10k-15m", type=float, default=8.0)
+    parser.add_argument("--regime-entry-budget-defensive-inventory-usage-ratio", type=float, default=0.80)
+    parser.add_argument("--regime-entry-budget-defensive-min-gross-notional-15m", type=float, default=1000.0)
+    parser.add_argument("--regime-entry-budget-tick-dominated-ratio", type=float, default=0.0035)
+    parser.add_argument("--regime-entry-budget-coarse-tick-ratio", type=float, default=0.0080)
     parser.add_argument("--multi-timeframe-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--multi-timeframe-bias-mode-adapter",
@@ -13114,6 +13251,18 @@ def main() -> None:
         raise SystemExit("--elastic-loss-per-10k sprint/cruise thresholds must be >= 0")
     if args.elastic_loss_per_10k_defensive < 0 or args.elastic_loss_per_10k_cooldown < 0:
         raise SystemExit("--elastic-loss-per-10k defensive/cooldown thresholds must be >= 0")
+    if args.regime_entry_budget_base_per_order_notional <= 0:
+        raise SystemExit("--regime-entry-budget-base-per-order-notional must be > 0")
+    if args.regime_entry_budget_base_step_ratio <= 0:
+        raise SystemExit("--regime-entry-budget-base-step-ratio must be > 0")
+    if args.regime_entry_budget_switch_reconcile_confirm_cycles < 1:
+        raise SystemExit("--regime-entry-budget-switch-reconcile-confirm-cycles must be >= 1")
+    if args.regime_entry_budget_shock_reconcile_confirm_cycles < 1:
+        raise SystemExit("--regime-entry-budget-shock-reconcile-confirm-cycles must be >= 1")
+    if args.regime_entry_budget_defensive_inventory_usage_ratio <= 0:
+        raise SystemExit("--regime-entry-budget-defensive-inventory-usage-ratio must be > 0")
+    if args.regime_entry_budget_tick_dominated_ratio < 0 or args.regime_entry_budget_coarse_tick_ratio < 0:
+        raise SystemExit("--regime-entry-budget tick ratios must be >= 0")
     if not (
         args.elastic_loss_per_10k_sprint
         <= args.elastic_loss_per_10k_cruise
@@ -13646,6 +13795,27 @@ def main() -> None:
                         (plan_report.get("elastic_volume") or {}).get("per_order_scale")
                     ),
                     "elastic_volume_levels_scale": _safe_float((plan_report.get("elastic_volume") or {}).get("levels_scale")),
+                    "regime_entry_budget": dict(plan_report.get("regime_entry_budget") or {}),
+                    "regime_entry_budget_enabled": bool((plan_report.get("regime_entry_budget") or {}).get("enabled")),
+                    "regime_entry_budget_state": str((plan_report.get("regime_entry_budget") or {}).get("state") or ""),
+                    "regime_entry_budget_switching": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("switching")
+                    ),
+                    "regime_entry_budget_shock_guard_active": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("shock_guard_active")
+                    ),
+                    "regime_entry_budget_long_capacity": int(
+                        _safe_float((plan_report.get("regime_entry_budget") or {}).get("long_entry_capacity"))
+                    ),
+                    "regime_entry_budget_short_capacity": int(
+                        _safe_float((plan_report.get("regime_entry_budget") or {}).get("short_entry_capacity"))
+                    ),
+                    "regime_entry_budget_cancel_entry_required": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("cancel_entry_required")
+                    ),
+                    "regime_entry_budget_tick_dominated": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("tick_dominated")
+                    ),
                     "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
                     "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
                     "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
