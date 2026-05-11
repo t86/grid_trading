@@ -9424,6 +9424,61 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             elif not bool(elastic_volume.get("allow_entry_short")) and current_short_notional > current_long_notional:
                 effective_args.sell_levels = 0
 
+    regime_entry_budget_config = _regime_entry_budget_config(effective_args)
+    if regime_entry_budget_config.enabled:
+        budget_open_orders = _decorate_synthetic_open_orders(state=state, open_orders=open_orders) if _is_synthetic_neutral_mode(strategy_mode) else _filter_futures_strategy_orders(open_orders, symbol)
+        open_entry_exposure = _summarize_open_entry_exposure(budget_open_orders)
+        elastic_metrics_for_budget = elastic_volume.get("metrics") if isinstance(elastic_volume.get("metrics"), dict) else {}
+        adaptive_metrics_for_budget = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
+        window_30s_for_budget = (
+            adaptive_metrics_for_budget.get("window_30s")
+            if isinstance(adaptive_metrics_for_budget.get("window_30s"), dict)
+            else {}
+        )
+        window_1m_for_budget = (
+            adaptive_metrics_for_budget.get("window_1m")
+            if isinstance(adaptive_metrics_for_budget.get("window_1m"), dict)
+            else {}
+        )
+        window_5m_for_budget = (
+            adaptive_metrics_for_budget.get("window_5m")
+            if isinstance(adaptive_metrics_for_budget.get("window_5m"), dict)
+            else {}
+        )
+        regime_entry_budget = resolve_regime_entry_budget_control(
+            config=regime_entry_budget_config,
+            inputs=RegimeEntryBudgetInputs(
+                now=plan_now,
+                last_state=state.get("regime_entry_budget") if isinstance(state.get("regime_entry_budget"), dict) else {},
+                candidate_regime=str(elastic_volume.get("regime") or "ping-pong-safe"),
+                mid_price=mid_price,
+                tick_size=_safe_float(symbol_info.get("tick_size")),
+                current_long_notional=current_long_notional,
+                current_short_notional=current_short_notional,
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
+                open_non_reduce_entry_orders=int(open_entry_exposure.get("open_non_reduce_entry_orders", 0) or 0),
+                reconcile_ok=True,
+                reconcile_diff_count=0,
+                gross_notional_15m=_safe_float(elastic_metrics_for_budget.get("gross_notional_15m")),
+                loss_per_10k_15m=_safe_float(elastic_metrics_for_budget.get("loss_per_10k_15m")),
+                abs_return_30s_ratio=_safe_float(window_30s_for_budget.get("abs_return_ratio")),
+                amplitude_30s_ratio=_safe_float(window_30s_for_budget.get("amplitude_ratio")),
+                abs_return_1m_ratio=_safe_float(window_1m_for_budget.get("abs_return_ratio")),
+                amplitude_1m_ratio=_safe_float(window_1m_for_budget.get("amplitude_ratio")),
+                amplitude_5m_ratio=_safe_float(window_5m_for_budget.get("amplitude_ratio")),
+            ),
+        )
+        if not bool(regime_entry_budget.get("report_only", True)):
+            effective_args = argparse.Namespace(**vars(effective_args))
+            if _safe_float(regime_entry_budget.get("effective_step_price")) > 0:
+                effective_args.step_price = _safe_float(regime_entry_budget.get("effective_step_price"))
+            if _safe_float(regime_entry_budget.get("effective_per_order_notional")) > 0:
+                effective_args.per_order_notional = _safe_float(regime_entry_budget.get("effective_per_order_notional"))
+            if bool(regime_entry_budget.get("cancel_entry_required")):
+                effective_args.buy_levels = 0
+                effective_args.sell_levels = 0
+
     def _apply_multi_timeframe_side_scheduler(*, long_notional: float, short_notional: float) -> None:
         nonlocal effective_args, multi_timeframe_bias
         if not bool(multi_timeframe_bias_config.enabled and multi_timeframe_bias_config.scheduler_enabled):
@@ -11639,63 +11694,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         state.pop("synthetic_tp_only_watchdog_state", None)
-    regime_entry_budget_config = _regime_entry_budget_config(effective_args)
-    if regime_entry_budget_config.enabled:
-        open_entry_exposure = _summarize_open_entry_exposure(open_orders_for_diff)
-        elastic_metrics_for_budget = elastic_volume.get("metrics") if isinstance(elastic_volume.get("metrics"), dict) else {}
-        adaptive_metrics_for_budget = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
-        window_30s_for_budget = (
-            adaptive_metrics_for_budget.get("window_30s")
-            if isinstance(adaptive_metrics_for_budget.get("window_30s"), dict)
-            else {}
+    if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled") and not bool(
+        regime_entry_budget.get("report_only", True)
+    ):
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            allow_entry_long=bool(regime_entry_budget.get("allow_entry_long", True)),
+            allow_entry_short=bool(regime_entry_budget.get("allow_entry_short", True)),
+            max_entry_long_orders=regime_entry_budget.get("long_entry_capacity"),
+            max_entry_short_orders=regime_entry_budget.get("short_entry_capacity"),
         )
-        window_1m_for_budget = (
-            adaptive_metrics_for_budget.get("window_1m")
-            if isinstance(adaptive_metrics_for_budget.get("window_1m"), dict)
-            else {}
-        )
-        window_5m_for_budget = (
-            adaptive_metrics_for_budget.get("window_5m")
-            if isinstance(adaptive_metrics_for_budget.get("window_5m"), dict)
-            else {}
-        )
-        regime_entry_budget = resolve_regime_entry_budget_control(
-            config=regime_entry_budget_config,
-            inputs=RegimeEntryBudgetInputs(
-                now=plan_now,
-                last_state=state.get("regime_entry_budget") if isinstance(state.get("regime_entry_budget"), dict) else {},
-                candidate_regime=str(elastic_volume.get("regime") or "ping-pong-safe"),
-                mid_price=mid_price,
-                tick_size=_safe_float(symbol_info.get("tick_size")),
-                current_long_notional=current_long_notional,
-                current_short_notional=current_short_notional,
-                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
-                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
-                open_non_reduce_entry_orders=int(open_entry_exposure.get("open_non_reduce_entry_orders", 0) or 0),
-                reconcile_ok=True,
-                reconcile_diff_count=0,
-                gross_notional_15m=_safe_float(elastic_metrics_for_budget.get("gross_notional_15m")),
-                loss_per_10k_15m=_safe_float(elastic_metrics_for_budget.get("loss_per_10k_15m")),
-                abs_return_30s_ratio=_safe_float(window_30s_for_budget.get("abs_return_ratio")),
-                amplitude_30s_ratio=_safe_float(window_30s_for_budget.get("amplitude_ratio")),
-                abs_return_1m_ratio=_safe_float(window_1m_for_budget.get("abs_return_ratio")),
-                amplitude_1m_ratio=_safe_float(window_1m_for_budget.get("amplitude_ratio")),
-                amplitude_5m_ratio=_safe_float(window_5m_for_budget.get("amplitude_ratio")),
-            ),
-        )
-        if not bool(regime_entry_budget.get("report_only", True)):
-            entry_permission_gate = apply_entry_permission_gate(
-                plan,
-                allow_entry_long=bool(regime_entry_budget.get("allow_entry_long", True)),
-                allow_entry_short=bool(regime_entry_budget.get("allow_entry_short", True)),
-                max_entry_long_orders=regime_entry_budget.get("long_entry_capacity"),
-                max_entry_short_orders=regime_entry_budget.get("short_entry_capacity"),
-            )
-            if entry_permission_gate.get("applied"):
-                desired_orders = [
-                    *plan["buy_orders"],
-                    *plan["sell_orders"],
-                ]
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
     if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
         entry_permission_gate = apply_entry_permission_gate(
             plan,

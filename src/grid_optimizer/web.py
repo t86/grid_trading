@@ -3466,6 +3466,21 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "elastic_cooldown_seconds": 120.0,
     "elastic_state_confirm_cycles": 3,
     "elastic_cancel_stale_entries_on_cooldown": True,
+    "regime_entry_budget_enabled": False,
+    "regime_entry_budget_report_only": True,
+    "regime_entry_budget_base_per_order_notional": 60.0,
+    "regime_entry_budget_base_step_ratio": 0.0025,
+    "regime_entry_budget_switch_reconcile_confirm_cycles": 2,
+    "regime_entry_budget_shock_reconcile_confirm_cycles": 3,
+    "regime_entry_budget_shock_30s_abs_return_ratio": 0.016,
+    "regime_entry_budget_shock_30s_amplitude_ratio": 0.024,
+    "regime_entry_budget_shock_1m_abs_return_ratio": 0.025,
+    "regime_entry_budget_shock_1m_amplitude_ratio": 0.030,
+    "regime_entry_budget_defensive_loss_per_10k_15m": 8.0,
+    "regime_entry_budget_defensive_inventory_usage_ratio": 0.80,
+    "regime_entry_budget_defensive_min_gross_notional_15m": 1000.0,
+    "regime_entry_budget_tick_dominated_ratio": 0.0035,
+    "regime_entry_budget_coarse_tick_ratio": 0.0080,
     "multi_timeframe_bias_enabled": False,
     "multi_timeframe_bias_mode_adapter": "auto",
     "multi_timeframe_bias_low_zone_threshold": 0.35,
@@ -8414,6 +8429,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_confirm_normal_to_caution",
         "multi_timeframe_bias_max_level_delta",
         "elastic_state_confirm_cycles",
+        "regime_entry_budget_switch_reconcile_confirm_cycles",
+        "regime_entry_budget_shock_reconcile_confirm_cycles",
         "synthetic_flow_sleeve_levels",
         "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
@@ -8436,6 +8453,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_enabled",
         "best_quote_maker_volume_enabled",
         "elastic_volume_enabled",
+        "regime_entry_budget_enabled",
+        "regime_entry_budget_report_only",
         "elastic_cancel_stale_entries_on_cooldown",
         "multi_timeframe_bias_enabled",
         "execution_regime_enabled",
@@ -8520,6 +8539,17 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "elastic_levels_scale_sprint",
         "elastic_levels_scale_defensive",
         "elastic_cooldown_seconds",
+        "regime_entry_budget_base_per_order_notional",
+        "regime_entry_budget_base_step_ratio",
+        "regime_entry_budget_shock_30s_abs_return_ratio",
+        "regime_entry_budget_shock_30s_amplitude_ratio",
+        "regime_entry_budget_shock_1m_abs_return_ratio",
+        "regime_entry_budget_shock_1m_amplitude_ratio",
+        "regime_entry_budget_defensive_loss_per_10k_15m",
+        "regime_entry_budget_defensive_inventory_usage_ratio",
+        "regime_entry_budget_defensive_min_gross_notional_15m",
+        "regime_entry_budget_tick_dominated_ratio",
+        "regime_entry_budget_coarse_tick_ratio",
         "execution_regime_vol_p50_ratio",
         "execution_regime_vol_p95_ratio",
         "execution_regime_spread_p50_bps",
@@ -9350,6 +9380,33 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         if config.get("elastic_cancel_stale_entries_on_cooldown", True)
         else "--no-elastic-cancel-stale-entries-on-cooldown"
     )
+    command.append(
+        "--regime-entry-budget-enabled"
+        if config.get("regime_entry_budget_enabled", False)
+        else "--no-regime-entry-budget-enabled"
+    )
+    command.append(
+        "--regime-entry-budget-report-only"
+        if config.get("regime_entry_budget_report_only", True)
+        else "--no-regime-entry-budget-report-only"
+    )
+    for key, flag in (
+        ("regime_entry_budget_base_per_order_notional", "--regime-entry-budget-base-per-order-notional"),
+        ("regime_entry_budget_base_step_ratio", "--regime-entry-budget-base-step-ratio"),
+        ("regime_entry_budget_switch_reconcile_confirm_cycles", "--regime-entry-budget-switch-reconcile-confirm-cycles"),
+        ("regime_entry_budget_shock_reconcile_confirm_cycles", "--regime-entry-budget-shock-reconcile-confirm-cycles"),
+        ("regime_entry_budget_shock_30s_abs_return_ratio", "--regime-entry-budget-shock-30s-abs-return-ratio"),
+        ("regime_entry_budget_shock_30s_amplitude_ratio", "--regime-entry-budget-shock-30s-amplitude-ratio"),
+        ("regime_entry_budget_shock_1m_abs_return_ratio", "--regime-entry-budget-shock-1m-abs-return-ratio"),
+        ("regime_entry_budget_shock_1m_amplitude_ratio", "--regime-entry-budget-shock-1m-amplitude-ratio"),
+        ("regime_entry_budget_defensive_loss_per_10k_15m", "--regime-entry-budget-defensive-loss-per-10k-15m"),
+        ("regime_entry_budget_defensive_inventory_usage_ratio", "--regime-entry-budget-defensive-inventory-usage-ratio"),
+        ("regime_entry_budget_defensive_min_gross_notional_15m", "--regime-entry-budget-defensive-min-gross-notional-15m"),
+        ("regime_entry_budget_tick_dominated_ratio", "--regime-entry-budget-tick-dominated-ratio"),
+        ("regime_entry_budget_coarse_tick_ratio", "--regime-entry-budget-coarse-tick-ratio"),
+    ):
+        if config.get(key) is not None:
+            command.extend([flag, str(config[key])])
     command.append(
         "--multi-timeframe-bias-enabled"
         if config.get("multi_timeframe_bias_enabled", False)
