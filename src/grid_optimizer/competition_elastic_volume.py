@@ -53,6 +53,10 @@ class ElasticVolumeConfig:
     max_total_scale_ping_pong_safe: float = 1.1
     max_total_scale_wide_step: float = 1.35
     max_total_scale_defensive: float = 1.6
+    max_entry_orders_ping_pong_fast: int = 6
+    max_entry_orders_ping_pong_safe: int = 4
+    max_entry_orders_wide_step: int = 3
+    max_entry_orders_defensive: int = 2
     cooldown_seconds: float = 120.0
     state_confirm_cycles: int = 3
     cancel_stale_entries_on_cooldown: bool = True
@@ -161,6 +165,8 @@ def _base_control(
         "pending_regime": None,
         "pending_count": 0,
         "cancel_stale_entries": False,
+        "max_entry_long_orders": None,
+        "max_entry_short_orders": None,
         "metrics": {},
     }
 
@@ -175,6 +181,7 @@ def _state_scales(config: ElasticVolumeConfig, regime: str) -> dict[str, float]:
             "threshold_scale": config.threshold_scale_defensive,
             "pause_scale": config.pause_scale_defensive,
             "max_total_scale": config.max_total_scale_defensive,
+            "max_entry_orders": config.max_entry_orders_defensive,
         }
     if regime == "wide-step":
         return {
@@ -185,6 +192,7 @@ def _state_scales(config: ElasticVolumeConfig, regime: str) -> dict[str, float]:
             "threshold_scale": config.threshold_scale_wide_step,
             "pause_scale": config.pause_scale_wide_step,
             "max_total_scale": config.max_total_scale_wide_step,
+            "max_entry_orders": config.max_entry_orders_wide_step,
         }
     if regime == "ping-pong-fast":
         return {
@@ -195,6 +203,7 @@ def _state_scales(config: ElasticVolumeConfig, regime: str) -> dict[str, float]:
             "threshold_scale": config.threshold_scale_ping_pong_fast,
             "pause_scale": config.pause_scale_ping_pong_fast,
             "max_total_scale": config.max_total_scale_ping_pong_fast,
+            "max_entry_orders": config.max_entry_orders_ping_pong_fast,
         }
     return {
         "step_scale": config.base_step_multiplier_ping_pong_safe,
@@ -204,11 +213,17 @@ def _state_scales(config: ElasticVolumeConfig, regime: str) -> dict[str, float]:
         "threshold_scale": config.threshold_scale_ping_pong_safe,
         "pause_scale": config.pause_scale_ping_pong_safe,
         "max_total_scale": config.max_total_scale_ping_pong_safe,
+        "max_entry_orders": config.max_entry_orders_ping_pong_safe,
     }
 
 
 def _control_for_state(config: ElasticVolumeConfig, regime: str, reasons: list[str] | None = None) -> dict[str, Any]:
-    return _base_control(enabled=True, regime=regime, reasons=reasons, **_state_scales(config, regime))
+    scales = _state_scales(config, regime)
+    max_entry_orders = max(int(scales.pop("max_entry_orders", 0)), 0)
+    control = _base_control(enabled=True, regime=regime, reasons=reasons, **scales)
+    control["max_entry_long_orders"] = max_entry_orders
+    control["max_entry_short_orders"] = max_entry_orders
+    return control
 
 
 def resolve_elastic_volume_control(
@@ -224,12 +239,15 @@ def resolve_elastic_volume_control(
     loss_15m = _loss_per_10k(inputs.net_pnl_15m, inputs.gross_notional_15m)
     long_notional = max(_safe_float(inputs.long_notional), 0.0)
     short_notional = max(_safe_float(inputs.short_notional), 0.0)
+    net = _safe_float(inputs.actual_net_notional)
+    directional_long_notional = max(long_notional, net if net > 0 else 0.0)
+    directional_short_notional = max(short_notional, -net if net < 0 else 0.0)
     max_long = max(_safe_float(inputs.max_long_notional), 0.0)
     max_short = max(_safe_float(inputs.max_short_notional), 0.0)
-    inventory_ratio = _inventory_ratio(long_notional, short_notional, max_long, max_short)
+    inventory_ratio = _inventory_ratio(directional_long_notional, directional_short_notional, max_long, max_short)
     threshold_inventory_ratio = _inventory_ratio_against_threshold(
-        long_notional,
-        short_notional,
+        directional_long_notional,
+        directional_short_notional,
         _safe_float(inputs.threshold_position_notional),
     )
     raw_scale = max(_safe_float(inputs.adaptive_step_raw_scale), 0.0)
@@ -319,14 +337,13 @@ def resolve_elastic_volume_control(
 
     control["last_regime"] = last_regime
 
-    net = _safe_float(inputs.actual_net_notional)
     if control["regime"] in {"defensive", "wide-step"}:
-        if long_notional >= short_notional and long_notional > 0:
+        if directional_long_notional >= directional_short_notional and directional_long_notional > 0:
             control["allow_entry_long"] = False
             control["allow_reduce_long"] = True
             if control["regime"] == "wide-step":
                 control["allow_entry_short"] = True
-        elif short_notional > 0:
+        elif directional_short_notional > 0:
             control["allow_entry_short"] = False
             control["allow_reduce_short"] = True
             if control["regime"] == "wide-step":
@@ -335,6 +352,25 @@ def resolve_elastic_volume_control(
             control["allow_entry_long"] = False
         elif net < 0:
             control["allow_entry_short"] = False
+    elif control["regime"] in {"ping-pong-fast", "ping-pong-safe"}:
+        soft_ratio = (
+            max(_safe_float(config.inventory_soft_ratio_ping_pong_fast), 0.0)
+            if control["regime"] == "ping-pong-fast"
+            else max(_safe_float(config.inventory_soft_ratio_ping_pong_safe), 0.0)
+        )
+        if threshold_inventory_ratio >= soft_ratio:
+            if directional_long_notional >= directional_short_notional and directional_long_notional > 0:
+                control["allow_entry_long"] = False
+                control["reasons"].append("ping_pong_inventory_entry_gate")
+            elif directional_short_notional > 0:
+                control["allow_entry_short"] = False
+                control["reasons"].append("ping_pong_inventory_entry_gate")
+            elif net > 0:
+                control["allow_entry_long"] = False
+                control["reasons"].append("ping_pong_inventory_entry_gate")
+            elif net < 0:
+                control["allow_entry_short"] = False
+                control["reasons"].append("ping_pong_inventory_entry_gate")
 
     if control["regime"] == "wide-step" and (
         (bias_regime == "low_long_bias" and not control["allow_entry_long"])
@@ -357,6 +393,8 @@ def resolve_elastic_volume_control(
         "long_notional": long_notional,
         "short_notional": short_notional,
         "actual_net_notional": net,
+        "directional_long_notional": directional_long_notional,
+        "directional_short_notional": directional_short_notional,
         "inventory_ratio": inventory_ratio,
         "threshold_inventory_ratio": threshold_inventory_ratio,
         "adaptive_step_raw_scale": raw_scale,

@@ -256,6 +256,44 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(control["metrics"]["loss_per_10k_5m"], 1.5)
         self.assertAlmostEqual(control["metrics"]["gross_notional_5m"], 20_000.0)
 
+    def test_ping_pong_soft_inventory_blocks_same_direction_entry(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True, inventory_soft_ratio_ping_pong_safe=0.30),
+            inputs=_inputs(
+                long_notional=0.0,
+                short_notional=0.0,
+                actual_net_notional=500.0,
+                threshold_position_notional=1_500.0,
+                max_long_notional=5_000.0,
+                max_short_notional=5_000.0,
+                volatility_1m_amplitude_ratio=0.0040,
+                volatility_5m_amplitude_ratio=0.0070,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "ping-pong-safe")
+        self.assertFalse(control["allow_entry_long"])
+        self.assertTrue(control["allow_entry_short"])
+        self.assertIn("ping_pong_inventory_entry_gate", control["reasons"])
+        self.assertAlmostEqual(control["metrics"]["directional_long_notional"], 500.0)
+
+    def test_elastic_control_exposes_entry_order_caps(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(
+                enabled=True,
+                max_entry_orders_ping_pong_safe=3,
+                max_entry_orders_wide_step=2,
+            ),
+            inputs=_inputs(
+                volatility_1m_amplitude_ratio=0.0040,
+                volatility_5m_amplitude_ratio=0.0070,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "ping-pong-safe")
+        self.assertEqual(control["max_entry_long_orders"], 3)
+        self.assertEqual(control["max_entry_short_orders"], 3)
+
 
 if __name__ == "__main__":
     unittest.main()
