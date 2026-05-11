@@ -3522,6 +3522,60 @@ def build_competition_displacement_volume(
     }
 
 
+def build_competition_entry_volume_targets(
+    board: dict[str, Any] | None,
+    *,
+    current_volume: float | int | None,
+    target_ranks: tuple[int, ...] = (1, 2, 3, 4, 5, 20, 50, 200),
+) -> dict[str, Any] | None:
+    if not isinstance(board, dict):
+        return None
+    current = _safe_float(current_volume)
+    if current is None or current < 0:
+        current = 0.0
+    rows_by_rank: dict[int, float] = {}
+    for item in board.get("rows", []):
+        if not isinstance(item, dict):
+            continue
+        rank = _safe_int(item.get("rank"))
+        value = _safe_float(item.get("value"))
+        if rank is None or value is None:
+            continue
+        rows_by_rank[int(rank)] = float(value)
+    targets: list[dict[str, Any]] = []
+    for rank in target_ranks:
+        target_value = rows_by_rank.get(int(rank))
+        if target_value is None:
+            targets.append(
+                {
+                    "rank": int(rank),
+                    "rank_label": f"第 {int(rank)} 名",
+                    "target_value": None,
+                    "additional_volume": None,
+                    "additional_volume_text": "",
+                    "status": "missing",
+                }
+            )
+            continue
+        additional = max(0.0, float(target_value) - float(current))
+        targets.append(
+            {
+                "rank": int(rank),
+                "rank_label": f"第 {int(rank)} 名",
+                "target_value": float(target_value),
+                "additional_volume": float(additional),
+                "additional_volume_text": f"{float(additional):,.2f}",
+                "status": "reached" if additional <= 0 else "needed",
+            }
+        )
+    return {
+        "leaderboard_unit": str(board.get("leaderboard_unit", "")).strip(),
+        "current_volume": float(current),
+        "targets": targets,
+        "message": "" if rows_by_rank else "当前榜单没有可用排名数据，暂时无法估算挤进各档需要的交易量。",
+    }
+
+
 def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any]:
     history_index = _load_history_index()
     now = datetime.now(timezone.utc)

@@ -24719,6 +24719,35 @@ MONITOR_PAGE = """<!doctype html>
       };
     }
 
+    function buildCompetitionEntryTargetCard(targets) {
+      const payload = (targets && typeof targets === "object") ? targets : {};
+      const rows = Array.isArray(payload.targets) ? payload.targets : [];
+      const message = String(payload.message || "").trim();
+      if (!rows.length && !message) {
+        return null;
+      }
+      const unit = String(payload.leaderboard_unit || "USDT").trim() || "USDT";
+      const rowHtml = rows.map((item) => {
+        const reached = String(item.status || "") === "reached";
+        const missing = String(item.status || "") === "missing";
+        const valueText = missing ? "--" : (reached ? "已达" : fmtWanVolume(item.additional_volume));
+        const targetText = item.target_value === null || item.target_value === undefined ? "--" : fmtWanVolume(item.target_value);
+        return `
+          <div class="metric-line">
+            <strong><span class="inline-badge">${escapeHtml(item.rank_label || "--")}</span>${escapeHtml(reached ? "已达" : "还差")}</strong><br />
+            ${escapeHtml(valueText)} ${escapeHtml(unit)} · 榜单量 ${escapeHtml(targetText)} ${escapeHtml(unit)}
+          </div>
+        `;
+      }).join("");
+      return {
+        label: "挤进交易量",
+        value: "1 / 2 / 3 / 4 / 5 / 20 / 50 / 200",
+        cls: "",
+        sub: `按当前成交量计算进入目标名次还差多少 · 当前成交 ${fmtNum(payload.current_volume || 0, 4)} ${unit}`,
+        bodyHtml: `<div class="metric-lines">${rowHtml || `<div class="metric-line">${escapeHtml(message || "当前没有可用的挤进交易量目标。")}</div>`}</div>`,
+      };
+    }
+
     function renderCards(data) {
       const trade = data.trade_summary || {};
       const income = data.income_summary || {};
@@ -24735,6 +24764,7 @@ MONITOR_PAGE = """<!doctype html>
       const competitionWindow = data.competition_window || {};
       const competitionRewardTargets = data.competition_reward_targets || {};
       const competitionDisplacement = data.competition_displacement_volume || {};
+      const competitionEntryTargets = data.competition_entry_volume_targets || {};
       const volumeTrigger = data.volume_trigger || {};
       const volatilityTrigger = data.volatility_trigger || {};
       const liveAccount = data.live_account || {};
@@ -24844,6 +24874,10 @@ MONITOR_PAGE = """<!doctype html>
       const displacementCard = buildCompetitionDisplacementCard(competitionDisplacement);
       if (displacementCard) {
         cards.splice(rewardTargetCard ? 7 : 6, 0, displacementCard);
+      }
+      const entryTargetCard = buildCompetitionEntryTargetCard(competitionEntryTargets);
+      if (entryTargetCard) {
+        cards.splice((rewardTargetCard ? 7 : 6) + (displacementCard ? 1 : 0), 0, entryTargetCard);
       }
       summaryEl.innerHTML = cards.map((item) => {
         const label = String(item.label || "");

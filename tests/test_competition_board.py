@@ -21,6 +21,7 @@ from grid_optimizer.competition_board import (
     _per_user_reward_from_segment,
     CompetitionSource,
     build_competition_displacement_volume,
+    build_competition_entry_volume_targets,
     build_reward_volume_targets,
     competition_board_daily_refresh_due,
     resolve_active_competition_board,
@@ -51,6 +52,32 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(result["current"]["last_included_rank"], 200)
         self.assertEqual(result["current"]["users_count"], 100)
         self.assertAlmostEqual(result["current"]["cumulative_gap"], 50_500.0, places=8)
+
+    def test_build_competition_entry_volume_targets_reports_gap_to_each_rank(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [
+                {"rank": 1, "value": 1_000.0},
+                {"rank": 2, "value": 900.0},
+                {"rank": 3, "value": 800.0},
+                {"rank": 4, "value": 700.0},
+                {"rank": 5, "value": 600.0},
+                {"rank": 20, "value": 500.0},
+                {"rank": 50, "value": 300.0},
+                {"rank": 200, "value": 100.0},
+            ],
+        }
+
+        result = build_competition_entry_volume_targets(board, current_volume=650.0)
+
+        self.assertEqual(result["current_volume"], 650.0)
+        self.assertEqual([item["rank"] for item in result["targets"]], [1, 2, 3, 4, 5, 20, 50, 200])
+        rank_5 = next(item for item in result["targets"] if item["rank"] == 5)
+        self.assertEqual(rank_5["status"], "reached")
+        self.assertEqual(rank_5["additional_volume"], 0.0)
+        rank_4 = next(item for item in result["targets"] if item["rank"] == 4)
+        self.assertEqual(rank_4["status"], "needed")
+        self.assertAlmostEqual(rank_4["additional_volume"], 50.0, places=8)
 
     def test_chip_futures_hint_uses_live_leaderboard_resource_id(self) -> None:
         source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_chip")
