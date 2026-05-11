@@ -11709,7 +11709,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 *plan["buy_orders"],
                 *plan["sell_orders"],
             ]
-    if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
+    regime_entry_budget_controls_entry = bool(
+        isinstance(regime_entry_budget, dict)
+        and regime_entry_budget.get("enabled")
+        and not bool(regime_entry_budget.get("report_only", True))
+    )
+    if isinstance(elastic_volume, dict) and elastic_volume.get("enabled") and not regime_entry_budget_controls_entry:
         entry_permission_gate = apply_entry_permission_gate(
             plan,
             allow_entry_long=bool(elastic_volume.get("allow_entry_long", True)),
