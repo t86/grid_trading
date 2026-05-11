@@ -31,6 +31,7 @@ from grid_optimizer.loop_runner import (
     _custom_grid_levels_above_current,
     _generate_competition_inventory_grid_plan,
     _filter_futures_strategy_orders,
+    _elastic_volume_config,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_synthetic_resync_price,
@@ -7556,6 +7557,68 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(result["effective_step_price"], 0.0001, places=8)
         self.assertAlmostEqual(result["effective_per_order_notional"], 100.0, places=8)
         self.assertAlmostEqual(result["effective_pause_buy_position_notional"], 2000.0, places=8)
+
+    def test_elastic_volume_config_reads_four_state_fields(self) -> None:
+        args = Namespace(
+            elastic_volume_enabled=True,
+            elastic_loss_per_10k_sprint=2.0,
+            elastic_loss_per_10k_cruise=3.5,
+            elastic_loss_per_10k_defensive=5.0,
+            elastic_loss_per_10k_cooldown=6.5,
+            elastic_inventory_soft_ratio=0.6,
+            elastic_inventory_hard_ratio=0.9,
+            elastic_inventory_soft_ratio_ping_pong_fast=0.30,
+            elastic_inventory_hard_ratio_ping_pong_fast=0.45,
+            elastic_inventory_soft_ratio_ping_pong_safe=0.45,
+            elastic_inventory_hard_ratio_ping_pong_safe=0.60,
+            elastic_inventory_soft_ratio_wide_step=0.60,
+            elastic_inventory_hard_ratio_wide_step=0.80,
+            elastic_step_scale_sprint=0.8,
+            elastic_step_scale_defensive=1.8,
+            elastic_step_scale_cooldown=3.0,
+            elastic_base_step_multiplier_ping_pong_fast=0.8,
+            elastic_base_step_multiplier_ping_pong_safe=1.2,
+            elastic_base_step_multiplier_wide_step=2.5,
+            elastic_base_step_multiplier_defensive=3.5,
+            elastic_per_order_scale_sprint=1.25,
+            elastic_per_order_scale_defensive=0.65,
+            elastic_per_order_scale_ping_pong_fast=1.0,
+            elastic_per_order_scale_ping_pong_safe=0.9,
+            elastic_per_order_scale_wide_step=0.6,
+            elastic_per_order_scale_defensive_state=0.4,
+            elastic_levels_scale_sprint=1.25,
+            elastic_levels_scale_defensive=0.65,
+            elastic_levels_scale_ping_pong_fast=1.0,
+            elastic_levels_scale_ping_pong_safe=0.85,
+            elastic_levels_scale_wide_step=0.65,
+            elastic_levels_scale_defensive_state=0.35,
+            elastic_threshold_scale_ping_pong_fast=1.0,
+            elastic_threshold_scale_ping_pong_safe=1.1,
+            elastic_threshold_scale_wide_step=1.5,
+            elastic_threshold_scale_defensive=1.8,
+            elastic_pause_scale_ping_pong_fast=1.0,
+            elastic_pause_scale_ping_pong_safe=1.1,
+            elastic_pause_scale_wide_step=1.5,
+            elastic_pause_scale_defensive=1.8,
+            elastic_max_total_scale_ping_pong_fast=1.0,
+            elastic_max_total_scale_ping_pong_safe=1.1,
+            elastic_max_total_scale_wide_step=1.35,
+            elastic_max_total_scale_defensive=1.6,
+            elastic_cooldown_seconds=120.0,
+            elastic_state_confirm_cycles=3,
+            elastic_cancel_stale_entries_on_cooldown=True,
+        )
+
+        config = _elastic_volume_config(args)
+
+        self.assertEqual(config.base_step_multiplier_ping_pong_fast, 0.8)
+        self.assertEqual(config.base_step_multiplier_ping_pong_safe, 1.2)
+        self.assertEqual(config.base_step_multiplier_wide_step, 2.5)
+        self.assertEqual(config.base_step_multiplier_defensive, 3.5)
+        self.assertEqual(config.inventory_hard_ratio_wide_step, 0.80)
+        self.assertEqual(config.threshold_scale_wide_step, 1.5)
+        self.assertEqual(config.pause_scale_defensive, 1.8)
+        self.assertEqual(config.max_total_scale_defensive, 1.6)
 
 
 if __name__ == "__main__":

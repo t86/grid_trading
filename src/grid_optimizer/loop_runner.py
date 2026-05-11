@@ -8245,15 +8245,58 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         loss_per_10k_cooldown=float(getattr(args, "elastic_loss_per_10k_cooldown", 1.8)),
         inventory_soft_ratio=float(getattr(args, "elastic_inventory_soft_ratio", 0.6)),
         inventory_hard_ratio=float(getattr(args, "elastic_inventory_hard_ratio", 0.9)),
+        inventory_soft_ratio_ping_pong_fast=float(
+            getattr(args, "elastic_inventory_soft_ratio_ping_pong_fast", 0.30)
+        ),
+        inventory_hard_ratio_ping_pong_fast=float(
+            getattr(args, "elastic_inventory_hard_ratio_ping_pong_fast", 0.45)
+        ),
+        inventory_soft_ratio_ping_pong_safe=float(
+            getattr(args, "elastic_inventory_soft_ratio_ping_pong_safe", 0.45)
+        ),
+        inventory_hard_ratio_ping_pong_safe=float(
+            getattr(args, "elastic_inventory_hard_ratio_ping_pong_safe", 0.60)
+        ),
+        inventory_soft_ratio_wide_step=float(getattr(args, "elastic_inventory_soft_ratio_wide_step", 0.60)),
+        inventory_hard_ratio_wide_step=float(getattr(args, "elastic_inventory_hard_ratio_wide_step", 0.80)),
         step_scale_sprint=float(getattr(args, "elastic_step_scale_sprint", 0.8)),
         step_scale_defensive=float(getattr(args, "elastic_step_scale_defensive", 1.8)),
         step_scale_cooldown=float(getattr(args, "elastic_step_scale_cooldown", 3.0)),
+        base_step_multiplier_ping_pong_fast=float(
+            getattr(args, "elastic_base_step_multiplier_ping_pong_fast", 0.8)
+        ),
+        base_step_multiplier_ping_pong_safe=float(
+            getattr(args, "elastic_base_step_multiplier_ping_pong_safe", 1.2)
+        ),
+        base_step_multiplier_wide_step=float(getattr(args, "elastic_base_step_multiplier_wide_step", 2.5)),
+        base_step_multiplier_defensive=float(getattr(args, "elastic_base_step_multiplier_defensive", 3.5)),
         per_order_scale_sprint=float(getattr(args, "elastic_per_order_scale_sprint", 1.25)),
         per_order_scale_defensive=float(getattr(args, "elastic_per_order_scale_defensive", 0.65)),
+        per_order_scale_ping_pong_fast=float(getattr(args, "elastic_per_order_scale_ping_pong_fast", 1.0)),
+        per_order_scale_ping_pong_safe=float(getattr(args, "elastic_per_order_scale_ping_pong_safe", 0.9)),
+        per_order_scale_wide_step=float(getattr(args, "elastic_per_order_scale_wide_step", 0.6)),
+        per_order_scale_defensive_state=float(getattr(args, "elastic_per_order_scale_defensive_state", 0.4)),
         levels_scale_sprint=float(getattr(args, "elastic_levels_scale_sprint", 1.25)),
         levels_scale_defensive=float(getattr(args, "elastic_levels_scale_defensive", 0.65)),
+        levels_scale_ping_pong_fast=float(getattr(args, "elastic_levels_scale_ping_pong_fast", 1.0)),
+        levels_scale_ping_pong_safe=float(getattr(args, "elastic_levels_scale_ping_pong_safe", 0.85)),
+        levels_scale_wide_step=float(getattr(args, "elastic_levels_scale_wide_step", 0.65)),
+        levels_scale_defensive_state=float(getattr(args, "elastic_levels_scale_defensive_state", 0.35)),
+        threshold_scale_ping_pong_fast=float(getattr(args, "elastic_threshold_scale_ping_pong_fast", 1.0)),
+        threshold_scale_ping_pong_safe=float(getattr(args, "elastic_threshold_scale_ping_pong_safe", 1.1)),
+        threshold_scale_wide_step=float(getattr(args, "elastic_threshold_scale_wide_step", 1.5)),
+        threshold_scale_defensive=float(getattr(args, "elastic_threshold_scale_defensive", 1.8)),
+        pause_scale_ping_pong_fast=float(getattr(args, "elastic_pause_scale_ping_pong_fast", 1.0)),
+        pause_scale_ping_pong_safe=float(getattr(args, "elastic_pause_scale_ping_pong_safe", 1.1)),
+        pause_scale_wide_step=float(getattr(args, "elastic_pause_scale_wide_step", 1.5)),
+        pause_scale_defensive=float(getattr(args, "elastic_pause_scale_defensive", 1.8)),
+        max_total_scale_ping_pong_fast=float(getattr(args, "elastic_max_total_scale_ping_pong_fast", 1.0)),
+        max_total_scale_ping_pong_safe=float(getattr(args, "elastic_max_total_scale_ping_pong_safe", 1.1)),
+        max_total_scale_wide_step=float(getattr(args, "elastic_max_total_scale_wide_step", 1.35)),
+        max_total_scale_defensive=float(getattr(args, "elastic_max_total_scale_defensive", 1.6)),
         cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
         state_confirm_cycles=int(getattr(args, "elastic_state_confirm_cycles", 3)),
+        cancel_stale_entries_on_cooldown=bool(getattr(args, "elastic_cancel_stale_entries_on_cooldown", True)),
     )
 
 
@@ -8269,6 +8312,9 @@ def _summarize_elastic_volume_windows(
     window_15m_start = now.astimezone(timezone.utc) - timedelta(minutes=15)
     competition_start = competition_start_time.astimezone(timezone.utc) if competition_start_time else None
     metrics = {
+        "gross_notional_5m": 0.0,
+        "net_pnl_5m": 0.0,
+        "commission_5m": 0.0,
         "gross_notional_15m": 0.0,
         "net_pnl_15m": 0.0,
         "commission_15m": 0.0,
@@ -8278,6 +8324,7 @@ def _summarize_elastic_volume_windows(
     }
 
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    window_5m_start = now.astimezone(timezone.utc) - timedelta(minutes=5)
     for row in read_jsonl(audit_paths["trade_audit"], limit=0):
         if normalized_symbol and str(row.get("symbol", "")).upper().strip() not in {"", normalized_symbol}:
             continue
@@ -8292,6 +8339,10 @@ def _summarize_elastic_volume_windows(
             else 0.0
         )
         net = _safe_float(row.get("realizedPnl")) - commission
+        if ts >= window_5m_start:
+            metrics["gross_notional_5m"] += notional
+            metrics["net_pnl_5m"] += net
+            metrics["commission_5m"] += commission
         if ts >= window_15m_start:
             metrics["gross_notional_15m"] += notional
             metrics["net_pnl_15m"] += net
@@ -9136,17 +9187,28 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             inputs=ElasticVolumeInputs(
                 now=plan_now,
                 last_state=state.get("elastic_volume") if isinstance(state.get("elastic_volume"), dict) else {},
+                gross_notional_5m=elastic_metrics["gross_notional_5m"],
+                net_pnl_5m=elastic_metrics["net_pnl_5m"],
+                commission_5m=elastic_metrics["commission_5m"],
                 gross_notional_15m=elastic_metrics["gross_notional_15m"],
                 net_pnl_15m=elastic_metrics["net_pnl_15m"],
+                commission_15m=elastic_metrics["commission_15m"],
                 competition_gross_notional=elastic_metrics["competition_gross_notional"],
                 competition_net_pnl=elastic_metrics["competition_net_pnl"],
                 competition_commission=elastic_metrics["competition_commission"],
                 long_notional=current_long_notional,
                 short_notional=current_short_notional,
+                threshold_position_notional=_safe_float(getattr(effective_args, "threshold_position_notional", None)),
                 max_long_notional=_safe_float(getattr(effective_args, "max_position_notional", None)),
                 max_short_notional=_safe_float(getattr(effective_args, "max_short_position_notional", None)),
                 actual_net_notional=actual_net_qty * max(mid_price, 0.0),
                 adaptive_step_raw_scale=_safe_float(adaptive_step.get("raw_scale")),
+                volatility_1m_amplitude_ratio=_safe_float(
+                    ((adaptive_step.get("metrics") or {}).get("window_1m") or {}).get("amplitude_ratio")
+                ),
+                volatility_5m_amplitude_ratio=_safe_float(
+                    ((adaptive_step.get("metrics") or {}).get("window_5m") or {}).get("amplitude_ratio")
+                ),
                 multi_timeframe_bias_regime=str(multi_timeframe_bias.get("regime") or "balanced"),
             ),
         )
@@ -9171,6 +9233,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 0,
             )
             position_limit_scale = _safe_float(elastic_volume.get("position_limit_scale")) or 1.0
+            threshold_scale = _safe_float(elastic_volume.get("threshold_scale")) or 1.0
+            pause_scale = _safe_float(elastic_volume.get("pause_scale")) or 1.0
+            max_total_scale = _safe_float(elastic_volume.get("max_total_scale")) or 1.0
+            if getattr(effective_args, "threshold_position_notional", None) is not None:
+                effective_args.threshold_position_notional = max(
+                    _safe_float(effective_args.threshold_position_notional) * threshold_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_buy_position_notional", None) is not None:
+                effective_args.pause_buy_position_notional = max(
+                    _safe_float(effective_args.pause_buy_position_notional) * pause_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_short_position_notional", None) is not None:
+                effective_args.pause_short_position_notional = max(
+                    _safe_float(effective_args.pause_short_position_notional) * pause_scale,
+                    0.0,
+                )
             if getattr(effective_args, "max_position_notional", None) is not None:
                 effective_args.max_position_notional = max(_safe_float(effective_args.max_position_notional) * position_limit_scale, 0.0)
             if getattr(effective_args, "max_short_position_notional", None) is not None:
@@ -9178,6 +9258,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     _safe_float(effective_args.max_short_position_notional) * position_limit_scale,
                     0.0,
                 )
+            if getattr(effective_args, "max_total_notional", None) is not None:
+                effective_args.max_total_notional = max(_safe_float(effective_args.max_total_notional) * max_total_scale, 0.0)
             if not bool(elastic_volume.get("entry_allowed")):
                 effective_args.buy_levels = 0
                 effective_args.sell_levels = 0
@@ -12196,13 +12278,43 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-loss-per-10k-cooldown", type=float, default=1.8)
     parser.add_argument("--elastic-inventory-soft-ratio", type=float, default=0.6)
     parser.add_argument("--elastic-inventory-hard-ratio", type=float, default=0.9)
+    parser.add_argument("--elastic-inventory-soft-ratio-ping-pong-fast", type=float, default=0.30)
+    parser.add_argument("--elastic-inventory-hard-ratio-ping-pong-fast", type=float, default=0.45)
+    parser.add_argument("--elastic-inventory-soft-ratio-ping-pong-safe", type=float, default=0.45)
+    parser.add_argument("--elastic-inventory-hard-ratio-ping-pong-safe", type=float, default=0.60)
+    parser.add_argument("--elastic-inventory-soft-ratio-wide-step", type=float, default=0.60)
+    parser.add_argument("--elastic-inventory-hard-ratio-wide-step", type=float, default=0.80)
     parser.add_argument("--elastic-step-scale-sprint", type=float, default=0.8)
     parser.add_argument("--elastic-step-scale-defensive", type=float, default=1.8)
     parser.add_argument("--elastic-step-scale-cooldown", type=float, default=3.0)
+    parser.add_argument("--elastic-base-step-multiplier-ping-pong-fast", type=float, default=0.8)
+    parser.add_argument("--elastic-base-step-multiplier-ping-pong-safe", type=float, default=1.2)
+    parser.add_argument("--elastic-base-step-multiplier-wide-step", type=float, default=2.5)
+    parser.add_argument("--elastic-base-step-multiplier-defensive", type=float, default=3.5)
     parser.add_argument("--elastic-per-order-scale-sprint", type=float, default=1.25)
     parser.add_argument("--elastic-per-order-scale-defensive", type=float, default=0.65)
+    parser.add_argument("--elastic-per-order-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-per-order-scale-ping-pong-safe", type=float, default=0.9)
+    parser.add_argument("--elastic-per-order-scale-wide-step", type=float, default=0.6)
+    parser.add_argument("--elastic-per-order-scale-defensive-state", type=float, default=0.4)
     parser.add_argument("--elastic-levels-scale-sprint", type=float, default=1.25)
     parser.add_argument("--elastic-levels-scale-defensive", type=float, default=0.65)
+    parser.add_argument("--elastic-levels-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-levels-scale-ping-pong-safe", type=float, default=0.85)
+    parser.add_argument("--elastic-levels-scale-wide-step", type=float, default=0.65)
+    parser.add_argument("--elastic-levels-scale-defensive-state", type=float, default=0.35)
+    parser.add_argument("--elastic-threshold-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-threshold-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-threshold-scale-wide-step", type=float, default=1.5)
+    parser.add_argument("--elastic-threshold-scale-defensive", type=float, default=1.8)
+    parser.add_argument("--elastic-pause-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-pause-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-pause-scale-wide-step", type=float, default=1.5)
+    parser.add_argument("--elastic-pause-scale-defensive", type=float, default=1.8)
+    parser.add_argument("--elastic-max-total-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-max-total-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-max-total-scale-wide-step", type=float, default=1.35)
+    parser.add_argument("--elastic-max-total-scale-defensive", type=float, default=1.6)
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
