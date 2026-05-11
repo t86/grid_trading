@@ -36,6 +36,15 @@ fi
 WATCHDOG_SERVICE_FILE="/etc/systemd/system/${WATCHDOG_NAME}.service"
 WATCHDOG_TIMER_FILE="/etc/systemd/system/${WATCHDOG_NAME}.timer"
 
+systemd_escape_env() {
+  local value="$1"
+  value="${value//\\/\\\\}"
+  value="${value//\"/\\\"}"
+  printf '%s' "${value}"
+}
+
+REMEDIATION_COMMAND_ESCAPED="$(systemd_escape_env "${REMEDIATION_COMMAND}")"
+
 sudo tee "${WATCHDOG_SERVICE_FILE}" >/dev/null <<EOF
 [Unit]
 Description=Grid remote web watchdog for ${REMOTE_LABEL}
@@ -57,7 +66,7 @@ Environment=FAILURE_THRESHOLD=${FAILURE_THRESHOLD}
 Environment=REMEDIATION_COOLDOWN_SECONDS=${REMEDIATION_COOLDOWN_SECONDS}
 Environment=AUTH_USERNAME=${AUTH_USERNAME}
 Environment=AUTH_PASSWORD=${AUTH_PASSWORD}
-Environment=REMEDIATION_COMMAND=${REMEDIATION_COMMAND}
+Environment="REMEDIATION_COMMAND=${REMEDIATION_COMMAND_ESCAPED}"
 ExecStart=/usr/bin/env bash ${RUNNER_CODE_DIR}/deploy/oracle/remote_web_watchdog.sh
 EOF
 
