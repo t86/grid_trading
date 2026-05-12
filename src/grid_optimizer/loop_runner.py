@@ -686,7 +686,10 @@ def resolve_adaptive_step_price(
 def resolve_volatility_entry_pause(
     *,
     adaptive_step: dict[str, Any],
+    state: dict[str, Any] | None = None,
     enabled: bool,
+    window_10s_abs_return_ratio: float | None,
+    window_10s_amplitude_ratio: float | None,
     window_30s_abs_return_ratio: float | None,
     window_30s_amplitude_ratio: float | None,
     window_1m_abs_return_ratio: float | None,
@@ -695,11 +698,17 @@ def resolve_volatility_entry_pause(
     window_3m_amplitude_ratio: float | None,
     window_5m_abs_return_ratio: float | None,
     window_5m_amplitude_ratio: float | None,
+    recover_confirm_cycles: int = 1,
 ) -> dict[str, Any]:
     metrics = dict(adaptive_step.get("metrics") or {}) if isinstance(adaptive_step, dict) else {}
+    memory = dict((state or {}).get("volatility_entry_pause_state") or {}) if isinstance(state, dict) else {}
     report: dict[str, Any] = {
         "enabled": bool(enabled),
         "active": False,
+        "trigger_active": False,
+        "recovering": False,
+        "recover_confirm_cycles": max(int(recover_confirm_cycles or 1), 1),
+        "recover_count": 0,
         "dominant_window": None,
         "dominant_metric": None,
         "dominant_value": 0.0,
@@ -707,11 +716,16 @@ def resolve_volatility_entry_pause(
         "matched_reasons": [],
         "reason": None,
         "metrics": metrics,
+        "state": {},
     }
     if not enabled:
         return report
 
     thresholds = {
+        "window_10s": {
+            "abs_return_ratio": _safe_float(window_10s_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_10s_amplitude_ratio),
+        },
         "window_30s": {
             "abs_return_ratio": _safe_float(window_30s_abs_return_ratio),
             "amplitude_ratio": _safe_float(window_30s_amplitude_ratio),
@@ -743,28 +757,63 @@ def resolve_volatility_entry_pause(
             if threshold <= 0 or value < threshold:
                 continue
             candidates.append((value / threshold, window_key, metric, value, threshold))
-    if not candidates:
-        return report
-
-    _, dominant_window, dominant_metric, dominant_value, dominant_threshold = max(
-        candidates,
-        key=lambda item: item[0],
-    )
+    dominant_window = dominant_metric = None
+    dominant_value = dominant_threshold = 0.0
+    if candidates:
+        _, dominant_window, dominant_metric, dominant_value, dominant_threshold = max(
+            candidates,
+            key=lambda item: item[0],
+        )
     matched_reasons = [
         f"{window_key} {metric}={value * 100:.2f}% >= {threshold * 100:.2f}%"
         for _, window_key, metric, value, threshold in sorted(candidates, key=lambda item: item[0], reverse=True)
     ]
+    required_recover = max(int(recover_confirm_cycles or 1), 1)
+    if candidates:
+        recover_count = 0
+        active = True
+        recovering = False
+        reason = matched_reasons[0] if matched_reasons else None
+    else:
+        was_active = bool(memory.get("active") or memory.get("recovering"))
+        previous_recover = int(_safe_float(memory.get("recover_count")))
+        recover_count = previous_recover + 1 if was_active else required_recover
+        active = was_active and recover_count < required_recover
+        recovering = bool(was_active and active)
+        reason = (
+            f"recovering {recover_count}/{required_recover} after "
+            f"{memory.get('last_trigger_reason') or 'volatility_entry_pause'}"
+            if recovering
+            else None
+        )
     report.update(
         {
-            "active": True,
-            "dominant_window": dominant_window,
-            "dominant_metric": dominant_metric,
-            "dominant_value": dominant_value,
-            "dominant_threshold": dominant_threshold,
+            "active": active,
+            "trigger_active": bool(candidates),
+            "recovering": recovering,
+            "recover_confirm_cycles": required_recover,
+            "recover_count": recover_count,
+            "dominant_window": dominant_window if candidates else memory.get("dominant_window"),
+            "dominant_metric": dominant_metric if candidates else memory.get("dominant_metric"),
+            "dominant_value": dominant_value if candidates else _safe_float(memory.get("dominant_value")),
+            "dominant_threshold": dominant_threshold if candidates else _safe_float(memory.get("dominant_threshold")),
             "matched_reasons": matched_reasons,
-            "reason": matched_reasons[0] if matched_reasons else None,
+            "reason": reason,
         }
     )
+    report["state"] = {
+        "active": active,
+        "recovering": recovering,
+        "recover_count": recover_count,
+        "recover_confirm_cycles": required_recover,
+        "last_trigger_reason": matched_reasons[0]
+        if matched_reasons
+        else (memory.get("last_trigger_reason") if active else None),
+        "dominant_window": report.get("dominant_window"),
+        "dominant_metric": report.get("dominant_metric"),
+        "dominant_value": report.get("dominant_value"),
+        "dominant_threshold": report.get("dominant_threshold"),
+    }
     return report
 
 
@@ -9928,7 +9977,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
 
     volatility_entry_pause = resolve_volatility_entry_pause(
         adaptive_step=adaptive_step,
+        state=state,
         enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
+        window_10s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_10s_abs_return_ratio", None),
+        window_10s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_10s_amplitude_ratio", None),
         window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
         window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
         window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
@@ -9937,6 +9989,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
         window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
         window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
+        recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
     )
     elastic_volume: dict[str, Any] = {
         "enabled": bool(getattr(effective_args, "elastic_volume_enabled", False)),
@@ -12633,6 +12686,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state["last_mid_price"] = mid_price
     state["updated_at"] = state_now
     state["version"] = STATE_VERSION
+    if isinstance(volatility_entry_pause, dict) and volatility_entry_pause.get("enabled"):
+        state["volatility_entry_pause_state"] = dict(volatility_entry_pause.get("state") or {})
+        state["volatility_entry_pause_state"]["updated_at"] = state_now
+    else:
+        state.pop("volatility_entry_pause_state", None)
     if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
         state["elastic_volume"] = _elastic_volume_state_snapshot(elastic_volume, updated_at=state_now)
     else:
@@ -13594,6 +13652,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--multi-timeframe-bias-scheduler-defensive-step-scale", type=float, default=1.35)
     parser.add_argument("--multi-timeframe-bias-scheduler-reduce-max-order-scale", type=float, default=0.65)
     parser.add_argument("--volatility-entry-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--volatility-entry-pause-10s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-10s-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-30s-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-30s-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-1m-abs-return-ratio", type=float, default=0.0)
@@ -13602,6 +13662,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-recover-confirm-cycles", type=int, default=1)
     parser.add_argument("--anti-chase-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--anti-chase-entry-guard-1m-abs-return-ratio", type=float, default=0.0025)
     parser.add_argument("--anti-chase-entry-guard-1m-amplitude-ratio", type=float, default=0.0035)
@@ -14300,6 +14361,8 @@ def main() -> None:
     if args.elastic_early_safe_inventory_ratio > args.elastic_early_wide_inventory_ratio:
         raise SystemExit("--elastic-early-safe-inventory-ratio must be <= wide-inventory-ratio")
     volatility_entry_pause_thresholds = (
+        args.volatility_entry_pause_10s_abs_return_ratio,
+        args.volatility_entry_pause_10s_amplitude_ratio,
         args.volatility_entry_pause_30s_abs_return_ratio,
         args.volatility_entry_pause_30s_amplitude_ratio,
         args.volatility_entry_pause_1m_abs_return_ratio,
@@ -14311,6 +14374,8 @@ def main() -> None:
     )
     if any(threshold < 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("--volatility-entry-pause thresholds must be >= 0")
+    if args.volatility_entry_pause_recover_confirm_cycles < 1:
+        raise SystemExit("--volatility-entry-pause-recover-confirm-cycles must be >= 1")
     if args.volatility_entry_pause_enabled and not any(threshold > 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("volatility entry pause requires at least one positive trigger threshold")
     anti_chase_entry_guard_thresholds = (

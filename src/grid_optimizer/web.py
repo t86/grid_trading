@@ -3746,6 +3746,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "execution_regime_rolling_loss_abs": None,
     "execution_regime_rolling_loss_limit": None,
     "volatility_entry_pause_enabled": False,
+    "volatility_entry_pause_10s_abs_return_ratio": 0.0,
+    "volatility_entry_pause_10s_amplitude_ratio": 0.0,
     "volatility_entry_pause_30s_abs_return_ratio": 0.0,
     "volatility_entry_pause_30s_amplitude_ratio": 0.0,
     "volatility_entry_pause_1m_abs_return_ratio": 0.0,
@@ -3754,6 +3756,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volatility_entry_pause_3m_amplitude_ratio": 0.0,
     "volatility_entry_pause_5m_abs_return_ratio": 0.0,
     "volatility_entry_pause_5m_amplitude_ratio": 0.0,
+    "volatility_entry_pause_recover_confirm_cycles": 1,
     "anti_chase_entry_guard_enabled": True,
     "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
     "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -8573,6 +8576,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_inventory_notional_limit",
         "execution_regime_rolling_loss_abs",
         "execution_regime_rolling_loss_limit",
+        "volatility_entry_pause_10s_abs_return_ratio",
+        "volatility_entry_pause_10s_amplitude_ratio",
         "volatility_entry_pause_30s_abs_return_ratio",
         "volatility_entry_pause_30s_amplitude_ratio",
         "volatility_entry_pause_1m_abs_return_ratio",
@@ -8695,6 +8700,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_confirm_normal_to_caution",
         "multi_timeframe_bias_max_level_delta",
         "elastic_state_confirm_cycles",
+        "volatility_entry_pause_recover_confirm_cycles",
         "regime_entry_budget_switch_reconcile_confirm_cycles",
         "regime_entry_budget_shock_reconcile_confirm_cycles",
         "synthetic_flow_sleeve_levels",
@@ -8848,6 +8854,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_inventory_notional_limit",
         "execution_regime_rolling_loss_abs",
         "execution_regime_rolling_loss_limit",
+        "volatility_entry_pause_10s_abs_return_ratio",
+        "volatility_entry_pause_10s_amplitude_ratio",
         "volatility_entry_pause_30s_abs_return_ratio",
         "volatility_entry_pause_30s_amplitude_ratio",
         "volatility_entry_pause_1m_abs_return_ratio",
@@ -9097,6 +9105,14 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
 
     def require_fast_entry_pause() -> None:
         require_enabled("volatility_entry_pause_enabled", "快速波动暂停加仓 volatility_entry_pause_enabled")
+        require_positive(
+            "volatility_entry_pause_10s_abs_return_ratio",
+            "10s 涨跌幅暂停加仓阈值 volatility_entry_pause_10s_abs_return_ratio",
+        )
+        require_positive(
+            "volatility_entry_pause_10s_amplitude_ratio",
+            "10s 振幅暂停加仓阈值 volatility_entry_pause_10s_amplitude_ratio",
+        )
         require_positive(
             "volatility_entry_pause_30s_abs_return_ratio",
             "30s 涨跌幅暂停加仓阈值 volatility_entry_pause_30s_abs_return_ratio",
@@ -9794,6 +9810,16 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         if config.get("volatility_entry_pause_enabled", False)
         else "--no-volatility-entry-pause-enabled"
     )
+    if config.get("volatility_entry_pause_10s_abs_return_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-10s-abs-return-ratio",
+            str(config["volatility_entry_pause_10s_abs_return_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_10s_amplitude_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-10s-amplitude-ratio",
+            str(config["volatility_entry_pause_10s_amplitude_ratio"]),
+        ])
     if config.get("volatility_entry_pause_30s_abs_return_ratio") is not None:
         command.extend([
             "--volatility-entry-pause-30s-abs-return-ratio",
@@ -9833,6 +9859,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend([
             "--volatility-entry-pause-5m-amplitude-ratio",
             str(config["volatility_entry_pause_5m_amplitude_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_recover_confirm_cycles") is not None:
+        command.extend([
+            "--volatility-entry-pause-recover-confirm-cycles",
+            str(config["volatility_entry_pause_recover_confirm_cycles"]),
         ])
     command.append(
         "--anti-chase-entry-guard-enabled"
@@ -10213,6 +10244,8 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "execution_regime_rolling_loss_abs",
             "execution_regime_rolling_loss_limit",
             "volatility_entry_pause_enabled",
+            "volatility_entry_pause_10s_abs_return_ratio",
+            "volatility_entry_pause_10s_amplitude_ratio",
             "volatility_entry_pause_30s_abs_return_ratio",
             "volatility_entry_pause_30s_amplitude_ratio",
             "volatility_entry_pause_1m_abs_return_ratio",
@@ -10221,6 +10254,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "volatility_entry_pause_3m_amplitude_ratio",
             "volatility_entry_pause_5m_abs_return_ratio",
             "volatility_entry_pause_5m_amplitude_ratio",
+            "volatility_entry_pause_recover_confirm_cycles",
             "synthetic_trend_follow_enabled",
             "synthetic_trend_follow_1m_abs_return_ratio",
             "synthetic_trend_follow_1m_amplitude_ratio",
@@ -22980,6 +23014,8 @@ MONITOR_PAGE = """<!doctype html>
       { key: "execution_regime_vol_protection_enabled", id: "runner_field_execution_regime_vol_protection_enabled", type: "boolean", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "execution_regime_vol_protection_min_scale", id: "runner_field_execution_regime_vol_protection_min_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_enabled", id: "runner_field_volatility_entry_pause_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_10s_abs_return_ratio", id: "runner_field_volatility_entry_pause_10s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_10s_amplitude_ratio", id: "runner_field_volatility_entry_pause_10s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_abs_return_ratio", id: "runner_field_volatility_entry_pause_30s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_amplitude_ratio", id: "runner_field_volatility_entry_pause_30s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_1m_abs_return_ratio", id: "runner_field_volatility_entry_pause_1m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -22988,6 +23024,7 @@ MONITOR_PAGE = """<!doctype html>
       { key: "volatility_entry_pause_3m_amplitude_ratio", id: "runner_field_volatility_entry_pause_3m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_5m_abs_return_ratio", id: "runner_field_volatility_entry_pause_5m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_5m_amplitude_ratio", id: "runner_field_volatility_entry_pause_5m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_recover_confirm_cycles", id: "runner_field_volatility_entry_pause_recover_confirm_cycles", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "auto_regime_enabled", id: "runner_field_auto_regime_enabled", type: "boolean", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_confirm_cycles", id: "runner_field_auto_regime_confirm_cycles", type: "integer", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_stable_15m_max_amplitude_ratio", id: "runner_field_auto_regime_stable_15m_max_amplitude_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
