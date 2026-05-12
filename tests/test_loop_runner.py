@@ -33,6 +33,7 @@ from grid_optimizer.loop_runner import (
     _filter_futures_strategy_orders,
     _elastic_volume_config,
     _elastic_volume_state_snapshot,
+    _regime_budget_entry_reuse_tolerance,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_synthetic_resync_price,
@@ -857,6 +858,38 @@ class LoopRunnerTests(unittest.TestCase):
                 {"side": "SELL", "role": "take_profit_long", "price": 1.1},
             ],
         )
+
+    def test_regime_budget_entry_reuse_tolerance_allows_small_drift_for_v2(self) -> None:
+        tolerance, reason = _regime_budget_entry_reuse_tolerance(
+            strategy_profile="billusdt_neutral_regime_budget_ping_pong_v2",
+            regime_entry_budget={
+                "enabled": True,
+                "report_only": False,
+                "state": "ping-pong-fast",
+                "cancel_entry_required": False,
+                "shock_guard_active": False,
+            },
+            step_price=0.0005,
+        )
+
+        self.assertAlmostEqual(tolerance, 0.001125)
+        self.assertEqual(reason, "regime_budget_small_drift_reuse")
+
+    def test_regime_budget_entry_reuse_tolerance_blocks_during_switch(self) -> None:
+        tolerance, reason = _regime_budget_entry_reuse_tolerance(
+            strategy_profile="billusdt_neutral_regime_budget_ping_pong_v2",
+            regime_entry_budget={
+                "enabled": True,
+                "report_only": False,
+                "state": "ping-pong-fast",
+                "cancel_entry_required": True,
+                "shock_guard_active": False,
+            },
+            step_price=0.0005,
+        )
+
+        self.assertEqual(tolerance, 0.0)
+        self.assertEqual(reason, "cancel_confirm_required")
 
     def test_take_profit_guard_blocks_untracked_reducers_when_cost_basis_missing(self) -> None:
         plan = {

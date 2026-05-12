@@ -2090,6 +2090,42 @@ def apply_entry_permission_gate(
     return report
 
 
+def _sync_plan_orders_from_desired_orders(plan: dict[str, Any], desired_orders: list[dict[str, Any]]) -> None:
+    plan["buy_orders"] = [
+        dict(item)
+        for item in desired_orders
+        if isinstance(item, dict) and str(item.get("side", "")).upper().strip() == "BUY"
+    ]
+    plan["sell_orders"] = [
+        dict(item)
+        for item in desired_orders
+        if isinstance(item, dict) and str(item.get("side", "")).upper().strip() == "SELL"
+    ]
+
+
+def _regime_budget_entry_reuse_tolerance(
+    *,
+    strategy_profile: str,
+    regime_entry_budget: dict[str, Any],
+    step_price: float,
+) -> tuple[float, str]:
+    normalized_profile = str(strategy_profile or "").strip()
+    if not normalized_profile.endswith("_neutral_regime_budget_ping_pong_v2"):
+        return max(float(step_price), 0.0), "default_step"
+    if not isinstance(regime_entry_budget, dict) or not regime_entry_budget.get("enabled"):
+        return max(float(step_price), 0.0), "default_step"
+    if bool(regime_entry_budget.get("report_only", True)):
+        return max(float(step_price), 0.0), "report_only_default_step"
+    if bool(regime_entry_budget.get("cancel_entry_required")):
+        return 0.0, "cancel_confirm_required"
+    if bool(regime_entry_budget.get("shock_guard_active")) or str(regime_entry_budget.get("state") or "") in {
+        "defensive",
+        "shock-guard",
+    }:
+        return 0.0, "defensive_or_shock"
+    return max(float(step_price), 0.0) * 2.25, "regime_budget_small_drift_reuse"
+
+
 def _summarize_open_entry_exposure(open_orders: Iterable[Any]) -> dict[str, Any]:
     long_notional = 0.0
     short_notional = 0.0
@@ -11669,12 +11705,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 desired_orders=desired_orders,
                 sticky_roles=set(sticky_exit_mode["roles"]),
             )
+        entry_reuse_tolerance, entry_reuse_reason = _regime_budget_entry_reuse_tolerance(
+            strategy_profile=effective_strategy_profile,
+            regime_entry_budget=regime_entry_budget,
+            step_price=effective_args.step_price,
+        )
         desired_orders = preserve_sticky_entry_orders(
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
-            price_tolerance=effective_args.step_price,
+            price_tolerance=entry_reuse_tolerance,
             max_levels_per_group=getattr(effective_args, "sticky_entry_levels", None),
         )
+        _sync_plan_orders_from_desired_orders(plan, desired_orders)
+        if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled"):
+            regime_entry_budget["entry_reuse_tolerance"] = entry_reuse_tolerance
+            regime_entry_budget["entry_reuse_reason"] = entry_reuse_reason
         synthetic_tp_only_watchdog = assess_synthetic_tp_only_watchdog(
             state=state,
             strategy_mode=strategy_mode,
