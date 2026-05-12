@@ -9933,6 +9933,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             now=plan_now,
             competition_start_time=competition_start_time,
         )
+        elastic_threshold_position_notional = _safe_float(getattr(effective_args, "threshold_position_notional", None))
+        if elastic_threshold_position_notional <= 0:
+            elastic_threshold_position_notional = _safe_float(getattr(args, "threshold_position_notional", None))
+        if elastic_threshold_position_notional <= 0:
+            elastic_threshold_position_notional = max(
+                _safe_float(getattr(effective_args, "pause_buy_position_notional", None)),
+                _safe_float(getattr(effective_args, "pause_short_position_notional", None)),
+                _safe_float(getattr(args, "pause_buy_position_notional", None)),
+                _safe_float(getattr(args, "pause_short_position_notional", None)),
+            )
         elastic_volume = resolve_elastic_volume_control(
             config=elastic_volume_config,
             inputs=ElasticVolumeInputs(
@@ -9949,7 +9959,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 competition_commission=elastic_metrics["competition_commission"],
                 long_notional=current_long_notional,
                 short_notional=current_short_notional,
-                threshold_position_notional=_safe_float(getattr(effective_args, "threshold_position_notional", None)),
+                threshold_position_notional=elastic_threshold_position_notional,
                 max_long_notional=_safe_float(getattr(effective_args, "max_position_notional", None)),
                 max_short_notional=_safe_float(getattr(effective_args, "max_short_position_notional", None)),
                 actual_net_notional=actual_net_qty * max(mid_price, 0.0),
