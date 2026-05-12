@@ -4682,6 +4682,84 @@ def _synthetic_drift_notional(mid_price: float, synthetic_drift_qty: float) -> f
     return abs(float(synthetic_drift_qty)) * max(float(mid_price), 0.0)
 
 
+def _runtime_guard_loss_recovery_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "runtime_guard_loss_recovery_enabled", True))
+
+
+def _runtime_guard_loss_recovery_state(state: dict[str, Any]) -> dict[str, Any]:
+    recovery = state.get("runtime_guard_loss_recovery")
+    if not isinstance(recovery, dict):
+        recovery = {}
+        state["runtime_guard_loss_recovery"] = recovery
+    return recovery
+
+
+def _filter_pnl_events_after(pnl_events: list[dict[str, Any]], since: datetime | None) -> list[dict[str, Any]]:
+    if since is None:
+        return pnl_events
+    filtered: list[dict[str, Any]] = []
+    for event in pnl_events:
+        event_ts = _parse_state_datetime(event.get("ts"))
+        if event_ts is None or event_ts >= since:
+            filtered.append(event)
+    return filtered
+
+
+def _runtime_guard_snapshot_is_flat(flatten_snapshot: dict[str, Any], *, min_notional: float = 5.0) -> bool:
+    if list(flatten_snapshot.get("orders", [])):
+        return False
+    bid_price = _safe_float(flatten_snapshot.get("bid_price"))
+    ask_price = _safe_float(flatten_snapshot.get("ask_price"))
+    mid_price = (bid_price + ask_price) / 2.0 if bid_price > 0 and ask_price > 0 else max(bid_price, ask_price)
+    net_qty = abs(_safe_float(flatten_snapshot.get("net_qty")))
+    long_qty = abs(_safe_float(flatten_snapshot.get("long_qty")))
+    short_qty = abs(_safe_float(flatten_snapshot.get("short_qty")))
+    if mid_price <= 0:
+        return max(net_qty, long_qty, short_qty) <= 1e-12
+    return max(net_qty, long_qty, short_qty) * mid_price <= max(_safe_float(min_notional), 0.0)
+
+
+def _runtime_guard_market_is_stable_for_recovery(
+    args: argparse.Namespace,
+    *,
+    now: datetime,
+) -> tuple[bool, dict[str, Any]]:
+    max_amp_1m = max(_safe_float(getattr(args, "runtime_guard_loss_recovery_max_1m_amplitude_ratio", 0.012)), 0.0)
+    max_amp_3m = max(_safe_float(getattr(args, "runtime_guard_loss_recovery_max_3m_amplitude_ratio", 0.025)), 0.0)
+    guard = assess_market_guard(
+        symbol=args.symbol.upper().strip(),
+        buy_pause_amp_trigger_ratio=max_amp_1m,
+        buy_pause_down_return_trigger_ratio=-max_amp_1m,
+        short_cover_pause_amp_trigger_ratio=max_amp_1m,
+        short_cover_pause_down_return_trigger_ratio=-max_amp_1m,
+        freeze_shift_abs_return_trigger_ratio=max_amp_1m,
+        now=now,
+        force_fetch=True,
+    )
+    amp_1m = _safe_float(guard.get("amplitude_ratio"))
+    window_3m = guard.get("window_3m") if isinstance(guard.get("window_3m"), dict) else {}
+    amp_3m = _safe_float(window_3m.get("amplitude_ratio"))
+    stable = (
+        bool(guard.get("available"))
+        and (max_amp_1m <= 0 or amp_1m <= max_amp_1m)
+        and (max_amp_3m <= 0 or amp_3m <= max_amp_3m)
+        and not bool(guard.get("buy_pause_active"))
+        and not bool(guard.get("short_cover_pause_active"))
+        and not bool(guard.get("shift_frozen"))
+    )
+    return stable, {
+        "available": bool(guard.get("available")),
+        "warning": guard.get("warning"),
+        "amplitude_1m": amp_1m,
+        "amplitude_3m": amp_3m,
+        "max_amplitude_1m": max_amp_1m,
+        "max_amplitude_3m": max_amp_3m,
+        "buy_pause_active": bool(guard.get("buy_pause_active")),
+        "short_cover_pause_active": bool(guard.get("short_cover_pause_active")),
+        "shift_frozen": bool(guard.get("shift_frozen")),
+    }
+
+
 def _build_runtime_guard_stop_summary(
     *,
     args: argparse.Namespace,
@@ -4854,17 +4932,25 @@ def _maybe_handle_runtime_guard(
         )
     ):
         return None
+    state_path = Path(getattr(args, "state_path", ""))
+    state = read_json(state_path) or {}
+    if not isinstance(state, dict):
+        state = {}
+    recovery = _runtime_guard_loss_recovery_state(state)
+    recovered_at = _parse_state_datetime(recovery.get("recovered_at"))
+
     cumulative_gross_notional, pnl_events, stats_start_time = _load_futures_runtime_guard_inputs(
         summary_path,
         runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
         symbol=args.symbol.upper().strip(),
         now=cycle_started_at,
     )
+    pnl_events_for_guard = _filter_pnl_events_after(pnl_events, recovered_at)
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=cycle_started_at,
         cumulative_gross_notional=cumulative_gross_notional,
-        pnl_events=pnl_events,
+        pnl_events=pnl_events_for_guard,
     )
     if runtime_guard_result.tradable:
         return None
@@ -4885,9 +4971,49 @@ def _maybe_handle_runtime_guard(
         api_secret,
         allow_loss=True,
     )
+    loss_only_stop = runtime_guard_result.matched_reasons == ["rolling_hourly_loss_limit_hit"]
+    if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+        stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+        if stopped_at is not None:
+            cooldown_seconds = max(
+                _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
+                0.0,
+            )
+            elapsed = max((cycle_started_at.astimezone(timezone.utc) - stopped_at).total_seconds(), 0.0)
+            flat = _runtime_guard_snapshot_is_flat(flatten_snapshot)
+            stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=cycle_started_at)
+            recovery.update(
+                {
+                    "last_checked_at": cycle_started_at.isoformat(),
+                    "cooldown_elapsed_seconds": elapsed,
+                    "cooldown_seconds": cooldown_seconds,
+                    "flat": flat,
+                    "market_stable": stable,
+                    "market": stable_report,
+                }
+            )
+            if elapsed >= cooldown_seconds and flat and stable:
+                recovered_at = cycle_started_at.astimezone(timezone.utc)
+                recovery.update(
+                    {
+                        "recovered_at": recovered_at.isoformat(),
+                        "last_reason": "market_stable_after_loss_stop",
+                        "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                    }
+                )
+                _write_json(state_path, state)
+                return None
+        recovery.update(
+            {
+                "stopped_at": recovery.get("stopped_at") or cycle_started_at.isoformat(),
+                "last_reason": "rolling_hourly_loss_limit_hit",
+                "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+            }
+        )
+        _write_json(state_path, state)
     if list(flatten_snapshot.get("orders", [])):
         flatten_result = _start_futures_flatten_process(args.symbol.upper().strip(), allow_loss=True)
-    return _build_runtime_guard_stop_summary(
+    summary = _build_runtime_guard_stop_summary(
         args=args,
         cycle=cycle,
         cycle_started_at=cycle_started_at,
@@ -4898,6 +5024,12 @@ def _maybe_handle_runtime_guard(
         flatten_result=flatten_result,
         flatten_snapshot=flatten_snapshot,
     )
+    if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+        summary["runtime_status"] = "cooldown"
+        summary["stop_triggered"] = False
+        summary["stop_reason"] = "rolling_hourly_loss_cooling_down"
+        summary["runtime_guard_loss_recovery"] = dict(recovery)
+    return summary
 
 
 def apply_position_controls(
@@ -13569,6 +13701,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-end-time", type=str, default=None)
     parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
+    parser.add_argument("--runtime-guard-loss-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--runtime-guard-loss-recovery-cooldown-seconds", type=float, default=180.0)
+    parser.add_argument("--runtime-guard-loss-recovery-max-1m-amplitude-ratio", type=float, default=0.012)
+    parser.add_argument("--runtime-guard-loss-recovery-max-3m-amplitude-ratio", type=float, default=0.025)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     parser.add_argument("--max-actual-net-notional", type=float, default=None)
     parser.add_argument("--max-synthetic-drift-notional", type=float, default=None)
