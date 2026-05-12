@@ -18,6 +18,8 @@ class ElasticVolumeConfig:
     inventory_hard_ratio_ping_pong_fast: float = 0.45
     inventory_soft_ratio_ping_pong_safe: float = 0.45
     inventory_hard_ratio_ping_pong_safe: float = 0.60
+    inventory_soft_ratio_wide_step_attack: float = 0.45
+    inventory_hard_ratio_wide_step_attack: float = 0.65
     inventory_soft_ratio_wide_step: float = 0.60
     inventory_hard_ratio_wide_step: float = 0.80
     adaptive_raw_scale_defensive: float = 1.2
@@ -27,34 +29,41 @@ class ElasticVolumeConfig:
     step_scale_cooldown: float = 3.0
     base_step_multiplier_ping_pong_fast: float = 0.8
     base_step_multiplier_ping_pong_safe: float = 1.2
+    base_step_multiplier_wide_step_attack: float = 2.2
     base_step_multiplier_wide_step: float = 2.5
     base_step_multiplier_defensive: float = 3.5
     per_order_scale_sprint: float = 1.25
     per_order_scale_defensive: float = 0.65
     per_order_scale_ping_pong_fast: float = 1.0
     per_order_scale_ping_pong_safe: float = 0.9
+    per_order_scale_wide_step_attack: float = 1.2
     per_order_scale_wide_step: float = 0.6
     per_order_scale_defensive_state: float = 0.4
     levels_scale_sprint: float = 1.25
     levels_scale_defensive: float = 0.65
     levels_scale_ping_pong_fast: float = 1.0
     levels_scale_ping_pong_safe: float = 0.85
+    levels_scale_wide_step_attack: float = 1.1
     levels_scale_wide_step: float = 0.65
     levels_scale_defensive_state: float = 0.35
     threshold_scale_ping_pong_fast: float = 1.0
     threshold_scale_ping_pong_safe: float = 1.1
+    threshold_scale_wide_step_attack: float = 1.5
     threshold_scale_wide_step: float = 1.5
     threshold_scale_defensive: float = 1.8
     pause_scale_ping_pong_fast: float = 1.0
     pause_scale_ping_pong_safe: float = 1.1
+    pause_scale_wide_step_attack: float = 1.2
     pause_scale_wide_step: float = 1.5
     pause_scale_defensive: float = 1.8
     max_total_scale_ping_pong_fast: float = 1.0
     max_total_scale_ping_pong_safe: float = 1.1
+    max_total_scale_wide_step_attack: float = 1.2
     max_total_scale_wide_step: float = 1.35
     max_total_scale_defensive: float = 1.6
     max_entry_orders_ping_pong_fast: int = 6
     max_entry_orders_ping_pong_safe: int = 4
+    max_entry_orders_wide_step_attack: int = 4
     max_entry_orders_wide_step: int = 3
     max_entry_orders_defensive: int = 2
     cooldown_seconds: float = 120.0
@@ -193,6 +202,17 @@ def _state_scales(config: ElasticVolumeConfig, regime: str) -> dict[str, float]:
             "max_total_scale": config.max_total_scale_defensive,
             "max_entry_orders": config.max_entry_orders_defensive,
         }
+    if regime == "wide-step-attack":
+        return {
+            "step_scale": config.base_step_multiplier_wide_step_attack,
+            "per_order_scale": config.per_order_scale_wide_step_attack,
+            "levels_scale": config.levels_scale_wide_step_attack,
+            "position_limit_scale": config.threshold_scale_wide_step_attack,
+            "threshold_scale": config.threshold_scale_wide_step_attack,
+            "pause_scale": config.pause_scale_wide_step_attack,
+            "max_total_scale": config.max_total_scale_wide_step_attack,
+            "max_entry_orders": config.max_entry_orders_wide_step_attack,
+        }
     if regime == "wide-step":
         return {
             "step_scale": config.base_step_multiplier_wide_step,
@@ -272,6 +292,12 @@ def resolve_elastic_volume_control(
         _safe_float(inputs.threshold_position_notional),
         config.threshold_scale_ping_pong_safe,
     )
+    wide_attack_threshold_inventory_ratio = _inventory_ratio_against_scaled_threshold(
+        long_notional,
+        short_notional,
+        _safe_float(inputs.threshold_position_notional),
+        config.threshold_scale_wide_step_attack,
+    )
     wide_threshold_inventory_ratio = _inventory_ratio_against_scaled_threshold(
         long_notional,
         short_notional,
@@ -322,6 +348,8 @@ def resolve_elastic_volume_control(
         fast_hard = fast_threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_ping_pong_fast), 0.0)
         safe_soft = safe_threshold_inventory_ratio >= max(_safe_float(config.inventory_soft_ratio_ping_pong_safe), 0.0)
         safe_hard = safe_threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_ping_pong_safe), 0.0)
+        wide_attack_soft = max(_safe_float(config.inventory_soft_ratio_wide_step_attack), 0.0)
+        wide_soft = max(_safe_float(config.inventory_soft_ratio_wide_step), 0.0)
         wide_hard = wide_threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_wide_step), 0.0)
 
         if amp_1m > 0.018 or amp_5m > 0.035 or wide_hard:
@@ -331,11 +359,14 @@ def resolve_elastic_volume_control(
             reasons: list[str] = []
             if amp_1m > 0.009 or amp_5m > 0.018:
                 reasons.append("volatility")
-            if safe_hard:
+            if safe_hard or wide_threshold_inventory_ratio >= wide_soft:
                 reasons.append("inventory_hard")
             if cap_pressure:
                 reasons.append("cap_pressure")
-            control = _control_for_state(config, "wide-step", reasons or ["inventory_soft"])
+            if threshold_inventory_ratio < wide_attack_soft and not cap_pressure:
+                control = _control_for_state(config, "wide-step-attack", reasons or ["inventory_attack"])
+            else:
+                control = _control_for_state(config, "wide-step", reasons or ["inventory_soft"])
         elif amp_1m < 0.0025 and amp_5m < 0.006 and not fast_soft and not fast_hard:
             control = _control_for_state(config, "ping-pong-fast", ["low_volatility", "light_inventory"])
         else:
@@ -346,7 +377,7 @@ def resolve_elastic_volume_control(
                 reasons.append("inventory_soft")
             control = _control_for_state(config, "ping-pong-safe", reasons or ["balanced"])
 
-        immediate_regimes = {"defensive", "wide-step", "ping-pong-safe"}
+        immediate_regimes = {"defensive", "wide-step", "wide-step-attack", "ping-pong-safe"}
         recovery_regimes = {"ping-pong-safe", "ping-pong-fast"}
         if last_regime in immediate_regimes and control["regime"] in recovery_regimes:
             candidate_regime = str(control["regime"])
@@ -365,16 +396,16 @@ def resolve_elastic_volume_control(
 
     control["last_regime"] = last_regime
 
-    if control["regime"] in {"defensive", "wide-step"}:
+    if control["regime"] in {"defensive", "wide-step", "wide-step-attack"}:
         if directional_long_notional >= directional_short_notional and directional_long_notional > 0:
             control["allow_entry_long"] = False
             control["allow_reduce_long"] = True
-            if control["regime"] == "wide-step":
+            if control["regime"] in {"wide-step", "wide-step-attack"}:
                 control["allow_entry_short"] = True
         elif directional_short_notional > 0:
             control["allow_entry_short"] = False
             control["allow_reduce_short"] = True
-            if control["regime"] == "wide-step":
+            if control["regime"] in {"wide-step", "wide-step-attack"}:
                 control["allow_entry_long"] = True
         elif net > 0:
             control["allow_entry_long"] = False
@@ -400,7 +431,7 @@ def resolve_elastic_volume_control(
                 control["allow_entry_short"] = False
                 control["reasons"].append("ping_pong_inventory_entry_gate")
 
-    if control["regime"] == "wide-step" and (
+    if control["regime"] in {"wide-step", "wide-step-attack"} and (
         (bias_regime == "low_long_bias" and not control["allow_entry_long"])
         or (bias_regime == "high_short_bias" and not control["allow_entry_short"])
     ):
@@ -425,6 +456,7 @@ def resolve_elastic_volume_control(
         "directional_short_notional": directional_short_notional,
         "inventory_ratio": inventory_ratio,
         "threshold_inventory_ratio": threshold_inventory_ratio,
+        "wide_attack_threshold_inventory_ratio": wide_attack_threshold_inventory_ratio,
         "adaptive_step_raw_scale": raw_scale,
         "volatility_1m_amplitude_ratio": amp_1m,
         "volatility_5m_amplitude_ratio": amp_5m,

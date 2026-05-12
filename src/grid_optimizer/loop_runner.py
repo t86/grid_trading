@@ -8411,6 +8411,12 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         inventory_hard_ratio_ping_pong_safe=float(
             getattr(args, "elastic_inventory_hard_ratio_ping_pong_safe", 0.60)
         ),
+        inventory_soft_ratio_wide_step_attack=float(
+            getattr(args, "elastic_inventory_soft_ratio_wide_step_attack", 0.45)
+        ),
+        inventory_hard_ratio_wide_step_attack=float(
+            getattr(args, "elastic_inventory_hard_ratio_wide_step_attack", 0.65)
+        ),
         inventory_soft_ratio_wide_step=float(getattr(args, "elastic_inventory_soft_ratio_wide_step", 0.60)),
         inventory_hard_ratio_wide_step=float(getattr(args, "elastic_inventory_hard_ratio_wide_step", 0.80)),
         step_scale_sprint=float(getattr(args, "elastic_step_scale_sprint", 0.8)),
@@ -8422,34 +8428,43 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         base_step_multiplier_ping_pong_safe=float(
             getattr(args, "elastic_base_step_multiplier_ping_pong_safe", 1.2)
         ),
+        base_step_multiplier_wide_step_attack=float(
+            getattr(args, "elastic_base_step_multiplier_wide_step_attack", 2.2)
+        ),
         base_step_multiplier_wide_step=float(getattr(args, "elastic_base_step_multiplier_wide_step", 2.5)),
         base_step_multiplier_defensive=float(getattr(args, "elastic_base_step_multiplier_defensive", 3.5)),
         per_order_scale_sprint=float(getattr(args, "elastic_per_order_scale_sprint", 1.25)),
         per_order_scale_defensive=float(getattr(args, "elastic_per_order_scale_defensive", 0.65)),
         per_order_scale_ping_pong_fast=float(getattr(args, "elastic_per_order_scale_ping_pong_fast", 1.0)),
         per_order_scale_ping_pong_safe=float(getattr(args, "elastic_per_order_scale_ping_pong_safe", 0.9)),
+        per_order_scale_wide_step_attack=float(getattr(args, "elastic_per_order_scale_wide_step_attack", 1.2)),
         per_order_scale_wide_step=float(getattr(args, "elastic_per_order_scale_wide_step", 0.6)),
         per_order_scale_defensive_state=float(getattr(args, "elastic_per_order_scale_defensive_state", 0.4)),
         levels_scale_sprint=float(getattr(args, "elastic_levels_scale_sprint", 1.25)),
         levels_scale_defensive=float(getattr(args, "elastic_levels_scale_defensive", 0.65)),
         levels_scale_ping_pong_fast=float(getattr(args, "elastic_levels_scale_ping_pong_fast", 1.0)),
         levels_scale_ping_pong_safe=float(getattr(args, "elastic_levels_scale_ping_pong_safe", 0.85)),
+        levels_scale_wide_step_attack=float(getattr(args, "elastic_levels_scale_wide_step_attack", 1.1)),
         levels_scale_wide_step=float(getattr(args, "elastic_levels_scale_wide_step", 0.65)),
         levels_scale_defensive_state=float(getattr(args, "elastic_levels_scale_defensive_state", 0.35)),
         threshold_scale_ping_pong_fast=float(getattr(args, "elastic_threshold_scale_ping_pong_fast", 1.0)),
         threshold_scale_ping_pong_safe=float(getattr(args, "elastic_threshold_scale_ping_pong_safe", 1.1)),
+        threshold_scale_wide_step_attack=float(getattr(args, "elastic_threshold_scale_wide_step_attack", 1.5)),
         threshold_scale_wide_step=float(getattr(args, "elastic_threshold_scale_wide_step", 1.5)),
         threshold_scale_defensive=float(getattr(args, "elastic_threshold_scale_defensive", 1.8)),
         pause_scale_ping_pong_fast=float(getattr(args, "elastic_pause_scale_ping_pong_fast", 1.0)),
         pause_scale_ping_pong_safe=float(getattr(args, "elastic_pause_scale_ping_pong_safe", 1.1)),
+        pause_scale_wide_step_attack=float(getattr(args, "elastic_pause_scale_wide_step_attack", 1.2)),
         pause_scale_wide_step=float(getattr(args, "elastic_pause_scale_wide_step", 1.5)),
         pause_scale_defensive=float(getattr(args, "elastic_pause_scale_defensive", 1.8)),
         max_total_scale_ping_pong_fast=float(getattr(args, "elastic_max_total_scale_ping_pong_fast", 1.0)),
         max_total_scale_ping_pong_safe=float(getattr(args, "elastic_max_total_scale_ping_pong_safe", 1.1)),
+        max_total_scale_wide_step_attack=float(getattr(args, "elastic_max_total_scale_wide_step_attack", 1.2)),
         max_total_scale_wide_step=float(getattr(args, "elastic_max_total_scale_wide_step", 1.35)),
         max_total_scale_defensive=float(getattr(args, "elastic_max_total_scale_defensive", 1.6)),
         max_entry_orders_ping_pong_fast=int(getattr(args, "elastic_max_entry_orders_ping_pong_fast", 6)),
         max_entry_orders_ping_pong_safe=int(getattr(args, "elastic_max_entry_orders_ping_pong_safe", 4)),
+        max_entry_orders_wide_step_attack=int(getattr(args, "elastic_max_entry_orders_wide_step_attack", 4)),
         max_entry_orders_wide_step=int(getattr(args, "elastic_max_entry_orders_wide_step", 3)),
         max_entry_orders_defensive=int(getattr(args, "elastic_max_entry_orders_defensive", 2)),
         cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
@@ -12584,6 +12599,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-inventory-hard-ratio-ping-pong-fast", type=float, default=0.45)
     parser.add_argument("--elastic-inventory-soft-ratio-ping-pong-safe", type=float, default=0.45)
     parser.add_argument("--elastic-inventory-hard-ratio-ping-pong-safe", type=float, default=0.60)
+    parser.add_argument("--elastic-inventory-soft-ratio-wide-step-attack", type=float, default=0.45)
+    parser.add_argument("--elastic-inventory-hard-ratio-wide-step-attack", type=float, default=0.65)
     parser.add_argument("--elastic-inventory-soft-ratio-wide-step", type=float, default=0.60)
     parser.add_argument("--elastic-inventory-hard-ratio-wide-step", type=float, default=0.80)
     parser.add_argument("--elastic-step-scale-sprint", type=float, default=0.8)
@@ -12591,34 +12608,41 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-step-scale-cooldown", type=float, default=3.0)
     parser.add_argument("--elastic-base-step-multiplier-ping-pong-fast", type=float, default=0.8)
     parser.add_argument("--elastic-base-step-multiplier-ping-pong-safe", type=float, default=1.2)
+    parser.add_argument("--elastic-base-step-multiplier-wide-step-attack", type=float, default=2.2)
     parser.add_argument("--elastic-base-step-multiplier-wide-step", type=float, default=2.5)
     parser.add_argument("--elastic-base-step-multiplier-defensive", type=float, default=3.5)
     parser.add_argument("--elastic-per-order-scale-sprint", type=float, default=1.25)
     parser.add_argument("--elastic-per-order-scale-defensive", type=float, default=0.65)
     parser.add_argument("--elastic-per-order-scale-ping-pong-fast", type=float, default=1.0)
     parser.add_argument("--elastic-per-order-scale-ping-pong-safe", type=float, default=0.9)
+    parser.add_argument("--elastic-per-order-scale-wide-step-attack", type=float, default=1.2)
     parser.add_argument("--elastic-per-order-scale-wide-step", type=float, default=0.6)
     parser.add_argument("--elastic-per-order-scale-defensive-state", type=float, default=0.4)
     parser.add_argument("--elastic-levels-scale-sprint", type=float, default=1.25)
     parser.add_argument("--elastic-levels-scale-defensive", type=float, default=0.65)
     parser.add_argument("--elastic-levels-scale-ping-pong-fast", type=float, default=1.0)
     parser.add_argument("--elastic-levels-scale-ping-pong-safe", type=float, default=0.85)
+    parser.add_argument("--elastic-levels-scale-wide-step-attack", type=float, default=1.1)
     parser.add_argument("--elastic-levels-scale-wide-step", type=float, default=0.65)
     parser.add_argument("--elastic-levels-scale-defensive-state", type=float, default=0.35)
     parser.add_argument("--elastic-threshold-scale-ping-pong-fast", type=float, default=1.0)
     parser.add_argument("--elastic-threshold-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-threshold-scale-wide-step-attack", type=float, default=1.5)
     parser.add_argument("--elastic-threshold-scale-wide-step", type=float, default=1.5)
     parser.add_argument("--elastic-threshold-scale-defensive", type=float, default=1.8)
     parser.add_argument("--elastic-pause-scale-ping-pong-fast", type=float, default=1.0)
     parser.add_argument("--elastic-pause-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-pause-scale-wide-step-attack", type=float, default=1.2)
     parser.add_argument("--elastic-pause-scale-wide-step", type=float, default=1.5)
     parser.add_argument("--elastic-pause-scale-defensive", type=float, default=1.8)
     parser.add_argument("--elastic-max-total-scale-ping-pong-fast", type=float, default=1.0)
     parser.add_argument("--elastic-max-total-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-max-total-scale-wide-step-attack", type=float, default=1.2)
     parser.add_argument("--elastic-max-total-scale-wide-step", type=float, default=1.35)
     parser.add_argument("--elastic-max-total-scale-defensive", type=float, default=1.6)
     parser.add_argument("--elastic-max-entry-orders-ping-pong-fast", type=int, default=6)
     parser.add_argument("--elastic-max-entry-orders-ping-pong-safe", type=int, default=4)
+    parser.add_argument("--elastic-max-entry-orders-wide-step-attack", type=int, default=4)
     parser.add_argument("--elastic-max-entry-orders-wide-step", type=int, default=3)
     parser.add_argument("--elastic-max-entry-orders-defensive", type=int, default=2)
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)

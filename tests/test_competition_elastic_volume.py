@@ -49,6 +49,7 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
 
         self.assertEqual(config.base_step_multiplier_ping_pong_fast, 0.8)
         self.assertEqual(config.base_step_multiplier_ping_pong_safe, 1.2)
+        self.assertEqual(config.base_step_multiplier_wide_step_attack, 2.2)
         self.assertEqual(config.base_step_multiplier_wide_step, 2.5)
         self.assertEqual(config.base_step_multiplier_defensive, 3.5)
         self.assertEqual(config.threshold_scale_wide_step, 1.5)
@@ -122,6 +123,45 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(control["threshold_scale"], 1.5)
         self.assertAlmostEqual(control["pause_scale"], 1.5)
         self.assertAlmostEqual(control["position_limit_scale"], 1.5)
+
+    def test_light_inventory_high_volatility_enters_wide_step_attack(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=180.0,
+                short_notional=120.0,
+                actual_net_notional=60.0,
+                max_long_notional=4_000.0,
+                max_short_notional=4_000.0,
+                volatility_1m_amplitude_ratio=0.0105,
+                volatility_5m_amplitude_ratio=0.0140,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "wide-step-attack")
+        self.assertGreater(control["per_order_scale"], 1.0)
+        self.assertGreater(control["levels_scale"], 1.0)
+        self.assertAlmostEqual(control["threshold_scale"], 1.5)
+        self.assertEqual(control["max_entry_long_orders"], 4)
+
+    def test_heavier_inventory_high_volatility_stays_on_conservative_wide_step(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=900.0,
+                short_notional=250.0,
+                actual_net_notional=650.0,
+                max_long_notional=4_000.0,
+                max_short_notional=4_000.0,
+                volatility_1m_amplitude_ratio=0.0105,
+                volatility_5m_amplitude_ratio=0.0140,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "wide-step")
+        self.assertLess(control["per_order_scale"], 1.0)
+        self.assertLess(control["levels_scale"], 1.0)
+        self.assertEqual(control["max_entry_long_orders"], 3)
 
     def test_wide_step_uses_scaled_threshold_before_escalating_to_defensive(self) -> None:
         control = resolve_elastic_volume_control(
