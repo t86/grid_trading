@@ -4043,6 +4043,20 @@ def _snapshot_runner_execution_events(args: argparse.Namespace, *, max_events: i
     return payloads
 
 
+def _runner_user_data_stream_status(args: argparse.Namespace) -> dict[str, Any]:
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None:
+        return {"enabled": False, "connection_state": "disabled"}
+    if not hasattr(stream, "status"):
+        return {"enabled": True, "connection_state": "unknown"}
+    try:
+        status = dict(stream.status())
+    except Exception as exc:
+        return {"enabled": True, "connection_state": "status_error", "last_error": str(exc)}
+    status["enabled"] = True
+    return status
+
+
 def _drain_new_runner_execution_events(args: argparse.Namespace, *, max_events: int = 50) -> list[dict[str, Any]]:
     events = _snapshot_runner_execution_events(args, max_events=max_events)
     seen = getattr(args, "_seen_execution_event_keys", None)
@@ -12380,6 +12394,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "cancel_stale": bool(args.cancel_stale),
             "maker_retries": args.maker_retries,
         },
+        "user_data_stream_status": _runner_user_data_stream_status(args),
         "observed_execution_events": _snapshot_runner_execution_events(args, max_events=5),
         "observed_strategy_execution_summary": _summarize_runner_strategy_execution_events(
             args,

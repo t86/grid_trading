@@ -303,6 +303,27 @@ class FuturesUserDataStream:
     def snapshot_events(self) -> list[ExecutionEvent]:
         return self.event_store.snapshot()
 
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            last_message_age_seconds = (
+                max(time.monotonic() - self._last_message_at, 0.0)
+                if self._last_message_at > 0
+                else None
+            )
+            last_keepalive_age_seconds = (
+                max(time.monotonic() - self._last_keepalive_at, 0.0)
+                if self._last_keepalive_at > 0
+                else None
+            )
+            return {
+                "connection_state": self._connection_state,
+                "last_error": self._last_error,
+                "last_message_age_seconds": last_message_age_seconds,
+                "last_keepalive_age_seconds": last_keepalive_age_seconds,
+                "listen_key_active": bool(self._listen_key),
+                "event_count": len(self.event_store.snapshot()),
+            }
+
     def _base_stream_url(self) -> str:
         if self.contract_type == "coinm":
             return "wss://dstream.binance.com/ws"
