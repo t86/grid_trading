@@ -218,6 +218,52 @@ class AccountPositionStore:
             return max(time.monotonic() - self._last_update_at, 0.0)
 
 
+class OpenOrderStateStore:
+    def __init__(self) -> None:
+        self._orders: dict[str, dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._last_update_at = 0.0
+
+    def update_from_execution_event(self, event: ExecutionEvent) -> None:
+        client_order_id = str(event.client_order_id or "").strip()
+        if not client_order_id:
+            return
+        now = time.monotonic()
+        with self._lock:
+            if event.kind in {"ORDER_FILLED", "ORDER_CANCELED", "ORDER_EXPIRED"}:
+                self._orders.pop(client_order_id, None)
+            else:
+                self._orders[client_order_id] = {
+                    "symbol": event.symbol,
+                    "orderId": event.order_id,
+                    "clientOrderId": client_order_id,
+                    "side": event.side,
+                    "type": event.order_type,
+                    "timeInForce": event.time_in_force,
+                    "positionSide": event.position_side,
+                    "origQty": str(event.original_qty),
+                    "price": str(event.original_price),
+                    "executedQty": str(event.cumulative_filled_qty),
+                    "status": event.order_status,
+                    "executionType": event.execution_type,
+                    "event_time": event.event_time,
+                    "transaction_time": event.transaction_time,
+                    "observed_at": now,
+                    "source": "user_data_stream",
+                }
+            self._last_update_at = now
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._orders.values()]
+
+    def last_update_age_seconds(self) -> float | None:
+        with self._lock:
+            if self._last_update_at <= 0:
+                return None
+            return max(time.monotonic() - self._last_update_at, 0.0)
+
+
 def _kind_from_order_update(execution_type: str, order_status: str) -> str:
     status = order_status.upper()
     execution = execution_type.upper()
@@ -305,6 +351,7 @@ class FuturesUserDataStream:
         contract_type: str = "usdm",
         event_store: ExecutionEventStore | None = None,
         account_position_store: AccountPositionStore | None = None,
+        open_order_state_store: OpenOrderStateStore | None = None,
         listen_key_client: FuturesListenKeyClient | None = None,
         keepalive_interval_seconds: float = 30 * 60,
     ) -> None:
@@ -315,6 +362,7 @@ class FuturesUserDataStream:
         self.contract_type = normalize_contract_type(contract_type)
         self.event_store = event_store or ExecutionEventStore()
         self.account_position_store = account_position_store or AccountPositionStore()
+        self.open_order_state_store = open_order_state_store or OpenOrderStateStore()
         self.keepalive_interval_seconds = max(float(keepalive_interval_seconds), 60.0)
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -361,6 +409,12 @@ class FuturesUserDataStream:
     def snapshot_account_positions(self) -> list[dict[str, Any]]:
         return self.account_position_store.snapshot()
 
+    def snapshot_open_orders(self) -> list[dict[str, Any]]:
+        return self.open_order_state_store.snapshot()
+
+    def open_order_state_age_seconds(self) -> float | None:
+        return self.open_order_state_store.last_update_age_seconds()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             last_message_age_seconds = (
@@ -379,9 +433,11 @@ class FuturesUserDataStream:
                 "last_message_age_seconds": last_message_age_seconds,
                 "last_keepalive_age_seconds": last_keepalive_age_seconds,
                 "last_account_update_age_seconds": self.account_position_store.last_update_age_seconds(),
+                "last_open_order_update_age_seconds": self.open_order_state_store.last_update_age_seconds(),
                 "listen_key_active": bool(self._listen_key),
                 "event_count": len(self.event_store.snapshot()),
                 "account_position_count": len(self.account_position_store.snapshot()),
+                "open_order_count": len(self.open_order_state_store.snapshot()),
             }
 
     def _base_stream_url(self) -> str:
@@ -454,6 +510,7 @@ class FuturesUserDataStream:
             event = normalize_order_trade_update(payload)
         if event is not None:
             self.event_store.add(event)
+            self.open_order_state_store.update_from_execution_event(event)
         if event_type == "ACCOUNT_UPDATE" or isinstance(payload.get("a"), dict):
             self.account_position_store.update_from_account_update(payload)
         with self._lock:

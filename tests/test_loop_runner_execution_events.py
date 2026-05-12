@@ -283,6 +283,53 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         self.assertEqual(summary["active_order_count"], 1)
         self.assertEqual(summary["active_client_order_ids"], ["gx-chipu-b"])
         self.assertEqual(summary["active_order_ids"], [2])
+        self.assertEqual(summary["source"], "observed_events")
+
+    def test_summarize_runner_strategy_open_order_state_prefers_stream_current_state(self) -> None:
+        stream = SimpleNamespace(
+            snapshot_open_orders=lambda: [
+                {
+                    "symbol": "CHIPUSDT",
+                    "clientOrderId": "gx-chipu-live",
+                    "orderId": 9,
+                }
+            ],
+            open_order_state_age_seconds=lambda: 1.0,
+            snapshot_events=lambda: [],
+        )
+        args = argparse.Namespace(user_data_stream=stream)
+
+        summary = _summarize_runner_strategy_open_order_state(args, "CHIPUSDT", max_events=20)
+
+        self.assertEqual(summary["active_order_count"], 1)
+        self.assertEqual(summary["active_client_order_ids"], ["gx-chipu-live"])
+        self.assertEqual(summary["active_order_ids"], [9])
+        self.assertEqual(summary["source"], "stream_open_orders")
+
+    def test_summarize_runner_strategy_open_order_state_accepts_fresh_empty_stream_state(self) -> None:
+        stream = SimpleNamespace(
+            snapshot_open_orders=lambda: [],
+            open_order_state_age_seconds=lambda: 1.0,
+            snapshot_events=lambda: [
+                ExecutionEvent(
+                    kind="ORDER_NEW",
+                    symbol="CHIPUSDT",
+                    event_time=1000,
+                    transaction_time=990,
+                    order_id=1,
+                    client_order_id="gx-chipu-stale-window",
+                    side="BUY",
+                    execution_type="NEW",
+                    order_status="NEW",
+                )
+            ],
+        )
+        args = argparse.Namespace(user_data_stream=stream)
+
+        summary = _summarize_runner_strategy_open_order_state(args, "CHIPUSDT", max_events=20)
+
+        self.assertEqual(summary["active_order_count"], 0)
+        self.assertEqual(summary["source"], "stream_open_orders")
 
     def test_should_backfill_open_orders_rest_skips_recent_rest_when_observed_state_matches_expected(self) -> None:
         decision = _should_backfill_open_orders_rest(

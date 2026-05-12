@@ -10,6 +10,7 @@ from grid_optimizer.execution_events import (
     FuturesListenKeyClient,
     FuturesUserDataStream,
     MarketTick,
+    OpenOrderStateStore,
     detect_crossed_grid_levels,
     normalize_order_trade_update,
 )
@@ -118,6 +119,56 @@ class AccountPositionStoreTests(unittest.TestCase):
         self.assertEqual(snapshot[0]["source"], "user_data_stream")
 
 
+class OpenOrderStateStoreTests(unittest.TestCase):
+    def test_execution_events_track_active_open_orders(self) -> None:
+        store = OpenOrderStateStore()
+        new_event = normalize_order_trade_update(
+            {
+                "E": 1000,
+                "T": 990,
+                "o": {
+                    "s": "CHIPUSDT",
+                    "c": "gx-chipu-a",
+                    "S": "BUY",
+                    "o": "LIMIT",
+                    "f": "GTX",
+                    "q": "10",
+                    "p": "0.067",
+                    "x": "NEW",
+                    "X": "NEW",
+                    "i": 1,
+                },
+            }
+        )
+        assert new_event is not None
+
+        store.update_from_execution_event(new_event)
+
+        self.assertEqual(len(store.snapshot()), 1)
+        filled_event = normalize_order_trade_update(
+            {
+                "E": 1010,
+                "T": 1005,
+                "o": {
+                    "s": "CHIPUSDT",
+                    "c": "gx-chipu-a",
+                    "S": "BUY",
+                    "x": "TRADE",
+                    "X": "FILLED",
+                    "i": 1,
+                    "l": "10",
+                    "z": "10",
+                    "L": "0.067",
+                },
+            }
+        )
+        assert filled_event is not None
+
+        store.update_from_execution_event(filled_event)
+
+        self.assertEqual(store.snapshot(), [])
+
+
 class FuturesListenKeyClientTests(unittest.TestCase):
     @patch("grid_optimizer.execution_events._http_api_key_request_json")
     def test_listen_key_client_create_keepalive_and_close(self, mock_request) -> None:
@@ -166,6 +217,7 @@ class FuturesUserDataStreamTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].kind, "ORDER_PARTIALLY_FILLED")
         self.assertEqual(events[0].last_filled_qty, 5.0)
+        self.assertEqual(len(stream.snapshot_open_orders()), 1)
 
     def test_user_data_stream_routes_account_updates_into_position_store(self) -> None:
         stream = FuturesUserDataStream(api_key="key")

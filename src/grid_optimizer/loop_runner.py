@@ -139,6 +139,7 @@ AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
 TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 30.0
+OPEN_ORDER_STREAM_MAX_AGE_SECONDS = 30.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -4131,6 +4132,33 @@ def _summarize_runner_strategy_open_order_state(
     max_events: int = 500,
 ) -> dict[str, Any]:
     strategy_prefix = _strategy_client_order_prefix(symbol)
+    stream = getattr(args, "user_data_stream", None)
+    if stream is not None and hasattr(stream, "snapshot_open_orders"):
+        stream_age = None
+        if hasattr(stream, "open_order_state_age_seconds"):
+            try:
+                stream_age = stream.open_order_state_age_seconds()
+            except Exception:
+                stream_age = None
+        try:
+            open_orders = [
+                dict(item)
+                for item in list(stream.snapshot_open_orders())
+                if isinstance(item, dict)
+                and str(item.get("symbol") or "").upper().strip() == symbol.upper().strip()
+                and str(item.get("clientOrderId") or "").startswith(strategy_prefix)
+            ]
+        except Exception:
+            open_orders = []
+        if stream_age is not None and stream_age <= OPEN_ORDER_STREAM_MAX_AGE_SECONDS:
+            return {
+                "active_order_count": len(open_orders),
+                "active_client_order_ids": [str(item.get("clientOrderId") or "") for item in open_orders],
+                "active_order_ids": [item.get("orderId") for item in open_orders],
+                "latest_events": [],
+                "source": "stream_open_orders",
+                "stream_age_seconds": stream_age,
+            }
     events = [
         item
         for item in _snapshot_runner_execution_events(args, max_events=max_events)
@@ -4154,6 +4182,7 @@ def _summarize_runner_strategy_open_order_state(
         "active_client_order_ids": [str(item.get("client_order_id") or "") for item in active_items],
         "active_order_ids": [item.get("order_id") for item in active_items],
         "latest_events": events[-5:],
+        "source": "observed_events",
     }
 
 
