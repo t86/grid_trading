@@ -409,6 +409,55 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         self.assertEqual(snapshot["account_position_source"], "user_data_stream")
         mock_account_info.assert_not_called()
 
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch(
+        "grid_optimizer.loop_runner.fetch_futures_open_orders",
+        return_value=[
+            {
+                "symbol": "CHIPUSDT",
+                "clientOrderId": "gx-chipu-live",
+                "orderId": 9,
+            }
+        ],
+    )
+    def test_periodic_reconcile_feeds_rest_open_orders_into_stream_baseline(
+        self,
+        _mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        captured: list[dict[str, object]] = []
+        stream = SimpleNamespace(
+            snapshot_events=lambda: [],
+            snapshot_account_positions=lambda: [
+                {
+                    "symbol": "CHIPUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "-73",
+                    "observed_at": __import__("time").monotonic(),
+                }
+            ],
+            replace_open_orders_from_rest=lambda orders: captured.extend(orders),
+        )
+        args = argparse.Namespace(user_data_stream=stream)
+
+        snapshot = _run_periodic_reconcile(
+            state={},
+            cycle=1,
+            interval_cycles=1,
+            symbol="CHIPUSDT",
+            strategy_mode="synthetic_neutral",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=1,
+            expected_actual_net_qty=-73.0,
+            args=args,
+        )
+
+        self.assertEqual(snapshot["open_orders_source"], "rest")
+        self.assertEqual([item["clientOrderId"] for item in captured], ["gx-chipu-live"])
+        mock_account_info.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -253,6 +253,34 @@ class OpenOrderStateStore:
                 }
             self._last_update_at = now
 
+    def replace_from_rest_open_orders(self, orders: list[dict[str, Any]]) -> None:
+        now = time.monotonic()
+        next_orders: dict[str, dict[str, Any]] = {}
+        for order in orders:
+            if not isinstance(order, dict):
+                continue
+            client_order_id = str(order.get("clientOrderId") or "").strip()
+            if not client_order_id:
+                continue
+            next_orders[client_order_id] = {
+                "symbol": str(order.get("symbol") or "").upper().strip(),
+                "orderId": order.get("orderId"),
+                "clientOrderId": client_order_id,
+                "side": str(order.get("side") or "").upper().strip(),
+                "type": str(order.get("type") or "").upper().strip(),
+                "timeInForce": str(order.get("timeInForce") or "").upper().strip(),
+                "positionSide": str(order.get("positionSide") or "BOTH").upper().strip() or "BOTH",
+                "origQty": str(order.get("origQty", order.get("quantity", order.get("qty", "0")))),
+                "price": str(order.get("price") or "0"),
+                "executedQty": str(order.get("executedQty") or "0"),
+                "status": str(order.get("status") or "NEW").upper().strip() or "NEW",
+                "observed_at": now,
+                "source": "rest_backfill",
+            }
+        with self._lock:
+            self._orders = next_orders
+            self._last_update_at = now
+
     def snapshot(self) -> list[dict[str, Any]]:
         with self._lock:
             return [dict(item) for item in self._orders.values()]
@@ -414,6 +442,9 @@ class FuturesUserDataStream:
 
     def open_order_state_age_seconds(self) -> float | None:
         return self.open_order_state_store.last_update_age_seconds()
+
+    def replace_open_orders_from_rest(self, orders: list[dict[str, Any]]) -> None:
+        self.open_order_state_store.replace_from_rest_open_orders(orders)
 
     def status(self) -> dict[str, Any]:
         with self._lock:

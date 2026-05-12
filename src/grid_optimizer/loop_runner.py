@@ -1239,6 +1239,12 @@ def _run_periodic_reconcile(
     if open_orders_rest_backfill_performed:
         current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
         current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
+        stream = getattr(args, "user_data_stream", None) if args is not None else None
+        if stream is not None and hasattr(stream, "replace_open_orders_from_rest"):
+            try:
+                stream.replace_open_orders_from_rest(current_strategy_open_orders)
+            except Exception:
+                pass
         actual_open_order_count = len(current_strategy_open_orders)
         total_open_order_count: int | None = len(current_open_orders)
         open_orders_source = "rest"

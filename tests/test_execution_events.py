@@ -168,6 +168,32 @@ class OpenOrderStateStoreTests(unittest.TestCase):
 
         self.assertEqual(store.snapshot(), [])
 
+    def test_rest_backfill_replaces_open_order_baseline(self) -> None:
+        store = OpenOrderStateStore()
+
+        store.replace_from_rest_open_orders(
+            [
+                {
+                    "symbol": "CHIPUSDT",
+                    "orderId": 9,
+                    "clientOrderId": "gx-chipu-live",
+                    "side": "SELL",
+                    "type": "LIMIT",
+                    "timeInForce": "GTX",
+                    "origQty": "10",
+                    "price": "0.0672",
+                    "executedQty": "0",
+                    "status": "NEW",
+                }
+            ]
+        )
+
+        snapshot = store.snapshot()
+        self.assertEqual(len(snapshot), 1)
+        self.assertEqual(snapshot[0]["clientOrderId"], "gx-chipu-live")
+        self.assertEqual(snapshot[0]["source"], "rest_backfill")
+        self.assertIsNotNone(store.last_update_age_seconds())
+
 
 class FuturesListenKeyClientTests(unittest.TestCase):
     @patch("grid_optimizer.execution_events._http_api_key_request_json")
