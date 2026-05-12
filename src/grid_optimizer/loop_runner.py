@@ -2109,9 +2109,6 @@ def _regime_budget_entry_reuse_tolerance(
     regime_entry_budget: dict[str, Any],
     step_price: float,
 ) -> tuple[float, str]:
-    normalized_profile = str(strategy_profile or "").strip()
-    if not normalized_profile.endswith("_neutral_regime_budget_ping_pong_v2"):
-        return max(float(step_price), 0.0), "default_step"
     if not isinstance(regime_entry_budget, dict) or not regime_entry_budget.get("enabled"):
         return max(float(step_price), 0.0), "default_step"
     if bool(regime_entry_budget.get("report_only", True)):

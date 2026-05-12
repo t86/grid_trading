@@ -875,6 +875,22 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(tolerance, 0.001125)
         self.assertEqual(reason, "regime_budget_small_drift_reuse")
 
+    def test_regime_budget_entry_reuse_tolerance_uses_enabled_budget_with_legacy_profile(self) -> None:
+        tolerance, reason = _regime_budget_entry_reuse_tolerance(
+            strategy_profile="billusdt_competition_neutral_ping_pong_v1",
+            regime_entry_budget={
+                "enabled": True,
+                "report_only": False,
+                "state": "ping-pong-safe",
+                "cancel_entry_required": False,
+                "shock_guard_active": False,
+            },
+            step_price=0.0005,
+        )
+
+        self.assertAlmostEqual(tolerance, 0.001125)
+        self.assertEqual(reason, "regime_budget_small_drift_reuse")
+
     def test_regime_budget_entry_reuse_tolerance_blocks_during_switch(self) -> None:
         tolerance, reason = _regime_budget_entry_reuse_tolerance(
             strategy_profile="billusdt_neutral_regime_budget_ping_pong_v2",
