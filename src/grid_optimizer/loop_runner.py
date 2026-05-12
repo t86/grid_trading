@@ -1251,7 +1251,7 @@ def _run_periodic_reconcile(
     else:
         actual_open_order_count = int(observed_open_order_state.get("active_order_count", 0) or 0)
         total_open_order_count = None
-        open_orders_source = "observed_events"
+        open_orders_source = str(observed_open_order_state.get("source") or "observed_events")
     stream_position = _snapshot_runner_account_position(args, symbol)
     if stream_position is not None:
         current_position = stream_position
