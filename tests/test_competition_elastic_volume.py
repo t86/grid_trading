@@ -123,6 +123,30 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(control["pause_scale"], 1.5)
         self.assertAlmostEqual(control["position_limit_scale"], 1.5)
 
+    def test_wide_step_uses_scaled_threshold_before_escalating_to_defensive(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(
+                enabled=True,
+                inventory_hard_ratio_ping_pong_fast=0.45,
+                inventory_hard_ratio_ping_pong_safe=0.60,
+                inventory_hard_ratio_wide_step=0.80,
+                threshold_scale_wide_step=1.5,
+            ),
+            inputs=_inputs(
+                threshold_position_notional=825.0,
+                short_notional=686.94,
+                long_notional=0.0,
+                actual_net_notional=-686.94,
+                max_long_notional=1_650.0,
+                max_short_notional=1_650.0,
+                volatility_1m_amplitude_ratio=0.0038,
+                volatility_5m_amplitude_ratio=0.0098,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "wide-step")
+        self.assertAlmostEqual(control["threshold_scale"], 1.5)
+
     def test_high_inventory_or_extreme_volatility_enters_defensive(self) -> None:
         control = resolve_elastic_volume_control(
             config=ElasticVolumeConfig(enabled=True),
@@ -164,7 +188,13 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
     def test_hard_inventory_enters_defensive(self) -> None:
         control = resolve_elastic_volume_control(
             config=ElasticVolumeConfig(enabled=True),
-            inputs=_inputs(short_notional=1_250.0, long_notional=20.0, actual_net_notional=-1_230.0),
+            inputs=_inputs(
+                short_notional=1_950.0,
+                long_notional=20.0,
+                actual_net_notional=-1_930.0,
+                max_long_notional=2_000.0,
+                max_short_notional=2_000.0,
+            ),
         )
 
         self.assertEqual(control["regime"], "defensive")

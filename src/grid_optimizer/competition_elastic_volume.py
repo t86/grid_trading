@@ -131,6 +131,16 @@ def _inventory_ratio_against_threshold(long_notional: float, short_notional: flo
     return max(max(_safe_float(long_notional), 0.0), max(_safe_float(short_notional), 0.0)) / threshold
 
 
+def _inventory_ratio_against_scaled_threshold(
+    long_notional: float,
+    short_notional: float,
+    threshold_notional: float,
+    threshold_scale: float,
+) -> float:
+    effective_threshold = max(_safe_float(threshold_notional) * max(_safe_float(threshold_scale), 0.0), 1e-12)
+    return max(max(_safe_float(long_notional), 0.0), max(_safe_float(short_notional), 0.0)) / effective_threshold
+
+
 def _base_control(
     *,
     enabled: bool,
@@ -250,6 +260,24 @@ def resolve_elastic_volume_control(
         directional_short_notional,
         _safe_float(inputs.threshold_position_notional),
     )
+    fast_threshold_inventory_ratio = _inventory_ratio_against_scaled_threshold(
+        long_notional,
+        short_notional,
+        _safe_float(inputs.threshold_position_notional),
+        config.threshold_scale_ping_pong_fast,
+    )
+    safe_threshold_inventory_ratio = _inventory_ratio_against_scaled_threshold(
+        long_notional,
+        short_notional,
+        _safe_float(inputs.threshold_position_notional),
+        config.threshold_scale_ping_pong_safe,
+    )
+    wide_threshold_inventory_ratio = _inventory_ratio_against_scaled_threshold(
+        long_notional,
+        short_notional,
+        _safe_float(inputs.threshold_position_notional),
+        config.threshold_scale_wide_step,
+    )
     raw_scale = max(_safe_float(inputs.adaptive_step_raw_scale), 0.0)
     amp_1m = max(_safe_float(inputs.volatility_1m_amplitude_ratio), 0.0)
     amp_5m = max(_safe_float(inputs.volatility_5m_amplitude_ratio), 0.0)
@@ -290,11 +318,11 @@ def resolve_elastic_volume_control(
         control["cooldown_until"] = cooldown_until.isoformat()
     else:
         cap_pressure = inventory_ratio >= 0.9
-        fast_soft = threshold_inventory_ratio >= max(_safe_float(config.inventory_soft_ratio_ping_pong_fast), 0.0)
-        fast_hard = threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_ping_pong_fast), 0.0)
-        safe_soft = threshold_inventory_ratio >= max(_safe_float(config.inventory_soft_ratio_ping_pong_safe), 0.0)
-        safe_hard = threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_ping_pong_safe), 0.0)
-        wide_hard = threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_wide_step), 0.0)
+        fast_soft = fast_threshold_inventory_ratio >= max(_safe_float(config.inventory_soft_ratio_ping_pong_fast), 0.0)
+        fast_hard = fast_threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_ping_pong_fast), 0.0)
+        safe_soft = safe_threshold_inventory_ratio >= max(_safe_float(config.inventory_soft_ratio_ping_pong_safe), 0.0)
+        safe_hard = safe_threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_ping_pong_safe), 0.0)
+        wide_hard = wide_threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_wide_step), 0.0)
 
         if amp_1m > 0.018 or amp_5m > 0.035 or wide_hard:
             reasons = ["extreme_volatility"] if (amp_1m > 0.018 or amp_5m > 0.035) else ["inventory_hard"]
