@@ -340,7 +340,7 @@ class FuturesUserDataStream:
                     self._listen_key = listen_key
                     self._last_keepalive_at = time.monotonic()
                 app = websocket.WebSocketApp(
-                    f"{self._base_stream_url()}/{listen_key}",
+                    self._base_stream_url(),
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
@@ -375,6 +375,9 @@ class FuturesUserDataStream:
         with self._lock:
             self._connection_state = "connected"
             self._last_error = None
+        listen_key = self._listen_key
+        if listen_key:
+            _ws.send(json.dumps({"method": "SUBSCRIBE", "params": [listen_key], "id": 1}))
 
     def _on_message(self, _ws: Any, raw_message: str) -> None:
         payload = json.loads(raw_message)

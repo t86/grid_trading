@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from grid_optimizer.execution_events import (
     ExecutionEventStore,
@@ -131,6 +131,16 @@ class FuturesUserDataStreamTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].kind, "ORDER_PARTIALLY_FILLED")
         self.assertEqual(events[0].last_filled_qty, 5.0)
+
+    def test_user_data_stream_subscribes_listen_key_after_open(self) -> None:
+        stream = FuturesUserDataStream(api_key="key")
+        stream._listen_key = "listen-key"
+        ws = MagicMock()
+
+        stream._on_open(ws)
+
+        ws.send.assert_called_once_with('{"method": "SUBSCRIBE", "params": ["listen-key"], "id": 1}')
+        self.assertEqual(stream.status()["connection_state"], "connected")
 
 
 class MarketCrossingEventTests(unittest.TestCase):
