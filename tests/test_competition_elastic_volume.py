@@ -33,6 +33,10 @@ def _inputs(**overrides):
         "max_short_notional": 500.0,
         "actual_net_notional": 20.0,
         "adaptive_step_raw_scale": 0.5,
+        "volatility_entry_pause_active": False,
+        "volatility_entry_pause_reason": "",
+        "volatility_10s_abs_return_ratio": 0.0,
+        "volatility_10s_amplitude_ratio": 0.0,
         "volatility_1m_amplitude_ratio": 0.004,
         "volatility_5m_amplitude_ratio": 0.007,
         "multi_timeframe_bias_regime": "balanced",
@@ -103,6 +107,90 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertGreater(control["step_scale"], 1.0)
         self.assertLess(control["step_scale"], 2.5)
 
+    def test_entry_pause_with_inventory_switches_to_safe_early(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=2_300.0,
+                short_notional=0.0,
+                actual_net_notional=2_300.0,
+                max_long_notional=5_000.0,
+                max_short_notional=5_000.0,
+                threshold_position_notional=10_000.0,
+                volatility_entry_pause_active=True,
+                volatility_entry_pause_reason="window_30s abs_return_ratio=0.04% >= 0.03%",
+                volatility_1m_amplitude_ratio=0.0010,
+                volatility_5m_amplitude_ratio=0.0020,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "ping-pong-safe")
+        self.assertIn("early_safe_volatility_inventory", control["reasons"])
+        self.assertFalse(control["allow_entry_long"])
+        self.assertTrue(control["allow_entry_short"])
+
+    def test_10s_micro_volatility_with_inventory_switches_to_safe_early(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=2_300.0,
+                short_notional=0.0,
+                actual_net_notional=2_300.0,
+                max_long_notional=5_000.0,
+                max_short_notional=5_000.0,
+                threshold_position_notional=10_000.0,
+                volatility_10s_abs_return_ratio=0.00026,
+                volatility_10s_amplitude_ratio=0.00020,
+                volatility_1m_amplitude_ratio=0.0010,
+                volatility_5m_amplitude_ratio=0.0020,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "ping-pong-safe")
+        self.assertIn("micro_volatility_10s", control["reasons"])
+        self.assertAlmostEqual(control["metrics"]["volatility_10s_abs_return_ratio"], 0.00026)
+
+    def test_inventory_ratio_switches_to_wide_step_before_threshold_pressure(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=3_300.0,
+                short_notional=0.0,
+                actual_net_notional=3_300.0,
+                max_long_notional=5_000.0,
+                max_short_notional=5_000.0,
+                threshold_position_notional=10_000.0,
+                volatility_1m_amplitude_ratio=0.0010,
+                volatility_5m_amplitude_ratio=0.0020,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "wide-step")
+        self.assertIn("early_wide_inventory", control["reasons"])
+        self.assertFalse(control["allow_entry_long"])
+        self.assertAlmostEqual(control["per_order_scale"], 0.6)
+
+    def test_short_window_loss_switches_to_wide_step(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                gross_notional_5m=10_000.0,
+                net_pnl_5m=-0.6,
+                long_notional=200.0,
+                short_notional=0.0,
+                actual_net_notional=200.0,
+                max_long_notional=5_000.0,
+                max_short_notional=5_000.0,
+                threshold_position_notional=10_000.0,
+                volatility_1m_amplitude_ratio=0.0010,
+                volatility_5m_amplitude_ratio=0.0020,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "wide-step")
+        self.assertIn("early_wide_loss_5m", control["reasons"])
+        self.assertAlmostEqual(control["metrics"]["loss_per_10k_5m"], 0.6)
+
     def test_ping_pong_fast_hard_inventory_jumps_to_wide_step(self) -> None:
         control = resolve_elastic_volume_control(
             config=ElasticVolumeConfig(enabled=True),
@@ -119,9 +207,10 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
 
         self.assertEqual(control["regime"], "wide-step")
         self.assertGreater(control["step_scale"], 2.0)
-        self.assertAlmostEqual(control["threshold_scale"], 1.5)
-        self.assertAlmostEqual(control["pause_scale"], 1.5)
-        self.assertAlmostEqual(control["position_limit_scale"], 1.5)
+        self.assertAlmostEqual(control["threshold_scale"], 1.0)
+        self.assertAlmostEqual(control["pause_scale"], 1.0)
+        self.assertAlmostEqual(control["position_limit_scale"], 1.0)
+        self.assertIn("same_side_risk_limit_clamp", control["reasons"])
 
     def test_high_inventory_or_extreme_volatility_enters_defensive(self) -> None:
         control = resolve_elastic_volume_control(
@@ -141,7 +230,8 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertGreater(control["step_scale"], 1.0)
         self.assertLess(control["per_order_scale"], 1.0)
         self.assertTrue(control["reasons"])
-        self.assertAlmostEqual(control["threshold_scale"], 1.8)
+        self.assertAlmostEqual(control["threshold_scale"], 1.0)
+        self.assertIn("same_side_risk_limit_clamp", control["reasons"])
 
     def test_ping_pong_safe_recovery_confirms_before_fast(self) -> None:
         control = resolve_elastic_volume_control(
@@ -246,6 +336,29 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertFalse(control["allow_entry_long"])
         self.assertTrue(control["allow_entry_short"])
         self.assertIn("inventory_over_bias", control["reasons"])
+
+    def test_inventory_pressure_does_not_raise_same_side_risk_limits(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=1_300.0,
+                short_notional=0.0,
+                actual_net_notional=1_300.0,
+                threshold_position_notional=2_700.0,
+                max_long_notional=5_400.0,
+                max_short_notional=5_400.0,
+                volatility_1m_amplitude_ratio=0.0040,
+                volatility_5m_amplitude_ratio=0.0070,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "wide-step")
+        self.assertFalse(control["allow_entry_long"])
+        self.assertTrue(control["allow_entry_short"])
+        self.assertEqual(control["position_limit_scale"], 1.0)
+        self.assertEqual(control["threshold_scale"], 1.0)
+        self.assertEqual(control["pause_scale"], 1.0)
+        self.assertIn("same_side_risk_limit_clamp", control["reasons"])
 
     def test_metrics_include_short_window_loss(self) -> None:
         control = resolve_elastic_volume_control(

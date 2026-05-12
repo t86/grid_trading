@@ -555,6 +555,7 @@ def resolve_adaptive_step_price(
         "reason": None,
         "history_count": len(history),
         "metrics": {
+            "window_10s": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=10),
             "window_30s": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=30),
             "window_1m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=60),
             "window_3m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=180),
@@ -1927,12 +1928,18 @@ def apply_hard_loss_forced_reduce(
     safe_current_qty = max(_safe_float(current_qty), 0.0)
     safe_current_notional = max(_safe_float(current_notional), 0.0)
     safe_target_notional = max(_safe_float(target_notional), 0.0)
-    if safe_current_qty <= 1e-12 or safe_current_notional <= safe_target_notional + 1e-12:
+    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
+    if safe_current_qty <= 1e-12:
         report["blocked_reason"] = "at_or_below_target"
         return report
+    if safe_current_notional <= safe_target_notional + 1e-12:
+        if safe_max_order_notional <= 0:
+            report["blocked_reason"] = "at_or_below_target"
+            return report
+        safe_target_notional = max(safe_current_notional - safe_max_order_notional, 0.0)
+        report["target_notional"] = safe_target_notional
 
     raw_reduce_notional = safe_current_notional - safe_target_notional
-    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
     reduce_notional = min(raw_reduce_notional, safe_max_order_notional) if safe_max_order_notional > 0 else raw_reduce_notional
     price_source = bid_price if normalized_side == "SELL" else ask_price
     price = _round_order_price(max(_safe_float(price_source), 0.0), tick_size, normalized_side)
@@ -8414,6 +8421,11 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         max_entry_orders_ping_pong_safe=int(getattr(args, "elastic_max_entry_orders_ping_pong_safe", 4)),
         max_entry_orders_wide_step=int(getattr(args, "elastic_max_entry_orders_wide_step", 3)),
         max_entry_orders_defensive=int(getattr(args, "elastic_max_entry_orders_defensive", 2)),
+        early_micro_abs_return_ratio=float(getattr(args, "elastic_early_micro_abs_return_ratio", 0.00025)),
+        early_micro_amplitude_ratio=float(getattr(args, "elastic_early_micro_amplitude_ratio", 0.00035)),
+        early_safe_inventory_ratio=float(getattr(args, "elastic_early_safe_inventory_ratio", 0.45)),
+        early_wide_inventory_ratio=float(getattr(args, "elastic_early_wide_inventory_ratio", 0.65)),
+        early_wide_loss_per_10k_5m=float(getattr(args, "elastic_early_wide_loss_per_10k_5m", 0.5)),
         cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
         state_confirm_cycles=int(getattr(args, "elastic_state_confirm_cycles", 3)),
         cancel_stale_entries_on_cooldown=bool(getattr(args, "elastic_cancel_stale_entries_on_cooldown", True)),
@@ -9359,6 +9371,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 max_short_notional=_safe_float(getattr(effective_args, "max_short_position_notional", None)),
                 actual_net_notional=actual_net_qty * max(mid_price, 0.0),
                 adaptive_step_raw_scale=_safe_float(adaptive_step.get("raw_scale")),
+                volatility_entry_pause_active=bool(volatility_entry_pause.get("active")),
+                volatility_entry_pause_reason=str(volatility_entry_pause.get("reason") or ""),
+                volatility_10s_abs_return_ratio=abs(
+                    _safe_float((((adaptive_step.get("metrics") or {}).get("window_10s") or {}).get("return_ratio")))
+                ),
+                volatility_10s_amplitude_ratio=_safe_float(
+                    ((adaptive_step.get("metrics") or {}).get("window_10s") or {}).get("amplitude_ratio")
+                ),
                 volatility_1m_amplitude_ratio=_safe_float(
                     ((adaptive_step.get("metrics") or {}).get("window_1m") or {}).get("amplitude_ratio")
                 ),
@@ -12198,14 +12218,26 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
 
     if args.cancel_stale:
         for stale_order in validation["actions"]["cancel_orders"]:
-            cancel_response = delete_futures_order(
-                symbol=symbol,
-                order_id=int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None,
-                orig_client_order_id=str(stale_order.get("clientOrderId", "")).strip() or None,
-                api_key=api_key,
-                api_secret=api_secret,
-                recv_window=args.recv_window,
-            )
+            order_id = int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None
+            orig_client_order_id = str(stale_order.get("clientOrderId", "")).strip() or None
+            try:
+                cancel_response = delete_futures_order(
+                    symbol=symbol,
+                    order_id=order_id,
+                    orig_client_order_id=orig_client_order_id,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    recv_window=args.recv_window,
+                )
+            except RuntimeError as exc:
+                if not _ignore_noop_error(exc, ("unknown order sent", "-2011")):
+                    raise
+                cancel_response = {
+                    "ignored_error": str(exc),
+                    "orderId": order_id,
+                    "origClientOrderId": orig_client_order_id,
+                    "status": "ALREADY_GONE",
+                }
             report["canceled_orders"].append(cancel_response)
 
     symbol_info = plan_report.get("symbol_info") or {}
@@ -12556,6 +12588,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-max-entry-orders-ping-pong-safe", type=int, default=4)
     parser.add_argument("--elastic-max-entry-orders-wide-step", type=int, default=3)
     parser.add_argument("--elastic-max-entry-orders-defensive", type=int, default=2)
+    parser.add_argument("--elastic-early-micro-abs-return-ratio", type=float, default=0.00025)
+    parser.add_argument("--elastic-early-micro-amplitude-ratio", type=float, default=0.00035)
+    parser.add_argument("--elastic-early-safe-inventory-ratio", type=float, default=0.45)
+    parser.add_argument("--elastic-early-wide-inventory-ratio", type=float, default=0.65)
+    parser.add_argument("--elastic-early-wide-loss-per-10k-5m", type=float, default=0.5)
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)

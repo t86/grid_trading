@@ -57,6 +57,11 @@ class ElasticVolumeConfig:
     max_entry_orders_ping_pong_safe: int = 4
     max_entry_orders_wide_step: int = 3
     max_entry_orders_defensive: int = 2
+    early_micro_abs_return_ratio: float = 0.00025
+    early_micro_amplitude_ratio: float = 0.00035
+    early_safe_inventory_ratio: float = 0.45
+    early_wide_inventory_ratio: float = 0.65
+    early_wide_loss_per_10k_5m: float = 0.5
     cooldown_seconds: float = 120.0
     state_confirm_cycles: int = 3
     cancel_stale_entries_on_cooldown: bool = True
@@ -82,6 +87,10 @@ class ElasticVolumeInputs:
     max_short_notional: float
     actual_net_notional: float
     adaptive_step_raw_scale: float
+    volatility_entry_pause_active: bool = False
+    volatility_entry_pause_reason: str = ""
+    volatility_10s_abs_return_ratio: float = 0.0
+    volatility_10s_amplitude_ratio: float = 0.0
     volatility_1m_amplitude_ratio: float = 0.0
     volatility_5m_amplitude_ratio: float = 0.0
     multi_timeframe_bias_regime: str = "balanced"
@@ -251,6 +260,10 @@ def resolve_elastic_volume_control(
         _safe_float(inputs.threshold_position_notional),
     )
     raw_scale = max(_safe_float(inputs.adaptive_step_raw_scale), 0.0)
+    volatility_entry_pause_active = bool(inputs.volatility_entry_pause_active)
+    volatility_entry_pause_reason = str(inputs.volatility_entry_pause_reason or "").strip()
+    abs_10s = max(_safe_float(inputs.volatility_10s_abs_return_ratio), 0.0)
+    amp_10s = max(_safe_float(inputs.volatility_10s_amplitude_ratio), 0.0)
     amp_1m = max(_safe_float(inputs.volatility_1m_amplitude_ratio), 0.0)
     amp_5m = max(_safe_float(inputs.volatility_5m_amplitude_ratio), 0.0)
     bias_regime = str(inputs.multi_timeframe_bias_regime or "balanced")
@@ -264,6 +277,10 @@ def resolve_elastic_volume_control(
             "inventory_ratio": inventory_ratio,
             "threshold_inventory_ratio": threshold_inventory_ratio,
             "adaptive_step_raw_scale": raw_scale,
+            "volatility_entry_pause_active": volatility_entry_pause_active,
+            "volatility_entry_pause_reason": volatility_entry_pause_reason,
+            "volatility_10s_abs_return_ratio": abs_10s,
+            "volatility_10s_amplitude_ratio": amp_10s,
             "volatility_1m_amplitude_ratio": amp_1m,
             "volatility_5m_amplitude_ratio": amp_5m,
         }
@@ -295,11 +312,29 @@ def resolve_elastic_volume_control(
         safe_soft = threshold_inventory_ratio >= max(_safe_float(config.inventory_soft_ratio_ping_pong_safe), 0.0)
         safe_hard = threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_ping_pong_safe), 0.0)
         wide_hard = threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_wide_step), 0.0)
+        micro_volatility = (
+            abs_10s >= max(_safe_float(config.early_micro_abs_return_ratio), 0.0)
+            or amp_10s >= max(_safe_float(config.early_micro_amplitude_ratio), 0.0)
+        )
+        early_safe = (
+            (volatility_entry_pause_active or micro_volatility)
+            and inventory_ratio >= max(_safe_float(config.early_safe_inventory_ratio), 0.0)
+        )
+        early_wide_inventory = inventory_ratio >= max(_safe_float(config.early_wide_inventory_ratio), 0.0)
+        early_wide_loss = loss_5m >= max(_safe_float(config.early_wide_loss_per_10k_5m), 0.0)
 
         if amp_1m > 0.018 or amp_5m > 0.035 or wide_hard:
             reasons = ["extreme_volatility"] if (amp_1m > 0.018 or amp_5m > 0.035) else ["inventory_hard"]
             control = _control_for_state(config, "defensive", reasons)
-        elif amp_1m > 0.009 or amp_5m > 0.018 or fast_hard or safe_hard or cap_pressure:
+        elif (
+            amp_1m > 0.009
+            or amp_5m > 0.018
+            or fast_hard
+            or safe_hard
+            or cap_pressure
+            or early_wide_inventory
+            or early_wide_loss
+        ):
             reasons: list[str] = []
             if amp_1m > 0.009 or amp_5m > 0.018:
                 reasons.append("volatility")
@@ -307,7 +342,18 @@ def resolve_elastic_volume_control(
                 reasons.append("inventory_hard")
             if cap_pressure:
                 reasons.append("cap_pressure")
+            if early_wide_inventory:
+                reasons.append("early_wide_inventory")
+            if early_wide_loss:
+                reasons.append("early_wide_loss_5m")
             control = _control_for_state(config, "wide-step", reasons or ["inventory_soft"])
+        elif early_safe:
+            reasons = ["early_safe_volatility_inventory"]
+            if micro_volatility:
+                reasons.append("micro_volatility_10s")
+            if volatility_entry_pause_reason:
+                reasons.append(f"volatility_entry_pause:{volatility_entry_pause_reason}")
+            control = _control_for_state(config, "ping-pong-safe", reasons)
         elif amp_1m < 0.0025 and amp_5m < 0.006 and not fast_soft and not fast_hard:
             control = _control_for_state(config, "ping-pong-fast", ["low_volatility", "light_inventory"])
         else:
@@ -338,27 +384,42 @@ def resolve_elastic_volume_control(
     control["last_regime"] = last_regime
 
     if control["regime"] in {"defensive", "wide-step"}:
+        def clamp_same_side_risk_limits() -> None:
+            control["position_limit_scale"] = min(_safe_float(control.get("position_limit_scale")), 1.0)
+            control["threshold_scale"] = min(_safe_float(control.get("threshold_scale")), 1.0)
+            control["pause_scale"] = min(_safe_float(control.get("pause_scale")), 1.0)
+            if "same_side_risk_limit_clamp" not in control["reasons"]:
+                control["reasons"].append("same_side_risk_limit_clamp")
+
         if directional_long_notional >= directional_short_notional and directional_long_notional > 0:
             control["allow_entry_long"] = False
             control["allow_reduce_long"] = True
+            clamp_same_side_risk_limits()
             if control["regime"] == "wide-step":
                 control["allow_entry_short"] = True
         elif directional_short_notional > 0:
             control["allow_entry_short"] = False
             control["allow_reduce_short"] = True
+            clamp_same_side_risk_limits()
             if control["regime"] == "wide-step":
                 control["allow_entry_long"] = True
         elif net > 0:
             control["allow_entry_long"] = False
+            clamp_same_side_risk_limits()
         elif net < 0:
             control["allow_entry_short"] = False
+            clamp_same_side_risk_limits()
     elif control["regime"] in {"ping-pong-fast", "ping-pong-safe"}:
         soft_ratio = (
             max(_safe_float(config.inventory_soft_ratio_ping_pong_fast), 0.0)
             if control["regime"] == "ping-pong-fast"
             else max(_safe_float(config.inventory_soft_ratio_ping_pong_safe), 0.0)
         )
-        if threshold_inventory_ratio >= soft_ratio:
+        early_safe_entry_pressure = (
+            control["regime"] == "ping-pong-safe"
+            and inventory_ratio >= max(_safe_float(config.early_safe_inventory_ratio), 0.0)
+        )
+        if threshold_inventory_ratio >= soft_ratio or early_safe_entry_pressure:
             if directional_long_notional >= directional_short_notional and directional_long_notional > 0:
                 control["allow_entry_long"] = False
                 control["reasons"].append("ping_pong_inventory_entry_gate")
@@ -398,6 +459,10 @@ def resolve_elastic_volume_control(
         "inventory_ratio": inventory_ratio,
         "threshold_inventory_ratio": threshold_inventory_ratio,
         "adaptive_step_raw_scale": raw_scale,
+        "volatility_entry_pause_active": volatility_entry_pause_active,
+        "volatility_entry_pause_reason": volatility_entry_pause_reason,
+        "volatility_10s_abs_return_ratio": abs_10s,
+        "volatility_10s_amplitude_ratio": amp_10s,
         "volatility_1m_amplitude_ratio": amp_1m,
         "volatility_5m_amplitude_ratio": amp_5m,
         "multi_timeframe_bias_regime": bias_regime,

@@ -1082,14 +1082,26 @@ def main() -> None:
 
         if args.cancel_stale:
             for stale_order in validation["actions"]["cancel_orders"]:
-                cancel_response = delete_futures_order(
-                    symbol=symbol,
-                    order_id=int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None,
-                    orig_client_order_id=str(stale_order.get("clientOrderId", "")).strip() or None,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    recv_window=args.recv_window,
-                )
+                order_id = int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None
+                orig_client_order_id = str(stale_order.get("clientOrderId", "")).strip() or None
+                try:
+                    cancel_response = delete_futures_order(
+                        symbol=symbol,
+                        order_id=order_id,
+                        orig_client_order_id=orig_client_order_id,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        recv_window=args.recv_window,
+                    )
+                except RuntimeError as exc:
+                    if not _ignore_noop_error(exc, ("unknown order sent", "-2011")):
+                        raise
+                    cancel_response = {
+                        "ignored_error": str(exc),
+                        "orderId": order_id,
+                        "origClientOrderId": orig_client_order_id,
+                        "status": "ALREADY_GONE",
+                    }
                 report["canceled_orders"].append(cancel_response)
 
         tick_size = _safe_float((plan_report.get("symbol_info") or {}).get("tick_size"))

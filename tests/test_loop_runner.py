@@ -762,6 +762,32 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(order["notional"], 400.0)
         self.assertEqual(plan["forced_reduce_orders"], [order])
 
+    def test_apply_hard_loss_forced_reduce_reduces_when_target_above_current(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="SELL",
+            current_qty=5000.0,
+            current_notional=650.0,
+            target_notional=2700.0,
+            max_order_notional=180.0,
+            bid_price=0.13,
+            ask_price=0.131,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["placed_order_count"], 1)
+        self.assertAlmostEqual(report["target_notional"], 470.0)
+        self.assertLessEqual(plan["sell_orders"][0]["notional"], 180.0)
+
     def test_apply_entry_permission_gate_prunes_short_entries_only(self) -> None:
         plan = {
             "bootstrap_orders": [
@@ -7702,6 +7728,15 @@ class LoopRunnerTests(unittest.TestCase):
             elastic_max_total_scale_ping_pong_safe=1.1,
             elastic_max_total_scale_wide_step=1.35,
             elastic_max_total_scale_defensive=1.6,
+            elastic_max_entry_orders_ping_pong_fast=6,
+            elastic_max_entry_orders_ping_pong_safe=4,
+            elastic_max_entry_orders_wide_step=3,
+            elastic_max_entry_orders_defensive=2,
+            elastic_early_micro_abs_return_ratio=0.00025,
+            elastic_early_micro_amplitude_ratio=0.00035,
+            elastic_early_safe_inventory_ratio=0.45,
+            elastic_early_wide_inventory_ratio=0.65,
+            elastic_early_wide_loss_per_10k_5m=0.5,
             elastic_cooldown_seconds=120.0,
             elastic_state_confirm_cycles=3,
             elastic_cancel_stale_entries_on_cooldown=True,
@@ -7717,6 +7752,11 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(config.threshold_scale_wide_step, 1.5)
         self.assertEqual(config.pause_scale_defensive, 1.8)
         self.assertEqual(config.max_total_scale_defensive, 1.6)
+        self.assertEqual(config.early_micro_abs_return_ratio, 0.00025)
+        self.assertEqual(config.early_micro_amplitude_ratio, 0.00035)
+        self.assertEqual(config.early_safe_inventory_ratio, 0.45)
+        self.assertEqual(config.early_wide_inventory_ratio, 0.65)
+        self.assertEqual(config.early_wide_loss_per_10k_5m, 0.5)
 
     def test_elastic_volume_state_snapshot_preserves_recovery_confirmation(self) -> None:
         snapshot = _elastic_volume_state_snapshot(
