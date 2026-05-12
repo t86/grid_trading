@@ -4698,6 +4698,23 @@ def _runtime_guard_loss_recovery_state(state: dict[str, Any]) -> dict[str, Any]:
     return recovery
 
 
+def _runtime_guard_mark_loss_stop(
+    recovery: dict[str, Any],
+    *,
+    stopped_at: datetime,
+    rolling_hourly_loss: float,
+) -> None:
+    stopped_iso = stopped_at.astimezone(timezone.utc).isoformat()
+    recovery.update(
+        {
+            "stopped_at": stopped_iso,
+            "last_reason": "rolling_hourly_loss_limit_hit",
+            "last_rolling_hourly_loss": rolling_hourly_loss,
+        }
+    )
+    recovery.pop("recovered_at", None)
+
+
 def _filter_pnl_events_after(pnl_events: list[dict[str, Any]], since: datetime | None) -> list[dict[str, Any]]:
     if since is None:
         return pnl_events
@@ -4978,6 +4995,13 @@ def _maybe_handle_runtime_guard(
     loss_only_stop = runtime_guard_result.matched_reasons == ["rolling_hourly_loss_limit_hit"]
     if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
         stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+        if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
+            _runtime_guard_mark_loss_stop(
+                recovery,
+                stopped_at=cycle_started_at,
+                rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+            )
+            stopped_at = cycle_started_at.astimezone(timezone.utc)
         if stopped_at is not None:
             cooldown_seconds = max(
                 _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
@@ -5007,13 +5031,12 @@ def _maybe_handle_runtime_guard(
                 )
                 _write_json(state_path, state)
                 return None
-        recovery.update(
-            {
-                "stopped_at": recovery.get("stopped_at") or cycle_started_at.isoformat(),
-                "last_reason": "rolling_hourly_loss_limit_hit",
-                "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
-            }
-        )
+        if stopped_at is None:
+            _runtime_guard_mark_loss_stop(
+                recovery,
+                stopped_at=cycle_started_at,
+                rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+            )
         _write_json(state_path, state)
     if list(flatten_snapshot.get("orders", [])):
         flatten_result = _start_futures_flatten_process(args.symbol.upper().strip(), allow_loss=True)
@@ -14643,12 +14666,25 @@ def main() -> None:
                     symbol=args.symbol.upper().strip(),
                     now=cycle_started_at,
                 )
+                runtime_recovery = _runtime_guard_loss_recovery_state(state)
+                runtime_recovered_at = _parse_state_datetime(runtime_recovery.get("recovered_at"))
+                runtime_pnl_events_for_guard = _filter_pnl_events_after(runtime_pnl_events, runtime_recovered_at)
                 runtime_guard_result = evaluate_runtime_guards(
                     config=runtime_guard_config,
                     now=cycle_started_at,
                     cumulative_gross_notional=runtime_cumulative_gross_notional,
-                    pnl_events=runtime_pnl_events,
+                    pnl_events=runtime_pnl_events_for_guard,
                 )
+                runtime_loss_recovery_summary: dict[str, Any] | None = None
+                runtime_loss_only_stop = runtime_guard_result.matched_reasons == ["rolling_hourly_loss_limit_hit"]
+                if runtime_loss_only_stop and _runtime_guard_loss_recovery_enabled(args) and not runtime_guard_result.tradable:
+                    _runtime_guard_mark_loss_stop(
+                        runtime_recovery,
+                        stopped_at=cycle_started_at,
+                        rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                    )
+                    runtime_loss_recovery_summary = dict(runtime_recovery)
+                    _write_json(state_path, state)
 
                 summary = {
                     "ts": cycle_started_at.isoformat(),
@@ -15108,6 +15144,11 @@ def main() -> None:
                     "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
                     "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
                 }
+                if runtime_loss_recovery_summary is not None:
+                    summary["runtime_status"] = "cooldown"
+                    summary["stop_triggered"] = False
+                    summary["stop_reason"] = "rolling_hourly_loss_cooling_down"
+                    summary["runtime_guard_loss_recovery"] = runtime_loss_recovery_summary
                 volatility_email_alert = maybe_send_volatility_email_alert(
                     args=args,
                     state=state,
