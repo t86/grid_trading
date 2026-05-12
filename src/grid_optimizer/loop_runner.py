@@ -563,6 +563,7 @@ def resolve_adaptive_step_price(
         "reason": None,
         "history_count": len(history),
         "metrics": {
+            "window_10s": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=10),
             "window_30s": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=30),
             "window_1m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=60),
             "window_3m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=180),
@@ -9100,6 +9101,11 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         max_entry_orders_wide_step_attack=int(getattr(args, "elastic_max_entry_orders_wide_step_attack", 4)),
         max_entry_orders_wide_step=int(getattr(args, "elastic_max_entry_orders_wide_step", 3)),
         max_entry_orders_defensive=int(getattr(args, "elastic_max_entry_orders_defensive", 2)),
+        early_micro_abs_return_ratio=float(getattr(args, "elastic_early_micro_abs_return_ratio", 0.00025)),
+        early_micro_amplitude_ratio=float(getattr(args, "elastic_early_micro_amplitude_ratio", 0.00035)),
+        early_safe_inventory_ratio=float(getattr(args, "elastic_early_safe_inventory_ratio", 0.45)),
+        early_wide_inventory_ratio=float(getattr(args, "elastic_early_wide_inventory_ratio", 0.65)),
+        early_wide_loss_per_10k_5m=float(getattr(args, "elastic_early_wide_loss_per_10k_5m", 0.5)),
         cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
         state_confirm_cycles=int(getattr(args, "elastic_state_confirm_cycles", 3)),
         cancel_stale_entries_on_cooldown=bool(getattr(args, "elastic_cancel_stale_entries_on_cooldown", True)),
@@ -10062,6 +10068,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 max_short_notional=_safe_float(getattr(effective_args, "max_short_position_notional", None)),
                 actual_net_notional=actual_net_qty * max(mid_price, 0.0),
                 adaptive_step_raw_scale=_safe_float(adaptive_step.get("raw_scale")),
+                volatility_entry_pause_active=bool(volatility_entry_pause.get("active")),
+                volatility_entry_pause_reason=(
+                    str(volatility_entry_pause.get("reason") or "")
+                    if volatility_entry_pause.get("reason") is not None
+                    else None
+                ),
+                volatility_10s_abs_return_ratio=abs(
+                    _safe_float(((adaptive_step.get("metrics") or {}).get("window_10s") or {}).get("return_ratio"))
+                ),
+                volatility_10s_amplitude_ratio=_safe_float(
+                    ((adaptive_step.get("metrics") or {}).get("window_10s") or {}).get("amplitude_ratio")
+                ),
                 volatility_1m_amplitude_ratio=_safe_float(
                     ((adaptive_step.get("metrics") or {}).get("window_1m") or {}).get("amplitude_ratio")
                 ),
@@ -13352,6 +13370,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-max-entry-orders-wide-step-attack", type=int, default=4)
     parser.add_argument("--elastic-max-entry-orders-wide-step", type=int, default=3)
     parser.add_argument("--elastic-max-entry-orders-defensive", type=int, default=2)
+    parser.add_argument("--elastic-early-micro-abs-return-ratio", type=float, default=0.00025)
+    parser.add_argument("--elastic-early-micro-amplitude-ratio", type=float, default=0.00035)
+    parser.add_argument("--elastic-early-safe-inventory-ratio", type=float, default=0.45)
+    parser.add_argument("--elastic-early-wide-inventory-ratio", type=float, default=0.65)
+    parser.add_argument("--elastic-early-wide-loss-per-10k-5m", type=float, default=0.5)
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
@@ -14089,6 +14112,17 @@ def main() -> None:
         raise SystemExit("--elastic-cooldown-seconds must be >= 0")
     if args.elastic_state_confirm_cycles < 1:
         raise SystemExit("--elastic-state-confirm-cycles must be >= 1")
+    elastic_early_thresholds = (
+        args.elastic_early_micro_abs_return_ratio,
+        args.elastic_early_micro_amplitude_ratio,
+        args.elastic_early_safe_inventory_ratio,
+        args.elastic_early_wide_inventory_ratio,
+        args.elastic_early_wide_loss_per_10k_5m,
+    )
+    if any(threshold < 0 for threshold in elastic_early_thresholds):
+        raise SystemExit("--elastic-early thresholds must be >= 0")
+    if args.elastic_early_safe_inventory_ratio > args.elastic_early_wide_inventory_ratio:
+        raise SystemExit("--elastic-early-safe-inventory-ratio must be <= wide-inventory-ratio")
     volatility_entry_pause_thresholds = (
         args.volatility_entry_pause_30s_abs_return_ratio,
         args.volatility_entry_pause_30s_amplitude_ratio,

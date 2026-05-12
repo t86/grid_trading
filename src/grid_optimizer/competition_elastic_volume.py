@@ -66,6 +66,11 @@ class ElasticVolumeConfig:
     max_entry_orders_wide_step_attack: int = 4
     max_entry_orders_wide_step: int = 3
     max_entry_orders_defensive: int = 2
+    early_micro_abs_return_ratio: float = 0.00025
+    early_micro_amplitude_ratio: float = 0.00035
+    early_safe_inventory_ratio: float = 0.45
+    early_wide_inventory_ratio: float = 0.65
+    early_wide_loss_per_10k_5m: float = 0.5
     cooldown_seconds: float = 120.0
     state_confirm_cycles: int = 3
     cancel_stale_entries_on_cooldown: bool = True
@@ -91,6 +96,10 @@ class ElasticVolumeInputs:
     max_short_notional: float
     actual_net_notional: float
     adaptive_step_raw_scale: float
+    volatility_entry_pause_active: bool = False
+    volatility_entry_pause_reason: str | None = None
+    volatility_10s_abs_return_ratio: float = 0.0
+    volatility_10s_amplitude_ratio: float = 0.0
     volatility_1m_amplitude_ratio: float = 0.0
     volatility_5m_amplitude_ratio: float = 0.0
     multi_timeframe_bias_regime: str = "balanced"
@@ -305,9 +314,14 @@ def resolve_elastic_volume_control(
         config.threshold_scale_wide_step,
     )
     raw_scale = max(_safe_float(inputs.adaptive_step_raw_scale), 0.0)
+    abs_return_10s = max(_safe_float(inputs.volatility_10s_abs_return_ratio), 0.0)
+    amp_10s = max(_safe_float(inputs.volatility_10s_amplitude_ratio), 0.0)
     amp_1m = max(_safe_float(inputs.volatility_1m_amplitude_ratio), 0.0)
     amp_5m = max(_safe_float(inputs.volatility_5m_amplitude_ratio), 0.0)
+    entry_pause_active = bool(inputs.volatility_entry_pause_active)
+    entry_pause_reason = str(inputs.volatility_entry_pause_reason or "").strip()
     bias_regime = str(inputs.multi_timeframe_bias_regime or "balanced")
+    early_same_side_entry_gate = False
 
     if not config.enabled:
         control = _base_control(enabled=False, regime="disabled")
@@ -318,6 +332,10 @@ def resolve_elastic_volume_control(
             "inventory_ratio": inventory_ratio,
             "threshold_inventory_ratio": threshold_inventory_ratio,
             "adaptive_step_raw_scale": raw_scale,
+            "volatility_entry_pause_active": entry_pause_active,
+            "volatility_entry_pause_reason": entry_pause_reason or None,
+            "volatility_10s_abs_return_ratio": abs_return_10s,
+            "volatility_10s_amplitude_ratio": amp_10s,
             "volatility_1m_amplitude_ratio": amp_1m,
             "volatility_5m_amplitude_ratio": amp_5m,
         }
@@ -351,10 +369,38 @@ def resolve_elastic_volume_control(
         wide_attack_soft = max(_safe_float(config.inventory_soft_ratio_wide_step_attack), 0.0)
         wide_soft = max(_safe_float(config.inventory_soft_ratio_wide_step), 0.0)
         wide_hard = wide_threshold_inventory_ratio >= max(_safe_float(config.inventory_hard_ratio_wide_step), 0.0)
+        early_micro_volatility = (
+            abs_return_10s >= max(_safe_float(config.early_micro_abs_return_ratio), 0.0) > 0
+            or amp_10s >= max(_safe_float(config.early_micro_amplitude_ratio), 0.0) > 0
+        )
+        early_volatility_active = entry_pause_active or early_micro_volatility
+        early_safe = early_volatility_active and inventory_ratio >= max(_safe_float(config.early_safe_inventory_ratio), 0.0)
+        early_wide_inventory = early_volatility_active and inventory_ratio >= max(_safe_float(config.early_wide_inventory_ratio), 0.0)
+        early_wide_loss = early_volatility_active and loss_5m >= max(_safe_float(config.early_wide_loss_per_10k_5m), 0.0)
+        early_same_side_entry_gate = early_safe or early_wide_inventory or early_wide_loss
 
         if amp_1m > 0.018 or amp_5m > 0.035 or wide_hard:
             reasons = ["extreme_volatility"] if (amp_1m > 0.018 or amp_5m > 0.035) else ["inventory_hard"]
             control = _control_for_state(config, "defensive", reasons)
+        elif early_wide_inventory or early_wide_loss:
+            reasons = []
+            if entry_pause_active:
+                reasons.append("volatility_entry_pause")
+            if early_micro_volatility:
+                reasons.append("early_micro_volatility")
+            if early_wide_inventory:
+                reasons.append("early_inventory_wide")
+            if early_wide_loss:
+                reasons.append("early_loss_wide")
+            control = _control_for_state(config, "wide-step", reasons or ["early_wide"])
+        elif early_safe:
+            reasons = []
+            if entry_pause_active:
+                reasons.append("volatility_entry_pause")
+            if early_micro_volatility:
+                reasons.append("early_micro_volatility")
+            reasons.append("early_inventory_safe")
+            control = _control_for_state(config, "ping-pong-safe", reasons)
         elif amp_1m > 0.009 or amp_5m > 0.018 or fast_hard or safe_hard or cap_pressure:
             reasons: list[str] = []
             if amp_1m > 0.009 or amp_5m > 0.018:
@@ -438,7 +484,7 @@ def resolve_elastic_volume_control(
             if control["regime"] == "ping-pong-fast"
             else max(_safe_float(config.inventory_soft_ratio_ping_pong_safe), 0.0)
         )
-        if threshold_inventory_ratio >= soft_ratio:
+        if threshold_inventory_ratio >= soft_ratio or early_same_side_entry_gate:
             if directional_long_notional >= directional_short_notional and directional_long_notional > 0:
                 control["allow_entry_long"] = False
                 control["reasons"].append("ping_pong_inventory_entry_gate")
@@ -479,6 +525,10 @@ def resolve_elastic_volume_control(
         "threshold_inventory_ratio": threshold_inventory_ratio,
         "wide_attack_threshold_inventory_ratio": wide_attack_threshold_inventory_ratio,
         "adaptive_step_raw_scale": raw_scale,
+        "volatility_entry_pause_active": entry_pause_active,
+        "volatility_entry_pause_reason": entry_pause_reason or None,
+        "volatility_10s_abs_return_ratio": abs_return_10s,
+        "volatility_10s_amplitude_ratio": amp_10s,
         "volatility_1m_amplitude_ratio": amp_1m,
         "volatility_5m_amplitude_ratio": amp_5m,
         "multi_timeframe_bias_regime": bias_regime,

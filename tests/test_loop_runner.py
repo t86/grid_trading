@@ -8264,6 +8264,8 @@ class LoopRunnerTests(unittest.TestCase):
             elastic_inventory_hard_ratio_ping_pong_fast=0.45,
             elastic_inventory_soft_ratio_ping_pong_safe=0.45,
             elastic_inventory_hard_ratio_ping_pong_safe=0.60,
+            elastic_inventory_soft_ratio_wide_step_attack=0.45,
+            elastic_inventory_hard_ratio_wide_step_attack=0.65,
             elastic_inventory_soft_ratio_wide_step=0.60,
             elastic_inventory_hard_ratio_wide_step=0.80,
             elastic_step_scale_sprint=0.8,
@@ -8271,32 +8273,48 @@ class LoopRunnerTests(unittest.TestCase):
             elastic_step_scale_cooldown=3.0,
             elastic_base_step_multiplier_ping_pong_fast=0.8,
             elastic_base_step_multiplier_ping_pong_safe=1.2,
+            elastic_base_step_multiplier_wide_step_attack=2.2,
             elastic_base_step_multiplier_wide_step=2.5,
             elastic_base_step_multiplier_defensive=3.5,
             elastic_per_order_scale_sprint=1.25,
             elastic_per_order_scale_defensive=0.65,
             elastic_per_order_scale_ping_pong_fast=1.0,
             elastic_per_order_scale_ping_pong_safe=0.9,
+            elastic_per_order_scale_wide_step_attack=1.2,
             elastic_per_order_scale_wide_step=0.6,
             elastic_per_order_scale_defensive_state=0.4,
             elastic_levels_scale_sprint=1.25,
             elastic_levels_scale_defensive=0.65,
             elastic_levels_scale_ping_pong_fast=1.0,
             elastic_levels_scale_ping_pong_safe=0.85,
+            elastic_levels_scale_wide_step_attack=1.1,
             elastic_levels_scale_wide_step=0.65,
             elastic_levels_scale_defensive_state=0.35,
             elastic_threshold_scale_ping_pong_fast=1.0,
             elastic_threshold_scale_ping_pong_safe=1.1,
+            elastic_threshold_scale_wide_step_attack=1.5,
             elastic_threshold_scale_wide_step=1.5,
             elastic_threshold_scale_defensive=1.8,
             elastic_pause_scale_ping_pong_fast=1.0,
             elastic_pause_scale_ping_pong_safe=1.1,
+            elastic_pause_scale_wide_step_attack=1.2,
             elastic_pause_scale_wide_step=1.5,
             elastic_pause_scale_defensive=1.8,
             elastic_max_total_scale_ping_pong_fast=1.0,
             elastic_max_total_scale_ping_pong_safe=1.1,
+            elastic_max_total_scale_wide_step_attack=1.2,
             elastic_max_total_scale_wide_step=1.35,
             elastic_max_total_scale_defensive=1.6,
+            elastic_max_entry_orders_ping_pong_fast=6,
+            elastic_max_entry_orders_ping_pong_safe=4,
+            elastic_max_entry_orders_wide_step_attack=4,
+            elastic_max_entry_orders_wide_step=3,
+            elastic_max_entry_orders_defensive=2,
+            elastic_early_micro_abs_return_ratio=0.00025,
+            elastic_early_micro_amplitude_ratio=0.00035,
+            elastic_early_safe_inventory_ratio=0.45,
+            elastic_early_wide_inventory_ratio=0.65,
+            elastic_early_wide_loss_per_10k_5m=0.5,
             elastic_cooldown_seconds=120.0,
             elastic_state_confirm_cycles=3,
             elastic_cancel_stale_entries_on_cooldown=True,
@@ -8306,12 +8324,19 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(config.base_step_multiplier_ping_pong_fast, 0.8)
         self.assertEqual(config.base_step_multiplier_ping_pong_safe, 1.2)
+        self.assertEqual(config.base_step_multiplier_wide_step_attack, 2.2)
         self.assertEqual(config.base_step_multiplier_wide_step, 2.5)
         self.assertEqual(config.base_step_multiplier_defensive, 3.5)
         self.assertEqual(config.inventory_hard_ratio_wide_step, 0.80)
         self.assertEqual(config.threshold_scale_wide_step, 1.5)
         self.assertEqual(config.pause_scale_defensive, 1.8)
         self.assertEqual(config.max_total_scale_defensive, 1.6)
+        self.assertEqual(config.max_entry_orders_wide_step_attack, 4)
+        self.assertEqual(config.early_micro_abs_return_ratio, 0.00025)
+        self.assertEqual(config.early_micro_amplitude_ratio, 0.00035)
+        self.assertEqual(config.early_safe_inventory_ratio, 0.45)
+        self.assertEqual(config.early_wide_inventory_ratio, 0.65)
+        self.assertEqual(config.early_wide_loss_per_10k_5m, 0.5)
 
     def test_elastic_volume_state_snapshot_preserves_recovery_confirmation(self) -> None:
         snapshot = _elastic_volume_state_snapshot(
