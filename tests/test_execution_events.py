@@ -132,14 +132,19 @@ class FuturesUserDataStreamTests(unittest.TestCase):
         self.assertEqual(events[0].kind, "ORDER_PARTIALLY_FILLED")
         self.assertEqual(events[0].last_filled_qty, 5.0)
 
-    def test_user_data_stream_subscribes_listen_key_after_open(self) -> None:
+    def test_user_data_stream_uses_private_listen_key_url(self) -> None:
         stream = FuturesUserDataStream(api_key="key")
-        stream._listen_key = "listen-key"
-        ws = MagicMock()
 
-        stream._on_open(ws)
+        self.assertEqual(
+            stream._user_stream_url("listen-key"),
+            "wss://fstream.binance.com/private/ws/listen-key",
+        )
 
-        ws.send.assert_called_once_with('{"method": "SUBSCRIBE", "params": ["listen-key"], "id": 1}')
+    def test_user_data_stream_marks_connected_after_open(self) -> None:
+        stream = FuturesUserDataStream(api_key="key")
+
+        stream._on_open(MagicMock())
+
         self.assertEqual(stream.status()["connection_state"], "connected")
 
 
