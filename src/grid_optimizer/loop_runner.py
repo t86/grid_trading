@@ -4666,14 +4666,18 @@ def _cancel_futures_strategy_orders(
         client_order_id = str(order.get("clientOrderId", "") or "")
         if not client_order_id.startswith(strategy_prefix) or is_flatten_order(order, flatten_prefix):
             continue
-        delete_futures_order(
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
-            orig_client_order_id=client_order_id or None,
-            recv_window=recv_window,
-        )
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
+                orig_client_order_id=client_order_id or None,
+                recv_window=recv_window,
+            )
+        except RuntimeError as exc:
+            if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                raise
         count += 1
     return count
 

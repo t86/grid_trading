@@ -7,10 +7,36 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from grid_optimizer.loop_runner import _maybe_handle_runtime_guard
+from grid_optimizer.loop_runner import _cancel_futures_strategy_orders, _maybe_handle_runtime_guard
 
 
 class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
+    @patch("grid_optimizer.loop_runner.delete_futures_order")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_cancel_futures_strategy_orders_treats_unknown_order_as_complete(
+        self,
+        mock_open_orders,
+        mock_delete_order,
+    ) -> None:
+        mock_open_orders.return_value = [
+            {"orderId": 101, "clientOrderId": "gx-ordiusdc-entry-1"},
+            {"orderId": 102, "clientOrderId": "gx-ordiusdc-exit-1"},
+        ]
+        mock_delete_order.side_effect = [
+            RuntimeError("Binance API error -2011: Unknown order sent."),
+            {"orderId": 102, "status": "CANCELED"},
+        ]
+
+        count = _cancel_futures_strategy_orders(
+            symbol="ORDIUSDC",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+        )
+
+        self.assertEqual(count, 2)
+        self.assertEqual(mock_delete_order.call_count, 2)
+
     @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
     @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")
