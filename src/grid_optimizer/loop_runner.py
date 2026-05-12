@@ -1275,7 +1275,9 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
         "clusdt_competition_maker_neutral_v1",
         "clusdt_competition_maker_neutral_conservative_v1",
         "ethusdc_um_volume_long_v1",
-    } or normalized_profile.endswith("_competition_neutral_ping_pong_v1")
+    } or normalized_profile.endswith("_competition_neutral_ping_pong_v1") or normalized_profile.endswith(
+        "_neutral_regime_budget_ping_pong_v2"
+    )
 
 
 def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
@@ -2441,7 +2443,10 @@ def _is_best_quote_long_profile(strategy_profile: str) -> bool:
 
 
 def _is_best_quote_neutral_profile(strategy_profile: str) -> bool:
-    return str(strategy_profile).strip().endswith("_competition_neutral_ping_pong_v1")
+    normalized_profile = str(strategy_profile).strip()
+    return normalized_profile.endswith("_competition_neutral_ping_pong_v1") or normalized_profile.endswith(
+        "_neutral_regime_budget_ping_pong_v2"
+    )
 
 
 def _is_strict_neutral_ping_pong_profile(strategy_profile: str) -> bool:

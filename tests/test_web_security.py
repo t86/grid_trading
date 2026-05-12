@@ -2083,6 +2083,40 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["volatility_trigger_fast_windows"][0]["window"], "1m")
         self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 10.0)
 
+    def test_runner_preset_payload_applies_billusdt_regime_budget_ping_pong_v2(self) -> None:
+        payload = _runner_preset_payload("billusdt_neutral_regime_budget_ping_pong_v2", {"symbol": "BILLUSDT"})
+        self.assertEqual(payload["strategy_profile"], "billusdt_neutral_regime_budget_ping_pong_v2")
+        self.assertEqual(payload["symbol"], "BILLUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["per_order_notional"], 180.0)
+        self.assertEqual(payload["buy_levels"], 12)
+        self.assertEqual(payload["sell_levels"], 12)
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertTrue(payload["regime_entry_budget_enabled"])
+        self.assertFalse(payload["regime_entry_budget_report_only"])
+        self.assertAlmostEqual(payload["regime_entry_budget_base_per_order_notional"], 180.0)
+        self.assertAlmostEqual(payload["regime_entry_budget_base_step_ratio"], 0.0025)
+        self.assertTrue(payload["anti_chase_entry_guard_enabled"])
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 55.0)
+
+    def test_runner_preset_payload_applies_btcusdt_regime_budget_ping_pong_v2(self) -> None:
+        payload = _runner_preset_payload("btcusdt_neutral_regime_budget_ping_pong_v2", {"symbol": "BTCUSDT"})
+        self.assertEqual(payload["strategy_profile"], "btcusdt_neutral_regime_budget_ping_pong_v2")
+        self.assertEqual(payload["symbol"], "BTCUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["per_order_notional"], 300.0)
+        self.assertEqual(payload["buy_levels"], 16)
+        self.assertEqual(payload["sell_levels"], 16)
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertTrue(payload["regime_entry_budget_enabled"])
+        self.assertFalse(payload["regime_entry_budget_report_only"])
+        self.assertAlmostEqual(payload["regime_entry_budget_base_per_order_notional"], 300.0)
+        self.assertAlmostEqual(payload["regime_entry_budget_base_step_ratio"], 0.00035)
+        self.assertTrue(payload["anti_chase_entry_guard_enabled"])
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 80.0)
+
     def test_runner_preset_payload_rejects_competition_neutral_ping_pong_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUUSDT"):
             _runner_preset_payload("xauusdt_competition_neutral_ping_pong_v1", {"symbol": "BTCUSDC"})
