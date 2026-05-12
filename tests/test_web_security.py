@@ -3289,6 +3289,24 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--sticky-entry-preserve-less-aggressive", command)
         self.assertIn("--synthetic-residual-short-flat-notional", command)
 
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_default_runner_command_includes_sticky_entry_churn_controls(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config({"symbol": "ENSOUSDT", "strategy_profile": "synthetic_neutral_v1"})
+        command = _build_runner_command(config)
+
+        sticky_index = command.index("--sticky-entry-levels")
+        self.assertEqual(command[sticky_index + 1], "4")
+        tolerance_index = command.index("--sticky-entry-price-tolerance-steps")
+        self.assertEqual(command[tolerance_index + 1], "2.0")
+        self.assertIn("--sticky-entry-preserve-less-aggressive", command)
+
     def test_build_runner_command_includes_synthetic_tiny_residual_thresholds(self) -> None:
         command = _build_runner_command(
             {
