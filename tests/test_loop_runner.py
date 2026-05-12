@@ -6432,6 +6432,99 @@ class LoopRunnerTests(unittest.TestCase):
         mock_update_synthetic_refs.assert_not_called()
         mock_update_inventory_grid_refs.assert_not_called()
 
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=[])
+    @patch(
+        "grid_optimizer.loop_runner.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "CHIPUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        },
+    )
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "0.0670", "lastFundingRate": "0.0"}])
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers", return_value=[{"bid_price": "0.0669", "ask_price": "0.0670"}])
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_exposes_top_level_submit_summary_fields(
+        self,
+        mock_validate_plan_report,
+        _mock_book_tickers,
+        _mock_premium_index,
+        _mock_credentials,
+        _mock_position_mode,
+        _mock_account_info,
+        _mock_open_orders,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 0,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [],
+            },
+        }
+        args = Namespace(
+            symbol="CHIPUSDT",
+            strategy_mode="synthetic_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/chipusdt_loop_latest_plan.json",
+            apply=False,
+            margin_type="KEEP",
+            leverage=3,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/chipusdt_loop_state.json",
+        )
+        plan_report = {
+            "symbol": "CHIPUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "mid_price": 0.0670,
+            "step_price": 0.00013,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_long_notional": 0.0,
+            "current_short_qty": 73.0,
+            "current_short_notional": 4.891,
+            "actual_net_qty": -73.0,
+            "actual_net_notional": -4.891,
+            "synthetic_net_qty": -73.0,
+            "synthetic_drift_qty": 0.0,
+            "buy_paused": False,
+            "pause_reasons": [],
+            "buy_cap_applied": False,
+            "buy_budget_notional": 100.0,
+            "planned_buy_notional": 20.0,
+            "max_position_notional": 500.0,
+            "short_paused": False,
+            "short_pause_reasons": [],
+            "short_cap_applied": False,
+            "short_budget_notional": 120.0,
+            "planned_short_notional": 25.0,
+            "max_short_position_notional": 500.0,
+            "inventory_tier": {"enabled": False},
+            "synthetic_ledger": {"virtual_short_qty": 73.0, "unmatched_trade_count": 0},
+            "effective_strategy_profile": "chipusdt_competition_neutral_ping_pong_v1",
+            "symbol_info": {
+                "tick_size": 0.00001,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertIsInstance(report["submit_generated_at"], str)
+        self.assertEqual(report["plan_summary"]["symbol"], "CHIPUSDT")
+        self.assertEqual(report["plan_summary"]["strategy_mode"], "synthetic_neutral")
+        self.assertEqual(report["synthetic_ledger"], {"virtual_short_qty": 73.0, "unmatched_trade_count": 0})
+        self.assertEqual(report["plan_snapshot"]["synthetic_ledger"], {"virtual_short_qty": 73.0, "unmatched_trade_count": 0})
+
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
     @patch("grid_optimizer.loop_runner.post_futures_order")

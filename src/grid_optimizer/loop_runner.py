@@ -12404,6 +12404,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     report = {
         "plan_json": str(args.plan_json),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "submit_generated_at": datetime.now(timezone.utc).isoformat(),
         "apply_requested": bool(args.apply),
         "validation": validation,
         "live_book": {
@@ -12434,6 +12435,26 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             symbol,
             max_events=500,
         ),
+        "plan_summary": {
+            "symbol": symbol,
+            "strategy_mode": strategy_mode,
+            "strategy_profile": str(
+                plan_report.get("effective_strategy_profile")
+                or plan_report.get("strategy_profile")
+                or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
+            ),
+            "mid_price": _safe_float(plan_report.get("mid_price")),
+            "center_price": _safe_float(plan_report.get("center_price")),
+            "open_order_count": int(plan_report.get("open_order_count", 0) or 0),
+            "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
+            "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
+            "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
+            "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
+            "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
+            "buy_paused": bool(plan_report.get("buy_paused")),
+            "short_paused": bool(plan_report.get("short_paused")),
+        },
+        "synthetic_ledger": dict(plan_report.get("synthetic_ledger") or {}),
         "plan_snapshot": {
             "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
             "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
