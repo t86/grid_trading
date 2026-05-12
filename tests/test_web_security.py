@@ -2570,6 +2570,40 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--fixed-center-enabled", command)
         self.assertIn("--reset-state", command)
 
+    def test_build_runner_command_includes_execution_budget_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BILLUSDT",
+                "strategy_profile": "billusdt_competition_neutral_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.00028,
+                "buy_levels": 12,
+                "sell_levels": 12,
+                "per_order_notional": 330.0,
+                "base_position_notional": 0.0,
+                "execution_request_budget_per_cycle": 4,
+                "execution_cancel_budget_per_cycle": 1,
+                "execution_place_budget_per_cycle": 3,
+                "execution_request_min_interval_seconds": 0.25,
+                "leverage_change_cache_ttl_seconds": 600.0,
+                "startup_jitter_seconds": 6.0,
+                "cycle_jitter_seconds": 0.8,
+            }
+        )
+
+        expected_pairs = {
+            "--execution-request-budget-per-cycle": "4",
+            "--execution-cancel-budget-per-cycle": "1",
+            "--execution-place-budget-per-cycle": "3",
+            "--execution-request-min-interval-seconds": "0.25",
+            "--leverage-change-cache-ttl-seconds": "600.0",
+            "--startup-jitter-seconds": "6.0",
+            "--cycle-jitter-seconds": "0.8",
+        }
+        for flag, value in expected_pairs.items():
+            index = command.index(flag)
+            self.assertEqual(command[index + 1], value)
+
     def test_build_runner_command_can_disable_take_profit(self) -> None:
         command = _build_runner_command(
             {
