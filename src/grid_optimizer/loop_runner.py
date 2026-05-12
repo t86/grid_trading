@@ -104,6 +104,7 @@ from .submit_plan import (
     enforce_execution_action_limits,
 )
 from .dry_run import _round_order_price, _round_order_qty
+from .execution_events import FuturesUserDataStream
 from .execution_regime import (
     ExecutionRegimeConfig,
     ExecutionRegimeFeatures,
@@ -135,6 +136,8 @@ XAUT_ADAPTIVE_STATE_NORMAL = "normal"
 XAUT_ADAPTIVE_STATE_DEFENSIVE = "defensive"
 XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
+TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
+OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -1209,6 +1212,7 @@ def _run_periodic_reconcile(
     recv_window: int,
     expected_open_order_count: int,
     expected_actual_net_qty: float,
+    args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
     safe_interval_cycles = max(int(interval_cycles), 0)
     snapshot = dict(state.get("last_reconcile") or {})
@@ -1219,12 +1223,31 @@ def _run_periodic_reconcile(
     if safe_interval_cycles <= 0 or cycle % safe_interval_cycles != 0:
         return snapshot
 
-    current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
-    current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
+    observed_open_order_state = (
+        _summarize_runner_strategy_open_order_state(args, symbol, max_events=500)
+        if args is not None
+        else {"active_order_count": 0, "active_client_order_ids": [], "active_order_ids": []}
+    )
+    open_orders_rest_backfill_performed = _should_backfill_open_orders_rest(
+        snapshot,
+        now_utc=_utc_now(),
+        observed_active_order_count=int(observed_open_order_state.get("active_order_count", 0) or 0),
+        expected_open_order_count=int(expected_open_order_count or 0),
+    )
+    if open_orders_rest_backfill_performed:
+        current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
+        current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
+        actual_open_order_count = len(current_strategy_open_orders)
+        total_open_order_count: int | None = len(current_open_orders)
+        open_orders_source = "rest"
+    else:
+        actual_open_order_count = int(observed_open_order_state.get("active_order_count", 0) or 0)
+        total_open_order_count = None
+        open_orders_source = "observed_events"
     account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
     current_position = extract_symbol_position(account_info, symbol)
     actual_net_qty = _safe_float(current_position.get("positionAmt"))
-    open_order_diff = len(current_strategy_open_orders) - int(expected_open_order_count or 0)
+    open_order_diff = actual_open_order_count - int(expected_open_order_count or 0)
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
     ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9
     message_parts: list[str] = []
@@ -1241,8 +1264,17 @@ def _run_periodic_reconcile(
         "cycle": cycle,
         "strategy_mode": strategy_mode,
         "expected_open_order_count": int(expected_open_order_count or 0),
-        "actual_open_order_count": len(current_strategy_open_orders),
-        "total_open_order_count": len(current_open_orders),
+        "actual_open_order_count": actual_open_order_count,
+        "total_open_order_count": total_open_order_count,
+        "open_orders_source": open_orders_source,
+        "open_orders_rest_backfill_performed": open_orders_rest_backfill_performed,
+        "open_orders_rest_last_sync_at": (
+            _isoformat(_utc_now())
+            if open_orders_rest_backfill_performed
+            else snapshot.get("open_orders_rest_last_sync_at")
+        ),
+        "observed_active_open_order_count": int(observed_open_order_state.get("active_order_count", 0) or 0),
+        "observed_active_client_order_ids": list(observed_open_order_state.get("active_client_order_ids", [])),
         "expected_actual_net_qty": float(expected_actual_net_qty or 0.0),
         "actual_actual_net_qty": actual_net_qty,
         "open_order_diff": open_order_diff,
@@ -3806,6 +3838,7 @@ def _sync_account_audit(
     cycle: int,
     summary_path: Path,
     recv_window: int,
+    args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
     credentials = load_binance_api_credentials()
     if credentials is None:
@@ -3836,20 +3869,54 @@ def _sync_account_audit(
     if income_start_time_ms <= 0:
         income_start_time_ms = int(audit_state.get("session_start_time_ms") or 0) or default_start_time_ms
 
-    trade_rows = _fetch_trade_rows_since(
-        symbol=symbol,
-        api_key=api_key,
-        api_secret=api_secret,
-        start_time_ms=trade_start_time_ms,
-        recv_window=recv_window,
-    )
-    fresh_trades, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
-        rows=trade_rows,
+    observed_trade_rows: list[dict[str, Any]] = []
+    if args is not None:
+        stream = getattr(args, "user_data_stream", None)
+        if stream is not None and hasattr(stream, "snapshot_events"):
+            try:
+                for event in list(stream.snapshot_events()):
+                    kind = str(getattr(event, "kind", "") or "").strip().upper()
+                    if kind not in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}:
+                        continue
+                    if str(getattr(event, "symbol", "") or "").upper().strip() != symbol.upper().strip():
+                        continue
+                    if _safe_float(getattr(event, "last_filled_qty", 0.0)) <= 0:
+                        continue
+                    observed_trade_rows.append(_trade_event_to_audit_row(event))
+            except Exception:
+                observed_trade_rows = []
+
+    observed_fresh_trades, observed_trade_last_time_ms, observed_trade_keys_at_time = collect_new_rows(
+        rows=observed_trade_rows,
         last_time_ms=int(audit_state.get("trade_last_time_ms") or 0) or None,
         last_keys_at_time=list(audit_state.get("trade_last_keys_at_time", [])),
         row_time_ms=trade_row_time_ms,
         row_key=trade_row_key,
     )
+
+    trade_rows: list[dict[str, Any]] = []
+    trade_rest_backfill_performed = False
+    if _should_backfill_trade_rest(
+        audit_state,
+        now_utc=now,
+        observed_trade_appended=len(observed_fresh_trades),
+    ):
+        trade_rows = _fetch_trade_rows_since(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=trade_start_time_ms,
+            recv_window=recv_window,
+        )
+        trade_rest_backfill_performed = True
+    fresh_trades, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
+        rows=trade_rows,
+        last_time_ms=observed_trade_last_time_ms,
+        last_keys_at_time=observed_trade_keys_at_time,
+        row_time_ms=trade_row_time_ms,
+        row_key=trade_row_key,
+    )
+    fresh_trades = [*observed_fresh_trades, *fresh_trades]
 
     income_rows = _fetch_income_rows_since(
         symbol=symbol,
@@ -3898,6 +3965,7 @@ def _sync_account_audit(
             "trade_last_keys_at_time": trade_keys_at_time,
             "income_last_time_ms": income_last_time_ms,
             "income_last_keys_at_time": income_keys_at_time,
+            "trade_rest_last_sync_at": synced_at if trade_rest_backfill_performed else audit_state.get("trade_rest_last_sync_at"),
         }
     )
     _write_json(audit_state_path, audit_state)
@@ -3907,6 +3975,7 @@ def _sync_account_audit(
         "trade_audit_path": str(audit_paths["trade_audit"]),
         "income_audit_path": str(audit_paths["income_audit"]),
         "audit_state_path": str(audit_state_path),
+        "trade_rest_backfill_performed": trade_rest_backfill_performed,
     }
 
 
@@ -3925,6 +3994,223 @@ def _filter_futures_strategy_orders(open_orders: Iterable[Any], symbol: str) -> 
         for order in open_orders
         if isinstance(order, dict) and _is_futures_strategy_order(order, symbol)
     ]
+
+
+def _maybe_start_runner_user_data_stream(args: argparse.Namespace) -> FuturesUserDataStream | None:
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        setattr(args, "user_data_stream", None)
+        return None
+    api_key, _api_secret = credentials
+    try:
+        stream = FuturesUserDataStream(api_key=api_key)
+        stream.start()
+        setattr(args, "user_data_stream", stream)
+        return stream
+    except Exception as exc:
+        setattr(args, "user_data_stream", None)
+        print(f"[user-data-stream] disabled for {getattr(args, 'symbol', '')}: {exc}")
+        return None
+
+
+def _snapshot_runner_execution_events(args: argparse.Namespace, *, max_events: int = 5) -> list[dict[str, Any]]:
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_events"):
+        return []
+    try:
+        events = list(stream.snapshot_events())
+    except Exception:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for event in events[-max_events:]:
+        payloads.append(
+            {
+                "kind": str(getattr(event, "kind", "") or ""),
+                "symbol": str(getattr(event, "symbol", "") or ""),
+                "event_time": getattr(event, "event_time", None),
+                "transaction_time": getattr(event, "transaction_time", None),
+                "order_id": getattr(event, "order_id", None),
+                "client_order_id": str(getattr(event, "client_order_id", "") or ""),
+                "side": str(getattr(event, "side", "") or ""),
+                "execution_type": str(getattr(event, "execution_type", "") or ""),
+                "order_status": str(getattr(event, "order_status", "") or ""),
+                "last_filled_qty": _safe_float(getattr(event, "last_filled_qty", 0.0)),
+                "cumulative_filled_qty": _safe_float(getattr(event, "cumulative_filled_qty", 0.0)),
+                "last_filled_price": _safe_float(getattr(event, "last_filled_price", 0.0)),
+                "realized_pnl": _safe_float(getattr(event, "realized_pnl", 0.0)),
+            }
+        )
+    return payloads
+
+
+def _drain_new_runner_execution_events(args: argparse.Namespace, *, max_events: int = 50) -> list[dict[str, Any]]:
+    events = _snapshot_runner_execution_events(args, max_events=max_events)
+    seen = getattr(args, "_seen_execution_event_keys", None)
+    if not isinstance(seen, set):
+        seen = set()
+        setattr(args, "_seen_execution_event_keys", seen)
+    fresh: list[dict[str, Any]] = []
+    for item in events:
+        key = (
+            item.get("kind"),
+            item.get("symbol"),
+            item.get("order_id"),
+            item.get("client_order_id"),
+            item.get("transaction_time"),
+            item.get("last_filled_qty"),
+            item.get("last_filled_price"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh.append(item)
+    return fresh
+
+
+def _summarize_runner_strategy_execution_events(
+    args: argparse.Namespace,
+    symbol: str,
+    *,
+    max_events: int = 200,
+) -> dict[str, Any]:
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    events = [
+        item
+        for item in _snapshot_runner_execution_events(args, max_events=max_events)
+        if str(item.get("symbol") or "").upper().strip() == symbol.upper().strip()
+        and str(item.get("client_order_id") or "").startswith(strategy_prefix)
+    ]
+    counts: dict[str, int] = {}
+    filled_client_order_ids: list[str] = []
+    canceled_client_order_ids: list[str] = []
+    for item in events:
+        kind = str(item.get("kind") or "")
+        counts[kind] = counts.get(kind, 0) + 1
+        client_order_id = str(item.get("client_order_id") or "")
+        if kind == "ORDER_FILLED" and client_order_id:
+            filled_client_order_ids.append(client_order_id)
+        if kind in {"ORDER_CANCELED", "ORDER_EXPIRED"} and client_order_id:
+            canceled_client_order_ids.append(client_order_id)
+    return {
+        "observed_event_count": len(events),
+        "counts": counts,
+        "filled_client_order_ids": filled_client_order_ids,
+        "canceled_client_order_ids": canceled_client_order_ids,
+        "latest_events": events[-5:],
+    }
+
+
+def _summarize_runner_strategy_open_order_state(
+    args: argparse.Namespace,
+    symbol: str,
+    *,
+    max_events: int = 500,
+) -> dict[str, Any]:
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    events = [
+        item
+        for item in _snapshot_runner_execution_events(args, max_events=max_events)
+        if str(item.get("symbol") or "").upper().strip() == symbol.upper().strip()
+        and str(item.get("client_order_id") or "").startswith(strategy_prefix)
+    ]
+    active_by_client_order_id: dict[str, dict[str, Any]] = {}
+    terminal_statuses = {"ORDER_FILLED", "ORDER_CANCELED", "ORDER_EXPIRED"}
+    for item in events:
+        client_order_id = str(item.get("client_order_id") or "")
+        if not client_order_id:
+            continue
+        kind = str(item.get("kind") or "")
+        if kind in terminal_statuses:
+            active_by_client_order_id.pop(client_order_id, None)
+        else:
+            active_by_client_order_id[client_order_id] = item
+    active_items = list(active_by_client_order_id.values())
+    return {
+        "active_order_count": len(active_items),
+        "active_client_order_ids": [str(item.get("client_order_id") or "") for item in active_items],
+        "active_order_ids": [item.get("order_id") for item in active_items],
+        "latest_events": events[-5:],
+    }
+
+
+def _trade_event_to_audit_row(event: Any) -> dict[str, Any]:
+    event_time = int(getattr(event, "event_time", 0) or 0)
+    transaction_time = int(getattr(event, "transaction_time", 0) or 0) or event_time
+    last_filled_qty = _safe_float(getattr(event, "last_filled_qty", 0.0))
+    last_filled_price = _safe_float(getattr(event, "last_filled_price", 0.0))
+    order_id = getattr(event, "order_id", None)
+    client_order_id = str(getattr(event, "client_order_id", "") or "")
+    return {
+        "id": f"{order_id}:{client_order_id}:{transaction_time}:{last_filled_qty}:{last_filled_price}",
+        "orderId": order_id,
+        "clientOrderId": client_order_id,
+        "symbol": str(getattr(event, "symbol", "") or "").upper().strip(),
+        "side": str(getattr(event, "side", "") or "").upper().strip(),
+        "positionSide": str(getattr(event, "position_side", "") or "").upper().strip(),
+        "time": transaction_time,
+        "price": last_filled_price,
+        "qty": last_filled_qty,
+        "quoteQty": last_filled_qty * last_filled_price,
+        "realizedPnl": _safe_float(getattr(event, "realized_pnl", 0.0)),
+        "commission": _safe_float(getattr(event, "commission", 0.0)),
+        "commissionAsset": str(getattr(event, "commission_asset", "") or "").upper().strip(),
+        "executionType": str(getattr(event, "execution_type", "") or "").upper().strip(),
+        "orderStatus": str(getattr(event, "order_status", "") or "").upper().strip(),
+        "source": "user_data_stream",
+    }
+
+
+def _should_backfill_trade_rest(
+    audit_state: dict[str, Any],
+    *,
+    now_utc: datetime | str,
+    observed_trade_appended: int,
+) -> bool:
+    if int(observed_trade_appended or 0) <= 0:
+        return True
+    current = now_utc
+    if isinstance(current, str):
+        current = datetime.fromisoformat(current.replace("Z", "+00:00"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    last_sync_raw = str(audit_state.get("trade_rest_last_sync_at") or "")
+    if not last_sync_raw:
+        return True
+    try:
+        last_sync = datetime.fromisoformat(last_sync_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    elapsed = (current.astimezone(timezone.utc) - last_sync.astimezone(timezone.utc)).total_seconds()
+    return elapsed >= TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS
+
+
+def _should_backfill_open_orders_rest(
+    reconcile_state: dict[str, Any],
+    *,
+    now_utc: datetime | str,
+    observed_active_order_count: int,
+    expected_open_order_count: int,
+) -> bool:
+    if int(observed_active_order_count or 0) != int(expected_open_order_count or 0):
+        return True
+    current = now_utc
+    if isinstance(current, str):
+        current = datetime.fromisoformat(current.replace("Z", "+00:00"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    last_sync_raw = str(reconcile_state.get("open_orders_rest_last_sync_at") or "")
+    if not last_sync_raw:
+        return True
+    try:
+        last_sync = datetime.fromisoformat(last_sync_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    elapsed = (current.astimezone(timezone.utc) - last_sync.astimezone(timezone.utc)).total_seconds()
+    return elapsed >= OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -12094,6 +12380,17 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "cancel_stale": bool(args.cancel_stale),
             "maker_retries": args.maker_retries,
         },
+        "observed_execution_events": _snapshot_runner_execution_events(args, max_events=5),
+        "observed_strategy_execution_summary": _summarize_runner_strategy_execution_events(
+            args,
+            symbol,
+            max_events=200,
+        ),
+        "observed_strategy_open_order_state": _summarize_runner_strategy_open_order_state(
+            args,
+            symbol,
+            max_events=500,
+        ),
         "plan_snapshot": {
             "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
             "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
@@ -13583,6 +13880,7 @@ def main() -> None:
     consecutive_errors = 0
     cycle = 0
     market_stream: FuturesMarketStream | None = None
+    user_data_stream: FuturesUserDataStream | None = None
     try:
         market_stream = FuturesMarketStream(args.symbol)
         market_stream.start()
@@ -13590,6 +13888,7 @@ def main() -> None:
     except Exception as exc:
         setattr(args, "market_stream", None)
         print(f"[market-stream] disabled for {args.symbol}: {exc}")
+    user_data_stream = _maybe_start_runner_user_data_stream(args)
 
     try:
         while True:
@@ -13659,6 +13958,17 @@ def main() -> None:
                             "payload": item,
                         },
                     )
+                for item in _drain_new_runner_execution_events(args, max_events=50):
+                    _append_jsonl(
+                        audit_paths["order_audit"],
+                        {
+                            "ts": cycle_started_at.isoformat(),
+                            "cycle": cycle,
+                            "symbol": args.symbol.upper().strip(),
+                            "event_type": "execution_observed",
+                            "payload": item,
+                        },
+                    )
                 audit_sync = {
                     "trade_appended": 0,
                     "income_appended": 0,
@@ -13670,6 +13980,7 @@ def main() -> None:
                         cycle=cycle,
                         summary_path=summary_path,
                         recv_window=args.recv_window,
+                        args=args,
                     )
                 except Exception as audit_exc:
                     audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
@@ -13696,6 +14007,7 @@ def main() -> None:
                         recv_window=args.recv_window,
                         expected_open_order_count=len(plan_report.get("kept_orders", [])) + len(submit_report.get("placed_orders", [])),
                         expected_actual_net_qty=_safe_float(plan_report.get("actual_net_qty")),
+                        args=args,
                     )
                 state["last_reconcile"] = reconcile_snapshot
                 _write_json(state_path, state)
@@ -14223,6 +14535,8 @@ def main() -> None:
                 break
             time.sleep(args.sleep_seconds)
     finally:
+        if user_data_stream is not None:
+            user_data_stream.stop()
         if market_stream is not None:
             market_stream.stop()
 
