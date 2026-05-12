@@ -104,6 +104,40 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(summary["commission_raw_by_asset"]["BNB"], 0.001, places=8)
         self.assertAlmostEqual(summary["recent_trades"][0]["commission_usdt"], 0.75, places=8)
 
+    def test_summarize_user_trades_accepts_non_numeric_trade_id(self) -> None:
+        trades = [
+            {
+                "id": "526323933:gx-chipu-takeprof-1-58228126:1778558235739:1447.0:0.06218",
+                "time": 1000,
+                "side": "BUY",
+                "price": "0.06218",
+                "qty": "1447",
+                "maker": True,
+                "realizedPnl": "0",
+                "commission": "0.02",
+            },
+            {
+                "id": 2,
+                "time": 1000,
+                "side": "SELL",
+                "price": "0.06220",
+                "qty": "1000",
+                "maker": False,
+                "realizedPnl": "0.05",
+                "commission": "0.01",
+            },
+        ]
+
+        summary = summarize_user_trades(trades)
+
+        self.assertEqual(summary["trade_count"], 2)
+        self.assertAlmostEqual(summary["gross_notional"], 152.17446, places=8)
+        self.assertAlmostEqual(summary["commission"], 0.03, places=8)
+        self.assertEqual(
+            summary["recent_trades"][1]["id"],
+            "526323933:gx-chipu-takeprof-1-58228126:1778558235739:1447.0:0.06218",
+        )
+
     @patch("grid_optimizer.monitor.fetch_time_paged")
     def test_load_or_fetch_trade_rows_merges_audit_and_api_manual_trades(self, mock_fetch_time_paged) -> None:
         session_start = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)

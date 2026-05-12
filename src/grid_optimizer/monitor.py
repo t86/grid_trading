@@ -55,6 +55,16 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _trade_sort_key(value: Any) -> tuple[int, int | str]:
+    text = str(value or "").strip()
+    if not text:
+        return (0, 0)
+    try:
+        return (0, int(text))
+    except (TypeError, ValueError):
+        return (1, text)
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
@@ -639,7 +649,10 @@ def _load_or_fetch_income_rows(
 
 
 def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: Any | None = None) -> dict[str, Any]:
-    sorted_trades = sorted(trades, key=lambda item: (int(item.get("time", 0) or 0), int(item.get("id", 0) or 0)))
+    sorted_trades = sorted(
+        trades,
+        key=lambda item: (int(item.get("time", 0) or 0), _trade_sort_key(item.get("id"))),
+    )
     gross_notional = 0.0
     buy_notional = 0.0
     sell_notional = 0.0
