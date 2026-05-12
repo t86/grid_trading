@@ -341,10 +341,20 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
 
         self.assertFalse(decision)
 
-    def test_should_backfill_open_orders_rest_keeps_rest_when_observed_state_disagrees(self) -> None:
+    def test_should_backfill_open_orders_rest_skips_recent_rest_when_observed_state_disagrees(self) -> None:
         decision = _should_backfill_open_orders_rest(
             {"open_orders_rest_last_sync_at": "2026-05-12T00:00:00+00:00"},
             now_utc="2026-05-12T00:02:00+00:00",
+            observed_active_order_count=2,
+            expected_open_order_count=3,
+        )
+
+        self.assertFalse(decision)
+
+    def test_should_backfill_open_orders_rest_allows_stale_rest_when_observed_state_disagrees(self) -> None:
+        decision = _should_backfill_open_orders_rest(
+            {"open_orders_rest_last_sync_at": "2026-05-12T00:00:00+00:00"},
+            now_utc="2026-05-12T00:06:00+00:00",
             observed_active_order_count=2,
             expected_open_order_count=3,
         )

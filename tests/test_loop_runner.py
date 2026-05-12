@@ -41,6 +41,7 @@ from grid_optimizer.loop_runner import (
     _resolve_synthetic_resync_price,
     _shift_custom_grid_bounds,
     _run_periodic_reconcile,
+    apply_execution_request_budget_to_actions,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
     apply_excess_inventory_reduce_only,
@@ -503,6 +504,80 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(snapshot["ok"])
         self.assertEqual(snapshot["actual_open_order_count"], 1)
         self.assertEqual(snapshot["total_open_order_count"], 2)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_periodic_reconcile_defers_rest_open_order_backfill_when_stream_is_fresh(
+        self,
+        mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        stream = SimpleNamespace(
+            snapshot_open_orders=lambda: [],
+            open_order_state_age_seconds=lambda: 1.0,
+        )
+        args = Namespace(user_data_stream=stream)
+        state = {
+            "last_reconcile": {
+                "open_orders_rest_last_sync_at": datetime.now(timezone.utc).isoformat(),
+            }
+        }
+
+        snapshot = _run_periodic_reconcile(
+            state=state,
+            cycle=5,
+            interval_cycles=5,
+            symbol="BTCUSDC",
+            strategy_mode="one_way_long",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=2,
+            expected_actual_net_qty=0.0,
+            args=args,
+        )
+
+        self.assertFalse(snapshot["ok"])
+        self.assertEqual(snapshot["open_orders_source"], "stream_open_orders")
+        self.assertFalse(snapshot["open_orders_rest_backfill_performed"])
+        mock_open_orders.assert_not_called()
+        mock_account_info.assert_called_once()
+
+    def test_apply_execution_request_budget_defers_extra_cancel_and_place_actions(self) -> None:
+        validation = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "cancel_count": 2,
+                "place_count": 3,
+                "cancel_orders": [
+                    {"orderId": 1, "clientOrderId": "mt_btcusdc_buy_001"},
+                    {"orderId": 2, "clientOrderId": "mt_btcusdc_buy_002"},
+                ],
+                "place_orders": [
+                    {"role": "entry", "side": "BUY", "qty": 1.0, "price": 100.0},
+                    {"role": "entry", "side": "BUY", "qty": 1.0, "price": 99.0},
+                    {"role": "entry", "side": "BUY", "qty": 1.0, "price": 98.0},
+                ],
+            },
+        }
+        report: dict[str, object] = {}
+
+        updated = apply_execution_request_budget_to_actions(
+            validation=validation,
+            report=report,
+            max_mutations_per_cycle=3,
+            max_cancels_per_cycle=1,
+            max_places_per_cycle=2,
+        )
+
+        actions = updated["actions"]
+        self.assertEqual(actions["cancel_count"], 1)
+        self.assertEqual(actions["place_count"], 2)
+        self.assertEqual([item["orderId"] for item in actions["cancel_orders"]], [1])
+        self.assertEqual([item["price"] for item in actions["place_orders"]], [100.0, 99.0])
+        self.assertEqual(report["execution_request_budget"]["deferred_cancel_count"], 1)
+        self.assertEqual(report["execution_request_budget"]["deferred_place_count"], 1)
 
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))
@@ -6627,6 +6702,91 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["account_snapshot_sources"]["open_orders"], "user_data_stream")
         mock_account_info.assert_not_called()
         mock_open_orders.assert_not_called()
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "0.144", "lastFundingRate": "0.0"}])
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers", return_value=[{"bid_price": "0.1439", "ask_price": "0.1441"}])
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_skips_repeated_leverage_change_within_cache_ttl(
+        self,
+        mock_validate_plan_report,
+        _mock_book_tickers,
+        _mock_premium_index,
+        _mock_credentials,
+        _mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        _mock_update_inventory_refs,
+        _mock_update_synthetic_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "entry", "side": "BUY", "qty": 35.0, "price": 0.1439},
+                ],
+            },
+        }
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BILLUSDT", "positionAmt": "-100", "entryPrice": "0.144"}],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 20}
+        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "gx-billu-test"}
+        args = Namespace(
+            symbol="BILLUSDT",
+            strategy_mode="synthetic_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/billusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=20,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/billusdt_loop_state.json",
+            leverage_change_cache_ttl_seconds=600.0,
+        )
+        plan_report = {
+            "symbol": "BILLUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "mid_price": 0.144,
+            "step_price": 0.00028,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 100.0,
+            "actual_net_qty": -100.0,
+            "symbol_info": {
+                "tick_size": 0.00001,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        first_report = execute_plan_report(args, plan_report)
+        second_report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(first_report["executed"])
+        self.assertTrue(second_report["executed"])
+        self.assertEqual(mock_change_leverage.call_count, 1)
+        self.assertEqual(second_report["leverage_response"]["source"], "cache")
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")

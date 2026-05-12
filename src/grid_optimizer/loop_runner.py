@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import time
@@ -138,6 +139,7 @@ XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
 TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
+EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS = 10 * 60.0
 ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 30.0
 OPEN_ORDER_STREAM_MAX_AGE_SECONDS = 30.0
 POSITION_MODE_CACHE_TTL_SECONDS = 10 * 60.0
@@ -4442,8 +4444,6 @@ def _should_backfill_open_orders_rest(
     observed_active_order_count: int,
     expected_open_order_count: int,
 ) -> bool:
-    if int(observed_active_order_count or 0) != int(expected_open_order_count or 0):
-        return True
     current = now_utc
     if isinstance(current, str):
         current = datetime.fromisoformat(current.replace("Z", "+00:00"))
@@ -4460,6 +4460,98 @@ def _should_backfill_open_orders_rest(
         last_sync = last_sync.replace(tzinfo=timezone.utc)
     elapsed = (current.astimezone(timezone.utc) - last_sync.astimezone(timezone.utc)).total_seconds()
     return elapsed >= OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS
+
+
+def apply_execution_request_budget_to_actions(
+    *,
+    validation: dict[str, Any],
+    report: dict[str, Any],
+    max_mutations_per_cycle: int = 0,
+    max_cancels_per_cycle: int = 0,
+    max_places_per_cycle: int = 0,
+) -> dict[str, Any]:
+    actions = dict(validation.get("actions") or {})
+    cancel_orders = list(actions.get("cancel_orders") or [])
+    place_orders = list(actions.get("place_orders") or [])
+    safe_max_mutations = max(int(max_mutations_per_cycle or 0), 0)
+    safe_max_cancels = max(int(max_cancels_per_cycle or 0), 0)
+    safe_max_places = max(int(max_places_per_cycle or 0), 0)
+    cancel_limit = len(cancel_orders) if safe_max_cancels <= 0 else min(len(cancel_orders), safe_max_cancels)
+    place_limit = len(place_orders) if safe_max_places <= 0 else min(len(place_orders), safe_max_places)
+    if safe_max_mutations > 0:
+        cancel_limit = min(cancel_limit, safe_max_mutations)
+        place_limit = min(place_limit, max(safe_max_mutations - cancel_limit, 0))
+    kept_cancel_orders = cancel_orders[:cancel_limit]
+    kept_place_orders = place_orders[:place_limit]
+    deferred_cancel_orders = cancel_orders[cancel_limit:]
+    deferred_place_orders = place_orders[place_limit:]
+    actions["cancel_orders"] = kept_cancel_orders
+    actions["place_orders"] = kept_place_orders
+    actions["cancel_count"] = len(kept_cancel_orders)
+    actions["place_count"] = len(kept_place_orders)
+    updated = dict(validation)
+    updated["actions"] = actions
+    report["execution_request_budget"] = {
+        "max_mutations_per_cycle": safe_max_mutations,
+        "max_cancels_per_cycle": safe_max_cancels,
+        "max_places_per_cycle": safe_max_places,
+        "applied": bool(safe_max_mutations or safe_max_cancels or safe_max_places),
+        "executed_cancel_count": len(kept_cancel_orders),
+        "executed_place_count": len(kept_place_orders),
+        "deferred_cancel_count": len(deferred_cancel_orders),
+        "deferred_place_count": len(deferred_place_orders),
+        "deferred_cancel_orders": deferred_cancel_orders,
+        "deferred_place_orders": deferred_place_orders,
+    }
+    return updated
+
+
+def _maybe_sleep_between_execution_requests(args: argparse.Namespace) -> None:
+    interval = _safe_float(getattr(args, "execution_request_min_interval_seconds", 0.0))
+    if interval > 0:
+        time.sleep(interval)
+
+
+def _change_initial_leverage_with_cache(
+    *,
+    args: argparse.Namespace,
+    symbol: str,
+    leverage: int,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+) -> dict[str, Any]:
+    ttl = _safe_float(
+        getattr(args, "leverage_change_cache_ttl_seconds", EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS)
+    )
+    cache_key = f"{symbol.upper().strip()}:{int(leverage)}"
+    cached_key = str(getattr(args, "_cached_execution_leverage_key", "") or "")
+    cached_at = _safe_float(getattr(args, "_cached_execution_leverage_at", 0.0))
+    now = time.monotonic()
+    if ttl > 0 and cached_key == cache_key and cached_at > 0 and now - cached_at <= ttl:
+        return {
+            "skipped": True,
+            "source": "cache",
+            "symbol": symbol,
+            "leverage": int(leverage),
+            "age_seconds": now - cached_at,
+            "ttl_seconds": ttl,
+        }
+    try:
+        response = post_futures_change_initial_leverage(
+            symbol=symbol,
+            leverage=leverage,
+            api_key=api_key,
+            api_secret=api_secret,
+            recv_window=recv_window,
+        )
+    except RuntimeError as exc:
+        if not _ignore_noop_error(exc, ("no need to change leverage", "same leverage")):
+            raise
+        response = {"ignored_error": str(exc)}
+    setattr(args, "_cached_execution_leverage_key", cache_key)
+    setattr(args, "_cached_execution_leverage_at", now)
+    return response
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -12847,6 +12939,15 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     if not validation["ok"]:
         return _mark_submit_report_blocked(report)
 
+    validation = apply_execution_request_budget_to_actions(
+        validation=validation,
+        report=report,
+        max_mutations_per_cycle=int(getattr(args, "execution_request_budget_per_cycle", 0) or 0),
+        max_cancels_per_cycle=int(getattr(args, "execution_cancel_budget_per_cycle", 0) or 0),
+        max_places_per_cycle=int(getattr(args, "execution_place_budget_per_cycle", 0) or 0),
+    )
+    report["validation"] = validation
+
     if requested_margin_type != "KEEP":
         try:
             report["margin_response"] = post_futures_change_margin_type(
@@ -12863,18 +12964,14 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     else:
         report["margin_response"] = {"skipped": True, "reason": "KEEP"}
 
-    try:
-        report["leverage_response"] = post_futures_change_initial_leverage(
-            symbol=symbol,
-            leverage=args.leverage,
-            api_key=api_key,
-            api_secret=api_secret,
-            recv_window=args.recv_window,
-        )
-    except RuntimeError as exc:
-        if not _ignore_noop_error(exc, ("no need to change leverage", "same leverage")):
-            raise
-        report["leverage_response"] = {"ignored_error": str(exc)}
+    report["leverage_response"] = _change_initial_leverage_with_cache(
+        args=args,
+        symbol=symbol,
+        leverage=args.leverage,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+    )
 
     if args.cancel_stale:
         for stale_order in validation["actions"]["cancel_orders"]:
@@ -12887,6 +12984,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 recv_window=args.recv_window,
             )
             report["canceled_orders"].append(cancel_response)
+            _maybe_sleep_between_execution_requests(args)
 
     symbol_info = plan_report.get("symbol_info") or {}
     tick_size = _safe_float(symbol_info.get("tick_size"))
@@ -12973,6 +13071,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                     }
                 )
                 last_exc = None
+                _maybe_sleep_between_execution_requests(args)
                 break
             except RuntimeError as exc:
                 last_exc = exc
@@ -13418,9 +13517,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-total-notional", type=float, default=220.0)
     parser.add_argument("--reconcile-interval-cycles", type=int, default=5)
     parser.add_argument("--maker-retries", type=int, default=2)
+    parser.add_argument("--execution-request-budget-per-cycle", type=int, default=0)
+    parser.add_argument("--execution-cancel-budget-per-cycle", type=int, default=0)
+    parser.add_argument("--execution-place-budget-per-cycle", type=int, default=0)
+    parser.add_argument("--execution-request-min-interval-seconds", type=float, default=0.0)
+    parser.add_argument("--leverage-change-cache-ttl-seconds", type=float, default=EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS)
     parser.add_argument("--cancel-stale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--apply", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--sleep-seconds", type=float, default=20.0)
+    parser.add_argument("--startup-jitter-seconds", type=float, default=0.0)
+    parser.add_argument("--cycle-jitter-seconds", type=float, default=0.0)
     parser.add_argument("--iterations", type=int, default=0, help="0 means run forever")
     parser.add_argument("--max-consecutive-errors", type=int, default=10)
     parser.add_argument("--state-path", type=str, default="output/night_small_semi_auto_state.json")
@@ -14148,8 +14254,22 @@ def main() -> None:
         raise SystemExit("--max-new-orders and --max-total-notional must be > 0")
     if args.maker_retries < 0:
         raise SystemExit("--maker-retries must be >= 0")
+    if args.execution_request_budget_per_cycle < 0:
+        raise SystemExit("--execution-request-budget-per-cycle must be >= 0")
+    if args.execution_cancel_budget_per_cycle < 0:
+        raise SystemExit("--execution-cancel-budget-per-cycle must be >= 0")
+    if args.execution_place_budget_per_cycle < 0:
+        raise SystemExit("--execution-place-budget-per-cycle must be >= 0")
+    if args.execution_request_min_interval_seconds < 0:
+        raise SystemExit("--execution-request-min-interval-seconds must be >= 0")
+    if args.leverage_change_cache_ttl_seconds < 0:
+        raise SystemExit("--leverage-change-cache-ttl-seconds must be >= 0")
     if args.sleep_seconds <= 0:
         raise SystemExit("--sleep-seconds must be > 0")
+    if args.startup_jitter_seconds < 0:
+        raise SystemExit("--startup-jitter-seconds must be >= 0")
+    if args.cycle_jitter_seconds < 0:
+        raise SystemExit("--cycle-jitter-seconds must be >= 0")
     if args.iterations < 0:
         raise SystemExit("--iterations must be >= 0")
     if args.max_consecutive_errors <= 0:
@@ -14196,6 +14316,11 @@ def main() -> None:
         setattr(args, "market_stream", None)
         print(f"[market-stream] disabled for {args.symbol}: {exc}")
     user_data_stream = _maybe_start_runner_user_data_stream(args)
+    startup_jitter = _safe_float(getattr(args, "startup_jitter_seconds", 0.0))
+    if startup_jitter > 0:
+        delay = random.uniform(0.0, startup_jitter)
+        print(f"[startup-jitter] sleeping {delay:.3f}s before first cycle")
+        time.sleep(delay)
 
     try:
         while True:
@@ -14840,7 +14965,8 @@ def main() -> None:
 
             if args.iterations and cycle >= args.iterations:
                 break
-            time.sleep(args.sleep_seconds)
+            cycle_jitter = _safe_float(getattr(args, "cycle_jitter_seconds", 0.0))
+            time.sleep(args.sleep_seconds + (random.uniform(0.0, cycle_jitter) if cycle_jitter > 0 else 0.0))
     finally:
         if user_data_stream is not None:
             user_data_stream.stop()
