@@ -165,6 +165,59 @@ class ExecutionEventStore:
             return list(self._events)
 
 
+class AccountPositionStore:
+    def __init__(self) -> None:
+        self._positions: dict[tuple[str, str], dict[str, Any]] = {}
+        self._lock = threading.RLock()
+        self._last_update_at = 0.0
+
+    def update_from_account_update(self, payload: dict[str, Any]) -> int:
+        account = payload.get("a")
+        if not isinstance(account, dict):
+            return 0
+        positions = account.get("P")
+        if not isinstance(positions, list):
+            return 0
+        observed_at = time.monotonic()
+        event_time = _safe_int(payload.get("E"))
+        changed = 0
+        with self._lock:
+            for item in positions:
+                if not isinstance(item, dict):
+                    continue
+                symbol = str(item.get("s") or "").upper().strip()
+                if not symbol:
+                    continue
+                position_side = str(item.get("ps") or "BOTH").upper().strip() or "BOTH"
+                self._positions[(symbol, position_side)] = {
+                    "symbol": symbol,
+                    "positionSide": position_side,
+                    "positionAmt": str(item.get("pa") or "0"),
+                    "entryPrice": str(item.get("ep") or "0"),
+                    "breakEvenPrice": str(item.get("bep") or "0"),
+                    "unRealizedProfit": str(item.get("up") or "0"),
+                    "marginType": str(item.get("mt") or ""),
+                    "isolatedWallet": str(item.get("iw") or "0"),
+                    "event_time": event_time,
+                    "observed_at": observed_at,
+                    "source": "user_data_stream",
+                }
+                changed += 1
+            if changed:
+                self._last_update_at = observed_at
+        return changed
+
+    def snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [dict(item) for item in self._positions.values()]
+
+    def last_update_age_seconds(self) -> float | None:
+        with self._lock:
+            if self._last_update_at <= 0:
+                return None
+            return max(time.monotonic() - self._last_update_at, 0.0)
+
+
 def _kind_from_order_update(execution_type: str, order_status: str) -> str:
     status = order_status.upper()
     execution = execution_type.upper()
@@ -251,6 +304,7 @@ class FuturesUserDataStream:
         api_key: str,
         contract_type: str = "usdm",
         event_store: ExecutionEventStore | None = None,
+        account_position_store: AccountPositionStore | None = None,
         listen_key_client: FuturesListenKeyClient | None = None,
         keepalive_interval_seconds: float = 30 * 60,
     ) -> None:
@@ -260,6 +314,7 @@ class FuturesUserDataStream:
         )
         self.contract_type = normalize_contract_type(contract_type)
         self.event_store = event_store or ExecutionEventStore()
+        self.account_position_store = account_position_store or AccountPositionStore()
         self.keepalive_interval_seconds = max(float(keepalive_interval_seconds), 60.0)
         self._lock = threading.RLock()
         self._stop_event = threading.Event()
@@ -303,6 +358,9 @@ class FuturesUserDataStream:
     def snapshot_events(self) -> list[ExecutionEvent]:
         return self.event_store.snapshot()
 
+    def snapshot_account_positions(self) -> list[dict[str, Any]]:
+        return self.account_position_store.snapshot()
+
     def status(self) -> dict[str, Any]:
         with self._lock:
             last_message_age_seconds = (
@@ -320,8 +378,10 @@ class FuturesUserDataStream:
                 "last_error": self._last_error,
                 "last_message_age_seconds": last_message_age_seconds,
                 "last_keepalive_age_seconds": last_keepalive_age_seconds,
+                "last_account_update_age_seconds": self.account_position_store.last_update_age_seconds(),
                 "listen_key_active": bool(self._listen_key),
                 "event_count": len(self.event_store.snapshot()),
+                "account_position_count": len(self.account_position_store.snapshot()),
             }
 
     def _base_stream_url(self) -> str:
@@ -394,6 +454,8 @@ class FuturesUserDataStream:
             event = normalize_order_trade_update(payload)
         if event is not None:
             self.event_store.add(event)
+        if event_type == "ACCOUNT_UPDATE" or isinstance(payload.get("a"), dict):
+            self.account_position_store.update_from_account_update(payload)
         with self._lock:
             self._last_message_at = time.monotonic()
 

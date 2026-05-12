@@ -9,8 +9,10 @@ from grid_optimizer.execution_events import ExecutionEvent
 from grid_optimizer.loop_runner import (
     _drain_new_runner_execution_events,
     _maybe_start_runner_user_data_stream,
+    _run_periodic_reconcile,
     _should_backfill_open_orders_rest,
     _should_backfill_trade_rest,
+    _snapshot_runner_account_position,
     _summarize_runner_strategy_open_order_state,
     _summarize_runner_strategy_execution_events,
     _snapshot_runner_execution_events,
@@ -301,6 +303,64 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         )
 
         self.assertTrue(decision)
+
+    def test_snapshot_runner_account_position_returns_recent_stream_position(self) -> None:
+        stream = SimpleNamespace(
+            snapshot_account_positions=lambda: [
+                {
+                    "symbol": "CHIPUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "-73",
+                    "observed_at": __import__("time").monotonic(),
+                }
+            ]
+        )
+        args = argparse.Namespace(user_data_stream=stream)
+
+        position = _snapshot_runner_account_position(args, "CHIPUSDT")
+
+        assert position is not None
+        self.assertEqual(position["positionAmt"], "-73")
+        self.assertEqual(position["symbol"], "CHIPUSDT")
+        self.assertIsNotNone(position["stream_age_seconds"])
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=[])
+    def test_periodic_reconcile_uses_stream_position_when_available(
+        self,
+        _mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        stream = SimpleNamespace(
+            snapshot_events=lambda: [],
+            snapshot_account_positions=lambda: [
+                {
+                    "symbol": "CHIPUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "-73",
+                    "observed_at": __import__("time").monotonic(),
+                }
+            ],
+        )
+        args = argparse.Namespace(user_data_stream=stream)
+
+        snapshot = _run_periodic_reconcile(
+            state={},
+            cycle=1,
+            interval_cycles=1,
+            symbol="CHIPUSDT",
+            strategy_mode="synthetic_neutral",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=0,
+            expected_actual_net_qty=-73.0,
+            args=args,
+        )
+
+        self.assertTrue(snapshot["ok"])
+        self.assertEqual(snapshot["account_position_source"], "user_data_stream")
+        mock_account_info.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from grid_optimizer.execution_events import (
+    AccountPositionStore,
     ExecutionEventStore,
     FuturesListenKeyClient,
     FuturesUserDataStream,
@@ -83,6 +84,40 @@ class ExecutionEventStoreTests(unittest.TestCase):
         self.assertEqual(len(store.snapshot()), 1)
 
 
+class AccountPositionStoreTests(unittest.TestCase):
+    def test_account_update_tracks_latest_positions(self) -> None:
+        store = AccountPositionStore()
+
+        changed = store.update_from_account_update(
+            {
+                "e": "ACCOUNT_UPDATE",
+                "E": 1000,
+                "a": {
+                    "P": [
+                        {
+                            "s": "CHIPUSDT",
+                            "pa": "-73",
+                            "ep": "0.067",
+                            "bep": "0.0671",
+                            "up": "0.12",
+                            "mt": "cross",
+                            "iw": "0",
+                            "ps": "BOTH",
+                        }
+                    ]
+                },
+            }
+        )
+
+        snapshot = store.snapshot()
+        self.assertEqual(changed, 1)
+        self.assertEqual(len(snapshot), 1)
+        self.assertEqual(snapshot[0]["symbol"], "CHIPUSDT")
+        self.assertEqual(snapshot[0]["positionAmt"], "-73")
+        self.assertEqual(snapshot[0]["positionSide"], "BOTH")
+        self.assertEqual(snapshot[0]["source"], "user_data_stream")
+
+
 class FuturesListenKeyClientTests(unittest.TestCase):
     @patch("grid_optimizer.execution_events._http_api_key_request_json")
     def test_listen_key_client_create_keepalive_and_close(self, mock_request) -> None:
@@ -131,6 +166,37 @@ class FuturesUserDataStreamTests(unittest.TestCase):
         self.assertEqual(len(events), 1)
         self.assertEqual(events[0].kind, "ORDER_PARTIALLY_FILLED")
         self.assertEqual(events[0].last_filled_qty, 5.0)
+
+    def test_user_data_stream_routes_account_updates_into_position_store(self) -> None:
+        stream = FuturesUserDataStream(api_key="key")
+
+        stream._on_message(
+            None,
+            json.dumps(
+                {
+                    "e": "ACCOUNT_UPDATE",
+                    "E": 1000,
+                    "a": {
+                        "P": [
+                            {
+                                "s": "CHIPUSDT",
+                                "pa": "-11",
+                                "ep": "0.067",
+                                "bep": "0.0671",
+                                "up": "0",
+                                "ps": "BOTH",
+                            }
+                        ]
+                    },
+                }
+            ),
+        )
+
+        positions = stream.snapshot_account_positions()
+        self.assertEqual(len(positions), 1)
+        self.assertEqual(positions[0]["symbol"], "CHIPUSDT")
+        self.assertEqual(positions[0]["positionAmt"], "-11")
+        self.assertEqual(stream.status()["account_position_count"], 1)
 
     def test_user_data_stream_uses_private_listen_key_url(self) -> None:
         stream = FuturesUserDataStream(api_key="key")

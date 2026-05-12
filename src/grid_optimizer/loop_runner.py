@@ -138,6 +138,7 @@ XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
 TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
+ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 30.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -1244,8 +1245,14 @@ def _run_periodic_reconcile(
         actual_open_order_count = int(observed_open_order_state.get("active_order_count", 0) or 0)
         total_open_order_count = None
         open_orders_source = "observed_events"
-    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
-    current_position = extract_symbol_position(account_info, symbol)
+    stream_position = _snapshot_runner_account_position(args, symbol)
+    if stream_position is not None:
+        current_position = stream_position
+        account_position_source = "user_data_stream"
+    else:
+        account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
+        current_position = extract_symbol_position(account_info, symbol)
+        account_position_source = "rest"
     actual_net_qty = _safe_float(current_position.get("positionAmt"))
     open_order_diff = actual_open_order_count - int(expected_open_order_count or 0)
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
@@ -1277,6 +1284,10 @@ def _run_periodic_reconcile(
         "observed_active_client_order_ids": list(observed_open_order_state.get("active_client_order_ids", [])),
         "expected_actual_net_qty": float(expected_actual_net_qty or 0.0),
         "actual_actual_net_qty": actual_net_qty,
+        "account_position_source": account_position_source,
+        "account_position_stream_age_seconds": (
+            stream_position.get("stream_age_seconds") if stream_position is not None else None
+        ),
         "open_order_diff": open_order_diff,
         "actual_net_qty_diff": actual_net_qty_diff,
         "ok": ok,
@@ -4144,6 +4155,48 @@ def _summarize_runner_strategy_open_order_state(
         "active_order_ids": [item.get("order_id") for item in active_items],
         "latest_events": events[-5:],
     }
+
+
+def _snapshot_runner_account_position(
+    args: argparse.Namespace | None,
+    symbol: str,
+    *,
+    position_side: str | None = None,
+    max_age_seconds: float = ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+) -> dict[str, Any] | None:
+    if args is None:
+        return None
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_account_positions"):
+        return None
+    wanted_symbol = symbol.upper().strip()
+    wanted_side = str(position_side or "BOTH").upper().strip() or "BOTH"
+    try:
+        positions = list(stream.snapshot_account_positions())
+    except Exception:
+        return None
+    best: dict[str, Any] | None = None
+    best_observed_at = -1.0
+    now = time.monotonic()
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol") or "").upper().strip() != wanted_symbol:
+            continue
+        item_side = str(item.get("positionSide") or "BOTH").upper().strip() or "BOTH"
+        if item_side != wanted_side:
+            continue
+        observed_at = _safe_float(item.get("observed_at"))
+        if max_age_seconds >= 0 and (observed_at <= 0 or now - observed_at > max_age_seconds):
+            continue
+        if observed_at >= best_observed_at:
+            best = item
+            best_observed_at = observed_at
+    if best is None:
+        return None
+    result = dict(best)
+    result["stream_age_seconds"] = max(now - best_observed_at, 0.0) if best_observed_at > 0 else None
+    return result
 
 
 def _trade_event_to_audit_row(event: Any) -> dict[str, Any]:
