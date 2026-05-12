@@ -12305,7 +12305,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
 
-    if volatility_entry_pause.get("active"):
+    elastic_absorbs_volatility_entry_pause = bool(elastic_volume.get("enabled") and elastic_volume.get("applied"))
+    if volatility_entry_pause.get("active") and not elastic_absorbs_volatility_entry_pause:
         entry_pause_reason = volatility_entry_pause.get("reason") or "active"
         controls["buy_paused"] = True
         controls["short_paused"] = True
@@ -12313,6 +12314,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
         controls["pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
         controls["short_pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+    elif volatility_entry_pause.get("active"):
+        volatility_entry_pause["entry_pause_absorbed_by_elastic"] = True
     if anti_chase_entry_guard.get("block_long_entries"):
         controls["buy_paused"] = True
         controls["pause_reasons"] = list(controls.get("pause_reasons", []))
