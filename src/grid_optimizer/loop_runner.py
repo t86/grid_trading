@@ -13134,14 +13134,24 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
 
     if args.cancel_stale:
         for stale_order in validation["actions"]["cancel_orders"]:
-            cancel_response = delete_futures_order(
-                symbol=symbol,
-                order_id=int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None,
-                orig_client_order_id=str(stale_order.get("clientOrderId", "")).strip() or None,
-                api_key=api_key,
-                api_secret=api_secret,
-                recv_window=args.recv_window,
-            )
+            try:
+                cancel_response = delete_futures_order(
+                    symbol=symbol,
+                    order_id=int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None,
+                    orig_client_order_id=str(stale_order.get("clientOrderId", "")).strip() or None,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    recv_window=args.recv_window,
+                )
+            except RuntimeError as exc:
+                if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                    raise
+                cancel_response = {
+                    "ignored_error": str(exc),
+                    "reason": "order_not_found",
+                    "orderId": stale_order.get("orderId"),
+                    "clientOrderId": stale_order.get("clientOrderId"),
+                }
             report["canceled_orders"].append(cancel_response)
             _maybe_sleep_between_execution_requests(args)
 
