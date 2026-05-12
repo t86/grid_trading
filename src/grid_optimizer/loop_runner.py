@@ -12269,8 +12269,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         desired_orders = preserve_sticky_entry_orders(
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
-            price_tolerance=entry_reuse_tolerance,
+            price_tolerance=entry_reuse_tolerance
+            * max(_safe_float(getattr(effective_args, "sticky_entry_price_tolerance_steps", 1.0)), 0.0),
             max_levels_per_group=getattr(effective_args, "sticky_entry_levels", None),
+            preserve_less_aggressive=bool(getattr(effective_args, "sticky_entry_preserve_less_aggressive", True)),
         )
         _sync_plan_orders_from_desired_orders(plan, desired_orders)
         if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled"):
@@ -13084,6 +13086,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-soft-loss-budget-scale", type=float, default=0.50)
     parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
     parser.add_argument("--sticky-entry-levels", type=int, default=None)
+    parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=1.0)
+    parser.add_argument("--sticky-entry-preserve-less-aggressive", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--synthetic-residual-long-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-residual-short-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-tiny-long-residual-notional", type=float, default=None)
@@ -13753,6 +13757,8 @@ def main() -> None:
         raise SystemExit("--per-order-notional must be > 0 and --base-position-notional must be >= 0")
     if args.sticky_entry_levels is not None and args.sticky_entry_levels < 0:
         raise SystemExit("--sticky-entry-levels must be >= 0")
+    if args.sticky_entry_price_tolerance_steps < 0:
+        raise SystemExit("--sticky-entry-price-tolerance-steps must be >= 0")
     if args.synthetic_residual_long_flat_notional is not None and args.synthetic_residual_long_flat_notional < 0:
         raise SystemExit("--synthetic-residual-long-flat-notional must be >= 0")
     if args.synthetic_residual_short_flat_notional is not None and args.synthetic_residual_short_flat_notional < 0:

@@ -3259,6 +3259,8 @@ class WebSecurityTests(unittest.TestCase):
                 "startup_entry_multiplier": 1.0,
                 "base_position_notional": 0.0,
                 "sticky_entry_levels": 2,
+                "sticky_entry_price_tolerance_steps": 2.5,
+                "sticky_entry_preserve_less_aggressive": True,
                 "synthetic_residual_short_flat_notional": 30.0,
                 "margin_type": "KEEP",
                 "leverage": 2,
@@ -3281,6 +3283,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--sticky-entry-levels", command)
         sticky_index = command.index("--sticky-entry-levels")
         self.assertEqual(command[sticky_index + 1], "2")
+        self.assertIn("--sticky-entry-price-tolerance-steps", command)
+        tolerance_index = command.index("--sticky-entry-price-tolerance-steps")
+        self.assertEqual(command[tolerance_index + 1], "2.5")
+        self.assertIn("--sticky-entry-preserve-less-aggressive", command)
         self.assertIn("--synthetic-residual-short-flat-notional", command)
 
     def test_build_runner_command_includes_synthetic_tiny_residual_thresholds(self) -> None:

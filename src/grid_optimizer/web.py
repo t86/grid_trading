@@ -3600,6 +3600,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "startup_entry_multiplier": 1.0,
     "base_position_notional": 420.0,
     "sticky_entry_levels": None,
+    "sticky_entry_price_tolerance_steps": 1.0,
+    "sticky_entry_preserve_less_aggressive": False,
     "synthetic_residual_long_flat_notional": None,
     "synthetic_residual_short_flat_notional": None,
     "threshold_position_notional": 0.0,
@@ -8667,6 +8669,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_loss_per_10k_hard",
         "best_quote_maker_volume_soft_loss_budget_scale",
         "best_quote_maker_volume_min_cycle_budget_notional",
+        "sticky_entry_price_tolerance_steps",
     }
     int_fields = {
         "buy_levels",
@@ -8706,6 +8709,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "cancel_stale",
         "apply",
         "reset_state",
+        "sticky_entry_preserve_less_aggressive",
         "flat_start_enabled",
         "warm_start_enabled",
         "market_bias_enabled",
@@ -9397,6 +9401,15 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
     ]
     if config.get("sticky_entry_levels") is not None:
         command.extend(["--sticky-entry-levels", str(config["sticky_entry_levels"])])
+    if config.get("sticky_entry_price_tolerance_steps") is not None:
+        command.extend(
+            [
+                "--sticky-entry-price-tolerance-steps",
+                str(config["sticky_entry_price_tolerance_steps"]),
+            ]
+        )
+    if bool(config.get("sticky_entry_preserve_less_aggressive", False)):
+        command.append("--sticky-entry-preserve-less-aggressive")
     if config.get("synthetic_residual_long_flat_notional") is not None:
         command.extend(
             [

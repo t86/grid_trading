@@ -7092,6 +7092,18 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.sticky_entry_levels, 2)
 
+    def test_build_parser_accepts_sticky_entry_churn_controls(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--sticky-entry-price-tolerance-steps",
+                "2.5",
+                "--sticky-entry-preserve-less-aggressive",
+            ]
+        )
+
+        self.assertEqual(args.sticky_entry_price_tolerance_steps, 2.5)
+        self.assertTrue(args.sticky_entry_preserve_less_aggressive)
+
     def test_build_parser_accepts_synthetic_residual_short_flat_notional(self) -> None:
         args = _build_parser().parse_args(["--synthetic-residual-short-flat-notional", "30"])
 

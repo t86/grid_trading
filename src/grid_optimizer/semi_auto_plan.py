@@ -2029,6 +2029,7 @@ def preserve_sticky_entry_orders(
     desired_orders: list[dict[str, Any]],
     price_tolerance: float,
     max_levels_per_group: int | None = None,
+    preserve_less_aggressive: bool = False,
 ) -> list[dict[str, Any]]:
     tolerance = max(_safe_float(price_tolerance), 0.0)
     safe_max_levels = None if max_levels_per_group is None else max(int(max_levels_per_group), 0)
@@ -2114,7 +2115,7 @@ def preserve_sticky_entry_orders(
             role = str(desired_order.get("role", "")).strip()
             if role in entry_roles and abs(existing_price - desired_price) > tolerance + 1e-12:
                 continue
-            if not _existing_is_closer(existing_order, desired_order):
+            if not preserve_less_aggressive and not _existing_is_closer(existing_order, desired_order):
                 continue
             bucket = _order_bucket_key(
                 str(desired_order.get("side", "")),
