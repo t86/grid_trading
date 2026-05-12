@@ -140,6 +140,7 @@ TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 30.0
 OPEN_ORDER_STREAM_MAX_AGE_SECONDS = 30.0
+POSITION_MODE_CACHE_TTL_SECONDS = 10 * 60.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -4232,6 +4233,127 @@ def _snapshot_runner_account_position(
     result = dict(best)
     result["stream_age_seconds"] = max(now - best_observed_at, 0.0) if best_observed_at > 0 else None
     return result
+
+
+def _snapshot_runner_account_positions(
+    args: argparse.Namespace | None,
+    symbol: str,
+    *,
+    max_age_seconds: float = ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+) -> list[dict[str, Any]]:
+    if args is None:
+        return []
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_account_positions"):
+        return []
+    wanted_symbol = symbol.upper().strip()
+    now = time.monotonic()
+    try:
+        positions = list(stream.snapshot_account_positions())
+    except Exception:
+        return []
+    fresh: list[dict[str, Any]] = []
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol") or "").upper().strip() != wanted_symbol:
+            continue
+        observed_at = _safe_float(item.get("observed_at"))
+        if max_age_seconds >= 0 and (observed_at <= 0 or now - observed_at > max_age_seconds):
+            continue
+        cloned = dict(item)
+        cloned["stream_age_seconds"] = max(now - observed_at, 0.0) if observed_at > 0 else None
+        fresh.append(cloned)
+    return fresh
+
+
+def _stream_account_info_snapshot(args: argparse.Namespace | None, symbol: str) -> dict[str, Any] | None:
+    positions = _snapshot_runner_account_positions(args, symbol)
+    if not positions:
+        return None
+    return {
+        "multiAssetsMargin": bool(getattr(args, "_cached_multi_assets_margin", False)),
+        "positions": positions,
+        "source": "user_data_stream",
+    }
+
+
+def _stream_open_orders_snapshot(args: argparse.Namespace | None, symbol: str) -> list[dict[str, Any]] | None:
+    if args is None:
+        return None
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_open_orders"):
+        return None
+    stream_age = None
+    if hasattr(stream, "open_order_state_age_seconds"):
+        try:
+            stream_age = stream.open_order_state_age_seconds()
+        except Exception:
+            stream_age = None
+    if stream_age is None or stream_age > OPEN_ORDER_STREAM_MAX_AGE_SECONDS:
+        return None
+    wanted_symbol = symbol.upper().strip()
+    try:
+        return [
+            dict(item)
+            for item in list(stream.snapshot_open_orders())
+            if isinstance(item, dict)
+            and str(item.get("symbol") or "").upper().strip() == wanted_symbol
+        ]
+    except Exception:
+        return None
+
+
+def _fetch_runner_position_mode_cached(
+    args: argparse.Namespace,
+    api_key: str,
+    api_secret: str,
+    *,
+    recv_window: int,
+) -> dict[str, Any]:
+    cached = getattr(args, "_cached_position_mode", None)
+    cached_at = _safe_float(getattr(args, "_cached_position_mode_at", 0.0))
+    now = time.monotonic()
+    if isinstance(cached, dict) and cached_at > 0 and now - cached_at <= POSITION_MODE_CACHE_TTL_SECONDS:
+        result = dict(cached)
+        result["source"] = "cache"
+        return result
+    result = dict(fetch_futures_position_mode(api_key, api_secret, recv_window=recv_window))
+    setattr(args, "_cached_position_mode", dict(result))
+    setattr(args, "_cached_position_mode_at", now)
+    return result
+
+
+def _resolve_runner_account_snapshot(
+    args: argparse.Namespace,
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+    require_account_mode: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]]:
+    sources: dict[str, str] = {}
+    account_info = None if require_account_mode else _stream_account_info_snapshot(args, symbol)
+    if account_info is None:
+        account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
+        sources["account_info"] = "rest"
+        setattr(args, "_cached_multi_assets_margin", _truthy(account_info.get("multiAssetsMargin")))
+    else:
+        sources["account_info"] = "user_data_stream"
+    open_orders = _stream_open_orders_snapshot(args, symbol)
+    if open_orders is None:
+        open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
+        sources["open_orders"] = "rest"
+        stream = getattr(args, "user_data_stream", None)
+        if stream is not None and hasattr(stream, "replace_open_orders_from_rest"):
+            try:
+                stream.replace_open_orders_from_rest(_filter_futures_strategy_orders(open_orders, symbol))
+            except Exception:
+                pass
+    else:
+        sources["open_orders"] = "user_data_stream"
+    return account_info, list(open_orders), sources
 
 
 def _trade_event_to_audit_row(event: Any) -> dict[str, Any]:
@@ -9702,9 +9824,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
     api_key, api_secret = credentials
 
-    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=args.recv_window)
-    position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
-    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
+    account_info, open_orders, account_snapshot_sources = _resolve_runner_account_snapshot(
+        args,
+        symbol=symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+    )
+    position_mode = _fetch_runner_position_mode_cached(args, api_key, api_secret, recv_window=args.recv_window)
+    account_snapshot_sources["position_mode"] = str(position_mode.get("source") or "rest")
     dual_side_position = _truthy(position_mode.get("dualSidePosition"))
     actual_position = extract_symbol_position(account_info, symbol)
     actual_net_qty = _safe_float(actual_position.get("positionAmt"))
@@ -12397,6 +12525,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "tail_cleanup_active": bool(plan.get("tail_cleanup_active")),
         "open_order_count": len(strategy_open_orders),
         "total_open_order_count": len(open_orders),
+        "account_snapshot_sources": account_snapshot_sources,
         "kept_orders": diff["kept_orders"],
         "missing_orders": diff["missing_orders"],
         "stale_orders": diff["stale_orders"],
@@ -12590,7 +12719,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
     api_key, api_secret = credentials
 
-    position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
+    submit_account_snapshot_sources: dict[str, str] = {}
+    position_mode = _fetch_runner_position_mode_cached(args, api_key, api_secret, recv_window=args.recv_window)
+    submit_account_snapshot_sources["position_mode"] = str(position_mode.get("source") or "rest")
     dual_side_position = _truthy(position_mode.get("dualSidePosition"))
     if strategy_mode == "hedge_neutral":
         if not dual_side_position:
@@ -12610,7 +12741,15 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     elif dual_side_position:
         raise RuntimeError("账户当前是双向持仓模式，当前提交器只支持单向模式")
 
-    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=args.recv_window)
+    account_info, current_open_orders, account_sources = _resolve_runner_account_snapshot(
+        args,
+        symbol=symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+        require_account_mode=str(args.margin_type).upper().strip() == "ISOLATED",
+    )
+    submit_account_snapshot_sources.update(account_sources)
     multi_assets_margin = _truthy(account_info.get("multiAssetsMargin"))
     requested_margin_type = str(args.margin_type).upper().strip()
     report["account_mode"] = {
@@ -12622,8 +12761,8 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "账户当前启用了 Multi-Assets Mode，Binance 不允许在该模式下切到 ISOLATED。"
         )
 
-    current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
     current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
+    report["account_snapshot_sources"] = submit_account_snapshot_sources
     expected_open_order_count = int(plan_report.get("open_order_count", 0) or 0)
     expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
     expected_short_qty = _safe_float(plan_report.get("current_short_qty"))

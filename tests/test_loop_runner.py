@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from argparse import Namespace
 import json
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from grid_optimizer.audit import build_audit_paths
@@ -5816,9 +5818,15 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(result["effective_sell_levels"], 12)
         self.assertAlmostEqual(result["effective_base_position_notional"], 280.0)
 
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "1.0001", "lastFundingRate": "0.0"}])
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
-    def test_execute_plan_report_handles_optional_synthetic_fields(self, mock_validate_plan_report, mock_book_tickers) -> None:
+    def test_execute_plan_report_handles_optional_synthetic_fields(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        _mock_premium_index,
+    ) -> None:
         mock_validate_plan_report.return_value = {
             "ok": False,
             "errors": ["plan contains no actions to execute"],
@@ -6524,6 +6532,101 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["plan_summary"]["strategy_mode"], "synthetic_neutral")
         self.assertEqual(report["synthetic_ledger"], {"virtual_short_qty": 73.0, "unmatched_trade_count": 0})
         self.assertEqual(report["plan_snapshot"]["synthetic_ledger"], {"virtual_short_qty": 73.0, "unmatched_trade_count": 0})
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "0.144", "lastFundingRate": "0.0"}])
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers", return_value=[{"bid_price": "0.1439", "ask_price": "0.1441"}])
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_prefers_user_stream_account_snapshot(
+        self,
+        mock_validate_plan_report,
+        _mock_book_tickers,
+        _mock_premium_index,
+        _mock_credentials,
+        _mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        _mock_change_leverage,
+        mock_post_order,
+        _mock_update_inventory_refs,
+        _mock_update_synthetic_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "entry", "side": "BUY", "qty": 35.0, "price": 0.1439},
+                ],
+            },
+        }
+        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "gx-billu-test"}
+        now = time.monotonic()
+        stream = SimpleNamespace(
+            snapshot_events=lambda: [],
+            snapshot_account_positions=lambda: [
+                {
+                    "symbol": "BILLUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "-100",
+                    "entryPrice": "0.144",
+                    "breakEvenPrice": "0.144",
+                    "observed_at": now,
+                }
+            ],
+            snapshot_open_orders=lambda: [],
+            open_order_state_age_seconds=lambda: 1.0,
+        )
+        args = Namespace(
+            symbol="BILLUSDT",
+            strategy_mode="synthetic_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/billusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=20,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/billusdt_loop_state.json",
+            user_data_stream=stream,
+        )
+        plan_report = {
+            "symbol": "BILLUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "mid_price": 0.144,
+            "step_price": 0.00028,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 100.0,
+            "actual_net_qty": -100.0,
+            "symbol_info": {
+                "tick_size": 0.00001,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["executed"])
+        self.assertEqual(report["account_snapshot_sources"]["account_info"], "user_data_stream")
+        self.assertEqual(report["account_snapshot_sources"]["open_orders"], "user_data_stream")
+        mock_account_info.assert_not_called()
+        mock_open_orders.assert_not_called()
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
