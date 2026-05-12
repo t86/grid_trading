@@ -4172,6 +4172,130 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(snapshot["synthetic_net_compacted"])
         self.assertTrue(snapshot["synthetic_net_compacted_used_actual_net"])
 
+    def test_sync_synthetic_ledger_applies_observed_fill_before_rest_backfill(self) -> None:
+        now = datetime(2026, 5, 12, 5, 0, tzinfo=timezone.utc)
+        trade_time_ms = int((now - timedelta(seconds=1)).timestamp() * 1000)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 0.0,
+                "virtual_long_avg_price": 0.0,
+                "virtual_long_lots": [],
+                "virtual_short_qty": 0.0,
+                "virtual_short_avg_price": 0.0,
+                "virtual_short_lots": [],
+                "last_trade_time_ms": int((now - timedelta(seconds=5)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            },
+            "synthetic_order_refs": {
+                "123": {
+                    "role": "entry_short",
+                    "client_order_id": "gx-chipu-entry-short-1",
+                }
+            },
+        }
+        observed_trade = {
+            "id": f"123:gx-chipu-entry-short-1:{trade_time_ms}:10.0:0.0671",
+            "orderId": 123,
+            "clientOrderId": "gx-chipu-entry-short-1",
+            "symbol": "CHIPUSDT",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "time": trade_time_ms,
+            "price": 0.0671,
+            "qty": 10.0,
+            "quoteQty": 0.671,
+            "executionType": "TRADE",
+            "orderStatus": "FILLED",
+            "source": "user_data_stream",
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="CHIPUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=-10.0,
+                entry_price=0.0671,
+                qty_tolerance=1e-9,
+                fallback_price=0.0671,
+                observed_trade_rows=[observed_trade],
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_short_qty"], 10.0)
+        self.assertEqual(snapshot["virtual_short_lots"], [{"qty": 10.0, "price": 0.0671}])
+        self.assertEqual(snapshot["applied_trade_count"], 1)
+        self.assertEqual(snapshot["unmatched_trade_count"], 0)
+        self.assertFalse(snapshot["resynced_to_actual"])
+        self.assertEqual(state["synthetic_ledger"]["last_trade_time_ms"], trade_time_ms)
+
+    def test_sync_synthetic_ledger_dedupes_rest_trade_after_observed_fill(self) -> None:
+        now = datetime(2026, 5, 12, 5, 0, tzinfo=timezone.utc)
+        trade_time_ms = int((now - timedelta(seconds=1)).timestamp() * 1000)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 0.0,
+                "virtual_long_avg_price": 0.0,
+                "virtual_long_lots": [],
+                "virtual_short_qty": 0.0,
+                "virtual_short_avg_price": 0.0,
+                "virtual_short_lots": [],
+                "last_trade_time_ms": int((now - timedelta(seconds=5)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            },
+            "synthetic_order_refs": {
+                "123": {
+                    "role": "entry_short",
+                    "client_order_id": "gx-chipu-entry-short-1",
+                }
+            },
+        }
+        trade_row = {
+            "id": f"123:gx-chipu-entry-short-1:{trade_time_ms}:10.0:0.0671",
+            "orderId": 123,
+            "clientOrderId": "gx-chipu-entry-short-1",
+            "symbol": "CHIPUSDT",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "time": trade_time_ms,
+            "price": 0.0671,
+            "qty": 10.0,
+            "quoteQty": 0.671,
+            "executionType": "TRADE",
+            "orderStatus": "FILLED",
+            "source": "user_data_stream",
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[trade_row]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="CHIPUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=-10.0,
+                entry_price=0.0671,
+                qty_tolerance=1e-9,
+                fallback_price=0.0671,
+                observed_trade_rows=[trade_row],
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_short_qty"], 10.0)
+        self.assertEqual(snapshot["virtual_short_lots"], [{"qty": 10.0, "price": 0.0671}])
+        self.assertEqual(snapshot["applied_trade_count"], 1)
+        self.assertEqual(snapshot["unmatched_trade_count"], 0)
+
     def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
@@ -5738,12 +5862,14 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_raises_entry_order_below_min_notional_after_post_only_adjustment(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
+        mock_premium_index,
         mock_load_credentials,
         mock_position_mode,
         mock_account_info,
@@ -5766,6 +5892,7 @@ class LoopRunnerTests(unittest.TestCase):
             },
         }
         mock_book_tickers.return_value = [{"bid_price": "0.49", "ask_price": "0.51"}]
+        mock_premium_index.return_value = [{"markPrice": "0.50", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {"multiAssetsMargin": False, "positions": [{"symbol": "KATUSDT", "positionAmt": "0", "entryPrice": "0"}]}
@@ -5824,12 +5951,14 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_competition_inventory_grid_sets_reduce_only_by_role(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
+        mock_premium_index,
         mock_load_credentials,
         mock_position_mode,
         mock_account_info,
@@ -5856,6 +5985,7 @@ class LoopRunnerTests(unittest.TestCase):
             },
         }
         mock_book_tickers.return_value = [{"bid_price": "0.09", "ask_price": "0.10"}]
+        mock_premium_index.return_value = [{"markPrice": "0.095", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
@@ -5919,12 +6049,14 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_synthetic_neutral_exit_orders_use_reduce_only(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
+        mock_premium_index,
         mock_load_credentials,
         mock_position_mode,
         mock_account_info,
@@ -5949,6 +6081,7 @@ class LoopRunnerTests(unittest.TestCase):
             },
         }
         mock_book_tickers.return_value = [{"bid_price": "0.09", "ask_price": "0.10"}]
+        mock_premium_index.return_value = [{"markPrice": "0.095", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
@@ -6010,12 +6143,14 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_caps_one_way_reduce_only_orders_to_net_position(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
+        mock_premium_index,
         mock_load_credentials,
         mock_position_mode,
         mock_account_info,
@@ -6041,6 +6176,7 @@ class LoopRunnerTests(unittest.TestCase):
             },
         }
         mock_book_tickers.return_value = [{"bid_price": "0.1731", "ask_price": "0.1732"}]
+        mock_premium_index.return_value = [{"markPrice": "0.17315", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
@@ -6106,12 +6242,14 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_skips_reduce_only_rejects_after_position_race(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
+        mock_premium_index,
         mock_load_credentials,
         mock_position_mode,
         mock_account_info,
@@ -6134,6 +6272,7 @@ class LoopRunnerTests(unittest.TestCase):
             },
         }
         mock_book_tickers.return_value = [{"bid_price": "0.1673", "ask_price": "0.1674"}]
+        mock_premium_index.return_value = [{"markPrice": "0.16735", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
@@ -6194,12 +6333,14 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_returns_blocked_report_after_runtime_guard_filters_actions(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
+        mock_premium_index,
         mock_load_credentials,
         mock_position_mode,
         mock_account_info,
@@ -6239,6 +6380,7 @@ class LoopRunnerTests(unittest.TestCase):
             "actions": filtered_actions,
         }
         mock_book_tickers.return_value = [{"bid_price": "0.0669", "ask_price": "0.0670"}]
+        mock_premium_index.return_value = [{"markPrice": "0.06695", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {
@@ -6409,12 +6551,14 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
     @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_refreshes_book_only_when_retrying_post_only_reject(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
+        mock_premium_index,
         mock_load_credentials,
         mock_position_mode,
         mock_account_info,
@@ -6441,6 +6585,7 @@ class LoopRunnerTests(unittest.TestCase):
             [{"bid_price": "0.48", "ask_price": "0.50"}],
             [{"bid_price": "0.48", "ask_price": "0.50"}],
         ]
+        mock_premium_index.return_value = [{"markPrice": "0.50", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
         mock_account_info.return_value = {

@@ -3245,6 +3245,7 @@ def sync_synthetic_ledger(
     entry_price: float,
     qty_tolerance: float | None = None,
     fallback_price: float = 0.0,
+    observed_trade_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     ledger = _load_synthetic_ledger(
         state=state,
@@ -3255,6 +3256,18 @@ def sync_synthetic_ledger(
     if trade_start_time_ms <= 0:
         trade_start_time_ms = max(int((_utc_now().timestamp() * 1000) - 48 * 3600 * 1000), 0)
 
+    observed_rows = [
+        dict(row)
+        for row in list(observed_trade_rows or [])
+        if isinstance(row, dict)
+    ]
+    observed_fresh_rows, observed_last_time_ms, observed_keys_at_time = collect_new_rows(
+        rows=observed_rows,
+        last_time_ms=int(ledger.get("last_trade_time_ms") or 0) or None,
+        last_keys_at_time=list(ledger.get("last_trade_keys_at_time", [])),
+        row_time_ms=trade_row_time_ms,
+        row_key=trade_row_key,
+    )
     trade_rows = _fetch_trade_rows_since(
         symbol=symbol,
         api_key=api_key,
@@ -3264,11 +3277,12 @@ def sync_synthetic_ledger(
     )
     fresh_rows, last_time_ms, keys_at_time = collect_new_rows(
         rows=trade_rows,
-        last_time_ms=int(ledger.get("last_trade_time_ms") or 0) or None,
-        last_keys_at_time=list(ledger.get("last_trade_keys_at_time", [])),
+        last_time_ms=observed_last_time_ms,
+        last_keys_at_time=observed_keys_at_time,
         row_time_ms=trade_row_time_ms,
         row_key=trade_row_key,
     )
+    fresh_rows = [*observed_fresh_rows, *fresh_rows]
 
     applied = 0
     unmatched = 0
@@ -3869,22 +3883,7 @@ def _sync_account_audit(
     if income_start_time_ms <= 0:
         income_start_time_ms = int(audit_state.get("session_start_time_ms") or 0) or default_start_time_ms
 
-    observed_trade_rows: list[dict[str, Any]] = []
-    if args is not None:
-        stream = getattr(args, "user_data_stream", None)
-        if stream is not None and hasattr(stream, "snapshot_events"):
-            try:
-                for event in list(stream.snapshot_events()):
-                    kind = str(getattr(event, "kind", "") or "").strip().upper()
-                    if kind not in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}:
-                        continue
-                    if str(getattr(event, "symbol", "") or "").upper().strip() != symbol.upper().strip():
-                        continue
-                    if _safe_float(getattr(event, "last_filled_qty", 0.0)) <= 0:
-                        continue
-                    observed_trade_rows.append(_trade_event_to_audit_row(event))
-            except Exception:
-                observed_trade_rows = []
+    observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
 
     observed_fresh_trades, observed_trade_last_time_ms, observed_trade_keys_at_time = collect_new_rows(
         rows=observed_trade_rows,
@@ -4172,6 +4171,32 @@ def _trade_event_to_audit_row(event: Any) -> dict[str, Any]:
         "orderStatus": str(getattr(event, "order_status", "") or "").upper().strip(),
         "source": "user_data_stream",
     }
+
+
+def _collect_runner_observed_trade_rows(
+    args: argparse.Namespace | None,
+    *,
+    symbol: str,
+) -> list[dict[str, Any]]:
+    if args is None:
+        return []
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_events"):
+        return []
+    observed_trade_rows: list[dict[str, Any]] = []
+    try:
+        for event in list(stream.snapshot_events()):
+            kind = str(getattr(event, "kind", "") or "").strip().upper()
+            if kind not in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}:
+                continue
+            if str(getattr(event, "symbol", "") or "").upper().strip() != symbol.upper().strip():
+                continue
+            if _safe_float(getattr(event, "last_filled_qty", 0.0)) <= 0:
+                continue
+            observed_trade_rows.append(_trade_event_to_audit_row(event))
+    except Exception:
+        return []
+    return observed_trade_rows
 
 
 def _should_backfill_trade_rest(
@@ -9619,6 +9644,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
     execution_regime = build_execution_regime_report(
         args=args,
         state=state,
@@ -10285,6 +10311,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 entry_price=actual_cost_basis_price,
                 qty_tolerance=max(_safe_float(symbol_info.get("step_size")), 1e-9),
                 fallback_price=mid_price,
+                observed_trade_rows=observed_trade_rows,
             )
             current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
             current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)
@@ -10629,6 +10656,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             entry_price=actual_cost_basis_price,
             qty_tolerance=max(_safe_float(symbol_info.get("step_size")), 1e-9),
             fallback_price=mid_price,
+            observed_trade_rows=observed_trade_rows,
         )
         current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
         current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)
