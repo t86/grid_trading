@@ -840,6 +840,32 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(order["notional"], 400.0)
         self.assertEqual(plan["forced_reduce_orders"], [order])
 
+    def test_apply_hard_loss_forced_reduce_reduces_when_target_above_current(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="SELL",
+            current_qty=5000.0,
+            current_notional=650.0,
+            target_notional=2700.0,
+            max_order_notional=180.0,
+            bid_price=0.13,
+            ask_price=0.131,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["placed_order_count"], 1)
+        self.assertAlmostEqual(report["target_notional"], 470.0)
+        self.assertLessEqual(plan["sell_orders"][0]["notional"], 180.0)
+
     def test_apply_entry_permission_gate_prunes_short_entries_only(self) -> None:
         plan = {
             "bootstrap_orders": [

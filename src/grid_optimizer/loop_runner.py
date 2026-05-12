@@ -1982,12 +1982,18 @@ def apply_hard_loss_forced_reduce(
     safe_current_qty = max(_safe_float(current_qty), 0.0)
     safe_current_notional = max(_safe_float(current_notional), 0.0)
     safe_target_notional = max(_safe_float(target_notional), 0.0)
-    if safe_current_qty <= 1e-12 or safe_current_notional <= safe_target_notional + 1e-12:
+    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
+    if safe_current_qty <= 1e-12:
         report["blocked_reason"] = "at_or_below_target"
         return report
+    if safe_current_notional <= safe_target_notional + 1e-12:
+        if safe_max_order_notional <= 0:
+            report["blocked_reason"] = "at_or_below_target"
+            return report
+        safe_target_notional = max(safe_current_notional - safe_max_order_notional, 0.0)
+        report["target_notional"] = safe_target_notional
 
     raw_reduce_notional = safe_current_notional - safe_target_notional
-    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
     reduce_notional = min(raw_reduce_notional, safe_max_order_notional) if safe_max_order_notional > 0 else raw_reduce_notional
     price_source = bid_price if normalized_side == "SELL" else ask_price
     price = _round_order_price(max(_safe_float(price_source), 0.0), tick_size, normalized_side)

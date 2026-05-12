@@ -120,9 +120,10 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
 
         self.assertEqual(control["regime"], "wide-step")
         self.assertGreater(control["step_scale"], 2.0)
-        self.assertAlmostEqual(control["threshold_scale"], 1.5)
-        self.assertAlmostEqual(control["pause_scale"], 1.5)
-        self.assertAlmostEqual(control["position_limit_scale"], 1.5)
+        self.assertAlmostEqual(control["threshold_scale"], 1.0)
+        self.assertAlmostEqual(control["pause_scale"], 1.0)
+        self.assertAlmostEqual(control["position_limit_scale"], 1.0)
+        self.assertIn("same_side_risk_limit_clamp", control["reasons"])
 
     def test_light_inventory_high_volatility_enters_wide_step_attack(self) -> None:
         control = resolve_elastic_volume_control(
@@ -163,7 +164,7 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertLess(control["levels_scale"], 1.0)
         self.assertEqual(control["max_entry_long_orders"], 3)
 
-    def test_wide_step_uses_scaled_threshold_before_escalating_to_defensive(self) -> None:
+    def test_wide_step_inventory_pressure_clamps_scaled_threshold(self) -> None:
         control = resolve_elastic_volume_control(
             config=ElasticVolumeConfig(
                 enabled=True,
@@ -185,7 +186,8 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         )
 
         self.assertEqual(control["regime"], "wide-step")
-        self.assertAlmostEqual(control["threshold_scale"], 1.5)
+        self.assertAlmostEqual(control["threshold_scale"], 1.0)
+        self.assertIn("same_side_risk_limit_clamp", control["reasons"])
 
     def test_high_inventory_or_extreme_volatility_enters_defensive(self) -> None:
         control = resolve_elastic_volume_control(
@@ -205,7 +207,8 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertGreater(control["step_scale"], 1.0)
         self.assertLess(control["per_order_scale"], 1.0)
         self.assertTrue(control["reasons"])
-        self.assertAlmostEqual(control["threshold_scale"], 1.8)
+        self.assertAlmostEqual(control["threshold_scale"], 1.0)
+        self.assertIn("same_side_risk_limit_clamp", control["reasons"])
 
     def test_ping_pong_safe_recovery_confirms_before_fast(self) -> None:
         control = resolve_elastic_volume_control(
@@ -316,6 +319,29 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertFalse(control["allow_entry_long"])
         self.assertTrue(control["allow_entry_short"])
         self.assertIn("inventory_over_bias", control["reasons"])
+
+    def test_inventory_pressure_does_not_raise_same_side_risk_limits(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=1_300.0,
+                short_notional=0.0,
+                actual_net_notional=1_300.0,
+                threshold_position_notional=2_700.0,
+                max_long_notional=5_400.0,
+                max_short_notional=5_400.0,
+                volatility_1m_amplitude_ratio=0.0040,
+                volatility_5m_amplitude_ratio=0.0070,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "wide-step")
+        self.assertFalse(control["allow_entry_long"])
+        self.assertTrue(control["allow_entry_short"])
+        self.assertEqual(control["position_limit_scale"], 1.0)
+        self.assertEqual(control["threshold_scale"], 1.0)
+        self.assertEqual(control["pause_scale"], 1.0)
+        self.assertIn("same_side_risk_limit_clamp", control["reasons"])
 
     def test_metrics_include_short_window_loss(self) -> None:
         control = resolve_elastic_volume_control(

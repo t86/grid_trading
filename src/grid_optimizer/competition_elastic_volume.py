@@ -397,20 +397,41 @@ def resolve_elastic_volume_control(
     control["last_regime"] = last_regime
 
     if control["regime"] in {"defensive", "wide-step", "wide-step-attack"}:
+        same_side_risk_pressure = (
+            control["regime"] == "defensive"
+            or cap_pressure
+            or threshold_inventory_ratio >= max(_safe_float(config.inventory_soft_ratio_ping_pong_fast), 0.0)
+        )
+
+        def clamp_same_side_risk_limits() -> None:
+            control["position_limit_scale"] = min(_safe_float(control.get("position_limit_scale")), 1.0)
+            control["threshold_scale"] = min(_safe_float(control.get("threshold_scale")), 1.0)
+            control["pause_scale"] = min(_safe_float(control.get("pause_scale")), 1.0)
+            if "same_side_risk_limit_clamp" not in control["reasons"]:
+                control["reasons"].append("same_side_risk_limit_clamp")
+
         if directional_long_notional >= directional_short_notional and directional_long_notional > 0:
             control["allow_entry_long"] = False
             control["allow_reduce_long"] = True
+            if same_side_risk_pressure:
+                clamp_same_side_risk_limits()
             if control["regime"] in {"wide-step", "wide-step-attack"}:
                 control["allow_entry_short"] = True
         elif directional_short_notional > 0:
             control["allow_entry_short"] = False
             control["allow_reduce_short"] = True
+            if same_side_risk_pressure:
+                clamp_same_side_risk_limits()
             if control["regime"] in {"wide-step", "wide-step-attack"}:
                 control["allow_entry_long"] = True
         elif net > 0:
             control["allow_entry_long"] = False
+            if same_side_risk_pressure:
+                clamp_same_side_risk_limits()
         elif net < 0:
             control["allow_entry_short"] = False
+            if same_side_risk_pressure:
+                clamp_same_side_risk_limits()
     elif control["regime"] in {"ping-pong-fast", "ping-pong-safe"}:
         soft_ratio = (
             max(_safe_float(config.inventory_soft_ratio_ping_pong_fast), 0.0)
