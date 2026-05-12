@@ -19377,6 +19377,34 @@ MONITOR_PAGE = """<!doctype html>
       font-weight: 700;
       margin-right: 6px;
     }
+    .metric.wide-metric { grid-column: span 2; }
+    .metric-kv-grid {
+      margin-top: 10px;
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+    }
+    .metric-kv {
+      border: 1px solid rgba(226, 221, 210, 0.85);
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.72);
+      padding: 8px;
+      min-width: 0;
+    }
+    .metric-kv span {
+      display: block;
+      color: var(--muted);
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .metric-kv strong {
+      display: block;
+      margin-top: 3px;
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.35;
+      overflow-wrap: anywhere;
+    }
     .good { color: var(--good); }
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
@@ -19490,6 +19518,7 @@ MONITOR_PAGE = """<!doctype html>
     }
     @media (max-width: 980px) {
       .status-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .metric-kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .grid-2 { grid-template-columns: 1fr; }
       .sprint-track-grid { grid-template-columns: 1fr; }
       .editor-grid { grid-template-columns: 1fr; }
@@ -19498,6 +19527,8 @@ MONITOR_PAGE = """<!doctype html>
     }
     @media (max-width: 640px) {
       .status-row { grid-template-columns: 1fr; }
+      .metric.wide-metric { grid-column: span 1; }
+      .metric-kv-grid { grid-template-columns: 1fr; }
       .toolbar label { min-width: 100%; }
       .sprint-metrics { grid-template-columns: 1fr; }
     }
@@ -25106,6 +25137,95 @@ MONITOR_PAGE = """<!doctype html>
       };
     }
 
+    function boolText(value) {
+      return value ? "是" : "否";
+    }
+
+    function fmtCompactPct(v) {
+      if (v === null || v === undefined || Number.isNaN(Number(v))) return "--";
+      return `${(Number(v) * 100).toFixed(4)}%`;
+    }
+
+    function buildStrategyMachineCard(risk, runnerCfg) {
+      const budget = (risk && typeof risk.regime_entry_budget === "object") ? risk.regime_entry_budget : {};
+      const elastic = (risk && typeof risk.elastic_volume === "object") ? risk.elastic_volume : {};
+      const adaptive = (risk && typeof risk.adaptive_step === "object") ? risk.adaptive_step : {};
+      const gate = (risk && typeof risk.entry_permission_gate === "object") ? risk.entry_permission_gate : {};
+      const metrics = (risk && typeof risk.regime_entry_budget_metrics === "object") ? risk.regime_entry_budget_metrics : {};
+      const elasticMetrics = (risk && typeof risk.elastic_volume_metrics === "object") ? risk.elastic_volume_metrics : {};
+      const enabled = Boolean(risk.regime_entry_budget_enabled || budget.enabled || risk.elastic_volume_enabled || elastic.enabled);
+      const state = String(risk.regime_entry_budget_state || budget.state || risk.elastic_volume_regime || elastic.regime || "--");
+      const candidate = String(risk.regime_entry_budget_candidate_regime || budget.candidate_regime || "--");
+      const target = String(risk.regime_entry_budget_target_regime || budget.target_regime || "");
+      const switching = Boolean(risk.regime_entry_budget_switching || budget.switching);
+      const shock = Boolean(risk.regime_entry_budget_shock_guard_active || budget.shock_guard_active);
+      const cancelRequired = Boolean(risk.regime_entry_budget_cancel_entry_required || budget.cancel_entry_required);
+      const baseStepRatio = Number(risk.regime_entry_budget_base_step_ratio || runnerCfg.regime_entry_budget_base_step_ratio || 0);
+      const effectiveStepRatio = Number(risk.regime_entry_budget_effective_step_ratio || budget.effective_step_ratio || 0);
+      const baseStep = Number(risk.base_step_price || risk.adaptive_step_base_step_price || adaptive.base_step_price || runnerCfg.step_price || 0);
+      const planStep = Number(risk.plan_step_price || runnerCfg.step_price || 0);
+      const effectiveStep = Number(
+        risk.regime_entry_budget_effective_step_price
+        || risk.effective_step_price
+        || risk.adaptive_step_effective_step_price
+        || budget.effective_step_price
+        || adaptive.effective_step_price
+        || planStep
+        || 0
+      );
+      const basePerOrder = Number(
+        risk.regime_entry_budget_base_per_order_notional
+        || risk.base_per_order_notional
+        || runnerCfg.regime_entry_budget_base_per_order_notional
+        || runnerCfg.per_order_notional
+        || 0
+      );
+      const effectivePerOrder = Number(
+        risk.regime_entry_budget_effective_per_order_notional
+        || risk.effective_per_order_notional
+        || budget.effective_per_order_notional
+        || 0
+      );
+      const rows = [
+        ["状态", state],
+        ["候选/目标", `${candidate}${target ? ` -> ${target}` : ""}`],
+        ["切换/撤单", `${boolText(switching)} / ${boolText(cancelRequired)}`],
+        ["基础 step", `${fmtNum(baseStep, 7)} (${fmtCompactPct(baseStepRatio)})`],
+        ["生效 step", `${fmtNum(effectiveStep, 7)} (${fmtCompactPct(effectiveStepRatio)})`],
+        ["计划 step", fmtNum(planStep, 7)],
+        ["基础单笔", `${fmtNum(basePerOrder, 4)}U`],
+        ["生效单笔", `${fmtNum(effectivePerOrder, 4)}U`],
+        ["买/卖格", `${fmtNum(risk.effective_buy_levels || 0, 0)} / ${fmtNum(risk.effective_sell_levels || 0, 0)}`],
+        ["单侧预算", `${fmtNum(risk.regime_entry_budget_long_side_budget || budget.long_side_budget || 0, 2)} / ${fmtNum(risk.regime_entry_budget_short_side_budget || budget.short_side_budget || 0, 2)}U`],
+        ["买/卖 cap", `${fmtNum(risk.regime_entry_budget_long_capacity ?? budget.long_entry_capacity ?? 0, 0)} / ${fmtNum(risk.regime_entry_budget_short_capacity ?? budget.short_entry_capacity ?? 0, 0)}`],
+        ["允许开多/开空", `${boolText(risk.regime_entry_budget_allow_entry_long ?? budget.allow_entry_long)} / ${boolText(risk.regime_entry_budget_allow_entry_short ?? budget.allow_entry_short)}`],
+        ["持仓阈值", `pause ${fmtNum(risk.pause_buy_position_notional || 0, 2)} / ${fmtNum(risk.pause_short_position_notional || 0, 2)}U`],
+        ["硬上限", `${fmtNum(risk.max_position_notional || 0, 2)} / ${fmtNum(risk.max_short_position_notional || 0, 2)}U`],
+        ["max_total", `${fmtNum(runnerCfg.max_total_notional || 0, 2)}U`],
+        ["当前多/空", `${fmtNum(risk.current_long_notional || 0, 2)} / ${fmtNum(risk.current_short_notional || 0, 2)}U`],
+        ["开放 entry", `${fmtNum(budget.open_entry_long_notional || 0, 2)} / ${fmtNum(budget.open_entry_short_notional || 0, 2)}U · ${fmtNum(budget.open_non_reduce_entry_orders || 0, 0)}单`],
+        ["旧单复用", `${fmtNum(risk.regime_entry_budget_entry_reuse_tolerance || budget.entry_reuse_tolerance || 0, 7)} · ${risk.regime_entry_budget_entry_reuse_reason || budget.entry_reuse_reason || "--"}`],
+        ["elastic", `${risk.elastic_volume_regime || elastic.regime || "--"} · step x${fmtNum(risk.elastic_volume_step_scale || elastic.step_scale || 0, 2)} · 单笔 x${fmtNum(risk.elastic_volume_per_order_scale || elastic.per_order_scale || 0, 2)}`],
+        ["adaptive", `${adaptive.dominant_window || risk.adaptive_step_dominant_window || "--"} ${adaptive.dominant_metric || risk.adaptive_step_dominant_metric || "--"} ${fmtCompactPct(risk.adaptive_step_dominant_value || adaptive.dominant_value || 0)} / ${fmtCompactPct(risk.adaptive_step_dominant_threshold || adaptive.dominant_threshold || 0)}`],
+        ["loss/库存", `loss10k ${fmtNum(metrics.loss_per_10k_15m ?? elasticMetrics.loss_per_10k_15m ?? 0, 4)} · inv ${fmtCompactPct(metrics.inventory_usage_ratio ?? elasticMetrics.inventory_ratio ?? 0)}`],
+        ["entry gate 裁剪", `${fmtNum(gate.pruned_buy_orders || 0, 0)}买 / ${fmtNum(gate.pruned_sell_orders || 0, 0)}卖`],
+      ];
+      const reasons = [
+        ...(Array.isArray(risk.regime_entry_budget_reasons) ? risk.regime_entry_budget_reasons : []),
+        ...(Array.isArray(risk.elastic_volume_reasons) ? risk.elastic_volume_reasons : []),
+      ].filter(Boolean).slice(0, 6);
+      return {
+        label: "策略状态机",
+        value: enabled ? state : "未启用",
+        cls: (shock || cancelRequired || state === "defensive" || state === "shock-guard") ? "warn" : (enabled ? "good" : ""),
+        sub: enabled
+          ? `candidate=${candidate} · switching=${boolText(switching)} · shock=${boolText(shock)} · reasons=${reasons.join(", ") || "--"}`
+          : "当前 latest_plan 没有 regime/elastic 状态。",
+        wide: true,
+        bodyHtml: `<div class="metric-kv-grid">${rows.map(([k, v]) => `<div class="metric-kv"><span>${escapeHtml(k)}</span><strong>${escapeHtml(v)}</strong></div>`).join("")}</div>`,
+      };
+    }
+
     function renderCards(data) {
       const trade = data.trade_summary || {};
       const income = data.income_summary || {};
@@ -25216,6 +25336,7 @@ MONITOR_PAGE = """<!doctype html>
         : "未匹配到交易赛窗口，默认按当前会话统计";
       const cards = [
         { label: "策略状态", value: strategyRunning ? "运行中" : "未活跃", cls: strategyRunning ? "good" : "warn", sub: strategyDetail },
+        buildStrategyMachineCard(risk, runnerCfg),
         { label: "交易赛窗口", value: statsWindowLabel, cls: "", sub: statsWindowSub },
         { label: "风控硬限制", value: riskValue, cls: riskStatusClass, sub: riskDetail },
         { label: "累计成交额", value: fmtNum(trade.gross_notional || 0, 4), cls: "", sub: `买入: ${fmtNum(trade.buy_notional || 0, 4)} · 卖出: ${fmtNum(trade.sell_notional || 0, 4)} · 来源: ${(audit.trade_source && audit.trade_source.source) || "--"}` },
@@ -25238,13 +25359,15 @@ MONITOR_PAGE = """<!doctype html>
         cards.splice((rewardTargetCard ? 7 : 6) + (displacementCard ? 1 : 0), 0, entryTargetCard);
       }
       summaryEl.innerHTML = cards.map((item) => {
+        if (!item) return "";
         const label = String(item.label || "");
         const value = String(item.value || "--");
         const cls = String(item.cls || "");
         const sub = String(item.sub || "");
         const bodyHtml = String(item.bodyHtml || "");
+        const extraClass = item.wide ? " wide-metric" : "";
         return `
-          <div class="metric">
+          <div class="metric${extraClass}">
             <div class="label">${escapeHtml(label)}</div>
             <div class="value ${cls}">${escapeHtml(value)}</div>
             <div class="sub">${escapeHtml(sub)}</div>

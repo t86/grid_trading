@@ -2552,6 +2552,18 @@ def _build_monitor_snapshot_uncached(
     hard_loss_forced_reduce = (plan_report or {}).get("hard_loss_forced_reduce")
     if not isinstance(hard_loss_forced_reduce, dict):
         hard_loss_forced_reduce = {}
+    adaptive_step = (plan_report or {}).get("adaptive_step")
+    if not isinstance(adaptive_step, dict):
+        adaptive_step = {}
+    elastic_volume = (plan_report or {}).get("elastic_volume")
+    if not isinstance(elastic_volume, dict):
+        elastic_volume = {}
+    regime_entry_budget = (plan_report or {}).get("regime_entry_budget")
+    if not isinstance(regime_entry_budget, dict):
+        regime_entry_budget = {}
+    entry_permission_gate = (plan_report or {}).get("entry_permission_gate")
+    if not isinstance(entry_permission_gate, dict):
+        entry_permission_gate = {}
     execution_regime = _execution_regime_from_sources(
         plan_report=plan_report if isinstance(plan_report, dict) else {},
         latest_loop=latest_loop,
@@ -2621,6 +2633,68 @@ def _build_monitor_snapshot_uncached(
         "auto_regime_confirm_cycles": auto_regime_confirm_cycles,
         "effective_strategy_profile": effective_strategy_profile,
         "effective_strategy_label": effective_strategy_label,
+        "base_step_price": _safe_float(adaptive_step.get("base_step_price") or runner_config.get("step_price")),
+        "plan_step_price": _safe_float((plan_report or {}).get("step_price")),
+        "effective_step_price": _safe_float(
+            regime_entry_budget.get("effective_step_price")
+            or adaptive_step.get("effective_step_price")
+            or (plan_report or {}).get("step_price")
+        ),
+        "base_per_order_notional": _safe_float(
+            regime_entry_budget.get("base_per_order_notional")
+            or runner_config.get("regime_entry_budget_base_per_order_notional")
+            or runner_config.get("per_order_notional")
+        ),
+        "regime_entry_budget": dict(regime_entry_budget),
+        "regime_entry_budget_enabled": bool(regime_entry_budget.get("enabled")),
+        "regime_entry_budget_report_only": bool(regime_entry_budget.get("report_only")),
+        "regime_entry_budget_state": str(regime_entry_budget.get("state") or "").strip(),
+        "regime_entry_budget_candidate_regime": str(regime_entry_budget.get("candidate_regime") or "").strip(),
+        "regime_entry_budget_target_regime": str(regime_entry_budget.get("target_regime") or "").strip(),
+        "regime_entry_budget_switching": bool(regime_entry_budget.get("switching")),
+        "regime_entry_budget_shock_guard_active": bool(regime_entry_budget.get("shock_guard_active")),
+        "regime_entry_budget_cancel_entry_required": bool(regime_entry_budget.get("cancel_entry_required")),
+        "regime_entry_budget_allow_entry_long": bool(regime_entry_budget.get("allow_entry_long", True)),
+        "regime_entry_budget_allow_entry_short": bool(regime_entry_budget.get("allow_entry_short", True)),
+        "regime_entry_budget_long_side_budget": _safe_float(regime_entry_budget.get("long_side_budget")),
+        "regime_entry_budget_short_side_budget": _safe_float(regime_entry_budget.get("short_side_budget")),
+        "regime_entry_budget_long_capacity": int(_safe_float(regime_entry_budget.get("long_entry_capacity"))),
+        "regime_entry_budget_short_capacity": int(_safe_float(regime_entry_budget.get("short_entry_capacity"))),
+        "regime_entry_budget_effective_step_ratio": _safe_float(regime_entry_budget.get("effective_step_ratio")),
+        "regime_entry_budget_effective_step_price": _safe_float(regime_entry_budget.get("effective_step_price")),
+        "regime_entry_budget_effective_per_order_notional": _safe_float(
+            regime_entry_budget.get("effective_per_order_notional")
+        ),
+        "regime_entry_budget_base_step_ratio": _safe_float(runner_config.get("regime_entry_budget_base_step_ratio")),
+        "regime_entry_budget_base_per_order_notional": _safe_float(
+            runner_config.get("regime_entry_budget_base_per_order_notional")
+        ),
+        "regime_entry_budget_entry_reuse_tolerance": _safe_float(regime_entry_budget.get("entry_reuse_tolerance")),
+        "regime_entry_budget_entry_reuse_reason": regime_entry_budget.get("entry_reuse_reason"),
+        "regime_entry_budget_reasons": list(regime_entry_budget.get("reasons") or []),
+        "regime_entry_budget_metrics": dict(regime_entry_budget.get("metrics") or {}),
+        "entry_permission_gate": dict(entry_permission_gate),
+        "elastic_volume": dict(elastic_volume),
+        "elastic_volume_enabled": bool(elastic_volume.get("enabled")),
+        "elastic_volume_regime": str(elastic_volume.get("regime") or "").strip(),
+        "elastic_volume_step_scale": _safe_float(elastic_volume.get("step_scale")),
+        "elastic_volume_per_order_scale": _safe_float(elastic_volume.get("per_order_scale")),
+        "elastic_volume_levels_scale": _safe_float(elastic_volume.get("levels_scale")),
+        "elastic_volume_reasons": list(elastic_volume.get("reasons") or []),
+        "elastic_volume_metrics": dict(elastic_volume.get("metrics") or {}),
+        "adaptive_step": dict(adaptive_step),
+        "adaptive_step_enabled": bool(adaptive_step.get("enabled")),
+        "adaptive_step_active": bool(adaptive_step.get("active")),
+        "adaptive_step_controls_active": bool(adaptive_step.get("controls_active")),
+        "adaptive_step_base_step_price": _safe_float(adaptive_step.get("base_step_price")),
+        "adaptive_step_effective_step_price": _safe_float(adaptive_step.get("effective_step_price")),
+        "adaptive_step_scale": _safe_float(adaptive_step.get("scale")),
+        "adaptive_step_raw_scale": _safe_float(adaptive_step.get("raw_scale")),
+        "adaptive_step_per_order_scale": _safe_float(adaptive_step.get("per_order_scale")),
+        "adaptive_step_dominant_window": adaptive_step.get("dominant_window"),
+        "adaptive_step_dominant_metric": adaptive_step.get("dominant_metric"),
+        "adaptive_step_dominant_value": _safe_float(adaptive_step.get("dominant_value")),
+        "adaptive_step_dominant_threshold": _safe_float(adaptive_step.get("dominant_threshold")),
         "xaut_adaptive_enabled": xaut_adaptive_enabled,
         "xaut_adaptive_state": xaut_adaptive_state,
         "xaut_adaptive_candidate_state": xaut_adaptive_candidate_state,
