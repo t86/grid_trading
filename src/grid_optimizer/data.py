@@ -526,7 +526,9 @@ def _safe_float(value: Any) -> float | None:
 
 
 def _format_request_number(value: float) -> str:
-    text = format(Decimal(str(value)), "f").rstrip("0").rstrip(".")
+    text = format(Decimal(str(value)), "f")
+    if "." in text:
+        text = text.rstrip("0").rstrip(".")
     return text or "0"
 
 
