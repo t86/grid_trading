@@ -18,7 +18,7 @@ HIGH_LOSS_PER_10K = 1.0
 ROLLING_LOSS_LIMITS = {
     "BTCUSDC": 14.0,
     "ETHUSDC": 10.0,
-    "XAGUSDT": 6.0,
+    "XAGUSDT": 4.0,
 }
 RECOVERABLE_STABLE_SYMBOLS = {"BTCUSDC", "XAGUSDT"}
 RECOVERY_MAX_1M_AMP = {
@@ -361,16 +361,18 @@ def _desired_mode(symbol: str, metrics: dict[str, Any]) -> tuple[str, str]:
     is_cooldown = runtime_status == "cooldown" or "rolling_hourly_loss" in stop_reason
     if float(metrics["rolling_loss"]) >= ROLLING_LOSS_LIMITS[symbol]:
         return "conservative", "rolling_hourly_loss_still_high"
+    high_loss = max(loss_15m, loss_5m) > HIGH_LOSS_PER_10K
+    if high_loss:
+        return "conservative", "loss_per_10k_above_1"
     if is_cooldown:
         if (
             symbol in RECOVERABLE_STABLE_SYMBOLS
             and market_stable
+            and max(loss_15m, loss_5m, rolling_per_10k) < LOW_LOSS_PER_10K
             and float(metrics["market_amp_1m"]) <= RECOVERY_MAX_1M_AMP[symbol]
         ):
             return "conservative", f"recover_{symbol.lower()}_after_stable_cooldown"
         return "conservative", "runtime_loss_cooldown"
-    if max(loss_15m, loss_5m) > HIGH_LOSS_PER_10K:
-        return "conservative", "loss_per_10k_above_1"
     if max(loss_15m, loss_5m, rolling_per_10k) < LOW_LOSS_PER_10K and market_stable:
         return "aggressive", "loss_per_10k_below_0.5_and_stable"
     return "conservative", "middle_loss_or_unstable"
