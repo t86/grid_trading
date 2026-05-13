@@ -1184,19 +1184,26 @@ class FuturesMarketStream:
             self._refresh_snapshot_locked(now)
 
     def _refresh_snapshot_locked(self, now: float) -> None:
-        if self._book_state is None or self._mark_state is None:
+        if self._book_state is None:
             return
+        bid_price = _safe_float(self._book_state.get("bid_price"))
+        ask_price = _safe_float(self._book_state.get("ask_price"))
+        mid_price = (bid_price + ask_price) / 2.0 if bid_price > 0 and ask_price > 0 else 0.0
+        mark_state = self._mark_state or {}
+        mark_price = _safe_float(mark_state.get("mark_price")) or 0.0
+        if mark_price <= 0:
+            mark_price = mid_price
         self._latest_snapshot = {
             "symbol": self.symbol,
-            "bid_price": _safe_float(self._book_state.get("bid_price")),
-            "ask_price": _safe_float(self._book_state.get("ask_price")),
-            "mark_price": _safe_float(self._mark_state.get("mark_price")),
-            "funding_rate": _safe_float(self._mark_state.get("funding_rate")),
-            "next_funding_time": self._mark_state.get("next_funding_time"),
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+            "mark_price": mark_price,
+            "funding_rate": _safe_float(mark_state.get("funding_rate")) or 0.0,
+            "next_funding_time": mark_state.get("next_funding_time"),
             "book_time": self._book_state.get("book_time"),
-            "mark_time": self._mark_state.get("mark_time"),
+            "mark_time": mark_state.get("mark_time"),
             "snapshot_at": now,
-            "source": "websocket",
+            "source": "websocket" if self._mark_state is not None else "websocket_book_ticker",
         }
         self._latest_snapshot_at = now
 
