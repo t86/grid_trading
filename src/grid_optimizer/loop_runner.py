@@ -145,6 +145,8 @@ OPEN_ORDER_STREAM_MAX_AGE_SECONDS = 30.0
 POSITION_MODE_CACHE_TTL_SECONDS = 10 * 60.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
+RUNNER_MARKET_STREAM_WARMUP_SECONDS = 8.0
+RUNNER_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
         "buy_levels": 8,
@@ -1037,6 +1039,7 @@ def _normalize_live_book_snapshot(book_row: dict[str, Any] | None, *, symbol: st
     return {
         "bid_price": bid_price,
         "ask_price": ask_price,
+        "source": str(row.get("source") or "unknown"),
     }
 
 
@@ -1101,6 +1104,33 @@ def _resolve_runner_market_snapshot(args: argparse.Namespace, *, symbol: str) ->
         "mark_time": premium.get("time"),
         "source": "rest",
     }
+
+
+def _wait_for_runner_market_stream_snapshot(
+    market_stream: FuturesMarketStream | None,
+    *,
+    max_wait_seconds: float = RUNNER_MARKET_STREAM_WARMUP_SECONDS,
+) -> dict[str, Any] | None:
+    if market_stream is None:
+        return None
+    deadline = time.monotonic() + max(float(max_wait_seconds), 0.0)
+    while True:
+        snapshot = market_stream.snapshot(max_age_seconds=RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS)
+        if snapshot is not None:
+            return snapshot
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
+def _is_binance_rate_limit_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        "-1003" in message
+        or "Too many requests" in message
+        or "current limit of IP" in message
+        or "Please use the websocket" in message
+    )
 
 
 def _resolve_custom_grid_roll(
@@ -12975,6 +13005,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "live_book": {
             "bid_price": live_bid_price,
             "ask_price": live_ask_price,
+            "source": str(live_book.get("source") or "unknown"),
         },
         "executed": False,
         "canceled_orders": [],
@@ -14593,6 +14624,14 @@ def main() -> None:
         market_stream = FuturesMarketStream(args.symbol)
         market_stream.start()
         setattr(args, "market_stream", market_stream)
+        warm_snapshot = _wait_for_runner_market_stream_snapshot(market_stream)
+        if warm_snapshot is None:
+            print(
+                f"[market-stream] no warm snapshot for {args.symbol} after "
+                f"{RUNNER_MARKET_STREAM_WARMUP_SECONDS:.1f}s; REST fallback remains enabled"
+            )
+        else:
+            print(f"[market-stream] warm snapshot ready for {args.symbol}")
     except Exception as exc:
         setattr(args, "market_stream", None)
         print(f"[market-stream] disabled for {args.symbol}: {exc}")
@@ -15257,6 +15296,10 @@ def main() -> None:
                 }
                 _append_jsonl(summary_path, error_report)
                 print(f"[{cycle}] error: {exc}")
+                if _is_binance_rate_limit_error(exc):
+                    backoff = max(RUNNER_RATE_LIMIT_BACKOFF_SECONDS, float(args.sleep_seconds))
+                    print(f"[{cycle}] Binance rate limit detected; backing off {backoff:.1f}s")
+                    time.sleep(backoff)
                 if consecutive_errors >= args.max_consecutive_errors:
                     raise SystemExit(
                         f"Stopped after {consecutive_errors} consecutive errors. Inspect {summary_path} and {submit_report_path}."

@@ -36,6 +36,8 @@ from grid_optimizer.loop_runner import (
     _elastic_volume_config,
     _elastic_volume_state_snapshot,
     _regime_budget_entry_reuse_tolerance,
+    _wait_for_runner_market_stream_snapshot,
+    _is_binance_rate_limit_error,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_synthetic_resync_price,
@@ -3823,6 +3825,45 @@ class LoopRunnerTests(unittest.TestCase):
         mock_book_tickers.assert_not_called()
         mock_premium_index.assert_not_called()
 
+    def test_wait_for_runner_market_stream_snapshot_returns_warm_snapshot(self) -> None:
+        class DummyMarketStream:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def snapshot(self, *, max_age_seconds: float | None = None) -> dict[str, object] | None:
+                self.calls += 1
+                if self.calls < 2:
+                    return None
+                return {
+                    "symbol": "TESTUSDT",
+                    "bid_price": 1.0,
+                    "ask_price": 1.1,
+                    "mark_price": 1.05,
+                    "source": "websocket",
+                    "max_age_seconds": max_age_seconds,
+                }
+
+        stream = DummyMarketStream()
+
+        with patch("grid_optimizer.loop_runner.time.sleep") as mock_sleep:
+            snapshot = _wait_for_runner_market_stream_snapshot(stream, max_wait_seconds=1.0)
+
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot["source"], "websocket")
+        self.assertEqual(snapshot["max_age_seconds"], 3.0)
+        self.assertEqual(stream.calls, 2)
+        mock_sleep.assert_called_once_with(0.1)
+
+    def test_binance_rate_limit_error_detection_matches_exchange_message(self) -> None:
+        exc = RuntimeError(
+            "Binance API error -1003: Too many requests; current limit of IP(43.155.163.114) "
+            "is 2400 requests per minute. Please use the websocket for live updates to avoid polling the API."
+        )
+
+        self.assertTrue(_is_binance_rate_limit_error(exc))
+        self.assertFalse(_is_binance_rate_limit_error(RuntimeError("Binance API error -2011: Unknown order sent.")))
+
     def test_apply_synthetic_trade_fill_tracks_virtual_long_and_short_books(self) -> None:
         ledger = {
             "virtual_long_qty": 0.0,
@@ -6922,6 +6963,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(report["executed"])
         self.assertEqual(len(report["placed_orders"]), 1)
+        self.assertEqual(report["live_book"]["source"], "websocket")
         self.assertEqual(mock_market_snapshot.call_count, 2)
         mock_book_tickers.assert_not_called()
 
