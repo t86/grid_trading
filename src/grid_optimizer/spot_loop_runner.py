@@ -1447,7 +1447,10 @@ def _build_spot_competition_inventory_grid_orders(
             runtime = new_inventory_grid_runtime(market_type="futures")
             runtime["synthetic_neutral"] = True
             runtime["neutral_base_qty"] = neutral_qty
-        elif expected_direction_state != "flat" and runtime_direction_state != expected_direction_state:
+        elif expected_direction_state != "flat" and (
+            runtime_direction_state != expected_direction_state
+            or str(runtime.get("recovery_mode", "live") or "live").strip().lower() != "live"
+        ):
             runtime = new_inventory_grid_runtime(market_type="futures")
             runtime["synthetic_neutral"] = True
             runtime["neutral_base_qty"] = neutral_qty
