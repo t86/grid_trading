@@ -260,6 +260,20 @@ def _spot_long_entry_reference_price(
     return reference_price
 
 
+def _spot_maker_buy_price(*, price: float, bid_price: float, tick_size: float | None) -> float:
+    best_bid = max(_safe_float(bid_price), 0.0)
+    if best_bid <= EPSILON:
+        return _round_order_price(price, tick_size, "BUY")
+    return min(_round_order_price(price, tick_size, "BUY"), _round_order_price(best_bid, tick_size, "BUY"))
+
+
+def _spot_maker_sell_price(*, price: float, ask_price: float, tick_size: float | None) -> float:
+    best_ask = max(_safe_float(ask_price), 0.0)
+    if best_ask <= EPSILON:
+        return _round_order_price(price, tick_size, "SELL")
+    return max(_round_order_price(price, tick_size, "SELL"), _round_order_price(best_ask, tick_size, "SELL"))
+
+
 def _bootstrap_orders(
     *,
     market_type: str,
@@ -603,7 +617,9 @@ def build_inventory_grid_orders(
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         planned_closing_qty = 0.0
         sell_reference_price = anchor_price
-        if market_type == "spot":
+        if synthetic_neutral:
+            sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
+        elif market_type == "spot":
             sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
         raw_sell_orders: list[dict[str, Any]]
         if warmup_top_of_book_active:
@@ -765,6 +781,8 @@ def build_inventory_grid_orders(
             )
 
         exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
+        if synthetic_neutral:
+            exit_price = _spot_maker_buy_price(price=exit_price, bid_price=bid_price, tick_size=tick_size)
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         exit_qty = min(exit_qty, closeable_qty)
@@ -779,6 +797,8 @@ def build_inventory_grid_orders(
         )
         if entry_allowed:
             entry_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
+            if synthetic_neutral:
+                entry_price = _spot_maker_sell_price(price=entry_price, ask_price=ask_price, tick_size=tick_size)
             entry_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(entry_price, EPSILON), step_size)
             if entry_qty > 0 and (min_qty is None or entry_qty >= min_qty) and (
                 min_notional is None or entry_qty * entry_price >= min_notional

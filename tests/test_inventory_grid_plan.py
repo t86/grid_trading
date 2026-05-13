@@ -252,6 +252,94 @@ def test_pair_credit_unlocks_forced_reduce_order() -> None:
     assert any(item["role"] == "forced_reduce" for item in plan["forced_reduce_orders"])
 
 
+def test_synthetic_neutral_short_exit_buy_stays_post_only_when_anchor_is_above_market() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "short_active"
+    runtime["grid_anchor_price"] = 0.035295
+    runtime["position_lots"] = [
+        {
+            "lot_id": "short",
+            "side": "short",
+            "qty": 8633.0,
+            "entry_price": 0.035295,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.035234,
+        ask_price=0.035236,
+        step_price=0.00002,
+        per_order_notional=75.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=520.0,
+        threshold_reduce_target_notional=380.0,
+        max_order_position_notional=900.0,
+        max_position_notional=1200.0,
+        max_short_order_position_notional=900.0,
+        max_short_position_notional=900.0,
+        buy_levels=8,
+        sell_levels=8,
+        tick_size=0.000001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    grid_exit_buys = [order for order in plan["buy_orders"] if order["role"] == "grid_exit"]
+    assert grid_exit_buys
+    assert grid_exit_buys[0]["price"] == 0.035234
+    assert all(order["price"] < 0.035236 for order in plan["buy_orders"])
+    assert all(order["price"] > 0.035234 for order in plan["sell_orders"])
+
+
+def test_synthetic_neutral_long_exit_sell_stays_post_only_when_anchor_is_below_market() -> None:
+    runtime = new_inventory_grid_runtime(market_type="futures")
+    runtime["synthetic_neutral"] = True
+    runtime["direction_state"] = "long_active"
+    runtime["grid_anchor_price"] = 0.035100
+    runtime["position_lots"] = [
+        {
+            "lot_id": "long",
+            "side": "long",
+            "qty": 8633.0,
+            "entry_price": 0.035100,
+            "opened_at_ms": 1,
+            "source_role": "grid_entry",
+        }
+    ]
+
+    plan = build_inventory_grid_orders(
+        runtime=runtime,
+        bid_price=0.035234,
+        ask_price=0.035236,
+        step_price=0.00002,
+        per_order_notional=75.0,
+        first_order_multiplier=1.0,
+        threshold_position_notional=520.0,
+        threshold_reduce_target_notional=380.0,
+        max_order_position_notional=900.0,
+        max_position_notional=1200.0,
+        max_short_order_position_notional=900.0,
+        max_short_position_notional=900.0,
+        buy_levels=8,
+        sell_levels=8,
+        tick_size=0.000001,
+        step_size=1.0,
+        min_qty=1.0,
+        min_notional=5.0,
+    )
+
+    grid_exit_sells = [order for order in plan["sell_orders"] if order["role"] == "grid_exit"]
+    assert grid_exit_sells
+    assert grid_exit_sells[0]["price"] == 0.035236
+    assert all(order["price"] < 0.035236 for order in plan["buy_orders"])
+    assert all(order["price"] > 0.035234 for order in plan["sell_orders"])
+
+
 def test_threshold_reduce_target_unlocks_forced_reduce_without_pair_credit() -> None:
     runtime = new_inventory_grid_runtime(market_type="spot")
     runtime["direction_state"] = "long_active"
