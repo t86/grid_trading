@@ -355,6 +355,13 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.binance.com/zh-CN/activity/trading-competition/futures-bill-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="futures_aigensyn",
+        symbol="AIGENSYN",
+        market="futures",
+        label="AIGENSYN 合约交易挑战赛",
+        url="https://www.bsmkweb.cc/activity/trading-competition/futures-aigensyn-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
         slug="futures_tradfi_week1",
         symbol="TRADFI",
         market="futures",
@@ -1447,6 +1454,45 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
 平分 600,000 BILL
 第 51 - 200 名
 平分 1,200,000 BILL
+""",
+            }
+        ]
+    },
+    "futures_aigensyn": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 0,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "AIGENSYN",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/12 18:00 - 2026/05/19 07:59",
+                "activityEndAt": "2026-05-19T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/12 18:00 - 2026/05/19 07:59
+累计AIGENSYN U本位合约交易量不低于500 USDT，方可参与排行榜奖励。
+总奖池 3,200,000 AIGENSYN
+第 1 名
+480,000 AIGENSYN
+第 2 名
+384,000 AIGENSYN
+第 3 名
+224,000 AIGENSYN
+第 4 名
+128,000 AIGENSYN
+第 5 名
+64,000 AIGENSYN
+第 6 - 20 名
+平分 480,000 AIGENSYN
+第 21 - 50 名
+平分 480,000 AIGENSYN
+第 51 - 200 名
+平分 960,000 AIGENSYN
 """,
             }
         ]

@@ -319,6 +319,7 @@ class CompetitionBoardTests(unittest.TestCase):
                 "futures_soon",
                 "futures_chip",
                 "futures_bill",
+                "futures_aigensyn",
                 "futures_tradfi_week1",
                 "futures_altcoins_week1",
                 "futures_um_week1",
@@ -326,12 +327,28 @@ class CompetitionBoardTests(unittest.TestCase):
             }.issubset(slugs)
         )
 
+    def test_aigensyn_futures_hint_uses_user_provided_activity_terms(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_aigensyn")
+        hinted = _hinted_boards_for_source(source)
+        self.assertIsNotNone(hinted)
+        _, boards = hinted or ({}, [])
+
+        self.assertEqual(len(boards), 1)
+        board = boards[0]
+        self.assertEqual(board.get("resourceId"), 0)
+        self.assertEqual(board["rewardUnit"], "AIGENSYN")
+        self.assertEqual(board["activityPeriodText"], "2026/05/12 18:00 - 2026/05/19 07:59")
+        self.assertEqual(board["activityEndAt"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(board["maxRows"], 200)
+        self.assertIn("累计AIGENSYN U本位合约交易量不低于500 USDT", board["bodyExcerpt"])
+        self.assertIn("总奖池 3,200,000 AIGENSYN", board["bodyExcerpt"])
+
     def test_hinted_current_live_boards_include_real_resource_ids(self) -> None:
         expected = {
             "spot_plume": (50208, "PLUME", "2026-04-30T19:00:00+08:00"),
             "spot_ton": (49996, "USDC", "2026-04-29T20:00:00+08:00"),
             "spot_vana": (51242, "BNB", "2026-05-07T19:00:00+08:00"),
-            "futures_chip": (51201, "CHIP", "2026-05-13T07:59:00+08:00"),
+            "futures_chip": (51202, "CHIP", "2026-05-13T07:59:00+08:00"),
             "futures_bill": (54211, "BILL", "2026-05-19T07:59:00+08:00"),
         }
         for slug, (resource_id, reward_unit, end_at) in expected.items():
@@ -501,6 +518,47 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(board["market"], "futures")
         self.assertIn("第一阶段", board["label"])
         self.assertEqual(board["resource_id"], 50568)
+
+    def test_resolve_active_competition_board_falls_back_to_hinted_aigensyn_board_when_snapshot_missing(self) -> None:
+        board = resolve_active_competition_board(
+            "AIGENSYNUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 13, 0, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "AIGENSYN")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["reward_unit"], "AIGENSYN")
+        self.assertEqual(board["activity_start_at"], "2026-05-12T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(board["threshold_value"], 500.0)
+        self.assertEqual(board["threshold_unit"], "USDT")
+        self.assertEqual([segment["end_rank"] for segment in board.get("segments", [])], [1, 2, 3, 4, 5, 20, 50, 200])
+
+    def test_aigensyn_reward_volume_targets_use_user_provided_rank_segments(self) -> None:
+        board = resolve_active_competition_board(
+            "AIGENSYNUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 13, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.01):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 5, 13, 0, 0, tzinfo=timezone.utc))
+
+        self.assertIsNotNone(targets)
+        self.assertEqual(targets["reward_unit"], "AIGENSYN")
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        rank_200, rank_50, rank_20 = targets["tiers"]
+        self.assertAlmostEqual(rank_200["reward_value_usdt"], 64.0, places=8)
+        self.assertAlmostEqual(rank_50["reward_value_usdt"], 160.0, places=8)
+        self.assertAlmostEqual(rank_20["reward_value_usdt"], 320.0, places=8)
+        self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["3"], 213333.33333333334, places=8)
+        self.assertAlmostEqual(rank_50["volumes_by_loss_rate"]["4"], 400000.0, places=8)
+        self.assertAlmostEqual(rank_20["volumes_by_loss_rate"]["5"], 640000.0, places=8)
 
     def test_load_history_index_merges_disk_files_with_stale_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
