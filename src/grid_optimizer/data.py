@@ -44,6 +44,7 @@ _SPOT_URLS = {
     "book_ticker": "https://api.binance.com/api/v3/ticker/bookTicker",
     "ticker_price": "https://api.binance.com/api/v3/ticker/price",
     "kline": "https://api.binance.com/api/v3/klines",
+    "agg_trades": "https://api.binance.com/api/v3/aggTrades",
 }
 _SUPPORTED_MARKET_TYPES = ("futures", "spot")
 _MARKET_TYPE_ALIASES = {
@@ -736,6 +737,28 @@ def fetch_spot_latest_price(symbol: str) -> float:
     if price <= 0:
         raise RuntimeError("Invalid spot ticker price value")
     return price
+
+
+def fetch_spot_agg_trades(
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    limit: int = 1000,
+) -> list[dict[str, Any]]:
+    if start_ms >= end_ms:
+        raise ValueError("start_ms must be < end_ms")
+    data = _http_get_json(
+        _SPOT_URLS["agg_trades"],
+        {
+            "symbol": symbol.upper(),
+            "startTime": int(start_ms),
+            "endTime": int(end_ms),
+            "limit": int(limit),
+        },
+    )
+    if not isinstance(data, list):
+        raise RuntimeError("Unexpected spot aggTrades response")
+    return [item for item in data if isinstance(item, dict)]
 
 
 def fetch_spot_klines(

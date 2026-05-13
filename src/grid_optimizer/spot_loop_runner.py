@@ -17,6 +17,7 @@ from .backtest import build_grid_levels
 from .data import (
     delete_spot_order,
     fetch_spot_account_info,
+    fetch_spot_agg_trades,
     fetch_spot_book_tickers,
     fetch_spot_klines,
     fetch_spot_latest_price,
@@ -1107,6 +1108,126 @@ def _assess_spot_market_guard(
     return guard
 
 
+def _spot_trade_window_move(symbol: str, *, seconds: int, now: datetime | None = None) -> dict[str, Any]:
+    window_seconds = max(int(seconds), 1)
+    current_time = now or _utc_now()
+    end_ms = int(current_time.timestamp() * 1000)
+    start_ms = end_ms - window_seconds * 1000
+    result: dict[str, Any] = {
+        "seconds": window_seconds,
+        "available": False,
+        "warning": None,
+        "open": 0.0,
+        "high": 0.0,
+        "low": 0.0,
+        "close": 0.0,
+        "return_ratio": 0.0,
+        "amplitude_ratio": 0.0,
+        "trade_count": 0,
+    }
+    try:
+        trades = fetch_spot_agg_trades(symbol=symbol, start_ms=start_ms, end_ms=end_ms, limit=1000)
+    except Exception as exc:
+        result["warning"] = f"{exc.__class__.__name__}: {exc}"
+        return result
+    prices: list[float] = []
+    for trade in trades:
+        price = _safe_float(trade.get("p"))
+        if price > 0:
+            prices.append(price)
+    if len(prices) < 2:
+        result["warning"] = "insufficient_trades"
+        result["trade_count"] = len(prices)
+        return result
+    open_price = prices[0]
+    close_price = prices[-1]
+    high_price = max(prices)
+    low_price = min(prices)
+    result.update(
+        {
+            "available": True,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "return_ratio": (close_price / open_price - 1.0) if open_price > 0 else 0.0,
+            "amplitude_ratio": (high_price / low_price - 1.0) if low_price > 0 else 0.0,
+            "trade_count": len(prices),
+        }
+    )
+    return result
+
+
+def _assess_spot_fast_stop_guard(
+    *,
+    symbol: str,
+    current_long_notional: float,
+    freeze_position_notional: float,
+    exit_position_notional: float,
+    trigger_10s_abs_return_ratio: float,
+    trigger_10s_amplitude_ratio: float,
+    trigger_30s_abs_return_ratio: float,
+    trigger_30s_amplitude_ratio: float,
+    down_only: bool = True,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    enabled = any(
+        threshold > 0
+        for threshold in (
+            freeze_position_notional,
+            exit_position_notional,
+            trigger_10s_abs_return_ratio,
+            trigger_10s_amplitude_ratio,
+            trigger_30s_abs_return_ratio,
+            trigger_30s_amplitude_ratio,
+        )
+    )
+    result: dict[str, Any] = {
+        "enabled": enabled,
+        "available": False,
+        "freeze_buy": False,
+        "force_exit": False,
+        "reasons": [],
+        "windows": {},
+        "current_long_notional": max(_safe_float(current_long_notional), 0.0),
+        "freeze_position_notional": max(_safe_float(freeze_position_notional), 0.0),
+        "exit_position_notional": max(_safe_float(exit_position_notional), 0.0),
+    }
+    if not enabled:
+        return result
+    windows = {
+        "10s": _spot_trade_window_move(symbol, seconds=10, now=now),
+        "30s": _spot_trade_window_move(symbol, seconds=30, now=now),
+    }
+    result["windows"] = windows
+    result["available"] = any(bool(item.get("available")) for item in windows.values())
+    move_reasons: list[str] = []
+    for label, window in windows.items():
+        if not window.get("available"):
+            continue
+        ret = _safe_float(window.get("return_ratio"))
+        amp = _safe_float(window.get("amplitude_ratio"))
+        if down_only and ret >= 0:
+            continue
+        abs_ret_threshold = trigger_10s_abs_return_ratio if label == "10s" else trigger_30s_abs_return_ratio
+        amp_threshold = trigger_10s_amplitude_ratio if label == "10s" else trigger_30s_amplitude_ratio
+        if abs_ret_threshold > 0 and abs(ret) >= abs_ret_threshold:
+            move_reasons.append(f"{label}_fast_return ret={ret * 100:.3f}%")
+        if amp_threshold > 0 and amp >= amp_threshold:
+            move_reasons.append(f"{label}_fast_amplitude amp={amp * 100:.3f}%")
+    if not move_reasons:
+        return result
+    current_notional = max(_safe_float(current_long_notional), 0.0)
+    freeze_notional = max(_safe_float(freeze_position_notional), 0.0)
+    exit_notional = max(_safe_float(exit_position_notional), 0.0)
+    if freeze_notional <= 0 or current_notional >= freeze_notional:
+        result["freeze_buy"] = True
+    if exit_notional > 0 and current_notional >= exit_notional:
+        result["force_exit"] = True
+    result["reasons"] = move_reasons
+    return result
+
+
 def _band_prices(*, center_price: float, levels: int, band_ratio: float, tick_size: float | None, side: str) -> list[float]:
     if center_price <= 0 or levels <= 0 or band_ratio <= 0:
         return []
@@ -1783,6 +1904,168 @@ def _maybe_execute_spot_taker_exit(
     return result
 
 
+def _apply_synthetic_fast_stop_sell_to_state(
+    *,
+    state: dict[str, Any],
+    response: dict[str, Any],
+    base_asset: str,
+    quote_asset: str,
+    role: str,
+) -> dict[str, Any]:
+    metrics = state.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = _new_metrics()
+        state["metrics"] = metrics
+    transact_time_ms = _safe_int(response.get("transactTime")) or int(time.time() * 1000)
+    order_id = _safe_int(response.get("orderId"))
+    applied_qty = 0.0
+    applied_notional = 0.0
+    applied_commission_quote = 0.0
+    fills = response.get("fills")
+    if not isinstance(fills, list):
+        fills = []
+    for idx, fill in enumerate(fills):
+        if not isinstance(fill, dict):
+            continue
+        price = max(_safe_float(fill.get("price")), 0.0)
+        qty = max(_safe_float(fill.get("qty")), 0.0)
+        if price <= 0 or qty <= 0:
+            continue
+        commission = max(_safe_float(fill.get("commission")), 0.0)
+        commission_asset = str(fill.get("commissionAsset", "")).upper().strip()
+        commission_quote = _normalize_commission_quote(
+            commission=commission,
+            commission_asset=commission_asset,
+            price=price,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        trade = {
+            "id": _safe_int(fill.get("tradeId")) or order_id * 1000 + idx,
+            "orderId": order_id,
+            "time": transact_time_ms,
+            "isMaker": False,
+        }
+        _record_trade_metrics(
+            metrics=metrics,
+            trade=trade,
+            side="SELL",
+            price=price,
+            qty=qty,
+            commission_quote=commission_quote,
+            commission_asset=commission_asset,
+            commission_raw=commission,
+            realized_pnl=-commission_quote,
+            role=role,
+        )
+        applied_qty += qty
+        applied_notional += price * qty
+        applied_commission_quote += commission_quote
+    state["last_trade_time_ms"] = max(_safe_int(state.get("last_trade_time_ms")), transact_time_ms)
+    state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    state.pop(SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY, None)
+    return {
+        "executed_qty": applied_qty,
+        "executed_notional": applied_notional,
+        "realized_pnl": -applied_commission_quote,
+        "commission_quote": applied_commission_quote,
+        "order_id": order_id,
+    }
+
+
+def _maybe_execute_spot_fast_stop_exit(
+    *,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    strategy_open_orders: list[dict[str, Any]],
+    bid_price: float,
+    base_asset: str,
+    quote_asset: str,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    fast_stop_guard: dict[str, Any],
+    controls: dict[str, Any],
+) -> dict[str, Any]:
+    result = {
+        "enabled": bool(getattr(args, "spot_fast_stop_enabled", False)),
+        "executed": False,
+        "reason": "",
+        "canceled_count": 0,
+        "order": None,
+        "execution": None,
+        "guard": fast_stop_guard,
+    }
+    if not result["enabled"]:
+        return result
+    if not fast_stop_guard.get("force_exit"):
+        result["reason"] = "not_triggered"
+        return result
+    neutral_qty = max(_safe_float(getattr(args, "neutral_base_qty", 0.0)), 0.0)
+    actual_base_qty = max(_safe_float(controls.get("actual_base_qty")), 0.0)
+    mid_price = (max(_safe_float(bid_price), 0.0) + max(_safe_float(controls.get("center_price")), 0.0)) / 2.0
+    if mid_price <= 0:
+        mid_price = max(_safe_float(bid_price), 0.0)
+    reduce_target_notional = max(_safe_float(getattr(args, "spot_fast_stop_reduce_target_notional", 0.0)), 0.0)
+    target_excess_qty = (reduce_target_notional / mid_price) if mid_price > 0 else 0.0
+    excess_qty = max(actual_base_qty - neutral_qty, 0.0)
+    desired_sell_qty = max(excess_qty - target_excess_qty, 0.0)
+    if desired_sell_qty <= EPSILON:
+        result["reason"] = "at_or_below_target"
+        return result
+    account_info = fetch_spot_account_info(api_key, api_secret)
+    base_free, _ = _extract_balance(account_info, base_asset)
+    protected_base_qty = neutral_qty + max(_safe_float(getattr(args, "spot_fast_stop_min_base_buffer_qty", 0.0)), 0.0)
+    free_excess_qty = max(base_free - protected_base_qty, 0.0)
+    sell_qty = _round_order_qty(min(desired_sell_qty, free_excess_qty), step_size)
+    if sell_qty <= EPSILON:
+        result["reason"] = "no_free_excess_base"
+        return result
+    if min_qty is not None and sell_qty < min_qty:
+        result["reason"] = "below_min_qty"
+        return result
+    if min_notional is not None and sell_qty * max(bid_price, 0.0) < min_notional:
+        result["reason"] = "below_min_notional"
+        return result
+    if strategy_open_orders:
+        result["canceled_count"] = _cancel_orders(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            orders=strategy_open_orders,
+        )
+    if not _truthy(args.apply):
+        result["executed"] = True
+        result["reason"] = "dry_run"
+        result["execution"] = {"executed_qty": sell_qty, "executed_notional": sell_qty * max(bid_price, 0.0)}
+        return result
+    client_order_id = _build_client_order_id(str(args.client_order_prefix), "faststop", "SELL")
+    placed = post_spot_order(
+        symbol=symbol,
+        side="SELL",
+        quantity=sell_qty,
+        price=bid_price,
+        api_key=api_key,
+        api_secret=api_secret,
+        order_type="MARKET",
+        new_client_order_id=client_order_id,
+    )
+    result["order"] = placed
+    result["execution"] = _apply_synthetic_fast_stop_sell_to_state(
+        state=state,
+        response=placed,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+        role="fast_stop_exit",
+    )
+    result["executed"] = True
+    result["reason"] = "executed"
+    return result
+
+
 def _build_runtime_guard_summary(
     *,
     args: argparse.Namespace,
@@ -2041,6 +2324,15 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         account_info = fetch_spot_account_info(api_key, api_secret)
         open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
         strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+    fast_stop_exit_result = {
+        "enabled": bool(getattr(args, "spot_fast_stop_enabled", False)),
+        "executed": False,
+        "reason": "not_evaluated",
+        "canceled_count": 0,
+        "order": None,
+        "execution": None,
+        "guard": {},
+    }
 
     if strategy_mode == "spot_one_way_long":
         desired_orders = _build_static_desired_orders(
@@ -2086,6 +2378,48 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             max_short_position_notional=float(getattr(args, "max_short_position_notional", 0.0)),
             actual_base_qty=_total_base_balance(account_info, base_asset) if synthetic_neutral_mode else None,
         )
+        current_long_notional_for_guard = _safe_float(controls.get("current_long_notional"))
+        fast_stop_guard = _assess_spot_fast_stop_guard(
+            symbol=symbol,
+            current_long_notional=current_long_notional_for_guard,
+            freeze_position_notional=float(getattr(args, "spot_fast_stop_freeze_position_notional", 0.0)),
+            exit_position_notional=float(getattr(args, "spot_fast_stop_exit_position_notional", 0.0)),
+            trigger_10s_abs_return_ratio=float(getattr(args, "spot_fast_stop_10s_abs_return_ratio", 0.0)),
+            trigger_10s_amplitude_ratio=float(getattr(args, "spot_fast_stop_10s_amplitude_ratio", 0.0)),
+            trigger_30s_abs_return_ratio=float(getattr(args, "spot_fast_stop_30s_abs_return_ratio", 0.0)),
+            trigger_30s_amplitude_ratio=float(getattr(args, "spot_fast_stop_30s_amplitude_ratio", 0.0)),
+            down_only=bool(getattr(args, "spot_fast_stop_down_only", True)),
+        )
+        fast_stop_exit_result = _maybe_execute_spot_fast_stop_exit(
+            args=args,
+            state=state,
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            strategy_open_orders=strategy_open_orders,
+            bid_price=bid_price,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            fast_stop_guard=fast_stop_guard,
+            controls=controls,
+        )
+        if fast_stop_exit_result.get("executed"):
+            account_info = fetch_spot_account_info(api_key, api_secret)
+            open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
+            strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+            desired_orders = []
+            controls["buy_paused"] = True
+            controls["pause_reasons"] = list(controls.get("pause_reasons") or []) + list(fast_stop_guard.get("reasons") or [])
+            controls["risk_state"] = "fast_stop_exit"
+        elif fast_stop_guard.get("freeze_buy"):
+            desired_orders = [order for order in desired_orders if str(order.get("side", "")).upper() != "BUY"]
+            controls["buy_paused"] = True
+            controls["pause_reasons"] = list(controls.get("pause_reasons") or []) + list(fast_stop_guard.get("reasons") or [])
+            controls["risk_state"] = "fast_stop_freeze"
+        controls["fast_stop_guard"] = fast_stop_guard
     diff = diff_open_orders(existing_orders=strategy_open_orders, desired_orders=desired_orders)
 
     canceled_count = 0
@@ -2240,6 +2574,8 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "warmup_position_notional": _safe_float(controls.get("warmup_position_notional")),
         "require_non_loss_exit": bool(controls.get("require_non_loss_exit")),
         "spot_taker_exit": taker_exit_result,
+        "spot_fast_stop_exit": fast_stop_exit_result,
+        "spot_fast_stop_guard": controls.get("fast_stop_guard", {}),
         "shift_moves": controls.get("shift_moves", []),
         "runtime_status": runtime_guard_result.runtime_status,
         "stop_triggered": runtime_guard_result.stop_triggered,
@@ -2348,6 +2684,18 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-taker-exit-enabled", action="store_true")
     parser.add_argument("--spot-taker-exit-fee-ratio", type=float, default=0.001)
     parser.add_argument("--spot-taker-exit-min-profit-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-enabled", action="store_true")
+    parser.add_argument("--spot-fast-stop-down-only", dest="spot_fast_stop_down_only", action="store_true")
+    parser.add_argument("--spot-fast-stop-any-direction", dest="spot_fast_stop_down_only", action="store_false")
+    parser.set_defaults(spot_fast_stop_down_only=True)
+    parser.add_argument("--spot-fast-stop-10s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-10s-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-30s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-30s-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-freeze-position-notional", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-exit-position-notional", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-reduce-target-notional", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-min-base-buffer-qty", type=float, default=0.0)
     parser.add_argument("--max-order-position-notional", type=float, default=0.0)
     parser.add_argument("--max-position-notional", type=float, default=0.0)
     parser.add_argument("--neutral-base-qty", type=float, default=0.0)

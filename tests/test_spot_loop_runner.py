@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from grid_optimizer.inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from grid_optimizer.spot_loop_runner import (
+    _assess_spot_fast_stop_guard,
     _auto_flatten_on_runtime_guard,
     _build_parser,
     _build_spot_competition_inventory_grid_orders,
@@ -47,6 +48,17 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "0.001",
                 "--spot-taker-exit-min-profit-ratio",
                 "0.0002",
+                "--spot-fast-stop-enabled",
+                "--spot-fast-stop-10s-abs-return-ratio",
+                "0.003",
+                "--spot-fast-stop-30s-amplitude-ratio",
+                "0.006",
+                "--spot-fast-stop-freeze-position-notional",
+                "120",
+                "--spot-fast-stop-exit-position-notional",
+                "240",
+                "--spot-fast-stop-reduce-target-notional",
+                "80",
                 "--runtime-guard-stats-start-time",
                 "2026-04-05T00:00:00+00:00",
                 "--max-order-position-notional",
@@ -64,6 +76,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertTrue(args.spot_taker_exit_enabled)
         self.assertEqual(args.spot_taker_exit_fee_ratio, 0.001)
         self.assertEqual(args.spot_taker_exit_min_profit_ratio, 0.0002)
+        self.assertTrue(args.spot_fast_stop_enabled)
+        self.assertEqual(args.spot_fast_stop_10s_abs_return_ratio, 0.003)
+        self.assertEqual(args.spot_fast_stop_30s_amplitude_ratio, 0.006)
+        self.assertEqual(args.spot_fast_stop_freeze_position_notional, 120.0)
+        self.assertEqual(args.spot_fast_stop_exit_position_notional, 240.0)
+        self.assertEqual(args.spot_fast_stop_reduce_target_notional, 80.0)
         self.assertEqual(args.runtime_guard_stats_start_time, "2026-04-05T00:00:00+00:00")
         self.assertEqual(args.max_order_position_notional, 300.0)
         self.assertEqual(args.max_position_notional, 400.0)
@@ -98,6 +116,55 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertFalse(_auto_flatten_on_runtime_guard("spot_competition_inventory_grid"))
         self.assertFalse(_auto_flatten_on_runtime_guard("spot_competition_synthetic_neutral_grid"))
         self.assertTrue(_auto_flatten_on_runtime_guard("spot_one_way_long"))
+
+    def test_fast_stop_guard_freezes_before_exit_threshold(self) -> None:
+        def fake_window(symbol: str, *, seconds: int, now=None):
+            return {
+                "seconds": seconds,
+                "available": True,
+                "return_ratio": -0.004 if seconds == 10 else -0.003,
+                "amplitude_ratio": 0.005,
+            }
+
+        with patch("grid_optimizer.spot_loop_runner._spot_trade_window_move", side_effect=fake_window):
+            guard = _assess_spot_fast_stop_guard(
+                symbol="ETHU",
+                current_long_notional=180.0,
+                freeze_position_notional=100.0,
+                exit_position_notional=300.0,
+                trigger_10s_abs_return_ratio=0.003,
+                trigger_10s_amplitude_ratio=0.0,
+                trigger_30s_abs_return_ratio=0.006,
+                trigger_30s_amplitude_ratio=0.0,
+            )
+
+        self.assertTrue(guard["freeze_buy"])
+        self.assertFalse(guard["force_exit"])
+        self.assertTrue(guard["reasons"])
+
+    def test_fast_stop_guard_exits_above_exit_threshold(self) -> None:
+        def fake_window(symbol: str, *, seconds: int, now=None):
+            return {
+                "seconds": seconds,
+                "available": True,
+                "return_ratio": -0.008,
+                "amplitude_ratio": 0.01,
+            }
+
+        with patch("grid_optimizer.spot_loop_runner._spot_trade_window_move", side_effect=fake_window):
+            guard = _assess_spot_fast_stop_guard(
+                symbol="BNBU",
+                current_long_notional=650.0,
+                freeze_position_notional=100.0,
+                exit_position_notional=600.0,
+                trigger_10s_abs_return_ratio=0.003,
+                trigger_10s_amplitude_ratio=0.0,
+                trigger_30s_abs_return_ratio=0.006,
+                trigger_30s_amplitude_ratio=0.0,
+            )
+
+        self.assertTrue(guard["freeze_buy"])
+        self.assertTrue(guard["force_exit"])
 
     def test_build_spot_competition_inventory_grid_orders_places_only_buy_bootstrap_when_flat(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(

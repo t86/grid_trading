@@ -7702,6 +7702,16 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_taker_exit_enabled": False,
     "spot_taker_exit_fee_ratio": 0.001,
     "spot_taker_exit_min_profit_ratio": 0.0,
+    "spot_fast_stop_enabled": False,
+    "spot_fast_stop_down_only": True,
+    "spot_fast_stop_10s_abs_return_ratio": 0.0,
+    "spot_fast_stop_10s_amplitude_ratio": 0.0,
+    "spot_fast_stop_30s_abs_return_ratio": 0.0,
+    "spot_fast_stop_30s_amplitude_ratio": 0.0,
+    "spot_fast_stop_freeze_position_notional": 0.0,
+    "spot_fast_stop_exit_position_notional": 0.0,
+    "spot_fast_stop_reduce_target_notional": 0.0,
+    "spot_fast_stop_min_base_buffer_qty": 0.0,
     "max_order_position_notional": 0.0,
     "max_position_notional": 0.0,
     "neutral_base_qty": 0.0,
@@ -12475,6 +12485,70 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("spot_taker_exit_min_profit_ratio", SPOT_RUNNER_DEFAULT_CONFIG["spot_taker_exit_min_profit_ratio"]),
         "spot_taker_exit_min_profit_ratio",
     )
+    spot_fast_stop_enabled = _safe_bool(
+        payload.get("spot_fast_stop_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_enabled"]),
+        "spot_fast_stop_enabled",
+    )
+    spot_fast_stop_down_only = _safe_bool(
+        payload.get("spot_fast_stop_down_only", SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_down_only"]),
+        "spot_fast_stop_down_only",
+    )
+    spot_fast_stop_10s_abs_return_ratio = _safe_float(
+        payload.get(
+            "spot_fast_stop_10s_abs_return_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_10s_abs_return_ratio"],
+        ),
+        "spot_fast_stop_10s_abs_return_ratio",
+    )
+    spot_fast_stop_10s_amplitude_ratio = _safe_float(
+        payload.get(
+            "spot_fast_stop_10s_amplitude_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_10s_amplitude_ratio"],
+        ),
+        "spot_fast_stop_10s_amplitude_ratio",
+    )
+    spot_fast_stop_30s_abs_return_ratio = _safe_float(
+        payload.get(
+            "spot_fast_stop_30s_abs_return_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_30s_abs_return_ratio"],
+        ),
+        "spot_fast_stop_30s_abs_return_ratio",
+    )
+    spot_fast_stop_30s_amplitude_ratio = _safe_float(
+        payload.get(
+            "spot_fast_stop_30s_amplitude_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_30s_amplitude_ratio"],
+        ),
+        "spot_fast_stop_30s_amplitude_ratio",
+    )
+    spot_fast_stop_freeze_position_notional = _safe_float(
+        payload.get(
+            "spot_fast_stop_freeze_position_notional",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_freeze_position_notional"],
+        ),
+        "spot_fast_stop_freeze_position_notional",
+    )
+    spot_fast_stop_exit_position_notional = _safe_float(
+        payload.get(
+            "spot_fast_stop_exit_position_notional",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_exit_position_notional"],
+        ),
+        "spot_fast_stop_exit_position_notional",
+    )
+    spot_fast_stop_reduce_target_notional = _safe_float(
+        payload.get(
+            "spot_fast_stop_reduce_target_notional",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_reduce_target_notional"],
+        ),
+        "spot_fast_stop_reduce_target_notional",
+    )
+    spot_fast_stop_min_base_buffer_qty = _safe_float(
+        payload.get(
+            "spot_fast_stop_min_base_buffer_qty",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_fast_stop_min_base_buffer_qty"],
+        ),
+        "spot_fast_stop_min_base_buffer_qty",
+    )
     max_order_position_notional = _safe_float(
         payload.get("max_order_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_order_position_notional"]),
         "max_order_position_notional",
@@ -12610,6 +12684,18 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("spot_taker_exit_fee_ratio must be >= 0")
         if spot_taker_exit_min_profit_ratio < 0:
             raise ValueError("spot_taker_exit_min_profit_ratio must be >= 0")
+        for name, value in {
+            "spot_fast_stop_10s_abs_return_ratio": spot_fast_stop_10s_abs_return_ratio,
+            "spot_fast_stop_10s_amplitude_ratio": spot_fast_stop_10s_amplitude_ratio,
+            "spot_fast_stop_30s_abs_return_ratio": spot_fast_stop_30s_abs_return_ratio,
+            "spot_fast_stop_30s_amplitude_ratio": spot_fast_stop_30s_amplitude_ratio,
+            "spot_fast_stop_freeze_position_notional": spot_fast_stop_freeze_position_notional,
+            "spot_fast_stop_exit_position_notional": spot_fast_stop_exit_position_notional,
+            "spot_fast_stop_reduce_target_notional": spot_fast_stop_reduce_target_notional,
+            "spot_fast_stop_min_base_buffer_qty": spot_fast_stop_min_base_buffer_qty,
+        }.items():
+            if value < 0:
+                raise ValueError(f"{name} must be >= 0")
         if max_order_position_notional < 0:
             raise ValueError("max_order_position_notional must be >= 0")
         if max_position_notional <= 0:
@@ -12660,6 +12746,16 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_taker_exit_enabled": spot_taker_exit_enabled,
             "spot_taker_exit_fee_ratio": spot_taker_exit_fee_ratio,
             "spot_taker_exit_min_profit_ratio": spot_taker_exit_min_profit_ratio,
+            "spot_fast_stop_enabled": spot_fast_stop_enabled,
+            "spot_fast_stop_down_only": spot_fast_stop_down_only,
+            "spot_fast_stop_10s_abs_return_ratio": spot_fast_stop_10s_abs_return_ratio,
+            "spot_fast_stop_10s_amplitude_ratio": spot_fast_stop_10s_amplitude_ratio,
+            "spot_fast_stop_30s_abs_return_ratio": spot_fast_stop_30s_abs_return_ratio,
+            "spot_fast_stop_30s_amplitude_ratio": spot_fast_stop_30s_amplitude_ratio,
+            "spot_fast_stop_freeze_position_notional": spot_fast_stop_freeze_position_notional,
+            "spot_fast_stop_exit_position_notional": spot_fast_stop_exit_position_notional,
+            "spot_fast_stop_reduce_target_notional": spot_fast_stop_reduce_target_notional,
+            "spot_fast_stop_min_base_buffer_qty": spot_fast_stop_min_base_buffer_qty,
             "max_order_position_notional": max_order_position_notional,
             "max_position_notional": max_position_notional,
             "neutral_base_qty": neutral_base_qty,
@@ -12769,6 +12865,14 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--max-single-cycle-new-orders", config.get("max_single_cycle_new_orders")),
         ("--spot-taker-exit-fee-ratio", config.get("spot_taker_exit_fee_ratio")),
         ("--spot-taker-exit-min-profit-ratio", config.get("spot_taker_exit_min_profit_ratio")),
+        ("--spot-fast-stop-10s-abs-return-ratio", config.get("spot_fast_stop_10s_abs_return_ratio")),
+        ("--spot-fast-stop-10s-amplitude-ratio", config.get("spot_fast_stop_10s_amplitude_ratio")),
+        ("--spot-fast-stop-30s-abs-return-ratio", config.get("spot_fast_stop_30s_abs_return_ratio")),
+        ("--spot-fast-stop-30s-amplitude-ratio", config.get("spot_fast_stop_30s_amplitude_ratio")),
+        ("--spot-fast-stop-freeze-position-notional", config.get("spot_fast_stop_freeze_position_notional")),
+        ("--spot-fast-stop-exit-position-notional", config.get("spot_fast_stop_exit_position_notional")),
+        ("--spot-fast-stop-reduce-target-notional", config.get("spot_fast_stop_reduce_target_notional")),
+        ("--spot-fast-stop-min-base-buffer-qty", config.get("spot_fast_stop_min_base_buffer_qty")),
         ("--run-start-time", config.get("run_start_time")),
         ("--run-end-time", config.get("run_end_time")),
         ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
@@ -12782,6 +12886,9 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--require-non-loss-exit")
     if _truthy(config.get("spot_taker_exit_enabled", False)):
         command.append("--spot-taker-exit-enabled")
+    if _truthy(config.get("spot_fast_stop_enabled", False)):
+        command.append("--spot-fast-stop-enabled")
+    command.append("--spot-fast-stop-down-only" if config.get("spot_fast_stop_down_only", True) else "--spot-fast-stop-any-direction")
     command.append("--elastic-volume-enabled" if config.get("elastic_volume_enabled", False) else "--no-elastic-volume-enabled")
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")
     command.append("--apply" if config.get("apply", True) else "--no-apply")
@@ -12872,6 +12979,16 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "spot_taker_exit_enabled",
             "spot_taker_exit_fee_ratio",
             "spot_taker_exit_min_profit_ratio",
+            "spot_fast_stop_enabled",
+            "spot_fast_stop_down_only",
+            "spot_fast_stop_10s_abs_return_ratio",
+            "spot_fast_stop_10s_amplitude_ratio",
+            "spot_fast_stop_30s_abs_return_ratio",
+            "spot_fast_stop_30s_amplitude_ratio",
+            "spot_fast_stop_freeze_position_notional",
+            "spot_fast_stop_exit_position_notional",
+            "spot_fast_stop_reduce_target_notional",
+            "spot_fast_stop_min_base_buffer_qty",
             "run_start_time",
             "run_end_time",
             "runtime_guard_stats_start_time",
