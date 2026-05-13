@@ -12,9 +12,19 @@ from typing import Any
 BASE = Path(__file__).resolve().parents[1]
 OUTPUT = BASE / "output"
 LOG_PATH = OUTPUT / "competition_autotune_111.jsonl"
-SYMBOLS = ("BTCUSDC", "ETHUSDC")
+SYMBOLS = ("BTCUSDC", "ETHUSDC", "XAGUSDT")
 LOW_LOSS_PER_10K = 0.5
 HIGH_LOSS_PER_10K = 1.0
+ROLLING_LOSS_LIMITS = {
+    "BTCUSDC": 14.0,
+    "ETHUSDC": 10.0,
+    "XAGUSDT": 6.0,
+}
+RECOVERABLE_STABLE_SYMBOLS = {"BTCUSDC", "XAGUSDT"}
+RECOVERY_MAX_1M_AMP = {
+    "BTCUSDC": 0.0012,
+    "XAGUSDT": 0.0035,
+}
 
 
 @dataclass(frozen=True)
@@ -254,6 +264,90 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
             "volatility_entry_pause_1m_abs_return_ratio": 0.0012,
         },
     },
+    "XAGUSDT": {
+        "aggressive": {
+            "step_price": 0.08,
+            "per_order_notional": 180.0,
+            "buy_levels": 12,
+            "sell_levels": 12,
+            "max_new_orders": 48,
+            "max_position_notional": 2800.0,
+            "max_short_position_notional": 2800.0,
+            "pause_buy_position_notional": 2100.0,
+            "pause_short_position_notional": 2100.0,
+            "threshold_position_notional": 2400.0,
+            "max_total_notional": 10000.0,
+            "rolling_hourly_loss_limit": 12.0,
+            "max_actual_net_notional": 2000.0,
+            "take_profit_min_profit_ratio": 0.0,
+            "adaptive_step_30s_abs_return_ratio": 0.0010,
+            "adaptive_step_1m_abs_return_ratio": 0.0016,
+            "adaptive_step_1m_amplitude_ratio": 0.0027,
+            "adaptive_step_3m_abs_return_ratio": 0.0036,
+            "adaptive_step_3m_amplitude_ratio": 0.0055,
+            "volatility_entry_pause_30s_abs_return_ratio": 0.0020,
+            "volatility_entry_pause_1m_abs_return_ratio": 0.0032,
+            "volatility_entry_pause_1m_amplitude_ratio": 0.0050,
+            "volatility_entry_pause_3m_abs_return_ratio": 0.0065,
+            "volatility_entry_pause_3m_amplitude_ratio": 0.0090,
+            "hard_loss_forced_reduce_enabled": True,
+            "hard_loss_forced_reduce_target_notional": 220.0,
+            "hard_loss_forced_reduce_max_order_notional": 90.0,
+            "hard_loss_forced_reduce_unrealized_loss_limit": 2.0,
+            "adverse_reduce_short_trigger_ratio": 0.0042,
+            "adverse_reduce_long_trigger_ratio": 0.0042,
+            "adverse_reduce_target_ratio": 0.45,
+            "elastic_loss_per_10k_sprint": 0.08,
+            "elastic_loss_per_10k_cruise": 0.25,
+            "elastic_loss_per_10k_defensive": 0.50,
+            "elastic_loss_per_10k_cooldown": 0.85,
+            "elastic_step_scale_defensive": 1.8,
+            "elastic_step_scale_cooldown": 3.0,
+            "elastic_per_order_scale_defensive": 0.45,
+            "elastic_levels_scale_defensive": 0.45,
+        },
+        "conservative": {
+            "step_price": 0.10,
+            "per_order_notional": 120.0,
+            "buy_levels": 10,
+            "sell_levels": 10,
+            "max_new_orders": 36,
+            "max_position_notional": 1800.0,
+            "max_short_position_notional": 1800.0,
+            "pause_buy_position_notional": 1200.0,
+            "pause_short_position_notional": 1200.0,
+            "threshold_position_notional": 1450.0,
+            "max_total_notional": 7200.0,
+            "rolling_hourly_loss_limit": 6.0,
+            "max_actual_net_notional": 1200.0,
+            "take_profit_min_profit_ratio": 0.0,
+            "hard_loss_forced_reduce_enabled": True,
+            "hard_loss_forced_reduce_target_notional": 180.0,
+            "hard_loss_forced_reduce_max_order_notional": 70.0,
+            "hard_loss_forced_reduce_unrealized_loss_limit": 1.5,
+            "adverse_reduce_short_trigger_ratio": 0.0038,
+            "adverse_reduce_long_trigger_ratio": 0.0038,
+            "adverse_reduce_target_ratio": 0.45,
+            "elastic_loss_per_10k_sprint": 0.08,
+            "elastic_loss_per_10k_cruise": 0.25,
+            "elastic_loss_per_10k_defensive": 0.50,
+            "elastic_loss_per_10k_cooldown": 0.85,
+            "elastic_step_scale_defensive": 1.8,
+            "elastic_step_scale_cooldown": 3.0,
+            "elastic_per_order_scale_defensive": 0.45,
+            "elastic_levels_scale_defensive": 0.45,
+            "adaptive_step_30s_abs_return_ratio": 0.0011,
+            "adaptive_step_1m_abs_return_ratio": 0.0018,
+            "adaptive_step_1m_amplitude_ratio": 0.0030,
+            "adaptive_step_3m_abs_return_ratio": 0.0040,
+            "adaptive_step_3m_amplitude_ratio": 0.0060,
+            "volatility_entry_pause_30s_abs_return_ratio": 0.0022,
+            "volatility_entry_pause_1m_abs_return_ratio": 0.0035,
+            "volatility_entry_pause_1m_amplitude_ratio": 0.0055,
+            "volatility_entry_pause_3m_abs_return_ratio": 0.0070,
+            "volatility_entry_pause_3m_amplitude_ratio": 0.0100,
+        },
+    },
 }
 
 
@@ -265,11 +359,15 @@ def _desired_mode(symbol: str, metrics: dict[str, Any]) -> tuple[str, str]:
     runtime_status = str(metrics["runtime_status"])
     stop_reason = str(metrics["stop_reason"] or "")
     is_cooldown = runtime_status == "cooldown" or "rolling_hourly_loss" in stop_reason
-    if float(metrics["rolling_loss"]) >= (14.0 if symbol == "BTCUSDC" else 10.0):
+    if float(metrics["rolling_loss"]) >= ROLLING_LOSS_LIMITS[symbol]:
         return "conservative", "rolling_hourly_loss_still_high"
     if is_cooldown:
-        if symbol == "BTCUSDC" and market_stable and float(metrics["market_amp_1m"]) <= 0.0012:
-            return "conservative", "recover_btc_after_stable_cooldown"
+        if (
+            symbol in RECOVERABLE_STABLE_SYMBOLS
+            and market_stable
+            and float(metrics["market_amp_1m"]) <= RECOVERY_MAX_1M_AMP[symbol]
+        ):
+            return "conservative", f"recover_{symbol.lower()}_after_stable_cooldown"
         return "conservative", "runtime_loss_cooldown"
     if max(loss_15m, loss_5m) > HIGH_LOSS_PER_10K:
         return "conservative", "loss_per_10k_above_1"
@@ -280,7 +378,7 @@ def _desired_mode(symbol: str, metrics: dict[str, Any]) -> tuple[str, str]:
 
 def _apply_profile(files: SymbolFiles, control: dict[str, Any], mode: str, reason: str, metrics: dict[str, Any]) -> bool:
     patch = dict(PROFILES[files.symbol][mode])
-    if reason == "recover_btc_after_stable_cooldown":
+    if reason.startswith("recover_") and reason.endswith("_after_stable_cooldown"):
         patch["runtime_guard_stats_start_time"] = _now_iso()
         patch["reset_state"] = True
         patch["reset_state_reason"] = "autotune_recover_after_stable_loss_cooldown"
