@@ -192,6 +192,62 @@ class SpotLoopRunnerTests(unittest.TestCase):
 
         self.assertEqual({order["side"] for order in desired_orders}, {"SELL"})
 
+    def test_build_spot_competition_synthetic_neutral_grid_ignores_dust_residual(self) -> None:
+        runtime = new_inventory_grid_runtime(market_type="futures")
+        runtime["direction_state"] = "short_active"
+        runtime["grid_anchor_price"] = 0.034487
+        runtime["position_lots"] = [
+            {
+                "lot_id": "dust",
+                "side": "short",
+                "qty": 69.0,
+                "entry_price": 0.034487,
+                "opened_at_ms": 1000,
+                "source_role": "bootstrap_entry",
+            }
+        ]
+        state = {
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+            "known_orders": {},
+            "inventory_lots": [],
+            "spot_competition_synthetic_neutral_grid_runtime_cache": {
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "market_type": "futures",
+                "runtime": runtime,
+                "applied_trade_keys": [],
+            },
+        }
+
+        desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+            state=state,
+            trades=[],
+            bid_price=0.034532,
+            ask_price=0.034541,
+            step_price=0.00004,
+            buy_levels=2,
+            sell_levels=2,
+            first_order_multiplier=1.0,
+            per_order_notional=35.0,
+            threshold_position_notional=520.0,
+            max_order_position_notional=700.0,
+            max_position_notional=900.0,
+            tick_size=0.000001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            synthetic_neutral=True,
+            neutral_base_qty=30000.0,
+            max_short_position_notional=650.0,
+            actual_base_qty=29931.0,
+        )
+
+        self.assertEqual([order["side"] for order in desired_orders], ["BUY", "BUY", "SELL", "SELL"])
+        self.assertEqual(controls["direction_state"], "flat")
+        self.assertAlmostEqual(controls["synthetic_net_qty"], 0.0)
+        self.assertAlmostEqual(controls["actual_base_qty"], 29931.0)
+        self.assertAlmostEqual(controls["synthetic_dust_qty"], -69.0)
+        self.assertAlmostEqual(controls["synthetic_dust_notional"], 69.0 * 0.0345365)
+
     def test_build_spot_competition_inventory_grid_orders_ignores_unrelated_trades_when_flat(self) -> None:
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state={

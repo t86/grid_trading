@@ -1415,6 +1415,18 @@ def _build_spot_competition_inventory_grid_orders(
     )
     neutral_qty = max(_safe_float(neutral_base_qty), 0.0) if synthetic_neutral else 0.0
     synthetic_net_qty = resolved_actual_base_qty - neutral_qty if synthetic_neutral else resolved_actual_base_qty
+    mid_price = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+    synthetic_dust_qty = 0.0
+    synthetic_dust_notional = 0.0
+    if synthetic_neutral and _synthetic_residual_is_dust(
+        qty=abs(synthetic_net_qty),
+        price=mid_price,
+        min_qty=min_qty,
+        min_notional=min_notional,
+    ):
+        synthetic_dust_qty = synthetic_net_qty
+        synthetic_dust_notional = abs(synthetic_net_qty) * mid_price
+        synthetic_net_qty = 0.0
     current_position_qty = abs(synthetic_net_qty) if synthetic_neutral else resolved_actual_base_qty
     runtime = _resolve_spot_competition_runtime(
         state=state,
@@ -1476,7 +1488,6 @@ def _build_spot_competition_inventory_grid_orders(
     desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
     reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
     display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
-    mid_price = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
     current_long_notional = max(synthetic_net_qty, 0.0) * mid_price
     current_short_notional = max(-synthetic_net_qty, 0.0) * mid_price
     controls = {
@@ -1505,6 +1516,8 @@ def _build_spot_competition_inventory_grid_orders(
         "actual_base_qty": resolved_actual_base_qty,
         "tracked_base_qty": tracked_base_qty,
         "synthetic_net_qty": synthetic_net_qty,
+        "synthetic_dust_qty": synthetic_dust_qty,
+        "synthetic_dust_notional": synthetic_dust_notional,
         "current_long_notional": current_long_notional,
         "current_short_notional": current_short_notional,
         "max_short_position_notional": max(_safe_float(max_short_position_notional), 0.0),
@@ -1549,6 +1562,23 @@ def _spot_order_meets_exchange_mins(
     if min_notional is not None and qty * price + EPSILON < float(min_notional):
         return False
     return True
+
+
+def _synthetic_residual_is_dust(
+    *,
+    qty: float,
+    price: float,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> bool:
+    residual_qty = max(_safe_float(qty), 0.0)
+    if residual_qty <= EPSILON:
+        return False
+    if min_qty is not None and residual_qty + EPSILON < float(min_qty):
+        return True
+    if min_notional is not None and residual_qty * max(_safe_float(price), 0.0) + EPSILON < float(min_notional):
+        return True
+    return False
 
 
 def _cancel_orders(
@@ -2176,6 +2206,8 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "neutral_base_qty": _safe_float(controls.get("neutral_base_qty")),
         "actual_base_qty": _safe_float(controls.get("actual_base_qty")),
         "synthetic_net_qty": _safe_float(controls.get("synthetic_net_qty")),
+        "synthetic_dust_qty": _safe_float(controls.get("synthetic_dust_qty")),
+        "synthetic_dust_notional": _safe_float(controls.get("synthetic_dust_notional")),
         "current_long_notional": _safe_float(controls.get("current_long_notional")),
         "current_short_notional": _safe_float(controls.get("current_short_notional")),
         "max_short_position_notional": _safe_float(controls.get("max_short_position_notional")),
