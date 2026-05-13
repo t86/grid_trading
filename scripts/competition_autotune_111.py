@@ -19,7 +19,7 @@ HIGH_LOSS_PER_10K = 1.0
 BTC_BEST_QUOTE_MIN_GROSS_15M = 8_000.0
 ETH_SWITCH_MIN_RELATIVE_VOLUME = 0.30
 ROLLING_LOSS_LIMITS = {
-    "BTCUSDC": 14.0,
+    "BTCUSDC": 18.0,
     "ETHUSDC": 10.0,
     "XAGUSDT": 4.0,
 }
@@ -248,7 +248,7 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
             "pause_short_position_notional": 850.0,
             "threshold_position_notional": 950.0,
             "max_actual_net_notional": 1000.0,
-            "rolling_hourly_loss_limit": 10.0,
+            "rolling_hourly_loss_limit": 18.0,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "elastic_volume_enabled": False,
