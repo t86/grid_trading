@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -98,6 +98,64 @@ def _read_last_jsonl(path: Path, max_lines: int = 200) -> dict[str, Any]:
     return {}
 
 
+def _read_recent_jsonl(path: Path, max_lines: int = 600) -> list[dict[str, Any]]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            end = handle.tell()
+            size = min(end, 1024 * 1024)
+            handle.seek(end - size)
+            text = handle.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return []
+    records: list[dict[str, Any]] = []
+    for line in text.splitlines()[-max_lines:]:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            records.append(payload)
+    return records
+
+
+def _parse_event_ts(payload: dict[str, Any]) -> datetime | None:
+    raw = payload.get("ts") or payload.get("timestamp") or payload.get("time")
+    if not raw:
+        return None
+    try:
+        text = str(raw).replace("Z", "+00:00")
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _window_gross_from_events(records: list[dict[str, Any]], latest_event: dict[str, Any], minutes: int) -> float:
+    latest_ts = _parse_event_ts(latest_event)
+    latest_gross = _safe_float(latest_event.get("cumulative_gross_notional"))
+    if latest_ts is None or latest_gross <= 0:
+        return 0.0
+    cutoff = latest_ts - timedelta(minutes=minutes)
+    baseline_gross: float | None = None
+    for record in records:
+        record_ts = _parse_event_ts(record)
+        if record_ts is None or record_ts > cutoff:
+            continue
+        gross = _safe_float(record.get("cumulative_gross_notional"))
+        if gross > 0:
+            baseline_gross = gross
+    if baseline_gross is None:
+        first_gross = next((_safe_float(item.get("cumulative_gross_notional")) for item in records), 0.0)
+        baseline_gross = first_gross if first_gross > 0 else latest_gross
+    return max(0.0, latest_gross - baseline_gross)
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -111,7 +169,9 @@ def _nested(payload: dict[str, Any], *keys: str) -> Any:
     return current
 
 
-def _plan_metrics(plan: dict[str, Any], latest_event: dict[str, Any]) -> dict[str, float | bool | str | None]:
+def _plan_metrics(
+    plan: dict[str, Any], latest_event: dict[str, Any], recent_events: list[dict[str, Any]] | None = None
+) -> dict[str, float | bool | str | None]:
     elastic_metrics = _nested(plan, "elastic_volume", "metrics") or {}
     volatility = plan.get("volatility_entry_pause") if isinstance(plan.get("volatility_entry_pause"), dict) else {}
     recovery = plan.get("runtime_guard_loss_recovery") if isinstance(plan.get("runtime_guard_loss_recovery"), dict) else {}
@@ -120,6 +180,10 @@ def _plan_metrics(plan: dict[str, Any], latest_event: dict[str, Any]) -> dict[st
     loss_5m = _safe_float(elastic_metrics.get("loss_per_10k_5m"))
     gross_15m = _safe_float(elastic_metrics.get("gross_notional_15m"))
     gross_5m = _safe_float(elastic_metrics.get("gross_notional_5m"))
+    if gross_15m <= 0 and recent_events:
+        gross_15m = _window_gross_from_events(recent_events, latest_event, 15)
+    if gross_5m <= 0 and recent_events:
+        gross_5m = _window_gross_from_events(recent_events, latest_event, 5)
     rolling_loss = _safe_float(latest_event.get("rolling_hourly_loss"), _safe_float(plan.get("rolling_hourly_loss")))
     cumulative_gross = _safe_float(
         latest_event.get("cumulative_gross_notional"),
@@ -536,13 +600,17 @@ def _symbol_snapshot(symbol: str) -> dict[str, Any]:
     files = _files(symbol)
     control = _read_json(files.control)
     plan = _read_json(files.plan)
+    recent_events = _read_recent_jsonl(files.events)
     latest_event = _read_last_jsonl(files.events)
-    metrics = _plan_metrics(plan, latest_event) if plan else {}
+    if not latest_event and recent_events:
+        latest_event = recent_events[-1]
+    metrics = _plan_metrics(plan, latest_event, recent_events) if plan else {}
     return {
         "symbol": symbol,
         "files": files,
         "control": control,
         "plan": plan,
+        "recent_events": recent_events,
         "latest_event": latest_event,
         "metrics": metrics,
     }
