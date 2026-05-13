@@ -23,6 +23,7 @@ class SymbolFiles:
     slug: str
     control: Path
     plan: Path
+    events: Path
     state: Path
 
 
@@ -37,6 +38,7 @@ def _files(symbol: str) -> SymbolFiles:
         slug=slug,
         control=OUTPUT / f"{slug}_loop_runner_control.json",
         plan=OUTPUT / f"{slug}_loop_latest_plan.json",
+        events=OUTPUT / f"{slug}_loop_events.jsonl",
         state=OUTPUT / f"{slug}_loop_state.json",
     )
 
@@ -60,6 +62,29 @@ def _read_json(path: Path) -> dict[str, Any]:
     return payload if isinstance(payload, dict) else {}
 
 
+def _read_last_jsonl(path: Path, max_lines: int = 200) -> dict[str, Any]:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, 2)
+            end = handle.tell()
+            size = min(end, 256 * 1024)
+            handle.seek(end - size)
+            text = handle.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return {}
+    for line in reversed(text.splitlines()[-max_lines:]):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            payload = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return {}
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -73,7 +98,7 @@ def _nested(payload: dict[str, Any], *keys: str) -> Any:
     return current
 
 
-def _plan_metrics(plan: dict[str, Any]) -> dict[str, float | bool | str | None]:
+def _plan_metrics(plan: dict[str, Any], latest_event: dict[str, Any]) -> dict[str, float | bool | str | None]:
     elastic_metrics = _nested(plan, "elastic_volume", "metrics") or {}
     volatility = plan.get("volatility_entry_pause") if isinstance(plan.get("volatility_entry_pause"), dict) else {}
     recovery = plan.get("runtime_guard_loss_recovery") if isinstance(plan.get("runtime_guard_loss_recovery"), dict) else {}
@@ -81,8 +106,11 @@ def _plan_metrics(plan: dict[str, Any]) -> dict[str, float | bool | str | None]:
     loss_15m = _safe_float(elastic_metrics.get("loss_per_10k_15m"))
     loss_5m = _safe_float(elastic_metrics.get("loss_per_10k_5m"))
     gross_15m = _safe_float(elastic_metrics.get("gross_notional_15m"))
-    rolling_loss = _safe_float(plan.get("rolling_hourly_loss"))
-    cumulative_gross = _safe_float(plan.get("cumulative_gross_notional"))
+    rolling_loss = _safe_float(latest_event.get("rolling_hourly_loss"), _safe_float(plan.get("rolling_hourly_loss")))
+    cumulative_gross = _safe_float(
+        latest_event.get("cumulative_gross_notional"),
+        _safe_float(plan.get("cumulative_gross_notional")),
+    )
     rolling_per_10k = rolling_loss / cumulative_gross * 10000.0 if cumulative_gross > 0 else 0.0
     amp_1m = _safe_float(_nested(volatility, "metrics", "window_1m", "amplitude_ratio"))
     amp_3m = _safe_float(_nested(volatility, "metrics", "window_3m", "amplitude_ratio"))
@@ -96,8 +124,8 @@ def _plan_metrics(plan: dict[str, Any]) -> dict[str, float | bool | str | None]:
         "rolling_loss": rolling_loss,
         "rolling_per_10k": rolling_per_10k,
         "cumulative_gross": cumulative_gross,
-        "runtime_status": str(plan.get("runtime_status") or ""),
-        "stop_reason": plan.get("stop_reason"),
+        "runtime_status": str(latest_event.get("runtime_status") or plan.get("runtime_status") or ""),
+        "stop_reason": latest_event.get("stop_reason") or plan.get("stop_reason"),
         "market_stable": market_stable,
         "recovery_flat": bool(recovery.get("flat")),
         "market_amp_1m": _safe_float(market.get("amplitude_1m"), amp_1m),
@@ -237,6 +265,8 @@ def _desired_mode(symbol: str, metrics: dict[str, Any]) -> tuple[str, str]:
     runtime_status = str(metrics["runtime_status"])
     stop_reason = str(metrics["stop_reason"] or "")
     is_cooldown = runtime_status == "cooldown" or "rolling_hourly_loss" in stop_reason
+    if float(metrics["rolling_loss"]) >= (14.0 if symbol == "BTCUSDC" else 10.0):
+        return "conservative", "rolling_hourly_loss_still_high"
     if is_cooldown:
         if symbol == "BTCUSDC" and market_stable and float(metrics["market_amp_1m"]) <= 0.0012:
             return "conservative", "recover_btc_after_stable_cooldown"
@@ -296,11 +326,12 @@ def tune_symbol(symbol: str) -> dict[str, Any]:
     files = _files(symbol)
     control = _read_json(files.control)
     plan = _read_json(files.plan)
+    latest_event = _read_last_jsonl(files.events)
     if not control:
         return {"symbol": symbol, "action": "skip", "reason": "missing_control"}
     if not plan:
         return {"symbol": symbol, "action": "skip", "reason": "missing_plan"}
-    metrics = _plan_metrics(plan)
+    metrics = _plan_metrics(plan, latest_event)
     mode, reason = _desired_mode(symbol, metrics)
     changed = _apply_profile(files, control, mode, reason, metrics)
     restarted = False
