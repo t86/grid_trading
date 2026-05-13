@@ -7,7 +7,14 @@ import sys
 from pathlib import Path
 
 from .monitor import RUNNER_PID_PATH, runner_pid_path_for_symbol
-from .web import _build_runner_command, _load_runner_control_config
+from .web import (
+    _build_runner_command,
+    _build_spot_runner_command,
+    _load_runner_control_config,
+    _load_spot_runner_control_config,
+    _runner_control_path,
+    _spot_runner_control_path,
+)
 
 
 DEFAULT_RUNNER_SYMBOL = "SOONUSDT"
@@ -49,6 +56,13 @@ def _anchor_relative_runtime_paths(command: list[str], runner_work_dir: str) -> 
     return anchored
 
 
+def _should_use_spot_runner(symbol: str) -> bool:
+    normalized = str(symbol or "").upper().strip()
+    if not normalized:
+        return False
+    return _spot_runner_control_path(normalized).exists() and not _runner_control_path(normalized).exists()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--symbol", type=str, default="")
@@ -66,10 +80,13 @@ def main() -> None:
     pid_path = Path(pid_path).resolve()
     _write_pid(pid_path)
     atexit.register(_cleanup_pid, pid_path)
-    config = _load_runner_control_config(symbol)
-    if not config:
-        raise SystemExit(f"no saved runner control config found for {symbol}")
-    command = _build_runner_command(config)
+    if _should_use_spot_runner(symbol):
+        config = _load_spot_runner_control_config(symbol)
+        command_builder = _build_spot_runner_command
+    else:
+        config = _load_runner_control_config(symbol)
+        command_builder = _build_runner_command
+    command = command_builder(config)
     command = _anchor_relative_runtime_paths(command, runner_work_dir)
     if runner_work_dir:
         os.chdir(original_cwd)

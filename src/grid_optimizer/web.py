@@ -7704,6 +7704,9 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_taker_exit_min_profit_ratio": 0.0,
     "max_order_position_notional": 0.0,
     "max_position_notional": 0.0,
+    "neutral_base_qty": 0.0,
+    "max_short_position_notional": 0.0,
+    "elastic_volume_enabled": False,
     "sleep_seconds": 10.0,
     "cancel_stale": True,
     "apply": True,
@@ -12480,6 +12483,18 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         payload.get("max_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_position_notional"]),
         "max_position_notional",
     )
+    neutral_base_qty = _safe_float(
+        payload.get("neutral_base_qty", SPOT_RUNNER_DEFAULT_CONFIG["neutral_base_qty"]),
+        "neutral_base_qty",
+    )
+    max_short_position_notional = _safe_float(
+        payload.get("max_short_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_short_position_notional"]),
+        "max_short_position_notional",
+    )
+    elastic_volume_enabled = _safe_bool(
+        payload.get("elastic_volume_enabled", SPOT_RUNNER_DEFAULT_CONFIG["elastic_volume_enabled"]),
+        "elastic_volume_enabled",
+    )
     sleep_seconds = _safe_float(payload.get("sleep_seconds", SPOT_RUNNER_DEFAULT_CONFIG["sleep_seconds"]), "sleep_seconds")
     cancel_stale = _safe_bool(payload.get("cancel_stale", True), "cancel_stale")
     apply = _safe_bool(payload.get("apply", True), "apply")
@@ -12568,14 +12583,19 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             f"unsupported grid_level_mode: {grid_level_mode}; "
             f"supported: {','.join(supported_grid_level_modes())}"
         )
-    if strategy_mode not in {"spot_one_way_long", "spot_volume_shift_long", "spot_competition_inventory_grid"}:
+    if strategy_mode not in {
+        "spot_one_way_long",
+        "spot_volume_shift_long",
+        "spot_competition_inventory_grid",
+        "spot_competition_synthetic_neutral_grid",
+    }:
         raise ValueError("unsupported strategy_mode")
     if strategy_mode == "spot_one_way_long":
         if min_price <= 0 or max_price <= 0 or min_price >= max_price:
             raise ValueError("invalid min_price/max_price")
         if n <= 0:
             raise ValueError("n must be > 0")
-    elif strategy_mode == "spot_competition_inventory_grid":
+    elif strategy_mode in {"spot_competition_inventory_grid", "spot_competition_synthetic_neutral_grid"}:
         if step_price <= 0:
             raise ValueError("step_price must be > 0")
         if per_order_notional <= 0:
@@ -12594,6 +12614,11 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             raise ValueError("max_order_position_notional must be >= 0")
         if max_position_notional <= 0:
             raise ValueError("max_position_notional must be > 0")
+        if strategy_mode == "spot_competition_synthetic_neutral_grid":
+            if neutral_base_qty <= 0:
+                raise ValueError("neutral_base_qty must be > 0")
+            if max_short_position_notional <= 0:
+                raise ValueError("max_short_position_notional must be > 0")
     if total_quote_budget <= 0:
         raise ValueError("total_quote_budget must be > 0")
     if sleep_seconds <= 0:
@@ -12637,6 +12662,9 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_taker_exit_min_profit_ratio": spot_taker_exit_min_profit_ratio,
             "max_order_position_notional": max_order_position_notional,
             "max_position_notional": max_position_notional,
+            "neutral_base_qty": neutral_base_qty,
+            "max_short_position_notional": max_short_position_notional,
+            "elastic_volume_enabled": elastic_volume_enabled,
             "sleep_seconds": sleep_seconds,
             "cancel_stale": cancel_stale,
             "apply": apply,
@@ -12704,6 +12732,10 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("max_order_position_notional", 0.0)),
         "--max-position-notional",
         str(config.get("max_position_notional", 0.0)),
+        "--neutral-base-qty",
+        str(config.get("neutral_base_qty", 0.0)),
+        "--max-short-position-notional",
+        str(config.get("max_short_position_notional", 0.0)),
         "--grid-level-mode",
         str(config.get("grid_level_mode", "arithmetic")),
         "--sleep-seconds",
@@ -12750,6 +12782,7 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--require-non-loss-exit")
     if _truthy(config.get("spot_taker_exit_enabled", False)):
         command.append("--spot-taker-exit-enabled")
+    command.append("--elastic-volume-enabled" if config.get("elastic_volume_enabled", False) else "--no-elastic-volume-enabled")
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")
     command.append("--apply" if config.get("apply", True) else "--no-apply")
     return command
@@ -27132,7 +27165,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
   <div class="wrap">
     <section class="card header">
       <h1>现货比赛执行台</h1>
-      <p>隔离于现有合约 runner。支持 `Spot V1 单向做多静态网格`、`现货量优先移中心` 与 `现货竞赛库存网格` 三种模式，页面直接展示累计成交额、已实现收益、回收损耗、库存与停买状态。</p>
+      <p>隔离于现有合约 runner。支持 `Spot V1 单向做多静态网格`、`现货量优先移中心`、`现货竞赛库存网格` 与 `现货竞赛合成中性网格`，页面直接展示累计成交额、已实现收益、回收损耗、库存与停买状态。</p>
       <div class="header-links">
         <a href="/">返回测算页</a>
         <a href="/monitor">打开合约实盘监控</a>
@@ -27151,6 +27184,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
           <select id="strategy_mode">
             <option value="spot_volume_shift_long">现货量优先移中心</option>
             <option value="spot_competition_inventory_grid">现货竞赛库存网格</option>
+            <option value="spot_competition_synthetic_neutral_grid">现货竞赛合成中性网格</option>
             <option value="spot_one_way_long">Spot V1 单向做多静态网格</option>
           </select>
         </label>
@@ -27514,7 +27548,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         total_quote_budget: Number(
           strategyMode === "spot_one_way_long"
             ? (totalQuoteBudgetEl.value || 0)
-            : strategyMode === "spot_competition_inventory_grid"
+            : strategyMode === "spot_competition_inventory_grid" || strategyMode === "spot_competition_synthetic_neutral_grid"
               ? (competitionTotalQuoteBudgetEl.value || 0)
               : (shiftTotalQuoteBudgetEl.value || 0)
         ),
@@ -27524,6 +27558,11 @@ SPOT_RUNNER_PAGE = """<!doctype html>
         threshold_position_notional: Number(competitionThresholdPositionNotionalEl.value || 0),
         max_order_position_notional: Number(competitionMaxOrderPositionNotionalEl.value || 0),
         max_position_notional: Number(competitionMaxPositionNotionalEl.value || 0),
+        neutral_base_qty: strategyMode === "spot_competition_synthetic_neutral_grid" ? 30000 : 0,
+        max_short_position_notional: strategyMode === "spot_competition_synthetic_neutral_grid"
+          ? Number(competitionMaxPositionNotionalEl.value || 0)
+          : 0,
+        elastic_volume_enabled: strategyMode === "spot_competition_synthetic_neutral_grid",
         sleep_seconds: Number(sleepSecondsEl.value || 10),
         cancel_stale: true,
         apply: true,
@@ -27602,7 +27641,7 @@ SPOT_RUNNER_PAGE = """<!doctype html>
     function toggleModeFields() {
       const mode = String(strategyModeEl.value || "");
       const isStatic = mode === "spot_one_way_long";
-      const isCompetition = mode === "spot_competition_inventory_grid";
+      const isCompetition = mode === "spot_competition_inventory_grid" || mode === "spot_competition_synthetic_neutral_grid";
       staticFieldsEl.classList.toggle("hidden", !isStatic);
       shiftFieldsEl.classList.toggle("hidden", isStatic || isCompetition);
       competitionFieldsEl.classList.toggle("hidden", !isCompetition);

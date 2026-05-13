@@ -27,6 +27,7 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn('controlRunner("save")', SPOT_RUNNER_PAGE)
         self.assertIn("Spot V1 单向做多静态网格", SPOT_RUNNER_PAGE)
         self.assertIn("现货竞赛库存网格", SPOT_RUNNER_PAGE)
+        self.assertIn("现货竞赛合成中性网格", SPOT_RUNNER_PAGE)
         self.assertIn('id="competition_fields"', SPOT_RUNNER_PAGE)
         self.assertIn("/spot_strategies", SPOT_RUNNER_PAGE)
         self.assertIn('placeholder="输入币种，如 XAUTUSDT"', SPOT_RUNNER_PAGE)
@@ -139,6 +140,31 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(payload["max_order_position_notional"], 420.0)
         self.assertEqual(payload["max_position_notional"], 520.0)
 
+    @patch("grid_optimizer.web._validate_market_symbol")
+    def test_normalize_spot_runner_payload_accepts_synthetic_neutral_grid(self, _mock_validate_symbol) -> None:
+        payload = _normalize_spot_runner_payload(
+            {
+                "symbol": "spkusdt",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "total_quote_budget": 1500,
+                "neutral_base_qty": 30000,
+                "step_price": 0.00010,
+                "per_order_notional": 18,
+                "first_order_multiplier": 1,
+                "threshold_position_notional": 520,
+                "max_order_position_notional": 700,
+                "max_position_notional": 900,
+                "max_short_position_notional": 650,
+                "elastic_volume_enabled": True,
+            }
+        )
+
+        self.assertEqual(payload["strategy_mode"], "spot_competition_synthetic_neutral_grid")
+        self.assertEqual(payload["symbol"], "SPKUSDT")
+        self.assertEqual(payload["neutral_base_qty"], 30000.0)
+        self.assertEqual(payload["max_short_position_notional"], 650.0)
+        self.assertTrue(payload["elastic_volume_enabled"])
+
     @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
     @patch("grid_optimizer.web._save_spot_runner_control_config")
     @patch("grid_optimizer.web._validate_market_symbol")
@@ -216,6 +242,34 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--spot-taker-exit-enabled", command)
         self.assertIn("--spot-taker-exit-fee-ratio", command)
         self.assertIn("--spot-taker-exit-min-profit-ratio", command)
+
+    def test_build_spot_runner_command_includes_synthetic_neutral_arguments(self) -> None:
+        config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+        config.update(
+            {
+                "symbol": "SPKUSDT",
+                "strategy_mode": "spot_competition_synthetic_neutral_grid",
+                "total_quote_budget": 1500.0,
+                "neutral_base_qty": 30000.0,
+                "step_price": 0.00010,
+                "per_order_notional": 18.0,
+                "first_order_multiplier": 1.0,
+                "threshold_position_notional": 520.0,
+                "max_order_position_notional": 700.0,
+                "max_position_notional": 900.0,
+                "max_short_position_notional": 650.0,
+                "elastic_volume_enabled": True,
+            }
+        )
+
+        command = _build_spot_runner_command(config)
+
+        self.assertIn("spot_competition_synthetic_neutral_grid", command)
+        self.assertIn("--neutral-base-qty", command)
+        self.assertIn("30000.0", command)
+        self.assertIn("--max-short-position-notional", command)
+        self.assertIn("650.0", command)
+        self.assertIn("--elastic-volume-enabled", command)
 
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")

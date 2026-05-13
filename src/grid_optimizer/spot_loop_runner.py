@@ -39,6 +39,11 @@ EPSILON = 1e-12
 PRICE_CACHE_TTL_SECONDS = 30.0
 _LATEST_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 SPOT_COMPETITION_RUNTIME_CACHE_KEY = "spot_competition_inventory_grid_runtime_cache"
+SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY = "spot_competition_synthetic_neutral_grid_runtime_cache"
+SPOT_COMPETITION_MODES = {
+    "spot_competition_inventory_grid",
+    "spot_competition_synthetic_neutral_grid",
+}
 
 
 def _utc_now() -> datetime:
@@ -105,7 +110,7 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
     loaded_strategy_mode = str(state.get("strategy_mode") or "").strip()
     loaded_symbol = str(state.get("symbol") or "").upper().strip()
     requested_symbol = str(symbol or "").upper().strip()
-    if strategy_mode == "spot_competition_inventory_grid" and (
+    if strategy_mode in SPOT_COMPETITION_MODES and (
         (loaded_strategy_mode and loaded_strategy_mode != strategy_mode)
         or (loaded_symbol and loaded_symbol != requested_symbol)
     ):
@@ -115,8 +120,10 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
         state["last_trade_time_ms"] = 0
         state["metrics"] = _new_metrics()
         state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
-    elif strategy_mode != "spot_competition_inventory_grid":
+        state.pop(SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY, None)
+    elif strategy_mode not in SPOT_COMPETITION_MODES:
         state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+        state.pop(SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY, None)
     state["version"] = STATE_VERSION
     state["symbol"] = symbol
     state["strategy_mode"] = strategy_mode
@@ -233,20 +240,35 @@ def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
     )
 
 
-def _load_cached_spot_competition_runtime(state: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
-    payload = state.get(SPOT_COMPETITION_RUNTIME_CACHE_KEY)
+def _spot_competition_runtime_cache_key(*, synthetic_neutral: bool) -> str:
+    return SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY if synthetic_neutral else SPOT_COMPETITION_RUNTIME_CACHE_KEY
+
+
+def _load_cached_spot_competition_runtime(
+    state: dict[str, Any],
+    *,
+    synthetic_neutral: bool = False,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    cache_key = _spot_competition_runtime_cache_key(synthetic_neutral=synthetic_neutral)
+    expected_market_type = "futures" if synthetic_neutral else "spot"
+    expected_strategy_mode = (
+        "spot_competition_synthetic_neutral_grid"
+        if synthetic_neutral
+        else "spot_competition_inventory_grid"
+    )
+    payload = state.get(cache_key)
     if not isinstance(payload, dict):
         return None, []
-    if str(payload.get("strategy_mode", "")).strip() != "spot_competition_inventory_grid":
-        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    if str(payload.get("strategy_mode", "")).strip() != expected_strategy_mode:
+        state.pop(cache_key, None)
         return None, []
-    if str(payload.get("market_type", "")).strip().lower() != "spot":
-        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    if str(payload.get("market_type", "")).strip().lower() != expected_market_type:
+        state.pop(cache_key, None)
         return None, []
 
     runtime = payload.get("runtime")
-    if not isinstance(runtime, dict) or str(runtime.get("market_type", "")).strip().lower() != "spot":
-        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    if not isinstance(runtime, dict) or str(runtime.get("market_type", "")).strip().lower() != expected_market_type:
+        state.pop(cache_key, None)
         return None, []
 
     applied_trade_keys = [str(item).strip() for item in list(payload.get("applied_trade_keys") or []) if str(item).strip()]
@@ -258,14 +280,20 @@ def _store_cached_spot_competition_runtime(
     state: dict[str, Any],
     runtime: dict[str, Any],
     applied_trade_keys: list[str],
+    synthetic_neutral: bool = False,
 ) -> None:
     cached_runtime = copy.deepcopy(runtime)
     cached_runtime["pair_credit_steps"] = 0
     cached_runtime["recovery_mode"] = "live"
     cached_runtime["recovery_errors"] = []
-    state[SPOT_COMPETITION_RUNTIME_CACHE_KEY] = {
-        "strategy_mode": "spot_competition_inventory_grid",
-        "market_type": "spot",
+    cache_key = _spot_competition_runtime_cache_key(synthetic_neutral=synthetic_neutral)
+    state[cache_key] = {
+        "strategy_mode": (
+            "spot_competition_synthetic_neutral_grid"
+            if synthetic_neutral
+            else "spot_competition_inventory_grid"
+        ),
+        "market_type": "futures" if synthetic_neutral else "spot",
         "runtime": cached_runtime,
         "applied_trade_keys": list(applied_trade_keys),
     }
@@ -310,8 +338,10 @@ def _resolve_spot_competition_runtime(
     order_refs: dict[str, dict[str, Any]],
     step_price: float,
     current_position_qty: float,
+    synthetic_neutral: bool = False,
 ) -> dict[str, Any]:
     expected_position_qty = max(float(current_position_qty), 0.0)
+    runtime_market_type = "futures" if synthetic_neutral else "spot"
     strategy_trades = sorted(
         [
             trade
@@ -324,7 +354,10 @@ def _resolve_spot_competition_runtime(
         ),
     )
 
-    cached_runtime, applied_trade_keys = _load_cached_spot_competition_runtime(state)
+    cached_runtime, applied_trade_keys = _load_cached_spot_competition_runtime(
+        state,
+        synthetic_neutral=synthetic_neutral,
+    )
     if cached_runtime is not None:
         applied_trade_key_set = set(applied_trade_keys)
         cache_valid = True
@@ -351,11 +384,12 @@ def _resolve_spot_competition_runtime(
                 state=state,
                 runtime=cached_runtime,
                 applied_trade_keys=applied_trade_keys,
+                synthetic_neutral=synthetic_neutral,
             )
             return cached_runtime
 
     runtime = rebuild_inventory_grid_runtime(
-        market_type="spot",
+        market_type=runtime_market_type,
         trades=strategy_trades,
         order_refs=order_refs,
         step_price=step_price,
@@ -366,13 +400,15 @@ def _resolve_spot_competition_runtime(
             state=state,
             runtime=runtime,
             applied_trade_keys=[_competition_runtime_trade_key(trade) for trade in strategy_trades],
+            synthetic_neutral=synthetic_neutral,
         )
     elif expected_position_qty <= EPSILON:
-        flat_runtime = new_inventory_grid_runtime(market_type="spot")
+        flat_runtime = new_inventory_grid_runtime(market_type=runtime_market_type)
         _store_cached_spot_competition_runtime(
             state=state,
             runtime=flat_runtime,
             applied_trade_keys=[],
+            synthetic_neutral=synthetic_neutral,
         )
     return runtime
 
@@ -864,7 +900,7 @@ def _sync_volume_shift_trades(
     state["inventory_lots"] = lots
     state["seen_trade_ids"] = sorted(seen_ids)[-5000:]
     state["last_trade_time_ms"] = last_trade_time_ms
-    if str(state.get("strategy_mode") or "").strip() == "spot_competition_inventory_grid":
+    if str(state.get("strategy_mode") or "").strip() in SPOT_COMPETITION_MODES:
         state["known_orders"] = known_orders
     else:
         now_ms = int(time.time() * 1000)
@@ -874,6 +910,69 @@ def _sync_volume_shift_trades(
             for key, value in known_orders.items()
             if int((value or {}).get("created_at_ms", now_ms) or now_ms) >= cutoff_ms
         }
+    return applied
+
+
+def _sync_synthetic_neutral_trades(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    base_asset: str,
+    quote_asset: str,
+) -> int:
+    seen_ids = {int(x) for x in state.get("seen_trade_ids", []) if str(x).strip().isdigit()}
+    known_orders = state.get("known_orders", {})
+    if not isinstance(known_orders, dict):
+        known_orders = {}
+        state["known_orders"] = known_orders
+    metrics = state.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = _new_metrics()
+        state["metrics"] = metrics
+    last_trade_time_ms = int(state.get("last_trade_time_ms") or 0)
+    applied = 0
+    for trade in sorted(trades, key=lambda row: (int(row.get("time", 0) or 0), int(row.get("id", 0) or 0))):
+        trade_id = int(trade.get("id", 0) or 0)
+        if trade_id <= 0 or trade_id in seen_ids:
+            continue
+        order_id = str(int(trade.get("orderId", 0) or 0))
+        meta = known_orders.get(order_id)
+        if not isinstance(meta, dict):
+            continue
+        side = str(meta.get("side", trade.get("isBuyer") and "BUY" or "SELL")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            continue
+        trade_qty = max(_safe_float(trade.get("qty")), 0.0)
+        price = max(_safe_float(trade.get("price")), 0.0)
+        commission = max(_safe_float(trade.get("commission")), 0.0)
+        commission_asset = str(trade.get("commissionAsset", "")).upper().strip()
+        commission_quote = _normalize_commission_quote(
+            commission=commission,
+            commission_asset=commission_asset,
+            price=price,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        _record_trade_metrics(
+            metrics=metrics,
+            trade=trade,
+            side=side,
+            price=price,
+            qty=trade_qty,
+            commission_quote=commission_quote,
+            commission_asset=commission_asset,
+            commission_raw=commission,
+            realized_pnl=-commission_quote,
+            role=str(meta.get("role", "") or ""),
+        )
+        seen_ids.add(trade_id)
+        trade_time_ms = int(trade.get("time", 0) or 0)
+        if trade_time_ms > last_trade_time_ms:
+            last_trade_time_ms = trade_time_ms
+        applied += 1
+    state["seen_trade_ids"] = sorted(seen_ids)[-5000:]
+    state["last_trade_time_ms"] = last_trade_time_ms
+    state["known_orders"] = known_orders
     return applied
 
 
@@ -1300,18 +1399,55 @@ def _build_spot_competition_inventory_grid_orders(
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    synthetic_neutral: bool = False,
+    neutral_base_qty: float = 0.0,
+    max_short_position_notional: float = 0.0,
+    actual_base_qty: float | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     known_orders = state.get("known_orders")
     order_refs = known_orders if isinstance(known_orders, dict) else {}
     inventory_lots = state.get("inventory_lots")
-    current_position_qty = _sum_inventory_qty(inventory_lots if isinstance(inventory_lots, list) else [])
+    tracked_base_qty = _sum_inventory_qty(inventory_lots if isinstance(inventory_lots, list) else [])
+    resolved_actual_base_qty = (
+        max(_safe_float(actual_base_qty), 0.0)
+        if actual_base_qty is not None
+        else tracked_base_qty
+    )
+    neutral_qty = max(_safe_float(neutral_base_qty), 0.0) if synthetic_neutral else 0.0
+    synthetic_net_qty = resolved_actual_base_qty - neutral_qty if synthetic_neutral else resolved_actual_base_qty
+    current_position_qty = abs(synthetic_net_qty) if synthetic_neutral else resolved_actual_base_qty
     runtime = _resolve_spot_competition_runtime(
         state=state,
         trades=trades,
         order_refs=order_refs,
         step_price=step_price,
         current_position_qty=current_position_qty,
+        synthetic_neutral=synthetic_neutral,
     )
+    if synthetic_neutral:
+        runtime["synthetic_neutral"] = True
+        runtime["neutral_base_qty"] = neutral_qty
+        expected_direction_state = "long_active" if synthetic_net_qty > EPSILON else "short_active" if synthetic_net_qty < -EPSILON else "flat"
+        runtime_direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+        if current_position_qty <= EPSILON and runtime_direction_state != "flat":
+            runtime = new_inventory_grid_runtime(market_type="futures")
+            runtime["synthetic_neutral"] = True
+            runtime["neutral_base_qty"] = neutral_qty
+        elif expected_direction_state != "flat" and runtime_direction_state != expected_direction_state:
+            runtime = new_inventory_grid_runtime(market_type="futures")
+            runtime["synthetic_neutral"] = True
+            runtime["neutral_base_qty"] = neutral_qty
+            runtime["direction_state"] = expected_direction_state
+            runtime["position_lots"] = [
+                {
+                    "lot_id": "synthetic_recovered",
+                    "side": "long" if expected_direction_state == "long_active" else "short",
+                    "qty": current_position_qty,
+                    "entry_price": (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0,
+                    "opened_at_ms": 0,
+                    "source_role": "synthetic_recovery",
+                }
+            ]
     if _safe_float(runtime.get("grid_anchor_price")) <= 0:
         runtime["grid_anchor_price"] = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
 
@@ -1328,6 +1464,8 @@ def _build_spot_competition_inventory_grid_orders(
         require_non_loss_exit=require_non_loss_exit,
         max_order_position_notional=max_order_position_notional,
         max_position_notional=max_position_notional,
+        max_short_order_position_notional=max_short_position_notional,
+        max_short_position_notional=max_short_position_notional,
         buy_levels=buy_levels,
         sell_levels=sell_levels,
         tick_size=tick_size,
@@ -1338,8 +1476,11 @@ def _build_spot_competition_inventory_grid_orders(
     desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
     reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
     display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
+    mid_price = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+    current_long_notional = max(synthetic_net_qty, 0.0) * mid_price
+    current_short_notional = max(-synthetic_net_qty, 0.0) * mid_price
     controls = {
-        "mode": "competition_inventory_grid",
+        "mode": "competition_synthetic_neutral_grid" if synthetic_neutral else "competition_inventory_grid",
         "buy_paused": False,
         "pause_reasons": [],
         "shift_frozen": False,
@@ -1360,6 +1501,13 @@ def _build_spot_competition_inventory_grid_orders(
         "threshold_reduce_target_notional": reduce_target_notional,
         "warmup_position_notional": max(_safe_float(warmup_position_notional), 0.0),
         "require_non_loss_exit": bool(require_non_loss_exit),
+        "neutral_base_qty": neutral_qty,
+        "actual_base_qty": resolved_actual_base_qty,
+        "tracked_base_qty": tracked_base_qty,
+        "synthetic_net_qty": synthetic_net_qty,
+        "current_long_notional": current_long_notional,
+        "current_short_notional": current_short_notional,
+        "max_short_position_notional": max(_safe_float(max_short_position_notional), 0.0),
     }
     return desired_orders, controls
 
@@ -1378,8 +1526,13 @@ def _available_new_funds(
     return quote_free, base_free
 
 
+def _total_base_balance(account_info: dict[str, Any], base_asset: str) -> float:
+    base_free, base_locked = _extract_balance(account_info, base_asset)
+    return max(base_free, 0.0) + max(base_locked, 0.0)
+
+
 def _auto_flatten_on_runtime_guard(strategy_mode: str) -> bool:
-    return str(strategy_mode or "").strip() != "spot_competition_inventory_grid"
+    return str(strategy_mode or "").strip() not in SPOT_COMPETITION_MODES
 
 
 def _spot_order_meets_exchange_mins(
@@ -1770,6 +1923,14 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             freeze_shift_abs_return_trigger_ratio=args.freeze_shift_abs_return_trigger_ratio,
         )
         controls = {}
+    elif strategy_mode == "spot_competition_synthetic_neutral_grid":
+        applied_trades = _sync_synthetic_neutral_trades(
+            state=state,
+            trades=trades,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        controls = {}
     else:
         applied_trades = _sync_volume_shift_trades(
             state=state,
@@ -1864,6 +2025,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             market_guard=market_guard,
         )
     else:
+        synthetic_neutral_mode = strategy_mode == "spot_competition_synthetic_neutral_grid"
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state=state,
             trades=trades,
@@ -1884,6 +2046,10 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+            synthetic_neutral=synthetic_neutral_mode,
+            neutral_base_qty=float(getattr(args, "neutral_base_qty", 0.0)),
+            max_short_position_notional=float(getattr(args, "max_short_position_notional", 0.0)),
+            actual_base_qty=_total_base_balance(account_info, base_asset) if synthetic_neutral_mode else None,
         )
     diff = diff_open_orders(existing_orders=strategy_open_orders, desired_orders=desired_orders)
 
@@ -1961,10 +2127,11 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     inventory_qty = _sum_inventory_qty(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
     inventory_cost_quote = _sum_inventory_cost(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
     inventory_avg_cost = (inventory_cost_quote / inventory_qty) if inventory_qty > EPSILON else 0.0
+    synthetic_net_qty = _safe_float(controls.get("synthetic_net_qty")) if isinstance(controls, dict) else 0.0
     managed_base_qty = (
         sum(max(_safe_float((state["cells"].get(str(cell["idx"])) or {}).get("position_qty")), 0.0) for cell in cells)
         if strategy_mode == "spot_one_way_long"
-        else inventory_qty
+        else abs(synthetic_net_qty) if strategy_mode == "spot_competition_synthetic_neutral_grid" else inventory_qty
     )
     unrealized_pnl = (mid_price - inventory_avg_cost) * inventory_qty if inventory_qty > EPSILON else 0.0
     net_pnl_estimate = _safe_float(metrics.get("realized_pnl")) + unrealized_pnl
@@ -2006,6 +2173,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "sell_count": _safe_int(metrics.get("sell_count")),
         "inventory_qty": inventory_qty,
         "inventory_notional": inventory_qty * mid_price,
+        "neutral_base_qty": _safe_float(controls.get("neutral_base_qty")),
+        "actual_base_qty": _safe_float(controls.get("actual_base_qty")),
+        "synthetic_net_qty": _safe_float(controls.get("synthetic_net_qty")),
+        "current_long_notional": _safe_float(controls.get("current_long_notional")),
+        "current_short_notional": _safe_float(controls.get("current_short_notional")),
+        "max_short_position_notional": _safe_float(controls.get("max_short_position_notional")),
         "inventory_avg_cost": inventory_avg_cost,
         "oldest_inventory_age_minutes": _oldest_inventory_age_minutes(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else []),
         "mode": controls.get("mode", "static"),
@@ -2070,6 +2243,11 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("spot competition inventory grid requires per_order_notional > 0")
         if args.max_position_notional <= 0:
             raise RuntimeError("max_position_notional must be > 0")
+        if strategy_mode == "spot_competition_synthetic_neutral_grid":
+            if args.neutral_base_qty <= 0:
+                raise RuntimeError("spot synthetic-neutral grid requires neutral_base_qty > 0")
+            if args.max_short_position_notional <= 0:
+                raise RuntimeError("spot synthetic-neutral grid requires max_short_position_notional > 0")
     api_key, api_secret = creds
     symbol_info = fetch_spot_symbol_config(args.symbol)
     return _run_cycle(args, symbol_info, api_key, api_secret)
@@ -2082,7 +2260,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--strategy-mode",
         type=str,
         default="spot_one_way_long",
-        choices=("spot_one_way_long", "spot_volume_shift_long", "spot_competition_inventory_grid"),
+        choices=(
+            "spot_one_way_long",
+            "spot_volume_shift_long",
+            "spot_competition_inventory_grid",
+            "spot_competition_synthetic_neutral_grid",
+        ),
     )
     parser.add_argument("--min-price", type=float, default=0.0)
     parser.add_argument("--max-price", type=float, default=0.0)
@@ -2130,6 +2313,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-taker-exit-min-profit-ratio", type=float, default=0.0)
     parser.add_argument("--max-order-position-notional", type=float, default=0.0)
     parser.add_argument("--max-position-notional", type=float, default=0.0)
+    parser.add_argument("--neutral-base-qty", type=float, default=0.0)
+    parser.add_argument("--max-short-position-notional", type=float, default=0.0)
+    parser.add_argument("--elastic-volume-enabled", dest="elastic_volume_enabled", action="store_true")
+    parser.add_argument("--no-elastic-volume-enabled", dest="elastic_volume_enabled", action="store_false")
+    parser.set_defaults(elastic_volume_enabled=False)
     parser.add_argument("--max-single-cycle-new-orders", type=int, default=8)
     parser.add_argument("--run-start-time", type=str, default=None)
     parser.add_argument("--run-end-time", type=str, default=None)

@@ -117,6 +117,55 @@ class RunSavedRunnerTests(unittest.TestCase):
         self.assertEqual(command[command.index("--submit-report-json") + 1], "/already/absolute/submit.json")
         self.assertEqual(command[command.index("--summary-jsonl") + 1], "/tmp/runtime/output/events.jsonl")
 
+    @patch("grid_optimizer.run_saved_runner.os.chdir")
+    @patch("grid_optimizer.run_saved_runner.os.getcwd", return_value="/repo")
+    @patch("grid_optimizer.run_saved_runner.atexit.register")
+    @patch("grid_optimizer.run_saved_runner._write_pid")
+    @patch("grid_optimizer.run_saved_runner.os.execvpe")
+    @patch("grid_optimizer.run_saved_runner._should_use_spot_runner", return_value=True)
+    @patch("grid_optimizer.run_saved_runner._build_spot_runner_command")
+    @patch("grid_optimizer.run_saved_runner._load_spot_runner_control_config")
+    @patch("grid_optimizer.run_saved_runner._load_runner_control_config")
+    def test_main_falls_back_to_spot_runner_control_config(
+        self,
+        mock_load_runner_control_config,
+        mock_load_spot_runner_control_config,
+        mock_build_spot_runner_command,
+        _mock_should_use_spot_runner,
+        mock_execvpe,
+        mock_write_pid,
+        mock_atexit_register,
+        _mock_getcwd,
+        mock_chdir,
+    ) -> None:
+        mock_load_spot_runner_control_config.return_value = {
+            "symbol": "SPKUSDT",
+            "market_type": "spot",
+            "strategy_mode": "spot_competition_synthetic_neutral_grid",
+        }
+        mock_build_spot_runner_command.return_value = [
+            "python",
+            "-m",
+            "grid_optimizer.spot_loop_runner",
+            "--symbol",
+            "SPKUSDT",
+        ]
+
+        with patch.dict("os.environ", {}, clear=True), patch.object(
+            sys, "argv", ["run_saved_runner.py", "--symbol", "spkusdt"]
+        ):
+            run_saved_runner.main()
+
+        mock_write_pid.assert_called_once()
+        mock_atexit_register.assert_called_once()
+        mock_chdir.assert_not_called()
+        mock_load_runner_control_config.assert_not_called()
+        mock_load_spot_runner_control_config.assert_called_once_with("SPKUSDT")
+        mock_build_spot_runner_command.assert_called_once_with(mock_load_spot_runner_control_config.return_value)
+        mock_execvpe.assert_called_once()
+        command = mock_execvpe.call_args.args[1]
+        self.assertIn("grid_optimizer.spot_loop_runner", command)
+
 
 if __name__ == "__main__":
     unittest.main()
