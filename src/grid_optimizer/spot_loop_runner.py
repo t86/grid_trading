@@ -404,12 +404,14 @@ def _resolve_spot_competition_runtime(
         )
     elif expected_position_qty <= EPSILON:
         flat_runtime = new_inventory_grid_runtime(market_type=runtime_market_type)
+        replayed_trade_keys = [_competition_runtime_trade_key(trade) for trade in strategy_trades]
         _store_cached_spot_competition_runtime(
             state=state,
             runtime=flat_runtime,
-            applied_trade_keys=[],
+            applied_trade_keys=replayed_trade_keys,
             synthetic_neutral=synthetic_neutral,
         )
+        return flat_runtime
     return runtime
 
 
