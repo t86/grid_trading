@@ -3851,7 +3851,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIsNotNone(snapshot)
         assert snapshot is not None
         self.assertEqual(snapshot["source"], "websocket")
-        self.assertEqual(snapshot["max_age_seconds"], 3.0)
+        self.assertEqual(snapshot["max_age_seconds"], 15.0)
         self.assertEqual(stream.calls, 2)
         mock_sleep.assert_called_once_with(0.1)
 
