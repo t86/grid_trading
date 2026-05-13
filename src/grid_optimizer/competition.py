@@ -17,6 +17,7 @@ COMPETITION_SYMBOLS: tuple[str, ...] = (
     "CLUSDT",
     "BZUSDT",
     "ORDIUSDC",
+    "AIGENSYNUSDT",
 )
 
 COMPETITION_PROFILE_PRESETS: dict[str, dict[str, Any]] = {

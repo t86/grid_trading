@@ -18,6 +18,7 @@ class CompetitionTests(unittest.TestCase):
         self.assertIn("BTCUSDC", COMPETITION_SYMBOLS)
         self.assertIn("XAUUSDT", COMPETITION_SYMBOLS)
         self.assertIn("CLUSDT", COMPETITION_SYMBOLS)
+        self.assertIn("AIGENSYNUSDT", COMPETITION_SYMBOLS)
         mock_get_symbol_list.assert_called_once_with("competition")
 
     @patch("grid_optimizer.competition.get_symbol_list", return_value=["XAUTUSDT", "KATUSDT"])
