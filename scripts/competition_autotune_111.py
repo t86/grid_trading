@@ -296,7 +296,7 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
             "pause_short_position_notional": 280.0,
             "threshold_position_notional": 350.0,
             "max_actual_net_notional": 350.0,
-            "rolling_hourly_loss_limit": 6.0,
+            "rolling_hourly_loss_limit": 18.0,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "elastic_volume_enabled": False,
