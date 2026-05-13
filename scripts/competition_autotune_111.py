@@ -14,7 +14,10 @@ OUTPUT = BASE / "output"
 LOG_PATH = OUTPUT / "competition_autotune_111.jsonl"
 SYMBOLS = ("BTCUSDC", "ETHUSDC", "XAGUSDT")
 LOW_LOSS_PER_10K = 0.5
+TARGET_LOSS_PER_10K = 0.8
 HIGH_LOSS_PER_10K = 1.0
+BTC_BEST_QUOTE_MIN_GROSS_15M = 8_000.0
+ETH_SWITCH_MIN_RELATIVE_VOLUME = 0.30
 ROLLING_LOSS_LIMITS = {
     "BTCUSDC": 14.0,
     "ETHUSDC": 10.0,
@@ -116,6 +119,7 @@ def _plan_metrics(plan: dict[str, Any], latest_event: dict[str, Any]) -> dict[st
     loss_15m = _safe_float(elastic_metrics.get("loss_per_10k_15m"))
     loss_5m = _safe_float(elastic_metrics.get("loss_per_10k_5m"))
     gross_15m = _safe_float(elastic_metrics.get("gross_notional_15m"))
+    gross_5m = _safe_float(elastic_metrics.get("gross_notional_5m"))
     rolling_loss = _safe_float(latest_event.get("rolling_hourly_loss"), _safe_float(plan.get("rolling_hourly_loss")))
     cumulative_gross = _safe_float(
         latest_event.get("cumulative_gross_notional"),
@@ -131,11 +135,19 @@ def _plan_metrics(plan: dict[str, Any], latest_event: dict[str, Any]) -> dict[st
         "loss_15m": loss_15m,
         "loss_5m": loss_5m,
         "gross_15m": gross_15m,
+        "gross_5m": gross_5m,
         "rolling_loss": rolling_loss,
         "rolling_per_10k": rolling_per_10k,
         "cumulative_gross": cumulative_gross,
         "runtime_status": str(latest_event.get("runtime_status") or plan.get("runtime_status") or ""),
         "stop_reason": latest_event.get("stop_reason") or plan.get("stop_reason"),
+        "strategy_mode": str(latest_event.get("strategy_mode") or plan.get("strategy_mode") or ""),
+        "effective_strategy_profile": str(
+            latest_event.get("effective_strategy_profile") or plan.get("effective_strategy_profile") or ""
+        ),
+        "actual_net_notional": _safe_float(latest_event.get("actual_net_notional"), _safe_float(plan.get("actual_net_notional"))),
+        "volatility_pause_active": bool(_nested(volatility, "active")),
+        "volatility_pause_reason": _nested(volatility, "reason"),
         "market_stable": market_stable,
         "recovery_flat": bool(recovery.get("flat")),
         "market_amp_1m": _safe_float(market.get("amplitude_1m"), amp_1m),
@@ -266,6 +278,54 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
             "volatility_entry_pause_30s_abs_return_ratio": 0.0012,
             "volatility_entry_pause_1m_abs_return_ratio": 0.0018,
         },
+        "best_quote_candidate": {
+            "strategy_profile": "ethusdc_best_quote_maker_volume_v1",
+            "strategy_mode": "best_quote_maker_volume_v1",
+            "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_cycle_budget_notional": 260.0,
+            "best_quote_maker_volume_target_remaining_notional": 1_000_000.0,
+            "best_quote_maker_volume_quote_offset_ticks": 0,
+            "best_quote_maker_volume_defensive_offset_ticks": 5,
+            "best_quote_maker_volume_max_long_notional": 900.0,
+            "best_quote_maker_volume_max_short_notional": 900.0,
+            "best_quote_maker_volume_inventory_soft_ratio": 0.40,
+            "best_quote_maker_volume_loss_per_10k_soft": 0.30,
+            "best_quote_maker_volume_loss_per_10k_hard": 0.65,
+            "best_quote_maker_volume_soft_loss_budget_scale": 0.30,
+            "best_quote_maker_volume_min_cycle_budget_notional": 25.0,
+            "step_price": 0.01,
+            "per_order_notional": 90.0,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "max_new_orders": 5,
+            "max_total_notional": 1600.0,
+            "max_position_notional": 900.0,
+            "max_short_position_notional": 900.0,
+            "pause_buy_position_notional": 500.0,
+            "pause_short_position_notional": 500.0,
+            "threshold_position_notional": 650.0,
+            "max_actual_net_notional": 650.0,
+            "rolling_hourly_loss_limit": 8.0,
+            "flat_start_enabled": False,
+            "warm_start_enabled": True,
+            "elastic_volume_enabled": False,
+            "adaptive_step_enabled": False,
+            "volatility_entry_pause_enabled": True,
+            "volatility_entry_pause_10s_abs_return_ratio": 0.00080,
+            "volatility_entry_pause_10s_amplitude_ratio": 0.00120,
+            "volatility_entry_pause_30s_abs_return_ratio": 0.00120,
+            "volatility_entry_pause_30s_amplitude_ratio": 0.00180,
+            "volatility_entry_pause_1m_abs_return_ratio": 0.00180,
+            "volatility_entry_pause_1m_amplitude_ratio": 0.00260,
+            "volatility_entry_pause_3m_abs_return_ratio": 0.00320,
+            "volatility_entry_pause_3m_amplitude_ratio": 0.00480,
+            "volatility_entry_pause_recover_confirm_cycles": 2,
+            "anti_chase_entry_guard_enabled": True,
+            "anti_chase_entry_guard_1m_abs_return_ratio": 0.0028,
+            "anti_chase_entry_guard_1m_amplitude_ratio": 0.0040,
+            "anti_chase_entry_guard_3m_abs_return_ratio": 0.0060,
+            "anti_chase_entry_guard_3m_amplitude_ratio": 0.0085,
+        },
         "conservative": {
             "step_price": 2.75,
             "per_order_notional": 550.0,
@@ -304,19 +364,19 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
     },
     "XAGUSDT": {
         "aggressive": {
-            "step_price": 0.08,
-            "per_order_notional": 180.0,
-            "buy_levels": 12,
-            "sell_levels": 12,
-            "max_new_orders": 48,
-            "max_position_notional": 2800.0,
-            "max_short_position_notional": 2800.0,
-            "pause_buy_position_notional": 2100.0,
-            "pause_short_position_notional": 2100.0,
-            "threshold_position_notional": 2400.0,
-            "max_total_notional": 10000.0,
-            "rolling_hourly_loss_limit": 12.0,
-            "max_actual_net_notional": 2000.0,
+            "step_price": 0.16,
+            "per_order_notional": 70.0,
+            "buy_levels": 8,
+            "sell_levels": 8,
+            "max_new_orders": 24,
+            "max_position_notional": 800.0,
+            "max_short_position_notional": 800.0,
+            "pause_buy_position_notional": 520.0,
+            "pause_short_position_notional": 520.0,
+            "threshold_position_notional": 650.0,
+            "max_total_notional": 3200.0,
+            "rolling_hourly_loss_limit": 4.0,
+            "max_actual_net_notional": 480.0,
             "take_profit_min_profit_ratio": 0.0,
             "adaptive_step_30s_abs_return_ratio": 0.0010,
             "adaptive_step_1m_abs_return_ratio": 0.0016,
@@ -389,7 +449,7 @@ PROFILES: dict[str, dict[str, dict[str, Any]]] = {
 }
 
 
-def _desired_mode(symbol: str, metrics: dict[str, Any]) -> tuple[str, str]:
+def _desired_mode(symbol: str, metrics: dict[str, Any], comparison: dict[str, Any] | None = None) -> tuple[str, str]:
     loss_15m = float(metrics["loss_15m"])
     loss_5m = float(metrics["loss_5m"])
     rolling_per_10k = float(metrics["rolling_per_10k"])
@@ -402,6 +462,16 @@ def _desired_mode(symbol: str, metrics: dict[str, Any]) -> tuple[str, str]:
     high_loss = max(loss_15m, loss_5m) > HIGH_LOSS_PER_10K
     if high_loss:
         return "conservative", "loss_per_10k_above_1"
+    if symbol == "ETHUSDC" and comparison and comparison.get("eth_best_quote_switch_ready"):
+        return "best_quote_candidate", "btc_best_quote_sample_good_switch_eth_candidate"
+    if (
+        symbol == "ETHUSDC"
+        and comparison
+        and comparison.get("eth_strategy") == "best_quote_maker_volume_v1"
+        and max(loss_15m, loss_5m, rolling_per_10k) <= TARGET_LOSS_PER_10K
+        and market_stable
+    ):
+        return "best_quote_candidate", "eth_best_quote_under_target_keep_running"
     if is_cooldown:
         if (
             symbol in RECOVERABLE_STABLE_SYMBOLS
@@ -411,6 +481,8 @@ def _desired_mode(symbol: str, metrics: dict[str, Any]) -> tuple[str, str]:
         ):
             return "conservative", f"recover_{symbol.lower()}_after_stable_cooldown"
         return "conservative", "runtime_loss_cooldown"
+    if symbol == "XAGUSDT" and float(metrics["gross_15m"]) < 5_000.0:
+        return "conservative", "xag_low_sample_keep_conservative"
     if max(loss_15m, loss_5m, rolling_per_10k) < LOW_LOSS_PER_10K and market_stable:
         return "aggressive", "loss_per_10k_below_0.5_and_stable"
     return "conservative", "middle_loss_or_unstable"
@@ -460,17 +532,98 @@ def _append_log(record: dict[str, Any]) -> None:
         handle.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
-def tune_symbol(symbol: str) -> dict[str, Any]:
+def _symbol_snapshot(symbol: str) -> dict[str, Any]:
     files = _files(symbol)
     control = _read_json(files.control)
     plan = _read_json(files.plan)
     latest_event = _read_last_jsonl(files.events)
+    metrics = _plan_metrics(plan, latest_event) if plan else {}
+    return {
+        "symbol": symbol,
+        "files": files,
+        "control": control,
+        "plan": plan,
+        "latest_event": latest_event,
+        "metrics": metrics,
+    }
+
+
+def _comparison(snapshots: dict[str, dict[str, Any]]) -> dict[str, Any]:
+    btc = snapshots.get("BTCUSDC", {})
+    eth = snapshots.get("ETHUSDC", {})
+    btc_metrics = btc.get("metrics") if isinstance(btc.get("metrics"), dict) else {}
+    eth_metrics = eth.get("metrics") if isinstance(eth.get("metrics"), dict) else {}
+    btc_control = btc.get("control") if isinstance(btc.get("control"), dict) else {}
+    eth_control = eth.get("control") if isinstance(eth.get("control"), dict) else {}
+
+    btc_loss = max(
+        _safe_float(btc_metrics.get("loss_15m")),
+        _safe_float(btc_metrics.get("loss_5m")),
+        _safe_float(btc_metrics.get("rolling_per_10k")),
+    )
+    eth_loss = max(
+        _safe_float(eth_metrics.get("loss_15m")),
+        _safe_float(eth_metrics.get("loss_5m")),
+        _safe_float(eth_metrics.get("rolling_per_10k")),
+    )
+    btc_gross_15m = _safe_float(btc_metrics.get("gross_15m"))
+    eth_gross_15m = _safe_float(eth_metrics.get("gross_15m"))
+    relative_volume = btc_gross_15m / eth_gross_15m if eth_gross_15m > 0 else None
+    btc_best_quote = (
+        btc_control.get("strategy_mode") == "best_quote_maker_volume_v1"
+        or btc_metrics.get("strategy_mode") == "best_quote_maker_volume_v1"
+    )
+    btc_sample_good = (
+        btc_best_quote
+        and btc_metrics.get("runtime_status") == "running"
+        and not btc_metrics.get("volatility_pause_active")
+        and btc_gross_15m >= BTC_BEST_QUOTE_MIN_GROSS_15M
+        and btc_loss <= TARGET_LOSS_PER_10K
+        and bool(btc_metrics.get("market_stable"))
+    )
+    volume_ok = relative_volume is None or relative_volume >= ETH_SWITCH_MIN_RELATIVE_VOLUME
+    eth_best_quote_switch_ready = btc_sample_good and volume_ok
+    if not btc_best_quote:
+        switch_reason = "btc_not_best_quote"
+    elif btc_metrics.get("runtime_status") != "running":
+        switch_reason = "btc_not_running"
+    elif btc_metrics.get("volatility_pause_active"):
+        switch_reason = "btc_volatility_pause"
+    elif btc_gross_15m < BTC_BEST_QUOTE_MIN_GROSS_15M:
+        switch_reason = "btc_sample_gross_too_low"
+    elif btc_loss > TARGET_LOSS_PER_10K:
+        switch_reason = "btc_loss_above_target"
+    elif not bool(btc_metrics.get("market_stable")):
+        switch_reason = "btc_market_unstable"
+    elif not volume_ok:
+        switch_reason = "btc_volume_too_low_vs_eth"
+    else:
+        switch_reason = "ready"
+    return {
+        "target_loss_per_10k": TARGET_LOSS_PER_10K,
+        "btc_strategy": btc_control.get("strategy_mode") or btc_metrics.get("strategy_mode"),
+        "eth_strategy": eth_control.get("strategy_mode") or eth_metrics.get("strategy_mode"),
+        "btc_loss_score": btc_loss,
+        "eth_loss_score": eth_loss,
+        "btc_gross_15m": btc_gross_15m,
+        "eth_gross_15m": eth_gross_15m,
+        "btc_to_eth_gross_15m_ratio": relative_volume,
+        "eth_best_quote_switch_ready": eth_best_quote_switch_ready,
+        "eth_switch_reason": switch_reason,
+    }
+
+
+def tune_snapshot(snapshot: dict[str, Any], comparison: dict[str, Any] | None = None) -> dict[str, Any]:
+    symbol = str(snapshot["symbol"])
+    files = snapshot["files"]
+    control = snapshot.get("control") if isinstance(snapshot.get("control"), dict) else {}
+    plan = snapshot.get("plan") if isinstance(snapshot.get("plan"), dict) else {}
     if not control:
         return {"symbol": symbol, "action": "skip", "reason": "missing_control"}
     if not plan:
         return {"symbol": symbol, "action": "skip", "reason": "missing_plan"}
-    metrics = _plan_metrics(plan, latest_event)
-    mode, reason = _desired_mode(symbol, metrics)
+    metrics = snapshot.get("metrics") if isinstance(snapshot.get("metrics"), dict) else {}
+    mode, reason = _desired_mode(symbol, metrics, comparison)
     changed = _apply_profile(files, control, mode, reason, metrics)
     restarted = False
     if changed:
@@ -486,13 +639,15 @@ def tune_symbol(symbol: str) -> dict[str, Any]:
 
 
 def main() -> None:
+    snapshots = {symbol: _symbol_snapshot(symbol) for symbol in SYMBOLS}
+    comparison = _comparison(snapshots)
     records = []
     for symbol in SYMBOLS:
         try:
-            records.append(tune_symbol(symbol))
+            records.append(tune_snapshot(snapshots[symbol], comparison))
         except Exception as exc:
             records.append({"symbol": symbol, "action": "error", "error": str(exc)})
-    record = {"ts": _now_iso(), "records": records}
+    record = {"ts": _now_iso(), "comparison": comparison, "records": records}
     _append_log(record)
     print(json.dumps(record, ensure_ascii=False, sort_keys=True))
 
