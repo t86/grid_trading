@@ -966,7 +966,7 @@ def test_tail_cleanup_emits_single_cleanup_order() -> None:
     assert plan["buy_orders"] == []
 
 
-def test_tail_cleanup_below_exchange_mins_is_skipped() -> None:
+def test_tail_cleanup_below_exchange_mins_keeps_grid_entries_live() -> None:
     runtime = new_inventory_grid_runtime(market_type="spot")
     runtime["direction_state"] = "long_active"
     runtime["grid_anchor_price"] = 0.10
@@ -999,7 +999,7 @@ def test_tail_cleanup_below_exchange_mins_is_skipped() -> None:
 
     assert plan["tail_cleanup_active"] is True
     assert plan["sell_orders"] == []
-    assert plan["buy_orders"] == []
+    assert [item["role"] for item in plan["buy_orders"]] == ["grid_entry"]
 
 
 def test_tail_cleanup_overrides_threshold_reduce_only() -> None:

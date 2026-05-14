@@ -603,16 +603,16 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-            return _finalize_inventory_grid_plan(
-                risk_state=risk_state,
-                bootstrap_orders=bootstrap_orders,
-                buy_orders=buy_orders,
-                sell_orders=sell_orders,
-                forced_reduce_orders=forced_reduce_orders,
-                tail_cleanup_active=True,
-                min_qty=min_qty,
-                min_notional=min_notional,
-            )
+                return _finalize_inventory_grid_plan(
+                    risk_state=risk_state,
+                    bootstrap_orders=bootstrap_orders,
+                    buy_orders=buy_orders,
+                    sell_orders=sell_orders,
+                    forced_reduce_orders=forced_reduce_orders,
+                    tail_cleanup_active=True,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
 
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         planned_closing_qty = 0.0
@@ -769,16 +769,16 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-            return _finalize_inventory_grid_plan(
-                risk_state=risk_state,
-                bootstrap_orders=bootstrap_orders,
-                buy_orders=buy_orders,
-                sell_orders=sell_orders,
-                forced_reduce_orders=forced_reduce_orders,
-                tail_cleanup_active=True,
-                min_qty=min_qty,
-                min_notional=min_notional,
-            )
+                return _finalize_inventory_grid_plan(
+                    risk_state=risk_state,
+                    bootstrap_orders=bootstrap_orders,
+                    buy_orders=buy_orders,
+                    sell_orders=sell_orders,
+                    forced_reduce_orders=forced_reduce_orders,
+                    tail_cleanup_active=True,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
 
         exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
         if synthetic_neutral:
