@@ -36,6 +36,21 @@ from .audit import (
     read_trade_audit_rows,
     trade_row_time_ms,
 )
+from .ai_scheduler import (
+    build_scheduler_symbol_candidates,
+    delete_scheduler_task,
+    get_scheduler_task,
+    expand_scheduler_targets,
+    group_task_runs,
+    list_scheduler_task_runs,
+    list_scheduler_tasks,
+    load_global_policy,
+    next_run_at_for_task,
+    save_global_policy,
+    save_scheduler_task,
+    update_scheduler_task,
+)
+from .ai_scheduler_worker import run_scheduler_task
 from .backtest import (
     build_grid_levels,
     run_backtest,
@@ -137,6 +152,7 @@ from .running_status import (
     build_running_status_cross_payload as _build_cross_running_status_payload,
     build_running_status_local_payload as _build_local_running_status_payload,
     _read_jsonl_tail as _read_running_status_jsonl_tail,
+    normalize_running_status_server_payload,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
 from .symbol_lists import (
@@ -26841,8 +26857,97 @@ def _run_strategy_workspace_query(query: dict[str, list[str]]) -> dict[str, Any]
     return payload
 
 
+def _scheduler_available_servers(registry: dict[str, Any]) -> list[dict[str, Any]]:
+    servers: list[dict[str, Any]] = []
+    for server in registry.get("servers") or []:
+        if not isinstance(server, dict):
+            continue
+        if not bool(server.get("enabled", True)):
+            continue
+        if not bool(server.get("scheduler_enabled", False)):
+            continue
+        if not str(server.get("base_url") or "").strip():
+            continue
+        if not all(str(server.get(key) or "").strip() for key in ("ssh_host", "ssh_user", "workspace_dir", "codex_path", "python_path")):
+            continue
+        servers.append(server)
+    return servers
+
+
+def _run_ai_scheduler_query(query: dict[str, list[str]]) -> dict[str, Any]:
+    registry = load_console_registry()
+    available_servers = _scheduler_available_servers(registry)
+    server_payloads: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    for server in available_servers:
+        server_id = str(server.get("id") or "").strip()
+        try:
+            payload = _fetch_remote_json(server, "/api/running_status", params={"scope": "local"})
+            payload = normalize_running_status_server_payload(payload, server=server)
+        except Exception as exc:
+            warnings.append(f"{server_id or 'unknown'} unavailable: {type(exc).__name__}: {exc}")
+            payload = {
+                "ok": False,
+                "scope": "local",
+                "view_mode": "local",
+                "server_id": server_id or None,
+                "server_label": str(server.get("label") or "").strip() or None,
+                "server_base_url": str(server.get("base_url") or "").strip().rstrip("/"),
+                "groups": {"running": [], "saved_idle": []},
+                "summary": {"running_symbol_count": 0, "saved_idle_symbol_count": 0},
+                "error": f"{type(exc).__name__}: {exc}",
+            }
+        server_payloads.append(payload)
+    running_status_payload = {
+        "ok": True,
+        "scope": "ai_scheduler",
+        "view_mode": "scheduler_candidates",
+        "servers": server_payloads,
+        "warnings": warnings,
+    }
+    return {
+        "ok": True,
+        "available_servers": available_servers,
+        "global_policy": load_global_policy(),
+        "tasks": list_scheduler_tasks(),
+        "candidates": build_scheduler_symbol_candidates(running_status_payload),
+        "warnings": warnings,
+    }
+
+
+def _run_ai_scheduler_results_query(query: dict[str, list[str]]) -> dict[str, Any]:
+    rows = list_scheduler_task_runs()
+    return {
+        "ok": True,
+        "groups": group_task_runs(rows),
+    }
+
+
+def _normalize_scheduler_policy_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "allow_update_config": bool(payload.get("allow_update_config", False)),
+        "allow_start_stop": bool(payload.get("allow_start_stop", False)),
+        "allow_cancel_orders": bool(payload.get("allow_cancel_orders", False)),
+        "allow_reduce_position": bool(payload.get("allow_reduce_position", False)),
+        "allow_switch_strategy_mode": bool(payload.get("allow_switch_strategy_mode", False)),
+        "max_config_change_ratio": float(payload.get("max_config_change_ratio", 0.2) or 0.2),
+        "max_notional_delta": float(payload.get("max_notional_delta", 300.0) or 300.0),
+        "default_goal_prompt": str(payload.get("default_goal_prompt") or "").strip(),
+    }
+
+
 def _render_strategy_workspace_page() -> str:
     return STRATEGY_WORKSPACE_PAGE
+
+
+
+
+def _render_ai_scheduler_page() -> str:
+    return AI_SCHEDULER_PAGE
+
+
+def _render_ai_scheduler_results_page() -> str:
+    return AI_SCHEDULER_RESULTS_PAGE
 
 
 STRATEGY_WORKSPACE_PAGE = """<!doctype html>
@@ -27140,6 +27245,482 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
     document.getElementById("toggle_btn").addEventListener("click", (event) => { state.paused = !state.paused; event.target.textContent = state.paused ? "恢复自动刷新" : "暂停自动刷新"; });
     load().catch((err) => metaEl.textContent = err.message);
     state.timer = setInterval(() => { if (!state.paused) load().catch(() => {}); }, 20000);
+  </script>
+</body>
+</html>
+"""
+
+
+AI_SCHEDULER_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 定时任务控制台</title>
+  <style>
+    :root { --bg:#f6f4ef; --panel:#fffefa; --line:#ded8cb; --text:#1f2937; --muted:#667085; --brand:#0f766e; --good:#15803d; --warn:#b76e00; --bad:#b42318; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
+    .shell { max-width:1520px; margin:0 auto; padding:18px 16px 40px; display:grid; gap:14px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .topbar,.actions,.row { display:flex; gap:10px; flex-wrap:wrap; }
+    .topbar { justify-content:space-between; align-items:flex-start; }
+    .layout { display:grid; grid-template-columns:1.1fr 1.2fr .9fr; gap:14px; }
+    .summary { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px; }
+    .metric,.card,.check-item { border:1px solid var(--line); border-radius:8px; background:#fff; padding:12px; }
+    .metric span { display:block; color:var(--muted); font-size:12px; }
+    .metric strong { display:block; margin-top:6px; font-size:22px; }
+    .row { justify-content:space-between; align-items:center; padding:8px 0; border-bottom:1px solid #eee7da; }
+    .row:last-child { border-bottom:none; }
+    .check-grid,.form-grid,.server-symbol-list { display:grid; gap:10px; }
+    .check-grid,.server-symbol-list { grid-template-columns:repeat(2,minmax(0,1fr)); }
+    .form-grid { grid-template-columns:1fr 1fr; }
+    .check-item { display:flex; gap:8px; align-items:flex-start; padding:8px; }
+    .check-item.active { border-color:var(--brand); box-shadow:inset 0 0 0 1px var(--brand); background:#f5fffd; }
+    .check-item input { width:auto; margin-top:3px; }
+    .check-meta { display:grid; gap:3px; }
+    .server-symbol-block { display:grid; gap:8px; margin-bottom:12px; }
+    .pill, button, a.button { min-height:34px; border:1px solid var(--line); border-radius:8px; padding:0 10px; background:#fff; color:var(--text); text-decoration:none; font-size:13px; font-weight:700; display:inline-flex; align-items:center; }
+    button.primary { background:var(--brand); border-color:var(--brand); color:#fff; }
+    button.warn { background:#fff8eb; color:#8a4b00; border-color:#e7c98f; }
+    button.danger { background:#fff0ee; color:#b42318; border-color:#efb0a9; }
+    textarea, input, select { width:100%; border:1px solid var(--line); border-radius:8px; background:#fff; color:var(--text); padding:9px 10px; font-size:14px; }
+    textarea { min-height:96px; resize:vertical; }
+    label { display:grid; gap:6px; color:var(--muted); font-size:12px; font-weight:700; }
+    .table-wrap { overflow:auto; }
+    table { width:100%; min-width:1260px; border-collapse:collapse; font-size:13px; }
+    th,td { padding:10px 8px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { color:var(--muted); font-size:12px; }
+    .subtle { color:var(--muted); font-size:13px; line-height:1.55; }
+    .group-title { margin:0 0 10px; font-size:16px; }
+    .status-good { color:var(--good); font-weight:700; }
+    .status-warn { color:var(--warn); font-weight:700; }
+    .status-bad { color:var(--bad); font-weight:700; }
+    .code { font-family:ui-monospace,SFMono-Regular,Menlo,monospace; font-size:12px; }
+    @media (max-width:1180px){ .layout{grid-template-columns:1fr;} .summary{grid-template-columns:1fr;} .check-grid,.server-symbol-list,.form-grid{grid-template-columns:1fr;} }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel topbar">
+      <div>
+        <h1 style="margin:0 0 6px;">AI 定时任务控制台</h1>
+        <p class="subtle">按服务器与币种创建 AI 定时任务，统一管理全局默认规则、任务启停和最近执行摘要。</p>
+        <div class="actions">
+          <a class="button" href="/strategy_workspace">策略工作台</a>
+          <a class="button" href="/running_status_overview">跨服表格</a>
+          <a class="button" href="/ai_scheduler_results">查看执行结果</a>
+          <span class="subtle" data-results-api="/api/ai_scheduler_results"></span>
+        </div>
+      </div>
+      <div class="actions">
+        <button id="refresh_btn" class="primary">刷新</button>
+        <button id="create_btn">创建并启动</button>
+      </div>
+    </section>
+    <section class="summary">
+      <div class="metric"><span>目标服务器</span><strong id="server_count">--</strong></div>
+      <div class="metric"><span>候选币种</span><strong id="symbol_count">--</strong></div>
+      <div class="metric"><span>已创建任务</span><strong id="task_count">--</strong></div>
+    </section>
+    <section class="layout">
+      <section class="panel">
+        <h2 class="group-title">目标服务器</h2>
+        <div id="servers_box" class="card subtle">加载中...</div>
+        <div class="topbar" style="margin-top:14px;">
+          <h2 class="group-title" style="margin:0;">候选币种</h2>
+          <label class="subtle" style="display:flex;align-items:center;gap:8px;">
+            <input id="symbols_selected_only" type="checkbox" style="width:auto;" checked />
+            仅看已选服务器
+          </label>
+        </div>
+        <div id="symbols_box" class="card subtle">候选币种</div>
+      </section>
+      <section class="panel">
+        <h2 class="group-title">任务定义</h2>
+        <div class="form-grid">
+          <label>任务名称<input id="task_name" value="AI 巡检任务" /></label>
+          <label>执行模式
+            <select id="execution_mode">
+              <option value="one_shot">one_shot</option>
+              <option value="sticky_memory">sticky_memory</option>
+            </select>
+          </label>
+          <label>执行周期
+            <select id="schedule_value">
+              <option value="10m">每 10 分钟</option>
+              <option value="1h">每 1 小时</option>
+              <option value="1d">每 1 天</option>
+            </select>
+          </label>
+          <label>时区<input id="schedule_timezone" value="Asia/Shanghai" /></label>
+        </div>
+        <label style="margin-top:10px;">基础目标
+          <textarea id="goal_prompt">优先稳态调参，允许直接启停策略，禁止平仓/减仓和策略模式切换。</textarea>
+        </label>
+        <div class="form-grid" style="margin-top:10px;">
+          <label>任务级规则覆盖
+            <select id="policy_override_mode">
+              <option value="inherit">继承全局默认</option>
+              <option value="override">单独覆盖</option>
+            </select>
+          </label>
+        </div>
+      </section>
+      <section class="panel">
+        <h2 class="group-title">全局默认规则</h2>
+        <div id="policy_box" class="card subtle"></div>
+        <div class="actions" style="margin-top:10px;">
+          <button id="save_policy_btn" class="primary">保存全局规则</button>
+        </div>
+        <h2 class="group-title" style="margin-top:14px;">提交预览</h2>
+        <div id="preview_box" class="card subtle">创建并启动</div>
+      </section>
+    </section>
+    <section class="panel">
+      <div class="topbar">
+        <div>
+          <h2 class="group-title" style="margin:0;">已创建任务</h2>
+          <p class="subtle">支持编辑、启停、立即执行与查看最近摘要。</p>
+        </div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>任务</th><th>服务器</th><th>币种</th><th>周期</th><th>状态</th><th>模式</th><th>下次执行</th><th>最近结果</th><th>操作</th></tr>
+          </thead>
+          <tbody id="task_body"><tr><td colspan="9" class="subtle">暂无任务</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+  </main>
+  <script>
+    const serverCountEl = document.getElementById("server_count");
+    const symbolCountEl = document.getElementById("symbol_count");
+    const taskCountEl = document.getElementById("task_count");
+    const serversBoxEl = document.getElementById("servers_box");
+    const symbolsBoxEl = document.getElementById("symbols_box");
+    const policyBoxEl = document.getElementById("policy_box");
+    const previewBoxEl = document.getElementById("preview_box");
+    const taskBodyEl = document.getElementById("task_body");
+    const taskNameEl = document.getElementById("task_name");
+    const executionModeEl = document.getElementById("execution_mode");
+    const scheduleValueEl = document.getElementById("schedule_value");
+    const scheduleTimezoneEl = document.getElementById("schedule_timezone");
+    const goalPromptEl = document.getElementById("goal_prompt");
+    const policyOverrideModeEl = document.getElementById("policy_override_mode");
+    const symbolsSelectedOnlyEl = document.getElementById("symbols_selected_only");
+    let state = { payload:null, selectedServerIds:new Set(), selectedSymbols:new Set(), activeServerId:null };
+    function esc(v){ return String(v ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch])); }
+    function statusClass(status){
+      if (status === "success" || status === "enabled") return "status-good";
+      if (status === "paused" || status === "rejected") return "status-warn";
+      if (status === "error") return "status-bad";
+      return "";
+    }
+    function boolField(id, label, value){
+      return `<label class="check-item"><input type="checkbox" id="${id}" ${value ? "checked" : ""} /><span class="check-meta"><strong>${esc(label)}</strong></span></label>`;
+    }
+    function numField(id, label, value){
+      return `<label>${esc(label)}<input id="${id}" type="number" step="0.01" value="${esc(value)}" /></label>`;
+    }
+    function renderServers(availableServers){
+      if (!availableServers.length) {
+        serversBoxEl.textContent = "暂无可调度服务器";
+        return;
+      }
+      if (!state.selectedServerIds.size) {
+        availableServers.forEach((item) => state.selectedServerIds.add(item.id || item.server_id));
+      }
+      if (!state.activeServerId) {
+        state.activeServerId = availableServers[0].id || availableServers[0].server_id;
+      }
+      serversBoxEl.innerHTML = `<div class="check-grid">${availableServers.map((item) => {
+        const serverId = item.id || item.server_id;
+        return `<label class="check-item ${state.activeServerId === serverId ? "active" : ""}" data-server-focus="${esc(serverId)}"><input type="checkbox" data-server-id="${esc(serverId)}" ${state.selectedServerIds.has(serverId) ? "checked" : ""} /><span class="check-meta"><strong>${esc(item.label || serverId)}</strong><span class="subtle code">${esc(item.base_url || "--")}</span></span></label>`;
+      }).join("")}</div>`;
+      serversBoxEl.querySelectorAll("[data-server-id]").forEach((input) => {
+        input.addEventListener("change", (event) => {
+          const serverId = event.target.getAttribute("data-server-id");
+          if (!serverId) return;
+          if (event.target.checked) state.selectedServerIds.add(serverId);
+          else state.selectedServerIds.delete(serverId);
+          if (event.target.checked) {
+            state.activeServerId = serverId;
+          } else if (!state.selectedServerIds.has(state.activeServerId) && symbolsSelectedOnlyEl.checked) {
+            state.activeServerId = Array.from(state.selectedServerIds)[0] || serverId;
+          }
+          renderServers(state.payload?.available_servers || []);
+          renderSymbols(state.payload?.candidates || {servers:[]});
+          renderPreview();
+        });
+      });
+      serversBoxEl.querySelectorAll("[data-server-focus]").forEach((item) => {
+        item.addEventListener("click", (event) => {
+          if (event.target && event.target.matches('input[type="checkbox"]')) return;
+          const serverId = item.getAttribute("data-server-focus");
+          if (!serverId) return;
+          state.activeServerId = serverId;
+          renderServers(availableServers);
+          renderSymbols(state.payload?.candidates || {servers:[]});
+        });
+      });
+    }
+    function renderSymbols(candidates){
+      const allServerGroups = candidates.servers || [];
+      let serverGroups = allServerGroups;
+      if (symbolsSelectedOnlyEl.checked) {
+        serverGroups = allServerGroups.filter((server) => state.selectedServerIds.has(server.server_id));
+      } else if (state.activeServerId) {
+        serverGroups = allServerGroups.filter((server) => server.server_id === state.activeServerId);
+      }
+      const allSymbols = [];
+      serverGroups.forEach((server) => {
+        (server.symbols || []).forEach((item) => {
+          if (item && item.symbol && !allSymbols.includes(item.symbol)) allSymbols.push(item.symbol);
+        });
+      });
+      if (!state.selectedSymbols.size) {
+        allSymbols.forEach((symbol) => state.selectedSymbols.add(symbol));
+      }
+      if (!serverGroups.length) {
+        symbolsBoxEl.textContent = symbolsSelectedOnlyEl.checked ? "已选服务器暂无候选币种" : "当前服务器暂无候选币种";
+        return;
+      }
+      const diagnostics = serverGroups
+        .filter((server) => !(server.symbols || []).length || server.ok === false)
+        .map((server) => {
+          const name = server.server_label || server.server_id || "--";
+          if (server.ok === false) return `${name}: 连接失败 - ${server.error || "未知错误"}`;
+          return `${name}: 当前无 running/saved_idle`;
+        });
+      symbolsBoxEl.innerHTML = serverGroups.map((server) => `
+        <div class="server-symbol-block">
+          <strong>${esc(server.server_label || server.server_id || "--")}</strong>
+          ${(server.symbols || []).length ? `<div class="server-symbol-list">
+            ${(server.symbols || []).map((item) => `
+              <label class="check-item">
+                <input type="checkbox" data-symbol="${esc(item.symbol)}" ${state.selectedSymbols.has(item.symbol) ? "checked" : ""} />
+                <span class="check-meta"><strong>${esc(item.symbol)}</strong><span class="subtle">${esc(item.status)}</span></span>
+              </label>
+            `).join("")}
+          </div>` : `<div class="subtle">${server.ok === false ? `连接失败：${esc(server.error || "未知错误")}` : "当前无 running/saved_idle"}</div>`}
+        </div>
+      `).join("") + (diagnostics.length ? `<div class="subtle">${diagnostics.map(esc).join("<br>")}</div>` : "");
+      symbolsBoxEl.querySelectorAll("[data-symbol]").forEach((input) => {
+        input.addEventListener("change", (event) => {
+          const symbol = event.target.getAttribute("data-symbol");
+          if (!symbol) return;
+          if (event.target.checked) state.selectedSymbols.add(symbol);
+          else state.selectedSymbols.delete(symbol);
+          renderPreview();
+        });
+      });
+    }
+    function renderPolicy(policy){
+      policyBoxEl.innerHTML = `
+        <div class="check-grid">
+          ${boolField("policy_allow_update_config", "允许直接调参数", Boolean(policy.allow_update_config))}
+          ${boolField("policy_allow_start_stop", "允许直接启停策略", Boolean(policy.allow_start_stop))}
+          ${boolField("policy_allow_cancel_orders", "允许直接清理挂单", Boolean(policy.allow_cancel_orders))}
+          ${boolField("policy_allow_reduce_position", "允许直接平仓/减仓", Boolean(policy.allow_reduce_position))}
+          ${boolField("policy_allow_switch_strategy_mode", "允许切换策略模式", Boolean(policy.allow_switch_strategy_mode))}
+        </div>
+        <div class="form-grid" style="margin-top:10px;">
+          ${numField("policy_max_config_change_ratio", "单次最大调参幅度", policy.max_config_change_ratio ?? 0.2)}
+          ${numField("policy_max_notional_delta", "单次最大名义调整", policy.max_notional_delta ?? 300)}
+        </div>
+      `;
+      if (document.activeElement !== goalPromptEl && policy.default_goal_prompt !== undefined && !goalPromptEl.dataset.dirty) {
+        goalPromptEl.value = policy.default_goal_prompt || "";
+      }
+    }
+    function currentPolicyPayload(){
+      return {
+        allow_update_config: document.getElementById("policy_allow_update_config").checked,
+        allow_start_stop: document.getElementById("policy_allow_start_stop").checked,
+        allow_cancel_orders: document.getElementById("policy_allow_cancel_orders").checked,
+        allow_reduce_position: document.getElementById("policy_allow_reduce_position").checked,
+        allow_switch_strategy_mode: document.getElementById("policy_allow_switch_strategy_mode").checked,
+        max_config_change_ratio: Number(document.getElementById("policy_max_config_change_ratio").value || 0.2),
+        max_notional_delta: Number(document.getElementById("policy_max_notional_delta").value || 300),
+        default_goal_prompt: goalPromptEl.value.trim(),
+      };
+    }
+    function taskActionButtons(task){
+      const codeUrl = task.code_server_url || "";
+      return `<div class="actions"><button data-task-run="${esc(task.task_id)}" class="primary">立即执行</button><button data-task-toggle="${esc(task.task_id)}" data-enabled="${task.enabled ? "0" : "1"}" class="${task.enabled ? "warn" : ""}">${task.enabled ? "暂停" : "启用"}</button><button data-task-edit="${esc(task.task_id)}">载入编辑</button>${codeUrl ? `<a class="button" href="${esc(codeUrl)}" target="_blank" rel="noopener noreferrer">code-server</a>` : ""}<button data-task-delete="${esc(task.task_id)}" class="danger">删除</button></div>`;
+    }
+    function attachTaskActions(){
+      taskBodyEl.querySelectorAll("[data-task-run]").forEach((button) => button.addEventListener("click", () => runTask(button.getAttribute("data-task-run"))));
+      taskBodyEl.querySelectorAll("[data-task-toggle]").forEach((button) => button.addEventListener("click", () => toggleTask(button.getAttribute("data-task-toggle"), button.getAttribute("data-enabled") === "1")));
+      taskBodyEl.querySelectorAll("[data-task-edit]").forEach((button) => button.addEventListener("click", () => loadTaskIntoForm(button.getAttribute("data-task-edit"))));
+      taskBodyEl.querySelectorAll("[data-task-delete]").forEach((button) => button.addEventListener("click", () => deleteTask(button.getAttribute("data-task-delete"))));
+    }
+    function renderPreview(){
+      const serverIds = Array.from(state.selectedServerIds);
+      const symbols = Array.from(state.selectedSymbols);
+      previewBoxEl.textContent = serverIds.length && symbols.length ? `将创建 ${serverIds.length} 台服务器 x ${symbols.length} 个币种 = ${serverIds.length * symbols.length} 条独立任务。` : "请至少勾选一台服务器和一个币种。";
+    }
+    function render(payload){
+      state.payload = payload;
+      const availableServers = payload.available_servers || [];
+      const candidates = payload.candidates || {servers:[]};
+      const tasks = payload.tasks || [];
+      const policy = payload.global_policy || {};
+      serverCountEl.textContent = String(availableServers.length);
+      symbolCountEl.textContent = String((candidates.servers || []).reduce((sum, item) => sum + (item.symbols || []).length, 0));
+      taskCountEl.textContent = String(tasks.length);
+      renderServers(availableServers);
+      renderSymbols(candidates);
+      renderPolicy(policy);
+      renderPreview();
+      taskBodyEl.innerHTML = tasks.length ? tasks.map((task) => `<tr><td><strong>${esc(task.name || task.task_id)}</strong><div class="subtle code">${esc(task.task_id)}</div></td><td>${esc(task.server_id)}</td><td>${esc(task.symbol)}</td><td>${esc((task.schedule || {}).value || "--")}</td><td><span class="${statusClass(task.enabled ? "enabled" : "paused")}">${task.enabled ? "enabled" : "paused"}</span></td><td>${esc(task.execution_mode || "--")}</td><td>${esc(task.next_run_at || "--")}</td><td><span class="${statusClass(task.last_result_status)}">${esc(task.last_result_status || "--")}</span><div class="subtle">${esc(task.last_result_summary || "--")}</div></td><td>${taskActionButtons(task)}</td></tr>`).join("") : '<tr><td colspan="9" class="subtle">暂无任务</td></tr>';
+      attachTaskActions();
+    }
+    async function postJson(url, payload){
+      const resp = await fetch(url, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify(payload)});
+      const data = await resp.json();
+      if(!resp.ok || data.ok === false){ throw new Error(data.error || `HTTP ${resp.status}`); }
+      return data;
+    }
+    function taskOverridesPayload(){
+      if (policyOverrideModeEl.value !== "override") return {};
+      return currentPolicyPayload();
+    }
+    async function createTasks(){
+      const availableServers = Array.from(state.selectedServerIds);
+      const candidateSymbols = Array.from(state.selectedSymbols);
+      if(!availableServers.length || !candidateSymbols.length){ throw new Error("暂无可创建的服务器或币种"); }
+      await postJson("/api/ai_scheduler/create", {
+        name: taskNameEl.value.trim() || "AI 巡检任务",
+        server_ids: availableServers,
+        symbols: candidateSymbols,
+        schedule: {kind:"interval", value:scheduleValueEl.value, timezone:scheduleTimezoneEl.value.trim() || "Asia/Shanghai"},
+        goal_prompt: goalPromptEl.value.trim(),
+        execution_mode: executionModeEl.value,
+        policy_overrides: taskOverridesPayload(),
+      });
+      await load();
+    }
+    function loadTaskIntoForm(taskId){
+      const task = (state.payload?.tasks || []).find((item) => item.task_id === taskId);
+      if (!task) return;
+      taskNameEl.value = task.name || "";
+      executionModeEl.value = task.execution_mode || "one_shot";
+      scheduleValueEl.value = (task.schedule || {}).value || "10m";
+      scheduleTimezoneEl.value = (task.schedule || {}).timezone || "Asia/Shanghai";
+      goalPromptEl.value = task.goal_prompt || "";
+      state.selectedServerIds = new Set([task.server_id]);
+      state.selectedSymbols = new Set([task.symbol]);
+      policyOverrideModeEl.value = Object.keys(task.policy_overrides || {}).length ? "override" : "inherit";
+      render(state.payload);
+    }
+    async function toggleTask(taskId, enabled){ await postJson("/api/ai_scheduler/task/update", {task_id: taskId, enabled}); await load(); }
+    async function deleteTask(taskId){ await postJson("/api/ai_scheduler/task/delete", {task_id: taskId}); await load(); }
+    async function runTask(taskId){ previewBoxEl.textContent = "正在执行任务..."; await postJson("/api/ai_scheduler/task/run", {task_id: taskId}); await load(); }
+    async function savePolicy(){
+      const button = document.getElementById("save_policy_btn");
+      const originalText = button.textContent;
+      button.disabled = true;
+      button.textContent = "保存中...";
+      previewBoxEl.textContent = "正在保存全局规则...";
+      try {
+        const data = await postJson("/api/ai_scheduler/policy", currentPolicyPayload());
+        if (state.payload) state.payload.global_policy = data.global_policy || currentPolicyPayload();
+        delete goalPromptEl.dataset.dirty;
+        renderPolicy(data.global_policy || currentPolicyPayload());
+        previewBoxEl.textContent = "全局规则和基础目标已保存。新任务会继承这套默认内容；已有任务如果设置了任务级覆盖，会继续使用自己的覆盖规则。";
+        button.textContent = "已保存";
+        setTimeout(() => { button.textContent = originalText; button.disabled = false; }, 1200);
+      } catch (err) {
+        button.textContent = originalText;
+        button.disabled = false;
+        throw err;
+      }
+    }
+    async function load(){
+      const resp = await fetch("/api/ai_scheduler");
+      const payload = await resp.json();
+      if(!resp.ok || payload.ok === false){ throw new Error(payload.error || `HTTP ${resp.status}`); }
+      render(payload);
+    }
+    document.getElementById("refresh_btn").addEventListener("click", () => load().catch((err) => { serversBoxEl.textContent = err.message; }));
+    document.getElementById("create_btn").addEventListener("click", () => createTasks().catch((err) => { previewBoxEl.textContent = err.message; }));
+    document.getElementById("save_policy_btn").addEventListener("click", () => savePolicy().catch((err) => { previewBoxEl.textContent = err.message; }));
+    goalPromptEl.addEventListener("input", () => { goalPromptEl.dataset.dirty = "1"; });
+    symbolsSelectedOnlyEl.addEventListener("change", () => {
+      if (symbolsSelectedOnlyEl.checked && !state.selectedServerIds.has(state.activeServerId) && state.selectedServerIds.size) {
+        state.activeServerId = Array.from(state.selectedServerIds)[0];
+      }
+      renderSymbols(state.payload?.candidates || {servers:[]});
+    });
+    load().catch((err) => { serversBoxEl.textContent = err.message; });
+  </script>
+</body>
+</html>
+"""
+
+
+AI_SCHEDULER_RESULTS_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>AI 执行结果</title>
+  <style>
+    :root { --bg:#f6f4ef; --panel:#fffefa; --line:#ded8cb; --text:#1f2937; --muted:#667085; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--text); font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC",sans-serif; }
+    .shell { max-width:1520px; margin:0 auto; padding:18px 16px 40px; display:grid; gap:14px; }
+    .panel { background:var(--panel); border:1px solid var(--line); border-radius:8px; padding:14px; }
+    .actions { display:flex; gap:8px; flex-wrap:wrap; }
+    a.button, button { min-height:34px; border:1px solid var(--line); border-radius:8px; padding:0 10px; background:#fff; color:var(--text); text-decoration:none; font-size:13px; font-weight:700; display:inline-flex; align-items:center; }
+    .subtle { color:var(--muted); font-size:13px; line-height:1.55; }
+    .server, .symbol, .run { border:1px solid var(--line); border-radius:8px; background:#fff; padding:12px; margin-top:10px; }
+    .run { margin-top:8px; }
+    .status-good { color:#15803d; font-weight:700; }
+    .status-warn { color:#b76e00; font-weight:700; }
+    .status-bad { color:#b42318; font-weight:700; }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <section class="panel">
+      <h1 style="margin:0 0 6px;">AI 执行结果</h1>
+      <p class="subtle">按服务器查看，再按币种查看每次执行记录、执行摘要和最终状态。</p>
+      <div class="actions">
+        <a class="button" href="/ai_scheduler">返回任务控制台</a>
+        <button id="refresh_btn">刷新</button>
+      </div>
+    </section>
+    <section class="panel">
+      <h2 style="margin:0 0 8px;">按服务器查看</h2>
+      <div class="subtle">按币种查看</div>
+      <div id="results_box" class="subtle">执行摘要</div>
+    </section>
+  </main>
+  <script>
+    const resultsBoxEl = document.getElementById("results_box");
+    function esc(v){ return String(v ?? "").replace(/[&<>"']/g, (ch) => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[ch])); }
+    function statusClass(status){
+      if (status === "success") return "status-good";
+      if (status === "rejected") return "status-warn";
+      if (status === "error") return "status-bad";
+      return "";
+    }
+    function render(payload){
+      const groups = payload.groups || [];
+      resultsBoxEl.innerHTML = groups.length ? groups.map((server) => `<div class="server"><strong>${esc(server.server_id)}</strong>${(server.symbols || []).map((symbol) => `<div class="symbol"><div><strong>${esc(symbol.symbol)}</strong></div>${(symbol.runs || []).map((run) => `<div class="run"><div><span class="${statusClass(run.status)}">${esc(run.status || "--")}</span> · ${esc(run.triggered_at || "--")}</div><div class="subtle">${esc(run.summary || run.status || "执行摘要")}</div></div>`).join("") || '<div class="run">暂无记录</div>'}</div>`).join("")}</div>`).join("") : "暂无执行记录";
+    }
+    async function load(){
+      const resp = await fetch("/api/ai_scheduler_results");
+      const payload = await resp.json();
+      if(!resp.ok || payload.ok === false){ throw new Error(payload.error || `HTTP ${resp.status}`); }
+      render(payload);
+    }
+    document.getElementById("refresh_btn").addEventListener("click", () => load().catch((err) => { resultsBoxEl.textContent = err.message; }));
+    load().catch((err) => { resultsBoxEl.textContent = err.message; });
   </script>
 </body>
 </html>
@@ -33680,6 +34261,96 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _handle_ai_scheduler_create(self, payload: dict[str, Any]) -> dict[str, Any]:
+        name = str(payload.get("name") or "").strip() or "AI 巡检任务"
+        server_ids = payload.get("server_ids")
+        symbols = payload.get("symbols")
+        schedule = payload.get("schedule")
+        if not isinstance(server_ids, list) or not server_ids:
+            raise ValueError("server_ids is required")
+        if not isinstance(symbols, list) or not symbols:
+            raise ValueError("symbols is required")
+        if not isinstance(schedule, dict) or not schedule:
+            raise ValueError("schedule is required")
+        goal_prompt = str(payload.get("goal_prompt") or "").strip()
+        if not goal_prompt:
+            raise ValueError("goal_prompt is required")
+        execution_mode = str(payload.get("execution_mode") or "one_shot").strip() or "one_shot"
+        policy_overrides = payload.get("policy_overrides")
+        if policy_overrides is not None and not isinstance(policy_overrides, dict):
+            raise ValueError("policy_overrides must be object")
+        tasks = expand_scheduler_targets(
+            name=name,
+            server_ids=[str(item).strip() for item in server_ids],
+            symbols=[str(item).upper().strip() for item in symbols],
+            schedule=schedule,
+            goal_prompt=goal_prompt,
+            execution_mode=execution_mode,
+            global_policy=load_global_policy(),
+            policy_overrides=policy_overrides if isinstance(policy_overrides, dict) else {},
+        )
+        for task in tasks:
+            save_scheduler_task(task)
+        return {"ok": True, "created_count": len(tasks), "tasks": tasks}
+
+    def _handle_ai_scheduler_policy_update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        policy = save_global_policy(_normalize_scheduler_policy_payload(payload))
+        return {"ok": True, "global_policy": policy}
+
+    def _handle_ai_scheduler_task_update(self, payload: dict[str, Any]) -> dict[str, Any]:
+        task_id = str(payload.get("task_id") or "").strip()
+        if not task_id:
+            raise ValueError("task_id is required")
+        task = get_scheduler_task(task_id)
+        if task is None:
+            raise ValueError(f"unknown task_id: {task_id}")
+        updates: dict[str, Any] = {}
+        if "enabled" in payload:
+            updates["enabled"] = bool(payload.get("enabled"))
+            updates["next_run_at"] = next_run_at_for_task(task) if updates["enabled"] else ""
+        if "name" in payload:
+            updates["name"] = str(payload.get("name") or "").strip() or task.get("name")
+        if "goal_prompt" in payload:
+            goal_prompt = str(payload.get("goal_prompt") or "").strip()
+            if not goal_prompt:
+                raise ValueError("goal_prompt is required")
+            updates["goal_prompt"] = goal_prompt
+        if "execution_mode" in payload:
+            updates["execution_mode"] = str(payload.get("execution_mode") or "").strip() or "one_shot"
+        if "schedule" in payload:
+            schedule = payload.get("schedule")
+            if not isinstance(schedule, dict) or not schedule:
+                raise ValueError("schedule must be object")
+            updates["schedule"] = schedule
+            if bool(payload.get("enabled", task.get("enabled", False))):
+                updates["next_run_at"] = next_run_at_for_task({**task, **updates})
+        if "policy_overrides" in payload:
+            overrides = payload.get("policy_overrides")
+            if not isinstance(overrides, dict):
+                raise ValueError("policy_overrides must be object")
+            updates["policy_overrides"] = overrides
+            updates["effective_policy_snapshot"] = {**load_global_policy(), **overrides}
+        updated = update_scheduler_task(task_id, updates)
+        return {"ok": True, "task": updated}
+
+    def _handle_ai_scheduler_task_delete(self, payload: dict[str, Any]) -> dict[str, Any]:
+        task_id = str(payload.get("task_id") or "").strip()
+        if not task_id:
+            raise ValueError("task_id is required")
+        if not delete_scheduler_task(task_id):
+            raise ValueError(f"unknown task_id: {task_id}")
+        return {"ok": True, "deleted": True, "task_id": task_id}
+
+    def _handle_ai_scheduler_task_run(self, payload: dict[str, Any]) -> dict[str, Any]:
+        task_id = str(payload.get("task_id") or "").strip()
+        if not task_id:
+            raise ValueError("task_id is required")
+        task = get_scheduler_task(task_id)
+        if task is None:
+            raise ValueError(f"unknown task_id: {task_id}")
+        result = run_scheduler_task(task)
+        return {"ok": True, "result": result}
+
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)
         path = parsed.path
@@ -33716,6 +34387,12 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path in {"/strategy_workspace", "/strategy_workspace.html"}:
             self._send_html(_render_strategy_workspace_page(), status=HTTPStatus.OK)
+            return
+        if path in {"/ai_scheduler", "/ai_scheduler.html"}:
+            self._send_html(_render_ai_scheduler_page(), status=HTTPStatus.OK)
+            return
+        if path in {"/ai_scheduler_results", "/ai_scheduler_results.html"}:
+            self._send_html(_render_ai_scheduler_results_page(), status=HTTPStatus.OK)
             return
         if path in {"/competition_volume", "/competition_volume.html"}:
             self._send_html(COMPETITION_VOLUME_PAGE, status=HTTPStatus.OK)
@@ -33782,6 +34459,28 @@ class _Handler(BaseHTTPRequestHandler):
         if path == "/api/strategy_workspace":
             try:
                 payload = _run_strategy_workspace_query(query)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
+            return
+        if path == "/api/ai_scheduler":
+            try:
+                payload = _run_ai_scheduler_query(query)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
+            return
+        if path == "/api/ai_scheduler_results":
+            try:
+                payload = _run_ai_scheduler_results_query(query)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
@@ -34121,6 +34820,18 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/ai_scheduler", "/ai_scheduler.html"}:
+            body = _render_ai_scheduler_page().encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
+        if path in {"/ai_scheduler_results", "/ai_scheduler_results.html"}:
+            body = _render_ai_scheduler_results_page().encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/monitor", "/monitor.html"}:
             body = MONITOR_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -34170,6 +34881,8 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/running_status"
             or path == "/api/running_status_overview"
             or path == "/api/strategy_workspace"
+            or path == "/api/ai_scheduler"
+            or path == "/api/ai_scheduler_results"
             or path.startswith("/api/loop_monitor")
             or path == "/api/running_status"
             or path == "/api/grid_preview"

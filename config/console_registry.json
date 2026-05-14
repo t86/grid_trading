@@ -1,13 +1,42 @@
 {
   "servers": [
     {
+      "id": "srv_110",
+      "label": "Controller 110",
+      "base_url": "http://43.156.35.110:8787",
+      "location": "Tencent",
+      "enabled": true,
+      "capabilities": [
+        "futures_monitor",
+        "competition_board",
+        "strategies"
+      ],
+      "notes": "AI scheduler control plane on 110",
+      "scheduler_enabled": true,
+      "ssh_host": "43.156.35.110",
+      "ssh_user": "ubuntu",
+      "workspace_dir": "/home/ubuntu/wangge",
+      "codex_path": "/usr/local/bin/codex",
+      "python_path": "/usr/bin/python3"
+    },
+    {
       "id": "srv_150",
       "label": "Main Entry A",
       "base_url": "http://43.131.232.150:8789",
       "location": "Singapore",
       "enabled": true,
-      "capabilities": ["futures_monitor", "competition_board", "strategies"],
-      "notes": "Primary console node"
+      "capabilities": [
+        "futures_monitor",
+        "competition_board",
+        "strategies"
+      ],
+      "notes": "Primary console node",
+      "scheduler_enabled": true,
+      "ssh_host": "43.131.232.150",
+      "ssh_user": "ubuntu",
+      "workspace_dir": "/home/ubuntu/wangge",
+      "codex_path": "/usr/local/bin/codex",
+      "python_path": "/usr/bin/python3"
     },
     {
       "id": "srv_114",
@@ -15,7 +44,18 @@
       "base_url": "http://43.155.163.114:8788",
       "location": "Singapore",
       "enabled": true,
-      "capabilities": ["futures_monitor", "spot_runner", "spot_strategies", "strategies"]
+      "capabilities": [
+        "futures_monitor",
+        "spot_runner",
+        "spot_strategies",
+        "strategies"
+      ],
+      "scheduler_enabled": true,
+      "ssh_host": "43.155.163.114",
+      "ssh_user": "ubuntu",
+      "workspace_dir": "/home/ubuntu/wangge",
+      "codex_path": "/usr/local/bin/codex",
+      "python_path": "/usr/bin/python3"
     },
     {
       "id": "srv_111",
@@ -23,7 +63,19 @@
       "base_url": "http://43.155.136.111:8788",
       "location": "Oracle",
       "enabled": true,
-      "capabilities": ["futures_monitor", "competition_board", "strategies", "spot_runner", "spot_strategies"]
+      "capabilities": [
+        "futures_monitor",
+        "competition_board",
+        "strategies",
+        "spot_runner",
+        "spot_strategies"
+      ],
+      "scheduler_enabled": true,
+      "ssh_host": "43.155.136.111",
+      "ssh_user": "ubuntu",
+      "workspace_dir": "/home/ubuntu/wangge",
+      "codex_path": "/usr/local/bin/codex",
+      "python_path": "/usr/bin/python3"
     }
   ],
   "accounts": [
@@ -35,8 +87,17 @@
       "priority": 100,
       "enabled": true,
       "default_symbols": [],
-      "competition_symbols": ["KAT", "BARD", "XAUT", "BASED"],
-      "pages": ["/monitor", "/strategies", "/competition_board"],
+      "competition_symbols": [
+        "KAT",
+        "BARD",
+        "XAUT",
+        "BASED"
+      ],
+      "pages": [
+        "/monitor",
+        "/strategies",
+        "/competition_board"
+      ],
       "notes": "Default console account"
     },
     {
@@ -47,8 +108,17 @@
       "priority": 90,
       "enabled": true,
       "default_symbols": [],
-      "competition_symbols": ["KAT", "BARD", "XAUT", "BASED"],
-      "pages": ["/monitor", "/strategies", "/competition_board"]
+      "competition_symbols": [
+        "KAT",
+        "BARD",
+        "XAUT",
+        "BASED"
+      ],
+      "pages": [
+        "/monitor",
+        "/strategies",
+        "/competition_board"
+      ]
     },
     {
       "id": "lb",
@@ -58,8 +128,17 @@
       "priority": 80,
       "enabled": true,
       "default_symbols": [],
-      "competition_symbols": ["KAT", "BARD", "XAUT", "BASED"],
-      "pages": ["/monitor", "/strategies", "/competition_board"]
+      "competition_symbols": [
+        "KAT",
+        "BARD",
+        "XAUT",
+        "BASED"
+      ],
+      "pages": [
+        "/monitor",
+        "/strategies",
+        "/competition_board"
+      ]
     }
   ],
   "competition_source": {
