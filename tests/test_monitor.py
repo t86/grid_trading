@@ -223,6 +223,75 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(meta["deduped_row_count"], 1)
         self.assertAlmostEqual(summarize_income(rows)["funding_fee"], 0.01, places=8)
 
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_trade_rows_dedupes_audit_composite_id_against_api_trade(self, mock_fetch_time_paged) -> None:
+        session_start = datetime(2026, 5, 12, 10, 0, tzinfo=timezone.utc)
+        trade_time_ms = int((session_start + timedelta(minutes=5)).timestamp() * 1000)
+        audit_trade = {
+            "id": "84866504:gx-aigensynu-entrysho-2-86848575:1778586861251:5369.0:0.03352",
+            "orderId": 84866504,
+            "clientOrderId": "gx-aigensynu-entrysho-2-86848575",
+            "symbol": "AIGENSYNUSDT",
+            "time": trade_time_ms,
+            "side": "SELL",
+            "price": 0.03352,
+            "qty": 5369.0,
+            "realizedPnl": "0",
+            "commission": "0.00003911",
+            "commissionAsset": "BNB",
+        }
+        api_trade = {
+            "id": 10324910,
+            "orderId": 84866504,
+            "symbol": "AIGENSYNUSDT",
+            "time": trade_time_ms - 611,
+            "side": "SELL",
+            "price": "0.0335200",
+            "qty": "5369",
+            "realizedPnl": "0",
+            "commission": "0.00003911",
+            "commissionAsset": "BNB",
+        }
+        later_api_trade = {
+            "id": 10324911,
+            "orderId": 84866505,
+            "symbol": "AIGENSYNUSDT",
+            "time": trade_time_ms + 1000,
+            "side": "BUY",
+            "price": "0.03351",
+            "qty": "100",
+            "realizedPnl": "0.05",
+            "commission": "0.001",
+            "commissionAsset": "USDT",
+        }
+        mock_fetch_time_paged.return_value = [api_trade, later_api_trade]
+
+        with TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "aigensynusdt_loop_trade_audit.jsonl"
+            audit_path.write_text(json.dumps(audit_trade) + "\n", encoding="utf-8")
+
+            rows, meta = _load_or_fetch_trade_rows(
+                audit_path=audit_path,
+                symbol="AIGENSYNUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=session_start,
+            )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], audit_trade["id"])
+        self.assertEqual(rows[1]["id"], later_api_trade["id"])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 1)
+        self.assertEqual(meta["api_row_count"], 2)
+        self.assertEqual(meta["merged_row_count"], 2)
+        self.assertEqual(meta["deduped_row_count"], 1)
+        self.assertAlmostEqual(
+            summarize_user_trades(rows)["gross_notional"],
+            (0.03352 * 5369) + (0.03351 * 100),
+            places=8,
+        )
+
     def test_summarize_hourly_metrics_combines_trades_income_and_candles(self) -> None:
         hour0 = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
         hour1 = datetime(2026, 3, 19, 9, 0, tzinfo=timezone.utc)

@@ -550,11 +550,27 @@ def _load_or_fetch_trade_rows(
             "start_time": effective_start.isoformat(),
         }
 
+    def _trade_merge_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        order_id = row.get("orderId")
+        if order_id is not None:
+            return (
+                "order_fill",
+                str(order_id).strip(),
+                str(row.get("side", "")).upper().strip(),
+                round(_safe_float(row.get("price")), 12),
+                round(_safe_float(row.get("qty")), 12),
+            )
+        return (
+            "trade_id",
+            int(trade_row_time_ms(row) or 0),
+            trade_row_key(row),
+        )
+
     merged: list[dict[str, Any]] = []
-    seen: set[tuple[int, str]] = set()
+    seen: set[tuple[Any, ...]] = set()
     duplicate_count = 0
     for row in [*audit_rows, *api_rows]:
-        key = (int(trade_row_time_ms(row) or 0), trade_row_key(row))
+        key = _trade_merge_key(row)
         if key in seen:
             duplicate_count += 1
             continue
