@@ -152,6 +152,41 @@ class FuturesSignedResponseCacheTests(unittest.TestCase):
         self.assertEqual(second, [{"orderId": 99}])
         self.assertEqual(mock_http.call_count, 1)
 
+    @patch("grid_optimizer.data.urlencode", return_value="")
+    @patch("grid_optimizer.data.urlopen")
+    @patch("grid_optimizer.data.time.time")
+    def test_binance_1003_sets_cross_process_cooldown(self, mock_time, mock_urlopen, _mock_urlencode) -> None:
+        class FakeResponse:
+            def __init__(self, payload: bytes) -> None:
+                self.payload = payload
+                self.status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return None
+
+            def read(self, _size: int = -1) -> bytes:
+                payload, self.payload = self.payload, b""
+                return payload
+
+        mock_time.return_value = 10.0
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(
+            data, "BINANCE_RATE_LIMIT_FILE_PATH", Path(temp_dir) / "cooldown.json"
+        ), patch.object(data, "BINANCE_RATE_LIMIT_COOLDOWN_SECONDS", 30.0):
+            mock_urlopen.return_value = FakeResponse(
+                b'{"code":-1003,"msg":"Too many requests; please use websocket"}'
+            )
+            with self.assertRaisesRegex(RuntimeError, "Binance API error -1003"):
+                data._http_get_json("https://fapi.binance.com/fapi/v1/premiumIndex", {})
+
+            mock_urlopen.reset_mock()
+            mock_time.return_value = 20.0
+            with self.assertRaisesRegex(RuntimeError, "local cooldown active"):
+                data._http_get_json("https://fapi.binance.com/fapi/v1/premiumIndex", {})
+            mock_urlopen.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

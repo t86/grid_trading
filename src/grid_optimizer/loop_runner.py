@@ -137,6 +137,7 @@ XAUT_ADAPTIVE_STATE_NORMAL = "normal"
 XAUT_ADAPTIVE_STATE_DEFENSIVE = "defensive"
 XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
+AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GRID_AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS", "300.0"))
 TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS = 10 * 60.0
@@ -3889,6 +3890,17 @@ def _load_audit_state(path: Path) -> dict[str, Any]:
 
 
 def _should_sync_account_audit(audit_state: dict[str, Any], *, now: datetime) -> bool:
+    cooldown_until_raw = str((audit_state or {}).get("rate_limit_cooldown_until") or "").strip()
+    if cooldown_until_raw:
+        try:
+            cooldown_until = datetime.fromisoformat(cooldown_until_raw.replace("Z", "+00:00"))
+        except ValueError:
+            cooldown_until = None
+        if cooldown_until is not None:
+            if cooldown_until.tzinfo is None:
+                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+            if now.astimezone(timezone.utc) < cooldown_until.astimezone(timezone.utc):
+                return False
     updated_at_raw = str((audit_state or {}).get("updated_at") or "").strip()
     if not updated_at_raw:
         return True
@@ -3971,10 +3983,14 @@ def _sync_account_audit(
     audit_state = _load_audit_state(audit_state_path)
     now = datetime.now(timezone.utc)
     if not _should_sync_account_audit(audit_state, now=now):
+        cooldown_until = str(audit_state.get("rate_limit_cooldown_until") or "").strip()
+        skipped = f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s"
+        if cooldown_until:
+            skipped = f"rate_limit_cooldown_until={cooldown_until}"
         return {
             "trade_appended": 0,
             "income_appended": 0,
-            "skipped": f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s",
+            "skipped": skipped,
             "trade_audit_path": str(audit_paths["trade_audit"]),
             "income_audit_path": str(audit_paths["income_audit"]),
             "audit_state_path": str(audit_state_path),
@@ -4007,13 +4023,30 @@ def _sync_account_audit(
         now_utc=now,
         observed_trade_appended=len(observed_fresh_trades),
     ):
-        trade_rows = _fetch_trade_rows_since(
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            start_time_ms=trade_start_time_ms,
-            recv_window=recv_window,
-        )
+        try:
+            trade_rows = _fetch_trade_rows_since(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                start_time_ms=trade_start_time_ms,
+                recv_window=recv_window,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if "-1003" in message or "Too many requests" in message or "local cooldown active" in message:
+                cooldown_until = now.astimezone(timezone.utc) + timedelta(
+                    seconds=max(AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS, AUDIT_SYNC_MIN_INTERVAL_SECONDS)
+                )
+                audit_state.update(
+                    {
+                        "symbol": symbol.upper().strip(),
+                        "updated_at": now.isoformat(),
+                        "rate_limit_cooldown_until": cooldown_until.isoformat(),
+                        "rate_limit_error": message,
+                    }
+                )
+                _write_json(audit_state_path, audit_state)
+            raise
         trade_rest_backfill_performed = True
     fresh_trades, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
         rows=trade_rows,
@@ -4024,13 +4057,30 @@ def _sync_account_audit(
     )
     fresh_trades = [*observed_fresh_trades, *fresh_trades]
 
-    income_rows = _fetch_income_rows_since(
-        symbol=symbol,
-        api_key=api_key,
-        api_secret=api_secret,
-        start_time_ms=income_start_time_ms,
-        recv_window=recv_window,
-    )
+    try:
+        income_rows = _fetch_income_rows_since(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=income_start_time_ms,
+            recv_window=recv_window,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "-1003" in message or "Too many requests" in message or "local cooldown active" in message:
+            cooldown_until = now.astimezone(timezone.utc) + timedelta(
+                seconds=max(AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS, AUDIT_SYNC_MIN_INTERVAL_SECONDS)
+            )
+            audit_state.update(
+                {
+                    "symbol": symbol.upper().strip(),
+                    "updated_at": now.isoformat(),
+                    "rate_limit_cooldown_until": cooldown_until.isoformat(),
+                    "rate_limit_error": message,
+                }
+            )
+            _write_json(audit_state_path, audit_state)
+        raise
     fresh_income, income_last_time_ms, income_keys_at_time = collect_new_rows(
         rows=income_rows,
         last_time_ms=int(audit_state.get("income_last_time_ms") or 0) or None,
@@ -4074,6 +4124,8 @@ def _sync_account_audit(
             "trade_rest_last_sync_at": synced_at if trade_rest_backfill_performed else audit_state.get("trade_rest_last_sync_at"),
         }
     )
+    audit_state.pop("rate_limit_cooldown_until", None)
+    audit_state.pop("rate_limit_error", None)
     _write_json(audit_state_path, audit_state)
     return {
         "trade_appended": len(fresh_trades),
