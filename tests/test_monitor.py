@@ -874,6 +874,72 @@ class MonitorTests(unittest.TestCase):
             with mock.patch.dict("os.environ", {"GRID_MONITOR_AUDIT_COUNT_MAX_SCAN_BYTES": "64"}):
                 self.assertIsNone(_count_monitor_audit_lines(path))
 
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", side_effect=RuntimeError("trade refresh unavailable"))
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [
+                {
+                    "symbol": "TESTUSDT",
+                    "positionAmt": "4",
+                    "entryPrice": "1.0",
+                    "breakEvenPrice": "1.0",
+                    "unRealizedProfit": "0.5",
+                    "isolated": False,
+                    "leverage": "2",
+                }
+            ],
+        },
+    )
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "1.01"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "1.00", "ask_price": "1.02"}])
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
+    def test_build_monitor_snapshot_keeps_position_when_trade_refresh_fails(
+        self,
+        _mock_competition,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_klines,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "events.jsonl"
+            plan_path = root / "plan.json"
+            submit_path = root / "submit.json"
+            events_path.write_text("", encoding="utf-8")
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="TESTUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": False,
+                    "config": {"symbol": "TESTUSDT", "strategy_mode": "one_way_long"},
+                },
+            )
+
+        self.assertEqual(snapshot["position"]["position_amt"], 4.0)
+        self.assertIn("trade_audit_refresh_failed: RuntimeError: trade refresh unavailable", snapshot["warnings"])
+        self.assertFalse(any(str(item).startswith("account_read_failed:") for item in snapshot["warnings"]))
+
     @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
     @patch("grid_optimizer.monitor.fetch_futures_open_orders", side_effect=AssertionError("should not fetch open orders"))
     @patch("grid_optimizer.monitor.fetch_futures_position_mode", side_effect=AssertionError("should not fetch position mode"))
