@@ -3,10 +3,12 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
+from grid_optimizer.types import Candle
 from grid_optimizer.spot_loop_runner import (
     _assess_spot_fast_stop_guard,
     _auto_flatten_on_runtime_guard,
@@ -59,6 +61,17 @@ class SpotLoopRunnerTests(unittest.TestCase):
                 "240",
                 "--spot-fast-stop-reduce-target-notional",
                 "80",
+                "--spot-slow-trend-step-enabled",
+                "--spot-slow-trend-step-5m-return-ratio",
+                "0.0045",
+                "--spot-slow-trend-step-15m-return-ratio",
+                "0.008",
+                "--spot-slow-trend-step-5m-amplitude-ratio",
+                "0.005",
+                "--spot-slow-trend-step-15m-amplitude-ratio",
+                "0.01",
+                "--spot-slow-trend-step-scale",
+                "1.8",
                 "--runtime-guard-stats-start-time",
                 "2026-04-05T00:00:00+00:00",
                 "--max-order-position-notional",
@@ -82,6 +95,12 @@ class SpotLoopRunnerTests(unittest.TestCase):
         self.assertEqual(args.spot_fast_stop_freeze_position_notional, 120.0)
         self.assertEqual(args.spot_fast_stop_exit_position_notional, 240.0)
         self.assertEqual(args.spot_fast_stop_reduce_target_notional, 80.0)
+        self.assertTrue(args.spot_slow_trend_step_enabled)
+        self.assertEqual(args.spot_slow_trend_step_5m_return_ratio, 0.0045)
+        self.assertEqual(args.spot_slow_trend_step_15m_return_ratio, 0.008)
+        self.assertEqual(args.spot_slow_trend_step_5m_amplitude_ratio, 0.005)
+        self.assertEqual(args.spot_slow_trend_step_15m_amplitude_ratio, 0.01)
+        self.assertEqual(args.spot_slow_trend_step_scale, 1.8)
         self.assertEqual(args.runtime_guard_stats_start_time, "2026-04-05T00:00:00+00:00")
         self.assertEqual(args.max_order_position_notional, 300.0)
         self.assertEqual(args.max_position_notional, 400.0)
@@ -258,6 +277,68 @@ class SpotLoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual({order["side"] for order in desired_orders}, {"SELL"})
+
+    def test_slow_trend_step_guard_widens_synthetic_neutral_ladder(self) -> None:
+        now = datetime(2026, 5, 15, 6, 15, tzinfo=timezone.utc)
+        candles = []
+        for idx in range(15):
+            open_price = 676.0 + idx * 0.45
+            close_price = open_price + 0.45
+            candles.append(
+                Candle(
+                    open_time=now - timedelta(minutes=15 - idx),
+                    close_time=now - timedelta(minutes=14 - idx),
+                    open=open_price,
+                    high=close_price + 0.05,
+                    low=open_price - 0.05,
+                    close=close_price,
+                )
+            )
+
+        with patch("grid_optimizer.spot_loop_runner.fetch_spot_klines", return_value=candles):
+            desired_orders, controls = _build_spot_competition_inventory_grid_orders(
+                state={
+                    "known_orders": {},
+                    "inventory_lots": [],
+                },
+                trades=[],
+                bid_price=682.7,
+                ask_price=682.8,
+                step_price=0.06,
+                buy_levels=3,
+                sell_levels=3,
+                first_order_multiplier=1.0,
+                per_order_notional=420.0,
+                threshold_position_notional=1000.0,
+                max_order_position_notional=1600.0,
+                max_position_notional=2000.0,
+                tick_size=0.01,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=5.0,
+                synthetic_neutral=True,
+                neutral_base_qty=10.0,
+                max_short_position_notional=1600.0,
+                actual_base_qty=10.0,
+                symbol="BNBU",
+                slow_trend_step_enabled=True,
+                slow_trend_step_5m_return_ratio=0.003,
+                slow_trend_step_15m_return_ratio=0.006,
+                slow_trend_step_5m_amplitude_ratio=0.0,
+                slow_trend_step_15m_amplitude_ratio=0.0,
+                slow_trend_step_scale=2.0,
+                now=now,
+            )
+
+        buy_prices = [order["price"] for order in desired_orders if order["side"] == "BUY"]
+        sell_prices = [order["price"] for order in desired_orders if order["side"] == "SELL"]
+        self.assertEqual(buy_prices, [682.7, 682.58, 682.46])
+        self.assertEqual(sell_prices, [682.8, 682.92, 683.04])
+        self.assertAlmostEqual(controls["base_step_price"], 0.06)
+        self.assertAlmostEqual(controls["effective_step_price"], 0.12)
+        self.assertTrue(controls["slow_trend_step"]["active"])
+        self.assertEqual(controls["slow_trend_step"]["scale"], 2.0)
+        self.assertGreater(controls["slow_trend_step"]["window_5m"]["return_ratio"], 0.003)
 
     def test_build_spot_competition_synthetic_neutral_grid_ignores_dust_residual(self) -> None:
         runtime = new_inventory_grid_runtime(market_type="futures")

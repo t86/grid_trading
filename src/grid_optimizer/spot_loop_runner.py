@@ -1526,6 +1526,14 @@ def _build_spot_competition_inventory_grid_orders(
     neutral_base_qty: float = 0.0,
     max_short_position_notional: float = 0.0,
     actual_base_qty: float | None = None,
+    symbol: str = "",
+    slow_trend_step_enabled: bool = False,
+    slow_trend_step_5m_return_ratio: float = 0.0,
+    slow_trend_step_15m_return_ratio: float = 0.0,
+    slow_trend_step_5m_amplitude_ratio: float = 0.0,
+    slow_trend_step_15m_amplitude_ratio: float = 0.0,
+    slow_trend_step_scale: float = 1.0,
+    now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     known_orders = state.get("known_orders")
     order_refs = known_orders if isinstance(known_orders, dict) else {}
@@ -1588,12 +1596,25 @@ def _build_spot_competition_inventory_grid_orders(
             ]
     if _safe_float(runtime.get("grid_anchor_price")) <= 0:
         runtime["grid_anchor_price"] = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+    slow_trend_step = _resolve_spot_slow_trend_step(
+        symbol=str(symbol or state.get("symbol") or "").upper().strip(),
+        base_step_price=step_price,
+        enabled=bool(slow_trend_step_enabled),
+        trigger_5m_return_ratio=slow_trend_step_5m_return_ratio,
+        trigger_15m_return_ratio=slow_trend_step_15m_return_ratio,
+        trigger_5m_amplitude_ratio=slow_trend_step_5m_amplitude_ratio,
+        trigger_15m_amplitude_ratio=slow_trend_step_15m_amplitude_ratio,
+        scale=slow_trend_step_scale,
+        tick_size=tick_size,
+        now=now,
+    )
+    effective_step_price = max(_safe_float(slow_trend_step.get("effective_step_price")), _safe_float(step_price))
 
     plan = build_inventory_grid_orders(
         runtime=runtime,
         bid_price=bid_price,
         ask_price=ask_price,
-        step_price=step_price,
+        step_price=effective_step_price,
         per_order_notional=per_order_notional,
         first_order_multiplier=first_order_multiplier,
         threshold_position_notional=threshold_position_notional,
@@ -1630,6 +1651,9 @@ def _build_spot_competition_inventory_grid_orders(
         "effective_buy_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "BUY"),
         "effective_sell_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "SELL"),
         "effective_per_order_notional": _safe_float(per_order_notional),
+        "base_step_price": _safe_float(step_price),
+        "effective_step_price": effective_step_price,
+        "slow_trend_step": slow_trend_step,
         "direction_state": str(runtime.get("direction_state", "flat") or "flat"),
         "risk_state": str(plan.get("risk_state", "normal") or "normal"),
         "grid_anchor_price": _safe_float(runtime.get("grid_anchor_price")),
@@ -1705,6 +1729,143 @@ def _synthetic_residual_is_dust(
     if min_notional is not None and residual_qty * max(_safe_float(price), 0.0) + EPSILON < float(min_notional):
         return True
     return False
+
+
+def _round_up_to_step(value: float, step: float | None) -> float:
+    if step is None or step <= 0:
+        return float(value)
+    units = max(int(math.ceil(max(float(value), 0.0) / float(step))), 0)
+    return units * float(step)
+
+
+def _empty_spot_slow_trend_step(
+    *,
+    enabled: bool,
+    base_step_price: float,
+    warning: str | None = None,
+) -> dict[str, Any]:
+    safe_base_step = max(_safe_float(base_step_price), 0.0)
+    return {
+        "enabled": bool(enabled),
+        "active": False,
+        "warning": warning,
+        "base_step_price": safe_base_step,
+        "effective_step_price": safe_base_step,
+        "scale": 1.0,
+        "configured_scale": 1.0,
+        "reasons": [],
+        "window_5m": {
+            "available": False,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        },
+        "window_15m": {
+            "available": False,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        },
+    }
+
+
+def _spot_slow_trend_window_stats(candles: list[Any], minutes: int) -> dict[str, Any]:
+    safe_minutes = max(_safe_int(minutes), 1)
+    window = list(candles[-safe_minutes:])
+    if len(window) < safe_minutes:
+        return {
+            "available": False,
+            "minutes": safe_minutes,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+    open_price = max(_safe_float(getattr(window[0], "open", 0.0)), 0.0)
+    close_price = max(_safe_float(getattr(window[-1], "close", 0.0)), 0.0)
+    high_price = max((_safe_float(getattr(item, "high", 0.0)) for item in window), default=0.0)
+    low_price = min((_safe_float(getattr(item, "low", 0.0)) for item in window), default=0.0)
+    return_ratio = ((close_price / open_price) - 1.0) if open_price > EPSILON and close_price > EPSILON else 0.0
+    amplitude_ratio = ((high_price / low_price) - 1.0) if low_price > EPSILON and high_price > EPSILON else 0.0
+    return {
+        "available": open_price > EPSILON and close_price > EPSILON,
+        "minutes": safe_minutes,
+        "return_ratio": return_ratio,
+        "amplitude_ratio": amplitude_ratio,
+        "open": open_price,
+        "close": close_price,
+        "high": high_price,
+        "low": low_price,
+    }
+
+
+def _resolve_spot_slow_trend_step(
+    *,
+    symbol: str,
+    base_step_price: float,
+    enabled: bool,
+    trigger_5m_return_ratio: float,
+    trigger_15m_return_ratio: float,
+    trigger_5m_amplitude_ratio: float,
+    trigger_15m_amplitude_ratio: float,
+    scale: float,
+    tick_size: float | None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    safe_base_step = max(_safe_float(base_step_price), 0.0)
+    configured_scale = max(_safe_float(scale), 1.0)
+    result = _empty_spot_slow_trend_step(enabled=enabled, base_step_price=safe_base_step)
+    result["configured_scale"] = configured_scale
+    if not enabled:
+        return result
+    if safe_base_step <= EPSILON:
+        result["warning"] = "base_step_price_not_positive"
+        return result
+    if configured_scale <= 1.0 + EPSILON:
+        result["warning"] = "scale_not_above_one"
+        return result
+    current_time = now or _utc_now()
+    end_ms = int(current_time.timestamp() * 1000)
+    start_ms = end_ms - int(timedelta(minutes=16).total_seconds() * 1000)
+    try:
+        candles = fetch_spot_klines(symbol=symbol, interval="1m", start_ms=start_ms, end_ms=end_ms, limit=20)
+    except Exception as exc:
+        result["warning"] = f"{type(exc).__name__}: {exc}"
+        return result
+    closed_candles = [item for item in candles if getattr(item, "close_time", current_time) <= current_time]
+    if len(closed_candles) < 5:
+        result["warning"] = "insufficient_closed_1m_candles"
+        return result
+    window_5m = _spot_slow_trend_window_stats(closed_candles, 5)
+    window_15m = _spot_slow_trend_window_stats(closed_candles, 15)
+    result["window_5m"] = window_5m
+    result["window_15m"] = window_15m
+
+    reasons: list[str] = []
+    for name, stats, metric, threshold in (
+        ("5m_return", window_5m, "return_ratio", trigger_5m_return_ratio),
+        ("15m_return", window_15m, "return_ratio", trigger_15m_return_ratio),
+        ("5m_amplitude", window_5m, "amplitude_ratio", trigger_5m_amplitude_ratio),
+        ("15m_amplitude", window_15m, "amplitude_ratio", trigger_15m_amplitude_ratio),
+    ):
+        safe_threshold = max(_safe_float(threshold), 0.0)
+        if safe_threshold <= EPSILON or not bool(stats.get("available")):
+            continue
+        value = abs(_safe_float(stats.get(metric))) if metric == "return_ratio" else _safe_float(stats.get(metric))
+        if value >= safe_threshold:
+            reasons.append(f"{name}={value * 100:.3f}%>=threshold={safe_threshold * 100:.3f}%")
+    if not reasons:
+        return result
+    desired_step = safe_base_step * configured_scale
+    safe_tick = _safe_float(tick_size)
+    effective_step = _round_up_to_step(desired_step, safe_tick if safe_tick > 0 else None)
+    if effective_step <= safe_base_step + EPSILON:
+        return result
+    result.update(
+        {
+            "active": True,
+            "effective_step_price": effective_step,
+            "scale": effective_step / safe_base_step,
+            "reasons": reasons,
+        }
+    )
+    return result
 
 
 def _cancel_orders(
@@ -2377,6 +2538,13 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             neutral_base_qty=float(getattr(args, "neutral_base_qty", 0.0)),
             max_short_position_notional=float(getattr(args, "max_short_position_notional", 0.0)),
             actual_base_qty=_total_base_balance(account_info, base_asset) if synthetic_neutral_mode else None,
+            symbol=symbol,
+            slow_trend_step_enabled=bool(getattr(args, "spot_slow_trend_step_enabled", False)),
+            slow_trend_step_5m_return_ratio=float(getattr(args, "spot_slow_trend_step_5m_return_ratio", 0.0)),
+            slow_trend_step_15m_return_ratio=float(getattr(args, "spot_slow_trend_step_15m_return_ratio", 0.0)),
+            slow_trend_step_5m_amplitude_ratio=float(getattr(args, "spot_slow_trend_step_5m_amplitude_ratio", 0.0)),
+            slow_trend_step_15m_amplitude_ratio=float(getattr(args, "spot_slow_trend_step_15m_amplitude_ratio", 0.0)),
+            slow_trend_step_scale=float(getattr(args, "spot_slow_trend_step_scale", 1.0)),
         )
         current_long_notional_for_guard = _safe_float(controls.get("current_long_notional"))
         fast_stop_guard = _assess_spot_fast_stop_guard(
@@ -2565,6 +2733,9 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "effective_buy_levels": _safe_int(controls.get("effective_buy_levels")),
         "effective_sell_levels": _safe_int(controls.get("effective_sell_levels")),
         "effective_per_order_notional": _safe_float(controls.get("effective_per_order_notional")),
+        "base_step_price": _safe_float(controls.get("base_step_price")),
+        "effective_step_price": _safe_float(controls.get("effective_step_price")),
+        "slow_trend_step": controls.get("slow_trend_step", {}),
         "direction_state": str(controls.get("direction_state", "") or ""),
         "risk_state": str(controls.get("risk_state", "") or ""),
         "grid_anchor_price": _safe_float(controls.get("grid_anchor_price")),
@@ -2696,6 +2867,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-fast-stop-exit-position-notional", type=float, default=0.0)
     parser.add_argument("--spot-fast-stop-reduce-target-notional", type=float, default=0.0)
     parser.add_argument("--spot-fast-stop-min-base-buffer-qty", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-enabled", action="store_true")
+    parser.add_argument("--spot-slow-trend-step-5m-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-15m-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-15m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-scale", type=float, default=1.0)
     parser.add_argument("--max-order-position-notional", type=float, default=0.0)
     parser.add_argument("--max-position-notional", type=float, default=0.0)
     parser.add_argument("--neutral-base-qty", type=float, default=0.0)

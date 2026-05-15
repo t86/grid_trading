@@ -156,6 +156,12 @@ class SpotRunnerTests(unittest.TestCase):
                 "max_position_notional": 900,
                 "max_short_position_notional": 650,
                 "elastic_volume_enabled": True,
+                "spot_slow_trend_step_enabled": True,
+                "spot_slow_trend_step_5m_return_ratio": 0.0045,
+                "spot_slow_trend_step_15m_return_ratio": 0.008,
+                "spot_slow_trend_step_5m_amplitude_ratio": 0.005,
+                "spot_slow_trend_step_15m_amplitude_ratio": 0.01,
+                "spot_slow_trend_step_scale": 1.8,
             }
         )
 
@@ -164,6 +170,12 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertEqual(payload["neutral_base_qty"], 30000.0)
         self.assertEqual(payload["max_short_position_notional"], 650.0)
         self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertTrue(payload["spot_slow_trend_step_enabled"])
+        self.assertEqual(payload["spot_slow_trend_step_5m_return_ratio"], 0.0045)
+        self.assertEqual(payload["spot_slow_trend_step_15m_return_ratio"], 0.008)
+        self.assertEqual(payload["spot_slow_trend_step_5m_amplitude_ratio"], 0.005)
+        self.assertEqual(payload["spot_slow_trend_step_15m_amplitude_ratio"], 0.01)
+        self.assertEqual(payload["spot_slow_trend_step_scale"], 1.8)
 
     @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
     @patch("grid_optimizer.web._save_spot_runner_control_config")
@@ -259,6 +271,12 @@ class SpotRunnerTests(unittest.TestCase):
                 "max_position_notional": 900.0,
                 "max_short_position_notional": 650.0,
                 "elastic_volume_enabled": True,
+                "spot_slow_trend_step_enabled": True,
+                "spot_slow_trend_step_5m_return_ratio": 0.0045,
+                "spot_slow_trend_step_15m_return_ratio": 0.008,
+                "spot_slow_trend_step_5m_amplitude_ratio": 0.005,
+                "spot_slow_trend_step_15m_amplitude_ratio": 0.01,
+                "spot_slow_trend_step_scale": 2.0,
             }
         )
 
@@ -270,6 +288,14 @@ class SpotRunnerTests(unittest.TestCase):
         self.assertIn("--max-short-position-notional", command)
         self.assertIn("650.0", command)
         self.assertIn("--elastic-volume-enabled", command)
+        self.assertIn("--spot-slow-trend-step-enabled", command)
+        self.assertIn("--spot-slow-trend-step-5m-return-ratio", command)
+        self.assertIn("0.0045", command)
+        self.assertIn("--spot-slow-trend-step-15m-return-ratio", command)
+        self.assertIn("--spot-slow-trend-step-5m-amplitude-ratio", command)
+        self.assertIn("--spot-slow-trend-step-15m-amplitude-ratio", command)
+        self.assertIn("--spot-slow-trend-step-scale", command)
+        self.assertIn("2.0", command)
 
     @patch("grid_optimizer.web.fetch_spot_open_orders")
     @patch("grid_optimizer.web.fetch_spot_account_info")

@@ -7729,6 +7729,12 @@ SPOT_RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "spot_fast_stop_exit_position_notional": 0.0,
     "spot_fast_stop_reduce_target_notional": 0.0,
     "spot_fast_stop_min_base_buffer_qty": 0.0,
+    "spot_slow_trend_step_enabled": False,
+    "spot_slow_trend_step_5m_return_ratio": 0.0,
+    "spot_slow_trend_step_15m_return_ratio": 0.0,
+    "spot_slow_trend_step_5m_amplitude_ratio": 0.0,
+    "spot_slow_trend_step_15m_amplitude_ratio": 0.0,
+    "spot_slow_trend_step_scale": 1.0,
     "max_order_position_notional": 0.0,
     "max_position_notional": 0.0,
     "neutral_base_qty": 0.0,
@@ -12572,6 +12578,42 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
         ),
         "spot_fast_stop_min_base_buffer_qty",
     )
+    spot_slow_trend_step_enabled = _safe_bool(
+        payload.get("spot_slow_trend_step_enabled", SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_enabled"]),
+        "spot_slow_trend_step_enabled",
+    )
+    spot_slow_trend_step_5m_return_ratio = _safe_float(
+        payload.get(
+            "spot_slow_trend_step_5m_return_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_5m_return_ratio"],
+        ),
+        "spot_slow_trend_step_5m_return_ratio",
+    )
+    spot_slow_trend_step_15m_return_ratio = _safe_float(
+        payload.get(
+            "spot_slow_trend_step_15m_return_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_15m_return_ratio"],
+        ),
+        "spot_slow_trend_step_15m_return_ratio",
+    )
+    spot_slow_trend_step_5m_amplitude_ratio = _safe_float(
+        payload.get(
+            "spot_slow_trend_step_5m_amplitude_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_5m_amplitude_ratio"],
+        ),
+        "spot_slow_trend_step_5m_amplitude_ratio",
+    )
+    spot_slow_trend_step_15m_amplitude_ratio = _safe_float(
+        payload.get(
+            "spot_slow_trend_step_15m_amplitude_ratio",
+            SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_15m_amplitude_ratio"],
+        ),
+        "spot_slow_trend_step_15m_amplitude_ratio",
+    )
+    spot_slow_trend_step_scale = _safe_float(
+        payload.get("spot_slow_trend_step_scale", SPOT_RUNNER_DEFAULT_CONFIG["spot_slow_trend_step_scale"]),
+        "spot_slow_trend_step_scale",
+    )
     max_order_position_notional = _safe_float(
         payload.get("max_order_position_notional", SPOT_RUNNER_DEFAULT_CONFIG["max_order_position_notional"]),
         "max_order_position_notional",
@@ -12716,9 +12758,16 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_fast_stop_exit_position_notional": spot_fast_stop_exit_position_notional,
             "spot_fast_stop_reduce_target_notional": spot_fast_stop_reduce_target_notional,
             "spot_fast_stop_min_base_buffer_qty": spot_fast_stop_min_base_buffer_qty,
+            "spot_slow_trend_step_5m_return_ratio": spot_slow_trend_step_5m_return_ratio,
+            "spot_slow_trend_step_15m_return_ratio": spot_slow_trend_step_15m_return_ratio,
+            "spot_slow_trend_step_5m_amplitude_ratio": spot_slow_trend_step_5m_amplitude_ratio,
+            "spot_slow_trend_step_15m_amplitude_ratio": spot_slow_trend_step_15m_amplitude_ratio,
+            "spot_slow_trend_step_scale": spot_slow_trend_step_scale,
         }.items():
             if value < 0:
                 raise ValueError(f"{name} must be >= 0")
+        if spot_slow_trend_step_enabled and spot_slow_trend_step_scale <= 1.0:
+            raise ValueError("spot_slow_trend_step_scale must be > 1 when enabled")
         if max_order_position_notional < 0:
             raise ValueError("max_order_position_notional must be >= 0")
         if max_position_notional <= 0:
@@ -12779,6 +12828,12 @@ def _normalize_spot_runner_payload(payload: dict[str, Any]) -> dict[str, Any]:
             "spot_fast_stop_exit_position_notional": spot_fast_stop_exit_position_notional,
             "spot_fast_stop_reduce_target_notional": spot_fast_stop_reduce_target_notional,
             "spot_fast_stop_min_base_buffer_qty": spot_fast_stop_min_base_buffer_qty,
+            "spot_slow_trend_step_enabled": spot_slow_trend_step_enabled,
+            "spot_slow_trend_step_5m_return_ratio": spot_slow_trend_step_5m_return_ratio,
+            "spot_slow_trend_step_15m_return_ratio": spot_slow_trend_step_15m_return_ratio,
+            "spot_slow_trend_step_5m_amplitude_ratio": spot_slow_trend_step_5m_amplitude_ratio,
+            "spot_slow_trend_step_15m_amplitude_ratio": spot_slow_trend_step_15m_amplitude_ratio,
+            "spot_slow_trend_step_scale": spot_slow_trend_step_scale,
             "max_order_position_notional": max_order_position_notional,
             "max_position_notional": max_position_notional,
             "neutral_base_qty": neutral_base_qty,
@@ -12896,6 +12951,11 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--spot-fast-stop-exit-position-notional", config.get("spot_fast_stop_exit_position_notional")),
         ("--spot-fast-stop-reduce-target-notional", config.get("spot_fast_stop_reduce_target_notional")),
         ("--spot-fast-stop-min-base-buffer-qty", config.get("spot_fast_stop_min_base_buffer_qty")),
+        ("--spot-slow-trend-step-5m-return-ratio", config.get("spot_slow_trend_step_5m_return_ratio")),
+        ("--spot-slow-trend-step-15m-return-ratio", config.get("spot_slow_trend_step_15m_return_ratio")),
+        ("--spot-slow-trend-step-5m-amplitude-ratio", config.get("spot_slow_trend_step_5m_amplitude_ratio")),
+        ("--spot-slow-trend-step-15m-amplitude-ratio", config.get("spot_slow_trend_step_15m_amplitude_ratio")),
+        ("--spot-slow-trend-step-scale", config.get("spot_slow_trend_step_scale")),
         ("--run-start-time", config.get("run_start_time")),
         ("--run-end-time", config.get("run_end_time")),
         ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
@@ -12911,6 +12971,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         command.append("--spot-taker-exit-enabled")
     if _truthy(config.get("spot_fast_stop_enabled", False)):
         command.append("--spot-fast-stop-enabled")
+    if _truthy(config.get("spot_slow_trend_step_enabled", False)):
+        command.append("--spot-slow-trend-step-enabled")
     command.append("--spot-fast-stop-down-only" if config.get("spot_fast_stop_down_only", True) else "--spot-fast-stop-any-direction")
     command.append("--elastic-volume-enabled" if config.get("elastic_volume_enabled", False) else "--no-elastic-volume-enabled")
     command.append("--cancel-stale" if config.get("cancel_stale", True) else "--no-cancel-stale")
