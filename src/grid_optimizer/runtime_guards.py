@@ -45,6 +45,8 @@ class RuntimeGuardConfig:
     run_start_time: datetime | None
     run_end_time: datetime | None
     rolling_hourly_loss_limit: float | None
+    rolling_hourly_loss_per_10k_limit: float | None
+    rolling_hourly_loss_per_10k_min_notional: float
     max_cumulative_notional: float | None
     max_actual_net_notional: float | None
     max_synthetic_drift_notional: float | None
@@ -60,6 +62,9 @@ class RuntimeGuardResult:
     matched_reasons: list[str]
     triggered_at: str | None
     rolling_hourly_loss: float
+    rolling_hourly_gross_notional: float
+    rolling_hourly_loss_per_10k: float
+    rolling_hourly_loss_per_10k_active: bool
     cumulative_gross_notional: float
     actual_net_notional_abs: float
     synthetic_drift_notional: float
@@ -144,6 +149,7 @@ def summarize_futures_runtime_guard_inputs(
             {
                 "ts": trade_ts.isoformat(),
                 "net_pnl": net_pnl,
+                "gross_notional": price * qty,
             }
         )
 
@@ -158,6 +164,7 @@ def summarize_futures_runtime_guard_inputs(
             {
                 "ts": income_ts.isoformat(),
                 "net_pnl": _as_float(row.get("income")),
+                "gross_notional": 0.0,
             }
         )
 
@@ -171,6 +178,17 @@ def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
         rolling_hourly_loss_limit=_parse_positive_float(
             raw.get("rolling_hourly_loss_limit"),
             "rolling_hourly_loss_limit",
+        ),
+        rolling_hourly_loss_per_10k_limit=_parse_positive_float(
+            raw.get("rolling_hourly_loss_per_10k_limit"),
+            "rolling_hourly_loss_per_10k_limit",
+        ),
+        rolling_hourly_loss_per_10k_min_notional=(
+            _parse_positive_float(
+                raw.get("rolling_hourly_loss_per_10k_min_notional"),
+                "rolling_hourly_loss_per_10k_min_notional",
+            )
+            or 10000.0
         ),
         max_cumulative_notional=_parse_positive_float(
             raw.get("max_cumulative_notional"),
@@ -213,6 +231,8 @@ def normalize_runtime_guard_payload(
         "run_start_time": config.run_start_time.isoformat() if config.run_start_time else None,
         "run_end_time": config.run_end_time.isoformat() if config.run_end_time else None,
         "rolling_hourly_loss_limit": config.rolling_hourly_loss_limit,
+        "rolling_hourly_loss_per_10k_limit": config.rolling_hourly_loss_per_10k_limit,
+        "rolling_hourly_loss_per_10k_min_notional": config.rolling_hourly_loss_per_10k_min_notional,
         "max_cumulative_notional": config.max_cumulative_notional,
         "max_actual_net_notional": config.max_actual_net_notional,
         "max_synthetic_drift_notional": config.max_synthetic_drift_notional,
@@ -236,6 +256,7 @@ def evaluate_runtime_guards(
 
     window_start = current - timedelta(minutes=60)
     window_net_pnl = 0.0
+    window_gross_notional = 0.0
     for event in pnl_events:
         event_ts = _parse_datetime(event.get("ts"), "ts")
         if event_ts is None or event_ts < window_start or event_ts > current:
@@ -243,7 +264,13 @@ def evaluate_runtime_guards(
         if config.runtime_guard_stats_start_time and event_ts < config.runtime_guard_stats_start_time:
             continue
         window_net_pnl += _event_net_pnl(event)
+        try:
+            window_gross_notional += max(float(event.get("gross_notional") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            pass
     rolling_loss = max(0.0, -window_net_pnl)
+    rolling_loss_per_10k = rolling_loss / (window_gross_notional / 10000.0) if window_gross_notional > 0 else 0.0
+    rolling_loss_per_10k_active = window_gross_notional >= config.rolling_hourly_loss_per_10k_min_notional
 
     if config.run_start_time and current < config.run_start_time:
         return RuntimeGuardResult(
@@ -254,6 +281,9 @@ def evaluate_runtime_guards(
             matched_reasons=["before_start_window"],
             triggered_at=None,
             rolling_hourly_loss=rolling_loss,
+            rolling_hourly_gross_notional=window_gross_notional,
+            rolling_hourly_loss_per_10k=rolling_loss_per_10k,
+            rolling_hourly_loss_per_10k_active=rolling_loss_per_10k_active,
             cumulative_gross_notional=float(cumulative_gross_notional),
             actual_net_notional_abs=actual_net_notional_abs,
             synthetic_drift_notional=safe_synthetic_drift_notional,
@@ -263,6 +293,12 @@ def evaluate_runtime_guards(
         reasons.append("after_end_window")
     if config.rolling_hourly_loss_limit is not None and rolling_loss >= config.rolling_hourly_loss_limit:
         reasons.append("rolling_hourly_loss_limit_hit")
+    if (
+        config.rolling_hourly_loss_per_10k_limit is not None
+        and rolling_loss_per_10k_active
+        and rolling_loss_per_10k >= config.rolling_hourly_loss_per_10k_limit
+    ):
+        reasons.append("rolling_hourly_loss_per_10k_limit_hit")
     if config.max_cumulative_notional is not None and float(cumulative_gross_notional) >= config.max_cumulative_notional:
         reasons.append("max_cumulative_notional_hit")
     if config.max_actual_net_notional is not None and actual_net_notional_abs >= config.max_actual_net_notional:
@@ -281,6 +317,9 @@ def evaluate_runtime_guards(
         matched_reasons=reasons,
         triggered_at=current.isoformat() if reasons else None,
         rolling_hourly_loss=rolling_loss,
+        rolling_hourly_gross_notional=window_gross_notional,
+        rolling_hourly_loss_per_10k=rolling_loss_per_10k,
+        rolling_hourly_loss_per_10k_active=rolling_loss_per_10k_active,
         cumulative_gross_notional=float(cumulative_gross_notional),
         actual_net_notional_abs=actual_net_notional_abs,
         synthetic_drift_notional=safe_synthetic_drift_notional,

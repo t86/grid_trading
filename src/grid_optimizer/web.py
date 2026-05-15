@@ -8685,6 +8685,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "grid_inventory_rebalance_min_center_distance_steps",
         "max_total_notional",
         "rolling_hourly_loss_limit",
+        "rolling_hourly_loss_per_10k_limit",
+        "rolling_hourly_loss_per_10k_min_notional",
         "max_cumulative_notional",
         "max_actual_net_notional",
         "max_synthetic_drift_notional",
@@ -8938,6 +8940,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_tiny_long_residual_notional",
         "synthetic_tiny_short_residual_notional",
         "rolling_hourly_loss_limit",
+        "rolling_hourly_loss_per_10k_limit",
+        "rolling_hourly_loss_per_10k_min_notional",
         "max_cumulative_notional",
         "max_actual_net_notional",
         "max_synthetic_drift_notional",
@@ -9040,6 +9044,7 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
             runtime_guard_config.run_start_time,
             runtime_guard_config.run_end_time,
             runtime_guard_config.rolling_hourly_loss_limit,
+            runtime_guard_config.rolling_hourly_loss_per_10k_limit,
             runtime_guard_config.max_cumulative_notional,
             runtime_guard_config.max_actual_net_notional,
             runtime_guard_config.max_synthetic_drift_notional,
@@ -9078,6 +9083,17 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
         detail_lines.append(
             "最近 60 分钟滚动亏损 "
             f"{runtime_guard_result.rolling_hourly_loss:.4f} >= 阈值 {runtime_guard_config.rolling_hourly_loss_limit:.4f}"
+        )
+    if (
+        "rolling_hourly_loss_per_10k_limit_hit" in reasons
+        and runtime_guard_config.rolling_hourly_loss_per_10k_limit is not None
+    ):
+        detail_lines.append(
+            "最近 60 分钟每万成交损耗 "
+            f"{runtime_guard_result.rolling_hourly_loss_per_10k:.4f} >= 阈值 "
+            f"{runtime_guard_config.rolling_hourly_loss_per_10k_limit:.4f} "
+            f"（成交额 {runtime_guard_result.rolling_hourly_gross_notional:.4f}，"
+            f"最小生效成交额 {runtime_guard_config.rolling_hourly_loss_per_10k_min_notional:.4f}）"
         )
     if "max_cumulative_notional_hit" in reasons and runtime_guard_config.max_cumulative_notional is not None:
         detail_lines.append(
@@ -10089,6 +10105,13 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--runtime-guard-stats-start-time", str(config["runtime_guard_stats_start_time"])])
     if config.get("rolling_hourly_loss_limit") is not None:
         command.extend(["--rolling-hourly-loss-limit", str(config["rolling_hourly_loss_limit"])])
+    if config.get("rolling_hourly_loss_per_10k_limit") is not None:
+        command.extend(["--rolling-hourly-loss-per-10k-limit", str(config["rolling_hourly_loss_per_10k_limit"])])
+    if config.get("rolling_hourly_loss_per_10k_min_notional") is not None:
+        command.extend([
+            "--rolling-hourly-loss-per-10k-min-notional",
+            str(config["rolling_hourly_loss_per_10k_min_notional"]),
+        ])
     if config.get("max_cumulative_notional") is not None:
         command.extend(["--max-cumulative-notional", str(config["max_cumulative_notional"])])
     if config.get("max_actual_net_notional") is not None:
@@ -12960,6 +12983,8 @@ def _build_spot_runner_command(config: dict[str, Any]) -> list[str]:
         ("--run-end-time", config.get("run_end_time")),
         ("--runtime-guard-stats-start-time", config.get("runtime_guard_stats_start_time")),
         ("--rolling-hourly-loss-limit", config.get("rolling_hourly_loss_limit")),
+        ("--rolling-hourly-loss-per-10k-limit", config.get("rolling_hourly_loss_per_10k_limit")),
+        ("--rolling-hourly-loss-per-10k-min-notional", config.get("rolling_hourly_loss_per_10k_min_notional")),
         ("--max-cumulative-notional", config.get("max_cumulative_notional")),
     ]
     for flag, value in extra_args:

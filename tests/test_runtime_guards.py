@@ -43,6 +43,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_start_time=datetime(2026, 3, 30, 9, 0, tzinfo=timezone.utc),
             run_end_time=None,
             rolling_hourly_loss_limit=None,
+            rolling_hourly_loss_per_10k_limit=None,
+            rolling_hourly_loss_per_10k_min_notional=10000.0,
             max_cumulative_notional=None,
             max_actual_net_notional=None,
             max_synthetic_drift_notional=None,
@@ -64,6 +66,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_start_time=None,
             run_end_time=datetime(2026, 3, 30, 9, 30, tzinfo=timezone.utc),
             rolling_hourly_loss_limit=None,
+            rolling_hourly_loss_per_10k_limit=None,
+            rolling_hourly_loss_per_10k_min_notional=10000.0,
             max_cumulative_notional=None,
             max_actual_net_notional=None,
             max_synthetic_drift_notional=None,
@@ -84,6 +88,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_start_time=None,
             run_end_time=None,
             rolling_hourly_loss_limit=50.0,
+            rolling_hourly_loss_per_10k_limit=None,
+            rolling_hourly_loss_per_10k_min_notional=10000.0,
             max_cumulative_notional=None,
             max_actual_net_notional=None,
             max_synthetic_drift_notional=None,
@@ -101,12 +107,100 @@ class RuntimeGuardsTests(unittest.TestCase):
         self.assertEqual(result.primary_reason, "rolling_hourly_loss_limit_hit")
         self.assertAlmostEqual(result.rolling_hourly_loss, 55.0)
 
+    def test_evaluate_runtime_guards_stops_on_rolling_loss_per_10k(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = RuntimeGuardConfig(
+            run_start_time=None,
+            run_end_time=None,
+            rolling_hourly_loss_limit=100.0,
+            rolling_hourly_loss_per_10k_limit=5.0,
+            rolling_hourly_loss_per_10k_min_notional=5_000.0,
+            max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
+        )
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=50_000.0,
+            pnl_events=[
+                {
+                    "ts": (now - timedelta(minutes=20)).isoformat(),
+                    "net_pnl": -6.0,
+                    "gross_notional": 5_000.0,
+                },
+            ],
+        )
+        self.assertTrue(result.stop_triggered)
+        self.assertEqual(result.primary_reason, "rolling_hourly_loss_per_10k_limit_hit")
+        self.assertAlmostEqual(result.rolling_hourly_loss, 6.0)
+        self.assertAlmostEqual(result.rolling_hourly_gross_notional, 5_000.0)
+        self.assertAlmostEqual(result.rolling_hourly_loss_per_10k, 12.0)
+        self.assertTrue(result.rolling_hourly_loss_per_10k_active)
+
+    def test_evaluate_runtime_guards_ignores_per_10k_below_min_notional(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = RuntimeGuardConfig(
+            run_start_time=None,
+            run_end_time=None,
+            rolling_hourly_loss_limit=100.0,
+            rolling_hourly_loss_per_10k_limit=5.0,
+            rolling_hourly_loss_per_10k_min_notional=10_000.0,
+            max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
+        )
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=50_000.0,
+            pnl_events=[
+                {
+                    "ts": (now - timedelta(minutes=20)).isoformat(),
+                    "net_pnl": -6.0,
+                    "gross_notional": 5_000.0,
+                },
+            ],
+        )
+        self.assertTrue(result.tradable)
+        self.assertAlmostEqual(result.rolling_hourly_loss_per_10k, 12.0)
+        self.assertFalse(result.rolling_hourly_loss_per_10k_active)
+
+    def test_evaluate_runtime_guards_does_not_stop_per_10k_without_window_volume(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = RuntimeGuardConfig(
+            run_start_time=None,
+            run_end_time=None,
+            rolling_hourly_loss_limit=None,
+            rolling_hourly_loss_per_10k_limit=5.0,
+            rolling_hourly_loss_per_10k_min_notional=10000.0,
+            max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
+        )
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=50_000.0,
+            pnl_events=[
+                {
+                    "ts": (now - timedelta(minutes=20)).isoformat(),
+                    "net_pnl": -6.0,
+                    "gross_notional": 0.0,
+                },
+            ],
+        )
+        self.assertTrue(result.tradable)
+        self.assertAlmostEqual(result.rolling_hourly_loss_per_10k, 0.0)
+
     def test_evaluate_runtime_guards_stops_on_cumulative_notional(self) -> None:
         now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
         cfg = RuntimeGuardConfig(
             run_start_time=None,
             run_end_time=None,
             rolling_hourly_loss_limit=None,
+            rolling_hourly_loss_per_10k_limit=None,
+            rolling_hourly_loss_per_10k_min_notional=10000.0,
             max_cumulative_notional=1000.0,
             max_actual_net_notional=None,
             max_synthetic_drift_notional=None,
@@ -126,6 +220,8 @@ class RuntimeGuardsTests(unittest.TestCase):
             run_start_time=None,
             run_end_time=datetime(2026, 3, 30, 9, 30, tzinfo=timezone.utc),
             rolling_hourly_loss_limit=50.0,
+            rolling_hourly_loss_per_10k_limit=None,
+            rolling_hourly_loss_per_10k_min_notional=10000.0,
             max_cumulative_notional=1000.0,
             max_actual_net_notional=None,
             max_synthetic_drift_notional=None,

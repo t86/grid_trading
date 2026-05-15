@@ -5058,6 +5058,11 @@ def _build_runtime_guard_stop_summary(
         "runtime_guard_stats_start_time": stats_start_time.isoformat() if stats_start_time else None,
         "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
         "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+        "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,
+        "rolling_hourly_loss_per_10k": runtime_guard_result.rolling_hourly_loss_per_10k,
+        "rolling_hourly_loss_per_10k_active": runtime_guard_result.rolling_hourly_loss_per_10k_active,
+        "rolling_hourly_loss_per_10k_limit": runtime_guard_config.rolling_hourly_loss_per_10k_limit,
+        "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
         "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
@@ -5080,6 +5085,7 @@ def _maybe_handle_runtime_guard(
             runtime_guard_config.run_start_time,
             runtime_guard_config.run_end_time,
             runtime_guard_config.rolling_hourly_loss_limit,
+            runtime_guard_config.rolling_hourly_loss_per_10k_limit,
             runtime_guard_config.max_cumulative_notional,
         )
     ):
@@ -5123,7 +5129,10 @@ def _maybe_handle_runtime_guard(
         api_secret,
         allow_loss=True,
     )
-    loss_only_stop = runtime_guard_result.matched_reasons == ["rolling_hourly_loss_limit_hit"]
+    loss_only_stop = runtime_guard_result.matched_reasons in (
+        ["rolling_hourly_loss_limit_hit"],
+        ["rolling_hourly_loss_per_10k_limit_hit"],
+    )
     if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
         stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
         if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
@@ -13886,6 +13895,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-end-time", type=str, default=None)
     parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
+    parser.add_argument("--rolling-hourly-loss-per-10k-limit", type=float, default=None)
+    parser.add_argument("--rolling-hourly-loss-per-10k-min-notional", type=float, default=10000.0)
     parser.add_argument("--runtime-guard-loss-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--runtime-guard-loss-recovery-cooldown-seconds", type=float, default=180.0)
     parser.add_argument("--runtime-guard-loss-recovery-max-1m-amplitude-ratio", type=float, default=0.012)
@@ -14838,7 +14849,10 @@ def main() -> None:
                     pnl_events=runtime_pnl_events_for_guard,
                 )
                 runtime_loss_recovery_summary: dict[str, Any] | None = None
-                runtime_loss_only_stop = runtime_guard_result.matched_reasons == ["rolling_hourly_loss_limit_hit"]
+                runtime_loss_only_stop = runtime_guard_result.matched_reasons in (
+                    ["rolling_hourly_loss_limit_hit"],
+                    ["rolling_hourly_loss_per_10k_limit_hit"],
+                )
                 if runtime_loss_only_stop and _runtime_guard_loss_recovery_enabled(args) and not runtime_guard_result.tradable:
                     _runtime_guard_mark_loss_stop(
                         runtime_recovery,
@@ -15303,6 +15317,11 @@ def main() -> None:
                     "runtime_guard_stats_start_time": runtime_stats_start_time.isoformat() if runtime_stats_start_time else None,
                     "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
                     "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+                    "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,
+                    "rolling_hourly_loss_per_10k": runtime_guard_result.rolling_hourly_loss_per_10k,
+                    "rolling_hourly_loss_per_10k_active": runtime_guard_result.rolling_hourly_loss_per_10k_active,
+                    "rolling_hourly_loss_per_10k_limit": runtime_guard_config.rolling_hourly_loss_per_10k_limit,
+                    "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
                     "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
                     "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
                 }
