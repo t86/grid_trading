@@ -35,6 +35,12 @@ _TIME_HINT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"today at \d{1,2}:\d{2}", re.IGNORECASE),
     re.compile(r"今天\s*\d{1,2}:\d{2}"),
 )
+_TIME_EXTRACT_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"today at\s+(\d{1,2}:\d{2}(?:\s*\(utc(?:[+-]\d+)?\))?)", re.IGNORECASE),
+    re.compile(r"今天\s*(\d{1,2}:\d{2}(?:（UTC[+-]\d+）|\(UTC[+-]\d+\))?)"),
+    re.compile(r"\b(\d{1,2}:\d{2}\s*\(utc(?:[+-]\d+)?\))", re.IGNORECASE),
+    re.compile(r"\b(\d{1,2}:\d{2})\b"),
+)
 
 
 @dataclass(slots=True)
@@ -81,6 +87,14 @@ def _has_time_hint(text: str) -> bool:
     return any(pattern.search(text) for pattern in _TIME_HINT_PATTERNS)
 
 
+def _extract_time_hint_text(text: str) -> str | None:
+    for pattern in _TIME_EXTRACT_PATTERNS:
+        match = pattern.search(text)
+        if match:
+            return _normalize_text(match.group(1))
+    return None
+
+
 def _match_alpha_airdrop_post(entry: dict[str, Any], *, now: datetime, tz_offset_hours: int) -> dict[str, Any] | None:
     tweet_id = str(entry.get("id_str") or entry.get("id") or "").strip()
     text = _normalize_text(entry.get("full_text") or entry.get("text") or "")
@@ -112,6 +126,7 @@ def _match_alpha_airdrop_post(entry: dict[str, Any], *, now: datetime, tz_offset
         "text": text,
         "points_threshold": points_threshold,
         "has_time_hint": _has_time_hint(text),
+        "time_hint_text": _extract_time_hint_text(text),
     }
 
 
@@ -249,7 +264,10 @@ def _extract_bark_key(value: str) -> str:
 
 
 def _build_bark_title(post: dict[str, Any]) -> str:
-    return f"Alpha 空投 @{post.get('account')}"
+    time_hint = str(post.get("time_hint_text") or "").strip()
+    if time_hint:
+        return f"Alpha空投 {time_hint}开领 @{post.get('account')}"
+    return f"Alpha空投提醒 @{post.get('account')}"
 
 
 def _build_bark_body(post: dict[str, Any]) -> str:

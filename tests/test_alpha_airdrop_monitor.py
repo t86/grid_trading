@@ -9,10 +9,12 @@ from unittest.mock import patch
 
 from grid_optimizer.alpha_airdrop_monitor import (
     AccountCheckResult,
+    _build_bark_title,
     _extract_bark_key,
     _build_email_body,
     _build_match_key,
     _extract_entries_from_syndication_html,
+    _extract_time_hint_text,
     _is_today_in_tz,
     _load_state,
     load_bark_config,
@@ -104,6 +106,17 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
 
         self.assertIsNotNone(matched)
         self.assertEqual(matched["points_threshold"], 225)
+        self.assertEqual(matched["time_hint_text"], "17:00（UTC+8）")
+
+    def test_extract_time_hint_text_prefers_explicit_schedule(self) -> None:
+        self.assertEqual(
+            _extract_time_hint_text("Please get ready to claim today at 9:00 (UTC)."),
+            "9:00 (UTC)",
+        )
+        self.assertEqual(
+            _extract_time_hint_text("请大家准备今天 17:00（UTC+8）领取币安 Alpha 空投并交易！"),
+            "17:00（UTC+8）",
+        )
 
     def test_is_today_in_tz_uses_utc_plus_8_day_boundary(self) -> None:
         now = datetime(2026, 5, 15, 1, 0, tzinfo=timezone.utc)
@@ -187,6 +200,7 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
             "points_threshold": 225,
             "tweet_url": "https://x.com/binancezh/status/200",
             "notification_sequence": 1,
+            "time_hint_text": "17:00（UTC+8）",
         }
         captured: dict[str, object] = {}
 
@@ -209,6 +223,17 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
         self.assertTrue(result["sent"])
         self.assertEqual(captured["url"], "https://api.day.app/Ui2sPsKqsS4uvJsYP6tvwm")
         self.assertEqual(captured["json"]["url"], "https://x.com/binancezh/status/200")
+        self.assertEqual(captured["json"]["title"], "Alpha空投 17:00（UTC+8）开领 @binancezh")
+
+    def test_build_bark_title_uses_time_hint_when_available(self) -> None:
+        self.assertEqual(
+            _build_bark_title({"account": "binancezh", "time_hint_text": "17:00（UTC+8）"}),
+            "Alpha空投 17:00（UTC+8）开领 @binancezh",
+        )
+        self.assertEqual(
+            _build_bark_title({"account": "binancezh"}),
+            "Alpha空投提醒 @binancezh",
+        )
 
     def test_load_state_ignores_invalid_json(self) -> None:
         with TemporaryDirectory() as tmpdir:
