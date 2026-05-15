@@ -9,15 +9,18 @@ from unittest.mock import patch
 
 from grid_optimizer.alpha_airdrop_monitor import (
     AccountCheckResult,
+    _extract_bark_key,
     _build_email_body,
     _build_match_key,
     _extract_entries_from_syndication_html,
     _is_today_in_tz,
     _load_state,
+    load_bark_config,
     _match_alpha_airdrop_post,
     _select_notification_candidates,
     _update_state_for_candidates,
     check_alpha_airdrop_posts,
+    send_bark_notification,
 )
 
 
@@ -155,6 +158,58 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
         self.assertIn("第 1/3 次提醒", body)
         self.assertIn("https://x.com/BinanceWallet/status/200", body)
 
+    def test_extract_bark_key_supports_full_url_or_plain_key(self) -> None:
+        self.assertEqual(_extract_bark_key("Ui2sPsKqsS4uvJsYP6tvwm"), "Ui2sPsKqsS4uvJsYP6tvwm")
+        self.assertEqual(
+            _extract_bark_key("https://api.day.app/Ui2sPsKqsS4uvJsYP6tvwm/"),
+            "Ui2sPsKqsS4uvJsYP6tvwm",
+        )
+
+    def test_load_bark_config_prefers_file_and_env(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            config_path = Path(tmpdir) / "bark.json"
+            config_path.write_text(
+                json.dumps({"bark_endpoint": "https://api.day.app/testkey/", "bark_base_url": "https://api.day.app"}),
+                encoding="utf-8",
+            )
+
+            config = load_bark_config(config_path)
+
+            self.assertTrue(config["enabled"])
+            self.assertEqual(config["bark_endpoint"], "https://api.day.app/testkey/")
+
+    def test_send_bark_notification_posts_json_payload(self) -> None:
+        post = {
+            "account": "binancezh",
+            "tweet_id": "200",
+            "created_at": "2026-05-15T01:00:00+00:00",
+            "text": "Users with at least 225 Binance Alpha Points can claim the token.",
+            "points_threshold": 225,
+            "tweet_url": "https://x.com/binancezh/status/200",
+            "notification_sequence": 1,
+        }
+        captured: dict[str, object] = {}
+
+        class DummyResponse:
+            def raise_for_status(self) -> None:
+                return None
+
+        def fake_post(url, json=None, timeout=None):
+            captured["url"] = url
+            captured["json"] = json
+            captured["timeout"] = timeout
+            return DummyResponse()
+
+        with patch("grid_optimizer.alpha_airdrop_monitor.requests.post", side_effect=fake_post):
+            result = send_bark_notification(
+                bark_endpoint_or_key="https://api.day.app/Ui2sPsKqsS4uvJsYP6tvwm/",
+                post=post,
+            )
+
+        self.assertTrue(result["sent"])
+        self.assertEqual(captured["url"], "https://api.day.app/Ui2sPsKqsS4uvJsYP6tvwm")
+        self.assertEqual(captured["json"]["url"], "https://x.com/binancezh/status/200")
+
     def test_load_state_ignores_invalid_json(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
@@ -207,8 +262,14 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
 
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "alpha_state.json"
+            bark_path = Path(tmpdir) / "bark.json"
+            bark_path.write_text(
+                json.dumps({"bark_endpoint": "https://api.day.app/Ui2sPsKqsS4uvJsYP6tvwm/"}, ensure_ascii=False),
+                encoding="utf-8",
+            )
             now = datetime(2026, 5, 15, 6, 0, tzinfo=timezone.utc)
             sent_subjects: list[str] = []
+            bark_calls: list[str] = []
 
             def fake_get(*args, **kwargs):
                 return DummyResponse(html)
@@ -217,14 +278,25 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
                 sent_subjects.append(subject)
                 return {"sent": True, "subject": subject, "body": body}
 
+            class DummyBarkResponse:
+                def raise_for_status(self) -> None:
+                    return None
+
+            def fake_post(url, json=None, timeout=None):
+                bark_calls.append(url)
+                return DummyBarkResponse()
+
             with (
                 patch("grid_optimizer.alpha_airdrop_monitor.requests.get", side_effect=fake_get),
+                patch("grid_optimizer.alpha_airdrop_monitor.requests.post", side_effect=fake_post),
                 patch("grid_optimizer.alpha_airdrop_monitor.send_alert_email", side_effect=fake_send_alert_email),
             ):
-                result = check_alpha_airdrop_posts(now=now, state_path=state_path)
+                result = check_alpha_airdrop_posts(now=now, state_path=state_path, bark_config_path=bark_path)
 
             self.assertEqual(len(sent_subjects), 2)
+            self.assertEqual(len(bark_calls), 2)
             self.assertEqual(result["emails_sent"], 2)
+            self.assertEqual(result["bark_sent"], 2)
             self.assertEqual(len(result["matches"]), 2)
             saved_state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_state["binancezh:300"]["notification_count"], 1)

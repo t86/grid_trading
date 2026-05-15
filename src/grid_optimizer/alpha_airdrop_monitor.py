@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from html import unescape
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
@@ -16,8 +18,10 @@ from .notifications import send_alert_email
 DEFAULT_ACCOUNTS: tuple[str, ...] = ("binancezh", "BinanceWallet")
 DEFAULT_STATE_PATH = Path("output/alpha_airdrop_monitor_state.json")
 DEFAULT_ALERT_CONFIG_PATH = Path("output/alert_notifier_config.json")
+DEFAULT_BARK_CONFIG_PATH = Path("output/alpha_airdrop_monitor_bark.json")
 DEFAULT_TZ_OFFSET_HOURS = 8
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
+DEFAULT_BARK_URL = "https://api.day.app"
 
 _POINTS_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"at least\s+(\d{2,6})\s+binance alpha points", re.IGNORECASE),
@@ -226,14 +230,98 @@ def _build_email_body(post: dict[str, Any]) -> str:
     return "\n".join(lines).strip() + "\n"
 
 
+def _normalize_bark_base_url(value: str) -> str:
+    text = str(value or "").strip().rstrip("/")
+    return text or DEFAULT_BARK_URL
+
+
+def _extract_bark_key(value: str) -> str:
+    text = str(value or "").strip().rstrip("/")
+    if not text:
+        return ""
+    if text.startswith("http://") or text.startswith("https://"):
+        parsed = urlparse(text)
+        parts = [part for part in parsed.path.split("/") if part]
+        if parts and parts[0] == "push":
+            parts = parts[1:]
+        return parts[0] if parts else ""
+    return text
+
+
+def _build_bark_title(post: dict[str, Any]) -> str:
+    return f"Alpha 空投 @{post.get('account')}"
+
+
+def _build_bark_body(post: dict[str, Any]) -> str:
+    summary = str(post.get("text") or "").strip()
+    if len(summary) > 160:
+        summary = summary[:157] + "..."
+    return f"积分门槛 {post.get('points_threshold')}，第 {post.get('notification_sequence')}/3 次提醒\n{summary}"
+
+
+def send_bark_notification(
+    *,
+    bark_endpoint_or_key: str,
+    post: dict[str, Any],
+    bark_base_url: str = DEFAULT_BARK_URL,
+    timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+) -> dict[str, Any]:
+    key = _extract_bark_key(bark_endpoint_or_key)
+    if not key:
+        return {"sent": False, "error": "bark_disabled", "url": None}
+    base_url = _normalize_bark_base_url(bark_base_url)
+    url = f"{base_url}/{key}"
+    payload = {
+        "title": _build_bark_title(post),
+        "body": _build_bark_body(post),
+        "url": str(post.get("tweet_url") or ""),
+        "group": "binance-alpha-airdrop",
+        "level": "active",
+        "isArchive": "1",
+    }
+    result = {"sent": False, "error": None, "url": url}
+    try:
+        response = requests.post(url, json=payload, timeout=timeout_seconds)
+        response.raise_for_status()
+        result["sent"] = True
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
+
+def load_bark_config(path: Path | None = None) -> dict[str, Any]:
+    config_path = Path(path or DEFAULT_BARK_CONFIG_PATH)
+    file_config = _load_state(config_path)
+    env_endpoint = str(os.environ.get("GRID_ALPHA_AIRDROP_BARK_ENDPOINT", "")).strip()
+    env_base_url = str(os.environ.get("GRID_ALPHA_AIRDROP_BARK_BASE_URL", "")).strip()
+    return {
+        "enabled": bool(env_endpoint or file_config.get("bark_endpoint")),
+        "bark_endpoint": env_endpoint or str(file_config.get("bark_endpoint") or "").strip(),
+        "bark_base_url": env_base_url or str(file_config.get("bark_base_url") or DEFAULT_BARK_URL).strip(),
+        "config_path": str(config_path),
+    }
+
+
 def _send_notifications(
     candidates: list[dict[str, Any]],
     *,
     alert_config_path: Path | None,
-) -> tuple[int, list[dict[str, Any]]]:
-    sent = 0
+    bark_config_path: Path | None,
+) -> tuple[int, list[dict[str, Any]], int, list[dict[str, Any]]]:
+    bark_config = load_bark_config(bark_config_path)
+    email_sent = 0
     results: list[dict[str, Any]] = []
+    bark_sent = 0
+    bark_results: list[dict[str, Any]] = []
     for candidate in candidates:
+        bark_result = send_bark_notification(
+            bark_endpoint_or_key=str(bark_config.get("bark_endpoint") or ""),
+            bark_base_url=str(bark_config.get("bark_base_url") or DEFAULT_BARK_URL),
+            post=candidate,
+        )
+        bark_results.append(bark_result)
+        if bark_result.get("sent"):
+            bark_sent += 1
         result = send_alert_email(
             subject=_build_email_subject(candidate),
             body=_build_email_body(candidate),
@@ -241,8 +329,8 @@ def _send_notifications(
         )
         results.append(result)
         if result.get("sent"):
-            sent += 1
-    return sent, results
+            email_sent += 1
+    return email_sent, results, bark_sent, bark_results
 
 
 def check_alpha_airdrop_posts(
@@ -252,6 +340,7 @@ def check_alpha_airdrop_posts(
     tz_offset_hours: int = DEFAULT_TZ_OFFSET_HOURS,
     state_path: Path = DEFAULT_STATE_PATH,
     alert_config_path: Path | None = DEFAULT_ALERT_CONFIG_PATH,
+    bark_config_path: Path | None = DEFAULT_BARK_CONFIG_PATH,
 ) -> dict[str, Any]:
     current_now = now or datetime.now(UTC)
     state = _load_state(state_path)
@@ -278,9 +367,10 @@ def check_alpha_airdrop_posts(
             errors.append(error)
 
     candidates = _select_notification_candidates(matches, state, now=current_now)
-    emails_sent, email_results = _send_notifications(
+    emails_sent, email_results, bark_sent, bark_results = _send_notifications(
         candidates,
         alert_config_path=alert_config_path,
+        bark_config_path=bark_config_path,
     )
     sent_candidates = [
         candidate
@@ -303,6 +393,8 @@ def check_alpha_airdrop_posts(
         "matches": matches,
         "notifications": candidates,
         "emails_sent": emails_sent,
+        "bark_sent": bark_sent,
+        "bark_results": bark_results,
         "errors": errors,
         "state_path": str(state_path),
     }
@@ -329,6 +421,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Path to alert notifier config json.",
     )
     parser.add_argument(
+        "--bark-config-path",
+        type=str,
+        default="output/alpha_airdrop_monitor_bark.json",
+        help="Path to Bark config json.",
+    )
+    parser.add_argument(
         "--tz-offset-hours",
         type=int,
         default=DEFAULT_TZ_OFFSET_HOURS,
@@ -351,6 +449,7 @@ def main() -> None:
         tz_offset_hours=int(args.tz_offset_hours),
         state_path=Path(args.state_path),
         alert_config_path=Path(args.alert_config_path) if str(args.alert_config_path or "").strip() else None,
+        bark_config_path=Path(args.bark_config_path) if str(args.bark_config_path or "").strip() else None,
     )
     if args.print_json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -361,6 +460,7 @@ def main() -> None:
                     "checked_at": result["checked_at"],
                     "matches": len(result["matches"]),
                     "emails_sent": result["emails_sent"],
+                    "bark_sent": result["bark_sent"],
                     "errors": result["errors"],
                 },
                 ensure_ascii=False,
