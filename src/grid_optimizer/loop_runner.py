@@ -1444,6 +1444,10 @@ def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: 
     return 0.0
 
 
+def _position_unrealized_pnl(position: dict[str, Any]) -> float:
+    return _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
+
+
 def _resolve_adverse_reduce_cost_basis(
     *,
     side: str,
@@ -4947,6 +4951,7 @@ def _build_runtime_guard_stop_summary(
     synthetic_net_qty = _safe_float(metric_source.get("synthetic_net_qty"))
     synthetic_drift_qty = _safe_float(metric_source.get("synthetic_drift_qty"))
     synthetic_drift_notional = _synthetic_drift_notional(mid_price, synthetic_drift_qty)
+    unrealized_pnl = _safe_float(metric_source.get("unrealized_pnl"))
 
     return {
         "ts": cycle_started_at.isoformat(),
@@ -4965,6 +4970,7 @@ def _build_runtime_guard_stop_summary(
         "current_short_notional": current_short_notional,
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_notional,
+        "unrealized_pnl": unrealized_pnl,
         "synthetic_net_qty": synthetic_net_qty,
         "synthetic_drift_qty": synthetic_drift_qty,
         "synthetic_drift_notional": synthetic_drift_notional,
@@ -5067,6 +5073,8 @@ def _build_runtime_guard_stop_summary(
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
         "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
         "max_synthetic_drift_notional": runtime_guard_config.max_synthetic_drift_notional,
+        "max_unrealized_loss": runtime_guard_config.max_unrealized_loss,
+        "unrealized_loss": runtime_guard_result.unrealized_loss,
         "flatten_started": bool(flatten_result.get("started")),
         "flatten_already_running": bool(flatten_result.get("already_running")),
     }
@@ -5087,6 +5095,9 @@ def _maybe_handle_runtime_guard(
             runtime_guard_config.rolling_hourly_loss_limit,
             runtime_guard_config.rolling_hourly_loss_per_10k_limit,
             runtime_guard_config.max_cumulative_notional,
+            runtime_guard_config.max_actual_net_notional,
+            runtime_guard_config.max_synthetic_drift_notional,
+            runtime_guard_config.max_unrealized_loss,
         )
     ):
         return None
@@ -5104,11 +5115,22 @@ def _maybe_handle_runtime_guard(
         now=cycle_started_at,
     )
     pnl_events_for_guard = _filter_pnl_events_after(pnl_events, recovered_at)
+    latest_plan_report = read_json(Path(getattr(args, "plan_json", ""))) or {}
+    if not isinstance(latest_plan_report, dict):
+        latest_plan_report = {}
+    latest_mid_price = _safe_float(latest_plan_report.get("mid_price"))
+    latest_synthetic_drift_notional = _synthetic_drift_notional(
+        latest_mid_price,
+        _safe_float(latest_plan_report.get("synthetic_drift_qty")),
+    )
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=cycle_started_at,
         cumulative_gross_notional=cumulative_gross_notional,
         pnl_events=pnl_events_for_guard,
+        actual_net_notional=_safe_float(latest_plan_report.get("actual_net_notional")),
+        synthetic_drift_notional=latest_synthetic_drift_notional,
+        unrealized_pnl=_safe_float(latest_plan_report.get("unrealized_pnl")),
     )
     if runtime_guard_result.tradable:
         return None
@@ -10270,6 +10292,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    if requested_strategy_mode == "hedge_neutral":
+        unrealized_pnl = _position_unrealized_pnl(long_position) + _position_unrealized_pnl(short_position)
+    else:
+        unrealized_pnl = _position_unrealized_pnl(actual_position)
     observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
     execution_regime = build_execution_regime_report(
         args=args,
@@ -12866,6 +12892,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "current_short_avg_price": current_short_avg_price,
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_qty * max(mid_price, 0.0),
+        "unrealized_pnl": unrealized_pnl,
         "synthetic_ledger": synthetic_ledger_snapshot,
         "synthetic_net_qty": current_long_qty - current_short_qty if _is_synthetic_neutral_mode(strategy_mode) else None,
         "synthetic_drift_qty": (
@@ -13904,6 +13931,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     parser.add_argument("--max-actual-net-notional", type=float, default=None)
     parser.add_argument("--max-synthetic-drift-notional", type=float, default=None)
+    parser.add_argument("--max-unrealized-loss", type=float, default=None)
     parser.add_argument("--reset-state", action="store_true")
     return parser
 
@@ -14847,6 +14875,12 @@ def main() -> None:
                     now=cycle_started_at,
                     cumulative_gross_notional=runtime_cumulative_gross_notional,
                     pnl_events=runtime_pnl_events_for_guard,
+                    actual_net_notional=_safe_float(plan_report.get("actual_net_notional")),
+                    synthetic_drift_notional=_synthetic_drift_notional(
+                        _safe_float(plan_report.get("mid_price")),
+                        _safe_float(plan_report.get("synthetic_drift_qty")),
+                    ),
+                    unrealized_pnl=_safe_float(plan_report.get("unrealized_pnl")),
                 )
                 runtime_loss_recovery_summary: dict[str, Any] | None = None
                 runtime_loss_only_stop = runtime_guard_result.matched_reasons in (
@@ -15060,6 +15094,7 @@ def main() -> None:
                     "current_short_notional": _safe_float(plan_report.get("current_short_notional")),
                     "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
                     "actual_net_notional": _safe_float(plan_report.get("actual_net_notional")),
+                    "unrealized_pnl": _safe_float(plan_report.get("unrealized_pnl")),
                     "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
                     "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
                     "synthetic_unmatched_trade_count": int(
@@ -15324,6 +15359,10 @@ def main() -> None:
                     "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
                     "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
                     "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+                    "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
+                    "max_synthetic_drift_notional": runtime_guard_config.max_synthetic_drift_notional,
+                    "max_unrealized_loss": runtime_guard_config.max_unrealized_loss,
+                    "unrealized_loss": runtime_guard_result.unrealized_loss,
                 }
                 if runtime_loss_recovery_summary is not None:
                     summary["runtime_status"] = "cooldown"

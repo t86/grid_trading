@@ -214,6 +214,30 @@ class RuntimeGuardsTests(unittest.TestCase):
         self.assertTrue(result.stop_triggered)
         self.assertEqual(result.primary_reason, "max_cumulative_notional_hit")
 
+    def test_evaluate_runtime_guards_stops_on_unrealized_loss(self) -> None:
+        now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
+        cfg = RuntimeGuardConfig(
+            run_start_time=None,
+            run_end_time=None,
+            rolling_hourly_loss_limit=None,
+            rolling_hourly_loss_per_10k_limit=None,
+            rolling_hourly_loss_per_10k_min_notional=10000.0,
+            max_cumulative_notional=None,
+            max_actual_net_notional=None,
+            max_synthetic_drift_notional=None,
+            max_unrealized_loss=25.0,
+        )
+        result = evaluate_runtime_guards(
+            config=cfg,
+            now=now,
+            cumulative_gross_notional=0.0,
+            pnl_events=[],
+            unrealized_pnl=-30.0,
+        )
+        self.assertTrue(result.stop_triggered)
+        self.assertEqual(result.primary_reason, "max_unrealized_loss_hit")
+        self.assertAlmostEqual(result.unrealized_loss, 30.0)
+
     def test_evaluate_runtime_guards_prefers_end_time_over_other_stop_reasons(self) -> None:
         now = datetime(2026, 3, 30, 10, 0, tzinfo=timezone.utc)
         cfg = RuntimeGuardConfig(

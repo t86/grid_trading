@@ -50,6 +50,7 @@ class RuntimeGuardConfig:
     max_cumulative_notional: float | None
     max_actual_net_notional: float | None
     max_synthetic_drift_notional: float | None
+    max_unrealized_loss: float | None = None
     runtime_guard_stats_start_time: datetime | None = None
 
 
@@ -68,6 +69,7 @@ class RuntimeGuardResult:
     cumulative_gross_notional: float
     actual_net_notional_abs: float
     synthetic_drift_notional: float
+    unrealized_loss: float = 0.0
 
 
 def resolve_runtime_guard_stats_start_time(
@@ -202,6 +204,10 @@ def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
             raw.get("max_synthetic_drift_notional"),
             "max_synthetic_drift_notional",
         ),
+        max_unrealized_loss=_parse_positive_float(
+            raw.get("max_unrealized_loss"),
+            "max_unrealized_loss",
+        ),
         runtime_guard_stats_start_time=_parse_datetime(
             raw.get("runtime_guard_stats_start_time"),
             "runtime_guard_stats_start_time",
@@ -236,6 +242,7 @@ def normalize_runtime_guard_payload(
         "max_cumulative_notional": config.max_cumulative_notional,
         "max_actual_net_notional": config.max_actual_net_notional,
         "max_synthetic_drift_notional": config.max_synthetic_drift_notional,
+        "max_unrealized_loss": config.max_unrealized_loss,
         "runtime_guard_stats_start_time": resolved_stats_start_time.isoformat() if resolved_stats_start_time else None,
     }
 
@@ -248,11 +255,13 @@ def evaluate_runtime_guards(
     pnl_events: list[dict[str, Any]],
     actual_net_notional: float | None = None,
     synthetic_drift_notional: float | None = None,
+    unrealized_pnl: float | None = None,
 ) -> RuntimeGuardResult:
     current = now.astimezone(timezone.utc)
     reasons: list[str] = []
     actual_net_notional_abs = abs(float(actual_net_notional or 0.0))
     safe_synthetic_drift_notional = max(float(synthetic_drift_notional or 0.0), 0.0)
+    unrealized_loss = max(0.0, -float(unrealized_pnl or 0.0))
 
     window_start = current - timedelta(minutes=60)
     window_net_pnl = 0.0
@@ -287,6 +296,7 @@ def evaluate_runtime_guards(
             cumulative_gross_notional=float(cumulative_gross_notional),
             actual_net_notional_abs=actual_net_notional_abs,
             synthetic_drift_notional=safe_synthetic_drift_notional,
+            unrealized_loss=unrealized_loss,
         )
 
     if config.run_end_time and current >= config.run_end_time:
@@ -308,6 +318,8 @@ def evaluate_runtime_guards(
         and safe_synthetic_drift_notional >= config.max_synthetic_drift_notional
     ):
         reasons.append("max_synthetic_drift_notional_hit")
+    if config.max_unrealized_loss is not None and unrealized_loss >= config.max_unrealized_loss:
+        reasons.append("max_unrealized_loss_hit")
 
     return RuntimeGuardResult(
         tradable=not reasons,
@@ -323,4 +335,5 @@ def evaluate_runtime_guards(
         cumulative_gross_notional=float(cumulative_gross_notional),
         actual_net_notional_abs=actual_net_notional_abs,
         synthetic_drift_notional=safe_synthetic_drift_notional,
+        unrealized_loss=unrealized_loss,
     )

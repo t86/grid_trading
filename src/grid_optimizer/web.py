@@ -3868,6 +3868,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "max_cumulative_notional": None,
     "max_actual_net_notional": None,
     "max_synthetic_drift_notional": None,
+    "max_unrealized_loss": None,
     "volume_trigger_enabled": False,
     "volume_trigger_window": DEFAULT_VOLUME_TRIGGER_WINDOW,
     "volume_trigger_start_threshold": None,
@@ -5370,6 +5371,7 @@ RUNNING_STATUS_FORM_GROUPS: list[dict[str, Any]] = [
             {"key": "max_total_notional", "label": "最大总名义", "type": "number", "step": "0.01", "allowNull": True},
             {"key": "max_actual_net_notional", "label": "最大净敞口", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_NEUTRAL_MODE_LIST},
             {"key": "max_synthetic_drift_notional", "label": "账本漂移上限", "type": "number", "step": "0.01", "allowNull": True, "modes": RUNNING_STATUS_SYNTHETIC_MODE_LIST},
+            {"key": "max_unrealized_loss", "label": "最大浮亏", "type": "number", "step": "0.01", "allowNull": True},
         ],
     },
     {
@@ -8690,6 +8692,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_cumulative_notional",
         "max_actual_net_notional",
         "max_synthetic_drift_notional",
+        "max_unrealized_loss",
         "volume_trigger_start_threshold",
         "volume_trigger_stop_threshold",
         "volatility_trigger_amplitude_ratio",
@@ -8945,6 +8948,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "max_cumulative_notional",
         "max_actual_net_notional",
         "max_synthetic_drift_notional",
+        "max_unrealized_loss",
         "run_start_time",
         "run_end_time",
         "runtime_guard_stats_start_time",
@@ -9048,6 +9052,7 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
             runtime_guard_config.max_cumulative_notional,
             runtime_guard_config.max_actual_net_notional,
             runtime_guard_config.max_synthetic_drift_notional,
+            runtime_guard_config.max_unrealized_loss,
         )
     ):
         return
@@ -9112,6 +9117,11 @@ def _preflight_runner_runtime_guards(config: dict[str, Any]) -> None:
         detail_lines.append(
             "synthetic 漂移 "
             f"{runtime_guard_result.synthetic_drift_notional:.4f} >= 阈值 {runtime_guard_config.max_synthetic_drift_notional:.4f}"
+        )
+    if "max_unrealized_loss_hit" in reasons and runtime_guard_config.max_unrealized_loss is not None:
+        detail_lines.append(
+            "当前浮亏 "
+            f"{runtime_guard_result.unrealized_loss:.4f} >= 阈值 {runtime_guard_config.max_unrealized_loss:.4f}"
         )
     if not detail_lines:
         detail_lines.append(f"stop_reason={runtime_guard_result.primary_reason}")
@@ -10118,6 +10128,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--max-actual-net-notional", str(config["max_actual_net_notional"])])
     if config.get("max_synthetic_drift_notional") is not None:
         command.extend(["--max-synthetic-drift-notional", str(config["max_synthetic_drift_notional"])])
+    if config.get("max_unrealized_loss") is not None:
+        command.extend(["--max-unrealized-loss", str(config["max_unrealized_loss"])])
     command.append("--auto-regime-enabled" if config.get("auto_regime_enabled", False) else "--no-auto-regime-enabled")
     if config.get("auto_regime_confirm_cycles") is not None:
         command.extend(["--auto-regime-confirm-cycles", str(config["auto_regime_confirm_cycles"])])
@@ -10410,6 +10422,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "max_cumulative_notional",
             "max_actual_net_notional",
             "max_synthetic_drift_notional",
+            "max_unrealized_loss",
             "sleep_seconds",
             "startup_jitter_seconds",
             "cycle_jitter_seconds",
@@ -20102,6 +20115,9 @@ MONITOR_PAGE = """<!doctype html>
                 <label>账本漂移上限
                   <input id="runner_field_max_synthetic_drift_notional" type="number" min="0" step="0.01" />
                 </label>
+                <label>最大浮亏
+                  <input id="runner_field_max_unrealized_loss" type="number" min="0" step="0.01" />
+                </label>
               </div>
             </section>
             <section class="runner-form-section" data-runner-section="center">
@@ -23232,6 +23248,7 @@ MONITOR_PAGE = """<!doctype html>
       { key: "max_total_notional", id: "runner_field_max_total_notional", type: "number", allowNull: true },
       { key: "max_actual_net_notional", id: "runner_field_max_actual_net_notional", type: "number", allowNull: true, modes: NEUTRAL_RUNNER_MODE_LIST },
       { key: "max_synthetic_drift_notional", id: "runner_field_max_synthetic_drift_notional", type: "number", allowNull: true, modes: SYNTHETIC_RUNNER_MODE_LIST },
+      { key: "max_unrealized_loss", id: "runner_field_max_unrealized_loss", type: "number", allowNull: true },
       { key: "center_price", id: "runner_field_center_price", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "up_trigger_steps", id: "runner_field_up_trigger_steps", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "down_trigger_steps", id: "runner_field_down_trigger_steps", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -23425,6 +23442,7 @@ MONITOR_PAGE = """<!doctype html>
       max_cumulative_notional: "累计成交额阈值。达到后会自动停机、撤单并清仓。",
       max_actual_net_notional: "实际净敞口绝对值阈值。达到后会自动停机、撤单并清仓。",
       max_synthetic_drift_notional: "synthetic 虚拟净仓和实际净仓偏差折算成名义金额后的阈值。达到后会自动停机、撤单并清仓。",
+      max_unrealized_loss: "当前持仓按交易所 mark 价格计算的浮亏阈值。达到后会自动停机、撤单并清仓。",
       volume_trigger_enabled: "是否启用按市场成交额自动启动/停止策略的后台巡检。",
       volume_trigger_window: "量能观察窗口。当前按 Binance 合约 1 分钟 K 线的 quote volume 汇总。",
       volume_trigger_start_threshold: "最近窗口市场成交额达到这个阈值后，后台会自动启动策略。",
@@ -24685,6 +24703,9 @@ MONITOR_PAGE = """<!doctype html>
       }
       if (asGuideNumber(config.max_synthetic_drift_notional) > 0) {
         lines.push(`synthetic 虚拟净仓和真实净仓的偏差折算名义达到 ${fmtGuideNotional(config.max_synthetic_drift_notional)} 时，会直接停机并执行撤单清仓。`);
+      }
+      if (asGuideNumber(config.max_unrealized_loss) > 0) {
+        lines.push(`当前持仓浮亏达到 ${fmtGuideNotional(config.max_unrealized_loss)} 时，会直接停机并执行撤单清仓。`);
       }
       if (config.volume_trigger_enabled) {
         const windowLabel = formatVolumeTriggerWindowLabel(config.volume_trigger_window);

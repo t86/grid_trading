@@ -7296,11 +7296,14 @@ class LoopRunnerTests(unittest.TestCase):
                 "120",
                 "--max-synthetic-drift-notional",
                 "60",
+                "--max-unrealized-loss",
+                "25",
             ]
         )
 
         self.assertEqual(args.max_actual_net_notional, 120.0)
         self.assertEqual(args.max_synthetic_drift_notional, 60.0)
+        self.assertEqual(args.max_unrealized_loss, 25.0)
 
     def test_build_parser_accepts_static_quote_offset_thresholds(self) -> None:
         args = _build_parser().parse_args(
