@@ -15177,6 +15177,12 @@ def main() -> None:
                     "unrealized_loss_entry_guard_reason": plan_report.get("unrealized_loss_entry_guard_reason"),
                     "unrealized_loss_entry_guard_loss": _safe_float(plan_report.get("unrealized_loss_entry_guard_loss")),
                     "unrealized_loss_entry_guard_ratio": _safe_float(plan_report.get("unrealized_loss_entry_guard_ratio")),
+                    "unrealized_loss_entry_guard_threshold_ratio": _safe_float(
+                        plan_report.get("unrealized_loss_entry_guard_threshold_ratio")
+                    ),
+                    "unrealized_loss_entry_guard_min_loss": _safe_float(
+                        plan_report.get("unrealized_loss_entry_guard_min_loss")
+                    ),
                     "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
                     "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
                     "synthetic_unmatched_trade_count": int(
