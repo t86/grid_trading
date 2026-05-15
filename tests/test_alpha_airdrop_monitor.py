@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from grid_optimizer.alpha_airdrop_monitor import (
     AccountCheckResult,
+    _build_alert_headline,
     _build_bark_title,
     _extract_bark_key,
     _build_email_body,
@@ -171,6 +172,16 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
         self.assertIn("第 1/3 次提醒", body)
         self.assertIn("https://x.com/BinanceWallet/status/200", body)
 
+    def test_build_alert_headline_uses_points_bucket_and_time(self) -> None:
+        self.assertEqual(
+            _build_alert_headline({"points_threshold": 225, "time_hint_text": "18:00（UTC+8）"}),
+            "！！！空投 2xx 18:00",
+        )
+        self.assertEqual(
+            _build_alert_headline({"points_threshold": 95}),
+            "！！！空投 95",
+        )
+
     def test_extract_bark_key_supports_full_url_or_plain_key(self) -> None:
         self.assertEqual(_extract_bark_key("Ui2sPsKqsS4uvJsYP6tvwm"), "Ui2sPsKqsS4uvJsYP6tvwm")
         self.assertEqual(
@@ -223,16 +234,16 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
         self.assertTrue(result["sent"])
         self.assertEqual(captured["url"], "https://api.day.app/Ui2sPsKqsS4uvJsYP6tvwm")
         self.assertEqual(captured["json"]["url"], "https://x.com/binancezh/status/200")
-        self.assertEqual(captured["json"]["title"], "Alpha空投 17:00（UTC+8）开领 @binancezh")
+        self.assertEqual(captured["json"]["title"], "！！！空投 2xx 17:00")
 
     def test_build_bark_title_uses_time_hint_when_available(self) -> None:
         self.assertEqual(
-            _build_bark_title({"account": "binancezh", "time_hint_text": "17:00（UTC+8）"}),
-            "Alpha空投 17:00（UTC+8）开领 @binancezh",
+            _build_bark_title({"account": "binancezh", "points_threshold": 225, "time_hint_text": "17:00（UTC+8）"}),
+            "！！！空投 2xx 17:00",
         )
         self.assertEqual(
-            _build_bark_title({"account": "binancezh"}),
-            "Alpha空投提醒 @binancezh",
+            _build_bark_title({"account": "binancezh", "points_threshold": 225}),
+            "！！！空投 2xx",
         )
 
     def test_load_state_ignores_invalid_json(self) -> None:

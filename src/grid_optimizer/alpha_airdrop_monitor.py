@@ -22,6 +22,8 @@ DEFAULT_BARK_CONFIG_PATH = Path("output/alpha_airdrop_monitor_bark.json")
 DEFAULT_TZ_OFFSET_HOURS = 8
 DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_BARK_URL = "https://api.day.app"
+DEFAULT_BARK_LEVEL = "critical"
+DEFAULT_BARK_SOUND = "alarm"
 
 _POINTS_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"at least\s+(\d{2,6})\s+binance alpha points", re.IGNORECASE),
@@ -223,10 +225,7 @@ def _update_state_for_candidates(state: dict[str, Any], candidates: list[dict[st
 
 
 def _build_email_subject(post: dict[str, Any]) -> str:
-    return (
-        f"[grid][alpha-airdrop] @{post.get('account')} "
-        f"Alpha 空投提醒 {post.get('notification_sequence')}/3"
-    )
+    return _build_alert_headline(post)
 
 
 def _build_email_body(post: dict[str, Any]) -> str:
@@ -243,6 +242,29 @@ def _build_email_body(post: dict[str, Any]) -> str:
         str(post.get("text") or ""),
     ]
     return "\n".join(lines).strip() + "\n"
+
+
+def _format_points_bucket(points_threshold: Any) -> str:
+    try:
+        points = int(points_threshold)
+    except (TypeError, ValueError):
+        return "xxx"
+    if points < 100:
+        return str(points)
+    return f"{str(points)[0]}xx"
+
+
+def _normalize_headline_time(time_hint: str) -> str:
+    match = re.search(r"(\d{1,2}:\d{2})", str(time_hint or ""))
+    return match.group(1) if match else ""
+
+
+def _build_alert_headline(post: dict[str, Any]) -> str:
+    bucket = _format_points_bucket(post.get("points_threshold"))
+    time_text = _normalize_headline_time(str(post.get("time_hint_text") or ""))
+    if time_text:
+        return f"！！！空投 {bucket} {time_text}"
+    return f"！！！空投 {bucket}"
 
 
 def _normalize_bark_base_url(value: str) -> str:
@@ -264,10 +286,7 @@ def _extract_bark_key(value: str) -> str:
 
 
 def _build_bark_title(post: dict[str, Any]) -> str:
-    time_hint = str(post.get("time_hint_text") or "").strip()
-    if time_hint:
-        return f"Alpha空投 {time_hint}开领 @{post.get('account')}"
-    return f"Alpha空投提醒 @{post.get('account')}"
+    return _build_alert_headline(post)
 
 
 def _build_bark_body(post: dict[str, Any]) -> str:
@@ -282,6 +301,9 @@ def send_bark_notification(
     bark_endpoint_or_key: str,
     post: dict[str, Any],
     bark_base_url: str = DEFAULT_BARK_URL,
+    bark_level: str = DEFAULT_BARK_LEVEL,
+    bark_sound: str = DEFAULT_BARK_SOUND,
+    bark_call: bool = True,
     timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS,
 ) -> dict[str, Any]:
     key = _extract_bark_key(bark_endpoint_or_key)
@@ -294,7 +316,9 @@ def send_bark_notification(
         "body": _build_bark_body(post),
         "url": str(post.get("tweet_url") or ""),
         "group": "binance-alpha-airdrop",
-        "level": "active",
+        "level": bark_level,
+        "sound": bark_sound,
+        "call": "1" if bark_call else "0",
         "isArchive": "1",
     }
     result = {"sent": False, "error": None, "url": url}
@@ -312,10 +336,16 @@ def load_bark_config(path: Path | None = None) -> dict[str, Any]:
     file_config = _load_state(config_path)
     env_endpoint = str(os.environ.get("GRID_ALPHA_AIRDROP_BARK_ENDPOINT", "")).strip()
     env_base_url = str(os.environ.get("GRID_ALPHA_AIRDROP_BARK_BASE_URL", "")).strip()
+    env_level = str(os.environ.get("GRID_ALPHA_AIRDROP_BARK_LEVEL", "")).strip()
+    env_sound = str(os.environ.get("GRID_ALPHA_AIRDROP_BARK_SOUND", "")).strip()
+    env_call = str(os.environ.get("GRID_ALPHA_AIRDROP_BARK_CALL", "")).strip().lower()
     return {
         "enabled": bool(env_endpoint or file_config.get("bark_endpoint")),
         "bark_endpoint": env_endpoint or str(file_config.get("bark_endpoint") or "").strip(),
         "bark_base_url": env_base_url or str(file_config.get("bark_base_url") or DEFAULT_BARK_URL).strip(),
+        "bark_level": env_level or str(file_config.get("bark_level") or DEFAULT_BARK_LEVEL).strip(),
+        "bark_sound": env_sound or str(file_config.get("bark_sound") or DEFAULT_BARK_SOUND).strip(),
+        "bark_call": env_call not in {"0", "false", "no"} if env_call else bool(file_config.get("bark_call", True)),
         "config_path": str(config_path),
     }
 
@@ -335,6 +365,9 @@ def _send_notifications(
         bark_result = send_bark_notification(
             bark_endpoint_or_key=str(bark_config.get("bark_endpoint") or ""),
             bark_base_url=str(bark_config.get("bark_base_url") or DEFAULT_BARK_URL),
+            bark_level=str(bark_config.get("bark_level") or DEFAULT_BARK_LEVEL),
+            bark_sound=str(bark_config.get("bark_sound") or DEFAULT_BARK_SOUND),
+            bark_call=bool(bark_config.get("bark_call", True)),
             post=candidate,
         )
         bark_results.append(bark_result)
