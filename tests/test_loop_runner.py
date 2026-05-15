@@ -91,6 +91,7 @@ from grid_optimizer.loop_runner import (
     resolve_anti_chase_entry_guard,
     apply_synthetic_trend_follow_guard,
     apply_entry_permission_gate,
+    assess_unrealized_loss_entry_guard,
     remove_take_profit_exit_orders,
     sync_synthetic_ledger,
     update_synthetic_order_refs,
@@ -923,6 +924,32 @@ class LoopRunnerTests(unittest.TestCase):
             plan["sell_orders"],
             [{"side": "SELL", "role": "entry_short"}, {"side": "SELL", "role": "take_profit_long"}],
         )
+
+    def test_unrealized_loss_entry_guard_prunes_entries_but_keeps_reducers(self) -> None:
+        guard = assess_unrealized_loss_entry_guard(
+            enabled=True,
+            unrealized_pnl=-6.0,
+            current_long_notional=300.0,
+            current_short_notional=0.0,
+            min_loss=3.0,
+            loss_ratio=0.015,
+        )
+        plan = {
+            "bootstrap_orders": [{"side": "BUY", "role": "bootstrap_long"}],
+            "buy_orders": [{"side": "BUY", "role": "entry_long"}],
+            "sell_orders": [
+                {"side": "SELL", "role": "entry_short"},
+                {"side": "SELL", "role": "take_profit_long"},
+            ],
+        }
+
+        self.assertTrue(guard["active"])
+        report = apply_entry_permission_gate(plan, allow_entry_long=False, allow_entry_short=False)
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(plan["bootstrap_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [{"side": "SELL", "role": "take_profit_long"}])
 
     def test_apply_entry_permission_gate_limits_entry_order_count(self) -> None:
         plan = {
@@ -7298,12 +7325,20 @@ class LoopRunnerTests(unittest.TestCase):
                 "60",
                 "--max-unrealized-loss",
                 "25",
+                "--unrealized-loss-entry-guard-enabled",
+                "--unrealized-loss-entry-guard-min-loss",
+                "3",
+                "--unrealized-loss-entry-guard-ratio",
+                "0.015",
             ]
         )
 
         self.assertEqual(args.max_actual_net_notional, 120.0)
         self.assertEqual(args.max_synthetic_drift_notional, 60.0)
         self.assertEqual(args.max_unrealized_loss, 25.0)
+        self.assertTrue(args.unrealized_loss_entry_guard_enabled)
+        self.assertEqual(args.unrealized_loss_entry_guard_min_loss, 3.0)
+        self.assertEqual(args.unrealized_loss_entry_guard_ratio, 0.015)
 
     def test_build_parser_accepts_static_quote_offset_thresholds(self) -> None:
         args = _build_parser().parse_args(

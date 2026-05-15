@@ -9134,6 +9134,40 @@ def resolve_market_bias_entry_pause(
     }
 
 
+def assess_unrealized_loss_entry_guard(
+    *,
+    enabled: bool,
+    unrealized_pnl: float,
+    current_long_notional: float,
+    current_short_notional: float,
+    min_loss: float | None,
+    loss_ratio: float | None,
+) -> dict[str, Any]:
+    exposure_notional = max(_safe_float(current_long_notional), 0.0) + max(_safe_float(current_short_notional), 0.0)
+    unrealized_loss = max(0.0, -_safe_float(unrealized_pnl))
+    safe_min_loss = max(_safe_float(min_loss), 0.0)
+    safe_loss_ratio = max(_safe_float(loss_ratio), 0.0)
+    ratio = (unrealized_loss / exposure_notional) if exposure_notional > 0 else 0.0
+    active = bool(enabled and exposure_notional > 0 and safe_loss_ratio > 0 and unrealized_loss >= safe_min_loss and ratio >= safe_loss_ratio)
+    reason = None
+    if active:
+        reason = (
+            f"unrealized_loss_ratio loss={unrealized_loss:.4f} "
+            f"ratio={ratio:.4%} >= {safe_loss_ratio:.4%}"
+        )
+    return {
+        "enabled": bool(enabled),
+        "active": active,
+        "reason": reason,
+        "unrealized_pnl": _safe_float(unrealized_pnl),
+        "unrealized_loss": unrealized_loss,
+        "exposure_notional": exposure_notional,
+        "loss_ratio": ratio,
+        "min_loss": safe_min_loss,
+        "threshold_ratio": safe_loss_ratio,
+    }
+
+
 def resolve_market_bias_regime_switch(
     *,
     state: dict[str, Any],
@@ -9889,6 +9923,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "hard_unrealized_loss_limit": getattr(args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
         "placed_order_count": 0,
         "placed_notional": 0.0,
+    }
+    unrealized_loss_entry_guard: dict[str, Any] = {
+        "enabled": bool(getattr(args, "unrealized_loss_entry_guard_enabled", False)),
+        "active": False,
+        "reason": None,
+        "unrealized_pnl": 0.0,
+        "unrealized_loss": 0.0,
+        "exposure_notional": 0.0,
+        "loss_ratio": 0.0,
+        "min_loss": getattr(args, "unrealized_loss_entry_guard_min_loss", None),
+        "threshold_ratio": getattr(args, "unrealized_loss_entry_guard_ratio", None),
     }
     adverse_inventory_reduce: dict[str, Any] = {
         "enabled": bool(getattr(args, "adverse_reduce_enabled", False)),
@@ -12637,6 +12682,23 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
 
+    unrealized_loss_entry_guard = assess_unrealized_loss_entry_guard(
+        enabled=bool(getattr(effective_args, "unrealized_loss_entry_guard_enabled", False)),
+        unrealized_pnl=unrealized_pnl,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        min_loss=getattr(effective_args, "unrealized_loss_entry_guard_min_loss", None),
+        loss_ratio=getattr(effective_args, "unrealized_loss_entry_guard_ratio", None),
+    )
+    if unrealized_loss_entry_guard.get("active"):
+        controls["buy_paused"] = True
+        controls["short_paused"] = True
+        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
+        guard_reason = str(unrealized_loss_entry_guard.get("reason") or "active")
+        controls["pause_reasons"].append(f"unrealized_loss_entry_guard: {guard_reason}")
+        controls["short_pause_reasons"].append(f"unrealized_loss_entry_guard: {guard_reason}")
+
     elastic_absorbs_volatility_entry_pause = bool(elastic_volume.get("enabled") and elastic_volume.get("applied"))
     if volatility_entry_pause.get("active") and not elastic_absorbs_volatility_entry_pause:
         entry_pause_reason = volatility_entry_pause.get("reason") or "active"
@@ -12877,6 +12939,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "exposure_escalation": exposure_escalation,
         "exposure_escalation_buy_pause": exposure_escalation_buy_pause,
         "hard_loss_forced_reduce": hard_loss_forced_reduce,
+        "unrealized_loss_entry_guard": unrealized_loss_entry_guard,
         "active_delever": active_delever,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
@@ -12893,6 +12956,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_qty * max(mid_price, 0.0),
         "unrealized_pnl": unrealized_pnl,
+        "unrealized_loss_entry_guard_enabled": bool(unrealized_loss_entry_guard.get("enabled")),
+        "unrealized_loss_entry_guard_active": bool(unrealized_loss_entry_guard.get("active")),
+        "unrealized_loss_entry_guard_reason": unrealized_loss_entry_guard.get("reason"),
+        "unrealized_loss_entry_guard_loss": _safe_float(unrealized_loss_entry_guard.get("unrealized_loss")),
+        "unrealized_loss_entry_guard_ratio": _safe_float(unrealized_loss_entry_guard.get("loss_ratio")),
+        "unrealized_loss_entry_guard_threshold_ratio": _safe_float(unrealized_loss_entry_guard.get("threshold_ratio")),
+        "unrealized_loss_entry_guard_min_loss": _safe_float(unrealized_loss_entry_guard.get("min_loss")),
         "synthetic_ledger": synthetic_ledger_snapshot,
         "synthetic_net_qty": current_long_qty - current_short_qty if _is_synthetic_neutral_mode(strategy_mode) else None,
         "synthetic_drift_qty": (
@@ -13864,6 +13934,9 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-loss-forced-reduce-target-notional", type=float, default=None)
     parser.add_argument("--hard-loss-forced-reduce-max-order-notional", type=float, default=None)
     parser.add_argument("--hard-loss-forced-reduce-unrealized-loss-limit", type=float, default=10.0)
+    parser.add_argument("--unrealized-loss-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--unrealized-loss-entry-guard-min-loss", type=float, default=0.0)
+    parser.add_argument("--unrealized-loss-entry-guard-ratio", type=float, default=0.0)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -14589,9 +14662,13 @@ def main() -> None:
         (args.hard_loss_forced_reduce_target_notional, "--hard-loss-forced-reduce-target-notional"),
         (args.hard_loss_forced_reduce_max_order_notional, "--hard-loss-forced-reduce-max-order-notional"),
         (args.hard_loss_forced_reduce_unrealized_loss_limit, "--hard-loss-forced-reduce-unrealized-loss-limit"),
+        (args.unrealized_loss_entry_guard_min_loss, "--unrealized-loss-entry-guard-min-loss"),
+        (args.unrealized_loss_entry_guard_ratio, "--unrealized-loss-entry-guard-ratio"),
     ):
         if value is not None and value < 0:
             raise SystemExit(f"{label} must be >= 0")
+    if args.unrealized_loss_entry_guard_enabled and args.unrealized_loss_entry_guard_ratio <= 0:
+        raise SystemExit("--unrealized-loss-entry-guard-enabled requires --unrealized-loss-entry-guard-ratio > 0")
     if args.auto_regime_confirm_cycles <= 0:
         raise SystemExit("--auto-regime-confirm-cycles must be > 0")
     if args.auto_regime_stable_15m_max_amplitude_ratio <= 0 or args.auto_regime_stable_60m_max_amplitude_ratio <= 0:
@@ -15095,6 +15172,11 @@ def main() -> None:
                     "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
                     "actual_net_notional": _safe_float(plan_report.get("actual_net_notional")),
                     "unrealized_pnl": _safe_float(plan_report.get("unrealized_pnl")),
+                    "unrealized_loss_entry_guard_enabled": bool(plan_report.get("unrealized_loss_entry_guard_enabled")),
+                    "unrealized_loss_entry_guard_active": bool(plan_report.get("unrealized_loss_entry_guard_active")),
+                    "unrealized_loss_entry_guard_reason": plan_report.get("unrealized_loss_entry_guard_reason"),
+                    "unrealized_loss_entry_guard_loss": _safe_float(plan_report.get("unrealized_loss_entry_guard_loss")),
+                    "unrealized_loss_entry_guard_ratio": _safe_float(plan_report.get("unrealized_loss_entry_guard_ratio")),
                     "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
                     "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
                     "synthetic_unmatched_trade_count": int(

@@ -3399,6 +3399,9 @@ class WebSecurityTests(unittest.TestCase):
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
                 "max_unrealized_loss": 25.0,
+                "unrealized_loss_entry_guard_enabled": True,
+                "unrealized_loss_entry_guard_min_loss": 3.0,
+                "unrealized_loss_entry_guard_ratio": 0.015,
             }
         )
         self.assertEqual(config["run_start_time"], "2026-03-31T01:00:00+00:00")
@@ -3864,6 +3867,9 @@ class WebSecurityTests(unittest.TestCase):
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
                 "max_unrealized_loss": 25.0,
+                "unrealized_loss_entry_guard_enabled": True,
+                "unrealized_loss_entry_guard_min_loss": 3.0,
+                "unrealized_loss_entry_guard_ratio": 0.015,
             }
         )
         self.assertIn("--run-start-time", command)
@@ -3875,6 +3881,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--max-cumulative-notional", command)
         self.assertIn("--max-unrealized-loss", command)
         self.assertIn("25.0", command)
+        self.assertIn("--unrealized-loss-entry-guard-enabled", command)
+        self.assertIn("--unrealized-loss-entry-guard-ratio", command)
+        self.assertIn("0.015", command)
 
     def test_build_runner_command_includes_adverse_reduce_arguments(self) -> None:
         command = _build_runner_command(

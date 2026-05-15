@@ -3817,6 +3817,9 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "hard_loss_forced_reduce_target_notional": None,
     "hard_loss_forced_reduce_max_order_notional": None,
     "hard_loss_forced_reduce_unrealized_loss_limit": 10.0,
+    "unrealized_loss_entry_guard_enabled": False,
+    "unrealized_loss_entry_guard_min_loss": 0.0,
+    "unrealized_loss_entry_guard_ratio": 0.0,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -5405,6 +5408,9 @@ RUNNING_STATUS_FORM_GROUPS: list[dict[str, Any]] = [
             {"key": "hard_loss_forced_reduce_target_notional", "label": "硬损目标仓位", "type": "number", "step": "0.01", "allowNull": True},
             {"key": "hard_loss_forced_reduce_max_order_notional", "label": "硬损单笔上限", "type": "number", "step": "0.01", "allowNull": True},
             {"key": "hard_loss_forced_reduce_unrealized_loss_limit", "label": "硬损浮亏阈值", "type": "number", "step": "0.01", "allowNull": True},
+            {"key": "unrealized_loss_entry_guard_enabled", "label": "启用浮亏软保护", "type": "boolean"},
+            {"key": "unrealized_loss_entry_guard_min_loss", "label": "浮亏软保护最小损耗", "type": "number", "step": "0.01"},
+            {"key": "unrealized_loss_entry_guard_ratio", "label": "浮亏软保护比例", "type": "number", "step": "0.0001"},
         ],
     },
     {
@@ -8661,6 +8667,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "hard_loss_forced_reduce_target_notional",
         "hard_loss_forced_reduce_max_order_notional",
         "hard_loss_forced_reduce_unrealized_loss_limit",
+        "unrealized_loss_entry_guard_min_loss",
+        "unrealized_loss_entry_guard_ratio",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -8781,6 +8789,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "volume_long_v4_flow_sleeve_enabled",
         "exposure_escalation_enabled",
         "hard_loss_forced_reduce_enabled",
+        "unrealized_loss_entry_guard_enabled",
         "auto_regime_enabled",
         "neutral_hourly_scale_enabled",
         "fixed_center_enabled",
@@ -8931,6 +8940,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "hard_loss_forced_reduce_target_notional",
         "hard_loss_forced_reduce_max_order_notional",
         "hard_loss_forced_reduce_unrealized_loss_limit",
+        "unrealized_loss_entry_guard_min_loss",
+        "unrealized_loss_entry_guard_ratio",
         "inventory_tier_start_notional",
         "inventory_tier_end_notional",
         "inventory_tier_per_order_notional",
@@ -10107,6 +10118,21 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--hard-loss-forced-reduce-unrealized-loss-limit",
             str(config["hard_loss_forced_reduce_unrealized_loss_limit"]),
         ])
+    command.append(
+        "--unrealized-loss-entry-guard-enabled"
+        if config.get("unrealized_loss_entry_guard_enabled", False)
+        else "--no-unrealized-loss-entry-guard-enabled"
+    )
+    if config.get("unrealized_loss_entry_guard_min_loss") is not None:
+        command.extend([
+            "--unrealized-loss-entry-guard-min-loss",
+            str(config["unrealized_loss_entry_guard_min_loss"]),
+        ])
+    if config.get("unrealized_loss_entry_guard_ratio") is not None:
+        command.extend([
+            "--unrealized-loss-entry-guard-ratio",
+            str(config["unrealized_loss_entry_guard_ratio"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -10377,6 +10403,9 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "hard_loss_forced_reduce_target_notional",
             "hard_loss_forced_reduce_max_order_notional",
             "hard_loss_forced_reduce_unrealized_loss_limit",
+            "unrealized_loss_entry_guard_enabled",
+            "unrealized_loss_entry_guard_min_loss",
+            "unrealized_loss_entry_guard_ratio",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",
@@ -20554,6 +20583,18 @@ MONITOR_PAGE = """<!doctype html>
                     <span>超仓只减不加</span>
                   </span>
                 </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_unrealized_loss_entry_guard_enabled" type="checkbox" />
+                    <span>浮亏只减不加</span>
+                  </span>
+                </label>
+                <label>浮亏只减最小损耗
+                  <input id="runner_field_unrealized_loss_entry_guard_min_loss" type="number" min="0" step="0.01" />
+                </label>
+                <label>浮亏只减比例
+                  <input id="runner_field_unrealized_loss_entry_guard_ratio" type="number" min="0" step="0.0001" />
+                </label>
               </div>
             </section>
             <section class="runner-form-section full" data-runner-section="hint">
@@ -23357,6 +23398,9 @@ MONITOR_PAGE = """<!doctype html>
       { key: "reset_state", id: "runner_field_reset_state", type: "boolean" },
       { key: "autotune_symbol_enabled", id: "runner_field_autotune_symbol_enabled", type: "boolean" },
       { key: "excess_inventory_reduce_only_enabled", id: "runner_field_excess_inventory_reduce_only_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "unrealized_loss_entry_guard_enabled", id: "runner_field_unrealized_loss_entry_guard_enabled", type: "boolean" },
+      { key: "unrealized_loss_entry_guard_min_loss", id: "runner_field_unrealized_loss_entry_guard_min_loss", type: "number" },
+      { key: "unrealized_loss_entry_guard_ratio", id: "runner_field_unrealized_loss_entry_guard_ratio", type: "number" },
     ];
     const RUNNER_PARAM_EXPLAIN = {
       strategy_profile: "策略模板标识。用于区分量优先做空、做多、防守或自定义策略。",
@@ -23443,6 +23487,9 @@ MONITOR_PAGE = """<!doctype html>
       max_actual_net_notional: "实际净敞口绝对值阈值。达到后会自动停机、撤单并清仓。",
       max_synthetic_drift_notional: "synthetic 虚拟净仓和实际净仓偏差折算成名义金额后的阈值。达到后会自动停机、撤单并清仓。",
       max_unrealized_loss: "当前持仓按交易所 mark 价格计算的浮亏阈值。达到后会自动停机、撤单并清仓。",
+      unrealized_loss_entry_guard_enabled: "当前浮亏达到配置比例后停止新增开仓，只保留减仓/止盈类订单。",
+      unrealized_loss_entry_guard_min_loss: "浮亏只减不加的最小金额门槛，避免小仓位轻微浮亏误触发。",
+      unrealized_loss_entry_guard_ratio: "浮亏金额除以当前持仓名义的触发比例。",
       volume_trigger_enabled: "是否启用按市场成交额自动启动/停止策略的后台巡检。",
       volume_trigger_window: "量能观察窗口。当前按 Binance 合约 1 分钟 K 线的 quote volume 汇总。",
       volume_trigger_start_threshold: "最近窗口市场成交额达到这个阈值后，后台会自动启动策略。",
