@@ -73,3 +73,15 @@ def test_output_logrotate_installer_uses_copytruncate_timer() -> None:
     assert "delaycompress" not in script
     assert "OnUnitActiveSec=${ON_UNIT_ACTIVE_SEC}" in script
     assert "logrotate -s" in script
+
+
+def test_alpha_airdrop_monitor_installer_writes_expected_systemd_units() -> None:
+    script = Path("deploy/oracle/install_alpha_airdrop_monitor.sh").read_text(encoding="utf-8")
+
+    assert 'Description=Monitor Binance Alpha airdrop posts on X' in script
+    assert 'ExecStart=${PYTHON_BIN} -m grid_optimizer.alpha_airdrop_monitor' in script
+    assert '--accounts ${ACCOUNTS}' in script
+    assert '--state-path ${STATE_PATH}' in script
+    assert '--alert-config-path ${ALERT_CONFIG_PATH}' in script
+    assert 'OnUnitActiveSec=10min' in script
+    assert 'sudo systemctl restart "${TIMER_UNIT_NAME}.timer"' in script
