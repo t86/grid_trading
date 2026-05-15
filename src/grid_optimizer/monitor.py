@@ -1381,9 +1381,9 @@ def _build_monitor_snapshot_uncached(
     else:
         api_key, api_secret = credentials
         snapshot["account_connected"] = True
-        try:
-            unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
-            if local_runtime_snapshot is None:
+        unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
+        if local_runtime_snapshot is None:
+            try:
                 account_info = fetch_futures_account_info_v3(api_key, api_secret)
                 position_mode = fetch_futures_position_mode(api_key, api_secret)
                 open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
@@ -1438,6 +1438,9 @@ def _build_monitor_snapshot_uncached(
                     }
                     for item in open_orders
                 ]
+            except Exception as exc:
+                snapshot["warnings"].append(f"account_read_failed: {type(exc).__name__}: {exc}")
+        try:
             user_trades, trade_meta = _load_or_fetch_trade_rows(
                 audit_path=audit_paths["trade_audit"],
                 symbol=normalized_symbol,
@@ -1445,6 +1448,11 @@ def _build_monitor_snapshot_uncached(
                 api_secret=api_secret,
                 session_start=stats_start,
             )
+        except Exception as exc:
+            user_trades = []
+            trade_meta = {"source": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
+            snapshot["warnings"].append(f"trade_audit_refresh_failed: {type(exc).__name__}: {exc}")
+        try:
             income_rows, income_meta = _load_or_fetch_income_rows(
                 audit_path=audit_paths["income_audit"],
                 symbol=normalized_symbol,
@@ -1452,56 +1460,58 @@ def _build_monitor_snapshot_uncached(
                 api_secret=api_secret,
                 session_start=stats_start,
             )
-            trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
-            income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
-            session_start = _min_dt(stats_start, trade_start, income_start)
-            stats_start = competition_start or session_start
-            session_last = _max_dt(session_last, trade_last, income_last)
-            snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
-            snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
-            snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
-            commission_converter = _build_commission_converter(user_trades)
-            trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
-            income_summary = summarize_income(income_rows)
-            hourly_summary = None
-            try:
-                hourly_window_start = max(
-                    stats_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
-                    datetime.now(timezone.utc) - timedelta(hours=48),
-                )
-                hourly_window_start = _floor_hour(hourly_window_start)
-                hourly_window_end = datetime.now(timezone.utc) + timedelta(minutes=1)
-                hourly_candles = fetch_futures_klines(
-                    symbol=normalized_symbol,
-                    interval="1h",
-                    start_ms=int(hourly_window_start.timestamp() * 1000),
-                    end_ms=int(hourly_window_end.timestamp() * 1000),
-                )
-                hourly_summary = summarize_hourly_metrics(
-                    user_trades,
-                    income_rows,
-                    hourly_candles,
-                    commission_converter=commission_converter,
-                    limit=24,
-                )
-            except Exception as exc:
-                snapshot["warnings"].append(f"hourly_summary_failed: {type(exc).__name__}: {exc}")
-            net_pnl_est = (
-                trade_summary["realized_pnl"]
-                + unrealized_pnl
-                + income_summary["funding_fee"]
-                - trade_summary["commission"]
-            )
-            trade_summary["net_pnl_estimate"] = net_pnl_est
-            snapshot["trade_summary"] = trade_summary
-            snapshot["income_summary"] = income_summary
-            snapshot["hourly_summary"] = hourly_summary
-            snapshot["audit"]["trade_source"] = trade_meta
-            snapshot["audit"]["income_source"] = income_meta
-            snapshot["audit"]["trade_row_count"] = len(user_trades)
-            snapshot["audit"]["income_row_count"] = len(income_rows)
         except Exception as exc:
-            snapshot["warnings"].append(f"account_read_failed: {type(exc).__name__}: {exc}")
+            income_rows = []
+            income_meta = {"source": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
+            snapshot["warnings"].append(f"income_refresh_failed: {type(exc).__name__}: {exc}")
+        trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
+        income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
+        session_start = _min_dt(stats_start, trade_start, income_start)
+        stats_start = competition_start or session_start
+        session_last = _max_dt(session_last, trade_last, income_last)
+        snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
+        snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
+        snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
+        commission_converter = _build_commission_converter(user_trades)
+        trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
+        income_summary = summarize_income(income_rows)
+        hourly_summary = None
+        try:
+            hourly_window_start = max(
+                stats_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
+                datetime.now(timezone.utc) - timedelta(hours=48),
+            )
+            hourly_window_start = _floor_hour(hourly_window_start)
+            hourly_window_end = datetime.now(timezone.utc) + timedelta(minutes=1)
+            hourly_candles = fetch_futures_klines(
+                symbol=normalized_symbol,
+                interval="1h",
+                start_ms=int(hourly_window_start.timestamp() * 1000),
+                end_ms=int(hourly_window_end.timestamp() * 1000),
+            )
+            hourly_summary = summarize_hourly_metrics(
+                user_trades,
+                income_rows,
+                hourly_candles,
+                commission_converter=commission_converter,
+                limit=24,
+            )
+        except Exception as exc:
+            snapshot["warnings"].append(f"hourly_summary_failed: {type(exc).__name__}: {exc}")
+        net_pnl_est = (
+            trade_summary["realized_pnl"]
+            + unrealized_pnl
+            + income_summary["funding_fee"]
+            - trade_summary["commission"]
+        )
+        trade_summary["net_pnl_estimate"] = net_pnl_est
+        snapshot["trade_summary"] = trade_summary
+        snapshot["income_summary"] = income_summary
+        snapshot["hourly_summary"] = hourly_summary
+        snapshot["audit"]["trade_source"] = trade_meta
+        snapshot["audit"]["income_source"] = income_meta
+        snapshot["audit"]["trade_row_count"] = len(user_trades)
+        snapshot["audit"]["income_row_count"] = len(income_rows)
 
     runner_config = runner.get("config", {})
     latest_loop = (loop_summary.get("latest") or {}) if isinstance(loop_summary, dict) else {}

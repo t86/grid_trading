@@ -87,9 +87,18 @@ FUTURES_SIGNED_FILE_CACHE_ENABLED = os.getenv("GRID_FUTURES_SIGNED_FILE_CACHE_EN
 FUTURES_SIGNED_FILE_CACHE_DIR = Path(
     os.getenv("GRID_FUTURES_SIGNED_FILE_CACHE_DIR", str(Path(tempfile.gettempdir()) / "grid_optimizer_signed_cache"))
 )
+FUTURES_SIGNED_API_MIN_INTERVAL_SECONDS = float(os.getenv("GRID_FUTURES_SIGNED_API_MIN_INTERVAL_SECONDS", "0.05"))
+FUTURES_SIGNED_API_RATE_LIMIT_COOLDOWN_SECONDS = float(
+    os.getenv("GRID_FUTURES_SIGNED_API_RATE_LIMIT_COOLDOWN_SECONDS", "1.0")
+)
+FUTURES_SIGNED_API_MAX_LOCAL_COOLDOWN_RETRY_SECONDS = float(
+    os.getenv("GRID_FUTURES_SIGNED_API_MAX_LOCAL_COOLDOWN_RETRY_SECONDS", "2.0")
+)
 _ORIGINAL_GETADDRINFO = socket.getaddrinfo
 _GETADDRINFO_PATCH_LOCK = threading.RLock()
 _GETADDRINFO_PATCH_DEPTH = 0
+_FUTURES_SIGNED_API_GATE_LOCK = threading.RLock()
+_FUTURES_SIGNED_API_NEXT_REQUEST_AT = 0.0
 _FUTURES_MARKET_CACHE_LOCK = threading.RLock()
 _FUTURES_SIGNED_RESPONSE_CACHE_LOCK = threading.RLock()
 _FUTURES_SYMBOL_CONFIG_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
@@ -285,6 +294,71 @@ def _http_api_key_get_json(url: str, params: dict[str, str | int], api_key: str)
     return _http_api_key_request_json(url, params, api_key, method="GET")
 
 
+def _futures_signed_api_retry_after(exc: Exception) -> float | None:
+    message = str(exc)
+    if "Binance API local cooldown active for futures" not in message:
+        return None
+    match = re.search(r"retry after\s+([0-9]+(?:\.[0-9]+)?)s", message)
+    if match is None:
+        return 0.1
+    try:
+        retry_after = float(match.group(1))
+    except ValueError:
+        return 0.1
+    if retry_after < 0 or retry_after > FUTURES_SIGNED_API_MAX_LOCAL_COOLDOWN_RETRY_SECONDS:
+        return None
+    return retry_after
+
+
+def _futures_signed_api_error_cooldown_seconds(exc: Exception) -> float | None:
+    message = str(exc)
+    if "Binance API error 429" in message or "Binance API error 418" in message:
+        return max(float(FUTURES_SIGNED_API_RATE_LIMIT_COOLDOWN_SECONDS), 0.0)
+    return None
+
+
+def _wait_for_futures_signed_api_gate() -> None:
+    global _FUTURES_SIGNED_API_NEXT_REQUEST_AT
+    with _FUTURES_SIGNED_API_GATE_LOCK:
+        now = time.time()
+        wait_seconds = max(_FUTURES_SIGNED_API_NEXT_REQUEST_AT - now, 0.0)
+        if wait_seconds > 0:
+            time.sleep(wait_seconds)
+            now = time.time()
+        _FUTURES_SIGNED_API_NEXT_REQUEST_AT = max(
+            _FUTURES_SIGNED_API_NEXT_REQUEST_AT,
+            now + max(float(FUTURES_SIGNED_API_MIN_INTERVAL_SECONDS), 0.0),
+        )
+
+
+def _mark_futures_signed_api_cooldown(seconds: float) -> None:
+    global _FUTURES_SIGNED_API_NEXT_REQUEST_AT
+    if seconds <= 0:
+        return
+    with _FUTURES_SIGNED_API_GATE_LOCK:
+        _FUTURES_SIGNED_API_NEXT_REQUEST_AT = max(_FUTURES_SIGNED_API_NEXT_REQUEST_AT, time.time() + seconds)
+
+
+def _call_futures_signed_api_with_gate(fetch: Any) -> Any:
+    last_error: RuntimeError | None = None
+    for _attempt in range(2):
+        _wait_for_futures_signed_api_gate()
+        try:
+            return fetch()
+        except RuntimeError as exc:
+            cooldown_seconds = _futures_signed_api_error_cooldown_seconds(exc)
+            if cooldown_seconds is not None:
+                _mark_futures_signed_api_cooldown(cooldown_seconds)
+            retry_after = _futures_signed_api_retry_after(exc)
+            if retry_after is None:
+                raise
+            last_error = exc
+            time.sleep(retry_after)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("Binance API signed request failed")
+
+
 def _http_signed_request_json(
     url: str,
     params: dict[str, str | int],
@@ -304,11 +378,13 @@ def _http_signed_request_json(
     ).hexdigest()
     signed_params = dict(query_params)
     signed_params["signature"] = signature
-    return _http_request_json(
-        url,
-        signed_params,
-        headers={"X-MBX-APIKEY": api_key.strip()},
-        method=method,
+    return _call_futures_signed_api_with_gate(
+        lambda: _http_request_json(
+            url,
+            signed_params,
+            headers={"X-MBX-APIKEY": api_key.strip()},
+            method=method,
+        )
     )
 
 
@@ -322,11 +398,14 @@ def _http_signed_get_json(
 
 
 def clear_futures_signed_response_caches() -> None:
+    global _FUTURES_SIGNED_API_NEXT_REQUEST_AT
     with _FUTURES_SIGNED_RESPONSE_CACHE_LOCK:
         _FUTURES_POSITION_MODE_CACHE.clear()
         _FUTURES_ACCOUNT_INFO_CACHE.clear()
         _FUTURES_OPEN_ORDERS_CACHE.clear()
         _FUTURES_USER_TRADES_CACHE.clear()
+    with _FUTURES_SIGNED_API_GATE_LOCK:
+        _FUTURES_SIGNED_API_NEXT_REQUEST_AT = 0.0
     if FUTURES_SIGNED_FILE_CACHE_ENABLED:
         try:
             for path in FUTURES_SIGNED_FILE_CACHE_DIR.glob("*.json"):

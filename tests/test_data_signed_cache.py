@@ -19,6 +19,61 @@ class FuturesSignedResponseCacheTests(unittest.TestCase):
     def tearDown(self) -> None:
         clear_futures_signed_response_caches()
 
+    @patch("grid_optimizer.data.time.sleep")
+    @patch("grid_optimizer.data._http_request_json")
+    def test_signed_request_retries_short_local_cooldown(self, mock_request, mock_sleep) -> None:
+        mock_request.side_effect = [
+            RuntimeError("Binance API local cooldown active for futures; retry after 0.1s"),
+            {"ok": True},
+        ]
+
+        with patch.object(data, "FUTURES_SIGNED_API_MIN_INTERVAL_SECONDS", 0.0):
+            result = data._http_signed_request_json(
+                "https://fapi.binance.com/fapi/v1/order",
+                {},
+                "key",
+                "secret",
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(mock_request.call_count, 2)
+        mock_sleep.assert_called_once_with(0.1)
+
+    @patch("grid_optimizer.data.time.sleep")
+    @patch("grid_optimizer.data.time.time")
+    @patch("grid_optimizer.data._http_request_json")
+    def test_signed_request_enters_local_cooldown_after_binance_rate_limit(
+        self,
+        mock_request,
+        mock_time,
+        mock_sleep,
+    ) -> None:
+        mock_time.side_effect = [1000.0, 1000.0, 1000.5, 1000.5, 1000.5, 1000.5]
+        mock_request.side_effect = [
+            RuntimeError("Binance API error 429: Too many requests"),
+            {"ok": True},
+        ]
+
+        with patch.object(data, "FUTURES_SIGNED_API_MIN_INTERVAL_SECONDS", 0.0):
+            with self.assertRaisesRegex(RuntimeError, "Too many requests"):
+                data._http_signed_request_json(
+                    "https://fapi.binance.com/fapi/v1/account",
+                    {},
+                    "key",
+                    "secret",
+                )
+
+            result = data._http_signed_request_json(
+                "https://fapi.binance.com/fapi/v1/account",
+                {},
+                "key",
+                "secret",
+            )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(mock_request.call_count, 2)
+        mock_sleep.assert_called_once_with(1.0)
+
     @patch("grid_optimizer.data._http_signed_request_json")
     @patch("grid_optimizer.data.time.time")
     def test_fetch_futures_position_mode_uses_long_lived_cache(self, mock_time, mock_http) -> None:
