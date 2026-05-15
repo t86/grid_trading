@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import smtplib
 import socket
 from datetime import datetime, timezone
@@ -44,6 +45,7 @@ def load_alert_notifier_config(path: Path | None = None) -> dict[str, Any]:
     env_smtp_username = os.environ.get("GRID_ALERT_SMTP_USERNAME", "").strip()
     env_smtp_password = os.environ.get("GRID_ALERT_SMTP_PASSWORD", "").strip()
     env_smtp_tls = os.environ.get("GRID_ALERT_SMTP_STARTTLS", "").strip()
+    env_subject_allow_regex = os.environ.get("GRID_ALERT_SUBJECT_ALLOW_REGEX", "").strip()
 
     email_to = file_config.get("email_to") or []
     if isinstance(email_to, str):
@@ -79,6 +81,7 @@ def load_alert_notifier_config(path: Path | None = None) -> dict[str, Any]:
         "timeout_seconds": float(file_config.get("timeout_seconds") or 4.0),
         "direct_mx_by_domain": direct_mx_by_domain,
         "status_path": str(file_config.get("status_path") or DEFAULT_ALERT_STATUS_PATH),
+        "subject_allow_regex": env_subject_allow_regex or str(file_config.get("subject_allow_regex") or "").strip(),
     }
 
 
@@ -156,6 +159,17 @@ def send_alert_email(
         result["error"] = "alert_email_disabled"
         _write_json_dict(status_path, result)
         return result
+    subject_allow_regex = str(config.get("subject_allow_regex") or "").strip()
+    if subject_allow_regex:
+        try:
+            if re.search(subject_allow_regex, subject) is None:
+                result["error"] = "alert_email_filtered_by_subject_regex"
+                _write_json_dict(status_path, result)
+                return result
+        except re.error as exc:
+            result["error"] = f"alert_email_invalid_subject_regex: {exc}"
+            _write_json_dict(status_path, result)
+            return result
 
     message = EmailMessage()
     message["From"] = str(config.get("email_from") or "").strip()
