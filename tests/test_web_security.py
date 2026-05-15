@@ -1114,6 +1114,7 @@ class WebSecurityTests(unittest.TestCase):
                 "elastic_cooldown_seconds": 90.0,
                 "elastic_state_confirm_cycles": 4,
                 "elastic_cancel_stale_entries_on_cooldown": True,
+                "regime_entry_budget_min_profit_or_fee_buffer_ratio": "0.0006",
             }
         )
 
@@ -1135,6 +1136,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["elastic_cooldown_seconds"], 90.0)
         self.assertEqual(payload["elastic_state_confirm_cycles"], 4)
         self.assertTrue(payload["elastic_cancel_stale_entries_on_cooldown"])
+        self.assertEqual(payload["regime_entry_budget_min_profit_or_fee_buffer_ratio"], 0.0006)
 
     def test_normalize_runner_control_payload_supports_synthetic_trend_follow_fields(self) -> None:
         payload = _normalize_runner_control_payload(
@@ -3189,9 +3191,11 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_build_runner_command_includes_execution_regime_arguments(self) -> None:
         config = _runner_preset_payload("soon_volume_neutral_ping_pong_v1", {"symbol": "SOONUSDT"})
+        config["regime_entry_budget_min_profit_or_fee_buffer_ratio"] = 0.0006
 
         command = _build_runner_command(config)
 
+        self.assertIn("--regime-entry-budget-min-profit-or-fee-buffer-ratio", command)
         self.assertIn("--execution-regime-enabled", command)
         self.assertIn("--execution-regime-vol-p50-ratio", command)
         self.assertIn("--execution-regime-vol-p95-ratio", command)

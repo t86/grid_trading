@@ -9408,6 +9408,9 @@ def _regime_entry_budget_config(args: argparse.Namespace) -> RegimeEntryBudgetCo
         report_only=bool(getattr(args, "regime_entry_budget_report_only", True)),
         base_per_order_notional=float(getattr(args, "regime_entry_budget_base_per_order_notional", 60.0)),
         base_step_ratio=float(getattr(args, "regime_entry_budget_base_step_ratio", 0.0025)),
+        min_profit_or_fee_buffer_ratio=float(
+            getattr(args, "regime_entry_budget_min_profit_or_fee_buffer_ratio", 0.0008)
+        ),
         switch_reconcile_confirm_cycles=int(getattr(args, "regime_entry_budget_switch_reconcile_confirm_cycles", 2)),
         shock_reconcile_confirm_cycles=int(getattr(args, "regime_entry_budget_shock_reconcile_confirm_cycles", 3)),
         shock_30s_abs_return_ratio=float(getattr(args, "regime_entry_budget_shock_30s_abs_return_ratio", 0.016)),
@@ -13695,6 +13698,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--regime-entry-budget-report-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--regime-entry-budget-base-per-order-notional", type=float, default=60.0)
     parser.add_argument("--regime-entry-budget-base-step-ratio", type=float, default=0.0025)
+    parser.add_argument("--regime-entry-budget-min-profit-or-fee-buffer-ratio", type=float, default=0.0008)
     parser.add_argument("--regime-entry-budget-switch-reconcile-confirm-cycles", type=int, default=2)
     parser.add_argument("--regime-entry-budget-shock-reconcile-confirm-cycles", type=int, default=3)
     parser.add_argument("--regime-entry-budget-shock-30s-abs-return-ratio", type=float, default=0.016)
@@ -14403,6 +14407,8 @@ def main() -> None:
         raise SystemExit("--regime-entry-budget-base-per-order-notional must be > 0")
     if args.regime_entry_budget_base_step_ratio <= 0:
         raise SystemExit("--regime-entry-budget-base-step-ratio must be > 0")
+    if args.regime_entry_budget_min_profit_or_fee_buffer_ratio < 0:
+        raise SystemExit("--regime-entry-budget-min-profit-or-fee-buffer-ratio must be >= 0")
     if args.regime_entry_budget_switch_reconcile_confirm_cycles < 1:
         raise SystemExit("--regime-entry-budget-switch-reconcile-confirm-cycles must be >= 1")
     if args.regime_entry_budget_shock_reconcile_confirm_cycles < 1:
