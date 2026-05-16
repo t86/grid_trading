@@ -702,9 +702,15 @@ def resolve_volatility_entry_pause(
     window_5m_abs_return_ratio: float | None,
     window_5m_amplitude_ratio: float | None,
     recover_confirm_cycles: int = 1,
+    now: datetime | None = None,
+    min_observation_seconds: float = 0.0,
+    current_long_notional: float | None = None,
+    current_short_notional: float | None = None,
+    inventory_recover_ratio: float = 1.0,
 ) -> dict[str, Any]:
     metrics = dict(adaptive_step.get("metrics") or {}) if isinstance(adaptive_step, dict) else {}
     memory = dict((state or {}).get("volatility_entry_pause_state") or {}) if isinstance(state, dict) else {}
+    current_time = now or _utc_now()
     report: dict[str, Any] = {
         "enabled": bool(enabled),
         "active": False,
@@ -719,6 +725,8 @@ def resolve_volatility_entry_pause(
         "matched_reasons": [],
         "reason": None,
         "metrics": metrics,
+        "observation_remaining_seconds": 0.0,
+        "inventory_gate_active": False,
         "state": {},
     }
     if not enabled:
@@ -772,21 +780,52 @@ def resolve_volatility_entry_pause(
         for _, window_key, metric, value, threshold in sorted(candidates, key=lambda item: item[0], reverse=True)
     ]
     required_recover = max(int(recover_confirm_cycles or 1), 1)
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    short_notional = max(_safe_float(current_short_notional), 0.0)
+    current_inventory_notional = max(long_notional, short_notional)
+    inventory_ratio_required = min(max(float(inventory_recover_ratio or 1.0), 0.0), 1.0)
     if candidates:
         recover_count = 0
         active = True
         recovering = False
         reason = matched_reasons[0] if matched_reasons else None
+        trigger_inventory_notional = current_inventory_notional
+        last_trigger_at = _isoformat(current_time)
+        observation_remaining_seconds = max(float(min_observation_seconds or 0.0), 0.0)
+        inventory_gate_active = False
     else:
         was_active = bool(memory.get("active") or memory.get("recovering"))
         previous_recover = int(_safe_float(memory.get("recover_count")))
-        recover_count = previous_recover + 1 if was_active else required_recover
-        active = was_active and recover_count < required_recover
+        trigger_inventory_notional = max(_safe_float(memory.get("trigger_inventory_notional")), 0.0)
+        last_trigger_at_raw = str(memory.get("last_trigger_at") or "").strip()
+        try:
+            last_trigger_at = datetime.fromisoformat(last_trigger_at_raw) if last_trigger_at_raw else None
+        except ValueError:
+            last_trigger_at = None
+        elapsed_seconds = (
+            max((current_time - last_trigger_at).total_seconds(), 0.0)
+            if isinstance(last_trigger_at, datetime)
+            else float("inf")
+        )
+        observation_remaining_seconds = max(float(min_observation_seconds or 0.0) - elapsed_seconds, 0.0)
+        inventory_recover_limit = trigger_inventory_notional * inventory_ratio_required if trigger_inventory_notional > 0 else 0.0
+        inventory_gate_active = trigger_inventory_notional > 0 and current_inventory_notional > inventory_recover_limit
+        recover_gate_open = observation_remaining_seconds <= 0 and not inventory_gate_active
+        recover_count = previous_recover + 1 if was_active and recover_gate_open else 0 if was_active else required_recover
+        active = was_active and (not recover_gate_open or recover_count < required_recover)
         recovering = bool(was_active and active)
+        reason_parts: list[str] = []
+        if observation_remaining_seconds > 0:
+            reason_parts.append(f"observing {math.ceil(observation_remaining_seconds)}s")
+        if inventory_gate_active:
+            reason_parts.append(
+                f"inventory {current_inventory_notional:.4f} > recover_limit {inventory_recover_limit:.4f}"
+            )
+        if recover_gate_open and recovering:
+            reason_parts.append(f"recovering {recover_count}/{required_recover}")
         reason = (
-            f"recovering {recover_count}/{required_recover} after "
-            f"{memory.get('last_trigger_reason') or 'volatility_entry_pause'}"
-            if recovering
+            f"{' ; '.join(reason_parts)} after {memory.get('last_trigger_reason') or 'volatility_entry_pause'}"
+            if recovering and reason_parts
             else None
         )
     report.update(
@@ -802,6 +841,8 @@ def resolve_volatility_entry_pause(
             "dominant_threshold": dominant_threshold if candidates else _safe_float(memory.get("dominant_threshold")),
             "matched_reasons": matched_reasons,
             "reason": reason,
+            "observation_remaining_seconds": observation_remaining_seconds,
+            "inventory_gate_active": inventory_gate_active,
         }
     )
     report["state"] = {
@@ -812,6 +853,8 @@ def resolve_volatility_entry_pause(
         "last_trigger_reason": matched_reasons[0]
         if matched_reasons
         else (memory.get("last_trigger_reason") if active else None),
+        "last_trigger_at": last_trigger_at if candidates else memory.get("last_trigger_at"),
+        "trigger_inventory_notional": trigger_inventory_notional if active or recovering else 0.0,
         "dominant_window": report.get("dominant_window"),
         "dominant_metric": report.get("dominant_metric"),
         "dominant_value": report.get("dominant_value"),
@@ -10151,6 +10194,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
         window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
         recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
+        now=plan_now,
+        min_observation_seconds=getattr(effective_args, "volatility_entry_pause_min_observation_seconds", 180.0),
+        current_long_notional=current_long_qty * max(mid_price, 0.0),
+        current_short_notional=current_short_qty * max(mid_price, 0.0),
+        inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
     )
     elastic_volume: dict[str, Any] = {
         "enabled": bool(getattr(effective_args, "elastic_volume_enabled", False)),
@@ -13856,6 +13904,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-recover-confirm-cycles", type=int, default=1)
+    parser.add_argument("--volatility-entry-pause-min-observation-seconds", type=float, default=180.0)
+    parser.add_argument("--volatility-entry-pause-inventory-recover-ratio", type=float, default=0.75)
     parser.add_argument("--anti-chase-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--anti-chase-entry-guard-1m-abs-return-ratio", type=float, default=0.0025)
     parser.add_argument("--anti-chase-entry-guard-1m-amplitude-ratio", type=float, default=0.0035)
@@ -14577,6 +14627,13 @@ def main() -> None:
         raise SystemExit("--volatility-entry-pause thresholds must be >= 0")
     if args.volatility_entry_pause_recover_confirm_cycles < 1:
         raise SystemExit("--volatility-entry-pause-recover-confirm-cycles must be >= 1")
+    if args.volatility_entry_pause_min_observation_seconds < 0:
+        raise SystemExit("--volatility-entry-pause-min-observation-seconds must be >= 0")
+    if (
+        args.volatility_entry_pause_inventory_recover_ratio <= 0
+        or args.volatility_entry_pause_inventory_recover_ratio > 1
+    ):
+        raise SystemExit("--volatility-entry-pause-inventory-recover-ratio must be within (0, 1]")
     if args.volatility_entry_pause_enabled and not any(threshold > 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("volatility entry pause requires at least one positive trigger threshold")
     anti_chase_entry_guard_thresholds = (

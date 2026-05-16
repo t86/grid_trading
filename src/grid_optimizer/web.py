@@ -3774,6 +3774,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volatility_entry_pause_5m_abs_return_ratio": 0.0,
     "volatility_entry_pause_5m_amplitude_ratio": 0.0,
     "volatility_entry_pause_recover_confirm_cycles": 1,
+    "volatility_entry_pause_min_observation_seconds": 180.0,
+    "volatility_entry_pause_inventory_recover_ratio": 0.75,
     "anti_chase_entry_guard_enabled": True,
     "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
     "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -9302,6 +9304,15 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             "volatility_entry_pause_1m_amplitude_ratio",
             "1m 振幅暂停加仓阈值 volatility_entry_pause_1m_amplitude_ratio",
         )
+        require_positive(
+            "volatility_entry_pause_min_observation_seconds",
+            "波动暂停最短观察秒数 volatility_entry_pause_min_observation_seconds",
+        )
+        ratio = number("volatility_entry_pause_inventory_recover_ratio")
+        if ratio is None or ratio <= 0 or ratio > 1:
+            errors.append(
+                "波动暂停库存回落比例 volatility_entry_pause_inventory_recover_ratio 必须设置在 (0,1]，建议 <= 0.75"
+            )
 
     def require_anti_chase_entry_guard() -> None:
         require_enabled("anti_chase_entry_guard_enabled", "反追涨杀跌 anti_chase_entry_guard_enabled")
@@ -10056,6 +10067,16 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--volatility-entry-pause-recover-confirm-cycles",
             str(config["volatility_entry_pause_recover_confirm_cycles"]),
         ])
+    if config.get("volatility_entry_pause_min_observation_seconds") is not None:
+        command.extend([
+            "--volatility-entry-pause-min-observation-seconds",
+            str(config["volatility_entry_pause_min_observation_seconds"]),
+        ])
+    if config.get("volatility_entry_pause_inventory_recover_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-inventory-recover-ratio",
+            str(config["volatility_entry_pause_inventory_recover_ratio"]),
+        ])
     command.append(
         "--anti-chase-entry-guard-enabled"
         if config.get(
@@ -10471,6 +10492,8 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "volatility_entry_pause_5m_abs_return_ratio",
             "volatility_entry_pause_5m_amplitude_ratio",
             "volatility_entry_pause_recover_confirm_cycles",
+            "volatility_entry_pause_min_observation_seconds",
+            "volatility_entry_pause_inventory_recover_ratio",
             "synthetic_trend_follow_enabled",
             "synthetic_trend_follow_1m_abs_return_ratio",
             "synthetic_trend_follow_1m_amplitude_ratio",
@@ -20480,6 +20503,15 @@ MONITOR_PAGE = """<!doctype html>
                 <label>5 分钟振幅阈值
                   <input id="runner_field_volatility_entry_pause_5m_amplitude_ratio" type="number" min="0" step="0.000001" />
                 </label>
+                <label>恢复最短观察秒数
+                  <input id="runner_field_volatility_entry_pause_min_observation_seconds" type="number" min="0" step="1" />
+                </label>
+                <label>库存回落比例
+                  <input id="runner_field_volatility_entry_pause_inventory_recover_ratio" type="number" min="0.01" max="1" step="0.01" />
+                </label>
+                <label>恢复确认轮数
+                  <input id="runner_field_volatility_entry_pause_recover_confirm_cycles" type="number" min="1" step="1" />
+                </label>
               </div>
             </section>
             <section class="runner-form-section full" data-runner-section="execution_regime">
@@ -23463,6 +23495,8 @@ MONITOR_PAGE = """<!doctype html>
       { key: "volatility_entry_pause_3m_amplitude_ratio", id: "runner_field_volatility_entry_pause_3m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_5m_abs_return_ratio", id: "runner_field_volatility_entry_pause_5m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_5m_amplitude_ratio", id: "runner_field_volatility_entry_pause_5m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_min_observation_seconds", id: "runner_field_volatility_entry_pause_min_observation_seconds", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_inventory_recover_ratio", id: "runner_field_volatility_entry_pause_inventory_recover_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_recover_confirm_cycles", id: "runner_field_volatility_entry_pause_recover_confirm_cycles", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "auto_regime_enabled", id: "runner_field_auto_regime_enabled", type: "boolean", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_confirm_cycles", id: "runner_field_auto_regime_confirm_cycles", type: "integer", modes: LONG_ONLY_RUNNER_MODE_LIST },

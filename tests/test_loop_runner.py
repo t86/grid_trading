@@ -82,6 +82,7 @@ from grid_optimizer.loop_runner import (
     resolve_market_bias_offsets,
     resolve_market_bias_regime_switch,
     resolve_adaptive_step_price,
+    resolve_volatility_entry_pause,
     resolve_interval_locked_center_price,
     resolve_inventory_pause_timeout_state,
     resolve_short_threshold_timeout_state,
@@ -105,6 +106,105 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_resolve_volatility_entry_pause_holds_for_min_observation_window(self) -> None:
+        trigger_now = datetime(2026, 5, 16, 4, 7, tzinfo=timezone.utc)
+        triggered = resolve_volatility_entry_pause(
+            adaptive_step={"metrics": {"window_10s": {"return_ratio": -0.005, "amplitude_ratio": 0.005}}},
+            state={},
+            enabled=True,
+            window_10s_abs_return_ratio=0.004,
+            window_10s_amplitude_ratio=0.006,
+            window_30s_abs_return_ratio=0.0,
+            window_30s_amplitude_ratio=0.0,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_3m_amplitude_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            window_5m_amplitude_ratio=0.0,
+            recover_confirm_cycles=2,
+            now=trigger_now,
+            min_observation_seconds=180.0,
+            current_long_notional=700.0,
+            current_short_notional=0.0,
+            inventory_recover_ratio=0.75,
+        )
+        recovering = resolve_volatility_entry_pause(
+            adaptive_step={"metrics": {}},
+            state={"volatility_entry_pause_state": triggered["state"]},
+            enabled=True,
+            window_10s_abs_return_ratio=0.004,
+            window_10s_amplitude_ratio=0.006,
+            window_30s_abs_return_ratio=0.0,
+            window_30s_amplitude_ratio=0.0,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_3m_amplitude_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            window_5m_amplitude_ratio=0.0,
+            recover_confirm_cycles=2,
+            now=trigger_now + timedelta(seconds=30),
+            min_observation_seconds=180.0,
+            current_long_notional=500.0,
+            current_short_notional=0.0,
+            inventory_recover_ratio=0.75,
+        )
+
+        self.assertTrue(recovering["active"])
+        self.assertTrue(recovering["recovering"])
+        self.assertGreater(recovering["observation_remaining_seconds"], 0.0)
+        self.assertIn("observing", recovering["reason"])
+
+    def test_resolve_volatility_entry_pause_holds_until_inventory_recovers(self) -> None:
+        trigger_now = datetime(2026, 5, 16, 4, 7, tzinfo=timezone.utc)
+        triggered = resolve_volatility_entry_pause(
+            adaptive_step={"metrics": {"window_30s": {"return_ratio": -0.008, "amplitude_ratio": 0.010}}},
+            state={},
+            enabled=True,
+            window_10s_abs_return_ratio=0.0,
+            window_10s_amplitude_ratio=0.0,
+            window_30s_abs_return_ratio=0.007,
+            window_30s_amplitude_ratio=0.012,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_3m_amplitude_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            window_5m_amplitude_ratio=0.0,
+            recover_confirm_cycles=2,
+            now=trigger_now,
+            min_observation_seconds=180.0,
+            current_long_notional=800.0,
+            current_short_notional=0.0,
+            inventory_recover_ratio=0.75,
+        )
+        still_blocked = resolve_volatility_entry_pause(
+            adaptive_step={"metrics": {}},
+            state={"volatility_entry_pause_state": triggered["state"]},
+            enabled=True,
+            window_10s_abs_return_ratio=0.0,
+            window_10s_amplitude_ratio=0.0,
+            window_30s_abs_return_ratio=0.007,
+            window_30s_amplitude_ratio=0.012,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_3m_amplitude_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            window_5m_amplitude_ratio=0.0,
+            recover_confirm_cycles=2,
+            now=trigger_now + timedelta(seconds=240),
+            min_observation_seconds=180.0,
+            current_long_notional=650.0,
+            current_short_notional=0.0,
+            inventory_recover_ratio=0.75,
+        )
+
+        self.assertTrue(still_blocked["active"])
+        self.assertTrue(still_blocked["inventory_gate_active"])
+        self.assertIn("inventory", still_blocked["reason"])
+
     def test_remove_take_profit_exit_orders_keeps_active_delever(self) -> None:
         plan = {
             "buy_orders": [
