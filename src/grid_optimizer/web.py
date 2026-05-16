@@ -29,10 +29,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .audit import (
+    append_strategy_adjustment_audit,
     build_audit_paths,
+    ingest_strategy_adjustment_event,
     income_row_time_ms,
     iter_jsonl,
     read_jsonl_filtered,
+    read_strategy_adjustments,
     read_trade_audit_rows,
     trade_row_time_ms,
 )
@@ -55,6 +58,7 @@ from .console_registry import load_console_registry
 from .master_sprint import MASTER_SPRINT_PAGE, build_master_sprint_snapshot
 from .data import (
     cache_file_path,
+    clear_futures_signed_response_caches,
     delete_futures_order,
     delete_spot_order,
     fetch_futures_account_info_v3,
@@ -3456,13 +3460,47 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "elastic_loss_per_10k_cooldown": 1.8,
     "elastic_inventory_soft_ratio": 0.6,
     "elastic_inventory_hard_ratio": 0.9,
+    "elastic_inventory_soft_ratio_ping_pong_fast": 0.3,
+    "elastic_inventory_hard_ratio_ping_pong_fast": 0.45,
+    "elastic_inventory_soft_ratio_ping_pong_safe": 0.45,
+    "elastic_inventory_hard_ratio_ping_pong_safe": 0.6,
+    "elastic_inventory_soft_ratio_wide_step": 0.6,
+    "elastic_inventory_hard_ratio_wide_step": 0.8,
     "elastic_step_scale_sprint": 0.8,
     "elastic_step_scale_defensive": 1.8,
     "elastic_step_scale_cooldown": 3.0,
+    "elastic_base_step_multiplier_ping_pong_fast": 0.8,
+    "elastic_base_step_multiplier_ping_pong_safe": 1.2,
+    "elastic_base_step_multiplier_wide_step": 2.5,
+    "elastic_base_step_multiplier_defensive": 3.5,
     "elastic_per_order_scale_sprint": 1.25,
     "elastic_per_order_scale_defensive": 0.65,
+    "elastic_per_order_scale_ping_pong_fast": 1.0,
+    "elastic_per_order_scale_ping_pong_safe": 0.9,
+    "elastic_per_order_scale_wide_step": 0.6,
+    "elastic_per_order_scale_defensive_state": 0.4,
     "elastic_levels_scale_sprint": 1.25,
     "elastic_levels_scale_defensive": 0.65,
+    "elastic_levels_scale_ping_pong_fast": 1.0,
+    "elastic_levels_scale_ping_pong_safe": 0.85,
+    "elastic_levels_scale_wide_step": 0.65,
+    "elastic_levels_scale_defensive_state": 0.35,
+    "elastic_threshold_scale_ping_pong_fast": 1.0,
+    "elastic_threshold_scale_ping_pong_safe": 1.1,
+    "elastic_threshold_scale_wide_step": 1.5,
+    "elastic_threshold_scale_defensive": 1.8,
+    "elastic_pause_scale_ping_pong_fast": 1.0,
+    "elastic_pause_scale_ping_pong_safe": 1.1,
+    "elastic_pause_scale_wide_step": 1.5,
+    "elastic_pause_scale_defensive": 1.8,
+    "elastic_max_total_scale_ping_pong_fast": 1.0,
+    "elastic_max_total_scale_ping_pong_safe": 1.1,
+    "elastic_max_total_scale_wide_step": 1.35,
+    "elastic_max_total_scale_defensive": 1.6,
+    "elastic_max_entry_orders_ping_pong_fast": 6,
+    "elastic_max_entry_orders_ping_pong_safe": 4,
+    "elastic_max_entry_orders_wide_step": 3,
+    "elastic_max_entry_orders_defensive": 2,
     "elastic_cooldown_seconds": 120.0,
     "elastic_state_confirm_cycles": 3,
     "elastic_cancel_stale_entries_on_cooldown": True,
@@ -3512,6 +3550,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "execution_regime_rolling_loss_abs": None,
     "execution_regime_rolling_loss_limit": None,
     "volatility_entry_pause_enabled": False,
+    "volatility_entry_pause_10s_abs_return_ratio": 0.0,
+    "volatility_entry_pause_10s_amplitude_ratio": 0.0,
     "volatility_entry_pause_30s_abs_return_ratio": 0.0,
     "volatility_entry_pause_30s_amplitude_ratio": 0.0,
     "volatility_entry_pause_1m_abs_return_ratio": 0.0,
@@ -3520,6 +3560,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volatility_entry_pause_3m_amplitude_ratio": 0.0,
     "volatility_entry_pause_5m_abs_return_ratio": 0.0,
     "volatility_entry_pause_5m_amplitude_ratio": 0.0,
+    "volatility_entry_pause_recover_confirm_cycles": 1,
     "anti_chase_entry_guard_enabled": True,
     "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
     "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -4656,7 +4697,7 @@ def _load_runner_control_config(symbol: str | None = None) -> dict[str, Any]:
     if stored:
         config.update(stored)
     runner = _read_runner_process_for_symbol(normalized_symbol)
-    if runner.get("config"):
+    if runner.get("is_running") and runner.get("config"):
         config.update(runner["config"])
     config = _normalize_runner_runtime_paths(config, normalized_symbol)
     return _normalize_runner_volatility_trigger_config(_normalize_runner_volume_trigger_config(config))
@@ -4728,7 +4769,16 @@ def _save_runner_control_config(config: dict[str, Any], *, symbol: str | None = 
     normalized_symbol = str(symbol or config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     control_path = _runner_control_path(normalized_symbol)
     control_path.parent.mkdir(parents=True, exist_ok=True)
+    before = _read_json_dict(control_path) or {}
     control_path.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")
+    append_strategy_adjustment_audit(
+        symbol=normalized_symbol,
+        before=before,
+        after=config,
+        control_path=control_path,
+        actor=os.environ.get("GRID_STRATEGY_AUDIT_ACTOR") or None,
+        reason=os.environ.get("GRID_STRATEGY_AUDIT_REASON") or None,
+    )
 
 
 def _iter_saved_runner_control_configs() -> list[dict[str, Any]]:
@@ -7586,6 +7636,166 @@ def _tail_jsonl_dicts(path: Path, limit: int = 20) -> list[dict[str, Any]]:
     return rows[-limit:]
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value in {None, ""}:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any) -> int | None:
+    try:
+        if value in {None, ""}:
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _runner_start_safety_preflight(
+    config: dict[str, Any],
+    *,
+    spot: bool = False,
+) -> None:
+    symbol = str(config.get("symbol", "")).upper().strip() or ("BTCUSDT" if spot else "NIGHTUSDT")
+    plan_path = Path(str(config.get("plan_json", "")).strip()) if not spot else None
+    submit_path = Path(str(config.get("submit_report_json", "")).strip()) if not spot else None
+    events_path = Path(str(config.get("summary_jsonl", "")).strip())
+
+    plan = _read_json_dict(plan_path) if plan_path and str(plan_path) else {}
+    submit = _read_json_dict(submit_path) if submit_path and str(submit_path) else {}
+    recent_events = _tail_jsonl_dicts(events_path, limit=40) if str(events_path) else []
+
+    open_order_diffs: list[int] = []
+    execution_errors: list[str] = []
+    recent_pause_reasons: list[str] = []
+    manual_intervention_detected = False
+    post_shock_active = False
+
+    for event in recent_events:
+        message = str(event.get("reconcile_message") or "").strip()
+        match = re.search(r"open_orders diff=([+-]?\d+)", message)
+        if match:
+            try:
+                open_order_diffs.append(abs(int(match.group(1))))
+            except ValueError:
+                pass
+        error_message = str(event.get("error_message") or "").strip()
+        if error_message:
+            execution_errors.append(error_message)
+        pause_reason = str(
+            event.get("volatility_entry_pause_reason")
+            or event.get("pause_reason")
+            or ""
+        ).strip()
+        if pause_reason:
+            recent_pause_reasons.append(pause_reason)
+        if event.get("volatility_entry_pause_active"):
+            post_shock_active = True
+        scale = _safe_float(event.get("adaptive_step_scale"))
+        if scale is not None and scale > 1.2:
+            post_shock_active = True
+        if event.get("manual_intervention_detected") or event.get("manual_intervention"):
+            manual_intervention_detected = True
+
+    submit_error_fields = (
+        str(submit.get("error") or "").strip(),
+        str(submit.get("runtime_guard_stop_reason") or "").strip(),
+        str(submit.get("stop_reason") or "").strip(),
+    )
+    execution_errors.extend([msg for msg in submit_error_fields if msg])
+    if submit.get("manual_intervention_detected") or submit.get("manual_intervention"):
+        manual_intervention_detected = True
+
+    latest_diff = open_order_diffs[-1] if open_order_diffs else 0
+    repeated_large_diff = len(open_order_diffs) >= 2 and open_order_diffs[-1] > 10 and open_order_diffs[-2] > 10
+    severe_diff = latest_diff > 30
+    medium_diff = latest_diff > 20
+    severe_exec_error = any(
+        any(token in message for token in ("-2027", "计划生成时不一致", "open_orders diff", "validation_failed"))
+        for message in execution_errors
+    )
+
+    if plan and not spot:
+        buy_paused = bool(plan.get("buy_paused"))
+        current_long = _safe_float(plan.get("current_long_notional")) or 0.0
+        pause_long = _safe_float(
+            plan.get("effective_pause_buy_position_notional")
+            if plan.get("effective_pause_buy_position_notional") is not None
+            else config.get("pause_buy_position_notional")
+        )
+        if buy_paused and pause_long and current_long >= pause_long * 0.95:
+            post_shock_active = True
+
+    reasons: list[str] = []
+    if manual_intervention_detected:
+        reasons.append("检测到人工干预标记，必须先保持停止并核对仓位/挂单")
+    if repeated_large_diff:
+        reasons.append(f"连续两轮 open_orders diff > 10（最新 {latest_diff}）")
+    if medium_diff:
+        reasons.append(f"open_orders diff 超过 20（最新 {latest_diff}）")
+    if severe_diff or (latest_diff > 20 and severe_exec_error):
+        reasons.append(f"open_orders diff 严重异常（最新 {latest_diff}）且伴随执行/接口错误")
+    if severe_exec_error:
+        reasons.append("最近存在执行/API/计划一致性错误")
+    if post_shock_active and not spot:
+        reasons.append("仍处于 post-shock / volatility pause / adaptive-step 扩张后的危险恢复窗口")
+
+    if not spot:
+        flatten = _read_flatten_process_for_symbol(symbol)
+        if flatten.get("is_running"):
+            reasons.append("仍有 flatten 清仓进程在运行")
+
+        require_exchange_clean_start = any(
+            (
+                bool(config.get("reset_state")),
+                manual_intervention_detected,
+                repeated_large_diff,
+                medium_diff,
+                severe_exec_error,
+                post_shock_active,
+            )
+        )
+        if require_exchange_clean_start:
+            creds = load_binance_api_credentials()
+            if creds is None:
+                reasons.append("缺少 Binance API 凭证，无法在启动前核对真实仓位/挂单")
+            else:
+                api_key, api_secret = creds
+                clear_futures_signed_response_caches()
+                account_info = fetch_futures_account_info_v3(api_key, api_secret)
+                position_mode = fetch_futures_position_mode(api_key, api_secret)
+                open_orders = fetch_futures_open_orders(symbol, api_key, api_secret)
+                dual_side = _truthy(position_mode.get("dualSidePosition"))
+
+                if dual_side:
+                    long_position = _extract_futures_position(account_info, symbol, "LONG")
+                    short_position = _extract_futures_position(account_info, symbol, "SHORT")
+                    long_qty = abs(_safe_numeric(long_position.get("positionAmt")))
+                    short_qty = abs(_safe_numeric(short_position.get("positionAmt")))
+                    if long_qty > 0:
+                        reasons.append(f"交易所侧仍有 LONG 仓位 {long_qty:.8f}")
+                    if short_qty > 0:
+                        reasons.append(f"交易所侧仍有 SHORT 仓位 {short_qty:.8f}")
+                else:
+                    position = _extract_futures_position(account_info, symbol)
+                    position_amt = abs(_safe_numeric(position.get("positionAmt")))
+                    if position_amt > 0:
+                        reasons.append(f"交易所侧仍有仓位 {position_amt:.8f}")
+
+                if open_orders:
+                    reasons.append(f"交易所侧仍有 {len(open_orders)} 个未成交挂单")
+
+    if reasons:
+        raise ValueError(
+            f"{symbol} 启动/恢复前安全闸门未通过："
+            + "；".join(dict.fromkeys(reasons))
+            + "。请先保持 stopped/defensive，待状态干净后再启动。"
+        )
+
+
 def _is_spot_strategy_order(order: dict[str, Any], prefix: str) -> bool:
     client_order_id = str(order.get("clientOrderId", "") or "")
     return client_order_id.startswith(prefix)
@@ -8253,13 +8463,43 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "elastic_loss_per_10k_cooldown",
         "elastic_inventory_soft_ratio",
         "elastic_inventory_hard_ratio",
+        "elastic_inventory_soft_ratio_ping_pong_fast",
+        "elastic_inventory_hard_ratio_ping_pong_fast",
+        "elastic_inventory_soft_ratio_ping_pong_safe",
+        "elastic_inventory_hard_ratio_ping_pong_safe",
+        "elastic_inventory_soft_ratio_wide_step",
+        "elastic_inventory_hard_ratio_wide_step",
         "elastic_step_scale_sprint",
         "elastic_step_scale_defensive",
         "elastic_step_scale_cooldown",
+        "elastic_base_step_multiplier_ping_pong_fast",
+        "elastic_base_step_multiplier_ping_pong_safe",
+        "elastic_base_step_multiplier_wide_step",
+        "elastic_base_step_multiplier_defensive",
         "elastic_per_order_scale_sprint",
         "elastic_per_order_scale_defensive",
+        "elastic_per_order_scale_ping_pong_fast",
+        "elastic_per_order_scale_ping_pong_safe",
+        "elastic_per_order_scale_wide_step",
+        "elastic_per_order_scale_defensive_state",
         "elastic_levels_scale_sprint",
         "elastic_levels_scale_defensive",
+        "elastic_levels_scale_ping_pong_fast",
+        "elastic_levels_scale_ping_pong_safe",
+        "elastic_levels_scale_wide_step",
+        "elastic_levels_scale_defensive_state",
+        "elastic_threshold_scale_ping_pong_fast",
+        "elastic_threshold_scale_ping_pong_safe",
+        "elastic_threshold_scale_wide_step",
+        "elastic_threshold_scale_defensive",
+        "elastic_pause_scale_ping_pong_fast",
+        "elastic_pause_scale_ping_pong_safe",
+        "elastic_pause_scale_wide_step",
+        "elastic_pause_scale_defensive",
+        "elastic_max_total_scale_ping_pong_fast",
+        "elastic_max_total_scale_ping_pong_safe",
+        "elastic_max_total_scale_wide_step",
+        "elastic_max_total_scale_defensive",
         "elastic_cooldown_seconds",
         "multi_timeframe_bias_low_zone_threshold",
         "multi_timeframe_bias_high_zone_threshold",
@@ -8298,6 +8538,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_inventory_notional_limit",
         "execution_regime_rolling_loss_abs",
         "execution_regime_rolling_loss_limit",
+        "volatility_entry_pause_10s_abs_return_ratio",
+        "volatility_entry_pause_10s_amplitude_ratio",
         "volatility_entry_pause_30s_abs_return_ratio",
         "volatility_entry_pause_30s_amplitude_ratio",
         "volatility_entry_pause_1m_abs_return_ratio",
@@ -8414,6 +8656,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_confirm_normal_to_caution",
         "multi_timeframe_bias_max_level_delta",
         "elastic_state_confirm_cycles",
+        "volatility_entry_pause_recover_confirm_cycles",
+        "elastic_max_entry_orders_ping_pong_fast",
+        "elastic_max_entry_orders_ping_pong_safe",
+        "elastic_max_entry_orders_wide_step",
+        "elastic_max_entry_orders_defensive",
         "synthetic_flow_sleeve_levels",
         "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
@@ -8551,6 +8798,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_inventory_notional_limit",
         "execution_regime_rolling_loss_abs",
         "execution_regime_rolling_loss_limit",
+        "volatility_entry_pause_10s_abs_return_ratio",
+        "volatility_entry_pause_10s_amplitude_ratio",
         "volatility_entry_pause_30s_abs_return_ratio",
         "volatility_entry_pause_30s_amplitude_ratio",
         "volatility_entry_pause_1m_abs_return_ratio",
@@ -8800,6 +9049,14 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
 
     def require_fast_entry_pause() -> None:
         require_enabled("volatility_entry_pause_enabled", "快速波动暂停加仓 volatility_entry_pause_enabled")
+        require_positive(
+            "volatility_entry_pause_10s_abs_return_ratio",
+            "10s 涨跌幅暂停加仓阈值 volatility_entry_pause_10s_abs_return_ratio",
+        )
+        require_positive(
+            "volatility_entry_pause_10s_amplitude_ratio",
+            "10s 振幅暂停加仓阈值 volatility_entry_pause_10s_amplitude_ratio",
+        )
         require_positive(
             "volatility_entry_pause_30s_abs_return_ratio",
             "30s 涨跌幅暂停加仓阈值 volatility_entry_pause_30s_abs_return_ratio",
@@ -9333,13 +9590,47 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         ("elastic_loss_per_10k_cooldown", "--elastic-loss-per-10k-cooldown"),
         ("elastic_inventory_soft_ratio", "--elastic-inventory-soft-ratio"),
         ("elastic_inventory_hard_ratio", "--elastic-inventory-hard-ratio"),
+        ("elastic_inventory_soft_ratio_ping_pong_fast", "--elastic-inventory-soft-ratio-ping-pong-fast"),
+        ("elastic_inventory_hard_ratio_ping_pong_fast", "--elastic-inventory-hard-ratio-ping-pong-fast"),
+        ("elastic_inventory_soft_ratio_ping_pong_safe", "--elastic-inventory-soft-ratio-ping-pong-safe"),
+        ("elastic_inventory_hard_ratio_ping_pong_safe", "--elastic-inventory-hard-ratio-ping-pong-safe"),
+        ("elastic_inventory_soft_ratio_wide_step", "--elastic-inventory-soft-ratio-wide-step"),
+        ("elastic_inventory_hard_ratio_wide_step", "--elastic-inventory-hard-ratio-wide-step"),
         ("elastic_step_scale_sprint", "--elastic-step-scale-sprint"),
         ("elastic_step_scale_defensive", "--elastic-step-scale-defensive"),
         ("elastic_step_scale_cooldown", "--elastic-step-scale-cooldown"),
+        ("elastic_base_step_multiplier_ping_pong_fast", "--elastic-base-step-multiplier-ping-pong-fast"),
+        ("elastic_base_step_multiplier_ping_pong_safe", "--elastic-base-step-multiplier-ping-pong-safe"),
+        ("elastic_base_step_multiplier_wide_step", "--elastic-base-step-multiplier-wide-step"),
+        ("elastic_base_step_multiplier_defensive", "--elastic-base-step-multiplier-defensive"),
         ("elastic_per_order_scale_sprint", "--elastic-per-order-scale-sprint"),
         ("elastic_per_order_scale_defensive", "--elastic-per-order-scale-defensive"),
+        ("elastic_per_order_scale_ping_pong_fast", "--elastic-per-order-scale-ping-pong-fast"),
+        ("elastic_per_order_scale_ping_pong_safe", "--elastic-per-order-scale-ping-pong-safe"),
+        ("elastic_per_order_scale_wide_step", "--elastic-per-order-scale-wide-step"),
+        ("elastic_per_order_scale_defensive_state", "--elastic-per-order-scale-defensive-state"),
         ("elastic_levels_scale_sprint", "--elastic-levels-scale-sprint"),
         ("elastic_levels_scale_defensive", "--elastic-levels-scale-defensive"),
+        ("elastic_levels_scale_ping_pong_fast", "--elastic-levels-scale-ping-pong-fast"),
+        ("elastic_levels_scale_ping_pong_safe", "--elastic-levels-scale-ping-pong-safe"),
+        ("elastic_levels_scale_wide_step", "--elastic-levels-scale-wide-step"),
+        ("elastic_levels_scale_defensive_state", "--elastic-levels-scale-defensive-state"),
+        ("elastic_threshold_scale_ping_pong_fast", "--elastic-threshold-scale-ping-pong-fast"),
+        ("elastic_threshold_scale_ping_pong_safe", "--elastic-threshold-scale-ping-pong-safe"),
+        ("elastic_threshold_scale_wide_step", "--elastic-threshold-scale-wide-step"),
+        ("elastic_threshold_scale_defensive", "--elastic-threshold-scale-defensive"),
+        ("elastic_pause_scale_ping_pong_fast", "--elastic-pause-scale-ping-pong-fast"),
+        ("elastic_pause_scale_ping_pong_safe", "--elastic-pause-scale-ping-pong-safe"),
+        ("elastic_pause_scale_wide_step", "--elastic-pause-scale-wide-step"),
+        ("elastic_pause_scale_defensive", "--elastic-pause-scale-defensive"),
+        ("elastic_max_total_scale_ping_pong_fast", "--elastic-max-total-scale-ping-pong-fast"),
+        ("elastic_max_total_scale_ping_pong_safe", "--elastic-max-total-scale-ping-pong-safe"),
+        ("elastic_max_total_scale_wide_step", "--elastic-max-total-scale-wide-step"),
+        ("elastic_max_total_scale_defensive", "--elastic-max-total-scale-defensive"),
+        ("elastic_max_entry_orders_ping_pong_fast", "--elastic-max-entry-orders-ping-pong-fast"),
+        ("elastic_max_entry_orders_ping_pong_safe", "--elastic-max-entry-orders-ping-pong-safe"),
+        ("elastic_max_entry_orders_wide_step", "--elastic-max-entry-orders-wide-step"),
+        ("elastic_max_entry_orders_defensive", "--elastic-max-entry-orders-defensive"),
         ("elastic_cooldown_seconds", "--elastic-cooldown-seconds"),
         ("elastic_state_confirm_cycles", "--elastic-state-confirm-cycles"),
     ):
@@ -9427,6 +9718,16 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         if config.get("volatility_entry_pause_enabled", False)
         else "--no-volatility-entry-pause-enabled"
     )
+    if config.get("volatility_entry_pause_10s_abs_return_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-10s-abs-return-ratio",
+            str(config["volatility_entry_pause_10s_abs_return_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_10s_amplitude_ratio") is not None:
+        command.extend([
+            "--volatility-entry-pause-10s-amplitude-ratio",
+            str(config["volatility_entry_pause_10s_amplitude_ratio"]),
+        ])
     if config.get("volatility_entry_pause_30s_abs_return_ratio") is not None:
         command.extend([
             "--volatility-entry-pause-30s-abs-return-ratio",
@@ -9466,6 +9767,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend([
             "--volatility-entry-pause-5m-amplitude-ratio",
             str(config["volatility_entry_pause_5m_amplitude_ratio"]),
+        ])
+    if config.get("volatility_entry_pause_recover_confirm_cycles") is not None:
+        command.extend([
+            "--volatility-entry-pause-recover-confirm-cycles",
+            str(config["volatility_entry_pause_recover_confirm_cycles"]),
         ])
     command.append(
         "--anti-chase-entry-guard-enabled"
@@ -9733,6 +10039,7 @@ def _launchctl_loaded(label: str) -> bool:
 def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip() or "NIGHTUSDT"
     _validate_runner_required_risk_guards(config)
+    _runner_start_safety_preflight(config, spot=False)
     _stop_flatten_process(symbol, cancel_orders=True)
     runner = _read_runner_process_for_symbol(symbol)
     _preflight_runner_runtime_guards(config)
@@ -9846,6 +10153,8 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "execution_regime_rolling_loss_abs",
             "execution_regime_rolling_loss_limit",
             "volatility_entry_pause_enabled",
+            "volatility_entry_pause_10s_abs_return_ratio",
+            "volatility_entry_pause_10s_amplitude_ratio",
             "volatility_entry_pause_30s_abs_return_ratio",
             "volatility_entry_pause_30s_amplitude_ratio",
             "volatility_entry_pause_1m_abs_return_ratio",
@@ -9854,6 +10163,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "volatility_entry_pause_3m_amplitude_ratio",
             "volatility_entry_pause_5m_abs_return_ratio",
             "volatility_entry_pause_5m_amplitude_ratio",
+            "volatility_entry_pause_recover_confirm_cycles",
             "synthetic_trend_follow_enabled",
             "synthetic_trend_follow_1m_abs_return_ratio",
             "synthetic_trend_follow_1m_amplitude_ratio",
@@ -12377,6 +12687,7 @@ def _cancel_spot_strategy_orders(config: dict[str, Any]) -> dict[str, Any]:
 
 def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
+    _runner_start_safety_preflight(config, spot=True)
     runner = _read_spot_runner_process_for_symbol(symbol)
     restarted = False
     if runner.get("is_running"):
@@ -22578,6 +22889,8 @@ MONITOR_PAGE = """<!doctype html>
       { key: "execution_regime_vol_protection_enabled", id: "runner_field_execution_regime_vol_protection_enabled", type: "boolean", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "execution_regime_vol_protection_min_scale", id: "runner_field_execution_regime_vol_protection_min_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_enabled", id: "runner_field_volatility_entry_pause_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_10s_abs_return_ratio", id: "runner_field_volatility_entry_pause_10s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_10s_amplitude_ratio", id: "runner_field_volatility_entry_pause_10s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_abs_return_ratio", id: "runner_field_volatility_entry_pause_30s_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_30s_amplitude_ratio", id: "runner_field_volatility_entry_pause_30s_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_1m_abs_return_ratio", id: "runner_field_volatility_entry_pause_1m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -22586,6 +22899,7 @@ MONITOR_PAGE = """<!doctype html>
       { key: "volatility_entry_pause_3m_amplitude_ratio", id: "runner_field_volatility_entry_pause_3m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_5m_abs_return_ratio", id: "runner_field_volatility_entry_pause_5m_abs_return_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_5m_amplitude_ratio", id: "runner_field_volatility_entry_pause_5m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_recover_confirm_cycles", id: "runner_field_volatility_entry_pause_recover_confirm_cycles", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "auto_regime_enabled", id: "runner_field_auto_regime_enabled", type: "boolean", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_confirm_cycles", id: "runner_field_auto_regime_confirm_cycles", type: "integer", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_stable_15m_max_amplitude_ratio", id: "runner_field_auto_regime_stable_15m_max_amplitude_ratio", type: "number", modes: LONG_ONLY_RUNNER_MODE_LIST },
@@ -32934,6 +33248,13 @@ class _Handler(BaseHTTPRequestHandler):
         self._send_text("Forbidden", status=HTTPStatus.FORBIDDEN)
 
     def _authorize_request(self) -> bool:
+        if self._request_path() == "/api/strategy_adjustments/ingest":
+            expected = str(os.environ.get("GRID_STRATEGY_AUDIT_TOKEN") or "").strip()
+            if expected and str(self.headers.get("X-Grid-Audit-Token") or "").strip() == expected:
+                return True
+            if expected:
+                self._send_unauthorized()
+                return False
         if self._request_path() in {"/api/health", "/hub", "/hub.html", "/portal", "/portal.html"}:
             return True
 
@@ -33025,6 +33346,23 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/health":
             self._send_json({"ok": True}, status=HTTPStatus.OK)
+            return
+        if path == "/api/strategy_adjustments":
+            try:
+                limit = int((query.get("limit") or ["100"])[0])
+            except ValueError:
+                limit = 100
+            self._send_json(
+                {
+                    "ok": True,
+                    "adjustments": read_strategy_adjustments(
+                        symbol=(query.get("symbol") or [""])[0],
+                        server_id=(query.get("server_id") or [""])[0],
+                        limit=limit,
+                    ),
+                },
+                status=HTTPStatus.OK,
+            )
             return
         if path == "/api/running_status":
             try:
@@ -33491,6 +33829,30 @@ class _Handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         path = parsed.path
         if not self._authorize_request():
+            return
+        if path == "/api/strategy_adjustments/ingest":
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 2 * 1024 * 1024:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            raw = self.rfile.read(content_len)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            if not isinstance(payload, dict):
+                self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
+                return
+            try:
+                result = ingest_strategy_adjustment_event(payload)
+                self._send_json({"ok": True, **result}, status=200)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
         if path in {
             "/api/manual_trade/maker",
