@@ -51,6 +51,38 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(actions["cancel_count"], 1)
         self.assertAlmostEqual(actions["place_notional"], 202.32531, places=8)
 
+    def test_build_execution_actions_prioritizes_forced_reduce_orders(self) -> None:
+        report = {
+            "symbol": "BILLUSDT",
+            "forced_reduce_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                }
+            ],
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 0.1512, "qty": 100.0, "notional": 15.12, "role": "entry"}
+            ],
+            "missing_orders": [
+                {"side": "SELL", "price": 0.1520, "qty": 100.0, "notional": 15.2, "role": "take_profit_long"}
+            ],
+            "stale_orders": [],
+        }
+
+        actions = build_execution_actions(report)
+
+        self.assertEqual(actions["place_count"], 3)
+        self.assertEqual(actions["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(actions["place_orders"][0]["time_in_force"], "IOC")
+        self.assertTrue(actions["place_orders"][0]["force_reduce_only"])
+        self.assertAlmostEqual(actions["place_notional"], 110.19836, places=8)
+
     def test_build_execution_actions_excludes_manual_stale_orders(self) -> None:
         report = {
             "symbol": "BTCUSDC",
@@ -169,6 +201,55 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["cancel_orders"][0]["cancel_reason"], "urgent_reduce_only_displaces_take_profit")
         self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 0)
         self.assertEqual(capped["reduce_only_position_cap"]["displaced_order_count"], 1)
+
+    def test_queue_priority_preserves_urgent_forced_reduce_order(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                },
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "take_profit_long",
+                },
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "SELL",
+                    "price": "0.15186",
+                    "origQty": "526",
+                    "positionSide": "BOTH",
+                }
+            ],
+            "place_count": 2,
+            "cancel_count": 1,
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.15186,
+            live_ask_price=0.15187,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(adjusted["place_orders"][0]["execution_type"], "aggressive")
+        self.assertEqual(adjusted["place_orders"][0]["time_in_force"], "IOC")
+        self.assertTrue(adjusted["place_orders"][0]["force_reduce_only"])
 
     def test_anti_chase_guard_drops_long_entries_but_keeps_reduce_only_sells(self) -> None:
         actions = {
