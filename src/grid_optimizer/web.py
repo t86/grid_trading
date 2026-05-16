@@ -7867,6 +7867,104 @@ def _tail_jsonl_dicts(path: Path, limit: int = 20) -> list[dict[str, Any]]:
     return rows[-limit:]
 
 
+def _safe_float(value: Any) -> float | None:
+    try:
+        if value in {None, ""}:
+            return None
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _runner_start_safety_preflight(
+    config: dict[str, Any],
+    *,
+    spot: bool = False,
+) -> None:
+    symbol = str(config.get("symbol", "")).upper().strip() or ("BTCUSDT" if spot else "NIGHTUSDT")
+    plan_path = Path(str(config.get("plan_json", "")).strip()) if not spot else None
+    submit_path = Path(str(config.get("submit_report_json", "")).strip()) if not spot else None
+    events_path = Path(str(config.get("summary_jsonl", "")).strip())
+
+    plan = _read_json_dict(plan_path) if plan_path and str(plan_path) else {}
+    submit = _read_json_dict(submit_path) if submit_path and str(submit_path) else {}
+    recent_events = _tail_jsonl_dicts(events_path, limit=40) if str(events_path) else []
+
+    open_order_diffs: list[int] = []
+    execution_errors: list[str] = []
+    manual_intervention_detected = False
+    post_shock_active = False
+
+    for event in recent_events:
+        message = str(event.get("reconcile_message") or "").strip()
+        match = re.search(r"open_orders diff=([+-]?\d+)", message)
+        if match:
+            try:
+                open_order_diffs.append(abs(int(match.group(1))))
+            except ValueError:
+                pass
+        error_message = str(event.get("error_message") or "").strip()
+        if error_message:
+            execution_errors.append(error_message)
+        if event.get("volatility_entry_pause_active"):
+            post_shock_active = True
+        scale = _safe_float(event.get("adaptive_step_scale"))
+        if scale is not None and scale > 1.2:
+            post_shock_active = True
+        if event.get("manual_intervention_detected") or event.get("manual_intervention"):
+            manual_intervention_detected = True
+
+    submit_error_fields = (
+        str(submit.get("error") or "").strip(),
+        str(submit.get("runtime_guard_stop_reason") or "").strip(),
+        str(submit.get("stop_reason") or "").strip(),
+    )
+    execution_errors.extend([msg for msg in submit_error_fields if msg])
+    if submit.get("manual_intervention_detected") or submit.get("manual_intervention"):
+        manual_intervention_detected = True
+
+    latest_diff = open_order_diffs[-1] if open_order_diffs else 0
+    repeated_large_diff = len(open_order_diffs) >= 2 and open_order_diffs[-1] > 10 and open_order_diffs[-2] > 10
+    severe_diff = latest_diff > 30
+    medium_diff = latest_diff > 20
+    severe_exec_error = any(
+        any(token in message for token in ("-2027", "计划生成时不一致", "open_orders diff", "validation_failed"))
+        for message in execution_errors
+    )
+
+    if plan and not spot:
+        buy_paused = bool(plan.get("buy_paused"))
+        current_long = _safe_float(plan.get("current_long_notional")) or 0.0
+        pause_long = _safe_float(
+            plan.get("effective_pause_buy_position_notional")
+            if plan.get("effective_pause_buy_position_notional") is not None
+            else config.get("pause_buy_position_notional")
+        )
+        if buy_paused and pause_long and current_long >= pause_long * 0.95:
+            post_shock_active = True
+
+    reasons: list[str] = []
+    if manual_intervention_detected:
+        reasons.append("检测到人工干预标记，必须先保持停止并核对仓位/挂单")
+    if repeated_large_diff:
+        reasons.append(f"连续两轮 open_orders diff > 10（最新 {latest_diff}）")
+    if medium_diff:
+        reasons.append(f"open_orders diff 超过 20（最新 {latest_diff}）")
+    if severe_diff or (latest_diff > 20 and severe_exec_error):
+        reasons.append(f"open_orders diff 严重异常（最新 {latest_diff}）且伴随执行/接口错误")
+    if severe_exec_error:
+        reasons.append("最近存在执行/API/计划一致性错误")
+    if post_shock_active and not spot:
+        reasons.append("仍处于 post-shock / volatility pause / adaptive-step 扩张后的危险恢复窗口")
+
+    if reasons:
+        raise ValueError(
+            f"{symbol} 启动/恢复前安全闸门未通过："
+            + "；".join(dict.fromkeys(reasons))
+            + "。请先保持 stopped/defensive，待状态干净后再启动。"
+        )
+
+
 def _is_spot_strategy_order(order: dict[str, Any], prefix: str) -> bool:
     client_order_id = str(order.get("clientOrderId", "") or "")
     return client_order_id.startswith(prefix)
@@ -10248,6 +10346,7 @@ def _launchctl_loaded(label: str) -> bool:
 def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", RUNNER_DEFAULT_CONFIG.get("symbol", "NIGHTUSDT"))).upper().strip() or "NIGHTUSDT"
     _validate_runner_required_risk_guards(config)
+    _runner_start_safety_preflight(config, spot=False)
     _stop_flatten_process(symbol, cancel_orders=True)
     runner = _read_runner_process_for_symbol(symbol)
     _preflight_runner_runtime_guards(config)
@@ -13091,6 +13190,7 @@ def _cancel_spot_strategy_orders(config: dict[str, Any]) -> dict[str, Any]:
 
 def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     symbol = str(config.get("symbol", SPOT_RUNNER_DEFAULT_CONFIG["symbol"])).upper().strip() or "BTCUSDT"
+    _runner_start_safety_preflight(config, spot=True)
     runner = _read_spot_runner_process_for_symbol(symbol)
     restarted = False
     if runner.get("is_running"):
