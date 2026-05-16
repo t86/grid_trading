@@ -12239,6 +12239,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         target_remaining = max(_safe_float(getattr(effective_args, "best_quote_maker_volume_target_remaining_notional", 0.0)), 0.0)
         if target_remaining <= 0:
             target_remaining = max(_safe_float(getattr(effective_args, "max_total_notional", 0.0)), cycle_budget)
+        open_entry_exposure = _summarize_open_entry_exposure(open_orders_for_diff)
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
@@ -12264,6 +12265,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
+                pending_entry_buffer_notional=cycle_budget * 0.5,
             ),
         )
         best_quote_maker_volume = {

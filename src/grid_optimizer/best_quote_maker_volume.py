@@ -34,6 +34,9 @@ class BestQuoteMakerVolumeInputs:
     step_size: float | None = None
     min_qty: float | None = None
     min_notional: float | None = None
+    open_entry_long_notional: float = 0.0
+    open_entry_short_notional: float = 0.0
+    pending_entry_buffer_notional: float = 0.0
 
 
 def _safe_float(value: Any) -> float:
@@ -142,8 +145,13 @@ def build_best_quote_maker_volume_plan(
     net_qty = _safe_float(inputs.current_net_qty)
     long_notional = max(net_qty, 0.0) * mid
     short_notional = max(-net_qty, 0.0) * mid
+    open_entry_long_notional = max(_safe_float(inputs.open_entry_long_notional), 0.0)
+    open_entry_short_notional = max(_safe_float(inputs.open_entry_short_notional), 0.0)
+    pending_entry_buffer_notional = max(_safe_float(inputs.pending_entry_buffer_notional), 0.0)
     long_limit = max(_safe_float(config.max_long_notional), 0.0)
     short_limit = max(_safe_float(config.max_short_notional), 0.0)
+    projected_long_entry_notional = long_notional + open_entry_long_notional + pending_entry_buffer_notional
+    projected_short_entry_notional = short_notional + open_entry_short_notional + pending_entry_buffer_notional
     soft_ratio = _clamp(_safe_float(config.inventory_soft_ratio), 0.0, 1.0)
     long_soft = long_limit * soft_ratio if long_limit > 0 else 0.0
     short_soft = short_limit * soft_ratio if short_limit > 0 else 0.0
@@ -151,13 +159,22 @@ def build_best_quote_maker_volume_plan(
 
     reasons: list[str] = []
     regime = "normal"
-    allow_entry_long = long_limit <= 0 or long_notional < long_soft
-    allow_entry_short = short_limit <= 0 or short_notional < short_soft
+    allow_entry_long = long_limit <= 0 or (
+        projected_long_entry_notional < long_soft
+        and projected_long_entry_notional < long_limit
+    )
+    allow_entry_short = short_limit <= 0 or (
+        projected_short_entry_notional < short_soft
+        and projected_short_entry_notional < short_limit
+    )
     reduce_long_only = long_notional > 0 and not allow_entry_long
     reduce_short_only = short_notional > 0 and not allow_entry_short
     if reduce_long_only or reduce_short_only:
         regime = "inventory_recover"
         reasons.append("inventory_soft")
+    elif not allow_entry_long or not allow_entry_short:
+        regime = "inventory_recover"
+        reasons.append("open_entry_exposure")
 
     hard_loss = loss_per_10k >= max(_safe_float(config.loss_per_10k_hard), 0.0) > 0
     soft_loss = loss_per_10k >= max(_safe_float(config.loss_per_10k_soft), 0.0) > 0
@@ -178,12 +195,18 @@ def build_best_quote_maker_volume_plan(
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
     if allow_entry_long:
+        long_entry_notional = per_side
+        if long_limit > 0:
+            long_entry_notional = min(
+                long_entry_notional,
+                max(long_limit - projected_long_entry_notional, 0.0),
+            )
         _append_order(
             buy_orders,
             _build_order(
                 side="BUY",
                 price=_price_with_gap(bid, gap, -1),
-                notional=per_side,
+                notional=long_entry_notional,
                 role="best_quote_entry_long",
                 inputs=inputs,
             ),
@@ -213,12 +236,18 @@ def build_best_quote_maker_volume_plan(
             ),
         )
     elif allow_entry_short:
+        short_entry_notional = per_side
+        if short_limit > 0:
+            short_entry_notional = min(
+                short_entry_notional,
+                max(short_limit - projected_short_entry_notional, 0.0),
+            )
         _append_order(
             sell_orders,
             _build_order(
                 side="SELL",
                 price=_price_with_gap(ask, gap, 1),
-                notional=per_side,
+                notional=short_entry_notional,
                 role="best_quote_entry_short",
                 inputs=inputs,
             ),
@@ -252,6 +281,11 @@ def build_best_quote_maker_volume_plan(
             "loss_per_10k_15m": loss_per_10k,
             "long_notional": long_notional,
             "short_notional": short_notional,
+            "open_entry_long_notional": open_entry_long_notional,
+            "open_entry_short_notional": open_entry_short_notional,
+            "pending_entry_buffer_notional": pending_entry_buffer_notional,
+            "projected_long_entry_notional": projected_long_entry_notional,
+            "projected_short_entry_notional": projected_short_entry_notional,
             "cycle_budget_notional": cycle_budget,
         },
     }

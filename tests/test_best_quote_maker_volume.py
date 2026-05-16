@@ -55,6 +55,45 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["price"], 80400.4)
         self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
 
+    def test_open_entry_exposure_blocks_extra_long_entry_before_hard_limit(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_500.0,
+                inventory_soft_ratio=0.95,
+            ),
+            inputs=_inputs(
+                current_net_qty=0.0,
+                open_entry_long_notional=1_250.0,
+                pending_entry_buffer_notional=400.0,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_recover")
+        self.assertIn("open_entry_exposure", plan["reasons"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertEqual(plan["metrics"]["projected_long_entry_notional"], 1_650.0)
+
+    def test_open_entry_exposure_caps_new_long_entry_to_remaining_capacity(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_500.0,
+                inventory_soft_ratio=1.0,
+            ),
+            inputs=_inputs(
+                cycle_budget_notional=600.0,
+                open_entry_long_notional=1_150.0,
+                pending_entry_buffer_notional=100.0,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "normal")
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertLessEqual(plan["buy_orders"][0]["notional"], 250.0)
+
     def test_high_loss_switches_to_defensive_and_keeps_only_reduce_side(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True, loss_per_10k_hard=0.8),
