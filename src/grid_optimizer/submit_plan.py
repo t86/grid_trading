@@ -794,14 +794,64 @@ def preserve_queue_priority_in_execution_actions(
     adjusted_cancel_orders = [
         order for index, order in enumerate(cancel_orders) if index not in preserved_cancel_indices
     ]
+    pending_cancel_buckets = {
+        _order_bucket_key(
+            str(order.get("side", "")).upper().strip(),
+            _safe_float(order.get("price")),
+            _order_position_side(order),
+        )
+        for order in adjusted_cancel_orders
+        if str(order.get("side", "")).upper().strip() in {"BUY", "SELL"}
+        and _safe_float(order.get("price")) > 0
+    }
+    if pending_cancel_buckets:
+        safe_place_orders: list[dict[str, Any]] = []
+        deferred_place_orders: list[dict[str, Any]] = []
+        for order in adjusted_place_orders:
+            side = str(order.get("side", "")).upper().strip()
+            if side not in {"BUY", "SELL"}:
+                safe_place_orders.append(order)
+                continue
+            prepared_order, _ = prepare_post_only_order_request(
+                order=order,
+                side=side,
+                live_bid_price=live_bid_price,
+                live_ask_price=live_ask_price,
+                tick_size=tick_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                step_size=step_size,
+                post_only=_order_prefers_post_only(order),
+            )
+            price = (
+                _safe_float(prepared_order.get("submitted_price"))
+                if prepared_order is not None
+                else _safe_float(order.get("price"))
+            )
+            bucket = _order_bucket_key(side, price, _order_position_side(order))
+            if bucket in pending_cancel_buckets:
+                deferred = dict(order)
+                deferred["defer_reason"] = "pending_same_bucket_cancel"
+                deferred_place_orders.append(deferred)
+                continue
+            safe_place_orders.append(order)
+        adjusted_place_orders = safe_place_orders
     merged_place_orders = [*urgent_place_orders, *adjusted_place_orders]
-    return {
+    result = {
         "place_orders": merged_place_orders,
         "cancel_orders": adjusted_cancel_orders,
         "place_count": len(merged_place_orders),
         "cancel_count": len(adjusted_cancel_orders),
         "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
     }
+    if pending_cancel_buckets:
+        result["same_bucket_cancel_place_guard"] = {
+            "enabled": True,
+            "pending_cancel_bucket_count": len(pending_cancel_buckets),
+            "deferred_place_count": len(deferred_place_orders),
+            "deferred_place_orders": deferred_place_orders,
+        }
+    return result
 
 
 def estimate_mid_drift_steps(

@@ -538,6 +538,41 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
         self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
 
+    def test_preserve_queue_priority_defers_same_bucket_place_while_cancel_pending(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.14379, "qty": 20.0, "notional": 2.8758, "role": "entry_short"},
+                {"side": "BUY", "price": 0.14200, "qty": 35.0, "notional": 4.97, "role": "entry_long"},
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "SELL",
+                    "price": "0.14379",
+                    "origQty": "35",
+                    "positionSide": "BOTH",
+                    "clientOrderId": "gx-billu-entrysho-1-11111111",
+                },
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.14250,
+            live_ask_price=0.14378,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=0.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertEqual(adjusted["place_orders"][0]["side"], "BUY")
+        guard = adjusted["same_bucket_cancel_place_guard"]
+        self.assertEqual(guard["deferred_place_count"], 1)
+        self.assertEqual(guard["deferred_place_orders"][0]["role"], "entry_short")
+
     def test_validate_plan_report_rejects_old_plan_and_stale_orders_without_flag(self) -> None:
         now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
         report = {

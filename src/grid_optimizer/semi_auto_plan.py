@@ -2008,7 +2008,6 @@ def diff_open_orders(
 
         if existing_total > desired_total:
             stale_orders.extend(existing_group)
-            missing_orders.extend(desired_group)
             continue
 
         kept_orders.extend(existing_group)

@@ -310,8 +310,23 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual(len(diff["kept_orders"]), 0)
         self.assertEqual(len(diff["stale_orders"]), 1)
-        self.assertEqual(len(diff["missing_orders"]), 1)
-        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 600.0, places=8)
+        self.assertEqual(len(diff["missing_orders"]), 0)
+
+    def test_diff_open_orders_does_not_place_same_bucket_while_canceling_excess(self) -> None:
+        existing = [
+            {"side": "SELL", "type": "LIMIT", "price": "0.14379", "origQty": "35", "orderId": 1},
+            {"side": "SELL", "type": "LIMIT", "price": "0.14379", "origQty": "35", "orderId": 2},
+            {"side": "SELL", "type": "LIMIT", "price": "0.14379", "origQty": "833", "orderId": 3},
+        ]
+        desired = [
+            {"side": "SELL", "price": 0.14379, "qty": 35.0, "notional": 5.03265, "level": 1, "role": "entry_short"},
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 3)
+        self.assertEqual(len(diff["missing_orders"]), 0)
 
     def test_preserve_sticky_entry_orders_keeps_closer_existing_entries_within_step_tolerance(self) -> None:
         existing = [
