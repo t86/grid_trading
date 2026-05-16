@@ -52,6 +52,7 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
     apply_hard_loss_forced_reduce,
+    resolve_hard_loss_forced_reduce_episode,
     prime_exposure_escalation_on_market_guard,
     resolve_exposure_escalation_buy_pause,
     resolve_exposure_escalation,
@@ -943,7 +944,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(order["notional"], 400.0)
         self.assertEqual(plan["forced_reduce_orders"], [order])
 
-    def test_apply_hard_loss_forced_reduce_reduces_when_target_above_current(self) -> None:
+    def test_apply_hard_loss_forced_reduce_stops_when_target_above_current(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
 
         report = apply_hard_loss_forced_reduce(
@@ -964,10 +965,79 @@ class LoopRunnerTests(unittest.TestCase):
             reason="hard_unrealized_loss_limit",
         )
 
-        self.assertTrue(report["active"])
-        self.assertEqual(report["placed_order_count"], 1)
-        self.assertAlmostEqual(report["target_notional"], 470.0)
-        self.assertLessEqual(plan["sell_orders"][0]["notional"], 180.0)
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "at_or_below_target")
+        self.assertEqual(report["placed_order_count"], 0)
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["forced_reduce_orders"], [])
+
+    def test_hard_loss_episode_disarms_after_target_until_loss_recovers(self) -> None:
+        now = datetime(2026, 5, 16, 5, 0, tzinfo=timezone.utc)
+        state: dict[str, Any] = {}
+
+        reducing = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=1400.0,
+            target_notional=900.0,
+            unrealized_pnl=-30.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now,
+            loss_recover_ratio=0.75,
+        )
+        self.assertTrue(reducing["active"])
+        self.assertFalse(reducing["disarmed"])
+        self.assertEqual(reducing["reason"], "reducing_to_target")
+
+        disarmed = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=880.0,
+            target_notional=900.0,
+            unrealized_pnl=-24.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now + timedelta(seconds=10),
+            loss_recover_ratio=0.75,
+        )
+        self.assertTrue(disarmed["active"])
+        self.assertTrue(disarmed["disarmed"])
+        self.assertEqual(disarmed["reason"], "target_reached_waiting_loss_recovery")
+
+        still_waiting = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=1040.0,
+            target_notional=900.0,
+            unrealized_pnl=-22.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now + timedelta(seconds=20),
+            loss_recover_ratio=0.75,
+        )
+        self.assertTrue(still_waiting["disarmed"])
+        self.assertEqual(still_waiting["reason"], "waiting_loss_recovery")
+
+        recovered = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=1040.0,
+            target_notional=900.0,
+            unrealized_pnl=-18.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now + timedelta(seconds=30),
+            loss_recover_ratio=0.75,
+        )
+        self.assertFalse(recovered["active"])
+        self.assertFalse(recovered["disarmed"])
+        self.assertEqual(recovered["reason"], "recovered")
+        self.assertNotIn("hard_loss_forced_reduce_episode", state)
 
     def test_apply_entry_permission_gate_prunes_short_entries_only(self) -> None:
         plan = {

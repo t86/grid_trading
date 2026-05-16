@@ -905,6 +905,8 @@ def resolve_hard_loss_rescue_entry_guard(
     current_short_notional: float,
     now: datetime,
     protect_seconds: float = 180.0,
+    hard_unrealized_loss_limit: float | None = None,
+    loss_recover_ratio: float = 0.75,
 ) -> dict[str, Any]:
     safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
     memory = dict(state.get("hard_loss_rescue_entry_guard") or {})
@@ -924,6 +926,14 @@ def resolve_hard_loss_rescue_entry_guard(
         return {"enabled": True, "active": False, "reason": "no_recent_hard_loss"}
 
     target_notional = max(_safe_float(hard_loss_forced_reduce.get("target_notional")), 0.0)
+    hard_loss_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    loss_recover_threshold = hard_loss_limit * max(_safe_float(loss_recover_ratio), 0.0)
+    hard_unrealized_pnl = _safe_float(hard_loss_forced_reduce.get("unrealized_pnl"))
+    hard_loss_still_elevated = (
+        hard_loss_limit > 0
+        and loss_recover_threshold > 0
+        and hard_unrealized_pnl < -loss_recover_threshold
+    )
     current_rescue_notional = (
         max(_safe_float(current_short_notional), 0.0)
         if side == "BUY"
@@ -957,7 +967,13 @@ def resolve_hard_loss_rescue_entry_guard(
         window_key="window_3m",
     )
     over_target = target_notional > 0 and current_rescue_notional > target_notional + 1e-12
-    should_protect = hard_active or min_remaining_seconds > 0 or over_target or not (one_min_calm and three_min_calm)
+    should_protect = (
+        hard_active
+        or min_remaining_seconds > 0
+        or over_target
+        or hard_loss_still_elevated
+        or not (one_min_calm and three_min_calm)
+    )
     if not should_protect:
         state.pop("hard_loss_rescue_entry_guard", None)
         return {
@@ -967,6 +983,8 @@ def resolve_hard_loss_rescue_entry_guard(
             "elapsed_seconds": elapsed_seconds,
             "target_notional": target_notional,
             "current_rescue_notional": current_rescue_notional,
+            "hard_unrealized_pnl": hard_unrealized_pnl,
+            "loss_recover_threshold": loss_recover_threshold,
         }
 
     reasons: list[str] = []
@@ -976,6 +994,8 @@ def resolve_hard_loss_rescue_entry_guard(
         reasons.append(f"protect_window_remaining={math.ceil(min_remaining_seconds)}s")
     if over_target:
         reasons.append("inventory_above_target")
+    if hard_loss_still_elevated:
+        reasons.append("hard_loss_still_elevated")
     if not one_min_calm:
         reasons.append(one_min_reason or "window_1m_not_calm")
     if not three_min_calm:
@@ -993,9 +1013,142 @@ def resolve_hard_loss_rescue_entry_guard(
         "min_remaining_seconds": min_remaining_seconds,
         "target_notional": target_notional,
         "current_rescue_notional": current_rescue_notional,
+        "hard_unrealized_pnl": hard_unrealized_pnl,
+        "loss_recover_threshold": loss_recover_threshold,
         "one_min_calm": one_min_calm,
         "three_min_calm": three_min_calm,
         "reason": ";".join(item for item in reasons if item),
+    }
+
+
+def resolve_hard_loss_forced_reduce_episode(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    triggered: bool,
+    side: str | None,
+    current_notional: float,
+    target_notional: float | None,
+    unrealized_pnl: float,
+    hard_unrealized_loss_limit: float | None,
+    now: datetime,
+    loss_recover_ratio: float = 0.75,
+) -> dict[str, Any]:
+    normalized_side = str(side or "").upper().strip()
+    current_time = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    hard_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    recover_threshold = hard_limit * max(_safe_float(loss_recover_ratio), 0.0)
+    current_loss = -_safe_float(unrealized_pnl)
+    current_notional_safe = max(_safe_float(current_notional), 0.0)
+    target_notional_safe = max(_safe_float(target_notional), 0.0)
+    memory = dict(state.get("hard_loss_forced_reduce_episode") or {})
+    memory_side = str(memory.get("side") or "").upper().strip()
+    same_side = normalized_side in {"BUY", "SELL"} and memory_side == normalized_side
+    recovered = hard_limit > 0 and recover_threshold > 0 and current_loss <= recover_threshold
+    if not enabled:
+        state.pop("hard_loss_forced_reduce_episode", None)
+        return {
+            "enabled": False,
+            "active": False,
+            "disarmed": False,
+            "reason": "disabled",
+            "loss_recover_threshold": recover_threshold,
+        }
+    if recovered:
+        state.pop("hard_loss_forced_reduce_episode", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "disarmed": False,
+            "reason": "recovered",
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+        }
+    if same_side and memory.get("disarmed_until_recovery"):
+        memory["updated_at"] = _isoformat(current_time)
+        memory["current_loss"] = current_loss
+        memory["current_notional"] = current_notional_safe
+        memory["target_notional"] = target_notional_safe
+        memory["loss_recover_threshold"] = recover_threshold
+        state["hard_loss_forced_reduce_episode"] = memory
+        return {
+            "enabled": True,
+            "active": True,
+            "disarmed": True,
+            "side": normalized_side,
+            "reason": "waiting_loss_recovery",
+            "started_at": memory.get("started_at"),
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+        }
+    if triggered and normalized_side in {"BUY", "SELL"}:
+        disarmed = target_notional_safe <= 0 or current_notional_safe <= target_notional_safe + 1e-12
+        if disarmed:
+            memory = {
+                "side": normalized_side,
+                "started_at": str(memory.get("started_at") or _isoformat(current_time)),
+                "updated_at": _isoformat(current_time),
+                "disarmed_until_recovery": True,
+                "current_loss": current_loss,
+                "current_notional": current_notional_safe,
+                "target_notional": target_notional_safe,
+                "loss_recover_threshold": recover_threshold,
+            }
+            state["hard_loss_forced_reduce_episode"] = memory
+            return {
+                "enabled": True,
+                "active": True,
+                "disarmed": True,
+                "side": normalized_side,
+                "reason": "target_reached_waiting_loss_recovery",
+                "started_at": memory["started_at"],
+                "current_loss": current_loss,
+                "loss_recover_threshold": recover_threshold,
+                "current_notional": current_notional_safe,
+                "target_notional": target_notional_safe,
+            }
+        memory = {
+            "side": normalized_side,
+            "started_at": str(memory.get("started_at") or _isoformat(current_time)),
+            "updated_at": _isoformat(current_time),
+            "disarmed_until_recovery": False,
+            "current_loss": current_loss,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+            "loss_recover_threshold": recover_threshold,
+        }
+        state["hard_loss_forced_reduce_episode"] = memory
+        return {
+            "enabled": True,
+            "active": True,
+            "disarmed": False,
+            "side": normalized_side,
+            "reason": "reducing_to_target",
+            "started_at": memory["started_at"],
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+        }
+    if not triggered and not memory:
+        return {
+            "enabled": True,
+            "active": False,
+            "disarmed": False,
+            "reason": "not_triggered",
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+        }
+    return {
+        "enabled": True,
+        "active": bool(memory),
+        "disarmed": bool(memory.get("disarmed_until_recovery")),
+        "side": memory_side or normalized_side,
+        "reason": "memory",
+        "current_loss": current_loss,
+        "loss_recover_threshold": recover_threshold,
     }
 
 
@@ -2251,11 +2404,8 @@ def apply_hard_loss_forced_reduce(
         report["blocked_reason"] = "at_or_below_target"
         return report
     if safe_current_notional <= safe_target_notional + 1e-12:
-        if safe_max_order_notional <= 0:
-            report["blocked_reason"] = "at_or_below_target"
-            return report
-        safe_target_notional = max(safe_current_notional - safe_max_order_notional, 0.0)
-        report["target_notional"] = safe_target_notional
+        report["blocked_reason"] = "at_or_below_target"
+        return report
 
     raw_reduce_notional = safe_current_notional - safe_target_notional
     reduce_notional = min(raw_reduce_notional, safe_max_order_notional) if safe_max_order_notional > 0 else raw_reduce_notional
@@ -10327,6 +10477,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "state": "disabled" if not bool(getattr(effective_args, "regime_entry_budget_enabled", False)) else "not_evaluated",
         "reasons": [],
     }
+    hard_loss_forced_reduce_episode: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
+        "active": False,
+        "disarmed": False,
+        "reason": "not_evaluated",
+    }
 
     effective_args = argparse.Namespace(**vars(effective_args))
     effective_args.take_profit_min_profit_ratio = _resolve_effective_take_profit_min_profit_ratio(
@@ -12736,10 +12892,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ask_price=ask_price,
                 sell_offset_steps=getattr(effective_args, "static_sell_offset_steps", 0.0),
             )
+            hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
+                state=state,
+                enabled=bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
+                triggered=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
+                side="SELL",
+                current_notional=controls["current_long_notional"],
+                target_notional=(
+                    getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
+                    if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
+                    else exposure_escalation.get("target_notional")
+                ),
+                unrealized_pnl=_safe_float(exposure_escalation.get("unrealized_pnl")),
+                hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+                now=plan_now,
+                loss_recover_ratio=0.75,
+            )
+            hard_reduce_disarmed = bool(hard_loss_forced_reduce_episode.get("disarmed"))
             hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
                 plan=plan,
                 enabled=bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
-                active=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
+                active=exposure_escalation.get("reason") == "hard_unrealized_loss_limit" and not hard_reduce_disarmed,
                 side="SELL",
                 current_qty=current_long_qty,
                 current_notional=controls["current_long_notional"],
@@ -12755,8 +12928,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
-                reason=exposure_escalation.get("reason"),
+                reason=(
+                    "hard_loss_episode_disarmed"
+                    if hard_reduce_disarmed
+                    else exposure_escalation.get("reason")
+                ),
             )
+            hard_loss_forced_reduce["unrealized_pnl"] = _safe_float(exposure_escalation.get("unrealized_pnl"))
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
@@ -12850,10 +13028,23 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             hard_cost_basis = adverse_long_cost_price
             hard_unrealized = (mid_price - hard_cost_basis) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
         hard_loss_active = hard_loss_limit > 0 and hard_unrealized <= -hard_loss_limit
+        hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=bool(hard_side) and hard_loss_active,
+            side=hard_side,
+            current_notional=hard_notional,
+            target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+            unrealized_pnl=hard_unrealized,
+            hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+            now=plan_now,
+            loss_recover_ratio=0.75,
+        )
+        hard_reduce_disarmed = bool(hard_loss_forced_reduce_episode.get("disarmed"))
         hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
             plan=plan,
             enabled=True,
-            active=bool(hard_side) and hard_loss_active,
+            active=bool(hard_side) and hard_loss_active and not hard_reduce_disarmed,
             side=hard_side or "SELL",
             current_qty=hard_qty,
             current_notional=hard_notional,
@@ -12865,7 +13056,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
-            reason="hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered",
+            reason=(
+                "hard_loss_episode_disarmed"
+                if hard_reduce_disarmed
+                else "hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered"
+            ),
         )
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
@@ -12886,6 +13081,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_notional=controls.get("current_short_notional", current_short_notional),
         now=plan_now,
         protect_seconds=180.0,
+        hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+        loss_recover_ratio=0.75,
     )
 
     unrealized_loss_entry_guard = assess_unrealized_loss_entry_guard(
@@ -13145,6 +13342,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "exposure_escalation": exposure_escalation,
         "exposure_escalation_buy_pause": exposure_escalation_buy_pause,
         "hard_loss_forced_reduce": hard_loss_forced_reduce,
+        "hard_loss_forced_reduce_episode": hard_loss_forced_reduce_episode,
         "hard_loss_rescue_entry_guard": hard_loss_rescue_entry_guard,
         "unrealized_loss_entry_guard": unrealized_loss_entry_guard,
         "active_delever": active_delever,
