@@ -104,6 +104,7 @@
 - 同一台机器可以同时存在多个代码树，例如老 release 和常驻工作目录；重启前先用 `ps` / `/proc/<pid>/cwd` 确认当前进程到底跑在哪个目录，再去覆盖对应代码。
 - 如果不是通过 web 端拉起，而是手工 `nohup` runner，先在同一 shell 里加载匹配账号的 `binance_api*.env`。否则很容易出现“进程已启动但立即因缺少 API key 退出”的假成功。
 - 如果需要跨电脑查看 `KAT` 巡检结果，使用 [`docs/KAT_GUARD_AUTOMATION.md`](./KAT_GUARD_AUTOMATION.md) 里约定的远端落盘路径，不要依赖本机 automation 列表。
+- 所有 start / restart / resume 还必须满足 [`RUNNER_START_SAFETY_POLICY.md`](./RUNNER_START_SAFETY_POLICY.md) 的强制规则，尤其是人工干预、reconcile drift、post-shock 观察期和 restart 前一致性检查。
 
 ### 定时巡检与 Heartbeat 开发标准
 
