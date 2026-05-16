@@ -12395,7 +12395,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         target_remaining = max(_safe_float(getattr(effective_args, "best_quote_maker_volume_target_remaining_notional", 0.0)), 0.0)
         if target_remaining <= 0:
             target_remaining = max(_safe_float(getattr(effective_args, "max_total_notional", 0.0)), cycle_budget)
-        open_entry_exposure = _summarize_open_entry_exposure(open_orders_for_diff)
+        open_entry_exposure = _summarize_open_entry_exposure(
+            _filter_futures_strategy_orders(open_orders, symbol)
+        )
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
