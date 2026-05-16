@@ -102,6 +102,7 @@ from .submit_plan import (
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
+    suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
     enforce_execution_action_limits,
 )
@@ -13774,6 +13775,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         actions=validation["actions"],
         plan_report=plan_report,
         strategy_mode=strategy_mode,
+    )
+    validation["actions"] = suppress_place_orders_with_existing_submitted_buckets(
+        actions=validation["actions"],
+        current_open_orders=current_strategy_open_orders,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
     validation = enforce_execution_action_limits(
         validation=validation,

@@ -947,6 +947,82 @@ def preserve_queue_priority_in_execution_actions(
     return result
 
 
+def suppress_place_orders_with_existing_submitted_buckets(
+    *,
+    actions: dict[str, Any],
+    current_open_orders: Iterable[Any],
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None = None,
+) -> dict[str, Any]:
+    """Drop place orders whose submitted bucket already exists on exchange."""
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders:
+        return actions
+
+    existing_buckets: set[str] = set()
+    for order in current_open_orders:
+        if not isinstance(order, dict):
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        price = _safe_float(order.get("price"))
+        if side not in {"BUY", "SELL"} or price <= 0:
+            continue
+        existing_buckets.add(_order_bucket_key(side, price, _order_position_side(order)))
+
+    if not existing_buckets:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    suppressed_place_orders: list[dict[str, Any]] = []
+    for order in place_orders:
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            kept_place_orders.append(order)
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        bucket = _order_bucket_key(side, price, _order_position_side(order))
+        if bucket in existing_buckets:
+            suppressed = dict(order)
+            suppressed["defer_reason"] = "existing_same_submitted_bucket"
+            suppressed["submitted_bucket"] = bucket
+            suppressed_place_orders.append(suppressed)
+            continue
+        kept_place_orders.append(order)
+
+    if not suppressed_place_orders:
+        return actions
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["existing_submitted_bucket_guard"] = {
+        "enabled": True,
+        "suppressed_place_count": len(suppressed_place_orders),
+        "suppressed_place_orders": suppressed_place_orders,
+    }
+    return result
+
+
 def estimate_mid_drift_steps(
     *,
     report_mid_price: float,

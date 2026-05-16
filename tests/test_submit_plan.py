@@ -14,6 +14,7 @@ from grid_optimizer.submit_plan import (
     filter_strategy_open_orders,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
+    suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
 )
 
@@ -594,6 +595,45 @@ class SubmitPlanTests(unittest.TestCase):
         guard = adjusted["duplicate_place_bucket_guard"]
         self.assertEqual(guard["merged_order_count"], 1)
         self.assertEqual(guard["merged_orders"][0]["role"], "take_profit_long")
+
+    def test_suppress_place_orders_when_submitted_bucket_already_open(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.14567, "qty": 1029.0, "notional": 149.9, "role": "entry_short"},
+                {"side": "SELL", "price": 0.14629, "qty": 1025.0, "notional": 149.9, "role": "entry_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+            "place_notional": 299.8,
+        }
+        current_open_orders = [
+            {
+                "orderId": 1,
+                "clientOrderId": "gx-billu-entrysho-1-11111111",
+                "side": "SELL",
+                "price": "0.1456700",
+                "origQty": "1029",
+                "positionSide": "BOTH",
+            }
+        ]
+
+        adjusted = suppress_place_orders_with_existing_submitted_buckets(
+            actions=actions,
+            current_open_orders=current_open_orders,
+            live_bid_price=0.14200,
+            live_ask_price=0.14210,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=0.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertEqual(adjusted["place_orders"][0]["price"], 0.14629)
+        guard = adjusted["existing_submitted_bucket_guard"]
+        self.assertEqual(guard["suppressed_place_count"], 1)
+        self.assertEqual(guard["suppressed_place_orders"][0]["role"], "entry_short")
 
     def test_validate_plan_report_rejects_old_plan_and_stale_orders_without_flag(self) -> None:
         now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
