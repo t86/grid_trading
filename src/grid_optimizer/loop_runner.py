@@ -10179,27 +10179,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "warning": f"{exc.__class__.__name__}: {exc}",
             }
 
-    volatility_entry_pause = resolve_volatility_entry_pause(
-        adaptive_step=adaptive_step,
-        state=state,
-        enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
-        window_10s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_10s_abs_return_ratio", None),
-        window_10s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_10s_amplitude_ratio", None),
-        window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
-        window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
-        window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
-        window_1m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
-        window_3m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
-        window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
-        window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
-        window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
-        recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
-        now=plan_now,
-        min_observation_seconds=getattr(effective_args, "volatility_entry_pause_min_observation_seconds", 180.0),
-        current_long_notional=current_long_qty * max(mid_price, 0.0),
-        current_short_notional=current_short_qty * max(mid_price, 0.0),
-        inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
-    )
     elastic_volume: dict[str, Any] = {
         "enabled": bool(getattr(effective_args, "elastic_volume_enabled", False)),
         "regime": "disabled" if not bool(getattr(effective_args, "elastic_volume_enabled", False)) else "not_evaluated",
@@ -10389,6 +10368,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         unrealized_pnl = _position_unrealized_pnl(long_position) + _position_unrealized_pnl(short_position)
     else:
         unrealized_pnl = _position_unrealized_pnl(actual_position)
+    volatility_entry_pause = resolve_volatility_entry_pause(
+        adaptive_step=adaptive_step,
+        state=state,
+        enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
+        window_10s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_10s_abs_return_ratio", None),
+        window_10s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_10s_amplitude_ratio", None),
+        window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
+        window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
+        window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+        window_1m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+        window_3m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+        window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+        window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
+        window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
+        recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
+        now=plan_now,
+        min_observation_seconds=getattr(effective_args, "volatility_entry_pause_min_observation_seconds", 180.0),
+        current_long_notional=current_long_notional,
+        current_short_notional=current_short_notional,
+        inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
+    )
     observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
     execution_regime = build_execution_regime_report(
         args=args,
