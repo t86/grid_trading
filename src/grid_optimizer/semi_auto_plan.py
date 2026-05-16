@@ -1960,6 +1960,13 @@ def diff_open_orders(
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
+    def _merged_desired_order(orders: list[dict[str, Any]]) -> dict[str, Any]:
+        total_qty = sum(
+            (_quantity_decimal(order.get("qty", order.get("quantity"))) for order in orders),
+            Decimal("0"),
+        )
+        return _clone_order_with_qty(orders[0], total_qty)
+
     desired_by_bucket: dict[str, list[dict[str, Any]]] = {}
     for order in desired_orders:
         key = _order_bucket_key(
@@ -1994,7 +2001,7 @@ def diff_open_orders(
             stale_orders.extend(existing_group)
             continue
         if not existing_group:
-            missing_orders.extend(desired_group)
+            missing_orders.append(_merged_desired_order(desired_group))
             continue
 
         existing_total = sum(
@@ -2009,11 +2016,11 @@ def diff_open_orders(
         if existing_total > desired_total:
             stale_orders.extend(existing_group)
             continue
+        if existing_total < desired_total:
+            stale_orders.extend(existing_group)
+            continue
 
         kept_orders.extend(existing_group)
-        delta = desired_total - existing_total
-        if delta > Decimal("0"):
-            missing_orders.append(_clone_order_with_qty(desired_group[0], delta))
 
     return {
         "missing_orders": missing_orders,

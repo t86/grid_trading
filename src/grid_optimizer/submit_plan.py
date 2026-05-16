@@ -159,6 +159,68 @@ def _clone_order_with_qty(order: dict[str, Any], qty: Decimal) -> dict[str, Any]
     return cloned
 
 
+def _merge_place_orders_by_submitted_bucket(
+    *,
+    orders: list[dict[str, Any]],
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    merged: list[dict[str, Any]] = []
+    merged_index_by_bucket: dict[str, int] = {}
+    qty_by_bucket: dict[str, Decimal] = {}
+    dropped: list[dict[str, Any]] = []
+    for order in orders:
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            merged.append(order)
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        qty = (
+            _quantity_decimal(prepared_order.get("qty"))
+            if prepared_order is not None
+            else _quantity_decimal(order.get("qty", order.get("quantity")))
+        )
+        if price <= 0 or qty <= Decimal("0"):
+            merged.append(order)
+            continue
+        bucket = _order_bucket_key(side, price, _order_position_side(order))
+        if bucket not in merged_index_by_bucket:
+            template = dict(order)
+            template["price"] = price
+            merged_index_by_bucket[bucket] = len(merged)
+            qty_by_bucket[bucket] = qty
+            merged.append(_clone_order_with_qty(template, qty))
+            continue
+        qty_by_bucket[bucket] += qty
+        merged[merged_index_by_bucket[bucket]] = _clone_order_with_qty(
+            merged[merged_index_by_bucket[bucket]],
+            qty_by_bucket[bucket],
+        )
+        dropped_order = dict(order)
+        dropped_order["defer_reason"] = "merged_duplicate_place_bucket"
+        dropped.append(dropped_order)
+    return merged, dropped
+
+
 def _choose_preserved_cancel_indices(
     quantities: list[Decimal],
     target_qty: Decimal,
@@ -668,14 +730,30 @@ def preserve_queue_priority_in_execution_actions(
             queue_place_orders.append(order)
     place_orders = queue_place_orders
     if not place_orders or not cancel_orders:
+        place_orders, duplicate_place_orders = _merge_place_orders_by_submitted_bucket(
+            orders=place_orders,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+        )
         merged_place_orders = [*urgent_place_orders, *place_orders]
-        return {
+        result = {
             "place_orders": merged_place_orders,
             "cancel_orders": cancel_orders,
             "place_count": len(merged_place_orders),
             "cancel_count": len(cancel_orders),
             "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
         }
+        if duplicate_place_orders:
+            result["duplicate_place_bucket_guard"] = {
+                "enabled": True,
+                "merged_order_count": len(duplicate_place_orders),
+                "merged_orders": duplicate_place_orders,
+            }
+        return result
 
     cancel_indices_by_bucket: dict[str, list[int]] = {}
     cancel_totals_by_bucket: dict[str, Decimal] = {}
@@ -836,6 +914,15 @@ def preserve_queue_priority_in_execution_actions(
                 continue
             safe_place_orders.append(order)
         adjusted_place_orders = safe_place_orders
+    adjusted_place_orders, duplicate_place_orders = _merge_place_orders_by_submitted_bucket(
+        orders=adjusted_place_orders,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=tick_size,
+        min_qty=min_qty,
+        min_notional=min_notional,
+        step_size=step_size,
+    )
     merged_place_orders = [*urgent_place_orders, *adjusted_place_orders]
     result = {
         "place_orders": merged_place_orders,
@@ -850,6 +937,12 @@ def preserve_queue_priority_in_execution_actions(
             "pending_cancel_bucket_count": len(pending_cancel_buckets),
             "deferred_place_count": len(deferred_place_orders),
             "deferred_place_orders": deferred_place_orders,
+        }
+    if duplicate_place_orders:
+        result["duplicate_place_bucket_guard"] = {
+            "enabled": True,
+            "merged_order_count": len(duplicate_place_orders),
+            "merged_orders": duplicate_place_orders,
         }
     return result
 

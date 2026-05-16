@@ -282,7 +282,7 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(len(diff["missing_orders"]), 0)
         self.assertEqual(len(diff["stale_orders"]), 0)
 
-    def test_diff_open_orders_keeps_same_price_order_and_adds_delta_when_qty_increases(self) -> None:
+    def test_diff_open_orders_replaces_same_price_order_when_qty_increases(self) -> None:
         existing = [
             {"side": "BUY", "type": "LIMIT", "price": "0.02685", "origQty": "744", "orderId": 1},
         ]
@@ -292,11 +292,9 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
 
-        self.assertEqual(len(diff["kept_orders"]), 1)
-        self.assertEqual(len(diff["stale_orders"]), 0)
-        self.assertEqual(len(diff["missing_orders"]), 1)
-        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 156.0, places=8)
-        self.assertAlmostEqual(float(diff["missing_orders"][0]["price"]), 0.02685, places=8)
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 1)
+        self.assertEqual(len(diff["missing_orders"]), 0)
 
     def test_diff_open_orders_replaces_same_price_order_when_qty_decreases(self) -> None:
         existing = [
@@ -327,6 +325,40 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(len(diff["kept_orders"]), 0)
         self.assertEqual(len(diff["stale_orders"]), 3)
         self.assertEqual(len(diff["missing_orders"]), 0)
+
+    def test_diff_open_orders_replaces_same_bucket_take_profit_before_resizing(self) -> None:
+        existing = [
+            {"side": "SELL", "type": "LIMIT", "price": "0.14362", "origQty": "74", "orderId": 1},
+        ]
+        desired = [
+            {
+                "side": "SELL",
+                "price": 0.14362,
+                "qty": 974.0,
+                "notional": 139.914,
+                "level": 1,
+                "role": "take_profit_long",
+            },
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 1)
+        self.assertEqual(len(diff["missing_orders"]), 0)
+
+    def test_diff_open_orders_merges_duplicate_desired_bucket_when_no_existing_order(self) -> None:
+        desired = [
+            {"side": "SELL", "price": 0.14362, "qty": 74.0, "notional": 10.62788, "level": 1, "role": "take_profit_long"},
+            {"side": "SELL", "price": 0.14362, "qty": 974.0, "notional": 139.48588, "level": 1, "role": "take_profit_long"},
+        ]
+
+        diff = diff_open_orders(existing_orders=[], desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 0)
+        self.assertEqual(len(diff["missing_orders"]), 1)
+        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 1048.0, places=8)
 
     def test_preserve_sticky_entry_orders_keeps_closer_existing_entries_within_step_tolerance(self) -> None:
         existing = [

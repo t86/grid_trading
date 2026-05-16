@@ -485,9 +485,8 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 1)
-        self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 350.0, places=8)
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_count"], 1)
 
     def test_preserve_queue_priority_keeps_exact_same_bucket_subset_when_qty_shrinks(self) -> None:
         actions = {
@@ -534,9 +533,8 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 1)
-        self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_count"], 1)
 
     def test_preserve_queue_priority_defers_same_bucket_place_while_cancel_pending(self) -> None:
         actions = {
@@ -572,6 +570,33 @@ class SubmitPlanTests(unittest.TestCase):
         guard = adjusted["same_bucket_cancel_place_guard"]
         self.assertEqual(guard["deferred_place_count"], 1)
         self.assertEqual(guard["deferred_place_orders"][0]["role"], "entry_short")
+
+    def test_preserve_queue_priority_merges_duplicate_take_profit_place_buckets(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.14362, "qty": 74.0, "notional": 10.62788, "role": "take_profit_long"},
+                {"side": "SELL", "price": 0.14362, "qty": 974.0, "notional": 139.912, "role": "take_profit_long"},
+            ],
+            "cancel_orders": [],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.14200,
+            live_ask_price=0.14210,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=0.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertEqual(adjusted["place_orders"][0]["side"], "SELL")
+        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.14362, places=8)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 1048.0, places=8)
+        guard = adjusted["duplicate_place_bucket_guard"]
+        self.assertEqual(guard["merged_order_count"], 1)
+        self.assertEqual(guard["merged_orders"][0]["role"], "take_profit_long")
 
     def test_validate_plan_report_rejects_old_plan_and_stale_orders_without_flag(self) -> None:
         now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
