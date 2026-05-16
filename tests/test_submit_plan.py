@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     apply_anti_chase_entry_guard_to_actions,
+    apply_hard_loss_rescue_entry_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
     enforce_execution_action_limits,
@@ -317,6 +318,52 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guarded["place_count"], 1)
         self.assertEqual(guarded["place_orders"][0]["role"], "take_profit_short")
         self.assertEqual(guarded["anti_chase_entry_guard"]["dropped_order_count"], 1)
+
+    def test_hard_loss_rescue_guard_blocks_same_direction_entries_only(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.1565,
+                    "qty": 766.0,
+                    "notional": 119.879,
+                    "role": "hard_loss_forced_reduce_short",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                },
+                {"side": "BUY", "price": 0.1540, "qty": 843.0, "notional": 129.822, "role": "take_profit_short"},
+                {"side": "SELL", "price": 0.1600, "qty": 812.0, "notional": 129.92, "role": "entry_short"},
+                {"side": "BUY", "price": 0.1545, "qty": 841.0, "notional": 129.9345, "role": "entry_long"},
+            ],
+            "cancel_orders": [],
+            "place_count": 4,
+            "cancel_count": 0,
+            "place_notional": 509.5555,
+        }
+        plan_report = {
+            "hard_loss_rescue_entry_guard": {
+                "active": True,
+                "block_short_entries": True,
+                "block_long_entries": False,
+                "reason": "protect_window_remaining=120s",
+            }
+        }
+
+        guarded = apply_hard_loss_rescue_entry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(
+            [item["role"] for item in guarded["place_orders"]],
+            ["hard_loss_forced_reduce_short", "take_profit_short", "entry_long"],
+        )
+        self.assertEqual(guarded["place_count"], 3)
+        guard = guarded["hard_loss_rescue_entry_guard"]
+        self.assertEqual(guard["dropped_order_count"], 1)
+        self.assertEqual(guard["dropped_orders"][0]["role"], "entry_short")
 
     def test_deferred_action_limits_allow_capped_reduce_only_orders(self) -> None:
         now = datetime(2026, 5, 5, 0, 20, tzinfo=timezone.utc)

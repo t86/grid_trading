@@ -97,6 +97,7 @@ from .submit_plan import (
     _ignore_noop_error,
     _is_reduce_only_reject,
     apply_anti_chase_entry_guard_to_actions,
+    apply_hard_loss_rescue_entry_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
@@ -861,6 +862,141 @@ def resolve_volatility_entry_pause(
         "dominant_threshold": report.get("dominant_threshold"),
     }
     return report
+
+
+def _parse_rescue_guard_time(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _volatility_window_is_calm(
+    *,
+    metrics: dict[str, Any],
+    thresholds: dict[str, dict[str, float]],
+    window_key: str,
+) -> tuple[bool, str | None]:
+    window = metrics.get(window_key)
+    if not isinstance(window, dict):
+        return False, f"{window_key}_missing"
+    window_thresholds = thresholds.get(window_key) or {}
+    abs_threshold = _safe_float(window_thresholds.get("abs_return_ratio"))
+    amp_threshold = _safe_float(window_thresholds.get("amplitude_ratio"))
+    abs_return = abs(_safe_float(window.get("return_ratio")))
+    amplitude = _safe_float(window.get("amplitude_ratio"))
+    if abs_threshold > 0 and abs_return >= abs_threshold:
+        return False, f"{window_key}_abs_return={abs_return:.6f}>={abs_threshold:.6f}"
+    if amp_threshold > 0 and amplitude >= amp_threshold:
+        return False, f"{window_key}_amplitude={amplitude:.6f}>={amp_threshold:.6f}"
+    return True, None
+
+
+def resolve_hard_loss_rescue_entry_guard(
+    *,
+    state: dict[str, Any],
+    hard_loss_forced_reduce: dict[str, Any],
+    volatility_entry_pause: dict[str, Any],
+    current_long_notional: float,
+    current_short_notional: float,
+    now: datetime,
+    protect_seconds: float = 180.0,
+) -> dict[str, Any]:
+    safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    memory = dict(state.get("hard_loss_rescue_entry_guard") or {})
+    hard_active = bool(hard_loss_forced_reduce.get("active"))
+    side = str(hard_loss_forced_reduce.get("side") or memory.get("side") or "").upper().strip()
+    if hard_active and side in {"BUY", "SELL"}:
+        memory = {
+            "side": side,
+            "started_at": _isoformat(safe_now),
+            "updated_at": _isoformat(safe_now),
+        }
+        state["hard_loss_rescue_entry_guard"] = memory
+
+    started_at = _parse_rescue_guard_time(memory.get("started_at"))
+    if side not in {"BUY", "SELL"} or started_at is None:
+        state.pop("hard_loss_rescue_entry_guard", None)
+        return {"enabled": True, "active": False, "reason": "no_recent_hard_loss"}
+
+    target_notional = max(_safe_float(hard_loss_forced_reduce.get("target_notional")), 0.0)
+    current_rescue_notional = (
+        max(_safe_float(current_short_notional), 0.0)
+        if side == "BUY"
+        else max(_safe_float(current_long_notional), 0.0)
+    )
+    elapsed_seconds = max((safe_now - started_at).total_seconds(), 0.0)
+    min_remaining_seconds = max(_safe_float(protect_seconds) - elapsed_seconds, 0.0)
+    volatility_metrics = dict(volatility_entry_pause.get("metrics") or {})
+    thresholds: dict[str, dict[str, float]] = {}
+    for key in ("window_1m", "window_3m"):
+        threshold_key = f"{key}_thresholds"
+        if isinstance(volatility_entry_pause.get(threshold_key), dict):
+            thresholds[key] = dict(volatility_entry_pause[threshold_key])
+    if not thresholds:
+        state_snapshot = volatility_entry_pause.get("state")
+        dominant_threshold = _safe_float(state_snapshot.get("dominant_threshold")) if isinstance(state_snapshot, dict) else 0.0
+        if dominant_threshold > 0:
+            thresholds = {
+                "window_1m": {"abs_return_ratio": dominant_threshold, "amplitude_ratio": dominant_threshold},
+                "window_3m": {"abs_return_ratio": dominant_threshold, "amplitude_ratio": dominant_threshold},
+            }
+
+    one_min_calm, one_min_reason = _volatility_window_is_calm(
+        metrics=volatility_metrics,
+        thresholds=thresholds,
+        window_key="window_1m",
+    )
+    three_min_calm, three_min_reason = _volatility_window_is_calm(
+        metrics=volatility_metrics,
+        thresholds=thresholds,
+        window_key="window_3m",
+    )
+    over_target = target_notional > 0 and current_rescue_notional > target_notional + 1e-12
+    should_protect = hard_active or min_remaining_seconds > 0 or over_target or not (one_min_calm and three_min_calm)
+    if not should_protect:
+        state.pop("hard_loss_rescue_entry_guard", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "reason": "recovered",
+            "elapsed_seconds": elapsed_seconds,
+            "target_notional": target_notional,
+            "current_rescue_notional": current_rescue_notional,
+        }
+
+    reasons: list[str] = []
+    if hard_active:
+        reasons.append("hard_loss_active")
+    if min_remaining_seconds > 0:
+        reasons.append(f"protect_window_remaining={math.ceil(min_remaining_seconds)}s")
+    if over_target:
+        reasons.append("inventory_above_target")
+    if not one_min_calm:
+        reasons.append(one_min_reason or "window_1m_not_calm")
+    if not three_min_calm:
+        reasons.append(three_min_reason or "window_3m_not_calm")
+    memory["updated_at"] = _isoformat(safe_now)
+    state["hard_loss_rescue_entry_guard"] = memory
+    return {
+        "enabled": True,
+        "active": True,
+        "side": side,
+        "block_long_entries": side == "SELL",
+        "block_short_entries": side == "BUY",
+        "started_at": _isoformat(started_at),
+        "elapsed_seconds": elapsed_seconds,
+        "min_remaining_seconds": min_remaining_seconds,
+        "target_notional": target_notional,
+        "current_rescue_notional": current_rescue_notional,
+        "one_min_calm": one_min_calm,
+        "three_min_calm": three_min_calm,
+        "reason": ";".join(item for item in reasons if item),
+    }
 
 
 def resolve_anti_chase_entry_guard(
@@ -12730,6 +12866,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
 
+    volatility_entry_pause["window_1m_thresholds"] = {
+        "abs_return_ratio": getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+        "amplitude_ratio": getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+    }
+    volatility_entry_pause["window_3m_thresholds"] = {
+        "abs_return_ratio": getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+        "amplitude_ratio": getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+    }
+    hard_loss_rescue_entry_guard = resolve_hard_loss_rescue_entry_guard(
+        state=state,
+        hard_loss_forced_reduce=hard_loss_forced_reduce,
+        volatility_entry_pause=volatility_entry_pause,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        now=plan_now,
+        protect_seconds=180.0,
+    )
+
     unrealized_loss_entry_guard = assess_unrealized_loss_entry_guard(
         enabled=bool(getattr(effective_args, "unrealized_loss_entry_guard_enabled", False)),
         unrealized_pnl=unrealized_pnl,
@@ -12987,6 +13141,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "exposure_escalation": exposure_escalation,
         "exposure_escalation_buy_pause": exposure_escalation_buy_pause,
         "hard_loss_forced_reduce": hard_loss_forced_reduce,
+        "hard_loss_rescue_entry_guard": hard_loss_rescue_entry_guard,
         "unrealized_loss_entry_guard": unrealized_loss_entry_guard,
         "active_delever": active_delever,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
@@ -13204,6 +13359,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         plan_report=plan_report,
         strategy_mode=strategy_mode,
     )
+    validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
 
     report = {
         "plan_json": str(args.plan_json),
@@ -13402,6 +13562,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         current_open_orders=current_strategy_open_orders,
     )
     validation["actions"] = apply_anti_chase_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
         actions=validation["actions"],
         plan_report=plan_report,
         strategy_mode=strategy_mode,
