@@ -1768,6 +1768,7 @@ def fetch_futures_open_orders(
     api_secret: str,
     contract_type: str = "usdm",
     recv_window: int = 5000,
+    use_cache: bool = True,
 ) -> list[dict[str, Any]]:
     normalized_contract_type = normalize_contract_type(contract_type)
     normalized_symbol = symbol.upper().strip()
@@ -1782,6 +1783,9 @@ def fetch_futures_open_orders(
             method="GET",
         )
         return _as_list_payload(data, "futures openOrders")
+
+    if not use_cache:
+        return _fetch()
 
     return _get_or_fetch_cached_signed_response(
         namespace="futures_open_orders",

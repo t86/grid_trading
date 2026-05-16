@@ -13914,6 +13914,56 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 )
                 last_exc = None
                 break
+            latest_open_orders = fetch_futures_open_orders(
+                symbol,
+                api_key,
+                api_secret,
+                recv_window=args.recv_window,
+                use_cache=False,
+            )
+            submitted_bucket = (
+                side,
+                f"{_safe_float(prepared_order.get('submitted_price')):.10f}",
+                position_side,
+            )
+            existing_same_bucket_orders = [
+                item
+                for item in _filter_futures_strategy_orders(latest_open_orders, symbol)
+                if (
+                    str(item.get("side", "")).upper().strip(),
+                    f"{_safe_float(item.get('price')):.10f}",
+                    _order_position_side(item),
+                )
+                == submitted_bucket
+            ]
+            if existing_same_bucket_orders:
+                report["skipped_orders"].append(
+                    {
+                        "request": {
+                            "role": role,
+                            "side": side,
+                            "position_side": position_side,
+                            "qty": _safe_float(prepared_order.get("qty")),
+                            "desired_price": _safe_float(prepared_order.get("desired_price")),
+                            "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                            "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
+                            "attempt": attempt + 1,
+                            "time_in_force": time_in_force,
+                            "reduce_only": reduce_only,
+                        },
+                        "reason": {
+                            "reason": "existing_same_submitted_bucket",
+                            "bucket": ":".join(submitted_bucket),
+                            "existing_order_count": len(existing_same_bucket_orders),
+                            "existing_order_ids": [item.get("orderId") for item in existing_same_bucket_orders],
+                            "existing_client_order_ids": [
+                                item.get("clientOrderId") for item in existing_same_bucket_orders
+                            ],
+                        },
+                    }
+                )
+                last_exc = None
+                break
             try:
                 place_response = post_futures_order(
                     symbol=symbol,
