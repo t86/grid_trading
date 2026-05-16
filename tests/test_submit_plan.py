@@ -461,9 +461,7 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 0)
-        self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
+        self.assertEqual(adjusted["place_count"], 0)
 
     def test_preserve_queue_priority_keeps_replace_when_projected_bucket_needs_smaller_qty(self) -> None:
         actions = {
@@ -512,7 +510,7 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(adjusted["cancel_count"], 1)
         self.assertEqual(adjusted["cancel_orders"][0]["orderId"], 1)
 
-    def test_preserve_queue_priority_keeps_subset_and_places_delta_when_qty_shrinks(self) -> None:
+    def test_preserve_queue_priority_keeps_subset_without_same_bucket_delta(self) -> None:
         actions = {
             "place_orders": [
                 {"side": "BUY", "price": 0.05064, "qty": 650.0, "notional": 32.916, "role": "entry"}
@@ -534,7 +532,6 @@ class SubmitPlanTests(unittest.TestCase):
 
         self.assertEqual(adjusted["cancel_count"], 1)
         self.assertEqual(adjusted["place_count"], 0)
-        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_count"], 1)
 
     def test_preserve_queue_priority_defers_same_bucket_place_while_cancel_pending(self) -> None:
         actions = {

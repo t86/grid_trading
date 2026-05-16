@@ -2013,11 +2013,14 @@ def diff_open_orders(
             Decimal("0"),
         )
 
+        if len(existing_group) > 1:
+            stale_orders.extend(existing_group)
+            continue
         if existing_total > desired_total:
             stale_orders.extend(existing_group)
             continue
         if existing_total < desired_total:
-            stale_orders.extend(existing_group)
+            kept_orders.extend(existing_group)
             continue
 
         kept_orders.extend(existing_group)

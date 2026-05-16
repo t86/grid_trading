@@ -823,7 +823,7 @@ def preserve_queue_priority_in_execution_actions(
         if desired_total >= existing_total:
             for cancel_index in bucket_indices:
                 preserved_cancel_indices.add(cancel_index)
-            reduced_place_totals[key] = max(desired_total - existing_total, Decimal("0"))
+            reduced_place_totals[key] = Decimal("0")
             continue
 
         chosen_local_indices, preserved_qty = _choose_preserved_cancel_indices(bucket_quantities, desired_total)
