@@ -63,6 +63,20 @@
 
 仅靠少量 `recover_confirm_cycles` 通过，不足以视为可以恢复。
 
+如果策略启用了 `volatility_entry_pause`，那么以下恢复参数必须同时存在并生效，不能只配 trigger 不配恢复门：
+
+- `volatility_entry_pause_min_observation_seconds >= 180`
+- `volatility_entry_pause_inventory_recover_ratio <= 0.75`
+- `volatility_entry_pause_recover_confirm_cycles >= 2`
+
+也就是说，波动暂停解除必须同时满足：
+
+1. 观察时间已过
+2. 库存已经回落到触发时库存的一定比例以下
+3. 连续若干轮确认未再触发
+
+任何只靠 `recover_confirm_cycles` 的恢复逻辑，都视为不合规。
+
 ### 4. Restart 前必须过一致性检查
 
 任何 incident 后，restart 前至少确认：
@@ -107,5 +121,6 @@
 
 1. heartbeat / automation prompt 规则
 2. 代码级启动前 preflight
+3. 使用 `volatility_entry_pause` 的策略参数与恢复门校验
 
 只存在于文档、不存在于启动代码里的规则，不算真正落地。
