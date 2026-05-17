@@ -34,6 +34,7 @@ from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from .semi_auto_plan import diff_open_orders
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
+from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
 
 STATE_VERSION = 2
 EPSILON = 1e-12
@@ -726,6 +727,96 @@ def _record_trade_metrics(
             "role": role,
         },
     )
+
+
+def _spot_trade_audit_rows_from_metrics(metrics: dict[str, Any], *, symbol: str) -> list[dict[str, Any]]:
+    recent = metrics.get("recent_trades")
+    if not isinstance(recent, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in recent:
+        if not isinstance(row, dict):
+            continue
+        trade_id = _safe_int(row.get("id"))
+        rows.append(
+            {
+                "id": trade_id,
+                "orderId": row.get("orderId") or row.get("order_id") or trade_id,
+                "time": row.get("time"),
+                "symbol": symbol,
+                "side": row.get("side"),
+                "price": row.get("price"),
+                "qty": row.get("qty"),
+                "quoteQty": row.get("notional"),
+                "commission": row.get("commission"),
+                "commissionAsset": row.get("commission_asset"),
+                "commission_quote": row.get("commission_quote"),
+                "realizedPnl": row.get("realized_pnl"),
+                "maker": row.get("maker"),
+                "role": row.get("role"),
+                "source": "spot_runner_metrics",
+            }
+        )
+    return rows
+
+
+def _persist_spot_trade_database(
+    *,
+    symbol: str,
+    strategy_mode: str,
+    args: argparse.Namespace,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
+    if not trade_database_enabled():
+        return status
+    rows = _spot_trade_audit_rows_from_metrics(metrics, symbol=symbol)
+    if not rows:
+        return status
+    try:
+        ensure_trade_database_schema()
+        return persist_trade_rows(
+            symbol=symbol,
+            market_type="spot",
+            strategy_mode=strategy_mode,
+            config=vars(args),
+            trade_rows=rows,
+            income_rows=[],
+        )
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "trade_inserted": 0,
+            "income_inserted": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _persist_spot_cycle_database(
+    *,
+    symbol: str,
+    strategy_mode: str,
+    args: argparse.Namespace,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    status: dict[str, Any] = {"enabled": trade_database_enabled(), "cycle_inserted": 0}
+    if not trade_database_enabled():
+        return status
+    try:
+        ensure_trade_database_schema()
+        return persist_cycle_snapshot(
+            symbol=symbol,
+            market_type="spot",
+            strategy_mode=strategy_mode,
+            config=vars(args),
+            summary=summary,
+        )
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "cycle_inserted": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
 
 
 def _sync_static_trades(
@@ -2428,6 +2519,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
     strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
     metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else _new_metrics()
+    trade_database_status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
     runtime_guard_config = normalize_runtime_guard_config(vars(args))
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
@@ -2467,6 +2559,18 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             runtime_guard_config=runtime_guard_config,
             canceled_count=canceled_count,
             flatten_result=flatten_result,
+        )
+        summary["trade_database"] = _persist_spot_trade_database(
+            symbol=symbol,
+            strategy_mode=strategy_mode,
+            args=args,
+            metrics=metrics,
+        )
+        summary["cycle_database"] = _persist_spot_cycle_database(
+            symbol=symbol,
+            strategy_mode=strategy_mode,
+            args=args,
+            summary=summary,
         )
         _save_state(state_path, state)
         _append_jsonl(Path(args.summary_jsonl), summary)
@@ -2677,6 +2781,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     )
     unrealized_pnl = (mid_price - inventory_avg_cost) * inventory_qty if inventory_qty > EPSILON else 0.0
     net_pnl_estimate = _safe_float(metrics.get("realized_pnl")) + unrealized_pnl
+    trade_database_status = _persist_spot_trade_database(
+        symbol=symbol,
+        strategy_mode=strategy_mode,
+        args=args,
+        metrics=metrics,
+    )
 
     summary = {
         "ts": _utc_now().isoformat(),
@@ -2695,6 +2805,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "quote_asset": quote_asset,
         "base_asset": base_asset,
         "applied_trades": applied_trades,
+        "trade_database": trade_database_status,
         "placed_count": placed_count,
         "canceled_count": canceled_count,
         "open_strategy_orders": len(strategy_open_orders),
@@ -2770,6 +2881,12 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
     }
+    summary["cycle_database"] = _persist_spot_cycle_database(
+        symbol=symbol,
+        strategy_mode=strategy_mode,
+        args=args,
+        summary=summary,
+    )
     _save_state(state_path, state)
     _append_jsonl(Path(args.summary_jsonl), summary)
     return summary
