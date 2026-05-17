@@ -307,6 +307,27 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         self.assertEqual(summary["active_order_ids"], [9])
         self.assertEqual(summary["source"], "stream_open_orders")
 
+    def test_summarize_runner_strategy_open_order_state_uses_fresh_open_orders_when_account_stale(self) -> None:
+        stream = SimpleNamespace(
+            snapshot_open_orders=lambda: [
+                {
+                    "symbol": "CHIPUSDT",
+                    "clientOrderId": "gx-chipu-live",
+                    "orderId": 9,
+                }
+            ],
+            open_order_state_age_seconds=lambda: 1.0,
+            status=lambda: {"last_account_update_age_seconds": 120.0},
+            snapshot_events=lambda: [],
+        )
+        args = argparse.Namespace(user_data_stream=stream)
+
+        summary = _summarize_runner_strategy_open_order_state(args, "CHIPUSDT", max_events=20)
+
+        self.assertEqual(summary["active_order_count"], 1)
+        self.assertEqual(summary["active_client_order_ids"], ["gx-chipu-live"])
+        self.assertEqual(summary["source"], "stream_open_orders")
+
     def test_summarize_runner_strategy_open_order_state_accepts_fresh_empty_stream_state(self) -> None:
         stream = SimpleNamespace(
             snapshot_open_orders=lambda: [],
@@ -349,6 +370,28 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
             now_utc="2026-05-12T00:02:00+00:00",
             observed_active_order_count=2,
             expected_open_order_count=3,
+        )
+
+        self.assertFalse(decision)
+
+    def test_should_backfill_open_orders_rest_forces_recent_rest_when_event_state_large_diff(self) -> None:
+        decision = _should_backfill_open_orders_rest(
+            {"open_orders_rest_last_sync_at": "2026-05-12T00:02:00+00:00"},
+            now_utc="2026-05-12T00:02:30+00:00",
+            observed_active_order_count=0,
+            expected_open_order_count=12,
+            observed_source="observed_events",
+        )
+
+        self.assertTrue(decision)
+
+    def test_should_backfill_open_orders_rest_does_not_force_recent_rest_for_stream_state_large_diff(self) -> None:
+        decision = _should_backfill_open_orders_rest(
+            {"open_orders_rest_last_sync_at": "2026-05-12T00:02:00+00:00"},
+            now_utc="2026-05-12T00:02:30+00:00",
+            observed_active_order_count=0,
+            expected_open_order_count=12,
+            observed_source="stream_open_orders",
         )
 
         self.assertFalse(decision)

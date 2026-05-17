@@ -1659,6 +1659,7 @@ def _run_periodic_reconcile(
         now_utc=_utc_now(),
         observed_active_order_count=int(observed_open_order_state.get("active_order_count", 0) or 0),
         expected_open_order_count=int(expected_open_order_count or 0),
+        observed_source=str(observed_open_order_state.get("source") or ""),
     )
     if open_orders_rest_backfill_performed:
         current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window, use_cache=False)
@@ -1676,10 +1677,16 @@ def _run_periodic_reconcile(
         actual_open_order_count = int(observed_open_order_state.get("active_order_count", 0) or 0)
         total_open_order_count = None
         open_orders_source = str(observed_open_order_state.get("source") or "observed_events")
-    stream_position = _snapshot_runner_account_position(args, symbol, max_age_seconds=-1.0)
-    account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
-    current_position = extract_symbol_position(account_info, symbol)
-    account_position_source = "rest"
+    stream_position = _snapshot_runner_account_position(args, symbol)
+    if stream_position is not None:
+        current_position = stream_position
+        account_position_source = "user_data_stream"
+    else:
+        stale_stream_position = _snapshot_runner_account_position(args, symbol, max_age_seconds=-1.0)
+        account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
+        current_position = extract_symbol_position(account_info, symbol)
+        stream_position = stale_stream_position
+        account_position_source = "rest"
     actual_net_qty = _safe_float(current_position.get("positionAmt"))
     open_order_diff = actual_open_order_count - int(expected_open_order_count or 0)
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
@@ -4679,7 +4686,6 @@ def _summarize_runner_strategy_open_order_state(
     strategy_prefix = _strategy_client_order_prefix(symbol)
     stream = getattr(args, "user_data_stream", None)
     if stream is not None and hasattr(stream, "snapshot_open_orders"):
-        account_position_age = _runner_account_position_stream_age_seconds(args)
         stream_age = None
         if hasattr(stream, "open_order_state_age_seconds"):
             try:
@@ -4699,8 +4705,6 @@ def _summarize_runner_strategy_open_order_state(
         if (
             stream_age is not None
             and stream_age <= OPEN_ORDER_STREAM_MAX_AGE_SECONDS
-            and account_position_age is not None
-            and account_position_age <= ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS
         ):
             return {
                 "active_order_count": len(open_orders),
@@ -5031,7 +5035,14 @@ def _should_backfill_open_orders_rest(
     now_utc: datetime | str,
     observed_active_order_count: int,
     expected_open_order_count: int,
+    observed_source: str = "",
 ) -> bool:
+    observed_diff = int(observed_active_order_count or 0) - int(expected_open_order_count or 0)
+    if (
+        abs(observed_diff) > PROTECTIVE_OPEN_ORDER_DIFF_LIMIT
+        and str(observed_source or "").strip() != "stream_open_orders"
+    ):
+        return True
     current = now_utc
     if isinstance(current, str):
         current = datetime.fromisoformat(current.replace("Z", "+00:00"))
