@@ -642,6 +642,10 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
     long_avg = max(_safe_float(plan_report.get("current_long_avg_price")), 0.0)
     short_ceiling = short_avg * (1.0 - min_profit_ratio) if short_avg > 0 else 0.0
     long_floor = long_avg * (1.0 + min_profit_ratio) if long_avg > 0 else 0.0
+    small_entry_notional = max(
+        _safe_float(plan_report.get("loss_inventory_no_cross_small_entry_notional")),
+        0.0,
+    )
 
     losing_short = net_qty < -1e-12 and unrealized_pnl < -1e-9 and short_ceiling > 0
     losing_long = net_qty > 1e-12 and unrealized_pnl < -1e-9 and long_floor > 0
@@ -651,13 +655,19 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
     kept_place_orders: list[dict[str, Any]] = []
     dropped_orders: list[dict[str, Any]] = []
     converted_orders: list[dict[str, Any]] = []
+    allowed_small_entry_orders: list[dict[str, Any]] = []
     for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
         side = str(order.get("side", "")).upper().strip()
         price = _safe_float(order.get("price"))
+        order_notional = abs(_safe_float(order.get("notional")))
         entry_side = _entry_side_from_order(order, strategy_mode=normalized_mode)
         reduce_side = _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
         role = str(order.get("role", "") or "").strip().lower()
         hard_loss_forced_reduce = role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}
+        ordinary_entry = entry_side in {"long", "short"} and reduce_side is None
+        small_cross_entry_allowed = (
+            ordinary_entry and small_entry_notional > 0 and order_notional <= small_entry_notional + 1e-9
+        )
         short_recovery_order = entry_side == "long" or (
             reduce_side == "BUY" and not hard_loss_forced_reduce
         )
@@ -672,6 +682,12 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
+                if small_cross_entry_allowed:
+                    order["loss_inventory_no_cross_guard"] = "short_small_entry_cross_allowed"
+                    order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                    allowed_small_entry_orders.append(dict(order))
+                    kept_place_orders.append(order)
+                    continue
                 dropped = dict(order)
                 dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_buy_above_recovery_ceiling"
                 dropped["loss_inventory_recovery_ceiling"] = short_ceiling
@@ -685,6 +701,12 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
+                if small_cross_entry_allowed:
+                    order["loss_inventory_no_cross_guard"] = "long_small_entry_cross_allowed"
+                    order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                    allowed_small_entry_orders.append(dict(order))
+                    kept_place_orders.append(order)
+                    continue
                 dropped = dict(order)
                 dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_sell_below_recovery_floor"
                 dropped["loss_inventory_recovery_floor"] = long_floor
@@ -705,6 +727,9 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         "min_profit_ratio": min_profit_ratio,
         "short_recovery_ceiling": short_ceiling if losing_short else None,
         "long_recovery_floor": long_floor if losing_long else None,
+        "small_entry_notional_limit": small_entry_notional,
+        "allowed_small_entry_count": len(allowed_small_entry_orders),
+        "allowed_small_entry_orders": allowed_small_entry_orders,
         "converted_order_count": len(converted_orders),
         "dropped_order_count": len(dropped_orders),
         "converted_orders": converted_orders,

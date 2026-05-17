@@ -186,6 +186,49 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guarded["place_orders"], [])
         self.assertEqual(guarded["loss_inventory_no_cross_entry_guard"]["dropped_order_count"], 1)
 
+    def test_loss_inventory_guard_allows_small_cross_entry_for_brushing(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.1400, "qty": 100.0, "notional": 14.0, "role": "entry_short"},
+                {"side": "SELL", "price": 0.1400, "qty": 200.0, "notional": 28.0, "role": "entry_short"},
+                {
+                    "side": "SELL",
+                    "price": 0.1400,
+                    "qty": 100.0,
+                    "notional": 14.0,
+                    "role": "active_delever_long",
+                    "force_reduce_only": True,
+                    "execution_type": "maker_timeout_release",
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 3,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "entry_short")
+        self.assertEqual(
+            guarded["place_orders"][0]["loss_inventory_no_cross_guard"],
+            "long_small_entry_cross_allowed",
+        )
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 2)
+
     def test_loss_inventory_guard_converts_profitable_short_cover_and_cap_prevents_cross(self) -> None:
         actions = {
             "place_orders": [

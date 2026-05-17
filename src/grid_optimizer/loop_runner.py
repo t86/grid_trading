@@ -13667,6 +13667,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "hard_loss_forced_reduce_episode": hard_loss_forced_reduce_episode,
         "hard_loss_rescue_entry_guard": hard_loss_rescue_entry_guard,
         "unrealized_loss_entry_guard": unrealized_loss_entry_guard,
+        "loss_inventory_no_cross_small_entry_notional": getattr(
+            effective_args, "loss_inventory_no_cross_small_entry_notional", 0.0
+        ),
         "active_delever": active_delever,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
@@ -14777,6 +14780,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--unrealized-loss-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--unrealized-loss-entry-guard-min-loss", type=float, default=0.0)
     parser.add_argument("--unrealized-loss-entry-guard-ratio", type=float, default=0.0)
+    parser.add_argument("--loss-inventory-no-cross-small-entry-notional", type=float, default=0.0)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -15511,6 +15515,7 @@ def main() -> None:
         (args.hard_loss_forced_reduce_unrealized_loss_limit, "--hard-loss-forced-reduce-unrealized-loss-limit"),
         (args.unrealized_loss_entry_guard_min_loss, "--unrealized-loss-entry-guard-min-loss"),
         (args.unrealized_loss_entry_guard_ratio, "--unrealized-loss-entry-guard-ratio"),
+        (args.loss_inventory_no_cross_small_entry_notional, "--loss-inventory-no-cross-small-entry-notional"),
     ):
         if value is not None and value < 0:
             raise SystemExit(f"{label} must be >= 0")

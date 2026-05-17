@@ -3822,6 +3822,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "unrealized_loss_entry_guard_enabled": False,
     "unrealized_loss_entry_guard_min_loss": 0.0,
     "unrealized_loss_entry_guard_ratio": 0.0,
+    "loss_inventory_no_cross_small_entry_notional": 0.0,
     "auto_regime_enabled": False,
     "auto_regime_confirm_cycles": 2,
     "auto_regime_stable_15m_max_amplitude_ratio": 0.02,
@@ -8769,6 +8770,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "hard_loss_forced_reduce_unrealized_loss_limit",
         "unrealized_loss_entry_guard_min_loss",
         "unrealized_loss_entry_guard_ratio",
+        "loss_inventory_no_cross_small_entry_notional",
         "auto_regime_stable_15m_max_amplitude_ratio",
         "auto_regime_stable_60m_max_amplitude_ratio",
         "auto_regime_stable_60m_return_floor_ratio",
@@ -10252,6 +10254,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--unrealized-loss-entry-guard-ratio",
             str(config["unrealized_loss_entry_guard_ratio"]),
         ])
+    if config.get("loss_inventory_no_cross_small_entry_notional") is not None:
+        command.extend([
+            "--loss-inventory-no-cross-small-entry-notional",
+            str(config["loss_inventory_no_cross_small_entry_notional"]),
+        ])
     if config.get("run_start_time") is not None:
         command.extend(["--run-start-time", str(config["run_start_time"])])
     if config.get("run_end_time") is not None:
@@ -10528,6 +10535,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "unrealized_loss_entry_guard_enabled",
             "unrealized_loss_entry_guard_min_loss",
             "unrealized_loss_entry_guard_ratio",
+            "loss_inventory_no_cross_small_entry_notional",
             "auto_regime_enabled",
             "auto_regime_confirm_cycles",
             "auto_regime_stable_15m_max_amplitude_ratio",
