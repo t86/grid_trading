@@ -46,7 +46,21 @@ def _utc_from_ms(value: int) -> datetime:
 
 
 def _json_dumps(payload: Any) -> str:
-    return json.dumps(payload if payload is not None else {}, ensure_ascii=False, sort_keys=True)
+    return json.dumps(_json_safe(payload if payload is not None else {}), ensure_ascii=False, sort_keys=True)
+
+
+def _json_safe(payload: Any) -> Any:
+    if payload is None or isinstance(payload, (str, int, float, bool)):
+        return payload
+    if isinstance(payload, datetime):
+        return payload.isoformat()
+    if isinstance(payload, dict):
+        return {str(key): _json_safe(value) for key, value in payload.items()}
+    if isinstance(payload, (list, tuple)):
+        return [_json_safe(value) for value in payload]
+    if isinstance(payload, set):
+        return [_json_safe(value) for value in sorted(payload, key=lambda item: repr(item))]
+    return str(payload)
 
 
 def _config_fingerprint(config: dict[str, Any]) -> str:
