@@ -776,12 +776,165 @@ def _floor_hour(dt: datetime) -> datetime:
     return normalized.replace(minute=0, second=0, microsecond=0)
 
 
+TRADE_QUALITY_BUCKETS = (
+    "normal_grid",
+    "take_profit_recycle",
+    "active_delever",
+    "adverse_reduce",
+    "hard_loss_forced_reduce",
+    "protective_flatten",
+    "manual_unknown",
+)
+
+
+def _empty_trade_quality_bucket() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "gross_notional": 0.0,
+        "realized_pnl": 0.0,
+        "commission": 0.0,
+    }
+
+
+def _empty_trade_quality_buckets() -> dict[str, dict[str, Any]]:
+    return {key: _empty_trade_quality_bucket() for key in TRADE_QUALITY_BUCKETS}
+
+
+def _normalize_trade_role_text(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _trade_role_from_client_order_id(value: Any) -> str:
+    text = _normalize_trade_role_text(value)
+    if not text:
+        return ""
+    if "takeprof" in text or "take_profit" in text:
+        return "take_profit"
+    if "entrylon" in text or "entry_long" in text or "grid_long" in text:
+        return "entry_long"
+    if "entrysho" in text or "entry_short" in text or "grid_short" in text:
+        return "entry_short"
+    if "activede" in text or "active_delever" in text:
+        return "active_delever"
+    if "adverser" in text or "adverse_reduce" in text:
+        return "adverse_reduce"
+    if "harddele" in text or "hard_loss" in text or "forced_reduce" in text:
+        return "hard_loss_forced_reduce"
+    if "softdele" in text or "protect" in text or "flatten" in text or "flowslee" in text:
+        return "protective_flatten"
+    return ""
+
+
+def _trade_quality_bucket_for_role(role: Any) -> str:
+    normalized = _normalize_trade_role_text(role)
+    if not normalized:
+        return "manual_unknown"
+    if normalized in {
+        "entry",
+        "bootstrap",
+        "bootstrap_entry",
+        "grid_entry",
+        "entry_long",
+        "entry_short",
+        "bootstrap_long",
+        "bootstrap_short",
+    }:
+        return "normal_grid"
+    if normalized in {"take_profit", "take_profit_long", "take_profit_short", "grid_exit"}:
+        return "take_profit_recycle"
+    if "active_delever" in normalized or "activede" in normalized:
+        return "active_delever"
+    if "adverse_reduce" in normalized or "adverser" in normalized:
+        return "adverse_reduce"
+    if "hard_loss_forced_reduce" in normalized or "hard_delever" in normalized or "harddele" in normalized:
+        return "hard_loss_forced_reduce"
+    if (
+        "protect" in normalized
+        or "flatten" in normalized
+        or "soft_delever" in normalized
+        or "softdele" in normalized
+        or "flow_sleeve" in normalized
+        or "flowslee" in normalized
+        or normalized == "forced_reduce"
+        or normalized == "tail_cleanup"
+    ):
+        return "protective_flatten"
+    return "manual_unknown"
+
+
+def _trade_role_from_lookup(item: dict[str, Any], order_role_lookup: dict[str, dict[str, Any]] | None) -> str:
+    for key in ("role", "order_role", "strategy_role", "source_role"):
+        role = _normalize_trade_role_text(item.get(key))
+        if role:
+            return role
+    role = _trade_role_from_client_order_id(
+        item.get("clientOrderId")
+        or item.get("client_order_id")
+        or item.get("origClientOrderId")
+        or item.get("orig_client_order_id")
+    )
+    if role:
+        return role
+    if not order_role_lookup:
+        return ""
+    order_id = str(item.get("orderId") or item.get("order_id") or "").strip()
+    if not order_id:
+        return ""
+    ref = order_role_lookup.get(order_id)
+    if not isinstance(ref, dict):
+        return ""
+    return _normalize_trade_role_text(ref.get("role")) or _trade_role_from_client_order_id(ref.get("client_order_id"))
+
+
+def _finalize_trade_quality(bucket: dict[str, Any]) -> dict[str, Any]:
+    gross = float(bucket.get("gross_notional") or 0.0)
+    buy = float(bucket.get("buy_notional") or 0.0)
+    sell = float(bucket.get("sell_notional") or 0.0)
+    imbalance_ratio = abs(buy - sell) / gross if gross > 0 else 0.0
+    buckets = bucket.get("quality_buckets") if isinstance(bucket.get("quality_buckets"), dict) else {}
+    healthy_gross = sum(
+        float((buckets.get(key) or {}).get("gross_notional") or 0.0)
+        for key in ("normal_grid", "take_profit_recycle")
+    )
+    protective_gross = sum(
+        float((buckets.get(key) or {}).get("gross_notional") or 0.0)
+        for key in ("active_delever", "adverse_reduce", "hard_loss_forced_reduce", "protective_flatten")
+    )
+    unknown_gross = float((buckets.get("manual_unknown") or {}).get("gross_notional") or 0.0)
+    protective_share = protective_gross / gross if gross > 0 else 0.0
+    unknown_share = unknown_gross / gross if gross > 0 else 0.0
+    reasons: list[str] = []
+    if gross > 0 and protective_share >= 0.30:
+        reasons.append(f"保护/减仓成交占比 {protective_share:.1%}")
+    if gross > 0 and unknown_share >= 0.25:
+        reasons.append(f"未知成交占比 {unknown_share:.1%}")
+    if gross >= 1000.0 and imbalance_ratio >= 0.35:
+        reasons.append(f"买卖失衡 {imbalance_ratio:.1%}")
+    verdict = "abnormal" if reasons else ("healthy" if gross > 0 else "empty")
+    return {
+        "buy_count": int(bucket.get("buy_count") or 0),
+        "buy_notional": buy,
+        "sell_count": int(bucket.get("sell_count") or 0),
+        "sell_notional": sell,
+        "imbalance_ratio": imbalance_ratio,
+        "buckets": buckets,
+        "healthy_gross_notional": healthy_gross,
+        "protective_gross_notional": protective_gross,
+        "unknown_gross_notional": unknown_gross,
+        "protective_share": protective_share,
+        "unknown_share": unknown_share,
+        "verdict": verdict,
+        "reasons": reasons,
+    }
+
+
 def summarize_hourly_metrics(
     trades: list[dict[str, Any]],
     income_rows: list[dict[str, Any]],
     candles: list[Any],
     *,
     commission_converter: Any | None = None,
+    order_role_lookup: dict[str, dict[str, Any]] | None = None,
     limit: int = 24,
 ) -> dict[str, Any]:
     buckets: dict[datetime, dict[str, Any]] = {}
@@ -808,6 +961,9 @@ def summarize_hourly_metrics(
                 "low_price": 0.0,
                 "return_ratio": 0.0,
                 "amplitude_ratio": 0.0,
+                "buy_sell_imbalance_ratio": 0.0,
+                "quality_buckets": _empty_trade_quality_buckets(),
+                "trade_quality": None,
             }
             buckets[hour_start] = bucket
         return bucket
@@ -850,6 +1006,13 @@ def summarize_hourly_metrics(
         elif side == "SELL":
             bucket["sell_notional"] += trade_notional
             bucket["sell_count"] += 1
+        role = _trade_role_from_lookup(item, order_role_lookup)
+        bucket_key = _trade_quality_bucket_for_role(role)
+        quality_bucket = bucket["quality_buckets"].setdefault(bucket_key, _empty_trade_quality_bucket())
+        quality_bucket["count"] += 1
+        quality_bucket["gross_notional"] += trade_notional
+        quality_bucket["realized_pnl"] += trade_realized
+        quality_bucket["commission"] += trade_commission
 
     for item in income_rows:
         ts_ms = int(item.get("time", 0) or 0)
@@ -879,6 +1042,12 @@ def summarize_hourly_metrics(
             if gross_notional > 0
             else 0.0
         )
+        bucket["buy_sell_imbalance_ratio"] = (
+            abs(float(bucket["buy_notional"]) - float(bucket["sell_notional"])) / gross_notional
+            if gross_notional > 0
+            else 0.0
+        )
+        bucket["trade_quality"] = _finalize_trade_quality(bucket)
         rows.append(bucket)
 
     limited_rows = rows[: max(int(limit), 1)]
@@ -1877,6 +2046,78 @@ def _build_local_runtime_snapshot(
     }
 
 
+def _infer_state_path_from_events_path(events_path: str | Path) -> Path | None:
+    path = Path(events_path)
+    name = path.name
+    if name.endswith("_loop_events.jsonl"):
+        return path.with_name(f"{name.removesuffix('_loop_events.jsonl')}_loop_state.json")
+    if name == "night_loop_events.jsonl":
+        return path.with_name("night_loop_state.json")
+    return None
+
+
+def _build_order_role_lookup(
+    *,
+    state_path: Path | None,
+    plan_report: dict[str, Any] | None,
+    submit_report: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    state = _read_json(state_path) if state_path is not None else None
+    if isinstance(state, dict):
+        for refs_key in ("synthetic_order_refs", "inventory_grid_order_refs"):
+            refs = state.get(refs_key)
+            if not isinstance(refs, dict):
+                continue
+            for order_id, ref in refs.items():
+                if isinstance(ref, dict) and str(order_id).strip():
+                    lookup[str(order_id).strip()] = dict(ref)
+
+    for container in (plan_report if isinstance(plan_report, dict) else {}, submit_report if isinstance(submit_report, dict) else {}):
+        for key in ("kept_orders", "placed_orders", "open_orders"):
+            rows = container.get(key)
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                request = item.get("request") if isinstance(item.get("request"), dict) else {}
+                response = item.get("response") if isinstance(item.get("response"), dict) else item
+                order_id = response.get("orderId") or response.get("order_id") or item.get("orderId") or item.get("order_id")
+                if order_id in {"", None}:
+                    continue
+                role = (
+                    request.get("role")
+                    or response.get("role")
+                    or item.get("role")
+                    or _trade_role_from_client_order_id(
+                        response.get("clientOrderId")
+                        or response.get("client_order_id")
+                        or request.get("client_order_id")
+                        or item.get("client_order_id")
+                    )
+                )
+                lookup[str(order_id).strip()] = {
+                    "role": str(role or "").strip(),
+                    "side": str(request.get("side") or response.get("side") or item.get("side") or "").upper().strip(),
+                    "position_side": str(
+                        request.get("position_side")
+                        or response.get("positionSide")
+                        or item.get("position_side")
+                        or "BOTH"
+                    ).upper().strip()
+                    or "BOTH",
+                    "client_order_id": str(
+                        response.get("clientOrderId")
+                        or response.get("client_order_id")
+                        or request.get("client_order_id")
+                        or item.get("client_order_id")
+                        or ""
+                    ).strip(),
+                }
+    return lookup
+
+
 def _build_live_account_snapshot(
     *,
     symbol: str,
@@ -2060,6 +2301,11 @@ def _build_monitor_snapshot_uncached(
     )
     plan_report = _read_json(Path(plan_path))
     submit_report = _read_json(Path(submit_report_path))
+    order_role_lookup = _build_order_role_lookup(
+        state_path=_infer_state_path_from_events_path(event_path),
+        plan_report=plan_report if isinstance(plan_report, dict) else {},
+        submit_report=submit_report if isinstance(submit_report, dict) else {},
+    )
     session_start, session_last = _build_session_window(events, submit_report)
     session_start = _min_dt(session_start, event_start)
     stats_start = competition_start or session_start
@@ -2223,6 +2469,7 @@ def _build_monitor_snapshot_uncached(
                 income_rows,
                 hourly_candles,
                 commission_converter=commission_converter,
+                order_role_lookup=order_role_lookup,
                 limit=24,
             )
         except Exception as exc:

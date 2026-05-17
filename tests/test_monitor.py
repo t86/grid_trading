@@ -353,6 +353,75 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(previous["gross_notional"], 21.0, places=8)
         self.assertAlmostEqual(previous["net_after_fees_and_funding"], 0.3, places=8)
 
+    def test_summarize_hourly_metrics_reports_trade_quality_breakdown(self) -> None:
+        hour0 = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
+        candles = [
+            Candle(open_time=hour0, close_time=hour0 + timedelta(hours=1), open=1.0, high=1.1, low=0.95, close=1.05),
+        ]
+        trades = [
+            {
+                "orderId": 10,
+                "time": int((hour0 + timedelta(minutes=1)).timestamp() * 1000),
+                "side": "BUY",
+                "price": "1.00",
+                "qty": "600",
+                "realizedPnl": "0",
+                "commission": "0.3",
+            },
+            {
+                "orderId": 11,
+                "time": int((hour0 + timedelta(minutes=2)).timestamp() * 1000),
+                "side": "SELL",
+                "price": "1.02",
+                "qty": "600",
+                "realizedPnl": "2.5",
+                "commission": "0.3",
+            },
+            {
+                "orderId": 12,
+                "time": int((hour0 + timedelta(minutes=3)).timestamp() * 1000),
+                "side": "SELL",
+                "price": "1.01",
+                "qty": "700",
+                "realizedPnl": "-12",
+                "commission": "0.2",
+            },
+            {
+                "orderId": 13,
+                "time": int((hour0 + timedelta(minutes=4)).timestamp() * 1000),
+                "side": "BUY",
+                "price": "1.00",
+                "qty": "100",
+                "realizedPnl": "-1",
+                "commission": "0.05",
+            },
+        ]
+
+        summary = summarize_hourly_metrics(
+            trades,
+            [],
+            candles,
+            order_role_lookup={
+                "10": {"role": "entry_long"},
+                "11": {"role": "take_profit_long"},
+                "12": {"role": "hard_loss_forced_reduce_long"},
+            },
+            limit=24,
+        )
+
+        row = summary["rows"][0]
+        quality = row["trade_quality"]
+        self.assertEqual(quality["verdict"], "abnormal")
+        self.assertGreaterEqual(len(quality["reasons"]), 1)
+        self.assertEqual(quality["buy_count"], 2)
+        self.assertEqual(quality["sell_count"], 2)
+        self.assertAlmostEqual(quality["buckets"]["normal_grid"]["gross_notional"], 600.0, places=8)
+        self.assertAlmostEqual(quality["buckets"]["take_profit_recycle"]["gross_notional"], 612.0, places=8)
+        self.assertEqual(quality["buckets"]["hard_loss_forced_reduce"]["count"], 1)
+        self.assertAlmostEqual(quality["buckets"]["hard_loss_forced_reduce"]["realized_pnl"], -12.0, places=8)
+        self.assertEqual(quality["buckets"]["manual_unknown"]["count"], 1)
+        self.assertAlmostEqual(row["buy_sell_imbalance_ratio"], abs(700.0 - 1319.0) / 2019.0, places=8)
+
     def test_summarize_loop_events_marks_recent_loop_alive(self) -> None:
         now = datetime.now(timezone.utc)
         rows = [

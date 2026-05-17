@@ -20009,6 +20009,28 @@ MONITOR_PAGE = """<!doctype html>
       color: var(--text);
       font-size: 13px;
     }
+    .quality-cell {
+      min-width: 320px;
+      max-width: 460px;
+      white-space: normal;
+      line-height: 1.45;
+    }
+    .quality-line {
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .quality-line strong {
+      color: var(--text);
+      font-weight: 800;
+    }
+    .quality-bad {
+      color: var(--bad);
+      font-weight: 800;
+    }
+    .quality-good {
+      color: var(--good);
+      font-weight: 800;
+    }
     @media (max-width: 980px) {
       .status-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .metric-kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -20882,6 +20904,7 @@ MONITOR_PAGE = """<!doctype html>
               <th>涨跌幅</th>
               <th>振幅</th>
               <th>买/卖额</th>
+              <th>成交质量</th>
             </tr>
           </thead>
           <tbody id="hourly_body"></tbody>
@@ -26123,6 +26146,55 @@ MONITOR_PAGE = """<!doctype html>
       `).join("");
     }
 
+    const QUALITY_BUCKET_LABELS = {
+      normal_grid: "网格",
+      take_profit_recycle: "回转",
+      active_delever: "主动减",
+      adverse_reduce: "逆向减",
+      hard_loss_forced_reduce: "强减",
+      protective_flatten: "保护",
+      manual_unknown: "未知",
+    };
+
+    function fmtQualityBucket(key, bucket) {
+      const row = bucket || {};
+      const count = Number(row.count || 0);
+      const gross = Number(row.gross_notional || 0);
+      const pnl = Number(row.realized_pnl || 0);
+      const commission = Number(row.commission || 0);
+      if (!count && !gross && !pnl && !commission) return "";
+      const parts = [
+        `${escapeHtml(QUALITY_BUCKET_LABELS[key] || key)} ${fmtNum(count, 0)}笔/${fmtNum(gross, 1)}`,
+      ];
+      if (pnl) parts.push(`PnL ${fmtMoney(pnl)}`);
+      if (commission) parts.push(`费 ${fmtMoney(-Math.abs(commission))}`);
+      return parts.join(" ");
+    }
+
+    function renderHourlyQuality(row) {
+      const quality = (row && row.trade_quality) || {};
+      const buckets = quality.buckets || {};
+      const verdict = String(quality.verdict || "empty");
+      const verdictLabel = verdict === "abnormal" ? "异常" : (verdict === "healthy" ? "健康" : "无成交");
+      const verdictClass = verdict === "abnormal" ? "quality-bad" : (verdict === "healthy" ? "quality-good" : "");
+      const bucketLines = Object.keys(QUALITY_BUCKET_LABELS)
+        .map((key) => fmtQualityBucket(key, buckets[key]))
+        .filter(Boolean);
+      const reasons = Array.isArray(quality.reasons) ? quality.reasons : [];
+      return `
+        <div class="quality-cell">
+          <div><span class="${verdictClass}">${escapeHtml(verdictLabel)}</span>${reasons.length ? ` · ${escapeHtml(reasons.join("；"))}` : ""}</div>
+          <div class="quality-line">
+            <strong>1h</strong>
+            BUY ${fmtNum(quality.buy_count || row.buy_count || 0, 0)}笔/${fmtNum(quality.buy_notional || row.buy_notional || 0, 1)}
+            · SELL ${fmtNum(quality.sell_count || row.sell_count || 0, 0)}笔/${fmtNum(quality.sell_notional || row.sell_notional || 0, 1)}
+            · 失衡 ${fmtPct(quality.imbalance_ratio || row.buy_sell_imbalance_ratio || 0)}
+          </div>
+          <div class="quality-line">${bucketLines.length ? escapeHtml(bucketLines.join(" · ")) : "无角色成交"}</div>
+        </div>
+      `;
+    }
+
     function renderHourlyStats(data) {
       const hourly = (data.hourly_summary || {});
       const rows = (hourly.rows || []);
@@ -26132,7 +26204,7 @@ MONITOR_PAGE = """<!doctype html>
         : "";
       hourlyMetaEl.textContent = `最近 ${hourly.row_count || 0} / ${hourly.available_hours || 0} 小时${statsStartText}`;
       if (!rows.length) {
-        hourlyBody.innerHTML = '<tr><td colspan="11" class="empty">当前没有小时级统计数据</td></tr>';
+        hourlyBody.innerHTML = '<tr><td colspan="12" class="empty">当前没有小时级统计数据</td></tr>';
         return;
       }
       hourlyBody.innerHTML = rows.map((row) => `
@@ -26148,6 +26220,7 @@ MONITOR_PAGE = """<!doctype html>
           <td class="${statusClass(Number(row.return_ratio || 0))}">${fmtPct(row.return_ratio || 0)}</td>
           <td>${fmtPct(row.amplitude_ratio || 0)}</td>
           <td>${fmtNum(row.buy_notional || 0, 1)} / ${fmtNum(row.sell_notional || 0, 1)}</td>
+          <td>${renderHourlyQuality(row)}</td>
         </tr>
       `).join("");
     }
