@@ -71,6 +71,7 @@ from .maker_flatten_runner import (
     load_live_flatten_snapshot,
 )
 from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config, summarize_futures_runtime_guard_inputs
+from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
 from .semi_auto_plan import (
     STATE_VERSION,
     _isoformat,
@@ -4496,16 +4497,44 @@ def _sync_account_audit(
     )
 
     synced_at = datetime.now(timezone.utc).isoformat()
+    trade_payloads: list[dict[str, Any]] = []
+    income_payloads: list[dict[str, Any]] = []
     for row in fresh_trades:
         payload = dict(row)
         payload["audit_cycle"] = cycle
         payload["audit_synced_at"] = synced_at
+        trade_payloads.append(payload)
         _append_jsonl(audit_paths["trade_audit"], payload)
     for row in fresh_income:
         payload = dict(row)
         payload["audit_cycle"] = cycle
         payload["audit_synced_at"] = synced_at
+        income_payloads.append(payload)
         _append_jsonl(audit_paths["income_audit"], payload)
+
+    db_status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
+    if trade_database_enabled() and (trade_payloads or income_payloads):
+        try:
+            ensure_trade_database_schema()
+            db_status = persist_trade_rows(
+                symbol=symbol,
+                market_type="futures",
+                strategy_mode=(
+                    str(getattr(args, "strategy_profile", "") or getattr(args, "strategy_mode", "") or "unknown")
+                    if args is not None
+                    else "unknown"
+                ),
+                config=vars(args) if args is not None else {},
+                trade_rows=trade_payloads,
+                income_rows=income_payloads,
+            )
+        except Exception as exc:
+            db_status = {
+                "enabled": True,
+                "trade_inserted": 0,
+                "income_inserted": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     session_start_time_ms = int(audit_state.get("session_start_time_ms") or 0)
     earliest_appended_trade_time = min((trade_row_time_ms(item) for item in fresh_trades), default=0)
@@ -4540,6 +4569,7 @@ def _sync_account_audit(
         "income_audit_path": str(audit_paths["income_audit"]),
         "audit_state_path": str(audit_state_path),
         "trade_rest_backfill_performed": trade_rest_backfill_performed,
+        "database": db_status,
     }
 
 
@@ -16296,6 +16326,7 @@ def main() -> None:
                     "executed": bool(submit_report.get("executed")),
                     "trade_audit_appended": int(audit_sync.get("trade_appended", 0) or 0),
                     "income_audit_appended": int(audit_sync.get("income_appended", 0) or 0),
+                    "trade_database": audit_sync.get("database"),
                     "audit_error": audit_sync.get("error"),
                     "error_message": None,
                     "runtime_status": runtime_guard_result.runtime_status,
@@ -16336,6 +16367,24 @@ def main() -> None:
                 summary["volatility_email_alert_triggered"] = bool(volatility_email_alert.get("triggered"))
                 summary["volatility_email_alert_sent"] = bool(volatility_email_alert.get("sent"))
                 summary["volatility_email_alert_reason"] = volatility_email_alert.get("reason")
+                if trade_database_enabled():
+                    try:
+                        ensure_trade_database_schema()
+                        summary["cycle_database"] = persist_cycle_snapshot(
+                            symbol=args.symbol,
+                            market_type="futures",
+                            strategy_mode=str(
+                                getattr(args, "strategy_profile", "") or getattr(args, "strategy_mode", "") or "unknown"
+                            ),
+                            config=vars(args),
+                            summary=summary,
+                        )
+                    except Exception as db_exc:
+                        summary["cycle_database"] = {
+                            "enabled": True,
+                            "cycle_inserted": 0,
+                            "error": f"{type(db_exc).__name__}: {db_exc}",
+                        }
                 _write_json(state_path, state)
                 _append_jsonl(summary_path, summary)
                 _print_cycle_summary(summary)
