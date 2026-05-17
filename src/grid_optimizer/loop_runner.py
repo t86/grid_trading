@@ -4679,6 +4679,7 @@ def _summarize_runner_strategy_open_order_state(
     strategy_prefix = _strategy_client_order_prefix(symbol)
     stream = getattr(args, "user_data_stream", None)
     if stream is not None and hasattr(stream, "snapshot_open_orders"):
+        account_position_age = _runner_account_position_stream_age_seconds(args)
         stream_age = None
         if hasattr(stream, "open_order_state_age_seconds"):
             try:
@@ -4695,7 +4696,12 @@ def _summarize_runner_strategy_open_order_state(
             ]
         except Exception:
             open_orders = []
-        if stream_age is not None and stream_age <= OPEN_ORDER_STREAM_MAX_AGE_SECONDS:
+        if (
+            stream_age is not None
+            and stream_age <= OPEN_ORDER_STREAM_MAX_AGE_SECONDS
+            and account_position_age is not None
+            and account_position_age <= ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS
+        ):
             return {
                 "active_order_count": len(open_orders),
                 "active_client_order_ids": [str(item.get("clientOrderId") or "") for item in open_orders],
