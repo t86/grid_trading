@@ -619,6 +619,89 @@ def apply_anti_chase_entry_guard_to_actions(
     return result
 
 
+def apply_loss_inventory_no_cross_entry_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+) -> dict[str, Any]:
+    """Prevent losing inventory recovery from turning into a fresh opposite entry."""
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    if normalized_mode == "hedge_neutral":
+        return actions
+
+    net_qty = _safe_float(plan_report.get("actual_net_qty"))
+    unrealized_pnl = _safe_float(plan_report.get("unrealized_pnl"))
+    min_profit_ratio = max(_safe_float(plan_report.get("take_profit_min_profit_ratio")), 0.0)
+    if min_profit_ratio <= 0:
+        guard = plan_report.get("take_profit_guard")
+        if isinstance(guard, dict):
+            min_profit_ratio = max(_safe_float(guard.get("effective_min_profit_ratio")), 0.0)
+
+    short_avg = max(_safe_float(plan_report.get("current_short_avg_price")), 0.0)
+    long_avg = max(_safe_float(plan_report.get("current_long_avg_price")), 0.0)
+    short_ceiling = short_avg * (1.0 - min_profit_ratio) if short_avg > 0 else 0.0
+    long_floor = long_avg * (1.0 + min_profit_ratio) if long_avg > 0 else 0.0
+
+    losing_short = net_qty < -1e-12 and unrealized_pnl < -1e-9 and short_ceiling > 0
+    losing_long = net_qty > 1e-12 and unrealized_pnl < -1e-9 and long_floor > 0
+    if not losing_short and not losing_long:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    converted_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        side = str(order.get("side", "")).upper().strip()
+        price = _safe_float(order.get("price"))
+        entry_side = _entry_side_from_order(order, strategy_mode=normalized_mode)
+        if losing_short and entry_side == "long" and side == "BUY":
+            if price > 0 and price <= short_ceiling:
+                order["force_reduce_only"] = True
+                order["loss_inventory_no_cross_guard"] = "short_recover_no_cross"
+                converted_orders.append(dict(order))
+                kept_place_orders.append(order)
+            else:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_buy_above_recovery_ceiling"
+                dropped["loss_inventory_recovery_ceiling"] = short_ceiling
+                dropped_orders.append(dropped)
+            continue
+        if losing_long and entry_side == "short" and side == "SELL":
+            if price > 0 and price >= long_floor:
+                order["force_reduce_only"] = True
+                order["loss_inventory_no_cross_guard"] = "long_recover_no_cross"
+                converted_orders.append(dict(order))
+                kept_place_orders.append(order)
+            else:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_sell_below_recovery_floor"
+                dropped["loss_inventory_recovery_floor"] = long_floor
+                dropped_orders.append(dropped)
+            continue
+        kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["loss_inventory_no_cross_entry_guard"] = {
+        "enabled": True,
+        "active": bool(losing_short or losing_long),
+        "direction": "short" if losing_short else "long",
+        "actual_net_qty": net_qty,
+        "unrealized_pnl": unrealized_pnl,
+        "min_profit_ratio": min_profit_ratio,
+        "short_recovery_ceiling": short_ceiling if losing_short else None,
+        "long_recovery_floor": long_floor if losing_long else None,
+        "converted_order_count": len(converted_orders),
+        "dropped_order_count": len(dropped_orders),
+        "converted_orders": converted_orders,
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
 def _entry_side_from_order(order: dict[str, Any], *, strategy_mode: str) -> str | None:
     if _reduce_only_cap_side(order=order, strategy_mode=strategy_mode) is not None:
         return None

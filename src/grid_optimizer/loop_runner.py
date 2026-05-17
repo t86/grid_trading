@@ -98,6 +98,7 @@ from .submit_plan import (
     _is_reduce_only_reject,
     apply_anti_chase_entry_guard_to_actions,
     apply_hard_loss_rescue_entry_guard_to_actions,
+    apply_loss_inventory_no_cross_entry_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
@@ -14123,6 +14124,17 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         actions=validation["actions"],
         plan_report=plan_report,
         strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_loss_inventory_no_cross_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = cap_reduce_only_place_orders_to_position(
+        actions=validation["actions"],
+        strategy_mode=strategy_mode,
+        current_actual_net_qty=current_actual_net_qty,
+        current_open_orders=current_strategy_open_orders,
     )
     validation["actions"] = suppress_place_orders_with_existing_submitted_buckets(
         actions=validation["actions"],

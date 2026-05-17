@@ -7,6 +7,7 @@ from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     apply_anti_chase_entry_guard_to_actions,
     apply_hard_loss_rescue_entry_guard_to_actions,
+    apply_loss_inventory_no_cross_entry_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
     enforce_execution_action_limits,
@@ -158,6 +159,64 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_count"], 2)
         self.assertEqual(capped["place_orders"][0]["qty"], 150.0)
         self.assertEqual(capped["place_orders"][1]["qty"], 50.0)
+        self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
+    def test_loss_inventory_guard_drops_losing_short_buy_above_recovery_ceiling(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.1450, "qty": 1000.0, "notional": 145.0, "role": "entry_long"}
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -900.0,
+            "unrealized_pnl": -10.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.0002,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_orders"], [])
+        self.assertEqual(guarded["loss_inventory_no_cross_entry_guard"]["dropped_order_count"], 1)
+
+    def test_loss_inventory_guard_converts_profitable_short_cover_and_cap_prevents_cross(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.1429, "qty": 1000.0, "notional": 142.9, "role": "entry_long"}
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -700.0,
+            "unrealized_pnl": -1.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.0002,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+        capped = cap_reduce_only_place_orders_to_position(
+            actions=guarded,
+            strategy_mode="synthetic_neutral",
+            current_actual_net_qty=-700.0,
+            current_open_orders=[],
+        )
+
+        self.assertEqual(capped["place_count"], 1)
+        self.assertEqual(capped["place_orders"][0]["qty"], 700.0)
+        self.assertIs(capped["place_orders"][0]["force_reduce_only"], True)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
 
     def test_urgent_reduce_only_displaces_existing_take_profit_capacity(self) -> None:
