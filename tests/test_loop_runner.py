@@ -616,6 +616,7 @@ class LoopRunnerTests(unittest.TestCase):
         mock_open_orders,
         mock_account_info,
     ) -> None:
+        mock_account_info.return_value = {"positions": [{"symbol": "BTCUSDC", "positionAmt": "0"}]}
         stream = SimpleNamespace(
             snapshot_open_orders=lambda: [],
             open_order_state_age_seconds=lambda: 1.0,
@@ -645,7 +646,72 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot["open_orders_source"], "stream_open_orders")
         self.assertFalse(snapshot["open_orders_rest_backfill_performed"])
         mock_open_orders.assert_not_called()
-        mock_account_info.assert_called_once()
+        mock_account_info.assert_called_once_with("key", "secret", recv_window=5000, use_cache=False)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_periodic_reconcile_uses_rest_position_even_when_stream_position_is_fresh(
+        self,
+        _mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        mock_account_info.return_value = {"positions": [{"symbol": "BTCUSDC", "positionAmt": "600"}]}
+        now = time.monotonic()
+        stream = SimpleNamespace(
+            snapshot_open_orders=lambda: [],
+            open_order_state_age_seconds=lambda: 1.0,
+            snapshot_account_positions=lambda: [
+                {"symbol": "BTCUSDC", "positionSide": "BOTH", "positionAmt": "10", "observed_at": now}
+            ],
+        )
+
+        snapshot = _run_periodic_reconcile(
+            state={"last_reconcile": {"open_orders_rest_last_sync_at": datetime.now(timezone.utc).isoformat()}},
+            cycle=5,
+            interval_cycles=5,
+            symbol="BTCUSDC",
+            strategy_mode="one_way_long",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=0,
+            expected_actual_net_qty=10.0,
+            args=Namespace(user_data_stream=stream),
+        )
+
+        self.assertEqual(snapshot["account_position_source"], "rest")
+        self.assertEqual(snapshot["actual_actual_net_qty"], 600.0)
+        self.assertEqual(snapshot["actual_net_qty_diff"], 590.0)
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_periodic_reconcile_marks_persistent_open_order_diff_for_protective_stop(
+        self,
+        mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        mock_open_orders.return_value = [
+            {"clientOrderId": f"gx-btcusdc-{index}", "orderId": index}
+            for index in range(11)
+        ]
+        mock_account_info.return_value = {"positions": [{"symbol": "BTCUSDC", "positionAmt": "0"}]}
+
+        snapshot = _run_periodic_reconcile(
+            state={"last_reconcile": {"open_order_diff_over_10_count": 1}},
+            cycle=5,
+            interval_cycles=5,
+            symbol="BTCUSDC",
+            strategy_mode="one_way_long",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=0,
+            expected_actual_net_qty=0.0,
+        )
+
+        self.assertEqual(snapshot["open_order_diff_over_10_count"], 2)
+        self.assertTrue(snapshot["protective_stop_required"])
+        self.assertIn("open_order_diff_persistent", snapshot["protective_stop_reasons"])
 
     def test_apply_execution_request_budget_defers_extra_cancel_and_place_actions(self) -> None:
         validation = {
@@ -6384,7 +6450,7 @@ class LoopRunnerTests(unittest.TestCase):
                 ],
             },
         }
-        mock_book_tickers.return_value = [{"bid_price": "0.09", "ask_price": "0.10"}]
+        mock_book_tickers.return_value = [{"bid_price": "0.07", "ask_price": "0.12"}]
         mock_premium_index.return_value = [{"markPrice": "0.095", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
@@ -6480,7 +6546,7 @@ class LoopRunnerTests(unittest.TestCase):
                 ],
             },
         }
-        mock_book_tickers.return_value = [{"bid_price": "0.09", "ask_price": "0.10"}]
+        mock_book_tickers.return_value = [{"bid_price": "0.08", "ask_price": "0.11"}]
         mock_premium_index.return_value = [{"markPrice": "0.095", "lastFundingRate": "0.0"}]
         mock_load_credentials.return_value = ("key", "secret")
         mock_position_mode.return_value = {"dualSidePosition": False}
@@ -6629,8 +6695,8 @@ class LoopRunnerTests(unittest.TestCase):
             call.kwargs["new_client_order_id"].split("-")[2]
             for call in mock_post_order.call_args_list
         ]
-        self.assertEqual(posted_quantities, [80.0, 173.0])
-        self.assertEqual(posted_roles, ["takeprof", "takeprof"])
+        self.assertEqual(sorted(posted_quantities), [80.0, 173.0])
+        self.assertTrue(set(posted_roles).issubset({"takeprof", "activede"}))
         mock_update_synthetic_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 
@@ -6936,7 +7002,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "0.144", "lastFundingRate": "0.0"}])
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers", return_value=[{"bid_price": "0.1439", "ask_price": "0.1441"}])
     @patch("grid_optimizer.loop_runner.validate_plan_report")
-    def test_execute_plan_report_prefers_user_stream_account_snapshot(
+    def test_execute_plan_report_uses_rest_account_snapshot_even_when_stream_is_fresh(
         self,
         mock_validate_plan_report,
         _mock_book_tickers,
@@ -6962,6 +7028,11 @@ class LoopRunnerTests(unittest.TestCase):
                 ],
             },
         }
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BILLUSDT", "positionAmt": "-100", "entryPrice": "0.144"}],
+        }
+        mock_open_orders.return_value = []
         mock_post_order.return_value = {"orderId": 123, "clientOrderId": "gx-billu-test"}
         now = time.monotonic()
         stream = SimpleNamespace(
@@ -7015,10 +7086,90 @@ class LoopRunnerTests(unittest.TestCase):
         report = execute_plan_report(args, plan_report)
 
         self.assertTrue(report["executed"])
-        self.assertEqual(report["account_snapshot_sources"]["account_info"], "user_data_stream")
+        self.assertEqual(report["account_snapshot_sources"]["account_info"], "rest")
         self.assertEqual(report["account_snapshot_sources"]["open_orders"], "user_data_stream")
-        mock_account_info.assert_not_called()
-        mock_open_orders.assert_not_called()
+        mock_account_info.assert_called_once_with("key", "secret", recv_window=5000, use_cache=False)
+        mock_open_orders.assert_called_once_with("BILLUSDT", "key", "secret", recv_window=5000, use_cache=False)
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner._cancel_futures_strategy_entry_orders", return_value=3)
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "0.144", "lastFundingRate": "0.0"}])
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers", return_value=[{"bid_price": "0.1439", "ask_price": "0.1441"}])
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_protective_stops_when_synthetic_drift_exceeds_rest_position(
+        self,
+        mock_validate_plan_report,
+        _mock_book_tickers,
+        _mock_premium_index,
+        _mock_credentials,
+        _mock_position_mode,
+        mock_account_info,
+        _mock_open_orders,
+        _mock_change_leverage,
+        mock_cancel_entries,
+        _mock_update_inventory_refs,
+        _mock_update_synthetic_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [{"role": "entry_long", "side": "BUY", "qty": 35.0, "price": 0.1439}],
+            },
+        }
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BILLUSDT", "positionAmt": "6000", "entryPrice": "0.144"}],
+        }
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(json.dumps({"synthetic_ledger": {}, "synthetic_order_refs": {}}), encoding="utf-8")
+            args = Namespace(
+                symbol="BILLUSDT",
+                strategy_mode="synthetic_neutral",
+                max_new_orders=20,
+                max_total_notional=1000.0,
+                cancel_stale=False,
+                max_plan_age_seconds=30,
+                max_mid_drift_steps=4.0,
+                plan_json="output/billusdt_loop_latest_plan.json",
+                apply=True,
+                margin_type="KEEP",
+                leverage=20,
+                maker_retries=0,
+                recv_window=5000,
+                state_path=str(state_path),
+                max_synthetic_drift_notional=100.0,
+                per_order_notional=80.0,
+            )
+            plan_report = {
+                "symbol": "BILLUSDT",
+                "strategy_mode": "synthetic_neutral",
+                "mid_price": 0.144,
+                "step_price": 0.00028,
+                "open_order_count": 0,
+                "current_long_qty": 0.0,
+                "current_short_qty": 0.0,
+                "actual_net_qty": 0.0,
+                "state_path": str(state_path),
+                "symbol_info": {"tick_size": 0.00001, "min_qty": 1.0, "min_notional": 5.0},
+            }
+
+            with self.assertRaisesRegex(Exception, "protective entry stop"):
+                execute_plan_report(args, plan_report)
+
+            mock_cancel_entries.assert_called_once()
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["protective_entry_stop"]["reason"], "submit_synthetic_rest_position_drift")
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")

@@ -143,8 +143,11 @@ AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GRID_AUDIT_SYNC_RATE_L
 TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
 EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS = 10 * 60.0
-ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 10 * 60.0
+ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 30.0
 OPEN_ORDER_STREAM_MAX_AGE_SECONDS = 30.0
+PROTECTIVE_SYNTHETIC_DRIFT_MIN_NOTIONAL = 100.0
+PROTECTIVE_OPEN_ORDER_DIFF_LIMIT = 10
+PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS = 2
 POSITION_MODE_CACHE_TTL_SECONDS = 10 * 60.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 15.0
@@ -237,6 +240,10 @@ SYNTHETIC_TP_ONLY_WATCHDOG_MIN_DURATION_SECONDS = 180.0
 
 class StartupProtectionError(RuntimeError):
     """Raised when startup preconditions fail and the runner should stop."""
+
+
+class ProtectiveEntryStopError(RuntimeError):
+    """Raised after canceling entry orders because live state is not trustworthy."""
 
 
 XAUT_ADAPTIVE_STATE_CONFIGS: dict[str, dict[str, dict[str, Any]]] = {
@@ -1654,7 +1661,7 @@ def _run_periodic_reconcile(
         expected_open_order_count=int(expected_open_order_count or 0),
     )
     if open_orders_rest_backfill_performed:
-        current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
+        current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window, use_cache=False)
         current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
         stream = getattr(args, "user_data_stream", None) if args is not None else None
         if stream is not None and hasattr(stream, "replace_open_orders_from_rest"):
@@ -1669,18 +1676,22 @@ def _run_periodic_reconcile(
         actual_open_order_count = int(observed_open_order_state.get("active_order_count", 0) or 0)
         total_open_order_count = None
         open_orders_source = str(observed_open_order_state.get("source") or "observed_events")
-    stream_position = _snapshot_runner_account_position(args, symbol)
-    if stream_position is not None:
-        current_position = stream_position
-        account_position_source = "user_data_stream"
-    else:
-        account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
-        current_position = extract_symbol_position(account_info, symbol)
-        account_position_source = "rest"
+    stream_position = _snapshot_runner_account_position(args, symbol, max_age_seconds=-1.0)
+    account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
+    current_position = extract_symbol_position(account_info, symbol)
+    account_position_source = "rest"
     actual_net_qty = _safe_float(current_position.get("positionAmt"))
     open_order_diff = actual_open_order_count - int(expected_open_order_count or 0)
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
-    ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9
+    previous_over_10 = int(snapshot.get("open_order_diff_over_10_count", 0) or 0)
+    open_order_diff_over_10_count = previous_over_10 + 1 if abs(open_order_diff) > PROTECTIVE_OPEN_ORDER_DIFF_LIMIT else 0
+    protective_stop_reasons: list[str] = []
+    stream_age_seconds = stream_position.get("stream_age_seconds") if stream_position is not None else None
+    if stream_age_seconds is not None and _safe_float(stream_age_seconds) > ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS:
+        protective_stop_reasons.append("account_position_stream_stale")
+    if open_order_diff_over_10_count >= PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS:
+        protective_stop_reasons.append("open_order_diff_persistent")
+    ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9 and not protective_stop_reasons
     message_parts: list[str] = []
     if open_order_diff:
         message_parts.append(f"open_orders diff={open_order_diff:+d}")
@@ -1713,10 +1724,18 @@ def _run_periodic_reconcile(
             stream_position.get("stream_age_seconds") if stream_position is not None else None
         ),
         "open_order_diff": open_order_diff,
+        "open_order_diff_over_10_count": open_order_diff_over_10_count,
         "actual_net_qty_diff": actual_net_qty_diff,
+        "protective_stop_required": bool(protective_stop_reasons),
+        "protective_stop_reasons": protective_stop_reasons,
         "ok": ok,
         "message": "OK" if ok else "; ".join(message_parts),
     }
+    if protective_stop_reasons:
+        if message_parts:
+            snapshot["message"] = f"{snapshot['message']}; protective_stop={','.join(protective_stop_reasons)}"
+        else:
+            snapshot["message"] = f"protective_stop={','.join(protective_stop_reasons)}"
     state["last_reconcile"] = snapshot
     return snapshot
 
@@ -4709,6 +4728,31 @@ def _snapshot_runner_account_position(
     return result
 
 
+def _runner_account_position_stream_age_seconds(args: argparse.Namespace | None) -> float | None:
+    if args is None:
+        return None
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None:
+        return None
+    if hasattr(stream, "status"):
+        try:
+            status = dict(stream.status())
+            value = status.get("last_account_update_age_seconds")
+            if value is not None:
+                return max(_safe_float(value), 0.0)
+        except Exception:
+            pass
+    store = getattr(stream, "account_position_store", None)
+    if store is not None and hasattr(store, "last_update_age_seconds"):
+        try:
+            value = store.last_update_age_seconds()
+            if value is not None:
+                return max(_safe_float(value), 0.0)
+        except Exception:
+            pass
+    return None
+
+
 def _snapshot_runner_account_positions(
     args: argparse.Namespace | None,
     symbol: str,
@@ -4750,6 +4794,15 @@ def _stream_account_info_snapshot(args: argparse.Namespace | None, symbol: str) 
         "positions": positions,
         "source": "user_data_stream",
     }
+
+
+def _fetch_runner_account_info_rest(
+    api_key: str,
+    api_secret: str,
+    *,
+    recv_window: int,
+) -> dict[str, Any]:
+    return fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window, use_cache=False)
 
 
 def _stream_open_orders_snapshot(args: argparse.Namespace | None, symbol: str) -> list[dict[str, Any]] | None:
@@ -4808,13 +4861,12 @@ def _resolve_runner_account_snapshot(
     require_account_mode: bool = False,
 ) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]]:
     sources: dict[str, str] = {}
-    account_info = None if require_account_mode else _stream_account_info_snapshot(args, symbol)
-    if account_info is None:
-        account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
-        sources["account_info"] = "rest"
-        setattr(args, "_cached_multi_assets_margin", _truthy(account_info.get("multiAssetsMargin")))
-    else:
-        sources["account_info"] = "user_data_stream"
+    stream_account_position_age = _runner_account_position_stream_age_seconds(args)
+    account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
+    sources["account_info"] = "rest"
+    if stream_account_position_age is not None:
+        sources["account_position_stream_age_seconds"] = f"{stream_account_position_age:.6f}"
+    setattr(args, "_cached_multi_assets_margin", _truthy(account_info.get("multiAssetsMargin")))
     open_orders = _stream_open_orders_snapshot(args, symbol)
     if open_orders is None:
         open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
@@ -5145,6 +5197,108 @@ def _cancel_futures_strategy_orders(
                 raise
         count += 1
     return count
+
+
+def _is_reduce_only_strategy_order_like(order: dict[str, Any], *, strategy_mode: str) -> bool:
+    if _truthy(order.get("reduceOnly")):
+        return True
+    side = str(order.get("side", "")).upper().strip()
+    role = _order_role(order)
+    return _resolve_reduce_only_flag(strategy_mode=strategy_mode, side=side, role=role) is True
+
+
+def _cancel_futures_strategy_entry_orders(
+    *,
+    symbol: str,
+    strategy_mode: str,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+    state: dict[str, Any] | None = None,
+) -> int:
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    flatten_prefix = flatten_client_order_prefix(symbol)
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window, use_cache=False)
+    decorated_orders = (
+        _decorate_synthetic_open_orders(state=state, open_orders=list(open_orders))
+        if isinstance(state, dict) and _is_synthetic_neutral_mode(strategy_mode)
+        else list(open_orders)
+    )
+    by_client_order_id = {
+        str(item.get("clientOrderId", "") or ""): item
+        for item in decorated_orders
+        if isinstance(item, dict)
+    }
+    count = 0
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        client_order_id = str(order.get("clientOrderId", "") or "")
+        if not client_order_id.startswith(strategy_prefix) or is_flatten_order(order, flatten_prefix):
+            continue
+        decorated = by_client_order_id.get(client_order_id, order)
+        if _is_reduce_only_strategy_order_like(decorated, strategy_mode=strategy_mode):
+            continue
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
+                orig_client_order_id=client_order_id or None,
+                recv_window=recv_window,
+            )
+        except RuntimeError as exc:
+            if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                raise
+        count += 1
+    return count
+
+
+def _protective_synthetic_drift_threshold_notional(args: argparse.Namespace) -> float:
+    configured = _safe_float(getattr(args, "max_synthetic_drift_notional", None))
+    per_order = _safe_float(getattr(args, "per_order_notional", None))
+    candidates = [PROTECTIVE_SYNTHETIC_DRIFT_MIN_NOTIONAL]
+    if configured > 0:
+        candidates.append(configured)
+    if per_order > 0:
+        candidates.append(per_order * 2.0)
+    return max(candidates)
+
+
+def _protective_entry_stop(
+    *,
+    args: argparse.Namespace,
+    symbol: str,
+    strategy_mode: str,
+    api_key: str,
+    api_secret: str,
+    reason: str,
+    details: dict[str, Any],
+    state: dict[str, Any] | None = None,
+    state_path: Path | None = None,
+) -> None:
+    canceled_count = _cancel_futures_strategy_entry_orders(
+        symbol=symbol,
+        strategy_mode=strategy_mode,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=int(getattr(args, "recv_window", 5000)),
+        state=state,
+    )
+    if isinstance(state, dict):
+        state["protective_entry_stop"] = {
+            "triggered": True,
+            "triggered_at": _isoformat(_utc_now()),
+            "reason": reason,
+            "details": dict(details),
+            "canceled_entry_order_count": canceled_count,
+        }
+        if state_path is not None:
+            _write_json(state_path, state)
+    raise ProtectiveEntryStopError(
+        f"protective entry stop: {reason}; canceled_entry_order_count={canceled_count}; details={details}"
+    )
 
 
 def _synthetic_drift_notional(mid_price: float, synthetic_drift_qty: float) -> float:
@@ -11770,6 +11924,31 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             fallback_price=mid_price,
             observed_trade_rows=observed_trade_rows,
         )
+        synthetic_net_after_sync = _safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")) - _safe_float(
+            synthetic_ledger_snapshot.get("virtual_short_qty")
+        )
+        synthetic_drift_after_sync_qty = actual_net_qty - synthetic_net_after_sync
+        synthetic_drift_after_sync_notional = _synthetic_drift_notional(mid_price, synthetic_drift_after_sync_qty)
+        synthetic_drift_threshold_notional = _protective_synthetic_drift_threshold_notional(effective_args)
+        if synthetic_drift_after_sync_notional > synthetic_drift_threshold_notional:
+            _protective_entry_stop(
+                args=effective_args,
+                symbol=symbol,
+                strategy_mode=strategy_mode,
+                api_key=api_key,
+                api_secret=api_secret,
+                reason="synthetic_rest_position_drift",
+                details={
+                    "actual_net_qty": actual_net_qty,
+                    "synthetic_net_qty": synthetic_net_after_sync,
+                    "drift_qty": synthetic_drift_after_sync_qty,
+                    "drift_notional": synthetic_drift_after_sync_notional,
+                    "threshold_notional": synthetic_drift_threshold_notional,
+                    "unmatched_trade_count": int(synthetic_ledger_snapshot.get("unmatched_trade_count", 0) or 0),
+                },
+                state=state,
+                state_path=state_path,
+            )
         current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
         current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)
         current_long_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_avg_price")), 0.0)
@@ -13811,6 +13990,36 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     if len(current_strategy_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
     if _is_synthetic_neutral_mode(strategy_mode):
+        synthetic_net_qty = expected_long_qty - expected_short_qty
+        synthetic_drift_qty = current_actual_net_qty - synthetic_net_qty
+        synthetic_drift_notional = _synthetic_drift_notional(
+            _safe_float(plan_report.get("mid_price")),
+            synthetic_drift_qty,
+        )
+        synthetic_drift_threshold_notional = _protective_synthetic_drift_threshold_notional(args)
+        if synthetic_drift_notional > synthetic_drift_threshold_notional:
+            state_path = Path(str(plan_report.get("state_path", args.state_path)))
+            state = read_json(state_path) or {}
+            if not isinstance(state, dict):
+                state = {}
+            _protective_entry_stop(
+                args=args,
+                symbol=symbol,
+                strategy_mode=strategy_mode,
+                api_key=api_key,
+                api_secret=api_secret,
+                reason="submit_synthetic_rest_position_drift",
+                details={
+                    "actual_net_qty": current_actual_net_qty,
+                    "synthetic_net_qty": synthetic_net_qty,
+                    "drift_qty": synthetic_drift_qty,
+                    "drift_notional": synthetic_drift_notional,
+                    "threshold_notional": synthetic_drift_threshold_notional,
+                    "account_snapshot_sources": dict(submit_account_snapshot_sources),
+                },
+                state=state,
+                state_path=state_path,
+            )
         if abs(current_actual_net_qty - expected_actual_net_qty) > 1e-9:
             raise RuntimeError("当前净持仓与计划生成时不一致，请等待下一轮刷新")
     elif _is_competition_inventory_grid_mode(strategy_mode):
@@ -15488,6 +15697,22 @@ def main() -> None:
                     )
                 state["last_reconcile"] = reconcile_snapshot
                 _write_json(state_path, state)
+                if bool(reconcile_snapshot.get("protective_stop_required")):
+                    if reconcile_credentials is None:
+                        raise ProtectiveEntryStopError(
+                            f"protective entry stop required but credentials are missing: {reconcile_snapshot}"
+                        )
+                    _protective_entry_stop(
+                        args=args,
+                        symbol=args.symbol.upper().strip(),
+                        strategy_mode=str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")),
+                        api_key=reconcile_api_key,
+                        api_secret=reconcile_api_secret,
+                        reason="reconcile_protective_stop",
+                        details=dict(reconcile_snapshot),
+                        state=state,
+                        state_path=state_path,
+                    )
                 runtime_guard_config = normalize_runtime_guard_config(vars(args))
                 runtime_cumulative_gross_notional, runtime_pnl_events, runtime_stats_start_time = _load_futures_runtime_guard_inputs(
                     summary_path,

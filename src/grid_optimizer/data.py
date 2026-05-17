@@ -1698,6 +1698,7 @@ def fetch_futures_account_info_v3(
     api_secret: str,
     contract_type: str = "usdm",
     recv_window: int = 5000,
+    use_cache: bool = True,
 ) -> dict[str, Any]:
     normalized_contract_type = normalize_contract_type(contract_type)
     cache_key = (api_key.strip(), normalized_contract_type)
@@ -1722,6 +1723,9 @@ def fetch_futures_account_info_v3(
         except Exception:
             return data
         return _merge_futures_position_risk_into_account_info(data, position_risk)
+
+    if not use_cache:
+        return _fetch()
 
     return _get_or_fetch_cached_signed_response(
         namespace="futures_account_info_v3",
