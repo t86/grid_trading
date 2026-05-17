@@ -5383,6 +5383,34 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
         self.assertEqual(plan["sell_orders"][1]["role"], "entry_short")
 
+    def test_apply_hedge_position_controls_counts_pending_short_entries_toward_pause(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.23, "qty": 80, "notional": 98.4, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=150.0,
+            mid_price=1.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=200.0,
+            min_mid_price_for_buys=None,
+            open_entry_short_notional=80.0,
+            preserve_short_entry_on_inventory_pause=True,
+        )
+
+        self.assertTrue(result["short_paused"])
+        self.assertAlmostEqual(result["projected_short_notional"], 230.0)
+        self.assertTrue(any("projected_short_notional" in reason for reason in result["short_pause_reasons"]))
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+
     def test_apply_hedge_position_controls_can_keep_probe_long_on_inventory_pause_when_allowed(self) -> None:
         plan = {
             "bootstrap_orders": [],
@@ -5526,6 +5554,31 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 0)
         self.assertAlmostEqual(plan["bootstrap_orders"][0]["notional"], 30.0)
         self.assertAlmostEqual(plan["bootstrap_orders"][1]["notional"], 20.0)
+
+    def test_apply_hedge_position_notional_caps_subtracts_pending_short_entries(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 1.0, "qty": 10, "notional": 10.0, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [{"side": "SELL", "price": 1.0, "qty": 100, "notional": 100.0, "role": "entry_short", "position_side": "SHORT"}],
+        }
+
+        result = apply_hedge_position_notional_caps(
+            plan=plan,
+            current_long_notional=0.0,
+            current_short_notional=300.0,
+            max_long_position_notional=None,
+            max_short_position_notional=400.0,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            open_entry_short_notional=100.0,
+        )
+
+        self.assertTrue(result["short_cap_applied"])
+        self.assertAlmostEqual(result["short_budget_notional"], 0.0)
+        self.assertAlmostEqual(result["planned_short_notional"], 0.0)
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
 
     def test_apply_position_controls_pauses_buys_when_position_notional_is_too_large(self) -> None:
         plan = {

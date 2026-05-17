@@ -5560,14 +5560,16 @@ def apply_position_controls(
     min_mid_price_for_buys: float | None,
     external_buy_pause: bool = False,
     external_pause_reasons: list[str] | None = None,
+    open_entry_long_notional: float = 0.0,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
+    projected_long_notional = current_long_notional + max(_safe_float(open_entry_long_notional), 0.0)
     buy_paused = bool(external_buy_pause)
     reasons: list[str] = list(external_pause_reasons or [])
-    if pause_buy_position_notional is not None and current_long_notional >= pause_buy_position_notional:
+    if pause_buy_position_notional is not None and projected_long_notional >= pause_buy_position_notional:
         buy_paused = True
         reasons.append(
-            f"current_long_notional={_float(current_long_notional)} >= pause_buy_position_notional={_float(pause_buy_position_notional)}"
+            f"projected_long_notional={_float(projected_long_notional)} >= pause_buy_position_notional={_float(pause_buy_position_notional)}"
         )
     if min_mid_price_for_buys is not None and mid_price <= min_mid_price_for_buys:
         buy_paused = True
@@ -5581,6 +5583,7 @@ def apply_position_controls(
         "buy_paused": buy_paused,
         "pause_reasons": reasons,
         "current_long_notional": current_long_notional,
+        "projected_long_notional": projected_long_notional,
     }
 
 
@@ -5654,12 +5657,16 @@ def apply_hedge_position_controls(
     external_pause_reasons: list[str] | None = None,
     external_short_pause: bool = False,
     external_short_pause_reasons: list[str] | None = None,
+    open_entry_long_notional: float = 0.0,
+    open_entry_short_notional: float = 0.0,
     preserve_long_entry_on_inventory_pause: bool = False,
     preserve_short_entry_on_external_pause: bool = False,
     preserve_short_entry_on_inventory_pause: bool = False,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
     current_short_notional = max(current_short_qty, 0.0) * max(mid_price, 0.0)
+    projected_long_notional = current_long_notional + max(_safe_float(open_entry_long_notional), 0.0)
+    projected_short_notional = current_short_notional + max(_safe_float(open_entry_short_notional), 0.0)
     long_paused = bool(external_long_pause)
     short_paused = bool(external_short_pause)
     inventory_long_paused = False
@@ -5667,17 +5674,17 @@ def apply_hedge_position_controls(
     long_reasons: list[str] = list(external_pause_reasons or [])
     short_reasons: list[str] = list(external_short_pause_reasons or [])
 
-    if pause_long_position_notional is not None and current_long_notional >= pause_long_position_notional:
+    if pause_long_position_notional is not None and projected_long_notional >= pause_long_position_notional:
         long_paused = True
         inventory_long_paused = True
         long_reasons.append(
-            f"current_long_notional={_float(current_long_notional)} >= pause_long_position_notional={_float(pause_long_position_notional)}"
+            f"projected_long_notional={_float(projected_long_notional)} >= pause_long_position_notional={_float(pause_long_position_notional)}"
         )
-    if pause_short_position_notional is not None and current_short_notional >= pause_short_position_notional:
+    if pause_short_position_notional is not None and projected_short_notional >= pause_short_position_notional:
         short_paused = True
         inventory_short_paused = True
         short_reasons.append(
-            f"current_short_notional={_float(current_short_notional)} >= pause_short_position_notional={_float(pause_short_position_notional)}"
+            f"projected_short_notional={_float(projected_short_notional)} >= pause_short_position_notional={_float(pause_short_position_notional)}"
         )
     if min_mid_price_for_buys is not None and mid_price <= min_mid_price_for_buys:
         long_paused = True
@@ -5686,7 +5693,12 @@ def apply_hedge_position_controls(
         )
 
     if long_paused:
-        keep_long_probe = preserve_long_entry_on_inventory_pause if inventory_long_paused else False
+        keep_long_probe = (
+            preserve_long_entry_on_inventory_pause
+            and max(_safe_float(open_entry_long_notional), 0.0) <= 1e-12
+            if inventory_long_paused
+            else False
+        )
         if not keep_long_probe:
             plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
             plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
@@ -5694,6 +5706,7 @@ def apply_hedge_position_controls(
         plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
         keep_short_probe = (
             preserve_short_entry_on_inventory_pause
+            and max(_safe_float(open_entry_short_notional), 0.0) <= 1e-12
             if inventory_short_paused
             else preserve_short_entry_on_external_pause
         )
@@ -5709,6 +5722,8 @@ def apply_hedge_position_controls(
         "pause_reasons": long_reasons + short_reasons,
         "current_long_notional": current_long_notional,
         "current_short_notional": current_short_notional,
+        "projected_long_notional": projected_long_notional,
+        "projected_short_notional": projected_short_notional,
     }
 
 
@@ -9956,6 +9971,7 @@ def apply_max_position_notional_cap(
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    open_entry_long_notional: float = 0.0,
 ) -> dict[str, Any]:
     if max_position_notional is None or max_position_notional <= 0:
         return {
@@ -9966,7 +9982,12 @@ def apply_max_position_notional_cap(
             + sum(_safe_float(x.get("notional")) for x in plan.get("buy_orders", [])),
         }
 
-    buy_budget_notional = max(max_position_notional - max(current_long_notional, 0.0), 0.0)
+    buy_budget_notional = max(
+        max_position_notional
+        - max(current_long_notional, 0.0)
+        - max(_safe_float(open_entry_long_notional), 0.0),
+        0.0,
+    )
     bootstrap_orders = [dict(item) for item in plan.get("bootstrap_orders", []) if isinstance(item, dict)]
     buy_orders = [dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)]
     planned_buy_notional = sum(_safe_float(x.get("notional")) for x in bootstrap_orders) + sum(
@@ -10064,6 +10085,8 @@ def apply_hedge_position_notional_caps(
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    open_entry_long_notional: float = 0.0,
+    open_entry_short_notional: float = 0.0,
 ) -> dict[str, Any]:
     bootstrap_orders = [dict(item) for item in plan.get("bootstrap_orders", []) if isinstance(item, dict)]
     buy_orders = [dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)]
@@ -10072,9 +10095,19 @@ def apply_hedge_position_notional_caps(
     long_budget_notional = None
     short_budget_notional = None
     if max_long_position_notional is not None and max_long_position_notional > 0:
-        long_budget_notional = max(max_long_position_notional - max(current_long_notional, 0.0), 0.0)
+        long_budget_notional = max(
+            max_long_position_notional
+            - max(current_long_notional, 0.0)
+            - max(_safe_float(open_entry_long_notional), 0.0),
+            0.0,
+        )
     if max_short_position_notional is not None and max_short_position_notional > 0:
-        short_budget_notional = max(max_short_position_notional - max(current_short_notional, 0.0), 0.0)
+        short_budget_notional = max(
+            max_short_position_notional
+            - max(current_short_notional, 0.0)
+            - max(_safe_float(open_entry_short_notional), 0.0),
+            0.0,
+        )
 
     original_planned_long = sum(_safe_float(item.get("notional")) for item in bootstrap_orders if _is_long_entry_order(item))
     original_planned_long += sum(_safe_float(item.get("notional")) for item in buy_orders if _is_long_entry_order(item))
@@ -11287,6 +11320,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    strategy_open_orders_for_exposure = _filter_futures_strategy_orders(open_orders, symbol)
+    if _is_synthetic_neutral_mode(strategy_mode):
+        strategy_open_orders_for_exposure = _filter_futures_strategy_orders(
+            _decorate_synthetic_open_orders(state=state, open_orders=open_orders),
+            symbol,
+        )
+    open_entry_exposure = _summarize_open_entry_exposure(strategy_open_orders_for_exposure)
     synthetic_residual_long_flat_notional = max(
         _safe_float(getattr(effective_args, "synthetic_residual_long_flat_notional", None)),
         0.0,
@@ -11431,6 +11471,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
                 external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
                 external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             )
             cap_controls = apply_hedge_position_notional_caps(
                 plan=plan,
@@ -11438,6 +11480,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_notional=controls["current_short_notional"],
                 max_long_position_notional=effective_args.max_position_notional,
                 max_short_position_notional=effective_args.max_short_position_notional,
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
@@ -11455,6 +11499,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_mid_price_for_buys=None,
                 external_long_pause=False,
                 external_pause_reasons=[],
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             )
             cap_controls = apply_hedge_position_notional_caps(
                 plan=plan,
@@ -11462,6 +11507,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_notional=controls["current_short_notional"],
                 max_long_position_notional=None,
                 max_short_position_notional=effective_args.max_short_position_notional,
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
@@ -11486,6 +11532,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
                 external_buy_pause=bool(market_guard["buy_pause_active"]),
                 external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
             )
             cap_controls = apply_max_position_notional_cap(
                 plan=plan,
@@ -11494,6 +11541,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
             )
             target_base_qty = 0.0
             bootstrap_qty = 0.0
@@ -11679,6 +11727,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
@@ -11690,6 +11740,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -11987,6 +12039,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
@@ -11998,6 +12052,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -12238,6 +12294,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
             external_long_pause=bool(market_guard["buy_pause_active"]),
             external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -12245,6 +12303,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -12635,6 +12695,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=None,
             external_long_pause=False,
             external_pause_reasons=[],
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -12642,6 +12703,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=None,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -12767,6 +12829,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
             external_buy_pause=bool(market_guard["buy_pause_active"]),
             external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
         )
         if excess_inventory_gate["active"]:
             controls["buy_paused"] = True
@@ -12782,6 +12845,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
         )
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile):
             volume_long_v4_delever = apply_volume_long_v4_staged_delever(
