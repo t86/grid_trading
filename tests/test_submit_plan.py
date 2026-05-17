@@ -219,6 +219,79 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertIs(capped["place_orders"][0]["force_reduce_only"], True)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
 
+    def test_loss_inventory_guard_drops_non_urgent_reduce_only_long_below_recovery_floor(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 200.0,
+                    "notional": 28.1,
+                    "role": "adverse_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "maker_timeout_release",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_orders"], [])
+        self.assertEqual(guarded["loss_inventory_no_cross_entry_guard"]["dropped_order_count"], 1)
+        self.assertEqual(
+            guarded["loss_inventory_no_cross_entry_guard"]["dropped_orders"][0][
+                "loss_inventory_no_cross_drop_reason"
+            ],
+            "losing_long_sell_below_recovery_floor",
+        )
+
+    def test_loss_inventory_guard_keeps_hard_loss_forced_reduce_below_recovery_floor(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 200.0,
+                    "notional": 28.1,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -80.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(guarded["loss_inventory_no_cross_entry_guard"]["dropped_order_count"], 0)
+
     def test_urgent_reduce_only_displaces_existing_take_profit_capacity(self) -> None:
         actions = {
             "place_orders": [

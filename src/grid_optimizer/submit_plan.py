@@ -655,9 +655,19 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         side = str(order.get("side", "")).upper().strip()
         price = _safe_float(order.get("price"))
         entry_side = _entry_side_from_order(order, strategy_mode=normalized_mode)
-        if losing_short and entry_side == "long" and side == "BUY":
+        reduce_side = _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
+        role = str(order.get("role", "") or "").strip().lower()
+        hard_loss_forced_reduce = role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}
+        short_recovery_order = entry_side == "long" or (
+            reduce_side == "BUY" and not hard_loss_forced_reduce
+        )
+        long_recovery_order = entry_side == "short" or (
+            reduce_side == "SELL" and not hard_loss_forced_reduce
+        )
+        if losing_short and short_recovery_order and side == "BUY":
             if price > 0 and price <= short_ceiling:
-                order["force_reduce_only"] = True
+                if entry_side == "long":
+                    order["force_reduce_only"] = True
                 order["loss_inventory_no_cross_guard"] = "short_recover_no_cross"
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
@@ -667,9 +677,10 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 dropped["loss_inventory_recovery_ceiling"] = short_ceiling
                 dropped_orders.append(dropped)
             continue
-        if losing_long and entry_side == "short" and side == "SELL":
+        if losing_long and long_recovery_order and side == "SELL":
             if price > 0 and price >= long_floor:
-                order["force_reduce_only"] = True
+                if entry_side == "short":
+                    order["force_reduce_only"] = True
                 order["loss_inventory_no_cross_guard"] = "long_recover_no_cross"
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
