@@ -1160,6 +1160,7 @@ def build_hedge_micro_grid_plan(
     paused_entry_long_scale: float = 0.0,
     paused_entry_short_scale: float = 0.0,
     allow_opposite_entry_with_single_side_inventory: bool = False,
+    allow_same_side_entry_with_inventory: bool = True,
 ) -> dict[str, Any]:
     if center_price <= 0 or step_price <= 0:
         raise ValueError("center_price and step_price must be > 0")
@@ -1183,6 +1184,7 @@ def build_hedge_micro_grid_plan(
     paused_entry_long_scale = min(max(float(paused_entry_long_scale), 0.0), 1.0)
     paused_entry_short_scale = min(max(float(paused_entry_short_scale), 0.0), 1.0)
     allow_opposite_entry_with_single_side_inventory = bool(allow_opposite_entry_with_single_side_inventory)
+    allow_same_side_entry_with_inventory = bool(allow_same_side_entry_with_inventory)
     mid_price = (
         (float(bid_price) + float(ask_price)) / 2.0
         if bid_price is not None and ask_price is not None and bid_price > 0 and ask_price > 0
@@ -1551,7 +1553,13 @@ def build_hedge_micro_grid_plan(
         f"{order.side}:{order.price:.10f}" for order in buy_orders if order.role == "take_profit_short"
     }
     allow_paused_long_probe = bool(entry_long_paused and paused_entry_long_scale > 0)
-    if (not bool(entry_long_paused) or allow_paused_long_probe) and (
+    allow_same_side_long_entry = (
+        effective_long_qty <= 0
+        or dominant_long_with_tiny_short_residual
+        or allow_same_side_entry_with_inventory
+        or (allow_opposite_entry_with_single_side_inventory and effective_short_qty <= 0)
+    )
+    if (not bool(entry_long_paused) or allow_paused_long_probe) and allow_same_side_long_entry and (
         effective_short_qty <= 0
         or dominant_long_with_tiny_short_residual
         or (allow_opposite_entry_with_single_side_inventory and effective_long_qty <= 0)
@@ -1655,7 +1663,13 @@ def build_hedge_micro_grid_plan(
         f"{order.side}:{order.price:.10f}" for order in sell_orders if order.role == "take_profit_long"
     }
     allow_paused_short_probe = bool(entry_short_paused and paused_entry_short_scale > 0)
-    if (not bool(entry_short_paused) or allow_paused_short_probe) and (
+    allow_same_side_short_entry = (
+        effective_short_qty <= 0
+        or dominant_short_with_tiny_long_residual
+        or allow_same_side_entry_with_inventory
+        or (allow_opposite_entry_with_single_side_inventory and effective_long_qty <= 0)
+    )
+    if (not bool(entry_short_paused) or allow_paused_short_probe) and allow_same_side_short_entry and (
         effective_long_qty <= 0
         or dominant_short_with_tiny_long_residual
         or (allow_opposite_entry_with_single_side_inventory and effective_short_qty <= 0)
@@ -2008,7 +2022,6 @@ def diff_open_orders(
 
         if existing_total > desired_total:
             stale_orders.extend(existing_group)
-            missing_orders.extend(desired_group)
             continue
 
         kept_orders.extend(existing_group)

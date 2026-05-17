@@ -46,6 +46,8 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
     apply_hard_loss_forced_reduce,
+    resolve_hard_loss_forced_reduce_episode,
+    resolve_hard_loss_rescue_entry_guard,
     prime_exposure_escalation_on_market_guard,
     resolve_exposure_escalation_buy_pause,
     resolve_exposure_escalation,
@@ -862,7 +864,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(order["notional"], 400.0)
         self.assertEqual(plan["forced_reduce_orders"], [order])
 
-    def test_apply_hard_loss_forced_reduce_reduces_when_target_above_current(self) -> None:
+    def test_apply_hard_loss_forced_reduce_stops_when_target_above_current(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
 
         report = apply_hard_loss_forced_reduce(
@@ -883,10 +885,138 @@ class LoopRunnerTests(unittest.TestCase):
             reason="hard_unrealized_loss_limit",
         )
 
+        self.assertFalse(report["active"])
+        self.assertEqual(report["blocked_reason"], "at_or_below_target")
+        self.assertEqual(report["placed_order_count"], 0)
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["forced_reduce_orders"], [])
+
+    def test_hard_loss_rescue_guard_waits_for_loss_recovery_after_window(self) -> None:
+        started_at = datetime(2026, 5, 16, 4, 0, tzinfo=timezone.utc)
+        state = {
+            "hard_loss_rescue_entry_guard": {
+                "side": "SELL",
+                "started_at": started_at.isoformat(),
+                "updated_at": started_at.isoformat(),
+            }
+        }
+        volatility_entry_pause = {
+            "metrics": {
+                "window_1m": {"return_ratio": 0.0005, "amplitude_ratio": 0.001},
+                "window_3m": {"return_ratio": 0.0008, "amplitude_ratio": 0.0015},
+            },
+            "window_1m_thresholds": {"abs_return_ratio": 0.01, "amplitude_ratio": 0.02},
+            "window_3m_thresholds": {"abs_return_ratio": 0.02, "amplitude_ratio": 0.03},
+        }
+
+        report = resolve_hard_loss_rescue_entry_guard(
+            state=state,
+            hard_loss_forced_reduce={
+                "active": False,
+                "side": "SELL",
+                "target_notional": 900.0,
+                "unrealized_pnl": -19.0,
+            },
+            volatility_entry_pause=volatility_entry_pause,
+            current_long_notional=850.0,
+            current_short_notional=0.0,
+            now=started_at + timedelta(seconds=240),
+            protect_seconds=180.0,
+            hard_unrealized_loss_limit=25.0,
+            loss_recover_ratio=0.75,
+        )
+
         self.assertTrue(report["active"])
-        self.assertEqual(report["placed_order_count"], 1)
-        self.assertAlmostEqual(report["target_notional"], 470.0)
-        self.assertLessEqual(plan["sell_orders"][0]["notional"], 180.0)
+        self.assertTrue(report["block_long_entries"])
+        self.assertIn("hard_loss_still_elevated", report["reason"])
+
+        recovered = resolve_hard_loss_rescue_entry_guard(
+            state=state,
+            hard_loss_forced_reduce={
+                "active": False,
+                "side": "SELL",
+                "target_notional": 900.0,
+                "unrealized_pnl": -18.0,
+            },
+            volatility_entry_pause=volatility_entry_pause,
+            current_long_notional=850.0,
+            current_short_notional=0.0,
+            now=started_at + timedelta(seconds=245),
+            protect_seconds=180.0,
+            hard_unrealized_loss_limit=25.0,
+            loss_recover_ratio=0.75,
+        )
+
+        self.assertFalse(recovered["active"])
+        self.assertEqual(recovered["reason"], "recovered")
+
+    def test_hard_loss_episode_disarms_after_target_until_loss_recovers(self) -> None:
+        now = datetime(2026, 5, 16, 5, 0, tzinfo=timezone.utc)
+        state: dict[str, Any] = {}
+
+        reducing = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=1400.0,
+            target_notional=900.0,
+            unrealized_pnl=-30.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now,
+            loss_recover_ratio=0.75,
+        )
+        self.assertTrue(reducing["active"])
+        self.assertFalse(reducing["disarmed"])
+        self.assertEqual(reducing["reason"], "reducing_to_target")
+
+        disarmed = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=880.0,
+            target_notional=900.0,
+            unrealized_pnl=-24.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now + timedelta(seconds=10),
+            loss_recover_ratio=0.75,
+        )
+        self.assertTrue(disarmed["active"])
+        self.assertTrue(disarmed["disarmed"])
+        self.assertEqual(disarmed["reason"], "target_reached_waiting_loss_recovery")
+
+        still_waiting = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=1040.0,
+            target_notional=900.0,
+            unrealized_pnl=-22.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now + timedelta(seconds=20),
+            loss_recover_ratio=0.75,
+        )
+        self.assertTrue(still_waiting["disarmed"])
+        self.assertEqual(still_waiting["reason"], "waiting_loss_recovery")
+
+        recovered = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=True,
+            side="BUY",
+            current_notional=1040.0,
+            target_notional=900.0,
+            unrealized_pnl=-18.0,
+            hard_unrealized_loss_limit=25.0,
+            now=now + timedelta(seconds=30),
+            loss_recover_ratio=0.75,
+        )
+        self.assertFalse(recovered["active"])
+        self.assertFalse(recovered["disarmed"])
+        self.assertEqual(recovered["reason"], "recovered")
+        self.assertNotIn("hard_loss_forced_reduce_episode", state)
 
     def test_apply_entry_permission_gate_prunes_short_entries_only(self) -> None:
         plan = {
@@ -4969,6 +5099,34 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 1)
         self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
 
+    def test_apply_hedge_position_controls_counts_pending_short_entries_toward_pause(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 1.18, "qty": 10, "notional": 11.8, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.22, "qty": 10, "notional": 12.2, "role": "take_profit_long", "position_side": "LONG"},
+                {"side": "SELL", "price": 1.23, "qty": 80, "notional": 98.4, "role": "entry_short", "position_side": "SHORT"},
+            ],
+        }
+
+        result = apply_hedge_position_controls(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=150.0,
+            mid_price=1.0,
+            pause_long_position_notional=None,
+            pause_short_position_notional=200.0,
+            min_mid_price_for_buys=None,
+            open_entry_short_notional=80.0,
+            preserve_short_entry_on_inventory_pause=True,
+        )
+
+        self.assertTrue(result["short_paused"])
+        self.assertAlmostEqual(result["projected_short_notional"], 230.0)
+        self.assertTrue(any("projected_short_notional" in reason for reason in result["short_pause_reasons"]))
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "take_profit_long")
+
     def test_apply_hedge_position_controls_can_keep_probe_short_on_inventory_pause_when_allowed(self) -> None:
         plan = {
             "bootstrap_orders": [],
@@ -5138,6 +5296,31 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(plan["sell_orders"]), 0)
         self.assertAlmostEqual(plan["bootstrap_orders"][0]["notional"], 30.0)
         self.assertAlmostEqual(plan["bootstrap_orders"][1]["notional"], 20.0)
+
+    def test_apply_hedge_position_notional_caps_subtracts_pending_short_entries(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [{"side": "BUY", "price": 1.0, "qty": 10, "notional": 10.0, "role": "take_profit_short", "position_side": "SHORT"}],
+            "sell_orders": [{"side": "SELL", "price": 1.0, "qty": 100, "notional": 100.0, "role": "entry_short", "position_side": "SHORT"}],
+        }
+
+        result = apply_hedge_position_notional_caps(
+            plan=plan,
+            current_long_notional=0.0,
+            current_short_notional=300.0,
+            max_long_position_notional=None,
+            max_short_position_notional=400.0,
+            open_entry_short_notional=100.0,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(result["short_cap_applied"])
+        self.assertAlmostEqual(result["short_budget_notional"], 0.0)
+        self.assertAlmostEqual(result["planned_short_notional"], 0.0)
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
 
     def test_apply_position_controls_pauses_buys_when_position_notional_is_too_large(self) -> None:
         plan = {
@@ -6170,8 +6353,8 @@ class LoopRunnerTests(unittest.TestCase):
             call.kwargs["new_client_order_id"].split("-")[2]
             for call in mock_post_order.call_args_list
         ]
-        self.assertEqual(posted_quantities, [80.0, 173.0])
-        self.assertEqual(posted_roles, ["takeprof", "takeprof"])
+        self.assertEqual(sorted(posted_quantities), [80.0, 173.0])
+        self.assertEqual(posted_roles, ["activede", "activede"])
         mock_update_synthetic_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 

@@ -70,6 +70,13 @@ DEFAULT_TIMEOUT_SECONDS = 30
 MAX_HTTP_RESPONSE_BYTES = 8 * 1024 * 1024
 HTTP_READ_CHUNK_BYTES = 64 * 1024
 SYMBOL_CACHE_TTL_SECONDS = 6 * 3600
+BINANCE_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GRID_BINANCE_RATE_LIMIT_COOLDOWN_SECONDS", "45.0"))
+BINANCE_RATE_LIMIT_FILE_COOLDOWN_ENABLED = os.getenv(
+    "GRID_BINANCE_RATE_LIMIT_FILE_COOLDOWN_ENABLED", "1"
+).strip().lower() not in {"0", "false", "no"}
+BINANCE_RATE_LIMIT_FILE_PATH = Path(
+    os.getenv("GRID_BINANCE_RATE_LIMIT_FILE_PATH", str(Path(tempfile.gettempdir()) / "grid_optimizer_binance_rate_limit.json"))
+)
 COINM_MAX_KLINE_WINDOW_MS = 200 * 24 * 60 * 60 * 1000
 FUNDING_DEFAULT_STEP_MS = 8 * 60 * 60 * 1000
 FUNDING_MISSING_GAP_THRESHOLD_MS = 10 * 60 * 60 * 1000
@@ -97,6 +104,93 @@ _FUTURES_POSITION_MODE_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]
 _FUTURES_ACCOUNT_INFO_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 _FUTURES_OPEN_ORDERS_CACHE: dict[tuple[str, str, str], tuple[float, list[dict[str, Any]]]] = {}
 _FUTURES_USER_TRADES_CACHE: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
+_BINANCE_RATE_LIMIT_LOCK = threading.RLock()
+_BINANCE_RATE_LIMIT_UNTIL = 0.0
+
+
+def _binance_rate_limit_scope(url: str) -> str:
+    if "fapi.binance.com" in url:
+        return "futures"
+    if "dapi.binance.com" in url:
+        return "delivery"
+    if "api.binance.com" in url:
+        return "spot"
+    return "binance"
+
+
+def _binance_rate_limit_error_message(scope: str, wait_seconds: float) -> str:
+    return f"Binance API local cooldown active for {scope}; retry after {max(wait_seconds, 0.0):.1f}s"
+
+
+def _read_binance_rate_limit_file(scope: str, now: float) -> float:
+    if not BINANCE_RATE_LIMIT_FILE_COOLDOWN_ENABLED:
+        return 0.0
+    try:
+        raw = json.loads(BINANCE_RATE_LIMIT_FILE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return 0.0
+    if not isinstance(raw, dict):
+        return 0.0
+    until = float(raw.get("until") or 0.0)
+    file_scope = str(raw.get("scope") or "").strip()
+    if until <= now:
+        return 0.0
+    if file_scope and file_scope not in {scope, "binance"}:
+        return 0.0
+    return until
+
+
+def _raise_if_binance_rate_limited(scope: str) -> None:
+    now = time.time()
+    with _BINANCE_RATE_LIMIT_LOCK:
+        until = max(_BINANCE_RATE_LIMIT_UNTIL, _read_binance_rate_limit_file(scope, now))
+    if until > now:
+        raise RuntimeError(_binance_rate_limit_error_message(scope, until - now))
+
+
+def _mark_binance_rate_limited(scope: str, *, cooldown_seconds: float | None = None) -> None:
+    global _BINANCE_RATE_LIMIT_UNTIL
+    safe_cooldown = max(float(cooldown_seconds if cooldown_seconds is not None else BINANCE_RATE_LIMIT_COOLDOWN_SECONDS), 0.0)
+    if safe_cooldown <= 0:
+        return
+    until = time.time() + safe_cooldown
+    with _BINANCE_RATE_LIMIT_LOCK:
+        _BINANCE_RATE_LIMIT_UNTIL = max(_BINANCE_RATE_LIMIT_UNTIL, until)
+        if not BINANCE_RATE_LIMIT_FILE_COOLDOWN_ENABLED:
+            return
+        try:
+            BINANCE_RATE_LIMIT_FILE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = BINANCE_RATE_LIMIT_FILE_PATH.with_suffix(f".{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp_path.write_text(
+                json.dumps(
+                    {
+                        "scope": scope,
+                        "until": _BINANCE_RATE_LIMIT_UNTIL,
+                        "cooldown_seconds": safe_cooldown,
+                        "updated_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            tmp_path.replace(BINANCE_RATE_LIMIT_FILE_PATH)
+        except OSError:
+            pass
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)  # type: ignore[name-defined]
+            except (OSError, UnboundLocalError):
+                pass
+
+
+def _is_binance_rate_limit_error_payload(data: Any, http_status: int | None = None) -> bool:
+    if http_status == 429:
+        return True
+    if not isinstance(data, dict):
+        return False
+    code = str(data.get("code", "")).strip()
+    msg = str(data.get("msg", "")).lower()
+    return code == "-1003" or "too many requests" in msg
 
 
 def _ipv4_first_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
@@ -226,6 +320,8 @@ def _http_request_json(
     headers: dict[str, str] | None = None,
     method: str = "GET",
 ) -> Any:
+    scope = _binance_rate_limit_scope(url)
+    _raise_if_binance_rate_limited(scope)
     query = urlencode(params)
     full_url = f"{url}?{query}" if query else url
     request_headers = {
@@ -248,7 +344,11 @@ def _http_request_json(
         try:
             data = json.loads(payload)
         except json.JSONDecodeError:
+            if exc.code == 429:
+                _mark_binance_rate_limited(scope)
             raise
+        if _is_binance_rate_limit_error_payload(data, exc.code):
+            _mark_binance_rate_limited(scope)
         if isinstance(data, dict) and "code" in data and "msg" in data:
             code = data.get("code", exc.code)
             msg = data.get("msg", exc.reason)
@@ -262,6 +362,8 @@ def _http_request_json(
         code = data.get("code", "unknown")
         msg = data.get("msg", "unknown error")
         if code not in (0, "0"):
+            if _is_binance_rate_limit_error_payload(data):
+                _mark_binance_rate_limited(scope)
             raise RuntimeError(f"Binance API error {code}: {msg}")
     return data
 
@@ -322,11 +424,18 @@ def _http_signed_get_json(
 
 
 def clear_futures_signed_response_caches() -> None:
+    global _BINANCE_RATE_LIMIT_UNTIL
     with _FUTURES_SIGNED_RESPONSE_CACHE_LOCK:
         _FUTURES_POSITION_MODE_CACHE.clear()
         _FUTURES_ACCOUNT_INFO_CACHE.clear()
         _FUTURES_OPEN_ORDERS_CACHE.clear()
         _FUTURES_USER_TRADES_CACHE.clear()
+    with _BINANCE_RATE_LIMIT_LOCK:
+        _BINANCE_RATE_LIMIT_UNTIL = 0.0
+    try:
+        BINANCE_RATE_LIMIT_FILE_PATH.unlink(missing_ok=True)
+    except OSError:
+        pass
     if FUTURES_SIGNED_FILE_CACHE_ENABLED:
         try:
             for path in FUTURES_SIGNED_FILE_CACHE_DIR.glob("*.json"):

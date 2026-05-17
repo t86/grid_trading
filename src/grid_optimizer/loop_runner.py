@@ -96,6 +96,7 @@ from .submit_plan import (
     _ignore_noop_error,
     _is_reduce_only_reject,
     apply_anti_chase_entry_guard_to_actions,
+    apply_hard_loss_rescue_entry_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
@@ -135,6 +136,7 @@ XAUT_ADAPTIVE_STATE_NORMAL = "normal"
 XAUT_ADAPTIVE_STATE_DEFENSIVE = "defensive"
 XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
+AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GRID_AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS", "300.0"))
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
 RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
@@ -850,6 +852,294 @@ def resolve_volatility_entry_pause(
         "dominant_threshold": report.get("dominant_threshold"),
     }
     return report
+
+
+def _parse_rescue_guard_time(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _volatility_window_is_calm(
+    *,
+    metrics: dict[str, Any],
+    thresholds: dict[str, dict[str, float]],
+    window_key: str,
+) -> tuple[bool, str | None]:
+    window = metrics.get(window_key)
+    if not isinstance(window, dict):
+        return False, f"{window_key}_missing"
+    window_thresholds = thresholds.get(window_key) or {}
+    abs_threshold = _safe_float(window_thresholds.get("abs_return_ratio"))
+    amp_threshold = _safe_float(window_thresholds.get("amplitude_ratio"))
+    abs_return = abs(_safe_float(window.get("return_ratio")))
+    amplitude = _safe_float(window.get("amplitude_ratio"))
+    if abs_threshold > 0 and abs_return >= abs_threshold:
+        return False, f"{window_key}_abs_return={abs_return:.6f}>={abs_threshold:.6f}"
+    if amp_threshold > 0 and amplitude >= amp_threshold:
+        return False, f"{window_key}_amplitude={amplitude:.6f}>={amp_threshold:.6f}"
+    return True, None
+
+
+def resolve_hard_loss_rescue_entry_guard(
+    *,
+    state: dict[str, Any],
+    hard_loss_forced_reduce: dict[str, Any],
+    volatility_entry_pause: dict[str, Any],
+    current_long_notional: float,
+    current_short_notional: float,
+    now: datetime,
+    protect_seconds: float = 180.0,
+    hard_unrealized_loss_limit: float | None = None,
+    loss_recover_ratio: float = 0.75,
+) -> dict[str, Any]:
+    safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    memory = dict(state.get("hard_loss_rescue_entry_guard") or {})
+    hard_active = bool(hard_loss_forced_reduce.get("active"))
+    side = str(hard_loss_forced_reduce.get("side") or memory.get("side") or "").upper().strip()
+    if hard_active and side in {"BUY", "SELL"}:
+        memory = {
+            "side": side,
+            "started_at": _isoformat(safe_now),
+            "updated_at": _isoformat(safe_now),
+        }
+        state["hard_loss_rescue_entry_guard"] = memory
+
+    started_at = _parse_rescue_guard_time(memory.get("started_at"))
+    if side not in {"BUY", "SELL"} or started_at is None:
+        state.pop("hard_loss_rescue_entry_guard", None)
+        return {"enabled": True, "active": False, "reason": "no_recent_hard_loss"}
+
+    target_notional = max(_safe_float(hard_loss_forced_reduce.get("target_notional")), 0.0)
+    hard_loss_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    loss_recover_threshold = hard_loss_limit * max(_safe_float(loss_recover_ratio), 0.0)
+    hard_unrealized_pnl = _safe_float(hard_loss_forced_reduce.get("unrealized_pnl"))
+    hard_loss_still_elevated = (
+        hard_loss_limit > 0
+        and loss_recover_threshold > 0
+        and hard_unrealized_pnl < -loss_recover_threshold
+    )
+    current_rescue_notional = (
+        max(_safe_float(current_short_notional), 0.0)
+        if side == "BUY"
+        else max(_safe_float(current_long_notional), 0.0)
+    )
+    elapsed_seconds = max((safe_now - started_at).total_seconds(), 0.0)
+    min_remaining_seconds = max(_safe_float(protect_seconds) - elapsed_seconds, 0.0)
+    volatility_metrics = dict(volatility_entry_pause.get("metrics") or {})
+    thresholds: dict[str, dict[str, float]] = {}
+    for key in ("window_1m", "window_3m"):
+        threshold_key = f"{key}_thresholds"
+        if isinstance(volatility_entry_pause.get(threshold_key), dict):
+            thresholds[key] = dict(volatility_entry_pause[threshold_key])
+    if not thresholds:
+        state_snapshot = volatility_entry_pause.get("state")
+        dominant_threshold = _safe_float(state_snapshot.get("dominant_threshold")) if isinstance(state_snapshot, dict) else 0.0
+        if dominant_threshold > 0:
+            thresholds = {
+                "window_1m": {"abs_return_ratio": dominant_threshold, "amplitude_ratio": dominant_threshold},
+                "window_3m": {"abs_return_ratio": dominant_threshold, "amplitude_ratio": dominant_threshold},
+            }
+
+    one_min_calm, one_min_reason = _volatility_window_is_calm(
+        metrics=volatility_metrics,
+        thresholds=thresholds,
+        window_key="window_1m",
+    )
+    three_min_calm, three_min_reason = _volatility_window_is_calm(
+        metrics=volatility_metrics,
+        thresholds=thresholds,
+        window_key="window_3m",
+    )
+    over_target = target_notional > 0 and current_rescue_notional > target_notional + 1e-12
+    should_protect = (
+        hard_active
+        or min_remaining_seconds > 0
+        or over_target
+        or hard_loss_still_elevated
+        or not (one_min_calm and three_min_calm)
+    )
+    if not should_protect:
+        state.pop("hard_loss_rescue_entry_guard", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "reason": "recovered",
+            "elapsed_seconds": elapsed_seconds,
+            "target_notional": target_notional,
+            "current_rescue_notional": current_rescue_notional,
+            "hard_unrealized_pnl": hard_unrealized_pnl,
+            "loss_recover_threshold": loss_recover_threshold,
+        }
+
+    reasons: list[str] = []
+    if hard_active:
+        reasons.append("hard_loss_active")
+    if min_remaining_seconds > 0:
+        reasons.append(f"protect_window_remaining={math.ceil(min_remaining_seconds)}s")
+    if over_target:
+        reasons.append("inventory_above_target")
+    if hard_loss_still_elevated:
+        reasons.append("hard_loss_still_elevated")
+    if not one_min_calm:
+        reasons.append(one_min_reason or "window_1m_not_calm")
+    if not three_min_calm:
+        reasons.append(three_min_reason or "window_3m_not_calm")
+    memory["updated_at"] = _isoformat(safe_now)
+    state["hard_loss_rescue_entry_guard"] = memory
+    return {
+        "enabled": True,
+        "active": True,
+        "side": side,
+        "block_long_entries": side == "SELL",
+        "block_short_entries": side == "BUY",
+        "started_at": _isoformat(started_at),
+        "elapsed_seconds": elapsed_seconds,
+        "min_remaining_seconds": min_remaining_seconds,
+        "target_notional": target_notional,
+        "current_rescue_notional": current_rescue_notional,
+        "hard_unrealized_pnl": hard_unrealized_pnl,
+        "loss_recover_threshold": loss_recover_threshold,
+        "one_min_calm": one_min_calm,
+        "three_min_calm": three_min_calm,
+        "reason": ";".join(item for item in reasons if item),
+    }
+
+
+def resolve_hard_loss_forced_reduce_episode(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    triggered: bool,
+    side: str | None,
+    current_notional: float,
+    target_notional: float | None,
+    unrealized_pnl: float,
+    hard_unrealized_loss_limit: float | None,
+    now: datetime,
+    loss_recover_ratio: float = 0.75,
+) -> dict[str, Any]:
+    normalized_side = str(side or "").upper().strip()
+    current_time = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    hard_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    recover_threshold = hard_limit * max(_safe_float(loss_recover_ratio), 0.0)
+    current_loss = -_safe_float(unrealized_pnl)
+    current_notional_safe = max(_safe_float(current_notional), 0.0)
+    target_notional_safe = max(_safe_float(target_notional), 0.0)
+    memory = dict(state.get("hard_loss_forced_reduce_episode") or {})
+    memory_side = str(memory.get("side") or "").upper().strip()
+    same_side = normalized_side in {"BUY", "SELL"} and memory_side == normalized_side
+    recovered = hard_limit > 0 and recover_threshold > 0 and current_loss <= recover_threshold
+    if not enabled:
+        state.pop("hard_loss_forced_reduce_episode", None)
+        return {
+            "enabled": False,
+            "active": False,
+            "disarmed": False,
+            "reason": "disabled",
+            "loss_recover_threshold": recover_threshold,
+        }
+    if recovered:
+        state.pop("hard_loss_forced_reduce_episode", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "disarmed": False,
+            "reason": "recovered",
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+        }
+    if same_side and memory.get("disarmed_until_recovery"):
+        memory["updated_at"] = _isoformat(current_time)
+        memory["current_loss"] = current_loss
+        memory["current_notional"] = current_notional_safe
+        memory["target_notional"] = target_notional_safe
+        memory["loss_recover_threshold"] = recover_threshold
+        state["hard_loss_forced_reduce_episode"] = memory
+        return {
+            "enabled": True,
+            "active": True,
+            "disarmed": True,
+            "side": normalized_side,
+            "reason": "waiting_loss_recovery",
+            "started_at": memory.get("started_at"),
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+        }
+    if triggered and normalized_side in {"BUY", "SELL"}:
+        disarmed = target_notional_safe <= 0 or current_notional_safe <= target_notional_safe + 1e-12
+        if disarmed:
+            memory = {
+                "side": normalized_side,
+                "started_at": str(memory.get("started_at") or _isoformat(current_time)),
+                "updated_at": _isoformat(current_time),
+                "disarmed_until_recovery": True,
+                "current_loss": current_loss,
+                "current_notional": current_notional_safe,
+                "target_notional": target_notional_safe,
+                "loss_recover_threshold": recover_threshold,
+            }
+            state["hard_loss_forced_reduce_episode"] = memory
+            return {
+                "enabled": True,
+                "active": True,
+                "disarmed": True,
+                "side": normalized_side,
+                "reason": "target_reached_waiting_loss_recovery",
+                "started_at": memory["started_at"],
+                "current_loss": current_loss,
+                "loss_recover_threshold": recover_threshold,
+                "current_notional": current_notional_safe,
+                "target_notional": target_notional_safe,
+            }
+        memory = {
+            "side": normalized_side,
+            "started_at": str(memory.get("started_at") or _isoformat(current_time)),
+            "updated_at": _isoformat(current_time),
+            "disarmed_until_recovery": False,
+            "current_loss": current_loss,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+            "loss_recover_threshold": recover_threshold,
+        }
+        state["hard_loss_forced_reduce_episode"] = memory
+        return {
+            "enabled": True,
+            "active": True,
+            "disarmed": False,
+            "side": normalized_side,
+            "reason": "reducing_to_target",
+            "started_at": memory["started_at"],
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+        }
+    if not triggered and not memory:
+        return {
+            "enabled": True,
+            "active": False,
+            "disarmed": False,
+            "reason": "not_triggered",
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+        }
+    return {
+        "enabled": True,
+        "active": bool(memory),
+        "disarmed": bool(memory.get("disarmed_until_recovery")),
+        "side": memory_side or normalized_side,
+        "reason": "memory",
+        "current_loss": current_loss,
+        "loss_recover_threshold": recover_threshold,
+    }
 
 
 def resolve_anti_chase_entry_guard(
@@ -2025,11 +2315,8 @@ def apply_hard_loss_forced_reduce(
         report["blocked_reason"] = "at_or_below_target"
         return report
     if safe_current_notional <= safe_target_notional + 1e-12:
-        if safe_max_order_notional <= 0:
-            report["blocked_reason"] = "at_or_below_target"
-            return report
-        safe_target_notional = max(safe_current_notional - safe_max_order_notional, 0.0)
-        report["target_notional"] = safe_target_notional
+        report["blocked_reason"] = "at_or_below_target"
+        return report
 
     raw_reduce_notional = safe_current_notional - safe_target_notional
     reduce_notional = min(raw_reduce_notional, safe_max_order_notional) if safe_max_order_notional > 0 else raw_reduce_notional
@@ -3797,6 +4084,17 @@ def _load_audit_state(path: Path) -> dict[str, Any]:
 
 
 def _should_sync_account_audit(audit_state: dict[str, Any], *, now: datetime) -> bool:
+    cooldown_until_raw = str((audit_state or {}).get("rate_limit_cooldown_until") or "").strip()
+    if cooldown_until_raw:
+        try:
+            cooldown_until = datetime.fromisoformat(cooldown_until_raw)
+        except ValueError:
+            cooldown_until = None
+        if cooldown_until is not None:
+            if cooldown_until.tzinfo is None:
+                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+            if now.astimezone(timezone.utc) < cooldown_until.astimezone(timezone.utc):
+                return False
     updated_at_raw = str((audit_state or {}).get("updated_at") or "").strip()
     if not updated_at_raw:
         return True
@@ -3878,10 +4176,14 @@ def _sync_account_audit(
     audit_state = _load_audit_state(audit_state_path)
     now = datetime.now(timezone.utc)
     if not _should_sync_account_audit(audit_state, now=now):
+        cooldown_until = str(audit_state.get("rate_limit_cooldown_until") or "").strip()
+        skipped = f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s"
+        if cooldown_until:
+            skipped = f"rate_limit_cooldown_until={cooldown_until}"
         return {
             "trade_appended": 0,
             "income_appended": 0,
-            "skipped": f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s",
+            "skipped": skipped,
             "trade_audit_path": str(audit_paths["trade_audit"]),
             "income_audit_path": str(audit_paths["income_audit"]),
             "audit_state_path": str(audit_state_path),
@@ -3897,13 +4199,30 @@ def _sync_account_audit(
     if income_start_time_ms <= 0:
         income_start_time_ms = int(audit_state.get("session_start_time_ms") or 0) or default_start_time_ms
 
-    trade_rows = _fetch_trade_rows_since(
-        symbol=symbol,
-        api_key=api_key,
-        api_secret=api_secret,
-        start_time_ms=trade_start_time_ms,
-        recv_window=recv_window,
-    )
+    try:
+        trade_rows = _fetch_trade_rows_since(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=trade_start_time_ms,
+            recv_window=recv_window,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "-1003" in message or "Too many requests" in message or "local cooldown active" in message:
+            cooldown_until = now.astimezone(timezone.utc) + timedelta(
+                seconds=max(AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS, AUDIT_SYNC_MIN_INTERVAL_SECONDS)
+            )
+            audit_state.update(
+                {
+                    "symbol": symbol.upper().strip(),
+                    "updated_at": now.isoformat(),
+                    "rate_limit_cooldown_until": cooldown_until.isoformat(),
+                    "rate_limit_error": message,
+                }
+            )
+            _write_json(audit_state_path, audit_state)
+        raise
     fresh_trades, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
         rows=trade_rows,
         last_time_ms=int(audit_state.get("trade_last_time_ms") or 0) or None,
@@ -3912,13 +4231,30 @@ def _sync_account_audit(
         row_key=trade_row_key,
     )
 
-    income_rows = _fetch_income_rows_since(
-        symbol=symbol,
-        api_key=api_key,
-        api_secret=api_secret,
-        start_time_ms=income_start_time_ms,
-        recv_window=recv_window,
-    )
+    try:
+        income_rows = _fetch_income_rows_since(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=income_start_time_ms,
+            recv_window=recv_window,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "-1003" in message or "Too many requests" in message or "local cooldown active" in message:
+            cooldown_until = now.astimezone(timezone.utc) + timedelta(
+                seconds=max(AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS, AUDIT_SYNC_MIN_INTERVAL_SECONDS)
+            )
+            audit_state.update(
+                {
+                    "symbol": symbol.upper().strip(),
+                    "updated_at": now.isoformat(),
+                    "rate_limit_cooldown_until": cooldown_until.isoformat(),
+                    "rate_limit_error": message,
+                }
+            )
+            _write_json(audit_state_path, audit_state)
+        raise
     fresh_income, income_last_time_ms, income_keys_at_time = collect_new_rows(
         rows=income_rows,
         last_time_ms=int(audit_state.get("income_last_time_ms") or 0) or None,
@@ -3961,6 +4297,8 @@ def _sync_account_audit(
             "income_last_keys_at_time": income_keys_at_time,
         }
     )
+    audit_state.pop("rate_limit_cooldown_until", None)
+    audit_state.pop("rate_limit_error", None)
     _write_json(audit_state_path, audit_state)
     return {
         "trade_appended": len(fresh_trades),
@@ -4336,14 +4674,16 @@ def apply_position_controls(
     min_mid_price_for_buys: float | None,
     external_buy_pause: bool = False,
     external_pause_reasons: list[str] | None = None,
+    open_entry_long_notional: float = 0.0,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
+    projected_long_notional = current_long_notional + max(_safe_float(open_entry_long_notional), 0.0)
     buy_paused = bool(external_buy_pause)
     reasons: list[str] = list(external_pause_reasons or [])
-    if pause_buy_position_notional is not None and current_long_notional >= pause_buy_position_notional:
+    if pause_buy_position_notional is not None and projected_long_notional >= pause_buy_position_notional:
         buy_paused = True
         reasons.append(
-            f"current_long_notional={_float(current_long_notional)} >= pause_buy_position_notional={_float(pause_buy_position_notional)}"
+            f"projected_long_notional={_float(projected_long_notional)} >= pause_buy_position_notional={_float(pause_buy_position_notional)}"
         )
     if min_mid_price_for_buys is not None and mid_price <= min_mid_price_for_buys:
         buy_paused = True
@@ -4357,6 +4697,7 @@ def apply_position_controls(
         "buy_paused": buy_paused,
         "pause_reasons": reasons,
         "current_long_notional": current_long_notional,
+        "projected_long_notional": projected_long_notional,
     }
 
 
@@ -4430,12 +4771,16 @@ def apply_hedge_position_controls(
     external_pause_reasons: list[str] | None = None,
     external_short_pause: bool = False,
     external_short_pause_reasons: list[str] | None = None,
+    open_entry_long_notional: float = 0.0,
+    open_entry_short_notional: float = 0.0,
     preserve_long_entry_on_inventory_pause: bool = False,
     preserve_short_entry_on_external_pause: bool = False,
     preserve_short_entry_on_inventory_pause: bool = False,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
     current_short_notional = max(current_short_qty, 0.0) * max(mid_price, 0.0)
+    projected_long_notional = current_long_notional + max(_safe_float(open_entry_long_notional), 0.0)
+    projected_short_notional = current_short_notional + max(_safe_float(open_entry_short_notional), 0.0)
     long_paused = bool(external_long_pause)
     short_paused = bool(external_short_pause)
     inventory_long_paused = False
@@ -4443,17 +4788,17 @@ def apply_hedge_position_controls(
     long_reasons: list[str] = list(external_pause_reasons or [])
     short_reasons: list[str] = list(external_short_pause_reasons or [])
 
-    if pause_long_position_notional is not None and current_long_notional >= pause_long_position_notional:
+    if pause_long_position_notional is not None and projected_long_notional >= pause_long_position_notional:
         long_paused = True
         inventory_long_paused = True
         long_reasons.append(
-            f"current_long_notional={_float(current_long_notional)} >= pause_long_position_notional={_float(pause_long_position_notional)}"
+            f"projected_long_notional={_float(projected_long_notional)} >= pause_long_position_notional={_float(pause_long_position_notional)}"
         )
-    if pause_short_position_notional is not None and current_short_notional >= pause_short_position_notional:
+    if pause_short_position_notional is not None and projected_short_notional >= pause_short_position_notional:
         short_paused = True
         inventory_short_paused = True
         short_reasons.append(
-            f"current_short_notional={_float(current_short_notional)} >= pause_short_position_notional={_float(pause_short_position_notional)}"
+            f"projected_short_notional={_float(projected_short_notional)} >= pause_short_position_notional={_float(pause_short_position_notional)}"
         )
     if min_mid_price_for_buys is not None and mid_price <= min_mid_price_for_buys:
         long_paused = True
@@ -4462,7 +4807,12 @@ def apply_hedge_position_controls(
         )
 
     if long_paused:
-        keep_long_probe = preserve_long_entry_on_inventory_pause if inventory_long_paused else False
+        keep_long_probe = (
+            preserve_long_entry_on_inventory_pause
+            and max(_safe_float(open_entry_long_notional), 0.0) <= 1e-12
+            if inventory_long_paused
+            else False
+        )
         if not keep_long_probe:
             plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
             plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
@@ -4470,6 +4820,7 @@ def apply_hedge_position_controls(
         plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
         keep_short_probe = (
             preserve_short_entry_on_inventory_pause
+            and max(_safe_float(open_entry_short_notional), 0.0) <= 1e-12
             if inventory_short_paused
             else preserve_short_entry_on_external_pause
         )
@@ -4485,6 +4836,8 @@ def apply_hedge_position_controls(
         "pause_reasons": long_reasons + short_reasons,
         "current_long_notional": current_long_notional,
         "current_short_notional": current_short_notional,
+        "projected_long_notional": projected_long_notional,
+        "projected_short_notional": projected_short_notional,
     }
 
 
@@ -8680,6 +9033,7 @@ def apply_max_position_notional_cap(
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    open_entry_long_notional: float = 0.0,
 ) -> dict[str, Any]:
     if max_position_notional is None or max_position_notional <= 0:
         return {
@@ -8690,7 +9044,12 @@ def apply_max_position_notional_cap(
             + sum(_safe_float(x.get("notional")) for x in plan.get("buy_orders", [])),
         }
 
-    buy_budget_notional = max(max_position_notional - max(current_long_notional, 0.0), 0.0)
+    buy_budget_notional = max(
+        max_position_notional
+        - max(current_long_notional, 0.0)
+        - max(_safe_float(open_entry_long_notional), 0.0),
+        0.0,
+    )
     bootstrap_orders = [dict(item) for item in plan.get("bootstrap_orders", []) if isinstance(item, dict)]
     buy_orders = [dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)]
     planned_buy_notional = sum(_safe_float(x.get("notional")) for x in bootstrap_orders) + sum(
@@ -8785,6 +9144,8 @@ def apply_hedge_position_notional_caps(
     current_short_notional: float,
     max_long_position_notional: float | None,
     max_short_position_notional: float | None,
+    open_entry_long_notional: float = 0.0,
+    open_entry_short_notional: float = 0.0,
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
@@ -8796,9 +9157,15 @@ def apply_hedge_position_notional_caps(
     long_budget_notional = None
     short_budget_notional = None
     if max_long_position_notional is not None and max_long_position_notional > 0:
-        long_budget_notional = max(max_long_position_notional - max(current_long_notional, 0.0), 0.0)
+        long_budget_notional = max(
+            max_long_position_notional - max(current_long_notional, 0.0) - max(_safe_float(open_entry_long_notional), 0.0),
+            0.0,
+        )
     if max_short_position_notional is not None and max_short_position_notional > 0:
-        short_budget_notional = max(max_short_position_notional - max(current_short_notional, 0.0), 0.0)
+        short_budget_notional = max(
+            max_short_position_notional - max(current_short_notional, 0.0) - max(_safe_float(open_entry_short_notional), 0.0),
+            0.0,
+        )
 
     original_planned_long = sum(_safe_float(item.get("notional")) for item in bootstrap_orders if _is_long_entry_order(item))
     original_planned_long += sum(_safe_float(item.get("notional")) for item in buy_orders if _is_long_entry_order(item))
@@ -9179,6 +9546,50 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "warning": f"{exc.__class__.__name__}: {exc}",
             }
 
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
+    api_key, api_secret = credentials
+
+    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=args.recv_window)
+    position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
+    decorated_open_orders = _decorate_synthetic_open_orders(state=state, open_orders=open_orders)
+    strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
+    strategy_open_orders_for_exposure = (
+        _filter_futures_strategy_orders(decorated_open_orders, symbol)
+        if requested_strategy_mode == "synthetic_neutral"
+        else strategy_open_orders
+    )
+    open_entry_exposure = _summarize_open_entry_exposure(strategy_open_orders_for_exposure)
+    dual_side_position = _truthy(position_mode.get("dualSidePosition"))
+    actual_position = extract_symbol_position(account_info, symbol)
+    actual_net_qty = _safe_float(actual_position.get("positionAmt"))
+    prefer_entry_price_cost_basis = _uses_entry_price_cost_basis(effective_strategy_profile)
+    actual_cost_basis_price = _position_cost_basis_price(
+        actual_position,
+        prefer_entry_price=prefer_entry_price_cost_basis,
+    )
+    actual_break_even_price = max(_safe_float(actual_position.get("breakEvenPrice")), 0.0)
+    long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
+    short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
+    if (
+        _is_inventory_target_neutral_mode(requested_strategy_mode)
+        or _is_competition_inventory_grid_mode(requested_strategy_mode)
+        or _is_maker_volatility_inventory_mode(requested_strategy_mode)
+        or _is_best_quote_maker_volume_mode(requested_strategy_mode)
+    ):
+        current_long_qty = max(actual_net_qty, 0.0)
+        current_short_qty = max(-actual_net_qty, 0.0)
+    elif _is_one_way_short_mode(requested_strategy_mode):
+        current_long_qty = 0.0
+        current_short_qty = max(-actual_net_qty, 0.0)
+    else:
+        current_long_qty = max(_position_qty(long_position, position_side="LONG" if requested_strategy_mode == "hedge_neutral" else None), 0.0)
+        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
+    current_long_notional = current_long_qty * max(mid_price, 0.0)
+    current_short_notional = current_short_qty * max(mid_price, 0.0)
+
     volatility_entry_pause = resolve_volatility_entry_pause(
         adaptive_step=adaptive_step,
         state=state,
@@ -9196,8 +9607,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
         now=plan_now,
         min_observation_seconds=getattr(effective_args, "volatility_entry_pause_min_observation_seconds", 180.0),
-        current_long_notional=current_long_qty * max(mid_price, 0.0),
-        current_short_notional=current_short_qty * max(mid_price, 0.0),
+        current_long_notional=current_long_notional,
+        current_short_notional=current_short_notional,
         inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
     )
     elastic_volume: dict[str, Any] = {
@@ -9211,6 +9622,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "report_only": bool(getattr(effective_args, "regime_entry_budget_report_only", True)),
         "state": "disabled" if not bool(getattr(effective_args, "regime_entry_budget_enabled", False)) else "not_evaluated",
         "reasons": [],
+    }
+    hard_loss_forced_reduce_episode: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
+        "active": False,
+        "disarmed": False,
+        "reason": "not_evaluated",
     }
 
     effective_args = argparse.Namespace(**vars(effective_args))
@@ -9344,41 +9761,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             shift_steps=effective_args.shift_steps,
         )
 
-    credentials = load_binance_api_credentials()
-    if credentials is None:
-        raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
-    api_key, api_secret = credentials
-
-    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=args.recv_window)
-    position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
-    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
-    dual_side_position = _truthy(position_mode.get("dualSidePosition"))
-    actual_position = extract_symbol_position(account_info, symbol)
-    actual_net_qty = _safe_float(actual_position.get("positionAmt"))
-    prefer_entry_price_cost_basis = _uses_entry_price_cost_basis(effective_strategy_profile)
-    actual_cost_basis_price = _position_cost_basis_price(
-        actual_position,
-        prefer_entry_price=prefer_entry_price_cost_basis,
-    )
-    actual_break_even_price = max(_safe_float(actual_position.get("breakEvenPrice")), 0.0)
-    long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
-    short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
-    if (
-        _is_inventory_target_neutral_mode(requested_strategy_mode)
-        or _is_competition_inventory_grid_mode(requested_strategy_mode)
-        or _is_maker_volatility_inventory_mode(requested_strategy_mode)
-        or _is_best_quote_maker_volume_mode(requested_strategy_mode)
-    ):
-        current_long_qty = max(actual_net_qty, 0.0)
-        current_short_qty = max(-actual_net_qty, 0.0)
-    elif _is_one_way_short_mode(requested_strategy_mode):
-        current_long_qty = 0.0
-        current_short_qty = max(-actual_net_qty, 0.0)
-    else:
-        current_long_qty = max(_position_qty(long_position, position_side="LONG" if requested_strategy_mode == "hedge_neutral" else None), 0.0)
-        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
-    current_long_notional = current_long_qty * max(mid_price, 0.0)
-    current_short_notional = current_short_qty * max(mid_price, 0.0)
     execution_regime = build_execution_regime_report(
         args=args,
         state=state,
@@ -10057,6 +10439,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
                 external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
                 external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             )
             cap_controls = apply_hedge_position_notional_caps(
                 plan=plan,
@@ -10064,6 +10448,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_notional=controls["current_short_notional"],
                 max_long_position_notional=effective_args.max_position_notional,
                 max_short_position_notional=effective_args.max_short_position_notional,
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
@@ -10081,6 +10467,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_mid_price_for_buys=None,
                 external_long_pause=False,
                 external_pause_reasons=[],
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             )
             cap_controls = apply_hedge_position_notional_caps(
                 plan=plan,
@@ -10088,6 +10475,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_notional=controls["current_short_notional"],
                 max_long_position_notional=None,
                 max_short_position_notional=effective_args.max_short_position_notional,
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
@@ -10112,6 +10500,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
                 external_buy_pause=bool(market_guard["buy_pause_active"]),
                 external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
             )
             cap_controls = apply_max_position_notional_cap(
                 plan=plan,
@@ -10120,6 +10509,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
             )
             target_base_qty = 0.0
             bootstrap_qty = 0.0
@@ -10305,6 +10695,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
@@ -10316,6 +10708,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -10612,6 +11006,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
@@ -10623,6 +11019,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -10863,6 +11261,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
             external_long_pause=bool(market_guard["buy_pause_active"]),
             external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -10870,6 +11270,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -11046,6 +11448,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
+                pending_entry_buffer_notional=cycle_budget * 0.5,
             ),
         )
         best_quote_maker_volume = {
@@ -11254,6 +11659,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=None,
             external_long_pause=False,
             external_pause_reasons=[],
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -11261,6 +11667,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=None,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -11386,6 +11793,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
             external_buy_pause=bool(market_guard["buy_pause_active"]),
             external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
         )
         if excess_inventory_gate["active"]:
             controls["buy_paused"] = True
@@ -11401,6 +11809,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
         )
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile):
             volume_long_v4_delever = apply_volume_long_v4_staged_delever(
@@ -11514,10 +11923,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ask_price=ask_price,
                 sell_offset_steps=getattr(effective_args, "static_sell_offset_steps", 0.0),
             )
+            hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
+                state=state,
+                enabled=bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
+                triggered=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
+                side="SELL",
+                current_notional=controls["current_long_notional"],
+                target_notional=(
+                    getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
+                    if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
+                    else exposure_escalation.get("target_notional")
+                ),
+                unrealized_pnl=_safe_float(exposure_escalation.get("unrealized_pnl")),
+                hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+                now=plan_now,
+                loss_recover_ratio=0.75,
+            )
+            hard_reduce_disarmed = bool(hard_loss_forced_reduce_episode.get("disarmed"))
             hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
                 plan=plan,
                 enabled=bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
-                active=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
+                active=exposure_escalation.get("reason") == "hard_unrealized_loss_limit" and not hard_reduce_disarmed,
                 side="SELL",
                 current_qty=current_long_qty,
                 current_notional=controls["current_long_notional"],
@@ -11533,8 +11959,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
-                reason=exposure_escalation.get("reason"),
+                reason=(
+                    "hard_loss_episode_disarmed"
+                    if hard_reduce_disarmed
+                    else exposure_escalation.get("reason")
+                ),
             )
+            hard_loss_forced_reduce["unrealized_pnl"] = _safe_float(exposure_escalation.get("unrealized_pnl"))
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
@@ -11628,10 +12059,23 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             hard_cost_basis = adverse_long_cost_price
             hard_unrealized = (mid_price - hard_cost_basis) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
         hard_loss_active = hard_loss_limit > 0 and hard_unrealized <= -hard_loss_limit
+        hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=bool(hard_side) and hard_loss_active,
+            side=hard_side,
+            current_notional=hard_notional,
+            target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+            unrealized_pnl=hard_unrealized,
+            hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+            now=plan_now,
+            loss_recover_ratio=0.75,
+        )
+        hard_reduce_disarmed = bool(hard_loss_forced_reduce_episode.get("disarmed"))
         hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
             plan=plan,
             enabled=True,
-            active=bool(hard_side) and hard_loss_active,
+            active=bool(hard_side) and hard_loss_active and not hard_reduce_disarmed,
             side=hard_side or "SELL",
             current_qty=hard_qty,
             current_notional=hard_notional,
@@ -11643,10 +12087,34 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
-            reason="hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered",
+            reason=(
+                "hard_loss_episode_disarmed"
+                if hard_reduce_disarmed
+                else "hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered"
+            ),
         )
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
+
+    volatility_entry_pause["window_1m_thresholds"] = {
+        "abs_return_ratio": getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+        "amplitude_ratio": getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+    }
+    volatility_entry_pause["window_3m_thresholds"] = {
+        "abs_return_ratio": getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+        "amplitude_ratio": getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+    }
+    hard_loss_rescue_entry_guard = resolve_hard_loss_rescue_entry_guard(
+        state=state,
+        hard_loss_forced_reduce=hard_loss_forced_reduce,
+        volatility_entry_pause=volatility_entry_pause,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        now=plan_now,
+        protect_seconds=180.0,
+        hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+        loss_recover_ratio=0.75,
+    )
 
     if volatility_entry_pause.get("active"):
         entry_pause_reason = volatility_entry_pause.get("reason") or "active"
@@ -11911,6 +12379,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "exposure_escalation": exposure_escalation,
         "exposure_escalation_buy_pause": exposure_escalation_buy_pause,
         "hard_loss_forced_reduce": hard_loss_forced_reduce,
+        "hard_loss_forced_reduce_episode": hard_loss_forced_reduce_episode,
+        "hard_loss_rescue_entry_guard": hard_loss_rescue_entry_guard,
         "active_delever": active_delever,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
@@ -12118,6 +12588,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         plan_report=plan_report,
         strategy_mode=strategy_mode,
     )
+    validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
 
     report = {
         "plan_json": str(args.plan_json),
@@ -12272,6 +12747,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         current_open_orders=current_strategy_open_orders,
     )
     validation["actions"] = apply_anti_chase_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
         actions=validation["actions"],
         plan_report=plan_report,
         strategy_mode=strategy_mode,
@@ -12891,6 +13371,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     parser.add_argument("--max-actual-net-notional", type=float, default=None)
     parser.add_argument("--max-synthetic-drift-notional", type=float, default=None)
+    parser.add_argument("--synthetic-stop-on-unmatched-trades", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--synthetic-stop-on-position-resync", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--reset-state", action="store_true")
     return parser
 
@@ -13211,6 +13693,77 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         )
     if summary.get("audit_error"):
         print(f"  audit_error: {summary['audit_error']}")
+
+
+def _synthetic_manual_intervention_stop_reason(
+    *,
+    args: argparse.Namespace,
+    plan_report: dict[str, Any],
+    reset_requested: bool = False,
+) -> str | None:
+    strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "")).strip()
+    if not _is_synthetic_neutral_mode(strategy_mode) or bool(reset_requested):
+        return None
+    snapshot = plan_report.get("synthetic_ledger") if isinstance(plan_report.get("synthetic_ledger"), dict) else {}
+    unmatched_count = int(_safe_float(snapshot.get("unmatched_trade_count")))
+    if bool(getattr(args, "synthetic_stop_on_unmatched_trades", True)) and unmatched_count > 0:
+        return f"synthetic_manual_intervention_unmatched_trades={unmatched_count}"
+    if bool(getattr(args, "synthetic_stop_on_position_resync", True)) and _truthy(snapshot.get("resynced_to_actual")):
+        return "synthetic_manual_intervention_position_resync"
+    return None
+
+
+def _build_synthetic_manual_stop_summary(
+    *,
+    args: argparse.Namespace,
+    plan_report: dict[str, Any],
+    cycle: int,
+    cycle_started_at: datetime,
+    reason: str,
+) -> dict[str, Any]:
+    snapshot = plan_report.get("synthetic_ledger") if isinstance(plan_report.get("synthetic_ledger"), dict) else {}
+    return {
+        "ts": cycle_started_at.isoformat(),
+        "cycle": cycle,
+        "symbol": str(getattr(args, "symbol", "")).upper().strip(),
+        "strategy_profile": str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)),
+        "effective_strategy_profile": str(
+            plan_report.get("effective_strategy_profile") or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
+        ),
+        "strategy_mode": str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")),
+        "mid_price": _safe_float(plan_report.get("mid_price")),
+        "center_price": _safe_float(plan_report.get("center_price")),
+        "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
+        "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
+        "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
+        "current_short_notional": _safe_float(plan_report.get("current_short_notional")),
+        "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
+        "actual_net_notional": _safe_float(plan_report.get("actual_net_notional")),
+        "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
+        "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
+        "open_order_count": int(plan_report.get("open_order_count", 0) or 0),
+        "kept_order_count": int(plan_report.get("kept_order_count", 0) or 0),
+        "missing_order_count": int(plan_report.get("missing_order_count", 0) or 0),
+        "stale_order_count": int(plan_report.get("stale_order_count", 0) or 0),
+        "placed_count": 0,
+        "canceled_count": 0,
+        "buy_paused": bool(plan_report.get("buy_paused")),
+        "short_paused": bool(plan_report.get("short_paused")),
+        "pause_reasons": list(plan_report.get("pause_reasons") or []),
+        "short_pause_reasons": list(plan_report.get("short_pause_reasons") or []),
+        "buy_cap_applied": bool(plan_report.get("buy_cap_applied")),
+        "synthetic_ledger": dict(snapshot),
+        "synthetic_unmatched_trade_count": int(_safe_float(snapshot.get("unmatched_trade_count"))),
+        "synthetic_resynced_to_actual": bool(_truthy(snapshot.get("resynced_to_actual"))),
+        "reconcile_checked": False,
+        "executed": False,
+        "runtime_status": "stopped",
+        "stop_triggered": True,
+        "stop_reason": reason,
+        "stop_reasons": [reason],
+        "stop_triggered_at": cycle_started_at.isoformat(),
+        "error_message": None,
+    }
 
 
 def main() -> None:
@@ -13682,8 +14235,9 @@ def main() -> None:
                         break
                     time.sleep(args.sleep_seconds)
                     continue
+                reset_requested = bool(args.reset_state)
                 plan_report = generate_plan_report(args)
-                if args.reset_state:
+                if reset_requested:
                     args.reset_state = False
                 _write_json(plan_path, plan_report)
                 _append_jsonl(
@@ -13695,6 +14249,23 @@ def main() -> None:
                         "report": plan_report,
                     },
                 )
+
+                synthetic_stop_reason = _synthetic_manual_intervention_stop_reason(
+                    args=args,
+                    plan_report=plan_report,
+                    reset_requested=reset_requested,
+                )
+                if synthetic_stop_reason:
+                    manual_stop_summary = _build_synthetic_manual_stop_summary(
+                        args=args,
+                        plan_report=plan_report,
+                        cycle=cycle,
+                        cycle_started_at=cycle_started_at,
+                        reason=synthetic_stop_reason,
+                    )
+                    _append_jsonl(summary_path, manual_stop_summary)
+                    _print_cycle_summary(manual_stop_summary)
+                    break
 
                 submit_report = execute_plan_report(args, plan_report)
                 _write_json(submit_report_path, submit_report)

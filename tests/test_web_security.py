@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import io
 import json
+import sqlite3
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +61,7 @@ from grid_optimizer.web import (
     _volatility_reduce_escalation_reason,
     _volatility_trigger_orphan_recovery_action,
 )
+from grid_optimizer.audit import ingest_strategy_adjustment_event, read_strategy_adjustments, strategy_adjustments_db_path
 from grid_optimizer import web as web_module
 
 
@@ -85,6 +87,81 @@ class WebSecurityTests(unittest.TestCase):
         body = _build_running_status_api_body("test-lock-scope", payload_factory)
 
         self.assertEqual(json.loads(body.decode("utf-8")), {"ok": True})
+
+    def test_save_runner_control_config_records_strategy_adjustment_audit(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp) / "output"
+            output.mkdir()
+            existing = output / "billusdt_loop_runner_control.json"
+            existing.write_text(
+                json.dumps(
+                    {
+                        "symbol": "BILLUSDT",
+                        "step_price": 0.00025,
+                        "per_order_notional": 200.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with patch("grid_optimizer.web.runner_control_path_for_symbol", return_value=existing), patch(
+                "grid_optimizer.web._symbol_runner_systemd_enabled", return_value=True
+            ):
+                _save_runner_control_config(
+                    {
+                        "symbol": "BILLUSDT",
+                        "step_price": 0.00025,
+                        "per_order_notional": 220.0,
+                    },
+                    symbol="BILLUSDT",
+                )
+
+            db_path = strategy_adjustments_db_path(output)
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT server_id, symbol, source, diff_json, event_json FROM strategy_adjustments"
+                ).fetchone()
+            self.assertIsNotNone(row)
+            self.assertTrue(row[0])
+            self.assertEqual(row[1], "BILLUSDT")
+            self.assertEqual(row[2], "runner_control_save")
+            diff = json.loads(row[3])
+            self.assertEqual(diff["per_order_notional"]["before"], 200.0)
+            self.assertEqual(diff["per_order_notional"]["after"], 220.0)
+            event = json.loads(row[4])
+            self.assertEqual(event["symbol"], "BILLUSDT")
+            self.assertIn("server_id", event)
+
+    def test_ingest_strategy_adjustment_event_records_controller_row(self) -> None:
+        with TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "output" / "strategy_adjustments.sqlite3"
+            result = ingest_strategy_adjustment_event(
+                {
+                    "created_at": "2026-05-11T12:00:00+00:00",
+                    "server_id": "114",
+                    "symbol": "BILLUSDT",
+                    "source": "runner_control_save",
+                    "actor": "codex",
+                    "reason": "boost_volume",
+                    "control_path": "/home/ubuntu/wangge/output/billusdt_loop_runner_control.json",
+                    "before": {"per_order_notional": 200.0},
+                    "after": {"per_order_notional": 220.0},
+                    "diff": {"per_order_notional": {"before": 200.0, "after": 220.0}},
+                },
+                db_path=db_path,
+            )
+
+            self.assertGreater(result["id"], 0)
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute(
+                    "SELECT server_id, symbol, reason, diff_json FROM strategy_adjustments"
+                ).fetchone()
+            self.assertEqual(row[0], "114")
+            self.assertEqual(row[1], "BILLUSDT")
+            self.assertEqual(row[2], "boost_volume")
+            self.assertEqual(json.loads(row[3])["per_order_notional"]["after"], 220.0)
+            adjustments = read_strategy_adjustments(db_path=db_path, symbol="BILLUSDT", server_id="114")
+            self.assertEqual(len(adjustments), 1)
+            self.assertEqual(adjustments[0]["diff"]["per_order_notional"]["after"], 220.0)
 
     @patch("grid_optimizer.web.delete_futures_order")
     @patch("grid_optimizer.web.fetch_futures_open_orders")

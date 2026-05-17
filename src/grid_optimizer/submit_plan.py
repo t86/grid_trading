@@ -557,8 +557,73 @@ def apply_anti_chase_entry_guard_to_actions(
     return result
 
 
+def _entry_side_from_order(order: dict[str, Any], *, strategy_mode: str) -> str | None:
+    if _reduce_only_cap_side(order=order, strategy_mode=strategy_mode) is not None:
+        return None
+    side = str(order.get("side", "")).upper().strip()
+    role = str(order.get("role", "entry")).strip().lower()
+    if role in {"entry_short", "bootstrap_short", "grid_entry_short"}:
+        return "short"
+    if role in {"entry_long", "bootstrap_long", "grid_entry_long"}:
+        return "long"
+    if role in {"entry", "bootstrap", "grid_entry"}:
+        if side == "SELL":
+            return "short"
+        if side == "BUY":
+            return "long"
+    return None
+
+
+def apply_hard_loss_rescue_entry_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+) -> dict[str, Any]:
+    guard = plan_report.get("hard_loss_rescue_entry_guard")
+    if not isinstance(guard, dict) or not bool(guard.get("active")):
+        return actions
+
+    block_long_entries = bool(guard.get("block_long_entries"))
+    block_short_entries = bool(guard.get("block_short_entries"))
+    if not block_long_entries and not block_short_entries:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        entry_side = _entry_side_from_order(order, strategy_mode=strategy_mode)
+        should_drop = (entry_side == "long" and block_long_entries) or (
+            entry_side == "short" and block_short_entries
+        )
+        if should_drop:
+            dropped = dict(order)
+            dropped["hard_loss_rescue_drop_reason"] = guard.get("reason") or "hard_loss_rescue_active"
+            dropped_orders.append(dropped)
+        else:
+            kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["hard_loss_rescue_entry_guard"] = {
+        "enabled": True,
+        "active": True,
+        "block_long_entries": block_long_entries,
+        "block_short_entries": block_short_entries,
+        "reason": guard.get("reason"),
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     symbol = str(plan_report.get("symbol", "")).upper().strip()
+    forced_reduce_orders = [
+        item for item in plan_report.get("forced_reduce_orders", []) if isinstance(item, dict)
+    ]
     bootstrap_orders = [
         item for item in plan_report.get("bootstrap_orders", []) if isinstance(item, dict)
     ]
@@ -570,7 +635,7 @@ def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     ]
     if symbol:
         stale_orders = [item for item in stale_orders if _is_strategy_order(item, symbol)]
-    place_orders = [*bootstrap_orders, *missing_orders]
+    place_orders = [*forced_reduce_orders, *bootstrap_orders, *missing_orders]
     place_notional = sum(_safe_float(item.get("notional")) for item in place_orders)
     return {
         "place_orders": place_orders,
@@ -594,13 +659,22 @@ def preserve_queue_priority_in_execution_actions(
     """Prefer preserving queued orders unless the refreshed plan truly needs less size or a new bucket."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
     cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
+    urgent_place_orders: list[dict[str, Any]] = []
+    queue_place_orders: list[dict[str, Any]] = []
+    for order in place_orders:
+        if _is_urgent_reduce_only_order(order, strategy_mode="synthetic_neutral"):
+            urgent_place_orders.append(order)
+        else:
+            queue_place_orders.append(order)
+    place_orders = queue_place_orders
     if not place_orders or not cancel_orders:
+        merged_place_orders = [*urgent_place_orders, *place_orders]
         return {
-            "place_orders": place_orders,
+            "place_orders": merged_place_orders,
             "cancel_orders": cancel_orders,
-            "place_count": len(place_orders),
+            "place_count": len(merged_place_orders),
             "cancel_count": len(cancel_orders),
-            "place_notional": sum(_safe_float(item.get("notional")) for item in place_orders),
+            "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
         }
 
     cancel_indices_by_bucket: dict[str, list[int]] = {}
@@ -648,12 +722,13 @@ def preserve_queue_priority_in_execution_actions(
             projected_place_templates[key] = template
 
     if not projected_place_totals:
+        merged_place_orders = [*urgent_place_orders, *place_orders]
         return {
-            "place_orders": place_orders,
+            "place_orders": merged_place_orders,
             "cancel_orders": cancel_orders,
-            "place_count": len(place_orders),
+            "place_count": len(merged_place_orders),
             "cancel_count": len(cancel_orders),
-            "place_notional": sum(_safe_float(item.get("notional")) for item in place_orders),
+            "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
         }
 
     preserved_cancel_indices: set[int] = set()
@@ -719,13 +794,64 @@ def preserve_queue_priority_in_execution_actions(
     adjusted_cancel_orders = [
         order for index, order in enumerate(cancel_orders) if index not in preserved_cancel_indices
     ]
-    return {
-        "place_orders": adjusted_place_orders,
-        "cancel_orders": adjusted_cancel_orders,
-        "place_count": len(adjusted_place_orders),
-        "cancel_count": len(adjusted_cancel_orders),
-        "place_notional": sum(_safe_float(item.get("notional")) for item in adjusted_place_orders),
+    pending_cancel_buckets = {
+        _order_bucket_key(
+            str(order.get("side", "")).upper().strip(),
+            _safe_float(order.get("price")),
+            _order_position_side(order),
+        )
+        for order in adjusted_cancel_orders
+        if str(order.get("side", "")).upper().strip() in {"BUY", "SELL"}
+        and _safe_float(order.get("price")) > 0
     }
+    if pending_cancel_buckets:
+        safe_place_orders: list[dict[str, Any]] = []
+        deferred_place_orders: list[dict[str, Any]] = []
+        for order in adjusted_place_orders:
+            side = str(order.get("side", "")).upper().strip()
+            if side not in {"BUY", "SELL"}:
+                safe_place_orders.append(order)
+                continue
+            prepared_order, _ = prepare_post_only_order_request(
+                order=order,
+                side=side,
+                live_bid_price=live_bid_price,
+                live_ask_price=live_ask_price,
+                tick_size=tick_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                step_size=step_size,
+                post_only=_order_prefers_post_only(order),
+            )
+            price = (
+                _safe_float(prepared_order.get("submitted_price"))
+                if prepared_order is not None
+                else _safe_float(order.get("price"))
+            )
+            bucket = _order_bucket_key(side, price, _order_position_side(order))
+            if bucket in pending_cancel_buckets:
+                deferred = dict(order)
+                deferred["defer_reason"] = "pending_same_bucket_cancel"
+                deferred_place_orders.append(deferred)
+                continue
+            safe_place_orders.append(order)
+        adjusted_place_orders = safe_place_orders
+    merged_place_orders = [*urgent_place_orders, *adjusted_place_orders]
+    result = {
+        "place_orders": merged_place_orders,
+        "cancel_orders": adjusted_cancel_orders,
+        "place_count": len(merged_place_orders),
+        "cancel_count": len(adjusted_cancel_orders),
+        "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
+    }
+    if pending_cancel_buckets:
+        result["same_bucket_cancel_place_guard"] = {
+            "enabled": True,
+            "pending_cancel_bucket_count": len(pending_cancel_buckets),
+            "deferred_place_count": len(deferred_place_orders),
+            "deferred_place_orders": deferred_place_orders,
+        }
+    return result
 
 
 def estimate_mid_drift_steps(

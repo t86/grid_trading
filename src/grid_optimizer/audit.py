@@ -1,6 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
+import sqlite3
+import socket
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,6 +50,261 @@ def read_json(path: Path) -> dict[str, Any] | None:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def strategy_adjustments_db_path(output_dir: Path | str = "output") -> Path:
+    return Path(output_dir) / "strategy_adjustments.sqlite3"
+
+
+def _top_level_diff(before: dict[str, Any], after: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    diff: dict[str, dict[str, Any]] = {}
+    for key in sorted(set(before) | set(after)):
+        old = before.get(key)
+        new = after.get(key)
+        if old != new:
+            diff[key] = {"before": old, "after": new}
+    return diff
+
+
+def _strategy_adjustment_event(
+    *,
+    symbol: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+    control_path: Path,
+    source: str,
+    actor: str | None,
+    reason: str | None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
+    safe_before = dict(before or {})
+    safe_after = dict(after or {})
+    safe_symbol = str(symbol or safe_after.get("symbol") or safe_before.get("symbol") or "").upper().strip()
+    return {
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+        "server_id": os.environ.get("GRID_SERVER_ID") or socket.gethostname(),
+        "symbol": safe_symbol,
+        "source": str(source or "runner_control_save"),
+        "actor": actor,
+        "reason": reason,
+        "control_path": str(control_path),
+        "before": safe_before,
+        "after": safe_after,
+        "diff": _top_level_diff(safe_before, safe_after),
+        "git_commit": os.environ.get("GRID_GIT_COMMIT") or None,
+    }
+
+
+def _ensure_strategy_adjustment_schema(conn: sqlite3.Connection) -> None:
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_adjustments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            server_id TEXT,
+            symbol TEXT NOT NULL,
+            source TEXT NOT NULL,
+            actor TEXT,
+            reason TEXT,
+            control_path TEXT NOT NULL,
+            before_json TEXT NOT NULL,
+            after_json TEXT NOT NULL,
+            diff_json TEXT NOT NULL,
+            event_json TEXT NOT NULL
+        )
+        """
+    )
+    columns = {row[1] for row in conn.execute("PRAGMA table_info(strategy_adjustments)")}
+    for name, ddl in {
+        "server_id": "ALTER TABLE strategy_adjustments ADD COLUMN server_id TEXT",
+        "event_json": "ALTER TABLE strategy_adjustments ADD COLUMN event_json TEXT NOT NULL DEFAULT '{}'",
+    }.items():
+        if name not in columns:
+            conn.execute(ddl)
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_strategy_adjustments_symbol_time "
+        "ON strategy_adjustments(symbol, created_at)"
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS strategy_adjustment_outbox (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            target_url TEXT NOT NULL,
+            event_json TEXT NOT NULL,
+            error TEXT,
+            delivered_at TEXT
+        )
+        """
+    )
+
+
+def _post_strategy_adjustment_to_controller(event: dict[str, Any], *, timeout: float = 2.0) -> tuple[bool, str | None]:
+    url = str(os.environ.get("GRID_STRATEGY_AUDIT_CONTROLLER_URL") or "").strip()
+    if not url:
+        return True, None
+    token = str(os.environ.get("GRID_STRATEGY_AUDIT_TOKEN") or "").strip()
+    data = json.dumps(event, ensure_ascii=False).encode("utf-8")
+    headers = {"Content-Type": "application/json; charset=utf-8"}
+    if token:
+        headers["X-Grid-Audit-Token"] = token
+    try:
+        with urlopen(Request(url, data=data, headers=headers, method="POST"), timeout=timeout) as response:
+            status = getattr(response, "status", 200)
+            if 200 <= int(status) < 300:
+                return True, None
+            return False, f"HTTP {status}"
+    except (HTTPError, URLError, TimeoutError, OSError) as exc:
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def append_strategy_adjustment_audit(
+    *,
+    symbol: str,
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+    control_path: Path,
+    source: str = "runner_control_save",
+    actor: str | None = None,
+    reason: str | None = None,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    """Persist runner strategy/config changes locally and optionally mirror to a controller."""
+
+    target_db = db_path or strategy_adjustments_db_path(Path(control_path).parent)
+    target_db.parent.mkdir(parents=True, exist_ok=True)
+    event = _strategy_adjustment_event(
+        symbol=symbol,
+        before=before,
+        after=after,
+        control_path=control_path,
+        source=source,
+        actor=actor,
+        reason=reason,
+    )
+    with sqlite3.connect(target_db) as conn:
+        _ensure_strategy_adjustment_schema(conn)
+        conn.execute(
+            """
+            INSERT INTO strategy_adjustments (
+                created_at, server_id, symbol, source, actor, reason, control_path,
+                before_json, after_json, diff_json, event_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event["created_at"],
+                event["server_id"],
+                event["symbol"],
+                event["source"],
+                actor,
+                reason,
+                str(control_path),
+                json.dumps(event["before"], ensure_ascii=False, sort_keys=True),
+                json.dumps(event["after"], ensure_ascii=False, sort_keys=True),
+                json.dumps(event["diff"], ensure_ascii=False, sort_keys=True),
+                json.dumps(event, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        delivered, error = _post_strategy_adjustment_to_controller(event)
+        if not delivered:
+            conn.execute(
+                """
+                INSERT INTO strategy_adjustment_outbox (
+                    created_at, target_url, event_json, error, delivered_at
+                ) VALUES (?, ?, ?, ?, NULL)
+                """,
+                (
+                    datetime.now(timezone.utc).isoformat(),
+                    str(os.environ.get("GRID_STRATEGY_AUDIT_CONTROLLER_URL") or ""),
+                    json.dumps(event, ensure_ascii=False, sort_keys=True),
+                    error,
+                ),
+            )
+    return event
+
+
+def ingest_strategy_adjustment_event(
+    event: dict[str, Any],
+    *,
+    db_path: Path | None = None,
+) -> dict[str, Any]:
+    target_db = db_path or strategy_adjustments_db_path()
+    target_db.parent.mkdir(parents=True, exist_ok=True)
+    safe_event = dict(event or {})
+    before = safe_event.get("before") if isinstance(safe_event.get("before"), dict) else {}
+    after = safe_event.get("after") if isinstance(safe_event.get("after"), dict) else {}
+    diff = safe_event.get("diff") if isinstance(safe_event.get("diff"), dict) else _top_level_diff(before, after)
+    created_at = str(safe_event.get("created_at") or datetime.now(timezone.utc).isoformat())
+    symbol = str(safe_event.get("symbol") or after.get("symbol") or before.get("symbol") or "").upper().strip()
+    with sqlite3.connect(target_db) as conn:
+        _ensure_strategy_adjustment_schema(conn)
+        cursor = conn.execute(
+            """
+            INSERT INTO strategy_adjustments (
+                created_at, server_id, symbol, source, actor, reason, control_path,
+                before_json, after_json, diff_json, event_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                created_at,
+                str(safe_event.get("server_id") or ""),
+                symbol,
+                str(safe_event.get("source") or "controller_ingest"),
+                safe_event.get("actor"),
+                safe_event.get("reason"),
+                str(safe_event.get("control_path") or ""),
+                json.dumps(before, ensure_ascii=False, sort_keys=True),
+                json.dumps(after, ensure_ascii=False, sort_keys=True),
+                json.dumps(diff, ensure_ascii=False, sort_keys=True),
+                json.dumps(safe_event, ensure_ascii=False, sort_keys=True),
+            ),
+        )
+        row_id = int(cursor.lastrowid or 0)
+    return {"id": row_id, "symbol": symbol, "created_at": created_at}
+
+
+def read_strategy_adjustments(
+    *,
+    db_path: Path | None = None,
+    symbol: str | None = None,
+    server_id: str | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    target_db = db_path or strategy_adjustments_db_path()
+    if not target_db.exists():
+        return []
+    safe_limit = min(max(int(limit or 100), 1), 1000)
+    where: list[str] = []
+    params: list[Any] = []
+    normalized_symbol = str(symbol or "").upper().strip()
+    normalized_server = str(server_id or "").strip()
+    if normalized_symbol:
+        where.append("symbol = ?")
+        params.append(normalized_symbol)
+    if normalized_server:
+        where.append("server_id = ?")
+        params.append(normalized_server)
+    sql = (
+        "SELECT id, created_at, server_id, symbol, source, actor, reason, control_path, "
+        "before_json, after_json, diff_json, event_json "
+        "FROM strategy_adjustments"
+    )
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY created_at DESC, id DESC LIMIT ?"
+    params.append(safe_limit)
+    rows: list[dict[str, Any]] = []
+    with sqlite3.connect(target_db) as conn:
+        conn.row_factory = sqlite3.Row
+        for row in conn.execute(sql, params):
+            item = dict(row)
+            for key in ("before_json", "after_json", "diff_json", "event_json"):
+                try:
+                    item[key[:-5] if key.endswith("_json") else key] = json.loads(item.pop(key) or "{}")
+                except json.JSONDecodeError:
+                    item[key[:-5] if key.endswith("_json") else key] = {}
+            rows.append(item)
+    return rows
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:

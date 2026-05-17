@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     apply_anti_chase_entry_guard_to_actions,
+    apply_hard_loss_rescue_entry_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
     enforce_execution_action_limits,
@@ -50,6 +51,38 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(actions["place_count"], 3)
         self.assertEqual(actions["cancel_count"], 1)
         self.assertAlmostEqual(actions["place_notional"], 202.32531, places=8)
+
+    def test_build_execution_actions_prioritizes_forced_reduce_orders(self) -> None:
+        report = {
+            "symbol": "BILLUSDT",
+            "forced_reduce_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                }
+            ],
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 0.1512, "qty": 100.0, "notional": 15.12, "role": "entry"}
+            ],
+            "missing_orders": [
+                {"side": "SELL", "price": 0.1520, "qty": 100.0, "notional": 15.2, "role": "take_profit_long"}
+            ],
+            "stale_orders": [],
+        }
+
+        actions = build_execution_actions(report)
+
+        self.assertEqual(actions["place_count"], 3)
+        self.assertEqual(actions["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(actions["place_orders"][0]["time_in_force"], "IOC")
+        self.assertTrue(actions["place_orders"][0]["force_reduce_only"])
+        self.assertAlmostEqual(actions["place_notional"], 110.19836, places=8)
 
     def test_build_execution_actions_excludes_manual_stale_orders(self) -> None:
         report = {
@@ -170,6 +203,55 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 0)
         self.assertEqual(capped["reduce_only_position_cap"]["displaced_order_count"], 1)
 
+    def test_queue_priority_preserves_urgent_forced_reduce_order(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                },
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "take_profit_long",
+                },
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "SELL",
+                    "price": "0.15186",
+                    "origQty": "526",
+                    "positionSide": "BOTH",
+                }
+            ],
+            "place_count": 2,
+            "cancel_count": 1,
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.15186,
+            live_ask_price=0.15187,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(adjusted["place_orders"][0]["execution_type"], "aggressive")
+        self.assertEqual(adjusted["place_orders"][0]["time_in_force"], "IOC")
+        self.assertTrue(adjusted["place_orders"][0]["force_reduce_only"])
+
     def test_anti_chase_guard_drops_long_entries_but_keeps_reduce_only_sells(self) -> None:
         actions = {
             "place_orders": [
@@ -236,6 +318,52 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guarded["place_count"], 1)
         self.assertEqual(guarded["place_orders"][0]["role"], "take_profit_short")
         self.assertEqual(guarded["anti_chase_entry_guard"]["dropped_order_count"], 1)
+
+    def test_hard_loss_rescue_guard_blocks_same_direction_entries_only(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.1565,
+                    "qty": 766.0,
+                    "notional": 119.879,
+                    "role": "hard_loss_forced_reduce_short",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                },
+                {"side": "BUY", "price": 0.1540, "qty": 843.0, "notional": 129.822, "role": "take_profit_short"},
+                {"side": "SELL", "price": 0.1600, "qty": 812.0, "notional": 129.92, "role": "entry_short"},
+                {"side": "BUY", "price": 0.1545, "qty": 841.0, "notional": 129.9345, "role": "entry_long"},
+            ],
+            "cancel_orders": [],
+            "place_count": 4,
+            "cancel_count": 0,
+            "place_notional": 509.5555,
+        }
+        plan_report = {
+            "hard_loss_rescue_entry_guard": {
+                "active": True,
+                "block_short_entries": True,
+                "block_long_entries": False,
+                "reason": "protect_window_remaining=120s",
+            }
+        }
+
+        guarded = apply_hard_loss_rescue_entry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(
+            [item["role"] for item in guarded["place_orders"]],
+            ["hard_loss_forced_reduce_short", "take_profit_short", "entry_long"],
+        )
+        self.assertEqual(guarded["place_count"], 3)
+        guard = guarded["hard_loss_rescue_entry_guard"]
+        self.assertEqual(guard["dropped_order_count"], 1)
+        self.assertEqual(guard["dropped_orders"][0]["role"], "entry_short")
 
     def test_deferred_action_limits_allow_capped_reduce_only_orders(self) -> None:
         now = datetime(2026, 5, 5, 0, 20, tzinfo=timezone.utc)
@@ -337,7 +465,7 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
         self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
 
-    def test_preserve_queue_priority_keeps_replace_when_projected_bucket_needs_smaller_qty(self) -> None:
+    def test_preserve_queue_priority_defers_smaller_same_bucket_place_after_cancel(self) -> None:
         actions = {
             "place_orders": [
                 {"side": "BUY", "price": 0.05064, "qty": 350.0, "notional": 17.724, "role": "entry"}
@@ -357,9 +485,8 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 1)
-        self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 350.0, places=8)
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["place_orders"], [])
 
     def test_preserve_queue_priority_keeps_exact_same_bucket_subset_when_qty_shrinks(self) -> None:
         actions = {
@@ -385,7 +512,7 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(adjusted["cancel_count"], 1)
         self.assertEqual(adjusted["cancel_orders"][0]["orderId"], 1)
 
-    def test_preserve_queue_priority_keeps_subset_and_places_delta_when_qty_shrinks(self) -> None:
+    def test_preserve_queue_priority_defers_delta_when_same_bucket_qty_shrinks(self) -> None:
         actions = {
             "place_orders": [
                 {"side": "BUY", "price": 0.05064, "qty": 650.0, "notional": 32.916, "role": "entry"}
@@ -406,9 +533,43 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["place_orders"], [])
+
+    def test_preserve_queue_priority_defers_same_bucket_place_while_cancel_pending(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.14379, "qty": 20.0, "notional": 2.8758, "role": "entry_short"},
+                {"side": "BUY", "price": 0.14200, "qty": 35.0, "notional": 4.97, "role": "entry_long"},
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "SELL",
+                    "price": "0.14379",
+                    "origQty": "35",
+                    "positionSide": "BOTH",
+                    "clientOrderId": "gx-billu-entrysho-1-11111111",
+                },
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.14250,
+            live_ask_price=0.14378,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=0.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 1)
         self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
+        self.assertEqual(adjusted["place_orders"][0]["side"], "BUY")
+        guard = adjusted["same_bucket_cancel_place_guard"]
+        self.assertEqual(guard["deferred_place_count"], 1)
+        self.assertEqual(guard["deferred_place_orders"][0]["role"], "entry_short")
 
     def test_validate_plan_report_rejects_old_plan_and_stale_orders_without_flag(self) -> None:
         now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)
