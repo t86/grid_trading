@@ -621,6 +621,7 @@ class LoopRunnerTests(unittest.TestCase):
         stream = SimpleNamespace(
             snapshot_open_orders=lambda: [],
             open_order_state_age_seconds=lambda: 1.0,
+            status=lambda: {"last_account_update_age_seconds": 1.0},
         )
         args = Namespace(user_data_stream=stream)
         state = {
@@ -7242,7 +7243,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "0.144", "lastFundingRate": "0.0"}])
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers", return_value=[{"bid_price": "0.1439", "ask_price": "0.1441"}])
     @patch("grid_optimizer.loop_runner.validate_plan_report")
-    def test_execute_plan_report_uses_rest_account_snapshot_even_when_stream_is_fresh(
+    def test_execute_plan_report_uses_rest_position_and_fresh_stream_open_orders(
         self,
         mock_validate_plan_report,
         _mock_book_tickers,
@@ -7289,6 +7290,7 @@ class LoopRunnerTests(unittest.TestCase):
             ],
             snapshot_open_orders=lambda: [],
             open_order_state_age_seconds=lambda: 1.0,
+            status=lambda: {"last_account_update_age_seconds": 1.0},
         )
         args = Namespace(
             symbol="BILLUSDT",
@@ -7330,6 +7332,109 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["account_snapshot_sources"]["open_orders"], "user_data_stream")
         mock_account_info.assert_called_once_with("key", "secret", recv_window=5000, use_cache=False)
         mock_open_orders.assert_called_once_with("BILLUSDT", "key", "secret", recv_window=5000, use_cache=False)
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index", return_value=[{"markPrice": "0.144", "lastFundingRate": "0.0"}])
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers", return_value=[{"bid_price": "0.1439", "ask_price": "0.1441"}])
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_uses_rest_open_orders_when_account_stream_is_stale(
+        self,
+        mock_validate_plan_report,
+        _mock_book_tickers,
+        _mock_premium_index,
+        _mock_credentials,
+        _mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        _mock_change_leverage,
+        mock_post_order,
+        _mock_update_inventory_refs,
+        _mock_update_synthetic_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "entry", "side": "BUY", "qty": 35.0, "price": 0.1439},
+                ],
+            },
+        }
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BILLUSDT", "positionAmt": "-100", "entryPrice": "0.144"}],
+        }
+        mock_open_orders.return_value = []
+        mock_post_order.return_value = {"orderId": 123, "clientOrderId": "gx-billu-test"}
+        stale_observed_at = time.monotonic() - 90.0
+        stream = SimpleNamespace(
+            snapshot_events=lambda: [],
+            snapshot_account_positions=lambda: [
+                {
+                    "symbol": "BILLUSDT",
+                    "positionSide": "BOTH",
+                    "positionAmt": "-100",
+                    "entryPrice": "0.144",
+                    "breakEvenPrice": "0.144",
+                    "observed_at": stale_observed_at,
+                }
+            ],
+            snapshot_open_orders=lambda: [{"symbol": "BILLUSDT", "clientOrderId": "gx-billu-stale"}],
+            open_order_state_age_seconds=lambda: 1.0,
+            status=lambda: {"last_account_update_age_seconds": 90.0},
+            replace_open_orders_from_rest=lambda orders: None,
+        )
+        args = Namespace(
+            symbol="BILLUSDT",
+            strategy_mode="synthetic_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/billusdt_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=20,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/billusdt_loop_state.json",
+            user_data_stream=stream,
+        )
+        plan_report = {
+            "symbol": "BILLUSDT",
+            "strategy_mode": "synthetic_neutral",
+            "mid_price": 0.144,
+            "step_price": 0.00028,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 100.0,
+            "actual_net_qty": -100.0,
+            "symbol_info": {
+                "tick_size": 0.00001,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["executed"])
+        self.assertEqual(report["account_snapshot_sources"]["account_info"], "rest")
+        self.assertEqual(report["account_snapshot_sources"]["open_orders"], "rest")
+        self.assertEqual(report["account_snapshot_sources"]["account_position_stream_age_seconds"], "90.000000")
+        mock_account_info.assert_called_once_with("key", "secret", recv_window=5000, use_cache=False)
+        mock_open_orders.assert_any_call("BILLUSDT", "key", "secret", recv_window=5000)
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")

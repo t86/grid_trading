@@ -4850,9 +4850,18 @@ def _fetch_runner_account_info_rest(
     return fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window, use_cache=False)
 
 
-def _stream_open_orders_snapshot(args: argparse.Namespace | None, symbol: str) -> list[dict[str, Any]] | None:
+def _stream_open_orders_snapshot(
+    args: argparse.Namespace | None,
+    symbol: str,
+    *,
+    max_account_position_stream_age_seconds: float | None = ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+) -> list[dict[str, Any]] | None:
     if args is None:
         return None
+    if max_account_position_stream_age_seconds is not None and max_account_position_stream_age_seconds >= 0:
+        account_position_age = _runner_account_position_stream_age_seconds(args)
+        if account_position_age is None or account_position_age > max_account_position_stream_age_seconds:
+            return None
     stream = getattr(args, "user_data_stream", None)
     if stream is None or not hasattr(stream, "snapshot_open_orders"):
         return None
@@ -4912,7 +4921,11 @@ def _resolve_runner_account_snapshot(
     if stream_account_position_age is not None:
         sources["account_position_stream_age_seconds"] = f"{stream_account_position_age:.6f}"
     setattr(args, "_cached_multi_assets_margin", _truthy(account_info.get("multiAssetsMargin")))
-    open_orders = _stream_open_orders_snapshot(args, symbol)
+    open_orders = _stream_open_orders_snapshot(
+        args,
+        symbol,
+        max_account_position_stream_age_seconds=ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+    )
     if open_orders is None:
         open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
         sources["open_orders"] = "rest"

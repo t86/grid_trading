@@ -295,6 +295,7 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
                 }
             ],
             open_order_state_age_seconds=lambda: 1.0,
+            status=lambda: {"last_account_update_age_seconds": 1.0},
             snapshot_events=lambda: [],
         )
         args = argparse.Namespace(user_data_stream=stream)
@@ -310,6 +311,7 @@ class LoopRunnerExecutionEventHelpersTests(unittest.TestCase):
         stream = SimpleNamespace(
             snapshot_open_orders=lambda: [],
             open_order_state_age_seconds=lambda: 1.0,
+            status=lambda: {"last_account_update_age_seconds": 1.0},
             snapshot_events=lambda: [
                 ExecutionEvent(
                     kind="ORDER_NEW",
