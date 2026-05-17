@@ -1686,9 +1686,10 @@ def _run_periodic_reconcile(
     previous_over_10 = int(snapshot.get("open_order_diff_over_10_count", 0) or 0)
     open_order_diff_over_10_count = previous_over_10 + 1 if abs(open_order_diff) > PROTECTIVE_OPEN_ORDER_DIFF_LIMIT else 0
     protective_stop_reasons: list[str] = []
+    protective_warning_reasons: list[str] = []
     stream_age_seconds = stream_position.get("stream_age_seconds") if stream_position is not None else None
     if stream_age_seconds is not None and _safe_float(stream_age_seconds) > ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS:
-        protective_stop_reasons.append("account_position_stream_stale")
+        protective_warning_reasons.append("account_position_stream_stale")
     if open_order_diff_over_10_count >= PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS:
         protective_stop_reasons.append("open_order_diff_persistent")
     ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9 and not protective_stop_reasons
@@ -1728,6 +1729,7 @@ def _run_periodic_reconcile(
         "actual_net_qty_diff": actual_net_qty_diff,
         "protective_stop_required": bool(protective_stop_reasons),
         "protective_stop_reasons": protective_stop_reasons,
+        "protective_warning_reasons": protective_warning_reasons,
         "ok": ok,
         "message": "OK" if ok else "; ".join(message_parts),
     }
@@ -1736,6 +1738,12 @@ def _run_periodic_reconcile(
             snapshot["message"] = f"{snapshot['message']}; protective_stop={','.join(protective_stop_reasons)}"
         else:
             snapshot["message"] = f"protective_stop={','.join(protective_stop_reasons)}"
+    elif protective_warning_reasons:
+        snapshot["message"] = (
+            "OK; protective_warning=" + ",".join(protective_warning_reasons)
+            if snapshot["message"] == "OK"
+            else f"{snapshot['message']}; protective_warning={','.join(protective_warning_reasons)}"
+        )
     state["last_reconcile"] = snapshot
     return snapshot
 
@@ -3722,13 +3730,6 @@ def sync_synthetic_ledger(
         for row in list(observed_trade_rows or [])
         if isinstance(row, dict)
     ]
-    observed_fresh_rows, observed_last_time_ms, observed_keys_at_time = collect_new_rows(
-        rows=observed_rows,
-        last_time_ms=int(ledger.get("last_trade_time_ms") or 0) or None,
-        last_keys_at_time=list(ledger.get("last_trade_keys_at_time", [])),
-        row_time_ms=trade_row_time_ms,
-        row_key=trade_row_key,
-    )
     trade_rows = _fetch_trade_rows_since(
         symbol=symbol,
         api_key=api_key,
@@ -3737,13 +3738,12 @@ def sync_synthetic_ledger(
         recv_window=recv_window,
     )
     fresh_rows, last_time_ms, keys_at_time = collect_new_rows(
-        rows=trade_rows,
-        last_time_ms=observed_last_time_ms,
-        last_keys_at_time=observed_keys_at_time,
+        rows=[*observed_rows, *trade_rows],
+        last_time_ms=int(ledger.get("last_trade_time_ms") or 0) or None,
+        last_keys_at_time=list(ledger.get("last_trade_keys_at_time", [])),
         row_time_ms=trade_row_time_ms,
         row_key=trade_row_key,
     )
-    fresh_rows = [*observed_fresh_rows, *fresh_rows]
 
     applied = 0
     unmatched = 0

@@ -713,6 +713,41 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(snapshot["protective_stop_required"])
         self.assertIn("open_order_diff_persistent", snapshot["protective_stop_reasons"])
 
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    def test_periodic_reconcile_treats_stale_position_stream_as_warning_when_rest_is_clean(
+        self,
+        _mock_open_orders,
+        mock_account_info,
+    ) -> None:
+        mock_account_info.return_value = {"positions": [{"symbol": "BTCUSDC", "positionAmt": "0"}]}
+        stale_observed_at = time.monotonic() - 45.0
+        stream = SimpleNamespace(
+            snapshot_open_orders=lambda: [],
+            open_order_state_age_seconds=lambda: 1.0,
+            snapshot_account_positions=lambda: [
+                {"symbol": "BTCUSDC", "positionSide": "BOTH", "positionAmt": "0", "observed_at": stale_observed_at}
+            ],
+        )
+
+        snapshot = _run_periodic_reconcile(
+            state={"last_reconcile": {"open_orders_rest_last_sync_at": datetime.now(timezone.utc).isoformat()}},
+            cycle=5,
+            interval_cycles=5,
+            symbol="BTCUSDC",
+            strategy_mode="one_way_long",
+            api_key="key",
+            api_secret="secret",
+            recv_window=5000,
+            expected_open_order_count=0,
+            expected_actual_net_qty=0.0,
+            args=Namespace(user_data_stream=stream),
+        )
+
+        self.assertTrue(snapshot["ok"])
+        self.assertFalse(snapshot["protective_stop_required"])
+        self.assertIn("account_position_stream_stale", snapshot["protective_warning_reasons"])
+
     def test_apply_execution_request_budget_defers_extra_cancel_and_place_actions(self) -> None:
         validation = {
             "ok": True,
@@ -4702,6 +4737,72 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot["virtual_short_lots"], [{"qty": 10.0, "price": 0.0671}])
         self.assertEqual(snapshot["applied_trade_count"], 1)
         self.assertEqual(snapshot["unmatched_trade_count"], 0)
+
+    def test_sync_synthetic_ledger_backfills_rest_trade_older_than_latest_observed_fill(self) -> None:
+        now = datetime(2026, 5, 12, 5, 0, tzinfo=timezone.utc)
+        first_trade_time_ms = int((now - timedelta(seconds=3)).timestamp() * 1000)
+        second_trade_time_ms = int((now - timedelta(seconds=1)).timestamp() * 1000)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 0.0,
+                "virtual_long_avg_price": 0.0,
+                "virtual_long_lots": [],
+                "virtual_short_qty": 0.0,
+                "virtual_short_avg_price": 0.0,
+                "virtual_short_lots": [],
+                "last_trade_time_ms": int((now - timedelta(seconds=5)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            },
+            "synthetic_order_refs": {
+                "101": {"role": "entry_long", "client_order_id": "gx-billu-entry-long-1"},
+                "102": {"role": "entry_long", "client_order_id": "gx-billu-entry-long-2"},
+            },
+        }
+        older_rest_trade = {
+            "id": f"101:gx-billu-entry-long-1:{first_trade_time_ms}:100.0:0.14",
+            "orderId": 101,
+            "clientOrderId": "gx-billu-entry-long-1",
+            "symbol": "BILLUSDT",
+            "side": "BUY",
+            "time": first_trade_time_ms,
+            "price": 0.14,
+            "qty": 100.0,
+        }
+        latest_observed_trade = {
+            "id": f"102:gx-billu-entry-long-2:{second_trade_time_ms}:200.0:0.141",
+            "orderId": 102,
+            "clientOrderId": "gx-billu-entry-long-2",
+            "symbol": "BILLUSDT",
+            "side": "BUY",
+            "time": second_trade_time_ms,
+            "price": 0.141,
+            "qty": 200.0,
+            "source": "user_data_stream",
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[older_rest_trade]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="BILLUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=300.0,
+                entry_price=0.1407,
+                qty_tolerance=1e-9,
+                fallback_price=0.1407,
+                observed_trade_rows=[latest_observed_trade],
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_long_qty"], 300.0)
+        self.assertEqual(snapshot["applied_trade_count"], 2)
+        self.assertEqual(snapshot["unmatched_trade_count"], 0)
+        self.assertFalse(snapshot["resynced_to_actual"])
 
     def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:
