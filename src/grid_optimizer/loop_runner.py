@@ -3253,6 +3253,49 @@ def _synthetic_order_ref_from_state(state: dict[str, Any], order_id: int | None)
     return dict(item) if isinstance(item, dict) else None
 
 
+def _infer_synthetic_order_ref_from_trade(trade: dict[str, Any]) -> dict[str, Any] | None:
+    client_order_id = str(trade.get("clientOrderId", "") or "").strip()
+    if not client_order_id:
+        return None
+    parts = client_order_id.lower().split("-")
+    if len(parts) < 3 or parts[0] != "gx":
+        return None
+
+    compact_role = parts[2].strip()
+    side = str(trade.get("side", "") or "").upper().strip()
+    if side not in {"BUY", "SELL"}:
+        return None
+
+    role = ""
+    if compact_role == "entrylon":
+        role = "entry_long"
+    elif compact_role == "entrysho":
+        role = "entry_short"
+    elif compact_role == "bootstra":
+        role = "bootstrap_long" if side == "BUY" else "bootstrap_short"
+    elif compact_role == "takeprof":
+        role = "take_profit_short" if side == "BUY" else "take_profit_long"
+    elif compact_role == "activede":
+        role = "active_delever_short" if side == "BUY" else "active_delever_long"
+    elif compact_role == "flowslee":
+        role = "flow_sleeve_short" if side == "BUY" else "flow_sleeve_long"
+    elif compact_role == "softdele":
+        role = "soft_delever_short" if side == "BUY" else "soft_delever_long"
+    elif compact_role == "harddele":
+        role = "hard_delever_short" if side == "BUY" else "hard_delever_long"
+
+    if not role:
+        return None
+    return {
+        "role": role,
+        "side": side,
+        "position_side": str(trade.get("positionSide", trade.get("position_side", "BOTH")) or "BOTH").upper().strip()
+        or "BOTH",
+        "client_order_id": client_order_id,
+        "inferred_from_client_order_id": True,
+    }
+
+
 def _decorate_synthetic_open_orders(
     *,
     state: dict[str, Any],
@@ -3749,6 +3792,8 @@ def sync_synthetic_ledger(
     unmatched = 0
     for row in fresh_rows:
         order_ref = _synthetic_order_ref_from_state(state, epoch_ms(row.get("orderId")))
+        if order_ref is None:
+            order_ref = _infer_synthetic_order_ref_from_trade(row)
         if _apply_synthetic_trade_fill(ledger=ledger, trade=row, order_ref=order_ref):
             applied += 1
         else:

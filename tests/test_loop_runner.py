@@ -38,6 +38,7 @@ from grid_optimizer.loop_runner import (
     _regime_budget_entry_reuse_tolerance,
     _wait_for_runner_market_stream_snapshot,
     _is_binance_rate_limit_error,
+    _infer_synthetic_order_ref_from_trade,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_synthetic_resync_price,
@@ -4803,6 +4804,144 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot["applied_trade_count"], 2)
         self.assertEqual(snapshot["unmatched_trade_count"], 0)
         self.assertFalse(snapshot["resynced_to_actual"])
+
+    def test_infer_synthetic_order_ref_from_compact_client_order_id(self) -> None:
+        self.assertEqual(
+            _infer_synthetic_order_ref_from_trade(
+                {"clientOrderId": "gx-billu-entrylon-1-12345678", "side": "BUY", "positionSide": "BOTH"}
+            ),
+            {
+                "role": "entry_long",
+                "side": "BUY",
+                "position_side": "BOTH",
+                "client_order_id": "gx-billu-entrylon-1-12345678",
+                "inferred_from_client_order_id": True,
+            },
+        )
+        self.assertEqual(
+            _infer_synthetic_order_ref_from_trade(
+                {"clientOrderId": "gx-billu-entrysho-2-12345678", "side": "SELL"}
+            )["role"],
+            "entry_short",
+        )
+        self.assertEqual(
+            _infer_synthetic_order_ref_from_trade(
+                {"clientOrderId": "gx-billu-takeprof-3-12345678", "side": "SELL"}
+            )["role"],
+            "take_profit_long",
+        )
+        self.assertEqual(
+            _infer_synthetic_order_ref_from_trade(
+                {"clientOrderId": "gx-billu-takeprof-4-12345678", "side": "BUY"}
+            )["role"],
+            "take_profit_short",
+        )
+
+    def test_sync_synthetic_ledger_infers_missing_refs_from_rest_client_order_id(self) -> None:
+        now = datetime(2026, 5, 12, 5, 0, tzinfo=timezone.utc)
+        trade_time_ms = int((now - timedelta(seconds=1)).timestamp() * 1000)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 0.0,
+                "virtual_long_avg_price": 0.0,
+                "virtual_long_lots": [],
+                "virtual_short_qty": 0.0,
+                "virtual_short_avg_price": 0.0,
+                "virtual_short_lots": [],
+                "last_trade_time_ms": int((now - timedelta(seconds=5)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            },
+            "synthetic_order_refs": {},
+        }
+        trade_row = {
+            "id": f"777:gx-billu-entrylon-1-12345678:{trade_time_ms}:100.0:0.14",
+            "orderId": 777,
+            "clientOrderId": "gx-billu-entrylon-1-12345678",
+            "symbol": "BILLUSDT",
+            "side": "BUY",
+            "positionSide": "BOTH",
+            "time": trade_time_ms,
+            "price": 0.14,
+            "qty": 100.0,
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[trade_row]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="BILLUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=100.0,
+                entry_price=0.14,
+                qty_tolerance=1e-9,
+                fallback_price=0.14,
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_long_qty"], 100.0)
+        self.assertEqual(snapshot["virtual_long_lots"], [{"qty": 100.0, "price": 0.14}])
+        self.assertEqual(snapshot["applied_trade_count"], 1)
+        self.assertEqual(snapshot["unmatched_trade_count"], 0)
+        self.assertFalse(snapshot["resynced_to_actual"])
+
+    def test_sync_synthetic_ledger_infers_take_profit_without_order_ref(self) -> None:
+        now = datetime(2026, 5, 12, 5, 0, tzinfo=timezone.utc)
+        trade_time_ms = int((now - timedelta(seconds=1)).timestamp() * 1000)
+        state = {
+            "synthetic_ledger": {
+                "initialized": True,
+                "virtual_long_qty": 100.0,
+                "virtual_long_avg_price": 0.14,
+                "virtual_long_lots": [{"qty": 100.0, "price": 0.14}],
+                "virtual_short_qty": 0.0,
+                "virtual_short_avg_price": 0.0,
+                "virtual_short_lots": [],
+                "grid_buffer_realized_notional": 0.0,
+                "grid_buffer_spent_notional": 0.0,
+                "last_trade_time_ms": int((now - timedelta(seconds=5)).timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "unmatched_trade_count": 0,
+            },
+            "synthetic_order_refs": {},
+        }
+        trade_row = {
+            "id": f"778:gx-billu-takeprof-1-12345678:{trade_time_ms}:40.0:0.141",
+            "orderId": 778,
+            "clientOrderId": "gx-billu-takeprof-1-12345678",
+            "symbol": "BILLUSDT",
+            "side": "SELL",
+            "positionSide": "BOTH",
+            "time": trade_time_ms,
+            "price": 0.141,
+            "qty": 40.0,
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[trade_row]), patch(
+            "grid_optimizer.loop_runner._utc_now",
+            return_value=now,
+        ):
+            snapshot = sync_synthetic_ledger(
+                state=state,
+                symbol="BILLUSDT",
+                api_key="key",
+                api_secret="secret",
+                recv_window=5000,
+                actual_position_qty=60.0,
+                entry_price=0.14,
+                qty_tolerance=1e-9,
+                fallback_price=0.14,
+            )
+
+        self.assertAlmostEqual(snapshot["virtual_long_qty"], 60.0)
+        self.assertEqual(snapshot["virtual_long_lots"], [{"qty": 60.0, "price": 0.14}])
+        self.assertEqual(snapshot["applied_trade_count"], 1)
+        self.assertEqual(snapshot["unmatched_trade_count"], 0)
+        self.assertAlmostEqual(snapshot["grid_buffer_realized_notional"], 0.04, places=8)
 
     def test_update_synthetic_order_refs_persists_placed_orders(self) -> None:
         with TemporaryDirectory() as tmpdir:
