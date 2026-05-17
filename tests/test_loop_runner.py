@@ -53,6 +53,7 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
     apply_hard_loss_forced_reduce,
+    resolve_loss_recovery_brush,
     resolve_hard_loss_forced_reduce_episode,
     prime_exposure_escalation_on_market_guard,
     resolve_exposure_escalation_buy_pause,
@@ -1141,6 +1142,46 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(recovered["disarmed"])
         self.assertEqual(recovered["reason"], "recovered")
         self.assertNotIn("hard_loss_forced_reduce_episode", state)
+
+    def test_loss_recovery_brush_keeps_tiny_entries_until_hard_loss(self) -> None:
+        report = resolve_loss_recovery_brush(
+            enabled=True,
+            strategy_mode="synthetic_neutral",
+            current_long_notional=540.0,
+            current_short_notional=0.0,
+            unrealized_pnl=-12.0,
+            hard_loss_forced_reduce={"active": False},
+            hard_unrealized_loss_limit=80.0,
+            per_order_notional=20.0,
+            entry_notional=6.0,
+            min_unrealized_loss=2.0,
+            max_entry_orders_per_side=1,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["side"], "long")
+        self.assertAlmostEqual(report["same_side_probe_scale"], 0.3)
+        self.assertEqual(report["max_entry_long_orders"], 1)
+        self.assertEqual(report["max_entry_short_orders"], 1)
+        self.assertTrue(report["allow_opposite_entry_with_single_side_inventory"])
+
+    def test_loss_recovery_brush_yields_to_hard_loss_reduce(self) -> None:
+        report = resolve_loss_recovery_brush(
+            enabled=True,
+            strategy_mode="synthetic_neutral",
+            current_long_notional=540.0,
+            current_short_notional=0.0,
+            unrealized_pnl=-90.0,
+            hard_loss_forced_reduce={"active": True},
+            hard_unrealized_loss_limit=80.0,
+            per_order_notional=20.0,
+            entry_notional=6.0,
+            min_unrealized_loss=2.0,
+            max_entry_orders_per_side=1,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["reason"], "hard_loss_active")
 
     def test_apply_entry_permission_gate_prunes_short_entries_only(self) -> None:
         plan = {

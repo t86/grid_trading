@@ -1161,6 +1161,86 @@ def resolve_hard_loss_forced_reduce_episode(
     }
 
 
+def resolve_loss_recovery_brush(
+    *,
+    enabled: bool,
+    strategy_mode: str,
+    current_long_notional: float,
+    current_short_notional: float,
+    unrealized_pnl: float,
+    hard_loss_forced_reduce: dict[str, Any] | None,
+    hard_unrealized_loss_limit: float | None,
+    per_order_notional: float,
+    entry_notional: float | None,
+    min_unrealized_loss: float | None,
+    max_entry_orders_per_side: int | None,
+) -> dict[str, Any]:
+    safe_entry_notional = max(_safe_float(entry_notional), 0.0)
+    safe_per_order = max(_safe_float(per_order_notional), 0.0)
+    safe_min_loss = max(_safe_float(min_unrealized_loss), 0.0)
+    hard_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    hard_active = bool((hard_loss_forced_reduce or {}).get("active")) or (
+        hard_limit > 0 and _safe_float(unrealized_pnl) <= -hard_limit
+    )
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    short_notional = max(_safe_float(current_short_notional), 0.0)
+    dominant_side = "long" if long_notional >= short_notional and long_notional > 0 else (
+        "short" if short_notional > 0 else None
+    )
+    report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "side": dominant_side,
+        "reason": None,
+        "entry_notional": safe_entry_notional,
+        "same_side_probe_scale": 0.0,
+        "max_entry_long_orders": None,
+        "max_entry_short_orders": None,
+        "allow_opposite_entry_with_single_side_inventory": False,
+        "hard_loss_active": hard_active,
+        "unrealized_pnl": _safe_float(unrealized_pnl),
+        "min_unrealized_loss": safe_min_loss,
+    }
+    if not enabled:
+        report["reason"] = "disabled"
+        return report
+    if not _is_synthetic_neutral_mode(strategy_mode):
+        report["reason"] = "unsupported_strategy_mode"
+        return report
+    if hard_active:
+        report["reason"] = "hard_loss_active"
+        return report
+    if dominant_side is None:
+        report["reason"] = "no_inventory"
+        return report
+    if _safe_float(unrealized_pnl) >= -safe_min_loss:
+        report["reason"] = "loss_below_threshold"
+        return report
+    if safe_entry_notional <= 0 or safe_per_order <= 0:
+        report["reason"] = "entry_notional_disabled"
+        return report
+
+    max_orders = max(int(max_entry_orders_per_side or 1), 0)
+    if max_orders <= 0:
+        report["reason"] = "max_entry_orders_zero"
+        return report
+    scale = min(safe_entry_notional / safe_per_order, 1.0)
+    if scale <= 0:
+        report["reason"] = "probe_scale_zero"
+        return report
+    report.update(
+        {
+            "active": True,
+            "reason": "losing_inventory_brush",
+            "same_side_probe_scale": scale,
+            "max_entry_long_orders": max_orders,
+            "max_entry_short_orders": max_orders,
+            "allow_opposite_entry_with_single_side_inventory": True,
+        }
+    )
+    return report
+
+
 def resolve_anti_chase_entry_guard(
     *,
     market_guard: dict[str, Any] | None,
@@ -11256,6 +11336,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "pruned_sell_orders": 0,
         "applied": False,
     }
+    loss_recovery_brush = {
+        "enabled": bool(getattr(effective_args, "loss_recovery_brush_enabled", False)),
+        "active": False,
+        "reason": "not_evaluated",
+    }
     take_profit_guard = {
         "enabled": True,
         "min_profit_ratio": getattr(effective_args, "take_profit_min_profit_ratio", None),
@@ -11924,10 +12009,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             paused_entry_long_scale=combined_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
             allow_opposite_entry_with_single_side_inventory=bool(
-                _is_best_quote_neutral_profile(effective_strategy_profile)
-                and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
-                and not inventory_long_pause_active
-                and not inventory_short_pause_active
+                (
+                    _is_best_quote_neutral_profile(effective_strategy_profile)
+                    and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
+                    and not inventory_long_pause_active
+                    and not inventory_short_pause_active
+                )
+                or bool(loss_recovery_brush.get("allow_opposite_entry_with_single_side_inventory"))
             ),
         )
         controls = apply_hedge_position_controls(
@@ -12031,6 +12119,19 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0)
         current_long_notional = current_long_qty * max(mid_price, 0.0)
         current_short_notional = current_short_qty * max(mid_price, 0.0)
+        loss_recovery_brush = resolve_loss_recovery_brush(
+            enabled=bool(getattr(effective_args, "loss_recovery_brush_enabled", False)),
+            strategy_mode=strategy_mode,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            unrealized_pnl=unrealized_pnl,
+            hard_loss_forced_reduce=hard_loss_forced_reduce,
+            hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+            per_order_notional=effective_args.per_order_notional,
+            entry_notional=getattr(effective_args, "loss_recovery_brush_entry_notional", None),
+            min_unrealized_loss=getattr(effective_args, "loss_recovery_brush_min_unrealized_loss", None),
+            max_entry_orders_per_side=getattr(effective_args, "loss_recovery_brush_max_entry_orders_per_side", None),
+        )
         _apply_multi_timeframe_side_scheduler(
             long_notional=current_long_notional,
             short_notional=current_short_notional,
@@ -12048,6 +12149,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_long_pause_active
             else 0.0
         )
+        if loss_recovery_brush.get("active") and inventory_long_pause_active:
+            inventory_long_probe_scale = max(
+                inventory_long_probe_scale,
+                _safe_float(loss_recovery_brush.get("same_side_probe_scale")),
+            )
         combined_long_probe_scale = (
             weak_buy_probe_scale
             if bool(market_bias_entry_pause["buy_pause_active"])
@@ -12079,6 +12185,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_short_pause_active
             else 0.0
         )
+        if loss_recovery_brush.get("active") and inventory_short_pause_active:
+            inventory_short_probe_scale = max(
+                inventory_short_probe_scale,
+                _safe_float(loss_recovery_brush.get("same_side_probe_scale")),
+            )
         combined_short_probe_scale = (
             strong_short_probe_scale
             if bool(market_bias_entry_pause["short_pause_active"])
@@ -12211,10 +12322,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             paused_entry_long_scale=combined_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
             allow_opposite_entry_with_single_side_inventory=bool(
-                _is_best_quote_neutral_profile(effective_strategy_profile)
-                and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
-                and not inventory_long_pause_active
-                and not inventory_short_pause_active
+                (
+                    _is_best_quote_neutral_profile(effective_strategy_profile)
+                    and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
+                    and not inventory_long_pause_active
+                    and not inventory_short_pause_active
+                )
+                or bool(loss_recovery_brush.get("allow_opposite_entry_with_single_side_inventory"))
             ),
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
@@ -13570,6 +13684,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         and regime_entry_budget.get("enabled")
         and not bool(regime_entry_budget.get("report_only", True))
     )
+    if (
+        loss_recovery_brush.get("active")
+        and not regime_entry_budget_controls_entry
+        and not (isinstance(elastic_volume, dict) and elastic_volume.get("enabled"))
+    ):
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            max_entry_long_orders=loss_recovery_brush.get("max_entry_long_orders"),
+            max_entry_short_orders=loss_recovery_brush.get("max_entry_short_orders"),
+        )
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
     if isinstance(elastic_volume, dict) and elastic_volume.get("enabled") and not regime_entry_budget_controls_entry:
         entry_permission_gate = apply_entry_permission_gate(
             plan,
@@ -13613,6 +13742,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    effective_loss_inventory_no_cross_small_entry_notional = max(
+        _safe_float(getattr(effective_args, "loss_inventory_no_cross_small_entry_notional", 0.0)),
+        _safe_float(loss_recovery_brush.get("entry_notional")) if loss_recovery_brush.get("active") else 0.0,
+    )
     report = {
         "generated_at": _isoformat(_utc_now()),
         "symbol": symbol,
@@ -13667,9 +13800,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "hard_loss_forced_reduce_episode": hard_loss_forced_reduce_episode,
         "hard_loss_rescue_entry_guard": hard_loss_rescue_entry_guard,
         "unrealized_loss_entry_guard": unrealized_loss_entry_guard,
-        "loss_inventory_no_cross_small_entry_notional": getattr(
-            effective_args, "loss_inventory_no_cross_small_entry_notional", 0.0
-        ),
+        "loss_recovery_brush": loss_recovery_brush,
+        "loss_inventory_no_cross_small_entry_notional": effective_loss_inventory_no_cross_small_entry_notional,
         "active_delever": active_delever,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
@@ -14780,6 +14912,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--unrealized-loss-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--unrealized-loss-entry-guard-min-loss", type=float, default=0.0)
     parser.add_argument("--unrealized-loss-entry-guard-ratio", type=float, default=0.0)
+    parser.add_argument("--loss-recovery-brush-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--loss-recovery-brush-entry-notional", type=float, default=0.0)
+    parser.add_argument("--loss-recovery-brush-min-unrealized-loss", type=float, default=0.0)
+    parser.add_argument("--loss-recovery-brush-max-entry-orders-per-side", type=int, default=1)
     parser.add_argument("--loss-inventory-no-cross-small-entry-notional", type=float, default=0.0)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
@@ -15515,10 +15651,14 @@ def main() -> None:
         (args.hard_loss_forced_reduce_unrealized_loss_limit, "--hard-loss-forced-reduce-unrealized-loss-limit"),
         (args.unrealized_loss_entry_guard_min_loss, "--unrealized-loss-entry-guard-min-loss"),
         (args.unrealized_loss_entry_guard_ratio, "--unrealized-loss-entry-guard-ratio"),
+        (args.loss_recovery_brush_entry_notional, "--loss-recovery-brush-entry-notional"),
+        (args.loss_recovery_brush_min_unrealized_loss, "--loss-recovery-brush-min-unrealized-loss"),
         (args.loss_inventory_no_cross_small_entry_notional, "--loss-inventory-no-cross-small-entry-notional"),
     ):
         if value is not None and value < 0:
             raise SystemExit(f"{label} must be >= 0")
+    if args.loss_recovery_brush_max_entry_orders_per_side < 0:
+        raise SystemExit("--loss-recovery-brush-max-entry-orders-per-side must be >= 0")
     if args.unrealized_loss_entry_guard_enabled and args.unrealized_loss_entry_guard_ratio <= 0:
         raise SystemExit("--unrealized-loss-entry-guard-enabled requires --unrealized-loss-entry-guard-ratio > 0")
     if args.auto_regime_confirm_cycles <= 0:

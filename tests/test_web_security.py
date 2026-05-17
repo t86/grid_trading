@@ -3903,6 +3903,10 @@ class WebSecurityTests(unittest.TestCase):
                 "adverse_reduce_maker_timeout_seconds": 20.0,
                 "adverse_reduce_max_order_notional": 240.0,
                 "adverse_reduce_keep_probe_scale": 0.08,
+                "loss_recovery_brush_enabled": True,
+                "loss_recovery_brush_entry_notional": 7.0,
+                "loss_recovery_brush_min_unrealized_loss": 2.0,
+                "loss_recovery_brush_max_entry_orders_per_side": 1,
                 "inventory_pause_long_probe_scale": 0.2,
                 "inventory_pause_short_probe_scale": 0.25,
                 "inventory_pause_timeout_seconds": 75.0,
@@ -3929,6 +3933,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adverse-reduce-maker-timeout-seconds", command)
         self.assertIn("--adverse-reduce-max-order-notional", command)
         self.assertIn("--adverse-reduce-keep-probe-scale", command)
+        self.assertIn("--loss-recovery-brush-enabled", command)
+        self.assertIn("--loss-recovery-brush-entry-notional", command)
+        self.assertIn("7.0", command)
+        self.assertIn("--loss-recovery-brush-min-unrealized-loss", command)
+        self.assertIn("--loss-recovery-brush-max-entry-orders-per-side", command)
         self.assertIn("--inventory-pause-long-probe-scale", command)
         self.assertIn("0.2", command)
         self.assertIn("--inventory-pause-short-probe-scale", command)
