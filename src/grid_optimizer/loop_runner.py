@@ -7384,6 +7384,8 @@ def _resolve_inventory_unlock_pause_notional(
     strategy_mode: str,
     side: str,
     fallback_pause_notional: float | None,
+    open_entry_notional: float = 0.0,
+    pending_entry_buffer_notional: float = 0.0,
 ) -> float | None:
     if not _is_best_quote_maker_volume_mode(strategy_mode):
         return fallback_pause_notional
@@ -7395,6 +7397,12 @@ def _resolve_inventory_unlock_pause_notional(
     else:
         limit = max(_safe_float(getattr(args, "best_quote_maker_volume_max_long_notional", 0.0)), 0.0)
     soft_notional = limit * soft_ratio
+    if soft_notional <= 0:
+        return fallback_pause_notional
+    soft_notional = max(
+        soft_notional - max(_safe_float(open_entry_notional), 0.0) - max(_safe_float(pending_entry_buffer_notional), 0.0),
+        0.0,
+    )
     if soft_notional <= 0:
         return fallback_pause_notional
     fallback = max(_safe_float(fallback_pause_notional), 0.0)
@@ -13972,11 +13980,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         strategy_mode == "best_quote_maker_volume_v1" and current_short_qty > 1e-12
     )
     if unlock_long_side:
+        best_quote_metrics = dict(best_quote_maker_volume.get("metrics") or {})
         unlock_pause_notional = _resolve_inventory_unlock_pause_notional(
             args=effective_args,
             strategy_mode=strategy_mode,
             side="long",
             fallback_pause_notional=effective_args.pause_buy_position_notional,
+            open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_long_notional")),
+            pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
         )
         inventory_unlock_release = apply_inventory_unlock_release(
             plan=plan,
@@ -13998,11 +14009,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ask_price=ask_price,
         )
     elif unlock_short_side:
+        best_quote_metrics = dict(best_quote_maker_volume.get("metrics") or {})
         unlock_pause_notional = _resolve_inventory_unlock_pause_notional(
             args=effective_args,
             strategy_mode=strategy_mode,
             side="short",
             fallback_pause_notional=effective_args.pause_short_position_notional,
+            open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_short_notional")),
+            pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
         )
         inventory_unlock_release = apply_inventory_unlock_release(
             plan=plan,

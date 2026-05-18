@@ -1849,16 +1849,18 @@ class LoopRunnerTests(unittest.TestCase):
             strategy_mode="best_quote_maker_volume_v1",
             side="short",
             fallback_pause_notional=4015.0,
+            pending_entry_buffer_notional=300.0,
         )
         long_pause = _resolve_inventory_unlock_pause_notional(
             args=args,
             strategy_mode="best_quote_maker_volume_v1",
             side="long",
             fallback_pause_notional=4015.0,
+            pending_entry_buffer_notional=300.0,
         )
 
-        self.assertAlmostEqual(short_pause or 0.0, 3025.0)
-        self.assertAlmostEqual(long_pause or 0.0, 3025.0)
+        self.assertAlmostEqual(short_pause or 0.0, 2725.0)
+        self.assertAlmostEqual(long_pause or 0.0, 2725.0)
 
     def test_inventory_unlock_release_fires_for_best_quote_short_soft_stall(self) -> None:
         plan = {"buy_orders": [], "sell_orders": []}
@@ -1873,6 +1875,7 @@ class LoopRunnerTests(unittest.TestCase):
             strategy_mode="best_quote_maker_volume_v1",
             side="short",
             fallback_pause_notional=4015.0,
+            pending_entry_buffer_notional=300.0,
         )
 
         report = apply_inventory_unlock_release(
