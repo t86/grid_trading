@@ -6101,6 +6101,8 @@ def apply_take_profit_profit_guard(
     tick_size: float | None,
     bid_price: float,
     ask_price: float,
+    extra_long_guard_roles: Iterable[str] | None = None,
+    extra_short_guard_roles: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     safe_ratio = max(_safe_float(min_profit_ratio), 0.0)
     long_pause_threshold = max(_safe_float(pause_long_position_notional), 0.0)
@@ -6137,6 +6139,10 @@ def apply_take_profit_profit_guard(
     synthetic_short_avg = max(_safe_float(synthetic_short_avg_price), 0.0)
     long_guard_roles = {"take_profit", "take_profit_long", "active_delever_long"}
     short_guard_roles = {"take_profit_short", "active_delever_short"}
+    if extra_long_guard_roles is not None:
+        long_guard_roles.update(str(role) for role in extra_long_guard_roles)
+    if extra_short_guard_roles is not None:
+        short_guard_roles.update(str(role) for role in extra_short_guard_roles)
 
     long_floor_candidates: list[float] = []
     short_ceiling_candidates: list[float] = []
@@ -12858,6 +12864,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         open_entry_exposure = _summarize_open_entry_exposure(
             _filter_futures_strategy_orders(open_orders, symbol)
         )
+        best_quote_loss_per_10k_15m = _safe_float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_15m", 0.0))
+        if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
+            best_quote_loss_per_10k_15m = _safe_float(
+                ((elastic_volume.get("metrics") or {}).get("loss_per_10k_15m"))
+            )
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
@@ -12877,7 +12888,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 mid_price=mid_price,
                 current_net_qty=actual_net_qty,
                 cycle_budget_notional=cycle_budget,
-                loss_per_10k_15m=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_15m", 0.0)),
+                loss_per_10k_15m=best_quote_loss_per_10k_15m,
                 target_volume_remaining=target_remaining,
                 tick_size=symbol_info.get("tick_size"),
                 step_size=symbol_info.get("step_size"),
@@ -12887,6 +12898,25 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 pending_entry_buffer_notional=cycle_budget * 0.5,
             ),
+        )
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            extra_long_guard_roles={"best_quote_reduce_long", "best_quote_entry_short"},
+            extra_short_guard_roles={"best_quote_reduce_short", "best_quote_entry_long"},
         )
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
