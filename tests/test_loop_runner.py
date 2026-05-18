@@ -45,6 +45,7 @@ from grid_optimizer.loop_runner import (
     _resolve_synthetic_resync_price,
     _shift_custom_grid_bounds,
     _run_periodic_reconcile,
+    _cap_best_quote_profitable_inventory_exit_offset,
     apply_execution_request_budget_to_actions,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
@@ -366,6 +367,39 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(result["dynamic_quote_offset_applied"])
         self.assertEqual(result["quote_offset_ticks"], 3)
         self.assertEqual(result["defensive_offset_ticks"], 6)
+
+    def test_best_quote_profitable_long_exit_offset_cap_uses_configured_distance(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.14626,
+                    "qty": 888.0,
+                    "notional": 129.87888,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+        }
+
+        report = _cap_best_quote_profitable_inventory_exit_offset(
+            plan=plan,
+            current_long_qty=5430.0,
+            current_short_qty=0.0,
+            current_long_avg_price=0.1436006879299,
+            current_short_avg_price=0.0,
+            bid_price=0.14530,
+            ask_price=0.14532,
+            tick_size=0.00001,
+            configured_quote_offset_ticks=20,
+            min_profit_ratio=0.0003,
+        )
+
+        self.assertEqual(report["adjusted_sell_orders"], 1)
+        self.assertEqual(report["reason"], "profitable_inventory_exit_uses_configured_quote_offset")
+        self.assertEqual(plan["sell_orders"][0]["price"], 0.14552)
+        self.assertGreater(plan["sell_orders"][0]["price"], 0.14365)
+        self.assertEqual(plan["sell_orders"][0]["profitable_inventory_exit_offset_cap"]["max_price"], 0.14552)
 
     @patch("grid_optimizer.loop_runner.resolve_adaptive_step_price")
     @patch("grid_optimizer.loop_runner.assess_market_guard")

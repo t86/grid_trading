@@ -737,6 +737,99 @@ def _resolve_best_quote_dynamic_offsets(
     return report
 
 
+def _cap_best_quote_profitable_inventory_exit_offset(
+    *,
+    plan: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    configured_quote_offset_ticks: int,
+    min_profit_ratio: float | None,
+) -> dict[str, Any]:
+    configured_ticks = max(int(configured_quote_offset_ticks or 0), 0)
+    tick = _safe_float(tick_size)
+    safe_min_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    report = {
+        "enabled": configured_ticks > 0 and tick > 0,
+        "configured_quote_offset_ticks": configured_ticks,
+        "adjusted_sell_orders": 0,
+        "adjusted_buy_orders": 0,
+        "reason": None,
+    }
+    if configured_ticks <= 0 or tick <= 0:
+        report["reason"] = "disabled"
+        return report
+
+    max_sell_price = _round_order_price(_safe_float(ask_price) + tick * configured_ticks, tick_size, "SELL")
+    min_buy_price = _round_order_price(max(_safe_float(bid_price) - tick * configured_ticks, 0.0), tick_size, "BUY")
+    long_floor = (
+        _round_order_price(current_long_avg_price * (1.0 + safe_min_profit_ratio), tick_size, "SELL")
+        if current_long_qty > 1e-12 and current_long_avg_price > 0
+        else 0.0
+    )
+    short_ceiling = (
+        _round_order_price(max(current_short_avg_price * (1.0 - safe_min_profit_ratio), 0.0), tick_size, "BUY")
+        if current_short_qty > 1e-12 and current_short_avg_price > 0
+        else 0.0
+    )
+
+    adjusted_sell_orders = 0
+    sell_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in plan.get("sell_orders", []) if isinstance(item, dict)]:
+        role = _order_role(order)
+        price = _safe_float(order.get("price"))
+        profitable_long_exit = (
+            current_long_qty > 1e-12
+            and role in {"best_quote_entry_short", "best_quote_reduce_long"}
+            and long_floor > 0
+            and max_sell_price >= long_floor
+        )
+        if profitable_long_exit and price > max_sell_price + 1e-12:
+            order["price"] = max_sell_price
+            order["notional"] = _safe_float(order.get("qty")) * max_sell_price
+            order["profitable_inventory_exit_offset_cap"] = {
+                "side": "SELL",
+                "max_price": max_sell_price,
+                "profit_floor_price": long_floor,
+            }
+            adjusted_sell_orders += 1
+        sell_orders.append(order)
+    plan["sell_orders"] = sell_orders
+
+    adjusted_buy_orders = 0
+    buy_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)]:
+        role = _order_role(order)
+        price = _safe_float(order.get("price"))
+        profitable_short_exit = (
+            current_short_qty > 1e-12
+            and role in {"best_quote_entry_long", "best_quote_reduce_short"}
+            and short_ceiling > 0
+            and min_buy_price <= short_ceiling
+        )
+        if profitable_short_exit and price + 1e-12 < min_buy_price:
+            order["price"] = min_buy_price
+            order["notional"] = _safe_float(order.get("qty")) * min_buy_price
+            order["profitable_inventory_exit_offset_cap"] = {
+                "side": "BUY",
+                "min_price": min_buy_price,
+                "profit_ceiling_price": short_ceiling,
+            }
+            adjusted_buy_orders += 1
+        buy_orders.append(order)
+    plan["buy_orders"] = buy_orders
+
+    report["adjusted_sell_orders"] = adjusted_sell_orders
+    report["adjusted_buy_orders"] = adjusted_buy_orders
+    if adjusted_sell_orders or adjusted_buy_orders:
+        report["reason"] = "profitable_inventory_exit_uses_configured_quote_offset"
+    return report
+
+
 def resolve_volatility_entry_pause(
     *,
     adaptive_step: dict[str, Any],
@@ -13264,6 +13357,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             extra_long_guard_roles={"best_quote_entry_short", "best_quote_reduce_long"},
             extra_short_guard_roles={"best_quote_entry_long", "best_quote_reduce_short"},
         )
+        best_quote_profitable_exit_offset_cap = _cap_best_quote_profitable_inventory_exit_offset(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            configured_quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+        )
         best_quote_inventory_cost_gate = {
             "blocked_buy_orders": 0,
             "blocked_sell_orders": 0,
@@ -13327,6 +13432,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "reasons": list(plan.get("reasons") or []),
             "metrics": dict(plan.get("metrics") or {}),
             "dynamic_offsets": dict(best_quote_dynamic_offsets),
+            "profitable_exit_offset_cap": dict(best_quote_profitable_exit_offset_cap),
             "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
         }
         inventory_tier = {
