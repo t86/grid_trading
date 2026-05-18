@@ -1907,6 +1907,82 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["long_active"])
         self.assertEqual(report["long_activation_mode"], "pause")
 
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_adverse_reduce_triggers_below_soft_after_one_filled_order(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.00001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.14310", "ask_price": "0.14311"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BILLUSDT", "positionAmt": "900", "entryPrice": "0.14400"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BILLUSDT",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="billusdt_best_quote_maker_volume_reset_v1",
+                step_price=0.00019,
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=260.0,
+                best_quote_maker_volume_quote_offset_ticks=20,
+                best_quote_maker_volume_defensive_offset_ticks=30,
+                best_quote_maker_volume_max_long_notional=5500.0,
+                best_quote_maker_volume_max_short_notional=5500.0,
+                best_quote_maker_volume_inventory_soft_ratio=0.55,
+                adverse_reduce_enabled=True,
+                adverse_reduce_long_trigger_ratio=0.006,
+                adverse_reduce_short_trigger_ratio=0.006,
+                adverse_reduce_target_ratio=0.45,
+                adverse_reduce_max_order_notional=130.0,
+                adverse_reduce_maker_timeout_seconds=35.0,
+                take_profit_min_profit_ratio=0.0003,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        adverse = report["adverse_inventory_reduce"]
+        self.assertTrue(adverse["enabled"])
+        self.assertTrue(adverse["long_active"])
+        self.assertEqual(adverse["long_activation_mode"], "pause")
+        self.assertEqual(adverse["placed_reduce_orders"], 1)
+        self.assertEqual(report["forced_reduce_orders"][0]["role"], "adverse_reduce_long")
+        self.assertLessEqual(report["forced_reduce_orders"][0]["notional"], 130.0)
+
     def test_take_profit_guard_defaults_to_break_even_when_ratio_is_unset(self) -> None:
         plan = {
             "bootstrap_orders": [],

@@ -13840,6 +13840,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     adverse_long_pause_notional = effective_args.pause_buy_position_notional
     adverse_short_pause_notional = effective_args.pause_short_position_notional
     if _is_best_quote_maker_volume_mode(strategy_mode):
+        best_quote_adverse_probe_candidates = [
+            value
+            for value in (
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_cycle_budget_notional", 0.0)) * 0.5,
+                _safe_float(getattr(effective_args, "adverse_reduce_max_order_notional", 0.0)),
+            )
+            if value > 0
+        ]
+        best_quote_adverse_probe_notional = max(
+            (min(best_quote_adverse_probe_candidates) * 0.75) if best_quote_adverse_probe_candidates else 0.0,
+            _safe_float(symbol_info.get("min_notional")),
+        )
         adverse_long_pause_notional = _resolve_inventory_unlock_pause_notional(
             args=effective_args,
             strategy_mode=strategy_mode,
@@ -13852,6 +13864,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             side="short",
             fallback_pause_notional=effective_args.pause_short_position_notional,
         )
+        if best_quote_adverse_probe_notional > 0:
+            adverse_long_pause_notional = best_quote_adverse_probe_notional
+            adverse_short_pause_notional = best_quote_adverse_probe_notional
     adverse_inventory_reduce = assess_adverse_inventory_reduce(
         enabled=adverse_reduce_enabled,
         mid_price=mid_price,
