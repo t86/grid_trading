@@ -13212,8 +13212,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,
             ask_price=ask_price,
-            extra_long_guard_roles={"best_quote_reduce_long", "best_quote_entry_short"},
-            extra_short_guard_roles={"best_quote_reduce_short", "best_quote_entry_long"},
         )
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
