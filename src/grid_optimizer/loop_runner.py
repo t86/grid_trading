@@ -104,6 +104,7 @@ from .submit_plan import (
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
+    sort_cancel_orders_farthest_from_market_first,
     suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
     enforce_execution_action_limits,
@@ -7048,6 +7049,7 @@ def assess_adverse_inventory_reduce(
     long_trigger_ratio: float | None,
     short_trigger_ratio: float | None,
     target_ratio: float | None = None,
+    allow_short_below_pause_probe: bool = True,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "enabled": bool(enabled),
@@ -7113,8 +7115,11 @@ def assess_adverse_inventory_reduce(
     if (
         max(_safe_float(current_short_qty), 0.0) > 1e-12
         and short_pause > 0
-        and max(_safe_float(current_short_notional), 0.0) > min(
-            value for value in (short_pause, short_probe_floor) if value > 0
+        and max(_safe_float(current_short_notional), 0.0)
+        > (
+            min(value for value in (short_pause, short_probe_floor) if value > 0)
+            if allow_short_below_pause_probe and any(value > 0 for value in (short_pause, short_probe_floor))
+            else short_pause
         )
     ):
         if safe_short_cost <= 0:
@@ -13416,6 +13421,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
                 quote_offset_ticks=int(best_quote_dynamic_offsets["quote_offset_ticks"]),
                 defensive_offset_ticks=int(best_quote_dynamic_offsets["defensive_offset_ticks"]),
+                max_entry_orders_per_side=max(
+                    min(int(getattr(effective_args, "max_new_orders", 1) or 1) // 2, 2),
+                    1,
+                ),
                 max_long_notional=float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 1_500.0)),
                 max_short_notional=float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 1_500.0)),
                 inventory_soft_ratio=float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)),
@@ -14133,6 +14142,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         long_trigger_ratio=getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
         short_trigger_ratio=getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
         target_ratio=getattr(effective_args, "adverse_reduce_target_ratio", 0.75),
+        allow_short_below_pause_probe=not _is_best_quote_maker_volume_mode(strategy_mode),
     )
     adverse_inventory_reduce = apply_adverse_inventory_reduce(
         plan=plan,
@@ -15063,6 +15073,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+    )
+    validation["actions"] = sort_cancel_orders_farthest_from_market_first(
+        actions=validation["actions"],
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
     )
     validation["actions"] = prioritize_inventory_reducing_place_orders(
         actions=validation["actions"],
