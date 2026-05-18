@@ -359,7 +359,7 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         symbol="AIGENSYN",
         market="futures",
         label="AIGENSYN 合约交易挑战赛",
-        url="https://www.bsmkweb.cc/activity/trading-competition/futures-aigensyn-challenge?ref=YEK2JZJT",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-aigensyn-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
         slug="futures_tradfi_week1",
@@ -1462,7 +1462,7 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
         "boards": [
             {
                 "tabLabel": "交易量挑战赛",
-                "resourceId": 0,
+                "resourceId": 54596,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "AIGENSYN",

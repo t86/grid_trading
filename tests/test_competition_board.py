@@ -371,7 +371,8 @@ class CompetitionBoardTests(unittest.TestCase):
 
         self.assertEqual(len(boards), 1)
         board = boards[0]
-        self.assertEqual(board.get("resourceId"), 0)
+        self.assertIn("www.binance.com", source.url)
+        self.assertEqual(board.get("resourceId"), 54596)
         self.assertEqual(board["rewardUnit"], "AIGENSYN")
         self.assertEqual(board["activityPeriodText"], "2026/05/12 18:00 - 2026/05/19 07:59")
         self.assertEqual(board["activityEndAt"], "2026-05-19T07:59:00+08:00")
