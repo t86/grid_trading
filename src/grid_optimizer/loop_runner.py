@@ -13268,23 +13268,49 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "blocked_sell_orders": 0,
             "long_cost_price": current_long_avg_price if current_long_qty > 1e-12 else None,
             "short_cost_price": current_short_avg_price if current_short_qty > 1e-12 else None,
+            "long_unrealized_ratio": None,
+            "short_unrealized_ratio": None,
         }
         if current_long_qty > 1e-12 and current_long_avg_price > 0:
+            long_unrealized_ratio = (
+                (mid_price - current_long_avg_price) / current_long_avg_price
+                if mid_price > 0
+                else None
+            )
+            best_quote_inventory_cost_gate["long_unrealized_ratio"] = long_unrealized_ratio
             before = len(plan.get("buy_orders", []) or [])
             plan["buy_orders"] = [
                 dict(item)
                 for item in plan.get("buy_orders", [])
                 if isinstance(item, dict)
-                and (_order_role(item) != "best_quote_entry_long" or _safe_float(item.get("price")) <= current_long_avg_price)
+                and (
+                    _order_role(item) != "best_quote_entry_long"
+                    or (
+                        _safe_float(item.get("price")) <= current_long_avg_price
+                        and (long_unrealized_ratio is None or long_unrealized_ratio >= 0.0)
+                    )
+                )
             ]
             best_quote_inventory_cost_gate["blocked_buy_orders"] = before - len(plan["buy_orders"])
         if current_short_qty > 1e-12 and current_short_avg_price > 0:
+            short_unrealized_ratio = (
+                (current_short_avg_price - mid_price) / current_short_avg_price
+                if mid_price > 0
+                else None
+            )
+            best_quote_inventory_cost_gate["short_unrealized_ratio"] = short_unrealized_ratio
             before = len(plan.get("sell_orders", []) or [])
             plan["sell_orders"] = [
                 dict(item)
                 for item in plan.get("sell_orders", [])
                 if isinstance(item, dict)
-                and (_order_role(item) != "best_quote_entry_short" or _safe_float(item.get("price")) >= current_short_avg_price)
+                and (
+                    _order_role(item) != "best_quote_entry_short"
+                    or (
+                        _safe_float(item.get("price")) >= current_short_avg_price
+                        and (short_unrealized_ratio is None or short_unrealized_ratio >= 0.0)
+                    )
+                )
             ]
             best_quote_inventory_cost_gate["blocked_sell_orders"] = before - len(plan["sell_orders"])
         best_quote_maker_volume = {
