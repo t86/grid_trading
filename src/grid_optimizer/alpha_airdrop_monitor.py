@@ -174,6 +174,14 @@ def _extract_time_hint_text(text: str) -> str | None:
     return None
 
 
+def _is_eligible_alpha_airdrop_announcement(text: str, normalized: str) -> bool:
+    return (
+        "claim" in normalized
+        and ("eligible" in normalized or "符合" in text)
+        and ("alpha points" in normalized or "alpha 积分" in normalized or "Alpha 积分" in text)
+    )
+
+
 def _match_alpha_airdrop_post(entry: dict[str, Any], *, now: datetime, tz_offset_hours: int) -> dict[str, Any] | None:
     tweet_id = str(entry.get("id_str") or entry.get("id") or "").strip()
     text = _normalize_text(entry.get("full_text") or entry.get("text") or "")
@@ -196,7 +204,7 @@ def _match_alpha_airdrop_post(entry: dict[str, Any], *, now: datetime, tz_offset
     if "airdrop" not in normalized and "空投" not in text:
         return None
     points_threshold = _extract_points_threshold(text)
-    if points_threshold is None:
+    if points_threshold is None and not _is_eligible_alpha_airdrop_announcement(text, normalized):
         return None
 
     action_hit = any(

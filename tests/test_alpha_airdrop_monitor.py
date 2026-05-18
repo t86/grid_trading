@@ -129,6 +129,26 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
         self.assertEqual(matched["points_threshold"], 225)
         self.assertEqual(matched["time_hint_text"], "17:00（UTC+8）")
 
+    def test_match_alpha_airdrop_post_allows_future_eligible_airdrop_without_threshold(self) -> None:
+        now = datetime(2026, 5, 18, 8, 0, tzinfo=timezone.utc)
+
+        matched = _match_alpha_airdrop_post(
+            {
+                "id_str": "104",
+                "created_at": "Sun May 17 11:00:00 +0000 2026",
+                "full_text": (
+                    "Binance Alpha will be the first platform to feature Zest Protocol (ZEST) on May 19. "
+                    "Eligible users can claim their airdrop using Binance Alpha Points on the Alpha Events page "
+                    "once trading opens. Further details will be announced soon."
+                ),
+            },
+            now=now,
+            tz_offset_hours=8,
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertIsNone(matched["points_threshold"])
+
     def test_extract_time_hint_text_prefers_explicit_schedule(self) -> None:
         self.assertEqual(
             _extract_time_hint_text("Please get ready to claim today at 9:00 (UTC)."),
