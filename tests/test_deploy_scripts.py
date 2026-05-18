@@ -103,3 +103,4 @@ def test_low_volume_monitor_installer_runs_every_ten_minutes() -> None:
     assert "--min-volume-notional ${MIN_VOLUME_NOTIONAL}" in script
     assert "MIN_VOLUME_NOTIONAL=\"${MIN_VOLUME_NOTIONAL:-1000}\"" in script
     assert "ON_UNIT_ACTIVE_SEC=\"${ON_UNIT_ACTIVE_SEC:-10min}\"" in script
+    assert 'status "${TIMER_UNIT_NAME}.service" | sed -n \'1,20p\' || true' in script
