@@ -697,6 +697,46 @@ def resolve_adaptive_step_price(
     return report
 
 
+def _resolve_best_quote_dynamic_offsets(
+    *,
+    adaptive_step: dict[str, Any],
+    quote_offset_ticks: int,
+    defensive_offset_ticks: int,
+) -> dict[str, Any]:
+    configured_quote = max(int(quote_offset_ticks or 0), 0)
+    configured_defensive = max(int(defensive_offset_ticks or 0), 0)
+    report = {
+        "configured_quote_offset_ticks": configured_quote,
+        "configured_defensive_offset_ticks": configured_defensive,
+        "quote_offset_ticks": configured_quote,
+        "defensive_offset_ticks": configured_defensive,
+        "dynamic_quote_offset_applied": False,
+        "dynamic_quote_offset_scale": 1.0,
+        "reason": None,
+    }
+    if configured_quote <= 1 or not isinstance(adaptive_step, dict) or not bool(adaptive_step.get("enabled")):
+        return report
+    raw_scale = max(_safe_float(adaptive_step.get("raw_scale")), 0.0)
+    if raw_scale <= 0.0 or raw_scale >= 1.0:
+        return report
+    dynamic_quote = max(int(math.floor(configured_quote * raw_scale)), 1)
+    if dynamic_quote >= configured_quote:
+        return report
+    report.update(
+        {
+            "quote_offset_ticks": dynamic_quote,
+            "dynamic_quote_offset_applied": True,
+            "dynamic_quote_offset_scale": raw_scale,
+            "reason": (
+                "low_volatility_quote_tighten"
+                f": raw_scale={raw_scale:.3f} "
+                f"{configured_quote}->{dynamic_quote}"
+            ),
+        }
+    )
+    return report
+
+
 def resolve_volatility_entry_pause(
     *,
     adaptive_step: dict[str, Any],
@@ -12869,11 +12909,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             best_quote_loss_per_10k_15m = _safe_float(
                 ((elastic_volume.get("metrics") or {}).get("loss_per_10k_15m"))
             )
+        best_quote_dynamic_offsets = _resolve_best_quote_dynamic_offsets(
+            adaptive_step=adaptive_step,
+            quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
+            defensive_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_defensive_offset_ticks", 3)),
+        )
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
-                quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
-                defensive_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_defensive_offset_ticks", 3)),
+                quote_offset_ticks=int(best_quote_dynamic_offsets["quote_offset_ticks"]),
+                defensive_offset_ticks=int(best_quote_dynamic_offsets["defensive_offset_ticks"]),
                 max_long_notional=float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 1_500.0)),
                 max_short_notional=float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 1_500.0)),
                 inventory_soft_ratio=float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)),
@@ -12923,6 +12968,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "regime": str(plan.get("regime") or ""),
             "reasons": list(plan.get("reasons") or []),
             "metrics": dict(plan.get("metrics") or {}),
+            "dynamic_offsets": dict(best_quote_dynamic_offsets),
         }
         inventory_tier = {
             "enabled": False,

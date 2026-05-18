@@ -41,6 +41,7 @@ from grid_optimizer.loop_runner import (
     _infer_synthetic_order_ref_from_trade,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
+    _resolve_best_quote_dynamic_offsets,
     _resolve_synthetic_resync_price,
     _shift_custom_grid_bounds,
     _run_periodic_reconcile,
@@ -339,6 +340,107 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["maker_state"]["blocked_reason"], "invalid_market_data")
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(plan["sell_orders"], [])
+
+    def test_best_quote_dynamic_offsets_tighten_in_low_volatility(self) -> None:
+        result = _resolve_best_quote_dynamic_offsets(
+            adaptive_step={"enabled": True, "raw_scale": 0.4, "dominant_window": "window_1m"},
+            quote_offset_ticks=3,
+            defensive_offset_ticks=6,
+        )
+
+        self.assertTrue(result["dynamic_quote_offset_applied"])
+        self.assertEqual(result["quote_offset_ticks"], 1)
+        self.assertEqual(result["defensive_offset_ticks"], 6)
+        self.assertEqual(result["configured_quote_offset_ticks"], 3)
+
+    def test_best_quote_dynamic_offsets_keep_configured_offset_when_volatility_is_high(self) -> None:
+        result = _resolve_best_quote_dynamic_offsets(
+            adaptive_step={"enabled": True, "raw_scale": 1.3, "active": True},
+            quote_offset_ticks=3,
+            defensive_offset_ticks=6,
+        )
+
+        self.assertFalse(result["dynamic_quote_offset_applied"])
+        self.assertEqual(result["quote_offset_ticks"], 3)
+        self.assertEqual(result["defensive_offset_ticks"], 6)
+
+    @patch("grid_optimizer.loop_runner.resolve_adaptive_step_price")
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_maker_volume_reports_dynamic_low_volatility_offset(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+        mock_adaptive_step,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "80400.0", "ask_price": "80400.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BTCUSDC", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+        mock_adaptive_step.return_value = {
+            "enabled": True,
+            "active": False,
+            "controls_active": False,
+            "base_step_price": 1.0,
+            "effective_step_price": 1.0,
+            "scale": 1.0,
+            "raw_scale": 0.4,
+            "metrics": {},
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BTCUSDC",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="btcusdc_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=400.0,
+                best_quote_maker_volume_quote_offset_ticks=3,
+                best_quote_maker_volume_defensive_offset_ticks=6,
+                best_quote_maker_volume_max_long_notional=1_500.0,
+                best_quote_maker_volume_max_short_notional=1_500.0,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        dynamic_offsets = report["best_quote_maker_volume"]["dynamic_offsets"]
+        self.assertTrue(dynamic_offsets["dynamic_quote_offset_applied"])
+        self.assertEqual(dynamic_offsets["configured_quote_offset_ticks"], 3)
+        self.assertEqual(dynamic_offsets["quote_offset_ticks"], 1)
+        self.assertEqual(report["buy_orders"][0]["price"], 80399.9)
+        self.assertEqual(report["sell_orders"][0]["price"], 80400.2)
 
     def test_best_quote_maker_volume_quotes_best_bid_ask(self) -> None:
         plan = build_best_quote_maker_volume_plan(
