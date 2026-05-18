@@ -7477,8 +7477,6 @@ def apply_inventory_unlock_release(
         not candidate
         and runtime_state.get("side") == normalized_side
         and previous_reentry_cooldown > 0
-        and previous_target_notional > 0
-        and safe_current_notional > previous_target_notional + 1e-12
     )
     if candidate:
         previous_count = int(runtime_state.get("stall_count") or 0) if runtime_state.get("side") == normalized_side else 0

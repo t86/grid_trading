@@ -1935,7 +1935,7 @@ class LoopRunnerTests(unittest.TestCase):
             entry_paused=False,
             take_profit_guard={"enabled": True, "long_active": True, "long_floor_price": 1.05},
             current_qty=3600.0,
-            current_notional=3600.0,
+            current_notional=3100.0,
             pause_notional=4000.0,
             release_cap_notional=700.0,
             per_order_notional=1100.0,
