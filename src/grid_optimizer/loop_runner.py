@@ -13448,6 +13448,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
                 open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 pending_entry_buffer_notional=cycle_budget * 0.5,
+                entry_ladder_spacing=_safe_float(getattr(effective_args, "step_price", 0.0)),
             ),
         )
         take_profit_guard = apply_take_profit_profit_guard(

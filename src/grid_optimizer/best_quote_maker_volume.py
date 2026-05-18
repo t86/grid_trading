@@ -38,6 +38,7 @@ class BestQuoteMakerVolumeInputs:
     open_entry_long_notional: float = 0.0
     open_entry_short_notional: float = 0.0
     pending_entry_buffer_notional: float = 0.0
+    entry_ladder_spacing: float | None = None
 
 
 def _safe_float(value: Any) -> float:
@@ -117,10 +118,11 @@ def _build_entry_ladder(
         return []
     per_order_notional = total_notional / float(safe_slots)
     tick_gap = _tick_gap(inputs.tick_size, 1)
+    ladder_gap = max(_safe_float(inputs.entry_ladder_spacing), tick_gap)
     sign = -1 if str(side).upper() == "BUY" else 1
     orders: list[dict[str, Any]] = []
     for level in range(safe_slots):
-        gap = max(base_gap, 0.0) + (tick_gap * level)
+        gap = max(base_gap, 0.0) + (ladder_gap * level)
         _append_order(
             orders,
             _build_order(

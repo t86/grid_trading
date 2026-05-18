@@ -120,6 +120,25 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertLess(soft["buy_orders"][0]["price"], normal["buy_orders"][0]["price"])
         self.assertGreater(soft["sell_orders"][0]["price"], normal["sell_orders"][0]["price"])
 
+    def test_multiple_entry_orders_are_spaced_by_strategy_step(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True, max_entry_orders_per_side=2),
+            inputs=_inputs(
+                bid_price=0.15968,
+                ask_price=0.15969,
+                mid_price=0.159685,
+                cycle_budget_notional=460.0,
+                tick_size=0.00001,
+                step_size=1.0,
+                entry_ladder_spacing=0.00019,
+            ),
+        )
+
+        self.assertEqual(len(plan["buy_orders"]), 2)
+        self.assertEqual(len(plan["sell_orders"]), 2)
+        self.assertEqual([order["price"] for order in plan["buy_orders"]], [0.15968, 0.15949])
+        self.assertEqual([order["price"] for order in plan["sell_orders"]], [0.15969, 0.15988])
+
 
 if __name__ == "__main__":
     unittest.main()
