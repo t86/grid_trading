@@ -2000,6 +2000,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["best_quote_maker_volume_defensive_offset_ticks"], 3)
         self.assertAlmostEqual(payload["best_quote_maker_volume_max_long_notional"], 1200.0)
         self.assertAlmostEqual(payload["best_quote_maker_volume_max_short_notional"], 1200.0)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_below_soft_cost_gap_scale"], 1.0)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_below_soft_adverse_threshold_scale"], 1.0)
         self.assertAlmostEqual(payload["max_total_notional"], 1600.0)
         self.assertEqual(payload["max_new_orders"], 6)
         self.assertAlmostEqual(payload["sleep_seconds"], 1.4)
@@ -2685,6 +2687,8 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_loss_per_10k_soft": "0.5",
                 "best_quote_maker_volume_loss_per_10k_hard": "0.8",
                 "best_quote_maker_volume_soft_loss_budget_scale": "0.5",
+                "best_quote_maker_volume_below_soft_cost_gap_scale": "0.25",
+                "best_quote_maker_volume_below_soft_adverse_threshold_scale": "5",
             }
         )
 
@@ -2695,6 +2699,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["best_quote_maker_volume_max_long_notional"], 1500.0)
         self.assertEqual(payload["best_quote_maker_volume_max_short_notional"], 1500.0)
         self.assertEqual(payload["best_quote_maker_volume_loss_per_10k_hard"], 0.8)
+        self.assertEqual(payload["best_quote_maker_volume_below_soft_cost_gap_scale"], 0.25)
+        self.assertEqual(payload["best_quote_maker_volume_below_soft_adverse_threshold_scale"], 5.0)
 
     def test_validate_runner_required_risk_guards_allows_maker_inventory_limits(self) -> None:
         _validate_runner_required_risk_guards(
@@ -2793,6 +2799,8 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_loss_per_10k_soft": 0.5,
                 "best_quote_maker_volume_loss_per_10k_hard": 0.8,
                 "best_quote_maker_volume_soft_loss_budget_scale": 0.5,
+                "best_quote_maker_volume_below_soft_cost_gap_scale": 0.25,
+                "best_quote_maker_volume_below_soft_adverse_threshold_scale": 5.0,
                 "elastic_volume_enabled": True,
                 "elastic_early_micro_abs_return_ratio": 0.001,
                 "elastic_early_micro_amplitude_ratio": 0.0015,
@@ -2825,6 +2833,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--best-quote-maker-volume-max-long-notional", command)
         self.assertIn("--best-quote-maker-volume-max-short-notional", command)
         self.assertIn("--best-quote-maker-volume-loss-per-10k-hard", command)
+        self.assertIn("--best-quote-maker-volume-below-soft-cost-gap-scale", command)
+        self.assertIn("--best-quote-maker-volume-below-soft-adverse-threshold-scale", command)
+        self.assertIn("0.25", command)
+        self.assertIn("5.0", command)
         self.assertIn("--elastic-early-micro-abs-return-ratio", command)
         self.assertIn("--elastic-early-micro-amplitude-ratio", command)
         self.assertIn("--elastic-early-safe-inventory-ratio", command)

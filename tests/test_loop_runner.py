@@ -860,6 +860,76 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_maker_volume_relaxes_cost_gate_below_soft_inventory(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.00001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.14355", "ask_price": "0.14356"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BILLUSDT", "positionAmt": "5430", "entryPrice": "0.14360"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BILLUSDT",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="billusdt_best_quote_maker_volume_reset_v1",
+                step_price=0.00019,
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=260.0,
+                best_quote_maker_volume_quote_offset_ticks=1,
+                best_quote_maker_volume_defensive_offset_ticks=30,
+                best_quote_maker_volume_max_long_notional=5500.0,
+                best_quote_maker_volume_max_short_notional=5500.0,
+                best_quote_maker_volume_inventory_soft_ratio=0.55,
+                best_quote_maker_volume_below_soft_cost_gap_scale=0.0,
+                take_profit_min_profit_ratio=0.0003,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        gate = report["best_quote_maker_volume"]["inventory_cost_gate"]
+        self.assertTrue(gate["long_below_soft_exempt"])
+        self.assertAlmostEqual(gate["long_entry_gate_price"], 0.14360)
+        self.assertAlmostEqual(gate["long_cost_gap_price"], 0.0)
+        self.assertEqual(report["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertEqual(gate["blocked_buy_orders"], 0)
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
     def test_best_quote_maker_volume_allows_long_entry_below_cost_only_when_inventory_profitable(
         self,
         mock_symbol_config,
@@ -1045,6 +1115,77 @@ class LoopRunnerTests(unittest.TestCase):
         gate = report["best_quote_maker_volume"]["inventory_cost_gate"]
         self.assertEqual(gate["blocked_sell_orders"], 1)
         self.assertEqual(gate["blocked_sell_order_details"][0]["block_reason"], "losing_short_adverse_uptrend")
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_maker_volume_relaxes_adverse_gate_below_soft_inventory(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.00001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.16051", "ask_price": "0.16052"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BILLUSDT", "positionAmt": "-26909", "entryPrice": "0.1598576369652"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+            "return_ratio": 0.00337,
+            "amplitude_ratio": 0.00531,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BILLUSDT",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="billusdt_best_quote_maker_volume_reset_v1",
+                step_price=0.00019,
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=460.0,
+                best_quote_maker_volume_quote_offset_ticks=1,
+                best_quote_maker_volume_defensive_offset_ticks=2,
+                best_quote_maker_volume_max_long_notional=9000.0,
+                best_quote_maker_volume_max_short_notional=9000.0,
+                best_quote_maker_volume_inventory_soft_ratio=0.55,
+                best_quote_maker_volume_below_soft_adverse_threshold_scale=5.0,
+                take_profit_min_profit_ratio=0.0003,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        gate = report["best_quote_maker_volume"]["inventory_cost_gate"]
+        self.assertTrue(gate["short_below_soft_exempt"])
+        self.assertGreater(gate["short_adverse_trend_threshold_ratio"], gate["adverse_trend_threshold_ratio"])
+        self.assertEqual(report["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertEqual(gate["blocked_sell_orders"], 0)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")

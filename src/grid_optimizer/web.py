@@ -427,6 +427,8 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_loss_per_10k_hard": 0.8,
             "best_quote_maker_volume_soft_loss_budget_scale": 0.50,
             "best_quote_maker_volume_min_cycle_budget_notional": 20.0,
+            "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
+            "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "autotune_symbol_enabled": False,
@@ -3869,6 +3871,8 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "maker_extreme_volatility_threshold": 0.012,
     "maker_directional_move_threshold": 0.004,
     "maker_cooldown_seconds": 30.0,
+    "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
+    "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
     "max_new_orders": 20,
     "max_total_notional": 1000.0,
     "run_start_time": None,
@@ -8837,6 +8841,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_loss_per_10k_hard",
         "best_quote_maker_volume_soft_loss_budget_scale",
         "best_quote_maker_volume_min_cycle_budget_notional",
+        "best_quote_maker_volume_below_soft_cost_gap_scale",
+        "best_quote_maker_volume_below_soft_adverse_threshold_scale",
         "elastic_early_micro_abs_return_ratio",
         "elastic_early_micro_amplitude_ratio",
         "elastic_early_safe_inventory_ratio",
@@ -9460,6 +9466,12 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         require_positive("best_quote_maker_volume_max_long_notional")
         require_positive("best_quote_maker_volume_max_short_notional")
         require_positive("best_quote_maker_volume_inventory_soft_ratio")
+        below_soft_cost_gap_scale = number("best_quote_maker_volume_below_soft_cost_gap_scale")
+        if below_soft_cost_gap_scale is not None and below_soft_cost_gap_scale < 0:
+            errors.append("best_quote_maker_volume_below_soft_cost_gap_scale 必须 >= 0")
+        below_soft_adverse_threshold_scale = number("best_quote_maker_volume_below_soft_adverse_threshold_scale")
+        if below_soft_adverse_threshold_scale is not None and below_soft_adverse_threshold_scale < 0:
+            errors.append("best_quote_maker_volume_below_soft_adverse_threshold_scale 必须 >= 0")
         soft_ratio = number("best_quote_maker_volume_inventory_soft_ratio")
         if soft_ratio is not None and soft_ratio > 1:
             errors.append("best_quote_maker_volume_inventory_soft_ratio 必须 <= 1")
@@ -9596,6 +9608,10 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_soft_loss_budget_scale", 0.50)),
         "--best-quote-maker-volume-min-cycle-budget-notional",
         str(config.get("best_quote_maker_volume_min_cycle_budget_notional", 20.0)),
+        "--best-quote-maker-volume-below-soft-cost-gap-scale",
+        str(config.get("best_quote_maker_volume_below_soft_cost_gap_scale", 1.0)),
+        "--best-quote-maker-volume-below-soft-adverse-threshold-scale",
+        str(config.get("best_quote_maker_volume_below_soft_adverse_threshold_scale", 1.0)),
         "--margin-type",
         str(config.get("margin_type", "KEEP")),
         "--leverage",

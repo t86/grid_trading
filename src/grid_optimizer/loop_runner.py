@@ -13507,6 +13507,20 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             "long_below_soft_exempt": False,
             "short_below_soft_exempt": False,
+            "below_soft_cost_gap_scale": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_below_soft_cost_gap_scale", 1.0)),
+                0.0,
+            ),
+            "below_soft_adverse_threshold_scale": max(
+                _safe_float(
+                    getattr(effective_args, "best_quote_maker_volume_below_soft_adverse_threshold_scale", 1.0)
+                ),
+                0.0,
+            ),
+            "long_cost_gap_price": None,
+            "short_cost_gap_price": None,
+            "long_adverse_trend_threshold_ratio": None,
+            "short_adverse_trend_threshold_ratio": None,
         }
         best_quote_entry_adverse_trend_threshold_ratio = (
             _safe_float(effective_args.step_price) / mid_price
@@ -13521,17 +13535,31 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             )
             grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
-            long_entry_gate_price = max(current_long_avg_price - grid_profit_gap, 0.0) if grid_profit_gap > 0 else current_long_avg_price
-            best_quote_inventory_cost_gate["long_unrealized_ratio"] = long_unrealized_ratio
-            best_quote_inventory_cost_gate["long_entry_gate_price"] = long_entry_gate_price
             long_soft_threshold = _safe_float(best_quote_inventory_cost_gate["long_soft_threshold_notional"])
             long_below_soft_exempt = long_soft_threshold > 0 and current_long_notional < long_soft_threshold
+            below_soft_cost_gap_scale = _safe_float(best_quote_inventory_cost_gate["below_soft_cost_gap_scale"])
+            below_soft_adverse_threshold_scale = _safe_float(
+                best_quote_inventory_cost_gate["below_soft_adverse_threshold_scale"]
+            )
+            long_cost_gap = grid_profit_gap * below_soft_cost_gap_scale if long_below_soft_exempt else grid_profit_gap
+            long_adverse_threshold = (
+                best_quote_entry_adverse_trend_threshold_ratio * below_soft_adverse_threshold_scale
+                if long_below_soft_exempt
+                else best_quote_entry_adverse_trend_threshold_ratio
+            )
+            long_entry_gate_price = (
+                max(current_long_avg_price - long_cost_gap, 0.0) if long_cost_gap > 0 else current_long_avg_price
+            )
+            best_quote_inventory_cost_gate["long_unrealized_ratio"] = long_unrealized_ratio
+            best_quote_inventory_cost_gate["long_entry_gate_price"] = long_entry_gate_price
             best_quote_inventory_cost_gate["long_below_soft_exempt"] = long_below_soft_exempt
+            best_quote_inventory_cost_gate["long_cost_gap_price"] = long_cost_gap
+            best_quote_inventory_cost_gate["long_adverse_trend_threshold_ratio"] = long_adverse_threshold
             block_long_same_side_adverse = (
                 long_unrealized_ratio is not None
                 and long_unrealized_ratio < 0
-                and best_quote_entry_adverse_trend_threshold_ratio > 0
-                and _safe_float((market_guard or {}).get("return_ratio")) < -best_quote_entry_adverse_trend_threshold_ratio
+                and long_adverse_threshold > 0
+                and _safe_float((market_guard or {}).get("return_ratio")) < -long_adverse_threshold
             )
             kept_buy_orders: list[dict[str, Any]] = []
             blocked_buy_orders: list[dict[str, Any]] = []
@@ -13564,17 +13592,31 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             )
             grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
-            short_entry_gate_price = current_short_avg_price + grid_profit_gap if grid_profit_gap > 0 else current_short_avg_price
-            best_quote_inventory_cost_gate["short_unrealized_ratio"] = short_unrealized_ratio
-            best_quote_inventory_cost_gate["short_entry_gate_price"] = short_entry_gate_price
             short_soft_threshold = _safe_float(best_quote_inventory_cost_gate["short_soft_threshold_notional"])
             short_below_soft_exempt = short_soft_threshold > 0 and current_short_notional < short_soft_threshold
+            below_soft_cost_gap_scale = _safe_float(best_quote_inventory_cost_gate["below_soft_cost_gap_scale"])
+            below_soft_adverse_threshold_scale = _safe_float(
+                best_quote_inventory_cost_gate["below_soft_adverse_threshold_scale"]
+            )
+            short_cost_gap = grid_profit_gap * below_soft_cost_gap_scale if short_below_soft_exempt else grid_profit_gap
+            short_adverse_threshold = (
+                best_quote_entry_adverse_trend_threshold_ratio * below_soft_adverse_threshold_scale
+                if short_below_soft_exempt
+                else best_quote_entry_adverse_trend_threshold_ratio
+            )
+            short_entry_gate_price = (
+                current_short_avg_price + short_cost_gap if short_cost_gap > 0 else current_short_avg_price
+            )
+            best_quote_inventory_cost_gate["short_unrealized_ratio"] = short_unrealized_ratio
+            best_quote_inventory_cost_gate["short_entry_gate_price"] = short_entry_gate_price
             best_quote_inventory_cost_gate["short_below_soft_exempt"] = short_below_soft_exempt
+            best_quote_inventory_cost_gate["short_cost_gap_price"] = short_cost_gap
+            best_quote_inventory_cost_gate["short_adverse_trend_threshold_ratio"] = short_adverse_threshold
             block_short_same_side_adverse = (
                 short_unrealized_ratio is not None
                 and short_unrealized_ratio < 0
-                and best_quote_entry_adverse_trend_threshold_ratio > 0
-                and _safe_float((market_guard or {}).get("return_ratio")) > best_quote_entry_adverse_trend_threshold_ratio
+                and short_adverse_threshold > 0
+                and _safe_float((market_guard or {}).get("return_ratio")) > short_adverse_threshold
             )
             kept_sell_orders: list[dict[str, Any]] = []
             blocked_sell_orders: list[dict[str, Any]] = []
@@ -15483,6 +15525,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-loss-per-10k-hard", type=float, default=0.8)
     parser.add_argument("--best-quote-maker-volume-soft-loss-budget-scale", type=float, default=0.50)
     parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
+    parser.add_argument("--best-quote-maker-volume-below-soft-cost-gap-scale", type=float, default=1.0)
+    parser.add_argument("--best-quote-maker-volume-below-soft-adverse-threshold-scale", type=float, default=1.0)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
     parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)
     parser.add_argument("--sticky-entry-preserve-less-aggressive", action=argparse.BooleanOptionalAction, default=True)
@@ -16393,6 +16437,11 @@ def main() -> None:
         raise SystemExit("--regime-entry-budget-defensive-inventory-usage-ratio must be > 0")
     if args.regime_entry_budget_tick_dominated_ratio < 0 or args.regime_entry_budget_coarse_tick_ratio < 0:
         raise SystemExit("--regime-entry-budget tick ratios must be >= 0")
+    if (
+        args.best_quote_maker_volume_below_soft_cost_gap_scale < 0
+        or args.best_quote_maker_volume_below_soft_adverse_threshold_scale < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume below-soft scales must be >= 0")
     if not (
         args.elastic_loss_per_10k_sprint
         <= args.elastic_loss_per_10k_cruise
