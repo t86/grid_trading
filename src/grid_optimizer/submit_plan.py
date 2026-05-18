@@ -5,7 +5,7 @@ import json
 import time
 import traceback
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -170,6 +170,12 @@ def _resize_order_to_notional(order: dict[str, Any], target_notional: float) -> 
         return None
     if requested_qty > Decimal("0"):
         target_qty = min(target_qty, requested_qty)
+        if requested_qty == requested_qty.to_integral_value():
+            target_qty = target_qty.to_integral_value(rounding=ROUND_DOWN)
+        else:
+            target_qty = target_qty.quantize(requested_qty, rounding=ROUND_DOWN)
+    if target_qty <= Decimal("0"):
+        return None
     return _clone_order_with_qty(order, target_qty)
 
 

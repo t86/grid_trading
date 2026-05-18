@@ -231,7 +231,7 @@ class SubmitPlanTests(unittest.TestCase):
             guarded["place_orders"][1]["loss_inventory_no_cross_guard"],
             "long_small_loss_reduce_resized",
         )
-        self.assertAlmostEqual(guarded["place_orders"][1]["notional"], 15.0)
+        self.assertLessEqual(guarded["place_orders"][1]["notional"], 15.0)
         self.assertIs(guarded["place_orders"][1]["force_reduce_only"], True)
         self.assertEqual(guarded["place_orders"][2]["role"], "active_delever_long")
         self.assertEqual(
@@ -389,9 +389,9 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guarded["place_count"], 1)
         order = guarded["place_orders"][0]
         self.assertEqual(order["loss_inventory_no_cross_guard"], "long_small_loss_reduce_resized")
-        self.assertAlmostEqual(order["notional"], 15.0)
-        self.assertAlmostEqual(order["qty"], 15.0 / 0.1405)
-        self.assertAlmostEqual(order["quantity"], 15.0 / 0.1405)
+        self.assertEqual(order["qty"], 106.0)
+        self.assertEqual(order["quantity"], 106.0)
+        self.assertLessEqual(order["notional"], 15.0)
         guard_report = guarded["loss_inventory_no_cross_entry_guard"]
         self.assertEqual(guard_report["allowed_small_entry_count"], 1)
         self.assertEqual(guard_report["resized_small_loss_reduce_count"], 1)
@@ -431,7 +431,7 @@ class SubmitPlanTests(unittest.TestCase):
         order = guarded["place_orders"][0]
         self.assertEqual(order["loss_inventory_no_cross_guard"], "long_small_loss_reduce_resized")
         self.assertIs(order["force_reduce_only"], True)
-        self.assertAlmostEqual(order["notional"], 15.0)
+        self.assertLessEqual(order["notional"], 15.0)
         guard_report = guarded["loss_inventory_no_cross_entry_guard"]
         self.assertEqual(guard_report["resized_small_loss_reduce_count"], 1)
         self.assertEqual(guard_report["dropped_order_count"], 0)
@@ -510,9 +510,9 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guarded["place_count"], 1)
         order = guarded["place_orders"][0]
         self.assertEqual(order["loss_inventory_no_cross_guard"], "short_small_loss_reduce_resized")
-        self.assertAlmostEqual(order["notional"], 15.0)
-        self.assertAlmostEqual(order["qty"], 15.0 / 0.1450)
-        self.assertAlmostEqual(order["quantity"], 15.0 / 0.1450)
+        self.assertEqual(order["qty"], 103.0)
+        self.assertEqual(order["quantity"], 103.0)
+        self.assertLessEqual(order["notional"], 15.0)
         guard_report = guarded["loss_inventory_no_cross_entry_guard"]
         self.assertEqual(guard_report["allowed_small_entry_count"], 1)
         self.assertEqual(guard_report["resized_small_loss_reduce_count"], 1)
@@ -552,7 +552,7 @@ class SubmitPlanTests(unittest.TestCase):
         order = guarded["place_orders"][0]
         self.assertEqual(order["loss_inventory_no_cross_guard"], "short_small_loss_reduce_resized")
         self.assertIs(order["force_reduce_only"], True)
-        self.assertAlmostEqual(order["notional"], 15.0)
+        self.assertLessEqual(order["notional"], 15.0)
         guard_report = guarded["loss_inventory_no_cross_entry_guard"]
         self.assertEqual(guard_report["resized_small_loss_reduce_count"], 1)
         self.assertEqual(guard_report["dropped_order_count"], 0)
