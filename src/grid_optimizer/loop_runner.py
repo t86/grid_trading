@@ -7360,6 +7360,9 @@ def _inventory_unlock_default_report() -> dict[str, Any]:
         "release_price": None,
         "release_qty": 0.0,
         "release_order_count": 0,
+        "reentry_block_active": False,
+        "reentry_cooldown_cycles": 0,
+        "blocked_entry_order_count": 0,
     }
 
 
@@ -7435,21 +7438,66 @@ def apply_inventory_unlock_release(
         and safe_cap_notional > 0
         and (long_floor_blocks or short_ceiling_blocks)
     )
+    previous_reentry_cooldown = int(runtime_state.get("reentry_cooldown_cycles") or 0)
+    previous_target_notional = max(_safe_float(runtime_state.get("target_notional")), 0.0)
+    reentry_block_active = (
+        not candidate
+        and runtime_state.get("side") == normalized_side
+        and previous_reentry_cooldown > 0
+        and previous_target_notional > 0
+        and safe_current_notional > previous_target_notional + 1e-12
+    )
     if candidate:
         previous_count = int(runtime_state.get("stall_count") or 0) if runtime_state.get("side") == normalized_side else 0
         stall_count = previous_count + 1
-        runtime_state = {"side": normalized_side, "stall_count": stall_count}
+        runtime_state = {
+            "side": normalized_side,
+            "stall_count": stall_count,
+            "reentry_cooldown_cycles": previous_reentry_cooldown,
+            "target_notional": previous_target_notional,
+        }
+    elif reentry_block_active:
+        stall_count = 0
+        runtime_state = {
+            "side": normalized_side,
+            "stall_count": 0,
+            "reentry_cooldown_cycles": max(previous_reentry_cooldown - 1, 0),
+            "target_notional": previous_target_notional,
+        }
     else:
         stall_count = 0
         runtime_state = {}
     report["candidate"] = bool(candidate)
     report["stall_count"] = stall_count
+    report["reentry_block_active"] = bool(reentry_block_active)
+    report["reentry_cooldown_cycles"] = int(runtime_state.get("reentry_cooldown_cycles") or 0)
+    if previous_target_notional > 0 and report.get("target_notional") is None:
+        report["target_notional"] = previous_target_notional
 
     if runtime_state:
         state["inventory_unlock_release"] = runtime_state
     else:
         state.pop("inventory_unlock_release", None)
 
+    if reentry_block_active:
+        if normalized_side == "long":
+            before = len(plan.get("buy_orders", []) or [])
+            plan["buy_orders"] = [
+                dict(item)
+                for item in plan.get("buy_orders", [])
+                if isinstance(item, dict) and _is_short_exit_order(item)
+            ]
+            report["blocked_entry_order_count"] = before - len(plan["buy_orders"])
+        elif normalized_side == "short":
+            before = len(plan.get("sell_orders", []) or [])
+            plan["sell_orders"] = [
+                dict(item)
+                for item in plan.get("sell_orders", [])
+                if isinstance(item, dict) and _is_long_exit_order(item)
+            ]
+            report["blocked_entry_order_count"] = before - len(plan["sell_orders"])
+        report["reason"] = "reentry_cooldown"
+        return report
     if not candidate:
         report["reason"] = "not_stalled"
         return report
@@ -7514,6 +7562,12 @@ def apply_inventory_unlock_release(
     else:
         order["take_profit_guard_release_ceiling"] = price
     plan[order_key].append(order)
+    state["inventory_unlock_release"] = {
+        "side": normalized_side,
+        "stall_count": stall_count,
+        "reentry_cooldown_cycles": 6,
+        "target_notional": target_notional,
+    }
     report.update(
         {
             "active": True,
@@ -7522,6 +7576,7 @@ def apply_inventory_unlock_release(
             "release_price": price,
             "release_qty": qty,
             "release_order_count": 1,
+            "reentry_cooldown_cycles": 6,
         }
     )
     return report

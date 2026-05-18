@@ -1772,6 +1772,50 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["stall_count"], 1)
         self.assertEqual(plan["sell_orders"], [])
 
+    def test_inventory_unlock_release_blocks_same_side_reentry_after_release(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 700.0, "notional": 693.0, "role": "best_quote_entry_long"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.01, "qty": 800.0, "notional": 808.0, "role": "best_quote_entry_short"},
+            ],
+        }
+        state = {
+            "inventory_unlock_release": {
+                "side": "long",
+                "stall_count": 3,
+                "reentry_cooldown_cycles": 4,
+                "target_notional": 3200.0,
+            }
+        }
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="long",
+            entry_paused=False,
+            take_profit_guard={"enabled": True, "long_active": True, "long_floor_price": 1.05},
+            current_qty=3600.0,
+            current_notional=3600.0,
+            pause_notional=4000.0,
+            release_cap_notional=700.0,
+            per_order_notional=1100.0,
+            step_price=0.001,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            bid_price=0.998,
+            ask_price=1.0,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertTrue(report["reentry_block_active"])
+        self.assertEqual(report["blocked_entry_order_count"], 1)
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(len(plan["sell_orders"]), 1)
+
     def test_synthetic_resync_does_not_use_mid_price_as_nonzero_cost_basis(self) -> None:
         resolved = _resolve_synthetic_resync_price(
             actual_position_qty=300.0,
