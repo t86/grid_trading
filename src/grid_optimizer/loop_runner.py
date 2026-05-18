@@ -2614,14 +2614,14 @@ def apply_hard_loss_forced_reduce(
 def _is_long_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
     position_side = _order_position_side(order)
-    return role in {"bootstrap", "entry", "bootstrap_long", "entry_long"} or (
+    return role in {"bootstrap", "entry", "bootstrap_long", "entry_long", "best_quote_entry_long"} or (
         position_side in {"BOTH", "LONG"} and role in {"bootstrap", "entry"}
     )
 
 
 def _is_short_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
-    return role in {"bootstrap_short", "entry_short"}
+    return role in {"bootstrap_short", "entry_short", "best_quote_entry_short"}
 
 
 def _is_long_exit_order(order: dict[str, Any]) -> bool:
@@ -7363,6 +7363,8 @@ def _inventory_unlock_default_report() -> dict[str, Any]:
         "reentry_block_active": False,
         "reentry_cooldown_cycles": 0,
         "blocked_entry_order_count": 0,
+        "reentry_reference_price": None,
+        "reentry_gate_price": None,
     }
 
 
@@ -7473,10 +7475,14 @@ def apply_inventory_unlock_release(
     )
     previous_reentry_cooldown = int(runtime_state.get("reentry_cooldown_cycles") or 0)
     previous_target_notional = max(_safe_float(runtime_state.get("target_notional")), 0.0)
+    previous_release_price = max(_safe_float(runtime_state.get("release_price")), 0.0)
+    reentry_gap = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
     reentry_block_active = (
         not candidate
         and runtime_state.get("side") == normalized_side
         and previous_reentry_cooldown > 0
+        and previous_release_price > 0
+        and reentry_gap > 0
     )
     if candidate:
         previous_count = int(runtime_state.get("stall_count") or 0) if runtime_state.get("side") == normalized_side else 0
@@ -7486,6 +7492,7 @@ def apply_inventory_unlock_release(
             "stall_count": stall_count,
             "reentry_cooldown_cycles": previous_reentry_cooldown,
             "target_notional": previous_target_notional,
+            "release_price": previous_release_price,
         }
     elif reentry_block_active:
         stall_count = 0
@@ -7494,6 +7501,7 @@ def apply_inventory_unlock_release(
             "stall_count": 0,
             "reentry_cooldown_cycles": max(previous_reentry_cooldown - 1, 0),
             "target_notional": previous_target_notional,
+            "release_price": previous_release_price,
         }
     else:
         stall_count = 0
@@ -7502,6 +7510,8 @@ def apply_inventory_unlock_release(
     report["stall_count"] = stall_count
     report["reentry_block_active"] = bool(reentry_block_active)
     report["reentry_cooldown_cycles"] = int(runtime_state.get("reentry_cooldown_cycles") or 0)
+    if previous_release_price > 0:
+        report["reentry_reference_price"] = previous_release_price
     if previous_target_notional > 0 and report.get("target_notional") is None:
         report["target_notional"] = previous_target_notional
 
@@ -7512,22 +7522,28 @@ def apply_inventory_unlock_release(
 
     if reentry_block_active:
         if normalized_side == "long":
+            gate_price = previous_release_price - reentry_gap
             before = len(plan.get("buy_orders", []) or [])
             plan["buy_orders"] = [
                 dict(item)
                 for item in plan.get("buy_orders", [])
-                if isinstance(item, dict) and _is_short_exit_order(item)
+                if isinstance(item, dict)
+                and (_is_short_exit_order(item) or not _is_long_entry_order(item) or _safe_float(item.get("price")) <= gate_price)
             ]
             report["blocked_entry_order_count"] = before - len(plan["buy_orders"])
+            report["reentry_gate_price"] = gate_price
         elif normalized_side == "short":
+            gate_price = previous_release_price + reentry_gap
             before = len(plan.get("sell_orders", []) or [])
             plan["sell_orders"] = [
                 dict(item)
                 for item in plan.get("sell_orders", [])
-                if isinstance(item, dict) and _is_long_exit_order(item)
+                if isinstance(item, dict)
+                and (_is_long_exit_order(item) or not _is_short_entry_order(item) or _safe_float(item.get("price")) >= gate_price)
             ]
             report["blocked_entry_order_count"] = before - len(plan["sell_orders"])
-        report["reason"] = "reentry_cooldown"
+            report["reentry_gate_price"] = gate_price
+        report["reason"] = "reentry_price_gate"
         return report
     if not candidate:
         report["reason"] = "not_stalled"
@@ -7598,6 +7614,7 @@ def apply_inventory_unlock_release(
         "stall_count": stall_count,
         "reentry_cooldown_cycles": 6,
         "target_notional": target_notional,
+        "release_price": price,
     }
     report.update(
         {

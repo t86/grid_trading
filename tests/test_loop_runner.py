@@ -1913,7 +1913,7 @@ class LoopRunnerTests(unittest.TestCase):
     def test_inventory_unlock_release_blocks_same_side_reentry_after_release(self) -> None:
         plan = {
             "buy_orders": [
-                {"side": "BUY", "price": 0.99, "qty": 700.0, "notional": 693.0, "role": "best_quote_entry_long"},
+                {"side": "BUY", "price": 0.9995, "qty": 700.0, "notional": 699.65, "role": "best_quote_entry_long"},
             ],
             "sell_orders": [
                 {"side": "SELL", "price": 1.01, "qty": 800.0, "notional": 808.0, "role": "best_quote_entry_short"},
@@ -1925,6 +1925,7 @@ class LoopRunnerTests(unittest.TestCase):
                 "stall_count": 3,
                 "reentry_cooldown_cycles": 4,
                 "target_notional": 3200.0,
+                "release_price": 1.0000,
             }
         }
 
@@ -1951,8 +1952,54 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["active"])
         self.assertTrue(report["reentry_block_active"])
         self.assertEqual(report["blocked_entry_order_count"], 1)
+        self.assertEqual(report["reason"], "reentry_price_gate")
+        self.assertAlmostEqual(report["reentry_gate_price"], 0.999)
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(len(plan["sell_orders"]), 1)
+
+    def test_inventory_unlock_release_allows_reentry_after_grid_profit_gap(self) -> None:
+        plan = {
+            "buy_orders": [],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.0005, "qty": 800.0, "notional": 800.4, "role": "best_quote_entry_short"},
+                {"side": "SELL", "price": 1.0010, "qty": 800.0, "notional": 800.8, "role": "best_quote_entry_short"},
+            ],
+        }
+        state = {
+            "inventory_unlock_release": {
+                "side": "short",
+                "stall_count": 3,
+                "reentry_cooldown_cycles": 4,
+                "target_notional": 3200.0,
+                "release_price": 1.0000,
+            }
+        }
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=False,
+            take_profit_guard={"enabled": True, "short_active": True, "short_ceiling_price": 0.99},
+            current_qty=3600.0,
+            current_notional=3100.0,
+            pause_notional=4000.0,
+            release_cap_notional=700.0,
+            per_order_notional=1100.0,
+            step_price=0.001,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            bid_price=1.0004,
+            ask_price=1.0005,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertTrue(report["reentry_block_active"])
+        self.assertEqual(report["blocked_entry_order_count"], 1)
+        self.assertAlmostEqual(report["reentry_gate_price"], 1.001)
+        self.assertEqual([item["price"] for item in plan["sell_orders"]], [1.0010])
 
     def test_synthetic_resync_does_not_use_mid_price_as_nonzero_cost_basis(self) -> None:
         resolved = _resolve_synthetic_resync_price(
