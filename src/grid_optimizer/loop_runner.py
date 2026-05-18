@@ -13270,6 +13270,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "short_cost_price": current_short_avg_price if current_short_qty > 1e-12 else None,
             "long_unrealized_ratio": None,
             "short_unrealized_ratio": None,
+            "grid_profit_gap_price": max(_safe_float(effective_args.step_price), 0.0),
+            "long_entry_gate_price": None,
+            "short_entry_gate_price": None,
         }
         if current_long_qty > 1e-12 and current_long_avg_price > 0:
             long_unrealized_ratio = (
@@ -13277,7 +13280,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if mid_price > 0
                 else None
             )
+            grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
+            long_entry_gate_price = current_long_avg_price
+            if long_unrealized_ratio is not None and long_unrealized_ratio < 0.0 and grid_profit_gap > 0:
+                long_entry_gate_price = max(current_long_avg_price - grid_profit_gap, 0.0)
             best_quote_inventory_cost_gate["long_unrealized_ratio"] = long_unrealized_ratio
+            best_quote_inventory_cost_gate["long_entry_gate_price"] = long_entry_gate_price
             before = len(plan.get("buy_orders", []) or [])
             plan["buy_orders"] = [
                 dict(item)
@@ -13285,10 +13293,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if isinstance(item, dict)
                 and (
                     _order_role(item) != "best_quote_entry_long"
-                    or (
-                        _safe_float(item.get("price")) <= current_long_avg_price
-                        and (long_unrealized_ratio is None or long_unrealized_ratio >= 0.0)
-                    )
+                    or _safe_float(item.get("price")) <= long_entry_gate_price + 1e-12
                 )
             ]
             best_quote_inventory_cost_gate["blocked_buy_orders"] = before - len(plan["buy_orders"])
@@ -13298,7 +13303,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if mid_price > 0
                 else None
             )
+            grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
+            short_entry_gate_price = current_short_avg_price
+            if short_unrealized_ratio is not None and short_unrealized_ratio < 0.0 and grid_profit_gap > 0:
+                short_entry_gate_price = current_short_avg_price + grid_profit_gap
             best_quote_inventory_cost_gate["short_unrealized_ratio"] = short_unrealized_ratio
+            best_quote_inventory_cost_gate["short_entry_gate_price"] = short_entry_gate_price
             before = len(plan.get("sell_orders", []) or [])
             plan["sell_orders"] = [
                 dict(item)
@@ -13306,10 +13316,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if isinstance(item, dict)
                 and (
                     _order_role(item) != "best_quote_entry_short"
-                    or (
-                        _safe_float(item.get("price")) >= current_short_avg_price
-                        and (short_unrealized_ratio is None or short_unrealized_ratio >= 0.0)
-                    )
+                    or _safe_float(item.get("price")) + 1e-12 >= short_entry_gate_price
                 )
             ]
             best_quote_inventory_cost_gate["blocked_sell_orders"] = before - len(plan["sell_orders"])
