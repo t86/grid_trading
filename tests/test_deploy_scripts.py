@@ -85,3 +85,12 @@ def test_alpha_airdrop_monitor_installer_writes_expected_systemd_units() -> None
     assert '--alert-config-path ${ALERT_CONFIG_PATH}' in script
     assert 'OnUnitActiveSec=10min' in script
     assert 'sudo systemctl restart "${TIMER_UNIT_NAME}.timer"' in script
+
+
+def test_recovery_stall_monitor_installer_runs_every_minute() -> None:
+    script = Path("deploy/oracle/install_recovery_stall_monitor.sh").read_text(encoding="utf-8")
+
+    assert "grid_optimizer.recovery_stall_monitor" in script
+    assert "--threshold-seconds ${THRESHOLD_SECONDS}" in script
+    assert "ON_UNIT_ACTIVE_SEC=\"${ON_UNIT_ACTIVE_SEC:-1min}\"" in script
+    assert "sudo systemctl restart \"${TIMER_UNIT_NAME}.timer\"" in script
