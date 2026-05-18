@@ -679,25 +679,35 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         reduce_side = _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
         role = str(order.get("role", "") or "").strip().lower()
         hard_loss_forced_reduce = role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}
+        implicit_loss_reduce_side = None
+        if not hard_loss_forced_reduce:
+            if losing_short and side == "BUY" and net_qty < -1e-12:
+                implicit_loss_reduce_side = "BUY"
+            elif losing_long and side == "SELL" and net_qty > 1e-12:
+                implicit_loss_reduce_side = "SELL"
         ordinary_entry = entry_side in {"long", "short"} and reduce_side is None
         small_cross_entry_allowed = (
             ordinary_entry and small_entry_notional > 0 and order_notional <= small_entry_notional + 1e-9
         )
         small_loss_reduce_allowed = (
-            reduce_side is not None and small_entry_notional > 0 and order_notional <= small_entry_notional + 1e-9
+            (reduce_side is not None or implicit_loss_reduce_side is not None)
+            and small_entry_notional > 0
+            and order_notional <= small_entry_notional + 1e-9
         )
         small_loss_reduce_resize_allowed = (
-            reduce_side is not None and small_entry_notional > 0 and order_notional > small_entry_notional + 1e-9
+            (reduce_side is not None or implicit_loss_reduce_side is not None)
+            and small_entry_notional > 0
+            and order_notional > small_entry_notional + 1e-9
         )
         short_recovery_order = entry_side == "long" or (
             reduce_side == "BUY" and not hard_loss_forced_reduce
-        )
+        ) or implicit_loss_reduce_side == "BUY"
         long_recovery_order = entry_side == "short" or (
             reduce_side == "SELL" and not hard_loss_forced_reduce
-        )
+        ) or implicit_loss_reduce_side == "SELL"
         if losing_short and short_recovery_order and side == "BUY":
             if price > 0 and price <= short_ceiling:
-                if entry_side == "long":
+                if entry_side == "long" or implicit_loss_reduce_side is not None:
                     order["force_reduce_only"] = True
                 order["loss_inventory_no_cross_guard"] = "short_recover_no_cross"
                 converted_orders.append(dict(order))
@@ -710,6 +720,8 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                         else "short_small_entry_cross_allowed"
                     )
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                    if implicit_loss_reduce_side is not None:
+                        order["force_reduce_only"] = True
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
@@ -719,6 +731,8 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                         resized["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_resized"
                         resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                         resized["loss_inventory_original_notional"] = order_notional
+                        if implicit_loss_reduce_side is not None:
+                            resized["force_reduce_only"] = True
                         allowed_small_entry_orders.append(dict(resized))
                         resized_small_loss_reduce_orders.append(dict(resized))
                         kept_place_orders.append(resized)
@@ -730,7 +744,7 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
             continue
         if losing_long and long_recovery_order and side == "SELL":
             if price > 0 and price >= long_floor:
-                if entry_side == "short":
+                if entry_side == "short" or implicit_loss_reduce_side is not None:
                     order["force_reduce_only"] = True
                 order["loss_inventory_no_cross_guard"] = "long_recover_no_cross"
                 converted_orders.append(dict(order))
@@ -743,6 +757,8 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                         else "long_small_entry_cross_allowed"
                     )
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                    if implicit_loss_reduce_side is not None:
+                        order["force_reduce_only"] = True
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
@@ -752,6 +768,8 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                         resized["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_resized"
                         resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                         resized["loss_inventory_original_notional"] = order_notional
+                        if implicit_loss_reduce_side is not None:
+                            resized["force_reduce_only"] = True
                         allowed_small_entry_orders.append(dict(resized))
                         resized_small_loss_reduce_orders.append(dict(resized))
                         kept_place_orders.append(resized)
