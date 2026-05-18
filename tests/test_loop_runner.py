@@ -623,7 +623,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
-    def test_best_quote_maker_volume_keeps_entry_short_near_quote_when_long_is_losing(
+    def test_best_quote_maker_volume_clamps_entry_short_when_long_is_losing(
         self,
         mock_symbol_config,
         mock_book_tickers,
@@ -674,10 +674,9 @@ class LoopRunnerTests(unittest.TestCase):
             report = generate_plan_report(args)
 
         self.assertTrue(report["take_profit_guard"]["long_active"])
-        self.assertEqual(report["take_profit_guard"]["adjusted_sell_orders"], 0)
+        self.assertEqual(report["take_profit_guard"]["adjusted_sell_orders"], 1)
         self.assertEqual(report["sell_orders"][0]["role"], "best_quote_entry_short")
-        self.assertEqual(report["sell_orders"][0]["price"], 80400.1)
-        self.assertLess(report["sell_orders"][0]["price"], report["take_profit_guard"]["long_floor_price"])
+        self.assertEqual(report["sell_orders"][0]["price"], report["take_profit_guard"]["long_floor_price"])
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -687,7 +686,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
-    def test_best_quote_maker_volume_keeps_inventory_recover_reduce_near_quote_when_long_is_losing(
+    def test_best_quote_maker_volume_clamps_inventory_recover_reduce_when_long_is_losing(
         self,
         mock_symbol_config,
         mock_book_tickers,
@@ -739,10 +738,9 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(report["best_quote_maker_volume"]["regime"], "inventory_recover")
         self.assertTrue(report["take_profit_guard"]["long_active"])
-        self.assertEqual(report["take_profit_guard"]["adjusted_sell_orders"], 0)
+        self.assertEqual(report["take_profit_guard"]["adjusted_sell_orders"], 1)
         self.assertEqual(report["sell_orders"][0]["role"], "best_quote_reduce_long")
-        self.assertEqual(report["sell_orders"][0]["price"], 80400.4)
-        self.assertLess(report["sell_orders"][0]["price"], report["take_profit_guard"]["long_floor_price"])
+        self.assertEqual(report["sell_orders"][0]["price"], report["take_profit_guard"]["long_floor_price"])
 
     def test_filter_futures_strategy_orders_ignores_manual_and_flatten_orders(self) -> None:
         open_orders = [
@@ -6584,6 +6582,44 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(result["adjusted_sell_orders"], 2)
         self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.032, places=8)
         self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.032, places=8)
+
+    def test_apply_take_profit_profit_guard_clamps_best_quote_single_way_exit_roles(self) -> None:
+        plan = {
+            "bootstrap_orders": [],
+            "buy_orders": [
+                {"side": "BUY", "price": 0.99, "qty": 100.0, "notional": 99.0, "role": "best_quote_entry_long"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 1.00, "qty": 100.0, "notional": 100.0, "role": "best_quote_entry_short"},
+                {"side": "SELL", "price": 1.01, "qty": 50.0, "notional": 50.5, "role": "best_quote_reduce_long"},
+            ],
+        }
+
+        result = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=150.0,
+            current_short_qty=100.0,
+            current_long_avg_price=1.02,
+            current_short_avg_price=0.98,
+            current_long_notional=153.0,
+            current_short_notional=98.0,
+            pause_long_position_notional=500.0,
+            pause_short_position_notional=500.0,
+            min_profit_ratio=0.001,
+            tick_size=0.001,
+            bid_price=1.000,
+            ask_price=1.001,
+            extra_long_guard_roles={"best_quote_entry_short", "best_quote_reduce_long"},
+            extra_short_guard_roles={"best_quote_entry_long", "best_quote_reduce_short"},
+        )
+
+        self.assertTrue(result["long_active"])
+        self.assertTrue(result["short_active"])
+        self.assertEqual(result["adjusted_sell_orders"], 2)
+        self.assertEqual(result["adjusted_buy_orders"], 1)
+        self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.022, places=8)
+        self.assertAlmostEqual(plan["sell_orders"][1]["price"], 1.022, places=8)
+        self.assertAlmostEqual(plan["buy_orders"][0]["price"], 0.979, places=8)
 
     @patch("grid_optimizer.loop_runner.load_or_initialize_state")
     @patch("grid_optimizer.loop_runner.sync_synthetic_ledger")
