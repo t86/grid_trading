@@ -13380,6 +13380,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "grid_profit_gap_price": max(_safe_float(effective_args.step_price), 0.0),
             "long_entry_gate_price": None,
             "short_entry_gate_price": None,
+            "long_soft_threshold_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0))
+                * _safe_float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.0)),
+                0.0,
+            ),
+            "short_soft_threshold_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0))
+                * _safe_float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.0)),
+                0.0,
+            ),
+            "long_below_soft_exempt": False,
+            "short_below_soft_exempt": False,
         }
         if current_long_qty > 1e-12 and current_long_avg_price > 0:
             long_unrealized_ratio = (
@@ -13393,17 +13405,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 long_entry_gate_price = max(current_long_avg_price - grid_profit_gap, 0.0)
             best_quote_inventory_cost_gate["long_unrealized_ratio"] = long_unrealized_ratio
             best_quote_inventory_cost_gate["long_entry_gate_price"] = long_entry_gate_price
-            before = len(plan.get("buy_orders", []) or [])
-            plan["buy_orders"] = [
-                dict(item)
+            long_soft_threshold = _safe_float(best_quote_inventory_cost_gate["long_soft_threshold_notional"])
+            long_below_soft_exempt = long_soft_threshold > 0 and current_long_notional < long_soft_threshold
+            best_quote_inventory_cost_gate["long_below_soft_exempt"] = long_below_soft_exempt
+            best_quote_inventory_cost_gate["would_block_buy_orders"] = sum(
+                1
                 for item in plan.get("buy_orders", [])
                 if isinstance(item, dict)
-                and (
-                    _order_role(item) != "best_quote_entry_long"
-                    or _safe_float(item.get("price")) <= long_entry_gate_price + 1e-12
-                )
-            ]
-            best_quote_inventory_cost_gate["blocked_buy_orders"] = before - len(plan["buy_orders"])
+                and _order_role(item) == "best_quote_entry_long"
+                and _safe_float(item.get("price")) > long_entry_gate_price + 1e-12
+            )
         if current_short_qty > 1e-12 and current_short_avg_price > 0:
             short_unrealized_ratio = (
                 (current_short_avg_price - mid_price) / current_short_avg_price
@@ -13416,17 +13427,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 short_entry_gate_price = current_short_avg_price + grid_profit_gap
             best_quote_inventory_cost_gate["short_unrealized_ratio"] = short_unrealized_ratio
             best_quote_inventory_cost_gate["short_entry_gate_price"] = short_entry_gate_price
-            before = len(plan.get("sell_orders", []) or [])
-            plan["sell_orders"] = [
-                dict(item)
+            short_soft_threshold = _safe_float(best_quote_inventory_cost_gate["short_soft_threshold_notional"])
+            short_below_soft_exempt = short_soft_threshold > 0 and current_short_notional < short_soft_threshold
+            best_quote_inventory_cost_gate["short_below_soft_exempt"] = short_below_soft_exempt
+            best_quote_inventory_cost_gate["would_block_sell_orders"] = sum(
+                1
                 for item in plan.get("sell_orders", [])
                 if isinstance(item, dict)
-                and (
-                    _order_role(item) != "best_quote_entry_short"
-                    or _safe_float(item.get("price")) + 1e-12 >= short_entry_gate_price
-                )
-            ]
-            best_quote_inventory_cost_gate["blocked_sell_orders"] = before - len(plan["sell_orders"])
+                and _order_role(item) == "best_quote_entry_short"
+                and _safe_float(item.get("price")) + 1e-12 < short_entry_gate_price
+            )
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),

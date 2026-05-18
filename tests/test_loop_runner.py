@@ -778,8 +778,10 @@ class LoopRunnerTests(unittest.TestCase):
 
             report = generate_plan_report(args)
 
-        self.assertEqual(report["buy_orders"], [])
-        self.assertEqual(report["best_quote_maker_volume"]["inventory_cost_gate"]["blocked_buy_orders"], 1)
+        self.assertEqual(report["buy_orders"][0]["role"], "best_quote_entry_long")
+        gate = report["best_quote_maker_volume"]["inventory_cost_gate"]
+        self.assertEqual(gate["blocked_buy_orders"], 0)
+        self.assertEqual(gate["would_block_buy_orders"], 1)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -845,8 +847,9 @@ class LoopRunnerTests(unittest.TestCase):
 
         gate = report["best_quote_maker_volume"]["inventory_cost_gate"]
         self.assertAlmostEqual(gate["long_entry_gate_price"], 0.14341)
-        self.assertEqual(report["buy_orders"], [])
-        self.assertEqual(gate["blocked_buy_orders"], 1)
+        self.assertEqual(report["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertEqual(gate["blocked_buy_orders"], 0)
+        self.assertEqual(gate["would_block_buy_orders"], 1)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -968,8 +971,10 @@ class LoopRunnerTests(unittest.TestCase):
 
             report = generate_plan_report(args)
 
-        self.assertEqual(report["sell_orders"], [])
-        self.assertEqual(report["best_quote_maker_volume"]["inventory_cost_gate"]["blocked_sell_orders"], 1)
+        self.assertEqual(report["sell_orders"][0]["role"], "best_quote_entry_short")
+        gate = report["best_quote_maker_volume"]["inventory_cost_gate"]
+        self.assertEqual(gate["blocked_sell_orders"], 0)
+        self.assertEqual(gate["would_block_sell_orders"], 1)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
