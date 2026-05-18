@@ -159,6 +159,20 @@ def _clone_order_with_qty(order: dict[str, Any], qty: Decimal) -> dict[str, Any]
     return cloned
 
 
+def _resize_order_to_notional(order: dict[str, Any], target_notional: float) -> dict[str, Any] | None:
+    price = _safe_float(order.get("price"))
+    safe_target = max(_safe_float(target_notional), 0.0)
+    if price <= 0 or safe_target <= 0:
+        return None
+    requested_qty = _quantity_decimal(order.get("qty", order.get("quantity")))
+    target_qty = Decimal(str(safe_target)) / Decimal(str(price))
+    if target_qty <= Decimal("0"):
+        return None
+    if requested_qty > Decimal("0"):
+        target_qty = min(target_qty, requested_qty)
+    return _clone_order_with_qty(order, target_qty)
+
+
 def _merge_place_orders_by_submitted_bucket(
     *,
     orders: list[dict[str, Any]],
@@ -656,6 +670,7 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
     dropped_orders: list[dict[str, Any]] = []
     converted_orders: list[dict[str, Any]] = []
     allowed_small_entry_orders: list[dict[str, Any]] = []
+    resized_small_loss_reduce_orders: list[dict[str, Any]] = []
     for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
         side = str(order.get("side", "")).upper().strip()
         price = _safe_float(order.get("price"))
@@ -670,6 +685,9 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         )
         small_loss_reduce_allowed = (
             reduce_side is not None and small_entry_notional > 0 and order_notional <= small_entry_notional + 1e-9
+        )
+        small_loss_reduce_resize_allowed = (
+            reduce_side is not None and small_entry_notional > 0 and order_notional > small_entry_notional + 1e-9
         )
         short_recovery_order = entry_side == "long" or (
             reduce_side == "BUY" and not hard_loss_forced_reduce
@@ -695,6 +713,16 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
+                if small_loss_reduce_resize_allowed:
+                    resized = _resize_order_to_notional(order, small_entry_notional)
+                    if resized is not None:
+                        resized["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_resized"
+                        resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        resized["loss_inventory_original_notional"] = order_notional
+                        allowed_small_entry_orders.append(dict(resized))
+                        resized_small_loss_reduce_orders.append(dict(resized))
+                        kept_place_orders.append(resized)
+                        continue
                 dropped = dict(order)
                 dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_buy_above_recovery_ceiling"
                 dropped["loss_inventory_recovery_ceiling"] = short_ceiling
@@ -718,6 +746,16 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
+                if small_loss_reduce_resize_allowed:
+                    resized = _resize_order_to_notional(order, small_entry_notional)
+                    if resized is not None:
+                        resized["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_resized"
+                        resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        resized["loss_inventory_original_notional"] = order_notional
+                        allowed_small_entry_orders.append(dict(resized))
+                        resized_small_loss_reduce_orders.append(dict(resized))
+                        kept_place_orders.append(resized)
+                        continue
                 dropped = dict(order)
                 dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_sell_below_recovery_floor"
                 dropped["loss_inventory_recovery_floor"] = long_floor
@@ -741,6 +779,8 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         "small_entry_notional_limit": small_entry_notional,
         "allowed_small_entry_count": len(allowed_small_entry_orders),
         "allowed_small_entry_orders": allowed_small_entry_orders,
+        "resized_small_loss_reduce_count": len(resized_small_loss_reduce_orders),
+        "resized_small_loss_reduce_orders": resized_small_loss_reduce_orders,
         "converted_order_count": len(converted_orders),
         "dropped_order_count": len(dropped_orders),
         "converted_orders": converted_orders,
