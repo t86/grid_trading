@@ -8837,6 +8837,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_loss_per_10k_hard",
         "best_quote_maker_volume_soft_loss_budget_scale",
         "best_quote_maker_volume_min_cycle_budget_notional",
+        "elastic_early_micro_abs_return_ratio",
+        "elastic_early_micro_amplitude_ratio",
+        "elastic_early_safe_inventory_ratio",
+        "elastic_early_wide_inventory_ratio",
+        "elastic_early_wide_loss_per_10k_5m",
         "sticky_entry_price_tolerance_steps",
     }
     int_fields = {
@@ -9911,6 +9916,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         ("elastic_max_entry_orders_ping_pong_safe", "--elastic-max-entry-orders-ping-pong-safe"),
         ("elastic_max_entry_orders_wide_step", "--elastic-max-entry-orders-wide-step"),
         ("elastic_max_entry_orders_defensive", "--elastic-max-entry-orders-defensive"),
+        ("elastic_early_micro_abs_return_ratio", "--elastic-early-micro-abs-return-ratio"),
+        ("elastic_early_micro_amplitude_ratio", "--elastic-early-micro-amplitude-ratio"),
+        ("elastic_early_safe_inventory_ratio", "--elastic-early-safe-inventory-ratio"),
+        ("elastic_early_wide_inventory_ratio", "--elastic-early-wide-inventory-ratio"),
+        ("elastic_early_wide_loss_per_10k_5m", "--elastic-early-wide-loss-per-10k-5m"),
         ("elastic_cooldown_seconds", "--elastic-cooldown-seconds"),
         ("elastic_state_confirm_cycles", "--elastic-state-confirm-cycles"),
     ):

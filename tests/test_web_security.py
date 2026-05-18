@@ -1115,6 +1115,11 @@ class WebSecurityTests(unittest.TestCase):
                 "elastic_levels_scale_defensive": 0.7,
                 "elastic_cooldown_seconds": 90.0,
                 "elastic_state_confirm_cycles": 4,
+                "elastic_early_micro_abs_return_ratio": "0.001",
+                "elastic_early_micro_amplitude_ratio": "0.0015",
+                "elastic_early_safe_inventory_ratio": "0.62",
+                "elastic_early_wide_inventory_ratio": "0.78",
+                "elastic_early_wide_loss_per_10k_5m": "4.0",
                 "elastic_cancel_stale_entries_on_cooldown": True,
                 "regime_entry_budget_min_profit_or_fee_buffer_ratio": "0.0006",
             }
@@ -1137,6 +1142,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["elastic_levels_scale_defensive"], 0.7)
         self.assertEqual(payload["elastic_cooldown_seconds"], 90.0)
         self.assertEqual(payload["elastic_state_confirm_cycles"], 4)
+        self.assertEqual(payload["elastic_early_micro_abs_return_ratio"], 0.001)
+        self.assertEqual(payload["elastic_early_micro_amplitude_ratio"], 0.0015)
+        self.assertEqual(payload["elastic_early_safe_inventory_ratio"], 0.62)
+        self.assertEqual(payload["elastic_early_wide_inventory_ratio"], 0.78)
+        self.assertEqual(payload["elastic_early_wide_loss_per_10k_5m"], 4.0)
         self.assertTrue(payload["elastic_cancel_stale_entries_on_cooldown"])
         self.assertEqual(payload["regime_entry_budget_min_profit_or_fee_buffer_ratio"], 0.0006)
 
@@ -2783,6 +2793,12 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_loss_per_10k_soft": 0.5,
                 "best_quote_maker_volume_loss_per_10k_hard": 0.8,
                 "best_quote_maker_volume_soft_loss_budget_scale": 0.5,
+                "elastic_volume_enabled": True,
+                "elastic_early_micro_abs_return_ratio": 0.001,
+                "elastic_early_micro_amplitude_ratio": 0.0015,
+                "elastic_early_safe_inventory_ratio": 0.62,
+                "elastic_early_wide_inventory_ratio": 0.78,
+                "elastic_early_wide_loss_per_10k_5m": 4.0,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -2809,6 +2825,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--best-quote-maker-volume-max-long-notional", command)
         self.assertIn("--best-quote-maker-volume-max-short-notional", command)
         self.assertIn("--best-quote-maker-volume-loss-per-10k-hard", command)
+        self.assertIn("--elastic-early-micro-abs-return-ratio", command)
+        self.assertIn("--elastic-early-micro-amplitude-ratio", command)
+        self.assertIn("--elastic-early-safe-inventory-ratio", command)
+        self.assertIn("--elastic-early-wide-inventory-ratio", command)
+        self.assertIn("--elastic-early-wide-loss-per-10k-5m", command)
 
     def test_runner_preset_payload_for_maker_volatility_inventory_v1(self) -> None:
         payload = _runner_preset_payload("maker_volatility_inventory_v1", {"symbol": "BARDUSDT"})
