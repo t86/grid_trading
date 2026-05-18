@@ -944,6 +944,106 @@ def sort_cancel_orders_farthest_from_market_first(
     return result
 
 
+def suppress_same_side_nearby_place_orders(
+    *,
+    actions: dict[str, Any],
+    min_price_spacing: float,
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None = None,
+) -> dict[str, Any]:
+    """Keep only one non-urgent maker order per side inside the configured spacing."""
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    safe_spacing = max(_safe_float(min_price_spacing), 0.0)
+    if len(place_orders) <= 1 or safe_spacing <= 0:
+        return actions
+
+    urgent_orders: list[dict[str, Any]] = []
+    side_orders: dict[str, list[tuple[int, dict[str, Any], float]]] = {"BUY": [], "SELL": []}
+    other_orders: list[dict[str, Any]] = []
+    for index, order in enumerate(place_orders):
+        side = str(order.get("side", "")).upper().strip()
+        if bool(order.get("force_reduce_only")) or _is_urgent_reduce_only_order(order, strategy_mode="synthetic_neutral"):
+            urgent_orders.append(order)
+            continue
+        if side not in side_orders:
+            other_orders.append(order)
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        if price <= 0:
+            other_orders.append(order)
+            continue
+        normalized = dict(order)
+        normalized["price"] = price
+        normalized["notional"] = price * _safe_float(normalized.get("qty"))
+        side_orders[side].append((index, normalized, price))
+
+    kept_by_index: dict[int, dict[str, Any]] = {}
+    suppressed_orders: list[dict[str, Any]] = []
+    for side, entries in side_orders.items():
+        if not entries:
+            continue
+        reverse = side == "BUY"
+        selected: list[tuple[int, dict[str, Any], float]] = []
+        for index, order, price in sorted(entries, key=lambda item: item[2], reverse=reverse):
+            if any(abs(price - selected_price) < safe_spacing - 1e-12 for _, _, selected_price in selected):
+                suppressed = dict(order)
+                suppressed["defer_reason"] = "same_side_nearby_place_order"
+                suppressed["min_price_spacing"] = safe_spacing
+                suppressed_orders.append(suppressed)
+                continue
+            selected.append((index, order, price))
+            kept_by_index[index] = order
+
+    if not suppressed_orders:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    for index, order in enumerate(place_orders):
+        if index in kept_by_index:
+            kept_place_orders.append(kept_by_index[index])
+            continue
+        if any(order is urgent for urgent in urgent_orders):
+            kept_place_orders.append(order)
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        if side not in side_orders:
+            kept_place_orders.append(order)
+            continue
+        if not any(index == suppressed_index for suppressed_index, _, _ in side_orders[side]):
+            kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["same_side_spacing_guard"] = {
+        "enabled": True,
+        "min_price_spacing": safe_spacing,
+        "suppressed_place_count": len(suppressed_orders),
+        "suppressed_place_orders": suppressed_orders,
+    }
+    return result
+
+
 def preserve_queue_priority_in_execution_actions(
     *,
     actions: dict[str, Any],

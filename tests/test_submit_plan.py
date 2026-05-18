@@ -16,6 +16,7 @@ from grid_optimizer.submit_plan import (
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     sort_cancel_orders_farthest_from_market_first,
+    suppress_same_side_nearby_place_orders,
     suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
 )
@@ -174,6 +175,39 @@ class SubmitPlanTests(unittest.TestCase):
 
         self.assertEqual([item["orderId"] for item in adjusted["cancel_orders"]], [2, 3, 1])
         self.assertEqual(adjusted["cancel_count"], 3)
+
+    def test_suppress_same_side_nearby_place_orders_keeps_one_per_spacing_band(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.15900, "qty": 720.0, "notional": 114.48, "role": "best_quote_entry_long"},
+                {"side": "BUY", "price": 0.15900, "qty": 720.0, "notional": 114.48, "role": "best_quote_entry_long"},
+                {"side": "BUY", "price": 0.15900, "qty": 100.0, "notional": 15.9, "role": "best_quote_reduce_short", "force_reduce_only": True},
+                {"side": "SELL", "price": 0.16087, "qty": 714.0, "notional": 114.86118, "role": "best_quote_entry_short"},
+                {"side": "SELL", "price": 0.16106, "qty": 714.0, "notional": 114.99684, "role": "best_quote_entry_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 4,
+            "cancel_count": 0,
+        }
+
+        guarded = suppress_same_side_nearby_place_orders(
+            actions=actions,
+            min_price_spacing=0.00019,
+            live_bid_price=0.16090,
+            live_ask_price=0.16091,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 3)
+        self.assertEqual([(item["side"], item["price"]) for item in guarded["place_orders"]], [
+            ("BUY", 0.15900),
+            ("BUY", 0.15900),
+            ("SELL", 0.16091),
+        ])
+        self.assertEqual(guarded["same_side_spacing_guard"]["suppressed_place_count"], 2)
 
     def test_reduce_only_cap_counts_orders_pending_cancel_until_exchange_releases_qty(self) -> None:
         actions = {

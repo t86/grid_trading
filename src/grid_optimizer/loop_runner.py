@@ -105,6 +105,7 @@ from .submit_plan import (
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
     sort_cancel_orders_farthest_from_market_first,
+    suppress_same_side_nearby_place_orders,
     suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
     enforce_execution_action_limits,
@@ -15091,6 +15092,21 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
         min_profit_ratio=(plan_report.get("take_profit_guard") or {}).get("effective_min_profit_ratio"),
     )
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        validation["actions"] = suppress_same_side_nearby_place_orders(
+            actions=validation["actions"],
+            min_price_spacing=(
+                _safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))
+                or _safe_float(plan_report.get("effective_step_price"))
+                or _safe_float(getattr(args, "step_price", 0.0))
+            ),
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
+            min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+            step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        )
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
     effective_place_budget = (
