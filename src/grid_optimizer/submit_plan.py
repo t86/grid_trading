@@ -947,6 +947,7 @@ def sort_cancel_orders_farthest_from_market_first(
 def suppress_same_side_nearby_place_orders(
     *,
     actions: dict[str, Any],
+    current_open_orders: Iterable[Any] | None = None,
     min_price_spacing: float,
     live_bid_price: float,
     live_ask_price: float,
@@ -957,20 +958,35 @@ def suppress_same_side_nearby_place_orders(
 ) -> dict[str, Any]:
     """Keep only one non-urgent maker order per side inside the configured spacing."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
     safe_spacing = max(_safe_float(min_price_spacing), 0.0)
-    if len(place_orders) <= 1 or safe_spacing <= 0:
+    if not place_orders or safe_spacing <= 0:
         return actions
 
-    urgent_orders: list[dict[str, Any]] = []
+    tick = max(_safe_float(tick_size), 0.0)
+    existing_spacing = safe_spacing + tick
+    existing_orders: list[tuple[dict[str, Any], str, str, float]] = []
+    for open_order in current_open_orders or []:
+        if not isinstance(open_order, dict):
+            continue
+        side = str(open_order.get("side", "")).upper().strip()
+        price = _safe_float(open_order.get("price"))
+        if side not in {"BUY", "SELL"} or price <= 0:
+            continue
+        existing_orders.append((dict(open_order), side, _order_position_side(open_order), price))
+
     side_orders: dict[str, list[tuple[int, dict[str, Any], float]]] = {"BUY": [], "SELL": []}
-    other_orders: list[dict[str, Any]] = []
+    kept_by_index: dict[int, dict[str, Any]] = {}
+    suppressed_indices: set[int] = set()
+    suppressed_orders: list[dict[str, Any]] = []
+    protected_existing_orders: list[dict[str, Any]] = []
     for index, order in enumerate(place_orders):
         side = str(order.get("side", "")).upper().strip()
         if bool(order.get("force_reduce_only")) or _is_urgent_reduce_only_order(order, strategy_mode="synthetic_neutral"):
-            urgent_orders.append(order)
+            kept_by_index[index] = order
             continue
         if side not in side_orders:
-            other_orders.append(order)
+            kept_by_index[index] = order
             continue
         prepared_order, _ = prepare_post_only_order_request(
             order=order,
@@ -989,15 +1005,29 @@ def suppress_same_side_nearby_place_orders(
             else _safe_float(order.get("price"))
         )
         if price <= 0:
-            other_orders.append(order)
+            kept_by_index[index] = order
             continue
         normalized = dict(order)
         normalized["price"] = price
         normalized["notional"] = price * _safe_float(normalized.get("qty"))
+        position_side = _order_position_side(normalized)
+        matching_existing = [
+            open_order
+            for open_order, open_side, open_position_side, open_price in existing_orders
+            if open_side == side
+            and open_position_side == position_side
+            and abs(price - open_price) <= existing_spacing + 1e-12
+        ]
+        if matching_existing:
+            suppressed = dict(normalized)
+            suppressed["defer_reason"] = "existing_same_side_nearby_open_order"
+            suppressed["min_price_spacing"] = safe_spacing
+            suppressed_orders.append(suppressed)
+            suppressed_indices.add(index)
+            protected_existing_orders.extend(matching_existing)
+            continue
         side_orders[side].append((index, normalized, price))
 
-    kept_by_index: dict[int, dict[str, Any]] = {}
-    suppressed_orders: list[dict[str, Any]] = []
     for side, entries in side_orders.items():
         if not entries:
             continue
@@ -1009,6 +1039,7 @@ def suppress_same_side_nearby_place_orders(
                 suppressed["defer_reason"] = "same_side_nearby_place_order"
                 suppressed["min_price_spacing"] = safe_spacing
                 suppressed_orders.append(suppressed)
+                suppressed_indices.add(index)
                 continue
             selected.append((index, order, price))
             kept_by_index[index] = order
@@ -1016,30 +1047,37 @@ def suppress_same_side_nearby_place_orders(
     if not suppressed_orders:
         return actions
 
+    protected_cancel_orders: list[dict[str, Any]] = []
+    if protected_existing_orders and cancel_orders:
+        adjusted_cancel_orders: list[dict[str, Any]] = []
+        for cancel_order in cancel_orders:
+            if any(_order_matches_cancel(open_order, cancel_order) for open_order in protected_existing_orders):
+                protected_cancel_orders.append(cancel_order)
+                continue
+            adjusted_cancel_orders.append(cancel_order)
+        cancel_orders = adjusted_cancel_orders
+
     kept_place_orders: list[dict[str, Any]] = []
     for index, order in enumerate(place_orders):
         if index in kept_by_index:
             kept_place_orders.append(kept_by_index[index])
             continue
-        if any(order is urgent for urgent in urgent_orders):
-            kept_place_orders.append(order)
-            continue
-        side = str(order.get("side", "")).upper().strip()
-        if side not in side_orders:
-            kept_place_orders.append(order)
-            continue
-        if not any(index == suppressed_index for suppressed_index, _, _ in side_orders[side]):
+        if index not in suppressed_indices:
             kept_place_orders.append(order)
 
     result = dict(actions)
     result["place_orders"] = kept_place_orders
+    result["cancel_orders"] = cancel_orders
     result["place_count"] = len(kept_place_orders)
+    result["cancel_count"] = len(cancel_orders)
     result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
     result["same_side_spacing_guard"] = {
         "enabled": True,
         "min_price_spacing": safe_spacing,
         "suppressed_place_count": len(suppressed_orders),
         "suppressed_place_orders": suppressed_orders,
+        "protected_cancel_count": len(protected_cancel_orders),
+        "protected_cancel_orders": protected_cancel_orders,
     }
     return result
 

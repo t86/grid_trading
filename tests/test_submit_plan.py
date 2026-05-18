@@ -209,6 +209,53 @@ class SubmitPlanTests(unittest.TestCase):
         ])
         self.assertEqual(guarded["same_side_spacing_guard"]["suppressed_place_count"], 2)
 
+    def test_suppress_same_side_nearby_place_orders_preserves_existing_queue(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.16006, "qty": 718.0, "notional": 114.92308, "role": "best_quote_entry_short"}
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 419310803,
+                    "clientOrderId": "gx-billu-bestquot-2-12628113",
+                    "side": "SELL",
+                    "price": "0.16014",
+                    "origQty": "717.0",
+                    "positionSide": "BOTH",
+                }
+            ],
+            "place_count": 1,
+            "cancel_count": 1,
+        }
+        current_open_orders = [
+            {
+                "orderId": 419310803,
+                "clientOrderId": "gx-billu-bestquot-2-12628113",
+                "side": "SELL",
+                "price": "0.16014",
+                "origQty": "717.0",
+                "positionSide": "BOTH",
+            }
+        ]
+
+        guarded = suppress_same_side_nearby_place_orders(
+            actions=actions,
+            current_open_orders=current_open_orders,
+            min_price_spacing=0.00019,
+            live_bid_price=0.15993,
+            live_ask_price=0.15994,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 0)
+        self.assertEqual(guarded["cancel_count"], 0)
+        guard = guarded["same_side_spacing_guard"]
+        self.assertEqual(guard["suppressed_place_orders"][0]["defer_reason"], "existing_same_side_nearby_open_order")
+        self.assertEqual(guard["protected_cancel_count"], 1)
+
     def test_reduce_only_cap_counts_orders_pending_cancel_until_exchange_releases_qty(self) -> None:
         actions = {
             "place_orders": [

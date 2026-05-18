@@ -15095,6 +15095,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     if _is_best_quote_maker_volume_mode(strategy_mode):
         validation["actions"] = suppress_same_side_nearby_place_orders(
             actions=validation["actions"],
+            current_open_orders=current_strategy_open_orders,
             min_price_spacing=(
                 _safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))
                 or _safe_float(plan_report.get("effective_step_price"))
