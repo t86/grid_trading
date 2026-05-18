@@ -1356,6 +1356,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(_uses_entry_price_cost_basis("soon_high_vol_short_grid_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("soon_volume_neutral_ping_pong_v1"))
         self.assertTrue(_uses_entry_price_cost_basis("soonusdt_competition_neutral_ping_pong_v1"))
+        self.assertTrue(_uses_entry_price_cost_basis("billusdt_best_quote_maker_volume_reset_v1"))
 
     def test_defi_competition_maker_neutral_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("bzusdt_competition_maker_neutral_v1"))
