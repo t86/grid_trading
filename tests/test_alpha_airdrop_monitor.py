@@ -109,6 +109,26 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
         self.assertEqual(matched["points_threshold"], 225)
         self.assertEqual(matched["time_hint_text"], "17:00（UTC+8）")
 
+    def test_match_alpha_airdrop_post_allows_future_schedule_from_previous_day(self) -> None:
+        now = datetime(2026, 5, 15, 6, 0, tzinfo=timezone.utc)
+
+        matched = _match_alpha_airdrop_post(
+            {
+                "id_str": "103",
+                "created_at": "Thu May 14 07:30:00 +0000 2026",
+                "full_text": (
+                    "请大家准备明天 17:00（UTC+8）领取币安 Alpha 空投并交易！"
+                    "持有至少 225 个币安 Alpha 积分的用户可申领代币空投。"
+                ),
+            },
+            now=now,
+            tz_offset_hours=8,
+        )
+
+        self.assertIsNotNone(matched)
+        self.assertEqual(matched["points_threshold"], 225)
+        self.assertEqual(matched["time_hint_text"], "17:00（UTC+8）")
+
     def test_extract_time_hint_text_prefers_explicit_schedule(self) -> None:
         self.assertEqual(
             _extract_time_hint_text("Please get ready to claim today at 9:00 (UTC)."),

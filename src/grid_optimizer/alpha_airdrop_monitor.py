@@ -39,10 +39,50 @@ _TIME_HINT_PATTERNS: tuple[re.Pattern[str], ...] = (
 )
 _TIME_EXTRACT_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"today at\s+(\d{1,2}:\d{2}(?:\s*\(utc(?:[+-]\d+)?\))?)", re.IGNORECASE),
+    re.compile(r"tomorrow at\s+(\d{1,2}:\d{2}(?:\s*\(utc(?:[+-]\d+)?\))?)", re.IGNORECASE),
     re.compile(r"今天\s*(\d{1,2}:\d{2}(?:（UTC[+-]\d+）|\(UTC[+-]\d+\))?)"),
+    re.compile(r"明天\s*(\d{1,2}:\d{2}(?:（UTC[+-]\d+）|\(UTC[+-]\d+\))?)"),
     re.compile(r"\b(\d{1,2}:\d{2}\s*\(utc(?:[+-]\d+)?\))", re.IGNORECASE),
     re.compile(r"\b(\d{1,2}:\d{2})\b"),
 )
+_RELATIVE_SCHEDULE_DAY_PATTERNS: tuple[tuple[re.Pattern[str], int], ...] = (
+    (re.compile(r"\btomorrow\b", re.IGNORECASE), 1),
+    (re.compile(r"明天"), 1),
+    (re.compile(r"后天"), 2),
+)
+_EXPLICIT_SCHEDULE_DAY_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"(?<!\d)(\d{1,2})\s*月\s*(\d{1,2})\s*[日号]?"),
+    re.compile(
+        r"\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|"
+        r"sep(?:tember)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\.?\s+(\d{1,2})\b",
+        re.IGNORECASE,
+    ),
+)
+_EN_MONTHS: dict[str, int] = {
+    "jan": 1,
+    "january": 1,
+    "feb": 2,
+    "february": 2,
+    "mar": 3,
+    "march": 3,
+    "apr": 4,
+    "april": 4,
+    "may": 5,
+    "jun": 6,
+    "june": 6,
+    "jul": 7,
+    "july": 7,
+    "aug": 8,
+    "august": 8,
+    "sep": 9,
+    "september": 9,
+    "oct": 10,
+    "october": 10,
+    "nov": 11,
+    "november": 11,
+    "dec": 12,
+    "december": 12,
+}
 
 
 @dataclass(slots=True)
@@ -77,6 +117,43 @@ def _is_today_in_tz(post_time: datetime, *, now: datetime, tz_offset_hours: int)
     return post_time.astimezone(tz).date() == now.astimezone(tz).date()
 
 
+def _has_current_or_future_schedule(text: str, *, post_time: datetime, now: datetime, tz_offset_hours: int) -> bool:
+    tz = timezone(timedelta(hours=tz_offset_hours))
+    post_day = post_time.astimezone(tz).date()
+    today = now.astimezone(tz).date()
+
+    for pattern, day_offset in _RELATIVE_SCHEDULE_DAY_PATTERNS:
+        if pattern.search(text):
+            return post_day + timedelta(days=day_offset) >= today
+
+    chinese_date = _EXPLICIT_SCHEDULE_DAY_PATTERNS[0].search(text)
+    if chinese_date:
+        month = int(chinese_date.group(1))
+        day = int(chinese_date.group(2))
+        try:
+            scheduled_day = post_day.replace(month=month, day=day)
+        except ValueError:
+            return False
+        if scheduled_day < post_day:
+            scheduled_day = scheduled_day.replace(year=scheduled_day.year + 1)
+        return scheduled_day >= today
+
+    english_date = _EXPLICIT_SCHEDULE_DAY_PATTERNS[1].search(text)
+    if english_date:
+        month_text = english_date.group(0).split()[0].rstrip(".").casefold()
+        month = _EN_MONTHS.get(month_text[:3], 0)
+        day = int(english_date.group(1))
+        try:
+            scheduled_day = post_day.replace(month=month, day=day)
+        except ValueError:
+            return False
+        if scheduled_day < post_day:
+            scheduled_day = scheduled_day.replace(year=scheduled_day.year + 1)
+        return scheduled_day >= today
+
+    return False
+
+
 def _extract_points_threshold(text: str) -> int | None:
     for pattern in _POINTS_PATTERNS:
         match = pattern.search(text)
@@ -103,7 +180,14 @@ def _match_alpha_airdrop_post(entry: dict[str, Any], *, now: datetime, tz_offset
     created_at = _parse_created_at(str(entry.get("created_at") or ""))
     if not tweet_id or not text or created_at is None:
         return None
-    if not _is_today_in_tz(created_at, now=now, tz_offset_hours=tz_offset_hours):
+    posted_today = _is_today_in_tz(created_at, now=now, tz_offset_hours=tz_offset_hours)
+    scheduled_now_or_later = _has_current_or_future_schedule(
+        text,
+        post_time=created_at,
+        now=now,
+        tz_offset_hours=tz_offset_hours,
+    )
+    if not posted_today and not scheduled_now_or_later:
         return None
 
     normalized = text.casefold()
