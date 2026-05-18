@@ -86,6 +86,37 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertTrue(actions["place_orders"][0]["force_reduce_only"])
         self.assertAlmostEqual(actions["place_notional"], 110.19836, places=8)
 
+    def test_build_execution_actions_deduplicates_forced_reduce_already_missing(self) -> None:
+        forced_reduce = {
+            "side": "SELL",
+            "price": 0.14464,
+            "qty": 900.0,
+            "notional": 130.176,
+            "role": "best_quote_adverse_reduce_long",
+            "force_reduce_only": True,
+            "execution_type": "post_only",
+            "time_in_force": "GTX",
+        }
+        report = {
+            "symbol": "BILLUSDT",
+            "forced_reduce_orders": [forced_reduce],
+            "bootstrap_orders": [],
+            "missing_orders": [
+                dict(forced_reduce),
+                {"side": "BUY", "price": 0.14289, "qty": 909.0, "notional": 129.88701, "role": "best_quote_entry_long"},
+            ],
+            "stale_orders": [],
+        }
+
+        actions = build_execution_actions(report)
+
+        self.assertEqual(actions["place_count"], 2)
+        self.assertEqual([item["role"] for item in actions["place_orders"]], [
+            "best_quote_adverse_reduce_long",
+            "best_quote_entry_long",
+        ])
+        self.assertAlmostEqual(actions["place_notional"], 260.06301, places=8)
+
     def test_build_execution_actions_excludes_manual_stale_orders(self) -> None:
         report = {
             "symbol": "BTCUSDC",

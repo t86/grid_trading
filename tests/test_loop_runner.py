@@ -1273,8 +1273,48 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(actions["place_count"], 2)
         self.assertEqual([item["orderId"] for item in actions["cancel_orders"]], [1])
         self.assertEqual([item["price"] for item in actions["place_orders"]], [100.0, 99.0])
+        self.assertAlmostEqual(actions["place_notional"], 0.0, places=8)
         self.assertEqual(report["execution_request_budget"]["deferred_cancel_count"], 1)
         self.assertEqual(report["execution_request_budget"]["deferred_place_count"], 1)
+
+    def test_apply_execution_request_budget_recomputes_notional_and_preserves_cancels(self) -> None:
+        validation = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "cancel_count": 1,
+                "place_count": 4,
+                "place_notional": 520.0,
+                "cancel_orders": [{"orderId": 410254194, "clientOrderId": "gx-billu-bestquot-2-02555661"}],
+                "place_orders": [
+                    {"role": "best_quote_adverse_reduce_long", "side": "SELL", "qty": 909.0, "price": 0.14464, "notional": 130.0},
+                    {"role": "best_quote_entry_long", "side": "BUY", "qty": 909.0, "price": 0.14289, "notional": 130.0},
+                    {"role": "take_profit_long", "side": "SELL", "qty": 909.0, "price": 0.1448, "notional": 130.0},
+                    {"role": "best_quote_entry_long", "side": "BUY", "qty": 909.0, "price": 0.1427, "notional": 130.0},
+                ],
+            },
+        }
+        report: dict[str, object] = {}
+
+        updated = apply_execution_request_budget_to_actions(
+            validation=validation,
+            report=report,
+            max_mutations_per_cycle=0,
+            max_cancels_per_cycle=0,
+            max_places_per_cycle=2,
+        )
+
+        actions = updated["actions"]
+        self.assertEqual(actions["cancel_count"], 1)
+        self.assertEqual(actions["place_count"], 2)
+        self.assertEqual([item["orderId"] for item in actions["cancel_orders"]], [410254194])
+        self.assertEqual(
+            [item["role"] for item in actions["place_orders"]],
+            ["best_quote_adverse_reduce_long", "best_quote_entry_long"],
+        )
+        self.assertAlmostEqual(actions["place_notional"], 260.0, places=8)
+        self.assertEqual(report["execution_request_budget"]["deferred_cancel_count"], 0)
+        self.assertEqual(report["execution_request_budget"]["deferred_place_count"], 2)
 
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))

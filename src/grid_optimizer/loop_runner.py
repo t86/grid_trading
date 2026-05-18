@@ -5242,6 +5242,7 @@ def apply_execution_request_budget_to_actions(
     actions["place_orders"] = kept_place_orders
     actions["cancel_count"] = len(kept_cancel_orders)
     actions["place_count"] = len(kept_place_orders)
+    actions["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
     updated = dict(validation)
     updated["actions"] = actions
     report["execution_request_budget"] = {
@@ -14847,6 +14848,20 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
+    configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
+    max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
+    effective_place_budget = (
+        max_new_order_budget
+        if configured_place_budget <= 0
+        else min(configured_place_budget, max_new_order_budget)
+    )
+    validation = apply_execution_request_budget_to_actions(
+        validation=validation,
+        report=report,
+        max_mutations_per_cycle=int(getattr(args, "execution_request_budget_per_cycle", 0) or 0),
+        max_cancels_per_cycle=int(getattr(args, "execution_cancel_budget_per_cycle", 0) or 0),
+        max_places_per_cycle=effective_place_budget,
+    )
     validation = enforce_execution_action_limits(
         validation=validation,
         max_new_orders=args.max_new_orders,
@@ -14863,15 +14878,6 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         return report
     if not validation["ok"]:
         return _mark_submit_report_blocked(report)
-
-    validation = apply_execution_request_budget_to_actions(
-        validation=validation,
-        report=report,
-        max_mutations_per_cycle=int(getattr(args, "execution_request_budget_per_cycle", 0) or 0),
-        max_cancels_per_cycle=int(getattr(args, "execution_cancel_budget_per_cycle", 0) or 0),
-        max_places_per_cycle=int(getattr(args, "execution_place_budget_per_cycle", 0) or 0),
-    )
-    report["validation"] = validation
 
     if requested_margin_type != "KEEP":
         try:

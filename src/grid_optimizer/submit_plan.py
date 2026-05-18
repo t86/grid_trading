@@ -458,6 +458,18 @@ def _is_urgent_reduce_only_order(order: dict[str, Any], *, strategy_mode: str) -
     return bool(order.get("force_reduce_only")) and execution_type in {"aggressive", "maker_timeout_release"}
 
 
+def _place_order_template_key(order: dict[str, Any]) -> tuple[str, str, str, str, str, str, str, str]:
+    side = str(order.get("side", "")).upper().strip()
+    price = f"{_safe_float(order.get('price')):.10f}"
+    qty = f"{_safe_float(order.get('qty', order.get('quantity'))):.10f}"
+    role = str(order.get("role", "") or "").strip().lower()
+    position_side = _order_position_side(order)
+    force_reduce_only = str(bool(order.get("force_reduce_only"))).lower()
+    execution_type = str(order.get("execution_type", "") or "").strip().lower()
+    time_in_force = str(order.get("time_in_force", "") or "").strip().upper()
+    return (side, price, qty, role, position_side, force_reduce_only, execution_type, time_in_force)
+
+
 def _is_displaceable_reduce_only_open_order(open_order: dict[str, Any]) -> bool:
     if not _truthy(open_order.get("reduceOnly")):
         return False
@@ -891,7 +903,14 @@ def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     ]
     if symbol:
         stale_orders = [item for item in stale_orders if _is_strategy_order(item, symbol)]
-    place_orders = [*forced_reduce_orders, *bootstrap_orders, *missing_orders]
+    place_orders: list[dict[str, Any]] = []
+    seen_place_templates: set[tuple[str, str, str, str, str, str, str, str]] = set()
+    for order in [*forced_reduce_orders, *bootstrap_orders, *missing_orders]:
+        key = _place_order_template_key(order)
+        if key in seen_place_templates:
+            continue
+        seen_place_templates.add(key)
+        place_orders.append(order)
     place_notional = sum(_safe_float(item.get("notional")) for item in place_orders)
     return {
         "place_orders": place_orders,
