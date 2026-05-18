@@ -344,7 +344,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(plan["sell_orders"], [])
 
-    def test_best_quote_dynamic_offsets_tighten_in_low_volatility(self) -> None:
+    def test_best_quote_dynamic_offsets_widen_in_low_volatility(self) -> None:
         result = _resolve_best_quote_dynamic_offsets(
             adaptive_step={"enabled": True, "raw_scale": 0.4, "dominant_window": "window_1m"},
             quote_offset_ticks=3,
@@ -352,7 +352,7 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertTrue(result["dynamic_quote_offset_applied"])
-        self.assertEqual(result["quote_offset_ticks"], 1)
+        self.assertEqual(result["quote_offset_ticks"], 8)
         self.assertEqual(result["defensive_offset_ticks"], 6)
         self.assertEqual(result["configured_quote_offset_ticks"], 3)
 
@@ -376,7 +376,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
-    def test_best_quote_maker_volume_reports_dynamic_low_volatility_offset(
+    def test_best_quote_maker_volume_reports_dynamic_low_volatility_widen_offset(
         self,
         mock_symbol_config,
         mock_book_tickers,
@@ -441,9 +441,9 @@ class LoopRunnerTests(unittest.TestCase):
         dynamic_offsets = report["best_quote_maker_volume"]["dynamic_offsets"]
         self.assertTrue(dynamic_offsets["dynamic_quote_offset_applied"])
         self.assertEqual(dynamic_offsets["configured_quote_offset_ticks"], 3)
-        self.assertEqual(dynamic_offsets["quote_offset_ticks"], 1)
-        self.assertEqual(report["buy_orders"][0]["price"], 80399.9)
-        self.assertEqual(report["sell_orders"][0]["price"], 80400.2)
+        self.assertEqual(dynamic_offsets["quote_offset_ticks"], 8)
+        self.assertEqual(report["buy_orders"][0]["price"], 80399.2)
+        self.assertEqual(report["sell_orders"][0]["price"], 80400.9)
 
     def test_best_quote_maker_volume_quotes_best_bid_ask(self) -> None:
         plan = build_best_quote_maker_volume_plan(

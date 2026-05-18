@@ -719,19 +719,19 @@ def _resolve_best_quote_dynamic_offsets(
     raw_scale = max(_safe_float(adaptive_step.get("raw_scale")), 0.0)
     if raw_scale <= 0.0 or raw_scale >= 1.0:
         return report
-    dynamic_quote = max(int(math.floor(configured_quote * raw_scale)), 1)
-    if dynamic_quote >= configured_quote:
-        return report
+    dynamic_quote = max(int(math.ceil(configured_quote / raw_scale)), configured_quote)
     report.update(
         {
             "quote_offset_ticks": dynamic_quote,
-            "dynamic_quote_offset_applied": True,
+            "dynamic_quote_offset_applied": dynamic_quote > configured_quote,
             "dynamic_quote_offset_scale": raw_scale,
             "reason": (
-                "low_volatility_quote_tighten"
+                "low_volatility_quote_widen"
                 f": raw_scale={raw_scale:.3f} "
                 f"{configured_quote}->{dynamic_quote}"
-            ),
+            )
+            if dynamic_quote > configured_quote
+            else None,
         }
     )
     return report
