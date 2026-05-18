@@ -1359,9 +1359,9 @@ class LoopRunnerTests(unittest.TestCase):
     def test_inventory_reducing_place_priority_keeps_long_exits_before_new_buys(self) -> None:
         actions = {
             "place_orders": [
-                {"role": "best_quote_entry_long", "side": "BUY", "notional": 230.0},
-                {"role": "adverse_reduce_long", "side": "SELL", "notional": 230.0, "force_reduce_only": True},
-                {"role": "best_quote_entry_short", "side": "SELL", "notional": 230.0},
+                {"role": "best_quote_entry_long", "side": "BUY", "price": 0.14920, "notional": 230.0},
+                {"role": "adverse_reduce_long", "side": "SELL", "price": 0.14930, "notional": 230.0, "force_reduce_only": True},
+                {"role": "best_quote_entry_short", "side": "SELL", "price": 0.14930, "notional": 230.0},
             ],
             "cancel_orders": [],
             "place_count": 3,
@@ -1371,6 +1371,9 @@ class LoopRunnerTests(unittest.TestCase):
         prioritized = prioritize_inventory_reducing_place_orders(
             actions=actions,
             current_actual_net_qty=20_000.0,
+            current_long_avg_price=0.14900,
+            step_price=0.00019,
+            min_profit_ratio=0.0003,
         )
         report: dict[str, object] = {}
         capped = apply_execution_request_budget_to_actions(
@@ -1384,6 +1387,56 @@ class LoopRunnerTests(unittest.TestCase):
             ["adverse_reduce_long", "best_quote_entry_short"],
         )
         self.assertEqual(report["execution_request_budget"]["deferred_place_orders"][0]["role"], "best_quote_entry_long")
+
+    def test_inventory_reducing_place_priority_keeps_low_cost_buy_ahead_of_far_exit(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "price": 0.15100, "notional": 230.0},
+                {"role": "best_quote_entry_long", "side": "BUY", "price": 0.14870, "notional": 230.0},
+                {"role": "best_quote_entry_long", "side": "BUY", "price": 0.14920, "notional": 230.0},
+            ],
+            "cancel_orders": [],
+            "place_count": 3,
+            "cancel_count": 0,
+        }
+
+        prioritized = prioritize_inventory_reducing_place_orders(
+            actions=actions,
+            current_actual_net_qty=10_000.0,
+            current_long_avg_price=0.14900,
+            step_price=0.00019,
+            min_profit_ratio=0.0003,
+        )
+
+        self.assertEqual(
+            [item["price"] for item in prioritized["place_orders"]],
+            [0.15100, 0.14870, 0.14920],
+        )
+
+    def test_inventory_reducing_place_priority_does_not_put_non_profit_exit_before_low_cost_buy(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "price": 0.14902, "notional": 230.0},
+                {"role": "best_quote_entry_long", "side": "BUY", "price": 0.14870, "notional": 230.0},
+                {"role": "best_quote_entry_long", "side": "BUY", "price": 0.14920, "notional": 230.0},
+            ],
+            "cancel_orders": [],
+            "place_count": 3,
+            "cancel_count": 0,
+        }
+
+        prioritized = prioritize_inventory_reducing_place_orders(
+            actions=actions,
+            current_actual_net_qty=10_000.0,
+            current_long_avg_price=0.14900,
+            step_price=0.00019,
+            min_profit_ratio=0.0003,
+        )
+
+        self.assertEqual(
+            [item["price"] for item in prioritized["place_orders"]],
+            [0.14870, 0.14902, 0.14920],
+        )
 
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))

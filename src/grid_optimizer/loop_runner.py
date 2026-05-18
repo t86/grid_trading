@@ -5358,27 +5358,86 @@ def prioritize_inventory_reducing_place_orders(
     *,
     actions: dict[str, Any],
     current_actual_net_qty: float,
+    current_long_avg_price: float = 0.0,
+    current_short_avg_price: float = 0.0,
+    step_price: float = 0.0,
+    tick_size: float | None = None,
+    min_profit_ratio: float | None = None,
 ) -> dict[str, Any]:
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
     if not place_orders or abs(_safe_float(current_actual_net_qty)) <= 1e-12:
         return actions
 
     reducing_side = "SELL" if _safe_float(current_actual_net_qty) > 0 else "BUY"
+    safe_step = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
+    safe_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    long_cost = max(_safe_float(current_long_avg_price), 0.0)
+    short_cost = max(_safe_float(current_short_avg_price), 0.0)
+    long_profit_floor = (
+        max(
+            long_cost + safe_step if safe_step > 0 else 0.0,
+            long_cost * (1.0 + safe_profit_ratio) if safe_profit_ratio > 0 else 0.0,
+        )
+        if long_cost > 0
+        else 0.0
+    )
+    short_profit_ceiling = (
+        min(
+            value
+            for value in (
+                short_cost - safe_step if safe_step > 0 else None,
+                short_cost * (1.0 - safe_profit_ratio) if safe_profit_ratio > 0 else None,
+            )
+            if value is not None and value > 0
+        )
+        if short_cost > 0 and (safe_step > 0 or safe_profit_ratio > 0)
+        else 0.0
+    )
+    long_low_entry_ceiling = max(long_cost - safe_step, 0.0) if long_cost > 0 and safe_step > 0 else 0.0
+    short_high_entry_floor = short_cost + safe_step if short_cost > 0 and safe_step > 0 else 0.0
 
     def priority(order: dict[str, Any]) -> tuple[int, int]:
         side = str(order.get("side", "")).upper().strip()
         role = str(order.get("role", "") or "").strip().lower()
+        price = _safe_float(order.get("price"))
         reduce_like = (
             bool(order.get("force_reduce_only"))
             or "reduce" in role
             or role.startswith("take_profit")
             or role in {"best_quote_entry_short", "best_quote_entry_long"}
         )
-        if side == reducing_side and reduce_like:
+        low_cost_entry = (
+            side == "BUY"
+            and role == "best_quote_entry_long"
+            and long_low_entry_ceiling > 0
+            and price <= long_low_entry_ceiling + 1e-12
+        )
+        high_cost_entry = (
+            side == "SELL"
+            and role == "best_quote_entry_short"
+            and short_high_entry_floor > 0
+            and price + 1e-12 >= short_high_entry_floor
+        )
+        profitable_reduce = (
+            side == "SELL"
+            and reducing_side == "SELL"
+            and reduce_like
+            and (long_profit_floor <= 0 or price + 1e-12 >= long_profit_floor)
+        ) or (
+            side == "BUY"
+            and reducing_side == "BUY"
+            and reduce_like
+            and (short_profit_ceiling <= 0 or price <= short_profit_ceiling + 1e-12)
+        )
+        if profitable_reduce:
             return (0, 0)
-        if side == reducing_side:
+        if low_cost_entry or high_cost_entry:
             return (1, 0)
-        return (2, 0)
+        if side == reducing_side and reduce_like:
+            return (2, 0)
+        if side == reducing_side:
+            return (3, 0)
+        return (4, 0)
 
     prioritized = sorted(enumerate(place_orders), key=lambda item: (*priority(item[1]), item[0]))
     result = dict(actions)
@@ -5389,6 +5448,10 @@ def prioritize_inventory_reducing_place_orders(
         "enabled": True,
         "current_actual_net_qty": _safe_float(current_actual_net_qty),
         "reducing_side": reducing_side,
+        "long_profit_floor": long_profit_floor or None,
+        "long_low_entry_ceiling": long_low_entry_ceiling or None,
+        "short_profit_ceiling": short_profit_ceiling or None,
+        "short_high_entry_floor": short_high_entry_floor or None,
     }
     return result
 
@@ -13439,21 +13502,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             )
             grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
-            long_entry_gate_price = current_long_avg_price
-            if long_unrealized_ratio is not None and long_unrealized_ratio < 0.0 and grid_profit_gap > 0:
-                long_entry_gate_price = max(current_long_avg_price - grid_profit_gap, 0.0)
+            long_entry_gate_price = max(current_long_avg_price - grid_profit_gap, 0.0) if grid_profit_gap > 0 else current_long_avg_price
             best_quote_inventory_cost_gate["long_unrealized_ratio"] = long_unrealized_ratio
             best_quote_inventory_cost_gate["long_entry_gate_price"] = long_entry_gate_price
             long_soft_threshold = _safe_float(best_quote_inventory_cost_gate["long_soft_threshold_notional"])
             long_below_soft_exempt = long_soft_threshold > 0 and current_long_notional < long_soft_threshold
             best_quote_inventory_cost_gate["long_below_soft_exempt"] = long_below_soft_exempt
-            best_quote_inventory_cost_gate["would_block_buy_orders"] = sum(
-                1
-                for item in plan.get("buy_orders", [])
-                if isinstance(item, dict)
-                and _order_role(item) == "best_quote_entry_long"
-                and _safe_float(item.get("price")) > long_entry_gate_price + 1e-12
-            )
+            kept_buy_orders: list[dict[str, Any]] = []
+            blocked_buy_orders: list[dict[str, Any]] = []
+            for item in plan.get("buy_orders", []):
+                if (
+                    isinstance(item, dict)
+                    and _order_role(item) == "best_quote_entry_long"
+                    and _safe_float(item.get("price")) > long_entry_gate_price + 1e-12
+                ):
+                    blocked_buy_orders.append(dict(item))
+                else:
+                    kept_buy_orders.append(item)
+            plan["buy_orders"] = kept_buy_orders
+            best_quote_inventory_cost_gate["blocked_buy_orders"] = len(blocked_buy_orders)
+            best_quote_inventory_cost_gate["blocked_buy_order_details"] = blocked_buy_orders
+            best_quote_inventory_cost_gate["would_block_buy_orders"] = len(blocked_buy_orders)
         if current_short_qty > 1e-12 and current_short_avg_price > 0:
             short_unrealized_ratio = (
                 (current_short_avg_price - mid_price) / current_short_avg_price
@@ -13461,21 +13530,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             )
             grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
-            short_entry_gate_price = current_short_avg_price
-            if short_unrealized_ratio is not None and short_unrealized_ratio < 0.0 and grid_profit_gap > 0:
-                short_entry_gate_price = current_short_avg_price + grid_profit_gap
+            short_entry_gate_price = current_short_avg_price + grid_profit_gap if grid_profit_gap > 0 else current_short_avg_price
             best_quote_inventory_cost_gate["short_unrealized_ratio"] = short_unrealized_ratio
             best_quote_inventory_cost_gate["short_entry_gate_price"] = short_entry_gate_price
             short_soft_threshold = _safe_float(best_quote_inventory_cost_gate["short_soft_threshold_notional"])
             short_below_soft_exempt = short_soft_threshold > 0 and current_short_notional < short_soft_threshold
             best_quote_inventory_cost_gate["short_below_soft_exempt"] = short_below_soft_exempt
-            best_quote_inventory_cost_gate["would_block_sell_orders"] = sum(
-                1
-                for item in plan.get("sell_orders", [])
-                if isinstance(item, dict)
-                and _order_role(item) == "best_quote_entry_short"
-                and _safe_float(item.get("price")) + 1e-12 < short_entry_gate_price
-            )
+            kept_sell_orders: list[dict[str, Any]] = []
+            blocked_sell_orders: list[dict[str, Any]] = []
+            for item in plan.get("sell_orders", []):
+                if (
+                    isinstance(item, dict)
+                    and _order_role(item) == "best_quote_entry_short"
+                    and _safe_float(item.get("price")) + 1e-12 < short_entry_gate_price
+                ):
+                    blocked_sell_orders.append(dict(item))
+                else:
+                    kept_sell_orders.append(item)
+            plan["sell_orders"] = kept_sell_orders
+            best_quote_inventory_cost_gate["blocked_sell_orders"] = len(blocked_sell_orders)
+            best_quote_inventory_cost_gate["blocked_sell_order_details"] = blocked_sell_orders
+            best_quote_inventory_cost_gate["would_block_sell_orders"] = len(blocked_sell_orders)
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),
@@ -14992,6 +15067,13 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     validation["actions"] = prioritize_inventory_reducing_place_orders(
         actions=validation["actions"],
         current_actual_net_qty=current_actual_net_qty,
+        current_long_avg_price=current_long_avg_price,
+        current_short_avg_price=current_short_avg_price,
+        step_price=_safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))
+        or _safe_float(plan_report.get("effective_step_price"))
+        or _safe_float(getattr(args, "step_price", 0.0)),
+        tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
+        min_profit_ratio=(plan_report.get("take_profit_guard") or {}).get("effective_min_profit_ratio"),
     )
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
