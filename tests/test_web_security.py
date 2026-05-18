@@ -191,6 +191,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("挤出奖励区量", MONITOR_PAGE)
         self.assertIn("挤进交易量", MONITOR_PAGE)
         self.assertIn("按后续用户逐个超过当前成交量累计", MONITOR_PAGE)
+        self.assertIn("current_reward_floor", MONITOR_PAGE)
+        self.assertIn("当前档", MONITOR_PAGE)
         self.assertIn("按当前成交量计算进入目标名次还差多少", MONITOR_PAGE)
         self.assertIn("万3", MONITOR_PAGE)
         self.assertIn("万4", MONITOR_PAGE)

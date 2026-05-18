@@ -25667,10 +25667,11 @@ MONITOR_PAGE = """<!doctype html>
     function buildCompetitionDisplacementCard(displacement) {
       const payload = (displacement && typeof displacement === "object") ? displacement : {};
       const current = (payload.current && typeof payload.current === "object") ? payload.current : null;
+      const currentRewardFloor = (payload.current_reward_floor && typeof payload.current_reward_floor === "object") ? payload.current_reward_floor : null;
       const bands = Array.isArray(payload.displacement_bands) ? payload.displacement_bands.slice(0, 8) : [];
       const rewardSteps = Array.isArray(payload.reward_floor_steps) ? payload.reward_floor_steps.slice(0, 2) : [];
       const message = String(payload.message || "").trim();
-      if (!current && !bands.length && !rewardSteps.length && !message) {
+      if (!current && !currentRewardFloor && !bands.length && !rewardSteps.length && !message) {
         return null;
       }
       const unit = String(payload.leaderboard_unit || "USDT").trim() || "USDT";
@@ -25680,6 +25681,14 @@ MONITOR_PAGE = """<!doctype html>
           <div class="metric-line">
             <strong><span class="inline-badge">当前</span>${escapeHtml(current.label || "当前排位")}</strong><br />
             ${fmtWanVolume(current.cumulative_gap)} ${escapeHtml(unit)} · 需第 ${fmtNum((current.from_rank || 0) + 1, 0)}-${fmtNum(current.last_included_rank || 0, 0)} 名共 ${fmtNum(current.users_count || 0, 0)} 人超过
+          </div>
+        `);
+      }
+      if (currentRewardFloor) {
+        rowHtml.push(`
+          <div class="metric-line">
+            <strong><span class="inline-badge">当前档</span>${escapeHtml(currentRewardFloor.label || "当前奖励档")}</strong><br />
+            ${fmtWanVolume(currentRewardFloor.cumulative_gap)} ${escapeHtml(unit)} · 需第 ${fmtNum((currentRewardFloor.from_rank || 0) + 1, 0)}-${fmtNum(currentRewardFloor.last_included_rank || 0, 0)} 名共 ${fmtNum(currentRewardFloor.users_count || 0, 0)} 人超过
           </div>
         `);
       }

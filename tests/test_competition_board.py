@@ -144,6 +144,42 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(band_21["last_included_rank"], 51)
         self.assertAlmostEqual(band_21["cumulative_gap"], 470.0, places=8)
 
+    def test_build_competition_displacement_volume_reports_current_reward_floor(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [
+                *[{"rank": rank, "value": 5_000.0 - rank * 10.0} for rank in range(1, 39)],
+                {"rank": 39, "value": 3_900.0},
+                {"rank": 40, "value": 3_700.0},
+                {"rank": 41, "value": 3_650.0},
+                {"rank": 42, "value": 3_600.0},
+                {"rank": 43, "value": 3_575.0},
+                {"rank": 44, "value": 3_550.0},
+                {"rank": 45, "value": 3_525.0},
+                {"rank": 46, "value": 3_500.0},
+                {"rank": 47, "value": 3_475.0},
+                {"rank": 48, "value": 3_450.0},
+                {"rank": 49, "value": 3_425.0},
+                {"rank": 50, "value": 3_400.0},
+                {"rank": 51, "value": 3_300.0},
+                {"rank": 200, "value": 300.0},
+            ],
+            "segments": [
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名"},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名"},
+            ],
+        }
+
+        result = build_competition_displacement_volume(board, current_volume=3_763.0, target_rank=200)
+
+        floor = result["current_reward_floor"]
+        self.assertEqual(floor["label"], "当前第 40 名 -> 第 51 名")
+        self.assertEqual(floor["from_rank"], 40)
+        self.assertEqual(floor["target_rank"], 51)
+        self.assertEqual(floor["last_included_rank"], 50)
+        self.assertEqual(floor["users_count"], 10)
+        self.assertAlmostEqual(floor["cumulative_gap"], 2_480.0, places=8)
+
     def test_build_reward_volume_targets_maps_20_50_200_loss_targets(self) -> None:
         board = {
             "label": "KAT 合约交易挑战赛",

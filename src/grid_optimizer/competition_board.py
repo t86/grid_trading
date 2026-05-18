@@ -3457,6 +3457,7 @@ def build_competition_displacement_volume(
             "current_volume": float(current),
             "current_rank": None,
             "current": None,
+            "current_reward_floor": None,
             "rank_steps": [],
             "reward_floor_steps": [],
             "displacement_bands": [],
@@ -3520,6 +3521,7 @@ def build_competition_displacement_volume(
 
     reward_floor_steps: list[dict[str, Any]] = []
     displacement_bands: list[dict[str, Any]] = []
+    current_reward_floor = None
     for segment in board.get("segments", []):
         if not isinstance(segment, dict):
             continue
@@ -3542,6 +3544,16 @@ def build_competition_displacement_volume(
                     label=f"第 {int(start_rank)} 名 -> 第 {int(floor_rank)} 名",
                 )
             )
+        if current_reward_floor is None and int(start_rank) <= int(current_rank) <= int(end_rank):
+            floor_rank = min(int(end_rank), int(target_rank))
+            if int(current_rank) < floor_rank:
+                current_reward_floor = _gap_summary(
+                    int(current_rank),
+                    floor_rank,
+                    float(current),
+                    label=f"当前第 {int(current_rank)} 名 -> 第 {int(floor_rank) + 1} 名",
+                    result_rank=int(floor_rank) + 1,
+                )
         next_rank = min(int(end_rank) + 1, int(target_rank) + 1)
         if int(start_rank) < next_rank:
             included_rank = next_rank if next_rank <= int(target_rank) else next_rank - 1
@@ -3561,6 +3573,7 @@ def build_competition_displacement_volume(
         "current_rank": int(current_rank),
         "target_rank": int(target_rank),
         "current": current_summary,
+        "current_reward_floor": current_reward_floor,
         "rank_steps": rank_steps,
         "reward_floor_steps": reward_floor_steps,
         "displacement_bands": displacement_bands,
