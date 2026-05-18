@@ -674,6 +674,22 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
     long_avg = max(_safe_float(plan_report.get("current_long_avg_price")), 0.0)
     short_ceiling = short_avg * (1.0 - min_profit_ratio) if short_avg > 0 else 0.0
     long_floor = long_avg * (1.0 + min_profit_ratio) if long_avg > 0 else 0.0
+    step_price = max(
+        _safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price")),
+        _safe_float(plan_report.get("effective_step_price")),
+        _safe_float(plan_report.get("step_price")),
+        0.0,
+    )
+    mid_price = max(_safe_float(plan_report.get("mid_price")), 0.0)
+    market_guard = plan_report.get("market_guard") if isinstance(plan_report.get("market_guard"), dict) else {}
+    market_return_ratio = _safe_float(market_guard.get("return_ratio"))
+    adverse_trend_threshold_ratio = (step_price / mid_price) if step_price > 0 and mid_price > 0 else 0.0
+    long_same_side_entry_ceiling = (
+        max(long_avg - step_price, 0.0)
+        if step_price > 0 and long_avg > 0
+        else long_avg
+    )
+    short_same_side_entry_floor = short_avg + step_price if step_price > 0 and short_avg > 0 else short_avg
     small_entry_notional = max(
         _safe_float(plan_report.get("loss_inventory_no_cross_small_entry_notional")),
         0.0,
@@ -689,6 +705,7 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
     converted_orders: list[dict[str, Any]] = []
     allowed_small_entry_orders: list[dict[str, Any]] = []
     resized_small_loss_reduce_orders: list[dict[str, Any]] = []
+    allowed_same_side_entry_orders: list[dict[str, Any]] = []
     for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
         side = str(order.get("side", "")).upper().strip()
         price = _safe_float(order.get("price"))
@@ -721,6 +738,52 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         long_recovery_order = entry_side == "short" or (
             reduce_side == "SELL" and not hard_loss_forced_reduce
         ) or implicit_loss_reduce_side == "SELL"
+        if losing_short and entry_side == "short" and side == "SELL":
+            adverse_uptrend = (
+                adverse_trend_threshold_ratio > 0
+                and market_return_ratio > adverse_trend_threshold_ratio
+            )
+            if price <= 0 or price + 1e-12 < short_same_side_entry_floor:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_sell_below_entry_floor"
+                dropped["loss_inventory_same_side_entry_floor"] = short_same_side_entry_floor
+                dropped_orders.append(dropped)
+                continue
+            if adverse_uptrend:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_adverse_uptrend"
+                dropped["loss_inventory_market_return_ratio"] = market_return_ratio
+                dropped["loss_inventory_adverse_trend_threshold_ratio"] = adverse_trend_threshold_ratio
+                dropped_orders.append(dropped)
+                continue
+            order["loss_inventory_no_cross_guard"] = "short_same_side_entry_allowed"
+            order["loss_inventory_same_side_entry_floor"] = short_same_side_entry_floor
+            allowed_same_side_entry_orders.append(dict(order))
+            kept_place_orders.append(order)
+            continue
+        if losing_long and entry_side == "long" and side == "BUY":
+            adverse_downtrend = (
+                adverse_trend_threshold_ratio > 0
+                and market_return_ratio < -adverse_trend_threshold_ratio
+            )
+            if price <= 0 or price > long_same_side_entry_ceiling + 1e-12:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_buy_above_entry_ceiling"
+                dropped["loss_inventory_same_side_entry_ceiling"] = long_same_side_entry_ceiling
+                dropped_orders.append(dropped)
+                continue
+            if adverse_downtrend:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_adverse_downtrend"
+                dropped["loss_inventory_market_return_ratio"] = market_return_ratio
+                dropped["loss_inventory_adverse_trend_threshold_ratio"] = adverse_trend_threshold_ratio
+                dropped_orders.append(dropped)
+                continue
+            order["loss_inventory_no_cross_guard"] = "long_same_side_entry_allowed"
+            order["loss_inventory_same_side_entry_ceiling"] = long_same_side_entry_ceiling
+            allowed_same_side_entry_orders.append(dict(order))
+            kept_place_orders.append(order)
+            continue
         if losing_short and short_recovery_order and side == "BUY":
             if price > 0 and price <= short_ceiling:
                 if entry_side == "long" or implicit_loss_reduce_side is not None:
@@ -794,7 +857,14 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         "min_profit_ratio": min_profit_ratio,
         "short_recovery_ceiling": short_ceiling if losing_short else None,
         "long_recovery_floor": long_floor if losing_long else None,
+        "step_price": step_price,
+        "market_return_ratio": market_return_ratio,
+        "adverse_trend_threshold_ratio": adverse_trend_threshold_ratio,
+        "short_same_side_entry_floor": short_same_side_entry_floor if losing_short else None,
+        "long_same_side_entry_ceiling": long_same_side_entry_ceiling if losing_long else None,
         "small_entry_notional_limit": small_entry_notional,
+        "allowed_same_side_entry_count": len(allowed_same_side_entry_orders),
+        "allowed_same_side_entry_orders": allowed_same_side_entry_orders,
         "allowed_small_entry_count": len(allowed_small_entry_orders),
         "allowed_small_entry_orders": allowed_small_entry_orders,
         "resized_small_loss_reduce_count": len(resized_small_loss_reduce_orders),
@@ -812,9 +882,9 @@ def _entry_side_from_order(order: dict[str, Any], *, strategy_mode: str) -> str 
         return None
     side = str(order.get("side", "")).upper().strip()
     role = str(order.get("role", "entry")).strip().lower()
-    if role in {"entry_short", "bootstrap_short", "grid_entry_short"}:
+    if role in {"entry_short", "bootstrap_short", "grid_entry_short", "best_quote_entry_short"}:
         return "short"
-    if role in {"entry_long", "bootstrap_long", "grid_entry_long"}:
+    if role in {"entry_long", "bootstrap_long", "grid_entry_long", "best_quote_entry_long"}:
         return "long"
     if role in {"entry", "bootstrap", "grid_entry"}:
         if side == "SELL":

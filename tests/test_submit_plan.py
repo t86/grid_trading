@@ -698,6 +698,100 @@ class SubmitPlanTests(unittest.TestCase):
             "losing_short_buy_above_recovery_ceiling",
         )
 
+    def test_loss_inventory_guard_drops_best_quote_short_entry_during_losing_short_uptrend(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.16053,
+                    "qty": 716.0,
+                    "quantity": 716.0,
+                    "notional": 114.9,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -26909.0,
+            "unrealized_pnl": -17.0,
+            "current_short_avg_price": 0.1598576369652,
+            "step_price": 0.00019,
+            "mid_price": 0.160515,
+            "market_guard": {"return_ratio": 0.00337},
+            "take_profit_min_profit_ratio": 0.0003,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual(guarded["place_count"], 0)
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["dropped_order_count"], 1)
+        self.assertEqual(
+            guard_report["dropped_orders"][0]["loss_inventory_no_cross_drop_reason"],
+            "losing_short_adverse_uptrend",
+        )
+
+    def test_loss_inventory_guard_allows_best_quote_short_entry_only_after_cost_gap(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.16004,
+                    "qty": 718.0,
+                    "quantity": 718.0,
+                    "notional": 114.9,
+                    "role": "best_quote_entry_short",
+                },
+                {
+                    "side": "SELL",
+                    "price": 0.16020,
+                    "qty": 717.0,
+                    "quantity": 717.0,
+                    "notional": 114.9,
+                    "role": "best_quote_entry_short",
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -26909.0,
+            "unrealized_pnl": -17.0,
+            "current_short_avg_price": 0.1598576369652,
+            "step_price": 0.00019,
+            "mid_price": 0.16010,
+            "market_guard": {"return_ratio": 0.0},
+            "take_profit_min_profit_ratio": 0.0003,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertAlmostEqual(guarded["place_orders"][0]["price"], 0.16020)
+        self.assertEqual(
+            guarded["place_orders"][0]["loss_inventory_no_cross_guard"],
+            "short_same_side_entry_allowed",
+        )
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_same_side_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 1)
+        self.assertEqual(
+            guard_report["dropped_orders"][0]["loss_inventory_no_cross_drop_reason"],
+            "losing_short_sell_below_entry_floor",
+        )
+
     def test_loss_inventory_guard_keeps_hard_loss_forced_reduce_below_recovery_floor(self) -> None:
         actions = {
             "place_orders": [

@@ -13493,6 +13493,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "grid_profit_gap_price": max(_safe_float(effective_args.step_price), 0.0),
             "long_entry_gate_price": None,
             "short_entry_gate_price": None,
+            "market_return_ratio": _safe_float((market_guard or {}).get("return_ratio")),
+            "adverse_trend_threshold_ratio": None,
             "long_soft_threshold_notional": max(
                 _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0))
                 * _safe_float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.0)),
@@ -13506,6 +13508,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "long_below_soft_exempt": False,
             "short_below_soft_exempt": False,
         }
+        best_quote_entry_adverse_trend_threshold_ratio = (
+            _safe_float(effective_args.step_price) / mid_price
+            if _safe_float(effective_args.step_price) > 0 and mid_price > 0
+            else 0.0
+        )
+        best_quote_inventory_cost_gate["adverse_trend_threshold_ratio"] = best_quote_entry_adverse_trend_threshold_ratio
         if current_long_qty > 1e-12 and current_long_avg_price > 0:
             long_unrealized_ratio = (
                 (mid_price - current_long_avg_price) / current_long_avg_price
@@ -13519,15 +13527,30 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             long_soft_threshold = _safe_float(best_quote_inventory_cost_gate["long_soft_threshold_notional"])
             long_below_soft_exempt = long_soft_threshold > 0 and current_long_notional < long_soft_threshold
             best_quote_inventory_cost_gate["long_below_soft_exempt"] = long_below_soft_exempt
+            block_long_same_side_adverse = (
+                long_unrealized_ratio is not None
+                and long_unrealized_ratio < 0
+                and best_quote_entry_adverse_trend_threshold_ratio > 0
+                and _safe_float((market_guard or {}).get("return_ratio")) < -best_quote_entry_adverse_trend_threshold_ratio
+            )
             kept_buy_orders: list[dict[str, Any]] = []
             blocked_buy_orders: list[dict[str, Any]] = []
             for item in plan.get("buy_orders", []):
                 if (
                     isinstance(item, dict)
                     and _order_role(item) == "best_quote_entry_long"
-                    and _safe_float(item.get("price")) > long_entry_gate_price + 1e-12
+                    and (
+                        _safe_float(item.get("price")) > long_entry_gate_price + 1e-12
+                        or block_long_same_side_adverse
+                    )
                 ):
-                    blocked_buy_orders.append(dict(item))
+                    blocked = dict(item)
+                    blocked["block_reason"] = (
+                        "losing_long_adverse_downtrend"
+                        if block_long_same_side_adverse
+                        else "losing_long_entry_above_cost_gate"
+                    )
+                    blocked_buy_orders.append(blocked)
                 else:
                     kept_buy_orders.append(item)
             plan["buy_orders"] = kept_buy_orders
@@ -13547,15 +13570,30 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             short_soft_threshold = _safe_float(best_quote_inventory_cost_gate["short_soft_threshold_notional"])
             short_below_soft_exempt = short_soft_threshold > 0 and current_short_notional < short_soft_threshold
             best_quote_inventory_cost_gate["short_below_soft_exempt"] = short_below_soft_exempt
+            block_short_same_side_adverse = (
+                short_unrealized_ratio is not None
+                and short_unrealized_ratio < 0
+                and best_quote_entry_adverse_trend_threshold_ratio > 0
+                and _safe_float((market_guard or {}).get("return_ratio")) > best_quote_entry_adverse_trend_threshold_ratio
+            )
             kept_sell_orders: list[dict[str, Any]] = []
             blocked_sell_orders: list[dict[str, Any]] = []
             for item in plan.get("sell_orders", []):
                 if (
                     isinstance(item, dict)
                     and _order_role(item) == "best_quote_entry_short"
-                    and _safe_float(item.get("price")) + 1e-12 < short_entry_gate_price
+                    and (
+                        _safe_float(item.get("price")) + 1e-12 < short_entry_gate_price
+                        or block_short_same_side_adverse
+                    )
                 ):
-                    blocked_sell_orders.append(dict(item))
+                    blocked = dict(item)
+                    blocked["block_reason"] = (
+                        "losing_short_adverse_uptrend"
+                        if block_short_same_side_adverse
+                        else "losing_short_entry_below_cost_gate"
+                    )
+                    blocked_sell_orders.append(blocked)
                 else:
                     kept_sell_orders.append(item)
             plan["sell_orders"] = kept_sell_orders
