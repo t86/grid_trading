@@ -55,6 +55,7 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_flow_sleeve,
     apply_hard_loss_forced_reduce,
     apply_inventory_unlock_release,
+    _resolve_inventory_unlock_pause_notional,
     resolve_loss_recovery_brush,
     resolve_hard_loss_forced_reduce_episode,
     prime_exposure_escalation_on_market_guard,
@@ -1835,6 +1836,76 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["active"])
         self.assertEqual(report["stall_count"], 1)
         self.assertEqual(plan["sell_orders"], [])
+
+    def test_best_quote_inventory_unlock_uses_soft_pause_threshold(self) -> None:
+        args = SimpleNamespace(
+            best_quote_maker_volume_inventory_soft_ratio=0.55,
+            best_quote_maker_volume_max_long_notional=5500.0,
+            best_quote_maker_volume_max_short_notional=5500.0,
+        )
+
+        short_pause = _resolve_inventory_unlock_pause_notional(
+            args=args,
+            strategy_mode="best_quote_maker_volume_v1",
+            side="short",
+            fallback_pause_notional=4015.0,
+        )
+        long_pause = _resolve_inventory_unlock_pause_notional(
+            args=args,
+            strategy_mode="best_quote_maker_volume_v1",
+            side="long",
+            fallback_pause_notional=4015.0,
+        )
+
+        self.assertAlmostEqual(short_pause or 0.0, 3025.0)
+        self.assertAlmostEqual(long_pause or 0.0, 3025.0)
+
+    def test_inventory_unlock_release_fires_for_best_quote_short_soft_stall(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {"inventory_unlock_release": {"side": "short", "stall_count": 2}}
+        args = SimpleNamespace(
+            best_quote_maker_volume_inventory_soft_ratio=0.55,
+            best_quote_maker_volume_max_long_notional=5500.0,
+            best_quote_maker_volume_max_short_notional=5500.0,
+        )
+        pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=args,
+            strategy_mode="best_quote_maker_volume_v1",
+            side="short",
+            fallback_pause_notional=4015.0,
+        )
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "short_active": True, "short_ceiling_price": 0.14095},
+            current_qty=21500.0,
+            current_notional=3054.0,
+            pause_notional=pause_notional,
+            release_cap_notional=733.0,
+            per_order_notional=600.0,
+            step_price=0.00019,
+            tick_size=0.00001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            bid_price=0.14205,
+            ask_price=0.14206,
+        )
+
+        release_orders = [order for order in plan["buy_orders"] if order["role"] == "inventory_unlock_reduce_short"]
+        self.assertTrue(report["active"])
+        self.assertEqual(report["side"], "short")
+        self.assertEqual(report["stall_count"], 3)
+        self.assertEqual(len(release_orders), 1)
+        self.assertEqual(release_orders[0]["side"], "BUY")
+        self.assertTrue(release_orders[0]["force_reduce_only"])
+        self.assertEqual(release_orders[0]["time_in_force"], "GTX")
+        self.assertEqual(release_orders[0]["execution_type"], "inventory_unlock_release")
+        self.assertGreater(release_orders[0]["price"], 0.14095)
+        self.assertLessEqual(release_orders[0]["notional"], 733.0)
 
     def test_inventory_unlock_release_blocks_same_side_reentry_after_release(self) -> None:
         plan = {
