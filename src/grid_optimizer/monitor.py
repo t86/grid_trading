@@ -1506,6 +1506,10 @@ def _build_monitor_snapshot_uncached(
         )
         trade_summary["net_pnl_estimate"] = net_pnl_est
         snapshot["trade_summary"] = trade_summary
+        snapshot["competition_reward_targets"] = build_reward_volume_targets(
+            competition_board,
+            current_volume=trade_summary.get("gross_notional"),
+        )
         snapshot["income_summary"] = income_summary
         snapshot["hourly_summary"] = hourly_summary
         snapshot["audit"]["trade_source"] = trade_meta

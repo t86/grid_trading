@@ -27,7 +27,18 @@ class SymbolListsTests(unittest.TestCase):
 
     def test_default_symbol_lists_include_sprint_symbols(self) -> None:
         loaded = load_symbol_lists(self.path)
-        for symbol in ("CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"):
+        for symbol in (
+            "BILLUSDT",
+            "AIGENSYNUSDT",
+            "BTCUSDC",
+            "ETHUSDC",
+            "XAUUSDT",
+            "XAGUSDT",
+            "CLUSDT",
+            "BZUSDT",
+            "ORDIUSDC",
+            "TRUMPUSDC",
+        ):
             self.assertIn(symbol, loaded["monitor"])
             self.assertIn(symbol, loaded["competition"])
 

@@ -347,6 +347,20 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.binance.com/zh-CN/activity/trading-competition/futures-chip-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="futures_aigensyn",
+        symbol="AIGENSYN",
+        market="futures",
+        label="AIGENSYN 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-aigensyn-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_bill",
+        symbol="BILL",
+        market="futures",
+        label="BILL 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-bill-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
         slug="futures_tradfi_week1",
         symbol="TRADFI",
         market="futures",
@@ -1400,6 +1414,84 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
 平分 900,000 CHIP
 第 51 - 200 名
 平分 1,800,000 CHIP
+""",
+            }
+        ]
+    },
+    "futures_aigensyn": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 54596,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "AIGENSYN",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/12 18:00 - 2026/05/19 07:59",
+                "activityEndAt": "2026-05-19T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/12 18:00 - 2026/05/19 07:59
+累计 AIGENSYN U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 3,200,000 AIGENSYN
+第 1 名
+480,000 AIGENSYN
+第 2 名
+384,000 AIGENSYN
+第 3 名
+224,000 AIGENSYN
+第 4 名
+128,000 AIGENSYN
+第 5 名
+64,000 AIGENSYN
+第 6 - 20 名
+平分 480,000 AIGENSYN
+第 21 - 50 名
+平分 480,000 AIGENSYN
+第 51 - 200 名
+平分 960,000 AIGENSYN
+""",
+            }
+        ]
+    },
+    "futures_bill": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 54211,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BILL",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/08 18:00 - 2026/05/19 07:59",
+                "activityEndAt": "2026-05-19T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/08 18:00 - 2026/05/19 07:59
+累计 BILL U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 4,000,000 BILL
+第 1 名
+600,000 BILL
+第 2 名
+480,000 BILL
+第 3 名
+280,000 BILL
+第 4 名
+160,000 BILL
+第 5 名
+80,000 BILL
+第 6 - 20 名
+平分 600,000 BILL
+第 21 - 50 名
+平分 600,000 BILL
+第 51 - 200 名
+平分 1,200,000 BILL
 """,
             }
         ]
@@ -3231,6 +3323,7 @@ def build_reward_volume_targets(
     board: dict[str, Any] | None,
     *,
     now: datetime | None = None,
+    current_volume: float | None = None,
     tracked_ranks: tuple[int, ...] = (200, 50, 20),
     loss_per_10k_options: tuple[int, ...] = (3, 4, 5),
 ) -> dict[str, Any] | None:
@@ -3295,6 +3388,13 @@ def build_reward_volume_targets(
             }
         )
 
+    values_by_rank = _values_by_rank(board)
+    zone_moves = _build_reward_zone_moves(
+        segments,
+        values_by_rank,
+        current_volume=current_volume,
+    )
+
     return {
         "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip() or "-",
         "symbol": str(board.get("symbol", "")).strip(),
@@ -3302,8 +3402,88 @@ def build_reward_volume_targets(
         "reward_price_usdt": float(reward_price),
         "loss_per_10k_options": [int(item) for item in loss_per_10k_options],
         "tiers": tiers,
+        "zone_moves": zone_moves,
         "message": "" if tiers else "奖励段已识别，但没有拿到 20 / 50 / 200 名对应的有效奖励数据。",
     }
+
+
+def _rank_after_volume(values_by_rank: dict[int, float], current_volume: float) -> int | None:
+    if not values_by_rank:
+        return None
+    ranked_values = sorted(values_by_rank.items(), key=lambda item: int(item[0]))
+    for rank, value in ranked_values:
+        if float(current_volume) >= float(value):
+            return int(rank)
+    return int(ranked_values[-1][0]) + 1
+
+
+def _build_reward_zone_moves(
+    segments: list[Any],
+    values_by_rank: dict[int, float],
+    *,
+    current_volume: float | None,
+) -> list[dict[str, Any]]:
+    current_value = _safe_float(current_volume)
+    if current_value is None or current_value <= 0 or not values_by_rank:
+        return []
+    current_rank = _rank_after_volume(values_by_rank, current_value)
+    if current_rank is None:
+        return []
+
+    valid_segments: list[dict[str, int]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        start_rank = _safe_int(segment.get("start_rank"))
+        end_rank = _safe_int(segment.get("end_rank"))
+        if start_rank is None or end_rank is None:
+            continue
+        valid_segments.append({"start_rank": int(start_rank), "end_rank": int(end_rank)})
+    valid_segments.sort(key=lambda item: (item["start_rank"], item["end_rank"]))
+    if not valid_segments:
+        return []
+
+    moves: list[dict[str, Any]] = []
+    current_segment = next(
+        (
+            segment
+            for segment in valid_segments
+            if int(segment["start_rank"]) <= int(current_rank) <= int(segment["end_rank"])
+        ),
+        None,
+    )
+    if current_segment is not None:
+        target_rank = int(current_segment["end_rank"]) + 1
+        target_value = _safe_float(values_by_rank.get(target_rank))
+        if target_value is not None:
+            moves.append(
+                {
+                    "move_type": "current_segment_boundary",
+                    "from_rank": int(current_rank),
+                    "to_rank": target_rank,
+                    "target_rank": target_rank,
+                    "target_value": float(target_value),
+                    "volume_needed": max(0.0, float(target_value) - float(current_value)),
+                    "covered_users": max(0, target_rank - int(current_rank)),
+                }
+            )
+
+    max_reward_rank = max(int(segment["end_rank"]) for segment in valid_segments)
+    reward_exit_rank = max_reward_rank + 1
+    target_value = _safe_float(values_by_rank.get(reward_exit_rank))
+    if target_value is not None and not any(int(item.get("target_rank", 0)) == reward_exit_rank for item in moves):
+        moves.append(
+            {
+                "move_type": "reward_zone_boundary",
+                "from_rank": int(current_rank),
+                "to_rank": reward_exit_rank,
+                "target_rank": reward_exit_rank,
+                "target_value": float(target_value),
+                "volume_needed": max(0.0, float(target_value) - float(current_value)),
+                "covered_users": max(0, reward_exit_rank - int(current_rank)),
+            }
+        )
+    return moves
 
 
 def _build_ended_boards_analytics(boards: list[dict[str, Any]]) -> dict[str, Any]:
@@ -3534,6 +3714,7 @@ def resolve_active_competition_board(
     if not isinstance(boards, list):
         boards = build_competition_board_snapshot(refresh=False).get("boards", [])
     candidates: list[dict[str, Any]] = []
+    hinted_fallbacks: list[dict[str, Any]] = []
     for board in boards:
         if not isinstance(board, dict):
             continue
@@ -3574,21 +3755,7 @@ def resolve_active_competition_board(
             for board_meta in board_metas:
                 if not isinstance(board_meta, dict):
                     continue
-                start_raw = str(board_meta.get("activityStartAt", "")).strip()
-                end_raw = str(board_meta.get("activityEndAt", "")).strip()
-                if not start_raw or not end_raw:
-                    parsed_start, parsed_end = _parse_activity_period_bounds(str(board_meta.get("activityPeriodText", "")).strip())
-                    start_raw = start_raw or str(parsed_start or "")
-                    end_raw = end_raw or str(parsed_end or "")
-                start_at = _parse_iso_datetime(start_raw)
-                end_at = _parse_iso_datetime(end_raw)
-                if start_at is None or end_at is None:
-                    continue
-                start_utc = start_at.astimezone(timezone.utc)
-                end_utc = end_at.astimezone(timezone.utc)
-                if not (start_utc <= current <= end_utc):
-                    continue
-                board = _compose_board(
+                fallback_board = _compose_board(
                     source,
                     board_meta,
                     {
@@ -3602,9 +3769,27 @@ def resolve_active_competition_board(
                     },
                     meta if isinstance(meta, dict) else {},
                 )
+                start_raw = str(board_meta.get("activityStartAt", "")).strip()
+                end_raw = str(board_meta.get("activityEndAt", "")).strip()
+                if not start_raw or not end_raw:
+                    parsed_start, parsed_end = _parse_activity_period_bounds(str(board_meta.get("activityPeriodText", "")).strip())
+                    start_raw = start_raw or str(parsed_start or "")
+                    end_raw = end_raw or str(parsed_end or "")
+                start_at = _parse_iso_datetime(start_raw)
+                end_at = _parse_iso_datetime(end_raw)
+                if start_at is None or end_at is None:
+                    hinted_fallbacks.append(fallback_board)
+                    continue
+                start_utc = start_at.astimezone(timezone.utc)
+                end_utc = end_at.astimezone(timezone.utc)
+                if not (start_utc <= current <= end_utc):
+                    continue
+                board = fallback_board
                 board["activity_start_at"] = start_at.isoformat()
                 board["activity_end_at"] = end_at.isoformat()
                 return board
+        if hinted_fallbacks:
+            return hinted_fallbacks[0]
         return None
     candidates.sort(
         key=lambda item: _parse_iso_datetime(item.get("activity_start_at")) or datetime.min.replace(tzinfo=timezone.utc),

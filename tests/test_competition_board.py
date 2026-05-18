@@ -49,6 +49,44 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["4"], 120000.0, places=8)
         self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["5"], 96000.0, places=8)
 
+    def test_build_reward_volume_targets_includes_next_drop_boundary_for_current_rank(self) -> None:
+        board = {
+            "label": "BILL 合约交易挑战赛",
+            "symbol": "BILL",
+            "reward_unit": "BILL",
+            "rows": [
+                {"rank": 39, "value": 3_800_000.0},
+                {"rank": 40, "value": 3_746_887.917},
+                {"rank": 50, "value": 3_349_056.0},
+                {"rank": 51, "value": 3_323_060.97},
+                {"rank": 200, "value": 379_833.5},
+                {"rank": 201, "value": 375_981.75},
+            ],
+            "segments": [
+                {"start_rank": 1, "end_rank": 5, "rank_label": "第 1 - 5 名", "per_user_reward": 100000.0, "cutoff_value": 4_000_000.0},
+                {"start_rank": 6, "end_rank": 20, "rank_label": "第 6 - 20 名", "per_user_reward": 40000.0, "cutoff_value": 3_900_000.0},
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名", "per_user_reward": 20000.0, "cutoff_value": 3_349_056.0},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名", "per_user_reward": 8000.0, "cutoff_value": 379_833.5},
+            ],
+        }
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.1):
+            targets = build_reward_volume_targets(
+                board,
+                current_volume=3_746_887.917,
+                now=datetime(2026, 5, 18, tzinfo=timezone.utc),
+            )
+        self.assertIsNotNone(targets)
+        zone_moves = targets["zone_moves"]
+        self.assertEqual(zone_moves[0]["move_type"], "current_segment_boundary")
+        self.assertEqual(zone_moves[0]["from_rank"], 40)
+        self.assertEqual(zone_moves[0]["to_rank"], 51)
+        self.assertEqual(zone_moves[0]["target_rank"], 51)
+        self.assertAlmostEqual(zone_moves[0]["target_value"], 3_323_060.97, places=8)
+        self.assertAlmostEqual(zone_moves[0]["volume_needed"], 0.0, places=8)
+        self.assertEqual(zone_moves[1]["move_type"], "reward_zone_boundary")
+        self.assertEqual(zone_moves[1]["from_rank"], 40)
+        self.assertEqual(zone_moves[1]["to_rank"], 201)
+
     def test_parse_segments_extracts_fixed_reward_brackets(self) -> None:
         text = """
         奖池结构
@@ -202,6 +240,7 @@ class CompetitionBoardTests(unittest.TestCase):
                 "spot_vana",
                 "futures_soon",
                 "futures_chip",
+                "futures_aigensyn",
                 "futures_tradfi_week1",
                 "futures_altcoins_week1",
                 "futures_um_week1",
@@ -353,6 +392,52 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(board["market"], "futures")
         self.assertIn("第一阶段", board["label"])
         self.assertEqual(board["resource_id"], 50568)
+
+    def test_resolve_active_competition_board_falls_back_to_hinted_aigensyn_board(self) -> None:
+        board = resolve_active_competition_board(
+            "AIGENSYNUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 15, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "AIGENSYN")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["resource_id"], 54596)
+        self.assertEqual(board["activity_start_at"], "2026-05-12T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(len(board.get("segments", [])), 8)
+
+    def test_resolve_active_competition_board_falls_back_to_hinted_bill_board(self) -> None:
+        board = resolve_active_competition_board(
+            "BILLUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 15, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "BILL")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["resource_id"], 54211)
+        self.assertEqual(board["activity_start_at"], "2026-05-08T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(len(board.get("segments", [])), 8)
+
+    def test_build_reward_volume_targets_works_for_hinted_aigensyn_board(self) -> None:
+        board = resolve_active_competition_board(
+            "AIGENSYNUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 15, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.04):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 5, 15, 0, 0, tzinfo=timezone.utc))
+        self.assertIsNotNone(targets)
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        rank_200 = targets["tiers"][0]
+        self.assertAlmostEqual(rank_200["reward_value_usdt"], 256.0, places=8)
+        self.assertIsNone(rank_200["cutoff_value"])
 
     def test_load_history_index_merges_disk_files_with_stale_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

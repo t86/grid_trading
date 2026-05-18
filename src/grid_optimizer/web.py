@@ -18170,7 +18170,7 @@ MONITOR_PAGE = """<!doctype html>
     const customGridStatusEl = document.getElementById("custom_grid_status");
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
-    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
+    const DEFAULT_MONITOR_SYMBOLS = ["BILLUSDT", "AIGENSYNUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const VISIBLE_STRATEGY_PRESET_KEYS = new Set([
       "volume_long_v4",
       "based_volume_push_bard_v1",
@@ -22508,10 +22508,26 @@ MONITOR_PAGE = """<!doctype html>
     function buildCompetitionRewardTargetCard(targets) {
       const payload = (targets && typeof targets === "object") ? targets : {};
       const tiers = Array.isArray(payload.tiers) ? payload.tiers : [];
+      const zoneMoves = Array.isArray(payload.zone_moves) ? payload.zone_moves : [];
       const message = String(payload.message || "").trim();
-      if (!tiers.length && !message) {
+      if (!tiers.length && !zoneMoves.length && !message) {
         return null;
       }
+      const zoneRows = zoneMoves.map((item) => {
+        const badge = item.move_type === "current_segment_boundary" ? "当前档" : "奖励区";
+        const targetValueText = item.target_value === null || item.target_value === undefined
+          ? "--"
+          : fmtWanVolume(item.target_value);
+        const needText = item.volume_needed === null || item.volume_needed === undefined
+          ? "--"
+          : fmtWanVolume(item.volume_needed);
+        return `
+          <div class="metric-line">
+            <strong><span class="inline-badge">${escapeHtml(badge)}</span>第 ${escapeHtml(item.from_rank || "--")} 名 -> 第 ${escapeHtml(item.to_rank || "--")} 名</strong><br />
+            边界 ${targetValueText} USDT · 还需 ${needText} USDT · 覆盖 ${escapeHtml(item.covered_users || 0)} 人
+          </div>
+        `;
+      }).join("");
       const rows = tiers.map((item) => {
         const volumes = (item && item.volumes_by_loss_rate) || {};
         const rewardText = item.reward_value_usdt === null || item.reward_value_usdt === undefined
@@ -22532,7 +22548,7 @@ MONITOR_PAGE = """<!doctype html>
         value: "200 / 50 / 20",
         cls: "",
         sub: `按当前奖励折 USDT 估算 · 奖励币种 ${String(payload.reward_unit || "--").toUpperCase()} · 现价 ${rewardPriceText}`,
-        bodyHtml: `<div class="metric-lines">${rows || `<div class="metric-line">${escapeHtml(message || "当前没有可用的奖励换手量目标。")}</div>`}</div>`,
+        bodyHtml: `<div class="metric-lines">${zoneRows}${rows || `<div class="metric-line">${escapeHtml(message || "当前没有可用的奖励换手量目标。")}</div>`}</div>`,
       };
     }
 
@@ -25419,8 +25435,8 @@ STRATEGIES_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
-    const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
+    const DEFAULT_MONITOR_SYMBOLS = ["BILLUSDT", "AIGENSYNUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
+    const DEFAULT_COMPETITION_SYMBOLS = ["BILLUSDT", "AIGENSYNUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"];
     const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"];
     const cardsEl = document.getElementById("cards");
     const spotCardsEl = document.getElementById("spot_cards");
