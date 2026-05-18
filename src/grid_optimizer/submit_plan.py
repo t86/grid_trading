@@ -704,16 +704,14 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
             elif losing_long and side == "SELL" and net_qty > 1e-12:
                 implicit_loss_reduce_side = "SELL"
         ordinary_entry = entry_side in {"long", "short"} and reduce_side is None
-        small_cross_entry_allowed = (
-            ordinary_entry and small_entry_notional > 0 and order_notional <= small_entry_notional + 1e-9
-        )
+        explicit_loss_reduce = reduce_side is not None
         small_loss_reduce_allowed = (
-            (reduce_side is not None or implicit_loss_reduce_side is not None)
+            explicit_loss_reduce
             and small_entry_notional > 0
             and order_notional <= small_entry_notional + 1e-9
         )
         small_loss_reduce_resize_allowed = (
-            (reduce_side is not None or implicit_loss_reduce_side is not None)
+            explicit_loss_reduce
             and small_entry_notional > 0
             and order_notional > small_entry_notional + 1e-9
         )
@@ -731,15 +729,9 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
-                if small_cross_entry_allowed or small_loss_reduce_allowed:
-                    order["loss_inventory_no_cross_guard"] = (
-                        "short_small_loss_reduce_allowed"
-                        if small_loss_reduce_allowed
-                        else "short_small_entry_cross_allowed"
-                    )
+                if small_loss_reduce_allowed:
+                    order["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_allowed"
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
-                    if implicit_loss_reduce_side is not None:
-                        order["force_reduce_only"] = True
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
@@ -749,8 +741,6 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                         resized["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_resized"
                         resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                         resized["loss_inventory_original_notional"] = order_notional
-                        if implicit_loss_reduce_side is not None:
-                            resized["force_reduce_only"] = True
                         allowed_small_entry_orders.append(dict(resized))
                         resized_small_loss_reduce_orders.append(dict(resized))
                         kept_place_orders.append(resized)
@@ -768,15 +758,9 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
-                if small_cross_entry_allowed or small_loss_reduce_allowed:
-                    order["loss_inventory_no_cross_guard"] = (
-                        "long_small_loss_reduce_allowed"
-                        if small_loss_reduce_allowed
-                        else "long_small_entry_cross_allowed"
-                    )
+                if small_loss_reduce_allowed:
+                    order["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_allowed"
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
-                    if implicit_loss_reduce_side is not None:
-                        order["force_reduce_only"] = True
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
@@ -786,8 +770,6 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                         resized["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_resized"
                         resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                         resized["loss_inventory_original_notional"] = order_notional
-                        if implicit_loss_reduce_side is not None:
-                            resized["force_reduce_only"] = True
                         allowed_small_entry_orders.append(dict(resized))
                         resized_small_loss_reduce_orders.append(dict(resized))
                         kept_place_orders.append(resized)
