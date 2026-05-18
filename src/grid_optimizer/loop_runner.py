@@ -13885,7 +13885,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         args=effective_args,
         fallback_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
     )
-    if strategy_mode == "one_way_long":
+    unlock_long_side = strategy_mode == "one_way_long" or (
+        strategy_mode == "best_quote_maker_volume_v1" and current_long_qty > 1e-12
+    )
+    unlock_short_side = strategy_mode == "one_way_short" or (
+        strategy_mode == "best_quote_maker_volume_v1" and current_short_qty > 1e-12
+    )
+    if unlock_long_side:
         inventory_unlock_release = apply_inventory_unlock_release(
             plan=plan,
             state=state,
@@ -13905,7 +13911,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             bid_price=bid_price,
             ask_price=ask_price,
         )
-    elif strategy_mode == "one_way_short":
+    elif unlock_short_side:
         inventory_unlock_release = apply_inventory_unlock_release(
             plan=plan,
             state=state,
