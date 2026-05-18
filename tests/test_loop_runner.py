@@ -46,6 +46,7 @@ from grid_optimizer.loop_runner import (
     _shift_custom_grid_bounds,
     _run_periodic_reconcile,
     _cap_best_quote_profitable_inventory_exit_offset,
+    prioritize_inventory_reducing_place_orders,
     apply_execution_request_budget_to_actions,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
@@ -1354,6 +1355,35 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(actions["place_notional"], 260.0, places=8)
         self.assertEqual(report["execution_request_budget"]["deferred_cancel_count"], 0)
         self.assertEqual(report["execution_request_budget"]["deferred_place_count"], 2)
+
+    def test_inventory_reducing_place_priority_keeps_long_exits_before_new_buys(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_entry_long", "side": "BUY", "notional": 230.0},
+                {"role": "adverse_reduce_long", "side": "SELL", "notional": 230.0, "force_reduce_only": True},
+                {"role": "best_quote_entry_short", "side": "SELL", "notional": 230.0},
+            ],
+            "cancel_orders": [],
+            "place_count": 3,
+            "cancel_count": 0,
+        }
+
+        prioritized = prioritize_inventory_reducing_place_orders(
+            actions=actions,
+            current_actual_net_qty=20_000.0,
+        )
+        report: dict[str, object] = {}
+        capped = apply_execution_request_budget_to_actions(
+            validation={"ok": True, "errors": [], "actions": prioritized},
+            report=report,
+            max_places_per_cycle=2,
+        )
+
+        self.assertEqual(
+            [item["role"] for item in capped["actions"]["place_orders"]],
+            ["adverse_reduce_long", "best_quote_entry_short"],
+        )
+        self.assertEqual(report["execution_request_budget"]["deferred_place_orders"][0]["role"], "best_quote_entry_long")
 
     def test_soonusdt_volume_profiles_use_entry_price_cost_basis(self) -> None:
         self.assertTrue(_uses_entry_price_cost_basis("chip_low_wear_guarded_v1"))

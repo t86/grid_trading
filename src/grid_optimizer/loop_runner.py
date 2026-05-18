@@ -5354,6 +5354,45 @@ def apply_execution_request_budget_to_actions(
     return updated
 
 
+def prioritize_inventory_reducing_place_orders(
+    *,
+    actions: dict[str, Any],
+    current_actual_net_qty: float,
+) -> dict[str, Any]:
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders or abs(_safe_float(current_actual_net_qty)) <= 1e-12:
+        return actions
+
+    reducing_side = "SELL" if _safe_float(current_actual_net_qty) > 0 else "BUY"
+
+    def priority(order: dict[str, Any]) -> tuple[int, int]:
+        side = str(order.get("side", "")).upper().strip()
+        role = str(order.get("role", "") or "").strip().lower()
+        reduce_like = (
+            bool(order.get("force_reduce_only"))
+            or "reduce" in role
+            or role.startswith("take_profit")
+            or role in {"best_quote_entry_short", "best_quote_entry_long"}
+        )
+        if side == reducing_side and reduce_like:
+            return (0, 0)
+        if side == reducing_side:
+            return (1, 0)
+        return (2, 0)
+
+    prioritized = sorted(enumerate(place_orders), key=lambda item: (*priority(item[1]), item[0]))
+    result = dict(actions)
+    result["place_orders"] = [item for _, item in prioritized]
+    result["place_count"] = len(result["place_orders"])
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in result["place_orders"])
+    result["inventory_reducing_place_priority"] = {
+        "enabled": True,
+        "current_actual_net_qty": _safe_float(current_actual_net_qty),
+        "reducing_side": reducing_side,
+    }
+    return result
+
+
 def _maybe_sleep_between_execution_requests(args: argparse.Namespace) -> None:
     interval = _safe_float(getattr(args, "execution_request_min_interval_seconds", 0.0))
     if interval > 0:
@@ -14964,6 +15003,10 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+    )
+    validation["actions"] = prioritize_inventory_reducing_place_orders(
+        actions=validation["actions"],
+        current_actual_net_qty=current_actual_net_qty,
     )
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
