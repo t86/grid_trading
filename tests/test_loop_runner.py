@@ -56,6 +56,7 @@ from grid_optimizer.loop_runner import (
     apply_hard_loss_forced_reduce,
     apply_inventory_unlock_release,
     _resolve_inventory_unlock_pause_notional,
+    _is_best_quote_maker_volume_mode,
     resolve_loss_recovery_brush,
     resolve_hard_loss_forced_reduce_episode,
     prime_exposure_escalation_on_market_guard,
@@ -678,6 +679,131 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["take_profit_guard"]["adjusted_sell_orders"], 1)
         self.assertEqual(report["sell_orders"][0]["role"], "best_quote_entry_short")
         self.assertEqual(report["sell_orders"][0]["price"], report["take_profit_guard"]["long_floor_price"])
+        self.assertEqual(report["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertLessEqual(report["buy_orders"][0]["price"], 80410.0)
+        self.assertEqual(report["best_quote_maker_volume"]["inventory_cost_gate"]["blocked_buy_orders"], 0)
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_maker_volume_blocks_long_entry_above_existing_cost(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "80400.0", "ask_price": "80400.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BTCUSDC", "positionAmt": "0.01", "entryPrice": "80390"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BTCUSDC",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="btcusdc_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=400.0,
+                best_quote_maker_volume_max_long_notional=2_500.0,
+                best_quote_maker_volume_max_short_notional=2_500.0,
+                take_profit_min_profit_ratio=0.00025,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["buy_orders"], [])
+        self.assertEqual(report["best_quote_maker_volume"]["inventory_cost_gate"]["blocked_buy_orders"], 1)
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_maker_volume_blocks_short_entry_below_existing_cost(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "80400.0", "ask_price": "80400.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "BTCUSDC", "positionAmt": "-0.01", "entryPrice": "80410"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BTCUSDC",
+                strategy_mode="best_quote_maker_volume_v1",
+                strategy_profile="btcusdc_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=400.0,
+                best_quote_maker_volume_max_long_notional=2_500.0,
+                best_quote_maker_volume_max_short_notional=2_500.0,
+                take_profit_min_profit_ratio=0.00025,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["sell_orders"], [])
+        self.assertEqual(report["best_quote_maker_volume"]["inventory_cost_gate"]["blocked_sell_orders"], 1)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
@@ -1744,6 +1870,42 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["active"])
         self.assertFalse(report["long_active"])
         self.assertIsNone(report["long_activation_mode"])
+
+    def test_best_quote_adverse_reduce_can_use_soft_pause_threshold(self) -> None:
+        args = SimpleNamespace(
+            best_quote_maker_volume_inventory_soft_ratio=0.55,
+            best_quote_maker_volume_max_long_notional=5500.0,
+            best_quote_maker_volume_max_short_notional=5500.0,
+        )
+        pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=args,
+            strategy_mode="best_quote_maker_volume_v1",
+            side="long",
+            fallback_pause_notional=4015.0,
+            pending_entry_buffer_notional=300.0,
+        )
+
+        report = assess_adverse_inventory_reduce(
+            enabled=_is_best_quote_maker_volume_mode("best_quote_maker_volume_v1"),
+            mid_price=0.994,
+            current_long_qty=2850.0,
+            current_long_notional=2832.9,
+            current_short_qty=0.0,
+            current_short_notional=0.0,
+            current_long_cost_price=1.0,
+            current_short_cost_price=0.0,
+            current_long_cost_basis_source="current_avg_price",
+            current_short_cost_basis_source=None,
+            pause_long_position_notional=pause_notional,
+            pause_short_position_notional=4015.0,
+            long_trigger_ratio=0.004,
+            short_trigger_ratio=0.004,
+            target_ratio=0.45,
+        )
+
+        self.assertAlmostEqual(pause_notional or 0.0, 2725.0)
+        self.assertTrue(report["long_active"])
+        self.assertEqual(report["long_activation_mode"], "pause")
 
     def test_take_profit_guard_defaults_to_break_even_when_ratio_is_unset(self) -> None:
         plan = {

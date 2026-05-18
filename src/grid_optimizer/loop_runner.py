@@ -13263,12 +13263,37 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             extra_long_guard_roles={"best_quote_entry_short", "best_quote_reduce_long"},
             extra_short_guard_roles={"best_quote_entry_long", "best_quote_reduce_short"},
         )
+        best_quote_inventory_cost_gate = {
+            "blocked_buy_orders": 0,
+            "blocked_sell_orders": 0,
+            "long_cost_price": current_long_avg_price if current_long_qty > 1e-12 else None,
+            "short_cost_price": current_short_avg_price if current_short_qty > 1e-12 else None,
+        }
+        if current_long_qty > 1e-12 and current_long_avg_price > 0:
+            before = len(plan.get("buy_orders", []) or [])
+            plan["buy_orders"] = [
+                dict(item)
+                for item in plan.get("buy_orders", [])
+                if isinstance(item, dict)
+                and (_order_role(item) != "best_quote_entry_long" or _safe_float(item.get("price")) <= current_long_avg_price)
+            ]
+            best_quote_inventory_cost_gate["blocked_buy_orders"] = before - len(plan["buy_orders"])
+        if current_short_qty > 1e-12 and current_short_avg_price > 0:
+            before = len(plan.get("sell_orders", []) or [])
+            plan["sell_orders"] = [
+                dict(item)
+                for item in plan.get("sell_orders", [])
+                if isinstance(item, dict)
+                and (_order_role(item) != "best_quote_entry_short" or _safe_float(item.get("price")) >= current_short_avg_price)
+            ]
+            best_quote_inventory_cost_gate["blocked_sell_orders"] = before - len(plan["sell_orders"])
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),
             "reasons": list(plan.get("reasons") or []),
             "metrics": dict(plan.get("metrics") or {}),
             "dynamic_offsets": dict(best_quote_dynamic_offsets),
+            "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
         }
         inventory_tier = {
             "enabled": False,
@@ -13812,6 +13837,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     adverse_reduce_enabled = bool(getattr(effective_args, "adverse_reduce_enabled", False)) and not bool(
         (exposure_escalation or {}).get("active")
     )
+    adverse_long_pause_notional = effective_args.pause_buy_position_notional
+    adverse_short_pause_notional = effective_args.pause_short_position_notional
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        adverse_long_pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=effective_args,
+            strategy_mode=strategy_mode,
+            side="long",
+            fallback_pause_notional=effective_args.pause_buy_position_notional,
+        )
+        adverse_short_pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=effective_args,
+            strategy_mode=strategy_mode,
+            side="short",
+            fallback_pause_notional=effective_args.pause_short_position_notional,
+        )
     adverse_inventory_reduce = assess_adverse_inventory_reduce(
         enabled=adverse_reduce_enabled,
         mid_price=mid_price,
@@ -13823,8 +13863,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_cost_price=adverse_short_cost_price,
         current_long_cost_basis_source=adverse_long_cost_basis_source,
         current_short_cost_basis_source=adverse_short_cost_basis_source,
-        pause_long_position_notional=effective_args.pause_buy_position_notional,
-        pause_short_position_notional=effective_args.pause_short_position_notional,
+        pause_long_position_notional=adverse_long_pause_notional,
+        pause_short_position_notional=adverse_short_pause_notional,
         long_trigger_ratio=getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
         short_trigger_ratio=getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
         target_ratio=getattr(effective_args, "adverse_reduce_target_ratio", 0.75),
@@ -13838,8 +13878,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_long_notional=controls.get("current_long_notional", current_long_notional),
         current_short_qty=current_short_qty,
         current_short_notional=controls.get("current_short_notional", current_short_notional),
-        pause_long_position_notional=effective_args.pause_buy_position_notional,
-        pause_short_position_notional=effective_args.pause_short_position_notional,
+        pause_long_position_notional=adverse_long_pause_notional,
+        pause_short_position_notional=adverse_short_pause_notional,
         target_ratio=getattr(effective_args, "adverse_reduce_target_ratio", 0.75),
         max_order_notional=getattr(effective_args, "adverse_reduce_max_order_notional", 0.0),
         bid_price=bid_price,
