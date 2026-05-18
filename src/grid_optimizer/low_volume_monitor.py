@@ -134,6 +134,13 @@ def check_symbol(
     )
     gross = float(volume_summary["gross_notional"])
     item = dict(state.get(normalized_symbol) or {})
+    previous_summary = item.get("last_summary") if isinstance(item.get("last_summary"), dict) else {}
+    config_changed = (
+        _safe_float(previous_summary.get("window_seconds")) != float(volume_summary["window_seconds"])
+        or _safe_float(item.get("min_volume_notional")) != float(min_volume_notional)
+    )
+    if config_changed:
+        item["alert_sent"] = False
     should_alert = False
     alert_result = None
 
