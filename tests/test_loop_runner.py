@@ -54,6 +54,7 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
     apply_hard_loss_forced_reduce,
+    apply_inventory_unlock_release,
     resolve_loss_recovery_brush,
     resolve_hard_loss_forced_reduce_episode,
     prime_exposure_escalation_on_market_guard,
@@ -1707,6 +1708,69 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["long_active"])
         self.assertEqual(report["adjusted_sell_orders"], 1)
         self.assertAlmostEqual(plan["sell_orders"][0]["price"], 1.05)
+
+    def test_inventory_unlock_release_waits_for_stalled_cycles_then_adds_reduce_only_sell(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state = {"inventory_unlock_release": {"side": "long", "stall_count": 2}}
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="long",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "long_active": True, "long_floor_price": 1.05},
+            current_qty=2500.0,
+            current_notional=2500.0,
+            pause_notional=2000.0,
+            release_cap_notional=300.0,
+            per_order_notional=120.0,
+            step_price=0.001,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            bid_price=0.998,
+            ask_price=1.0,
+        )
+
+        release_orders = [order for order in plan["sell_orders"] if order["role"] == "inventory_unlock_reduce_long"]
+        self.assertTrue(report["active"])
+        self.assertEqual(report["side"], "long")
+        self.assertEqual(report["stall_count"], 3)
+        self.assertEqual(len(release_orders), 1)
+        self.assertEqual(release_orders[0]["side"], "SELL")
+        self.assertTrue(release_orders[0]["force_reduce_only"])
+        self.assertEqual(release_orders[0]["time_in_force"], "GTX")
+        self.assertLessEqual(release_orders[0]["notional"], 300.0)
+        self.assertLess(release_orders[0]["price"], 1.05)
+
+    def test_inventory_unlock_release_does_not_fire_before_stall_confirmation(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": []}
+        state: dict[str, object] = {}
+
+        report = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="long",
+            entry_paused=True,
+            take_profit_guard={"enabled": True, "long_active": True, "long_floor_price": 1.05},
+            current_qty=2500.0,
+            current_notional=2500.0,
+            pause_notional=2000.0,
+            release_cap_notional=300.0,
+            per_order_notional=120.0,
+            step_price=0.001,
+            tick_size=0.0001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            bid_price=0.998,
+            ask_price=1.0,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertEqual(report["stall_count"], 1)
+        self.assertEqual(plan["sell_orders"], [])
 
     def test_synthetic_resync_does_not_use_mid_price_as_nonzero_cost_basis(self) -> None:
         resolved = _resolve_synthetic_resync_price(

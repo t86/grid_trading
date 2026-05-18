@@ -2631,11 +2631,12 @@ def _is_long_exit_order(order: dict[str, Any]) -> bool:
         "soft_delever_long",
         "hard_delever_long",
         "flow_sleeve_long",
+        "inventory_unlock_reduce_long",
     }
 
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
-    return _order_role(order) in {"take_profit_short", "active_delever_short", "flow_sleeve_short"}
+    return _order_role(order) in {"take_profit_short", "active_delever_short", "flow_sleeve_short", "inventory_unlock_reduce_short"}
 
 
 def apply_entry_permission_gate(
@@ -2802,6 +2803,7 @@ def _resolve_reduce_only_flag(
         "soft_delever_long",
         "hard_delever_long",
         "flow_sleeve_long",
+        "inventory_unlock_reduce_long",
         "hard_loss_forced_reduce_long",
     }:
         return True
@@ -2809,6 +2811,7 @@ def _resolve_reduce_only_flag(
         "take_profit_short",
         "active_delever_short",
         "flow_sleeve_short",
+        "inventory_unlock_reduce_short",
         "hard_loss_forced_reduce_short",
     }:
         return True
@@ -7340,6 +7343,190 @@ def _build_near_market_release_seed_orders(
     return orders
 
 
+def _inventory_unlock_default_report() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "active": False,
+        "candidate": False,
+        "side": None,
+        "stall_count": 0,
+        "confirm_cycles": 3,
+        "reason": None,
+        "current_notional": 0.0,
+        "pause_notional": None,
+        "target_notional": None,
+        "release_cap_notional": 0.0,
+        "release_order_notional": 0.0,
+        "release_price": None,
+        "release_qty": 0.0,
+        "release_order_count": 0,
+    }
+
+
+def _resolve_inventory_unlock_release_cap(*, args: Any, fallback_notional: float) -> float:
+    for attr in (
+        "loss_inventory_no_cross_small_entry_notional",
+        "loss_recovery_brush_entry_notional",
+        "adverse_reduce_max_order_notional",
+    ):
+        value = max(_safe_float(getattr(args, attr, None)), 0.0)
+        if value > 0:
+            return value
+    return max(_safe_float(fallback_notional), 0.0)
+
+
+def apply_inventory_unlock_release(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    side: str,
+    entry_paused: bool,
+    take_profit_guard: dict[str, Any],
+    current_qty: float,
+    current_notional: float,
+    pause_notional: float | None,
+    release_cap_notional: float,
+    per_order_notional: float,
+    step_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+    confirm_cycles: int = 3,
+) -> dict[str, Any]:
+    report = _inventory_unlock_default_report()
+    normalized_side = str(side or "").strip().lower()
+    safe_confirm_cycles = max(int(confirm_cycles or 3), 1)
+    safe_qty = max(_safe_float(current_qty), 0.0)
+    safe_current_notional = max(_safe_float(current_notional), 0.0)
+    safe_pause_notional = max(_safe_float(pause_notional), 0.0)
+    safe_cap_notional = max(_safe_float(release_cap_notional), 0.0)
+    safe_per_order_notional = max(_safe_float(per_order_notional), 0.0)
+    report.update(
+        {
+            "side": normalized_side if normalized_side in {"long", "short"} else None,
+            "confirm_cycles": safe_confirm_cycles,
+            "current_notional": safe_current_notional,
+            "pause_notional": safe_pause_notional if safe_pause_notional > 0 else pause_notional,
+            "release_cap_notional": safe_cap_notional,
+        }
+    )
+
+    existing_state = state.get("inventory_unlock_release")
+    runtime_state = dict(existing_state) if isinstance(existing_state, dict) else {}
+    guard = dict(take_profit_guard or {})
+    floor_price = max(_safe_float(guard.get("long_floor_price")), 0.0)
+    ceiling_price = max(_safe_float(guard.get("short_ceiling_price")), 0.0)
+    long_floor_blocks = normalized_side == "long" and bool(guard.get("long_active")) and floor_price > max(_safe_float(ask_price), 0.0)
+    short_ceiling_blocks = (
+        normalized_side == "short"
+        and bool(guard.get("short_active"))
+        and ceiling_price > 0
+        and ceiling_price < max(_safe_float(bid_price), 0.0)
+    )
+    candidate = (
+        normalized_side in {"long", "short"}
+        and bool(entry_paused)
+        and safe_qty > 1e-12
+        and safe_pause_notional > 0
+        and safe_current_notional > safe_pause_notional
+        and safe_cap_notional > 0
+        and (long_floor_blocks or short_ceiling_blocks)
+    )
+    if candidate:
+        previous_count = int(runtime_state.get("stall_count") or 0) if runtime_state.get("side") == normalized_side else 0
+        stall_count = previous_count + 1
+        runtime_state = {"side": normalized_side, "stall_count": stall_count}
+    else:
+        stall_count = 0
+        runtime_state = {}
+    report["candidate"] = bool(candidate)
+    report["stall_count"] = stall_count
+
+    if runtime_state:
+        state["inventory_unlock_release"] = runtime_state
+    else:
+        state.pop("inventory_unlock_release", None)
+
+    if not candidate:
+        report["reason"] = "not_stalled"
+        return report
+    if stall_count < safe_confirm_cycles:
+        report["reason"] = "waiting_for_stall_confirmation"
+        return report
+
+    price_side = "SELL" if normalized_side == "long" else "BUY"
+    order_key = "sell_orders" if normalized_side == "long" else "buy_orders"
+    role = "inventory_unlock_reduce_long" if normalized_side == "long" else "inventory_unlock_reduce_short"
+    price = _resolve_near_market_release_price(
+        side=price_side,
+        level_index=1,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        step_price=step_price,
+        tick_size=tick_size,
+    )
+    if price <= 0:
+        report["reason"] = "invalid_release_price"
+        return report
+
+    buffer_notional = min(safe_cap_notional, max(safe_per_order_notional * 0.5, safe_pause_notional * 0.02))
+    target_notional = max(safe_pause_notional - buffer_notional, 0.0)
+    release_budget = min(
+        safe_cap_notional,
+        safe_current_notional,
+        max(safe_current_notional - target_notional, min(safe_per_order_notional, safe_cap_notional)),
+    )
+    qty = _round_order_qty(min(safe_qty, release_budget / price), step_size)
+    notional = qty * price
+    report["target_notional"] = target_notional
+    if qty <= 0:
+        report["reason"] = "invalid_release_qty"
+        return report
+    if min_qty is not None and qty < min_qty:
+        report["reason"] = "below_min_qty"
+        return report
+    if min_notional is not None and notional < min_notional:
+        report["reason"] = "below_min_notional"
+        return report
+
+    plan[order_key] = [
+        dict(item)
+        for item in plan.get(order_key, [])
+        if isinstance(item, dict) and _order_role(item) != role
+    ]
+    order = {
+        "side": price_side,
+        "price": price,
+        "qty": qty,
+        "notional": notional,
+        "level": 1,
+        "role": role,
+        "position_side": "BOTH",
+        "force_reduce_only": True,
+        "time_in_force": "GTX",
+        "execution_type": "inventory_unlock_release",
+    }
+    if normalized_side == "long":
+        order["take_profit_guard_release_floor"] = price
+    else:
+        order["take_profit_guard_release_ceiling"] = price
+    plan[order_key].append(order)
+    report.update(
+        {
+            "active": True,
+            "reason": "stalled_inventory_pause",
+            "release_order_notional": notional,
+            "release_price": price,
+            "release_qty": qty,
+            "release_order_count": 1,
+        }
+    )
+    return report
+
+
 def apply_active_delever_long(
     *,
     plan: dict[str, Any],
@@ -11403,6 +11590,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "short_cover_paused": False,
         "short_cover_pause_reasons": [],
     }
+    inventory_tier = {
+        "enabled": False,
+        "active": False,
+        "ratio": 0.0,
+        "effective_buy_levels": int(getattr(effective_args, "buy_levels", 0) or 0),
+        "effective_sell_levels": int(getattr(effective_args, "sell_levels", 0) or 0),
+        "effective_per_order_notional": _safe_float(getattr(effective_args, "per_order_notional", 0.0)),
+        "effective_base_position_notional": _safe_float(getattr(effective_args, "base_position_notional", 0.0)),
+    }
     entry_permission_gate = {
         "enabled": False,
         "allow_entry_long": True,
@@ -11465,6 +11661,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "inventory_pause_timeout_target_notional": None,
         "inventory_pause_timeout_aggressive": False,
     }
+    inventory_unlock_release = _inventory_unlock_default_report()
     long_inventory_pause_timeout = {
         "enabled": False,
         "side": "long",
@@ -13684,6 +13881,53 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if isinstance(item, dict) and _is_long_exit_order(item)
         ]
 
+    unlock_release_cap = _resolve_inventory_unlock_release_cap(
+        args=effective_args,
+        fallback_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
+    )
+    if strategy_mode == "one_way_long":
+        inventory_unlock_release = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="long",
+            entry_paused=bool(controls.get("buy_paused")),
+            take_profit_guard=take_profit_guard,
+            current_qty=current_long_qty,
+            current_notional=controls.get("current_long_notional", current_long_notional),
+            pause_notional=effective_args.pause_buy_position_notional,
+            release_cap_notional=unlock_release_cap,
+            per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
+    elif strategy_mode == "one_way_short":
+        inventory_unlock_release = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=bool(controls.get("short_paused")),
+            take_profit_guard=take_profit_guard,
+            current_qty=current_short_qty,
+            current_notional=controls.get("current_short_notional", current_short_notional),
+            pause_notional=effective_args.pause_short_position_notional,
+            release_cap_notional=unlock_release_cap,
+            per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
+    else:
+        state.pop("inventory_unlock_release", None)
+
     volume_long_v4_open_orders = (
         _decorate_volume_long_v4_open_orders(open_orders)
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long"
@@ -13909,6 +14153,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "loss_recovery_brush": loss_recovery_brush,
         "loss_inventory_no_cross_small_entry_notional": effective_loss_inventory_no_cross_small_entry_notional,
         "active_delever": active_delever,
+        "inventory_unlock_release": inventory_unlock_release,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
         "short_threshold_timeout": short_threshold_timeout,
@@ -15251,6 +15496,20 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"{'long' if take_profit_guard.get('long_cost_basis_missing') else ''}"
             f"{'short' if take_profit_guard.get('short_cost_basis_missing') else ''}"
         )
+    inventory_unlock_release = (
+        summary.get("inventory_unlock_release") if isinstance(summary.get("inventory_unlock_release"), dict) else {}
+    )
+    if inventory_unlock_release.get("candidate") or inventory_unlock_release.get("active"):
+        print(
+            "  inventory_unlock: "
+            f"active={'yes' if inventory_unlock_release.get('active') else 'no'} "
+            f"side={inventory_unlock_release.get('side') or '-'} "
+            f"stall={int(inventory_unlock_release.get('stall_count', 0) or 0)}/"
+            f"{int(inventory_unlock_release.get('confirm_cycles', 0) or 0)} "
+            f"release={_float(inventory_unlock_release.get('release_order_notional', 0.0))} "
+            f"price={_price(_safe_float(inventory_unlock_release.get('release_price')))} "
+            f"reason={inventory_unlock_release.get('reason') or '-'}"
+        )
     volume_long_v4_delever = (
         summary.get("volume_long_v4_delever") if isinstance(summary.get("volume_long_v4_delever"), dict) else {}
     )
@@ -16364,6 +16623,17 @@ def main() -> None:
                     ),
                     "synthetic_tp_only_watchdog_reason": (plan_report.get("synthetic_tp_only_watchdog") or {}).get("reason"),
                     "take_profit_guard": dict(plan_report.get("take_profit_guard") or {}),
+                    "inventory_unlock_release": dict(plan_report.get("inventory_unlock_release") or {}),
+                    "inventory_unlock_active": bool((plan_report.get("inventory_unlock_release") or {}).get("active")),
+                    "inventory_unlock_side": str(
+                        ((plan_report.get("inventory_unlock_release") or {}).get("side", "") or "")
+                    ),
+                    "inventory_unlock_stall_count": int(
+                        ((plan_report.get("inventory_unlock_release") or {}).get("stall_count", 0) or 0)
+                    ),
+                    "inventory_unlock_release_notional": _safe_float(
+                        (plan_report.get("inventory_unlock_release") or {}).get("release_order_notional")
+                    ),
                     "volume_long_v4_delever": dict(plan_report.get("volume_long_v4_delever") or {}),
                     "volume_long_v4_flow_sleeve": dict(plan_report.get("volume_long_v4_flow_sleeve") or {}),
                     "exposure_escalation": dict(plan_report.get("exposure_escalation") or {}),
