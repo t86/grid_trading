@@ -2157,7 +2157,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
-    def test_best_quote_adverse_reduce_triggers_below_soft_after_one_filled_order(
+    def test_best_quote_adverse_reduce_waits_until_soft_inventory(
         self,
         mock_symbol_config,
         mock_book_tickers,
@@ -2219,11 +2219,9 @@ class LoopRunnerTests(unittest.TestCase):
 
         adverse = report["adverse_inventory_reduce"]
         self.assertTrue(adverse["enabled"])
-        self.assertTrue(adverse["long_active"])
-        self.assertEqual(adverse["long_activation_mode"], "pause")
-        self.assertEqual(adverse["placed_reduce_orders"], 1)
-        self.assertEqual(report["forced_reduce_orders"][0]["role"], "adverse_reduce_long")
-        self.assertLessEqual(report["forced_reduce_orders"][0]["notional"], 130.0)
+        self.assertFalse(adverse["long_active"])
+        self.assertEqual(adverse["placed_reduce_orders"], 0)
+        self.assertEqual(report["forced_reduce_orders"], [])
 
     def test_take_profit_guard_defaults_to_break_even_when_ratio_is_unset(self) -> None:
         plan = {
