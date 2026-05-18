@@ -15,6 +15,7 @@ from grid_optimizer.submit_plan import (
     filter_strategy_open_orders,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
+    sort_cancel_orders_farthest_from_market_first,
     suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
 )
@@ -131,7 +132,48 @@ class SubmitPlanTests(unittest.TestCase):
         actions = build_execution_actions(report)
 
         self.assertEqual(actions["cancel_orders"], [report["stale_orders"][0]])
-        self.assertEqual(actions["cancel_count"], 1)
+
+    def test_sort_cancel_orders_farthest_from_market_first_for_buy_and_sell(self) -> None:
+        actions = {
+            "place_orders": [],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.15390"},
+                {"orderId": 2, "side": "BUY", "price": "0.15370"},
+                {"orderId": 3, "side": "SELL", "price": "0.15420"},
+                {"orderId": 4, "side": "SELL", "price": "0.15440"},
+            ],
+            "place_count": 0,
+            "cancel_count": 4,
+        }
+
+        adjusted = sort_cancel_orders_farthest_from_market_first(
+            actions=actions,
+            live_bid_price=0.15400,
+            live_ask_price=0.15410,
+        )
+
+        self.assertEqual([item["orderId"] for item in adjusted["cancel_orders"]], [4, 2, 3, 1])
+
+    def test_sort_cancel_orders_keeps_urgent_cancel_reason_first(self) -> None:
+        actions = {
+            "place_orders": [],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.15370"},
+                {"orderId": 2, "side": "SELL", "price": "0.15420", "cancel_reason": "urgent_reduce_only_displaces_take_profit"},
+                {"orderId": 3, "side": "SELL", "price": "0.15440"},
+            ],
+            "place_count": 0,
+            "cancel_count": 3,
+        }
+
+        adjusted = sort_cancel_orders_farthest_from_market_first(
+            actions=actions,
+            live_bid_price=0.15400,
+            live_ask_price=0.15410,
+        )
+
+        self.assertEqual([item["orderId"] for item in adjusted["cancel_orders"]], [2, 3, 1])
+        self.assertEqual(adjusted["cancel_count"], 3)
 
     def test_reduce_only_cap_counts_orders_pending_cancel_until_exchange_releases_qty(self) -> None:
         actions = {

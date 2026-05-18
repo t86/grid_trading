@@ -903,6 +903,47 @@ def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def sort_cancel_orders_farthest_from_market_first(
+    *,
+    actions: dict[str, Any],
+    live_bid_price: float,
+    live_ask_price: float,
+) -> dict[str, Any]:
+    cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
+    if len(cancel_orders) <= 1:
+        return actions
+
+    safe_bid = _safe_float(live_bid_price)
+    safe_ask = _safe_float(live_ask_price)
+
+    def _distance_key(order: dict[str, Any]) -> tuple[int, float, int]:
+        side = str(order.get("side", "")).upper().strip()
+        price = _safe_float(order.get("price"))
+        cancel_reason = str(order.get("cancel_reason", "") or "").strip().lower()
+        urgent = 0 if cancel_reason else 1
+        if side == "BUY":
+            reference = safe_bid if safe_bid > 0 else safe_ask
+            distance = max(reference - price, 0.0) if reference > 0 and price > 0 else 0.0
+        elif side == "SELL":
+            reference = safe_ask if safe_ask > 0 else safe_bid
+            distance = max(price - reference, 0.0) if reference > 0 and price > 0 else 0.0
+        else:
+            distance = 0.0
+        return (urgent, -distance, 0)
+
+    sorted_cancel_orders = sorted(enumerate(cancel_orders), key=lambda item: (_distance_key(item[1]), item[0]))
+    result = dict(actions)
+    result["cancel_orders"] = [item for _, item in sorted_cancel_orders]
+    result["cancel_count"] = len(result["cancel_orders"])
+    result["cancel_order_priority"] = {
+        "enabled": True,
+        "mode": "farthest_from_market_first",
+        "live_bid_price": safe_bid,
+        "live_ask_price": safe_ask,
+    }
+    return result
+
+
 def preserve_queue_priority_in_execution_actions(
     *,
     actions: dict[str, Any],
