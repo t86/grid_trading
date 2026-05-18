@@ -94,3 +94,12 @@ def test_recovery_stall_monitor_installer_runs_every_minute() -> None:
     assert "--threshold-seconds ${THRESHOLD_SECONDS}" in script
     assert "ON_UNIT_ACTIVE_SEC=\"${ON_UNIT_ACTIVE_SEC:-1min}\"" in script
     assert "sudo systemctl restart \"${TIMER_UNIT_NAME}.timer\"" in script
+
+
+def test_low_volume_monitor_installer_runs_every_ten_minutes() -> None:
+    script = Path("deploy/oracle/install_low_volume_monitor.sh").read_text(encoding="utf-8")
+
+    assert "grid_optimizer.low_volume_monitor" in script
+    assert "--min-volume-notional ${MIN_VOLUME_NOTIONAL}" in script
+    assert "MIN_VOLUME_NOTIONAL=\"${MIN_VOLUME_NOTIONAL:-1000}\"" in script
+    assert "ON_UNIT_ACTIVE_SEC=\"${ON_UNIT_ACTIVE_SEC:-10min}\"" in script

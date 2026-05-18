@@ -30,6 +30,7 @@ grid-loop-runner = "grid_optimizer.loop_runner:main"
 grid-alpha-airdrop-monitor = "grid_optimizer.alpha_airdrop_monitor:main"
 grid-trade-db-backfill = "grid_optimizer.trade_database_backfill:main"
 grid-recovery-stall-monitor = "grid_optimizer.recovery_stall_monitor:main"
+grid-low-volume-monitor = "grid_optimizer.low_volume_monitor:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}
