@@ -147,7 +147,7 @@ def check_symbol(
     else:
         first_low = _parse_time(item.get("first_low_volume_at")) or now
         elapsed = (now - first_low).total_seconds()
-        should_alert = elapsed >= max(float(threshold_seconds), 1.0) and not bool(item.get("alert_sent"))
+        should_alert = elapsed >= max(float(threshold_seconds), 0.0) and not bool(item.get("alert_sent"))
         item.update(
             {
                 "status": "low_volume",
@@ -163,7 +163,10 @@ def check_symbol(
             item["last_alert_at"] = now.isoformat()
             if send_email:
                 alert_result = send_alert_email(
-                    subject=f"[grid][{alert_source_label()}] {normalized_symbol} 10m volume below {min_volume_notional:g}",
+                    subject=(
+                        f"[grid][{alert_source_label()}] {normalized_symbol} "
+                        f"{volume_summary['window_seconds'] / 60:g}m volume below {min_volume_notional:g}"
+                    ),
                     body=_format_alert_body(
                         symbol=normalized_symbol,
                         volume_summary=volume_summary,
@@ -191,9 +194,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--output-dir", default="output")
     parser.add_argument("--state-path", default="output/low_volume_monitor_state.json")
     parser.add_argument("--alert-config-path", default="output/low_volume_alert_config.json")
-    parser.add_argument("--window-seconds", type=float, default=600.0)
+    parser.add_argument("--window-seconds", type=float, default=3600.0)
     parser.add_argument("--min-volume-notional", type=float, default=1000.0)
-    parser.add_argument("--threshold-seconds", type=float, default=600.0)
+    parser.add_argument("--threshold-seconds", type=float, default=0.0)
     args = parser.parse_args(argv)
 
     now = datetime.now(timezone.utc)
