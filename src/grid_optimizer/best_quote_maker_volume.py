@@ -12,6 +12,7 @@ class BestQuoteMakerVolumeConfig:
     enabled: bool = False
     quote_offset_ticks: int = 0
     defensive_offset_ticks: int = 3
+    max_entry_orders_per_side: int = 1
     max_long_notional: float = 1_500.0
     max_short_notional: float = 1_500.0
     inventory_soft_ratio: float = 0.60
@@ -99,6 +100,38 @@ def _build_order(
 def _append_order(bucket: list[dict[str, Any]], order: dict[str, Any] | None) -> None:
     if order is not None:
         bucket.append(order)
+
+
+def _build_entry_ladder(
+    *,
+    side: str,
+    anchor_price: float,
+    base_gap: float,
+    total_notional: float,
+    slots: int,
+    role: str,
+    inputs: BestQuoteMakerVolumeInputs,
+) -> list[dict[str, Any]]:
+    safe_slots = max(int(slots), 0)
+    if safe_slots <= 0 or total_notional <= 0:
+        return []
+    per_order_notional = total_notional / float(safe_slots)
+    tick_gap = _tick_gap(inputs.tick_size, 1)
+    sign = -1 if str(side).upper() == "BUY" else 1
+    orders: list[dict[str, Any]] = []
+    for level in range(safe_slots):
+        gap = max(base_gap, 0.0) + (tick_gap * level)
+        _append_order(
+            orders,
+            _build_order(
+                side=side,
+                price=_price_with_gap(anchor_price, gap, sign),
+                notional=per_order_notional,
+                role=role,
+                inputs=inputs,
+            ),
+        )
+    return orders
 
 
 def build_best_quote_maker_volume_plan(
@@ -194,6 +227,8 @@ def build_best_quote_maker_volume_plan(
 
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
+    max_entry_orders_per_side = max(int(_safe_float(config.max_entry_orders_per_side)), 1)
+
     if allow_entry_long:
         long_entry_notional = per_side
         if long_limit > 0:
@@ -201,15 +236,16 @@ def build_best_quote_maker_volume_plan(
                 long_entry_notional,
                 max(long_limit - projected_long_entry_notional, 0.0),
             )
-        _append_order(
-            buy_orders,
-            _build_order(
+        buy_orders.extend(
+            _build_entry_ladder(
                 side="BUY",
-                price=_price_with_gap(bid, gap, -1),
-                notional=long_entry_notional,
+                anchor_price=bid,
+                base_gap=gap,
+                total_notional=long_entry_notional,
+                slots=max_entry_orders_per_side,
                 role="best_quote_entry_long",
                 inputs=inputs,
-            ),
+            )
         )
     elif net_qty < 0:
         _append_order(
@@ -242,15 +278,16 @@ def build_best_quote_maker_volume_plan(
                 short_entry_notional,
                 max(short_limit - projected_short_entry_notional, 0.0),
             )
-        _append_order(
-            sell_orders,
-            _build_order(
+        sell_orders.extend(
+            _build_entry_ladder(
                 side="SELL",
-                price=_price_with_gap(ask, gap, 1),
-                notional=short_entry_notional,
+                anchor_price=ask,
+                base_gap=gap,
+                total_notional=short_entry_notional,
+                slots=max_entry_orders_per_side,
                 role="best_quote_entry_short",
                 inputs=inputs,
-            ),
+            )
         )
     elif net_qty > 0:
         _append_order(
