@@ -668,6 +668,9 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         small_cross_entry_allowed = (
             ordinary_entry and small_entry_notional > 0 and order_notional <= small_entry_notional + 1e-9
         )
+        small_loss_reduce_allowed = (
+            reduce_side is not None and small_entry_notional > 0 and order_notional <= small_entry_notional + 1e-9
+        )
         short_recovery_order = entry_side == "long" or (
             reduce_side == "BUY" and not hard_loss_forced_reduce
         )
@@ -682,8 +685,12 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
-                if small_cross_entry_allowed:
-                    order["loss_inventory_no_cross_guard"] = "short_small_entry_cross_allowed"
+                if small_cross_entry_allowed or small_loss_reduce_allowed:
+                    order["loss_inventory_no_cross_guard"] = (
+                        "short_small_loss_reduce_allowed"
+                        if small_loss_reduce_allowed
+                        else "short_small_entry_cross_allowed"
+                    )
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
@@ -701,8 +708,12 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
-                if small_cross_entry_allowed:
-                    order["loss_inventory_no_cross_guard"] = "long_small_entry_cross_allowed"
+                if small_cross_entry_allowed or small_loss_reduce_allowed:
+                    order["loss_inventory_no_cross_guard"] = (
+                        "long_small_loss_reduce_allowed"
+                        if small_loss_reduce_allowed
+                        else "long_small_entry_cross_allowed"
+                    )
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
