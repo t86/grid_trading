@@ -792,6 +792,22 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
             kept_place_orders.append(order)
             continue
         if losing_short and short_recovery_order and side == "BUY":
+            dust_target_notional = min(order_notional, abs(net_qty) * price) if price > 0 else order_notional
+            if (
+                implicit_loss_reduce
+                and ordinary_entry
+                and small_entry_notional > 0
+                and order_notional <= small_entry_notional + 1e-9
+                and min_order_notional > 0
+                and dust_target_notional + 1e-9 < min_order_notional
+            ):
+                order["loss_inventory_no_cross_guard"] = "short_dust_cross_allowed"
+                order["loss_inventory_min_notional"] = min_order_notional
+                order["loss_inventory_target_notional"] = dust_target_notional
+                order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                allowed_small_entry_orders.append(dict(order))
+                kept_place_orders.append(order)
+                continue
             if price > 0 and price <= short_ceiling:
                 if entry_side == "long" or implicit_loss_reduce_side is not None:
                     order["force_reduce_only"] = True
@@ -865,6 +881,22 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 dropped_orders.append(dropped)
             continue
         if losing_long and long_recovery_order and side == "SELL":
+            dust_target_notional = min(order_notional, abs(net_qty) * price) if price > 0 else order_notional
+            if (
+                implicit_loss_reduce
+                and ordinary_entry
+                and small_entry_notional > 0
+                and order_notional <= small_entry_notional + 1e-9
+                and min_order_notional > 0
+                and dust_target_notional + 1e-9 < min_order_notional
+            ):
+                order["loss_inventory_no_cross_guard"] = "long_dust_cross_allowed"
+                order["loss_inventory_min_notional"] = min_order_notional
+                order["loss_inventory_target_notional"] = dust_target_notional
+                order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                allowed_small_entry_orders.append(dict(order))
+                kept_place_orders.append(order)
+                continue
             if price > 0 and price >= long_floor:
                 if entry_side == "short" or implicit_loss_reduce_side is not None:
                     order["force_reduce_only"] = True
