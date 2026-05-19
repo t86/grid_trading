@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import io
+import inspect
 import json
 import unittest
 from datetime import datetime, timezone
@@ -14,6 +15,7 @@ from grid_optimizer.web import (
     COMPETITION_VOLUME_PAGE,
     HTML_PAGE,
     STRATEGIES_PAGE,
+    STRATEGY_EDITOR_PAGE,
     _Handler,
     _basic_auth_header_matches,
     _build_custom_grid_runner_preset,
@@ -21,6 +23,7 @@ from grid_optimizer.web import (
     _build_fast_running_status_item,
     _delete_custom_grid_runner_preset,
     _build_runner_command,
+    _build_strategy_editor_status,
     _client_ip_allowed,
     _default_runtime_paths_for_symbol,
     _cancel_symbol_open_orders,
@@ -761,11 +764,22 @@ class WebSecurityTests(unittest.TestCase):
                 "elastic_levels_scale_defensive": 0.7,
                 "elastic_cooldown_seconds": 90.0,
                 "elastic_state_confirm_cycles": 4,
+                "elastic_inventory_recover_exit_ratio": 0.42,
+                "elastic_repair_stale_cycles": 5,
+                "elastic_adverse_move_ticks": 4.0,
+                "elastic_adverse_move_bps": 6.0,
+                "elastic_repair_slice_ratio_passive": 0.08,
+                "elastic_repair_slice_ratio_touch": 0.18,
+                "elastic_repair_slice_ratio_near_cross": 0.28,
+                "elastic_repair_slice_ratio_cross": 0.55,
+                "elastic_max_repair_loss_per_10k": 0.6,
                 "elastic_cancel_stale_entries_on_cooldown": True,
+                "strict_strategy_profile_schema_enabled": True,
             }
         )
 
         self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertTrue(payload["strict_strategy_profile_schema_enabled"])
         self.assertEqual(payload["elastic_volume_mode"], "competition_elastic_volume_v1")
         self.assertEqual(payload["elastic_loss_per_10k_sprint"], 0.25)
         self.assertEqual(payload["elastic_loss_per_10k_cruise"], 0.75)
@@ -782,6 +796,15 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["elastic_levels_scale_defensive"], 0.7)
         self.assertEqual(payload["elastic_cooldown_seconds"], 90.0)
         self.assertEqual(payload["elastic_state_confirm_cycles"], 4)
+        self.assertEqual(payload["elastic_inventory_recover_exit_ratio"], 0.42)
+        self.assertEqual(payload["elastic_repair_stale_cycles"], 5)
+        self.assertEqual(payload["elastic_adverse_move_ticks"], 4.0)
+        self.assertEqual(payload["elastic_adverse_move_bps"], 6.0)
+        self.assertEqual(payload["elastic_repair_slice_ratio_passive"], 0.08)
+        self.assertEqual(payload["elastic_repair_slice_ratio_touch"], 0.18)
+        self.assertEqual(payload["elastic_repair_slice_ratio_near_cross"], 0.28)
+        self.assertEqual(payload["elastic_repair_slice_ratio_cross"], 0.55)
+        self.assertEqual(payload["elastic_max_repair_loss_per_10k"], 0.6)
         self.assertTrue(payload["elastic_cancel_stale_entries_on_cooldown"])
 
     def test_normalize_runner_control_payload_supports_synthetic_trend_follow_fields(self) -> None:
@@ -1615,6 +1638,35 @@ class WebSecurityTests(unittest.TestCase):
     def test_runner_preset_payload_rejects_btcusdc_best_quote_long_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
             _runner_preset_payload("btcusdc_best_quote_long_ping_pong_v1", {"symbol": "ETHUSDC"})
+
+    def test_runner_preset_payload_applies_aigensyn_best_quote_maker_volume_profile(self) -> None:
+        payload = _runner_preset_payload("aigensynusdt_best_quote_maker_volume_v1", {"symbol": "AIGENSYNUSDT"})
+        self.assertEqual(payload["strategy_profile"], "aigensynusdt_best_quote_maker_volume_v1")
+        self.assertEqual(payload["symbol"], "AIGENSYNUSDT")
+        self.assertEqual(payload["strategy_mode"], "one_way_long")
+        self.assertTrue(payload["strict_strategy_profile_schema_enabled"])
+        self.assertEqual(payload["buy_levels"], 1)
+        self.assertEqual(payload["sell_levels"], 1)
+        self.assertAlmostEqual(payload["step_price"], 0.00001)
+        self.assertAlmostEqual(payload["per_order_notional"], 750.0)
+        self.assertAlmostEqual(payload["base_position_notional"], 0.0)
+        self.assertFalse(payload["flat_start_enabled"])
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 900.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 1500.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 3000.0)
+        self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertAlmostEqual(payload["elastic_inventory_soft_ratio"], 0.60)
+        self.assertAlmostEqual(payload["elastic_inventory_hard_ratio"], 0.90)
+        self.assertEqual(payload["elastic_repair_stale_cycles"], 4)
+        self.assertAlmostEqual(payload["elastic_repair_slice_ratio_near_cross"], 0.30)
+        self.assertFalse(payload["adverse_reduce_enabled"])
+        self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
+        self.assertFalse(payload["synthetic_flow_sleeve_enabled"])
+        self.assertFalse(payload["custom_grid_enabled"])
+
+    def test_runner_preset_payload_rejects_aigensyn_best_quote_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=AIGENSYNUSDT"):
+            _runner_preset_payload("aigensynusdt_best_quote_maker_volume_v1", {"symbol": "BTCUSDC"})
 
     def test_runner_preset_payload_applies_competition_neutral_ping_pong_profiles(self) -> None:
         cases = {
@@ -3210,6 +3262,20 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--rolling-hourly-loss-limit", command)
         self.assertIn("--max-cumulative-notional", command)
 
+    def test_build_runner_command_includes_strict_schema_and_elastic_repair_arguments(self) -> None:
+        command = _build_runner_command(
+            _runner_preset_payload("aigensynusdt_best_quote_maker_volume_v1", {"symbol": "AIGENSYNUSDT"})
+        )
+
+        self.assertIn("--strict-strategy-profile-schema-enabled", command)
+        self.assertIn("--elastic-volume-enabled", command)
+        self.assertIn("--elastic-inventory-recover-exit-ratio", command)
+        self.assertIn("0.45", command)
+        self.assertIn("--elastic-repair-stale-cycles", command)
+        self.assertIn("4", command)
+        self.assertIn("--elastic-repair-slice-ratio-near-cross", command)
+        self.assertIn("0.3", command)
+
     def test_build_runner_command_includes_adverse_reduce_arguments(self) -> None:
         command = _build_runner_command(
             {
@@ -3415,9 +3481,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertNotIn("xaut_near_price_guarded_v1", opn_keys)
 
     def test_runner_preset_summaries_include_sprint_symbol_presets_with_config(self) -> None:
+        aigensyn_summaries = {item["key"]: item for item in _runner_preset_summaries("AIGENSYNUSDT")}
         btc_summaries = {item["key"]: item for item in _runner_preset_summaries("BTCUSDC")}
         xau_summaries = {item["key"]: item for item in _runner_preset_summaries("XAUUSDT")}
         eth_summaries = {item["key"]: item for item in _runner_preset_summaries("ETHUSDC")}
+        self.assertIn("aigensynusdt_best_quote_maker_volume_v1", aigensyn_summaries)
+        self.assertNotIn("aigensynusdt_best_quote_maker_volume_v1", btc_summaries)
         self.assertIn("btcusdc_competition_maker_neutral_v1", btc_summaries)
         self.assertIn("btcusdc_competition_maker_neutral_conservative_v1", btc_summaries)
         self.assertIn("btcusdc_competition_maker_neutral_aggressive_v1", btc_summaries)
@@ -3451,6 +3520,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(btc_best_quote["config"]["symbol"], "BTCUSDC")
         self.assertEqual(btc_best_quote["config"]["strategy_mode"], "one_way_long")
         self.assertAlmostEqual(btc_best_quote["config"]["per_order_notional"], 120.0)
+        aigensyn_best_quote = aigensyn_summaries["aigensynusdt_best_quote_maker_volume_v1"]
+        self.assertEqual(aigensyn_best_quote["label"], "AIGENSYNUSDT Best Quote 冲量")
+        self.assertEqual(aigensyn_best_quote["config"]["strategy_mode"], "one_way_long")
+        self.assertTrue(aigensyn_best_quote["config"]["strict_strategy_profile_schema_enabled"])
         btc_ping_pong = btc_summaries["btcusdc_competition_neutral_ping_pong_v1"]
         self.assertEqual(btc_ping_pong["config"]["strategy_mode"], "synthetic_neutral")
         self.assertFalse(btc_ping_pong["config"]["flat_start_enabled"])
@@ -3836,6 +3909,85 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(kwargs["plan_path"], "output/bardusdt_loop_latest_plan.json")
         self.assertEqual(kwargs["submit_report_path"], "output/bardusdt_loop_latest_submit.json")
 
+    @patch("grid_optimizer.web.build_monitor_snapshot", side_effect=AssertionError("strategy editor must stay lightweight"))
+    @patch("grid_optimizer.web._read_runner_process_for_symbol")
+    @patch("grid_optimizer.web._load_runner_control_config")
+    def test_strategy_editor_status_uses_lightweight_local_sources(
+        self,
+        mock_load_config,
+        mock_read_runner,
+        mock_build_snapshot,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            summary_path = root / "aigensyn_loop_events.jsonl"
+            plan_path = root / "aigensyn_plan.json"
+            submit_path = root / "aigensyn_submit.json"
+            summary_path.write_text(
+                json.dumps({"ts": "2026-05-19T10:00:00Z", "cycle": 17, "status": "ok"}, ensure_ascii=False)
+                + "\n",
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "mid_price": 0.02,
+                        "current_long_qty": 100.0,
+                        "current_short_qty": 0.0,
+                        "strategy_intent": "make_volume",
+                        "active_state": "NORMAL",
+                        "elastic_volume": {"repair_ladder_level": "passive"},
+                        "kept_orders": [{"side": "SELL", "price": 0.021, "qty": 100.0}],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            submit_path.write_text(
+                json.dumps(
+                    {
+                        "placed_orders": [{"side": "BUY", "price": 0.0199, "qty": 120.0}],
+                        "cancelled_orders": [{"orderId": 1}],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            config = {
+                "symbol": "AIGENSYNUSDT",
+                "strategy_profile": "aigensynusdt_best_quote_maker_volume_v1",
+                "strategy_mode": "one_way_long",
+                "summary_jsonl": str(summary_path),
+                "plan_json": str(plan_path),
+                "submit_report_json": str(submit_path),
+                "per_order_notional": 120.0,
+            }
+            mock_load_config.return_value = config
+            mock_read_runner.return_value = {
+                "is_running": True,
+                "pid": 1234,
+                "elapsed": "2m",
+                "config": config,
+            }
+
+            payload = _build_strategy_editor_status("aigensyn")
+
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["symbol"], "AIGENSYNUSDT")
+        self.assertTrue(payload["runner"]["running"])
+        self.assertEqual(payload["runner"]["pid"], 1234)
+        self.assertEqual(payload["runner"]["config"]["symbol"], "AIGENSYNUSDT")
+        self.assertEqual(payload["runner"]["config"]["strategy_profile"], "aigensynusdt_best_quote_maker_volume_v1")
+        self.assertEqual(payload["latest_loop"]["cycle"], 17)
+        self.assertEqual(payload["latest_loop"]["strategy_intent"], "make_volume")
+        self.assertEqual(payload["latest_loop"]["active_state"], "NORMAL")
+        self.assertEqual(payload["latest_loop"]["repair_ladder_level"], "passive")
+        self.assertAlmostEqual(payload["position"]["long_notional"], 2.0)
+        self.assertAlmostEqual(payload["position"]["net_notional"], 2.0)
+        self.assertEqual(payload["orders"]["strategy_open_order_count"], 2)
+        self.assertIn("aigensynusdt_best_quote_maker_volume_v1", {item["key"] for item in payload["presets"]})
+        mock_build_snapshot.assert_not_called()
+
     def test_symbol_specific_runner_control_round_trip(self) -> None:
         control_path = Path("output/opnusdt_loop_runner_control.json")
         if control_path.exists():
@@ -3887,14 +4039,39 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("高级模式 / 原始 JSON", MONITOR_PAGE)
         self.assertIn('id="runner_params_editor"', MONITOR_PAGE)
 
+    def test_strategy_editor_page_is_manual_and_lightweight(self) -> None:
+        self.assertIn("策略参数编辑器", STRATEGY_EDITOR_PAGE)
+        self.assertIn("不会自动刷新", STRATEGY_EDITOR_PAGE)
+        self.assertIn("刷新状态", STRATEGY_EDITOR_PAGE)
+        self.assertIn("载入当前参数", STRATEGY_EDITOR_PAGE)
+        self.assertIn("载入预设参数", STRATEGY_EDITOR_PAGE)
+        self.assertIn("保存参数", STRATEGY_EDITOR_PAGE)
+        self.assertIn("/api/strategy_editor/status", STRATEGY_EDITOR_PAGE)
+        self.assertIn("/api/runner/save", STRATEGY_EDITOR_PAGE)
+        self.assertNotIn("setInterval(", STRATEGY_EDITOR_PAGE)
+        self.assertNotIn("loadMonitor()", STRATEGY_EDITOR_PAGE)
+        self.assertNotIn("/api/runner/start", STRATEGY_EDITOR_PAGE)
+        self.assertNotIn("/api/runner/stop", STRATEGY_EDITOR_PAGE)
+
+    def test_strategy_editor_routes_are_registered(self) -> None:
+        source = inspect.getsource(_Handler.do_GET)
+        self.assertIn("/strategy_editor", source)
+        self.assertIn("/strategy_editor.html", source)
+        self.assertIn("/api/strategy_editor/status", source)
+
     def test_monitor_page_exposes_advanced_runner_fields_and_mode_visibility_logic(self) -> None:
         self.assertIn('id="runner_field_inventory_tier_start_notional"', MONITOR_PAGE)
         self.assertIn('id="runner_field_buy_pause_amp_trigger_ratio"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_strict_strategy_profile_schema_enabled"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_elastic_volume_enabled"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_elastic_repair_stale_cycles"', MONITOR_PAGE)
+        self.assertIn('id="runner_field_elastic_repair_slice_ratio_near_cross"', MONITOR_PAGE)
         self.assertIn('id="runner_field_market_bias_enabled"', MONITOR_PAGE)
         self.assertIn('id="runner_field_auto_regime_enabled"', MONITOR_PAGE)
         self.assertIn('id="runner_field_synthetic_trend_follow_enabled"', MONITOR_PAGE)
         self.assertIn('id="runner_field_neutral_band1_offset_ratio"', MONITOR_PAGE)
         self.assertIn("库存分层", MONITOR_PAGE)
+        self.assertIn("Profile 隔离 / 修仓", MONITOR_PAGE)
         self.assertIn("合成中性跟随", MONITOR_PAGE)
         self.assertIn("目标中性", MONITOR_PAGE)
         self.assertIn("function applyRunnerModeVisibility(mode)", MONITOR_PAGE)

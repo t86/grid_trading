@@ -24,6 +24,9 @@ from grid_optimizer.loop_runner import (
     _custom_grid_levels_above_current,
     _generate_competition_inventory_grid_plan,
     _filter_futures_strategy_orders,
+    _elastic_volume_config,
+    _is_best_quote_long_profile,
+    _normalize_strategy_mode,
     _read_custom_grid_trade_count,
     _resolve_custom_grid_roll,
     _resolve_synthetic_resync_price,
@@ -37,6 +40,7 @@ from grid_optimizer.loop_runner import (
     apply_volume_long_v4_staged_delever,
     apply_volume_long_v4_flow_sleeve,
     apply_hard_loss_forced_reduce,
+    apply_best_quote_repair_ladder,
     prime_exposure_escalation_on_market_guard,
     resolve_exposure_escalation_buy_pause,
     resolve_exposure_escalation,
@@ -82,6 +86,7 @@ from grid_optimizer.semi_auto_plan import (
     build_maker_volatility_inventory_plan,
     build_static_binance_grid_plan,
 )
+from grid_optimizer.strategy_profile_schema import apply_strategy_profile_schema
 from grid_optimizer.types import Candle
 
 
@@ -111,6 +116,148 @@ class LoopRunnerTests(unittest.TestCase):
         }
         params.update(overrides)
         return build_maker_volatility_inventory_plan(**params)
+
+    def test_parser_exposes_strict_profile_schema_and_repair_ladder_args(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--strict-strategy-profile-schema-enabled",
+                "--elastic-repair-stale-cycles",
+                "6",
+                "--elastic-adverse-move-ticks",
+                "5",
+                "--elastic-repair-slice-ratio-touch",
+                "0.25",
+            ]
+        )
+
+        self.assertTrue(args.strict_strategy_profile_schema_enabled)
+        self.assertEqual(args.elastic_repair_stale_cycles, 6)
+        self.assertEqual(args.elastic_adverse_move_ticks, 5.0)
+        self.assertEqual(args.elastic_repair_slice_ratio_touch, 0.25)
+
+    def test_elastic_volume_config_reads_repair_ladder_args(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--elastic-repair-stale-cycles",
+                "7",
+                "--elastic-adverse-move-bps",
+                "9",
+                "--elastic-repair-slice-ratio-near-cross",
+                "0.35",
+                "--elastic-max-repair-loss-per-10k",
+                "1.8",
+            ]
+        )
+
+        config = _elastic_volume_config(args)
+
+        self.assertEqual(config.repair_stale_cycles, 7)
+        self.assertEqual(config.adverse_move_bps, 9.0)
+        self.assertEqual(config.repair_slice_ratio_near_cross, 0.35)
+        self.assertEqual(config.max_repair_loss_per_10k, 1.8)
+
+    def test_best_quote_maker_volume_alias_is_one_way_best_quote_long(self) -> None:
+        self.assertEqual(_normalize_strategy_mode("best_quote_maker_volume_v1"), "one_way_long")
+        self.assertTrue(_is_best_quote_long_profile("aigensynusdt_best_quote_maker_volume_v1"))
+
+    def test_full_parser_best_quote_strict_schema_has_no_unknown_default_params(self) -> None:
+        args = _build_parser().parse_args(
+            [
+                "--strict-strategy-profile-schema-enabled",
+                "--strategy-profile",
+                "ethusdc_best_quote_long_ping_pong_v1",
+                "--strategy-mode",
+                "one_way_long",
+                "--market-bias-enabled",
+                "--synthetic-flow-sleeve-enabled",
+                "--synthetic-flow-sleeve-notional",
+                "99",
+                "--custom-grid-enabled",
+            ]
+        )
+
+        effective, report = apply_strategy_profile_schema(args, enabled=True)
+
+        self.assertEqual(report["unknown_params"], [])
+        self.assertTrue(report["strict_ok"])
+        self.assertFalse(effective.market_bias_enabled)
+        self.assertFalse(effective.synthetic_flow_sleeve_enabled)
+        self.assertFalse(effective.custom_grid_enabled)
+        self.assertIn("synthetic_flow_sleeve_notional", report["ignored_params"])
+
+    def test_apply_best_quote_repair_ladder_near_cross_reprices_long_reduce_and_drops_entries(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 99.99, "qty": 1.0, "notional": 99.99, "role": "entry"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 100.05, "qty": 0.4, "notional": 40.02, "role": "take_profit"},
+                {"side": "SELL", "price": 100.06, "qty": 0.4, "notional": 40.024, "role": "take_profit"},
+            ],
+            "bootstrap_orders": [],
+        }
+
+        report = apply_best_quote_repair_ladder(
+            plan=plan,
+            repair_ladder={
+                "enabled": True,
+                "level": "near_cross",
+                "side": "SELL",
+                "repair_slice_notional": 50.0,
+            },
+            bid_price=100.0,
+            ask_price=100.05,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(report["level"], "near_cross")
+        self.assertEqual(report["dropped_entry_order_count"], 1)
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertTrue(plan["sell_orders"])
+        self.assertTrue(all(item["price"] == 100.01 for item in plan["sell_orders"]))
+        self.assertTrue(all(bool(item["force_reduce_only"]) for item in plan["sell_orders"]))
+        self.assertLessEqual(sum(item["notional"] for item in plan["sell_orders"]), 50.0)
+
+    def test_apply_best_quote_repair_ladder_cross_short_uses_aggressive_reduce_only_buy(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"side": "BUY", "price": 100.0, "qty": 0.5, "notional": 50.0, "role": "take_profit_short"},
+            ],
+            "sell_orders": [
+                {"side": "SELL", "price": 100.05, "qty": 0.5, "notional": 50.025, "role": "entry_short"},
+            ],
+            "bootstrap_orders": [],
+        }
+
+        report = apply_best_quote_repair_ladder(
+            plan=plan,
+            repair_ladder={
+                "enabled": True,
+                "level": "cross",
+                "side": "BUY",
+                "repair_slice_notional": 20.0,
+            },
+            bid_price=100.0,
+            ask_price=100.05,
+            tick_size=0.01,
+            step_size=0.001,
+            min_qty=0.001,
+            min_notional=5.0,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        order = plan["buy_orders"][0]
+        self.assertEqual(order["price"], 100.05)
+        self.assertEqual(order["execution_type"], "aggressive")
+        self.assertEqual(order["time_in_force"], "IOC")
+        self.assertTrue(order["force_reduce_only"])
+        self.assertLessEqual(order["notional"], 20.0)
 
     def test_maker_volatility_inventory_normal_generates_two_sided_orders(self) -> None:
         plan = self._maker_plan()
@@ -3133,6 +3280,110 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(tp_buys[0]["price"], 0.965, places=8)
         self.assertEqual(result["relaxed_buy_orders"], 1)
         self.assertAlmostEqual(result["release_ceiling_price"], 1.003, places=8)
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.resolve_elastic_volume_control")
+    @patch("grid_optimizer.loop_runner._summarize_elastic_volume_windows")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_best_quote_long_applies_repair_ladder(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_elastic_windows,
+        mock_elastic_control,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.01,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "100.00", "ask_price": "100.05"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "ETHUSDC", "positionAmt": "2.0", "entryPrice": "99.0", "breakEvenPrice": "99.0"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_elastic_windows.return_value = {
+            "gross_notional_15m": 0.0,
+            "net_pnl_15m": 0.0,
+            "competition_gross_notional": 0.0,
+            "competition_net_pnl": 0.0,
+            "competition_commission": 0.0,
+        }
+        mock_elastic_control.return_value = {
+            "enabled": True,
+            "regime": "cooldown",
+            "applied": True,
+            "reasons": ["inventory_soft", "repair_stale_adverse"],
+            "strategy_intent": "repair_inventory",
+            "active_state": "ADVERSE_REPAIR",
+            "state_reason": ["inventory_soft", "repair_stale_adverse"],
+            "allowed_sides": ["SELL reduceOnly"],
+            "step_scale": 1.0,
+            "per_order_scale": 1.0,
+            "levels_scale": 1.0,
+            "position_limit_scale": 1.0,
+            "entry_allowed": False,
+            "allow_entry_long": False,
+            "allow_entry_short": False,
+            "repair_ladder_level": "near_cross",
+            "repair_ladder": {
+                "enabled": True,
+                "level": "near_cross",
+                "side": "SELL",
+                "repair_slice_notional": 60.0,
+            },
+        }
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="ETHUSDC",
+                strategy_profile="ethusdc_best_quote_long_ping_pong_v1",
+                per_order_notional=50.0,
+                base_position_notional=0.0,
+                max_position_notional=1000.0,
+                buy_levels=4,
+                sell_levels=6,
+                pause_buy_position_notional=900.0,
+                elastic_volume_enabled=True,
+            )
+            report = generate_plan_report(args)
+
+        repair = report["best_quote_repair_ladder"]
+        self.assertTrue(repair["active"])
+        self.assertEqual(repair["level"], "near_cross")
+        self.assertEqual(repair["side"], "SELL")
+        self.assertEqual(report["buy_orders"], [])
+        self.assertTrue(report["sell_orders"])
+        self.assertTrue(all(item["price"] == 100.01 for item in report["sell_orders"]))
+        self.assertTrue(all(bool(item["force_reduce_only"]) for item in report["sell_orders"]))
+        self.assertLessEqual(sum(item["notional"] for item in report["sell_orders"]), 60.0)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")

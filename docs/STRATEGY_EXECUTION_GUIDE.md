@@ -416,6 +416,115 @@
 - 不持有初始底仓，首轮买一 / 卖一可放大，后续反手单回到常规尺寸。
 - 更适合想保留中性结构、又不想一上来先 bootstrap 出库存的场景。
 
+### `aigensynusdt_best_quote_maker_volume_v1`
+
+- 核心：AIGENSYNUSDT 专用的 best quote 贴盘口冲量模板。
+- 这套不是多层网格。正常刷量时只保留最前排 `1` 买 `1` 卖：买单贴 `best bid`，已有多仓对应的减仓卖单贴 `best ask`。
+- 来源是 111 机器 `output/aigensynusdt_loop_runner_control.json` 的历史备份：
+  - `bak_leverage5_best_quote_20260512T220605Z`：`best_quote_maker_volume_v1`、`per_order_notional=1000`、`leverage=20`、`pause_buy=900`、`max_position=12000`、`max_total=24000`，这是非常猛的历史冲量版本。
+  - `bak_recover_big_reduce_20260512T221244Z`：降到 `per_order_notional=250`、`leverage=5`、`max_position=1500`、`max_total=3000`，更像修复和降风险过渡版。
+  - `bak_restore_small_cycle_20260512T221450Z`：恢复到 `per_order_notional=750`、`leverage=5`、`max_position=1500`、`max_total=3000`，本次清洁 preset 采用这一档作为默认基线。
+
+默认参数：
+
+- `strategy_mode=one_way_long`
+- `strict_strategy_profile_schema_enabled=true`
+- `step_price=0.00001`
+- `buy_levels=1`
+- `sell_levels=1`
+- `per_order_notional=750`
+- `base_position_notional=0`
+- `flat_start_enabled=false`
+- `pause_buy_position_notional=900`
+- `max_position_notional=1500`
+- `max_total_notional=3000`
+- `sleep_seconds=1.5`
+- `leverage=5`
+- `maker_retries=2`
+- `max_new_orders=8`
+- `autotune_symbol_enabled=false`
+- `adaptive_step_enabled=false`
+- `adverse_reduce_enabled=false`
+- `excess_inventory_reduce_only_enabled=false`
+- `market_bias_enabled=false`
+- `synthetic_flow_sleeve_enabled=false`
+- `custom_grid_enabled=false`
+
+适用场景：
+
+- 更适合交易赛最后阶段、盘口深度明显变厚、市场本身有足够对手盘的时候冲量。
+- 不适合作为交易赛前几天的低磨损常驻策略。前几天更应该优先看 `ping-pong-safe`、`BQ inventory_recover`、保守 synthetic neutral 或低单笔版本。
+- 它的成交效率来自“永远贴盘口最前排”，不是来自多层挂单。因此盘口很薄、价差跳动快、或单边下跌时，成交额会很快变成库存压力。
+
+正常刷量时怎么挂：
+
+- 无仓或轻仓：
+  - 下方只挂一笔 `entry_long` 买单，贴 `best bid`。
+  - 如果已经有多仓，会按可减仓数量挂一笔 `take_profit_long` / reduce 卖单，贴 `best ask`。
+- 仓位还没到 soft / hard：
+  - 买单仍可能继续工作，卖单会持续尝试把库存卖回去。
+  - 这时仍是“刷量状态”，报告里应看到 `strategy_intent=make_volume` 或接近 normal/fast 的状态。
+- 到 soft 附近：
+  - 本 preset 的 soft 比例是 `max_position_notional * 0.60 = 900U`，刚好等于 `pause_buy_position_notional`。
+  - 进入 soft 后，买侧会被压制或清掉，重点变成减仓卖单。
+- 到 hard 附近：
+  - hard 比例是 `max_position_notional * 0.90 = 1350U`。
+  - 这时不应该再继续为了成交额扩仓，修仓优先级高于刷量。
+
+修仓状态：
+
+- `elastic_volume_enabled=true` 后，报告会把状态分清楚：
+  - 刷量：`strategy_intent=make_volume`
+  - 修仓：`strategy_intent=repair_inventory`
+- 修仓退出线：
+  - `elastic_inventory_recover_exit_ratio=0.45`
+  - 对 1500U 上限来说，库存回到约 `675U` 以下，并连续确认几轮后，才允许回到 normal/fast。
+- 修仓阶梯：
+  - `passive=0.10`：被动 reduceOnly，尽量不主动吃损耗。
+  - `touch=0.20`：修仓滞留后贴近盘口，先提高成交概率。
+  - `near_cross=0.30`：继续不利时更靠近对手盘。
+  - `cross=0.60`：极端或长时间无法修复时，用 IOC 切片快速压库存。
+- 升级条件：
+  - `elastic_repair_stale_cycles=4`
+  - `elastic_adverse_move_ticks=3`
+  - `elastic_adverse_move_bps=5`
+- `elastic_max_repair_loss_per_10k=0` 表示默认不额外放开亏损预算。要降低磨损，优先降低切片比例和单笔金额，而不是直接放开亏损预算。
+
+单边行情里的变化：
+
+- 单边上涨：
+  - 已有多仓的卖单更容易成交，库存会下降。
+  - 买单因为贴 `best bid`，可能追不上上涨节奏，成交额会下降，但磨损通常也较低。
+  - 如果库存降太低，它可能重新进入轻仓刷量状态。
+- 单边下跌：
+  - 买单更容易成交，多仓会累积。
+  - 卖单挂在 `best ask` 可能长时间成交不了，浮亏扩大是正常风险。
+  - 达到 soft / hard 后，策略会转向 reduceOnly 修仓；如果价格继续不利，会按 passive -> touch -> near_cross -> cross 逐步加速。
+- 震荡高深度：
+  - 这是它最适合的环境。买一卖一能反复成交，库存不过快堆积，成交额上得快。
+
+调参优先级：
+
+- 想降低磨损：
+  - 先降 `per_order_notional`。
+  - 再拉长 `sleep_seconds`。
+  - 再降低 `elastic_repair_slice_ratio_near_cross` / `cross`。
+  - 不要先放宽 `elastic_max_repair_loss_per_10k`。
+- 想提高冲量：
+  - 先确认盘口深度和真实成交量足够承接。
+  - 再提高 `per_order_notional`，例如从 750U 往历史 1000U 档靠。
+  - 最后才考虑扩大 `max_position_notional` / `max_total_notional`。
+- 想避免“20 万 / 50 万每小时目标被莫名卡住”：
+  - 这套 profile 本身不会因为 synthetic、custom grid、market bias、adverse reduce、excess reduce-only 等无关参数突然切行为。
+  - 仍可能真正卡住的，是仓位 soft/hard、`max_total_notional`、post-only 拒单、计划过期、中价漂移、API 限频、run window、累计成交额 / 滚动亏损保护。
+  - 如果报告显示 `repair_inventory`，那不是卡住，而是策略已经判断当前优先级从刷量切到修仓。
+
+隔离要求：
+
+- 该 profile 必须保持 `strict_strategy_profile_schema_enabled=true`。
+- 旧的 synthetic neutral、multi-layer custom grid、market bias、autotune、adverse reduce 参数即使还留在 JSON 里，也不应参与这套策略的决策。
+- 后续如果要做更猛的 `20x / 1000U / 12000U` 版本，应另建 profile，例如 `aigensynusdt_best_quote_maker_volume_aggressive_v1`，不要直接改这个默认清洁版。
+
 ### `bard_volume_long_v2`
 
 - 核心：BARDUSDT 专用做多预设。

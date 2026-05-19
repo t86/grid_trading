@@ -128,6 +128,86 @@ class CompetitionElasticVolumeTests(unittest.TestCase):
         self.assertTrue(control["allow_entry_short"])
         self.assertIn("inventory_over_bias", control["reasons"])
 
+    def test_soft_inventory_reports_passive_repair_ladder(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                long_notional=330.0,
+                short_notional=20.0,
+                actual_net_notional=310.0,
+                mid_price=1.000,
+                tick_size=0.001,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "recover")
+        self.assertEqual(control["strategy_intent"], "repair_inventory")
+        self.assertEqual(control["active_state"], "RECOVERY_SAFE")
+        self.assertEqual(control["repair_ladder_level"], "passive")
+        self.assertEqual(control["repair_ladder"]["side"], "SELL")
+        self.assertAlmostEqual(control["repair_ladder"]["slice_ratio"], 0.10)
+
+    def test_stale_adverse_repair_upgrades_to_touch(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True, repair_stale_cycles=3),
+            inputs=_inputs(
+                last_state={
+                    "regime": "recover",
+                    "repair_reference_price": 100.000,
+                    "repair_stale_cycles": 3,
+                },
+                long_notional=330.0,
+                short_notional=20.0,
+                actual_net_notional=310.0,
+                mid_price=99.996,
+                tick_size=0.001,
+            ),
+        )
+
+        self.assertEqual(control["repair_ladder_level"], "touch")
+        self.assertEqual(control["active_state"], "ADVERSE_REPAIR")
+        self.assertIn("repair_stale_adverse", control["reasons"])
+        self.assertGreaterEqual(control["repair_ladder"]["adverse_move_ticks"], 3.0)
+
+    def test_large_adverse_move_upgrades_to_near_cross(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True, repair_stale_cycles=3),
+            inputs=_inputs(
+                last_state={
+                    "regime": "recover",
+                    "repair_reference_price": 100.000,
+                    "repair_stale_cycles": 5,
+                },
+                short_notional=330.0,
+                long_notional=20.0,
+                actual_net_notional=-310.0,
+                mid_price=100.010,
+                tick_size=0.001,
+            ),
+        )
+
+        self.assertEqual(control["repair_ladder_level"], "near_cross")
+        self.assertEqual(control["repair_ladder"]["side"], "BUY")
+        self.assertAlmostEqual(control["repair_ladder"]["slice_ratio"], 0.30)
+
+    def test_hard_inventory_reports_cross_repair(self) -> None:
+        control = resolve_elastic_volume_control(
+            config=ElasticVolumeConfig(enabled=True),
+            inputs=_inputs(
+                short_notional=455.0,
+                long_notional=20.0,
+                actual_net_notional=-435.0,
+                mid_price=1.010,
+                tick_size=0.001,
+            ),
+        )
+
+        self.assertEqual(control["regime"], "cooldown")
+        self.assertEqual(control["strategy_intent"], "repair_inventory")
+        self.assertEqual(control["active_state"], "ADVERSE_REPAIR")
+        self.assertEqual(control["repair_ladder_level"], "cross")
+        self.assertEqual(control["repair_ladder"]["side"], "BUY")
+
 
 if __name__ == "__main__":
     unittest.main()
