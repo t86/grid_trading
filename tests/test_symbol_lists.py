@@ -41,6 +41,8 @@ class SymbolListsTests(unittest.TestCase):
         ):
             self.assertIn(symbol, loaded["monitor"])
             self.assertIn(symbol, loaded["competition"])
+        self.assertIn("PHAROSUSDT", loaded["monitor"])
+        self.assertNotIn("PHAROSUSDT", loaded["competition"])
 
     def test_set_symbol_list_normalizes_and_deduplicates(self) -> None:
         symbols = set_symbol_list("monitor", [" soonusdt ", "soonusdt", "SOONUSDT"], self.path)
