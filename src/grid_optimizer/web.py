@@ -415,6 +415,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "per_order_notional": 120.0,
             "base_position_notional": 0.0,
             "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_take_profit_guard_enabled": True,
             "best_quote_maker_volume_cycle_budget_notional": 400.0,
             "best_quote_maker_volume_target_remaining_notional": 1_000_000.0,
             "best_quote_maker_volume_quote_offset_ticks": 0,
@@ -3871,6 +3872,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "maker_extreme_volatility_threshold": 0.012,
     "maker_directional_move_threshold": 0.004,
     "maker_cooldown_seconds": 30.0,
+    "best_quote_maker_volume_take_profit_guard_enabled": True,
     "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
     "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
     "max_new_orders": 20,
@@ -8899,6 +8901,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "take_profit_enabled",
         "adaptive_step_enabled",
         "best_quote_maker_volume_enabled",
+        "best_quote_maker_volume_take_profit_guard_enabled",
         "elastic_volume_enabled",
         "regime_entry_budget_enabled",
         "regime_entry_budget_report_only",
@@ -9612,6 +9615,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_below_soft_cost_gap_scale", 1.0)),
         "--best-quote-maker-volume-below-soft-adverse-threshold-scale",
         str(config.get("best_quote_maker_volume_below_soft_adverse_threshold_scale", 1.0)),
+        "--best-quote-maker-volume-take-profit-guard-enabled"
+        if config.get("best_quote_maker_volume_take_profit_guard_enabled", True)
+        else "--no-best-quote-maker-volume-take-profit-guard-enabled",
         "--margin-type",
         str(config.get("margin_type", "KEEP")),
         "--leverage",

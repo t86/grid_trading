@@ -13215,6 +13215,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             current_net_qty=actual_net_qty,
         )
+        best_quote_take_profit_guard_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_take_profit_guard_enabled", True)
+        )
         take_profit_guard = apply_take_profit_profit_guard(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -13468,9 +13471,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,
             ask_price=ask_price,
-            extra_long_guard_roles={"best_quote_entry_short", "best_quote_reduce_long"},
-            extra_short_guard_roles={"best_quote_entry_long", "best_quote_reduce_short"},
+            extra_long_guard_roles={"best_quote_entry_short", "best_quote_reduce_long"}
+            if best_quote_take_profit_guard_enabled
+            else None,
+            extra_short_guard_roles={"best_quote_entry_long", "best_quote_reduce_short"}
+            if best_quote_take_profit_guard_enabled
+            else None,
         )
+        take_profit_guard["best_quote_guard_enabled"] = best_quote_take_profit_guard_enabled
         best_quote_profitable_exit_offset_cap = _cap_best_quote_profitable_inventory_exit_offset(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -15542,6 +15550,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
     parser.add_argument("--best-quote-maker-volume-below-soft-cost-gap-scale", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-below-soft-adverse-threshold-scale", type=float, default=1.0)
+    parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
     parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)
     parser.add_argument("--sticky-entry-preserve-less-aggressive", action=argparse.BooleanOptionalAction, default=True)
