@@ -725,8 +725,12 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         ordinary_entry = entry_side in {"long", "short"} and reduce_side is None
         explicit_loss_reduce = reduce_side is not None
         implicit_loss_reduce = implicit_loss_reduce_side is not None
+        best_quote_implicit_loss_reduce = implicit_loss_reduce and ordinary_entry and role in {
+            "best_quote_entry_long",
+            "best_quote_entry_short",
+        }
         small_loss_reduce_allowed = (
-            (explicit_loss_reduce or (implicit_loss_reduce and not ordinary_entry))
+            (explicit_loss_reduce or (implicit_loss_reduce and (not ordinary_entry or best_quote_implicit_loss_reduce)))
             and small_entry_notional > 0
             and order_notional <= small_entry_notional + 1e-9
         )
