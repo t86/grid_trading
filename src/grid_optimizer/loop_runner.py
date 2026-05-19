@@ -13215,9 +13215,6 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             current_net_qty=actual_net_qty,
         )
-        best_quote_take_profit_guard_enabled = bool(
-            getattr(effective_args, "best_quote_maker_volume_take_profit_guard_enabled", True)
-        )
         take_profit_guard = apply_take_profit_profit_guard(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -13454,6 +13451,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 pending_entry_buffer_notional=cycle_budget * 0.5,
                 entry_ladder_spacing=_safe_float(getattr(effective_args, "step_price", 0.0)),
             ),
+        )
+        best_quote_take_profit_guard_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_take_profit_guard_enabled", True)
         )
         take_profit_guard = apply_take_profit_profit_guard(
             plan=plan,
