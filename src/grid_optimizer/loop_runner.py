@@ -13433,6 +13433,35 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 loss_per_10k_hard=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_hard", 0.8)),
                 soft_loss_budget_scale=float(getattr(effective_args, "best_quote_maker_volume_soft_loss_budget_scale", 0.50)),
                 min_cycle_budget_notional=float(getattr(effective_args, "best_quote_maker_volume_min_cycle_budget_notional", 20.0)),
+                dynamic_tick_enabled=bool(getattr(effective_args, "best_quote_maker_volume_dynamic_tick_enabled", False)),
+                dynamic_tick_tight_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_tight_offset_ticks", 2)
+                ),
+                dynamic_tick_low_loss_per_10k=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_low_loss_per_10k", 3.0)
+                ),
+                dynamic_tick_mid_loss_per_10k=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_mid_loss_per_10k", 5.0)
+                ),
+                dynamic_tick_low_inventory_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_low_inventory_ratio", 0.35)
+                ),
+                dynamic_tick_high_inventory_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_high_inventory_ratio", 0.75)
+                ),
+                inventory_bias_enabled=bool(getattr(effective_args, "best_quote_maker_volume_inventory_bias_enabled", False)),
+                inventory_bias_start_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_start_ratio", 0.25)
+                ),
+                inventory_bias_reduce_share=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_reduce_share", 0.70)
+                ),
+                inventory_bias_same_side_extra_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_same_side_extra_ticks", 2)
+                ),
+                inventory_bias_reduce_extra_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_reduce_extra_ticks", -1)
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -15550,6 +15579,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
     parser.add_argument("--best-quote-maker-volume-below-soft-cost-gap-scale", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-below-soft-adverse-threshold-scale", type=float, default=1.0)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-tight-offset-ticks", type=int, default=2)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-low-loss-per-10k", type=float, default=3.0)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-mid-loss-per-10k", type=float, default=5.0)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-low-inventory-ratio", type=float, default=0.35)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-high-inventory-ratio", type=float, default=0.75)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-start-ratio", type=float, default=0.25)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-share", type=float, default=0.70)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-same-side-extra-ticks", type=int, default=2)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-extra-ticks", type=int, default=-1)
     parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
     parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)

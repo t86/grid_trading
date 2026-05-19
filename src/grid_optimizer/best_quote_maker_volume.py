@@ -20,6 +20,17 @@ class BestQuoteMakerVolumeConfig:
     loss_per_10k_hard: float = 0.8
     soft_loss_budget_scale: float = 0.50
     min_cycle_budget_notional: float = 20.0
+    dynamic_tick_enabled: bool = False
+    dynamic_tick_tight_offset_ticks: int = 2
+    dynamic_tick_low_loss_per_10k: float = 3.0
+    dynamic_tick_mid_loss_per_10k: float = 5.0
+    dynamic_tick_low_inventory_ratio: float = 0.35
+    dynamic_tick_high_inventory_ratio: float = 0.75
+    inventory_bias_enabled: bool = False
+    inventory_bias_start_ratio: float = 0.25
+    inventory_bias_reduce_share: float = 0.70
+    inventory_bias_same_side_extra_ticks: int = 2
+    inventory_bias_reduce_extra_ticks: int = -1
 
 
 @dataclass(frozen=True)
@@ -191,6 +202,9 @@ def build_best_quote_maker_volume_plan(
     long_soft = long_limit * soft_ratio if long_limit > 0 else 0.0
     short_soft = short_limit * soft_ratio if short_limit > 0 else 0.0
     loss_per_10k = max(_safe_float(inputs.loss_per_10k_15m), 0.0)
+    long_inventory_ratio = long_notional / long_soft if long_soft > 0 else 0.0
+    short_inventory_ratio = short_notional / short_soft if short_soft > 0 else 0.0
+    inventory_ratio = max(long_inventory_ratio, short_inventory_ratio)
 
     reasons: list[str] = []
     regime = "normal"
@@ -224,14 +238,133 @@ def build_best_quote_maker_volume_plan(
         cycle_budget *= _clamp(_safe_float(config.soft_loss_budget_scale), 0.0, 1.0)
 
     offset_ticks = config.defensive_offset_ticks if regime in {"loss_soft", "inventory_recover"} else config.quote_offset_ticks
+    dynamic_tick_report = {
+        "enabled": bool(config.dynamic_tick_enabled),
+        "base_offset_ticks": int(offset_ticks),
+        "offset_ticks": int(offset_ticks),
+        "reason": None,
+    }
+    if config.dynamic_tick_enabled and regime == "normal":
+        tight_ticks = max(int(_safe_float(config.dynamic_tick_tight_offset_ticks)), 0)
+        low_loss = max(_safe_float(config.dynamic_tick_low_loss_per_10k), 0.0)
+        mid_loss = max(_safe_float(config.dynamic_tick_mid_loss_per_10k), low_loss)
+        low_inventory = _clamp(_safe_float(config.dynamic_tick_low_inventory_ratio), 0.0, 1.0)
+        high_inventory = _clamp(_safe_float(config.dynamic_tick_high_inventory_ratio), low_inventory, 10.0)
+        if loss_per_10k <= low_loss and inventory_ratio <= low_inventory:
+            new_ticks = min(max(int(offset_ticks), 0), tight_ticks)
+            if new_ticks != offset_ticks:
+                dynamic_tick_report["reason"] = "low_loss_low_inventory_tighten"
+            offset_ticks = new_ticks
+        elif loss_per_10k >= mid_loss or inventory_ratio >= high_inventory:
+            new_ticks = max(int(offset_ticks), int(config.defensive_offset_ticks))
+            if new_ticks != offset_ticks:
+                dynamic_tick_report["reason"] = "loss_or_inventory_widen"
+            offset_ticks = new_ticks
+    dynamic_tick_report["offset_ticks"] = int(offset_ticks)
     gap = _tick_gap(inputs.tick_size, offset_ticks)
     per_side = cycle_budget / max((1 if allow_entry_long or net_qty < 0 else 0) + (1 if allow_entry_short or net_qty > 0 else 0), 1)
 
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
     max_entry_orders_per_side = max(int(_safe_float(config.max_entry_orders_per_side)), 1)
+    inventory_bias_report = {
+        "enabled": bool(config.inventory_bias_enabled),
+        "applied": False,
+        "side": None,
+        "inventory_ratio": inventory_ratio,
+        "reduce_share": None,
+        "same_side_entry_share": None,
+        "reduce_offset_ticks": None,
+        "same_side_offset_ticks": None,
+    }
+    bias_start = _clamp(_safe_float(config.inventory_bias_start_ratio), 0.0, 1.0)
+    bias_reduce_share = _clamp(_safe_float(config.inventory_bias_reduce_share), 0.0, 1.0)
+    bias_entry_share = max(1.0 - bias_reduce_share, 0.0)
+    can_bias_short = (
+        config.inventory_bias_enabled
+        and regime == "normal"
+        and net_qty < 0
+        and allow_entry_long
+        and allow_entry_short
+        and short_soft > 0
+        and short_notional >= short_soft * bias_start
+    )
+    can_bias_long = (
+        config.inventory_bias_enabled
+        and regime == "normal"
+        and net_qty > 0
+        and allow_entry_long
+        and allow_entry_short
+        and long_soft > 0
+        and long_notional >= long_soft * bias_start
+    )
+    if can_bias_short or can_bias_long:
+        reduce_ticks = max(int(offset_ticks) + int(config.inventory_bias_reduce_extra_ticks), 0)
+        same_side_ticks = max(int(offset_ticks) + max(int(config.inventory_bias_same_side_extra_ticks), 0), 0)
+        reduce_gap = _tick_gap(inputs.tick_size, reduce_ticks)
+        same_side_gap = _tick_gap(inputs.tick_size, same_side_ticks)
+        reduce_notional = cycle_budget * bias_reduce_share
+        same_side_notional = cycle_budget * bias_entry_share
+        regime = "inventory_bias"
+        reasons.append("inventory_bias")
+        inventory_bias_report.update(
+            {
+                "applied": True,
+                "side": "short" if can_bias_short else "long",
+                "reduce_share": bias_reduce_share,
+                "same_side_entry_share": bias_entry_share,
+                "reduce_offset_ticks": reduce_ticks,
+                "same_side_offset_ticks": same_side_ticks,
+            }
+        )
+        if can_bias_short:
+            _append_order(
+                buy_orders,
+                _build_order(
+                    side="BUY",
+                    price=_price_with_gap(bid, reduce_gap, -1),
+                    notional=min(reduce_notional, short_notional),
+                    role="best_quote_reduce_short",
+                    inputs=inputs,
+                    force_reduce_only=True,
+                ),
+            )
+            sell_orders.extend(
+                _build_entry_ladder(
+                    side="SELL",
+                    anchor_price=ask,
+                    base_gap=same_side_gap,
+                    total_notional=same_side_notional,
+                    slots=max_entry_orders_per_side,
+                    role="best_quote_entry_short",
+                    inputs=inputs,
+                )
+            )
+        else:
+            _append_order(
+                sell_orders,
+                _build_order(
+                    side="SELL",
+                    price=_price_with_gap(ask, reduce_gap, 1),
+                    notional=min(reduce_notional, long_notional),
+                    role="best_quote_reduce_long",
+                    inputs=inputs,
+                    force_reduce_only=True,
+                ),
+            )
+            buy_orders.extend(
+                _build_entry_ladder(
+                    side="BUY",
+                    anchor_price=bid,
+                    base_gap=same_side_gap,
+                    total_notional=same_side_notional,
+                    slots=max_entry_orders_per_side,
+                    role="best_quote_entry_long",
+                    inputs=inputs,
+                )
+            )
 
-    if allow_entry_long:
+    if not inventory_bias_report["applied"] and allow_entry_long:
         long_entry_notional = per_side
         if long_limit > 0:
             long_entry_notional = min(
@@ -249,7 +382,7 @@ def build_best_quote_maker_volume_plan(
                 inputs=inputs,
             )
         )
-    elif net_qty < 0:
+    elif not inventory_bias_report["applied"] and net_qty < 0:
         _append_order(
             buy_orders,
             _build_order(
@@ -261,7 +394,9 @@ def build_best_quote_maker_volume_plan(
                 force_reduce_only=True,
             ),
         )
-    if net_qty > 0 and not allow_entry_long:
+    if inventory_bias_report["applied"]:
+        pass
+    elif net_qty > 0 and not allow_entry_long:
         _append_order(
             sell_orders,
             _build_order(
@@ -326,5 +461,10 @@ def build_best_quote_maker_volume_plan(
             "projected_long_entry_notional": projected_long_entry_notional,
             "projected_short_entry_notional": projected_short_entry_notional,
             "cycle_budget_notional": cycle_budget,
+            "long_inventory_ratio": long_inventory_ratio,
+            "short_inventory_ratio": short_inventory_ratio,
+            "inventory_ratio": inventory_ratio,
+            "dynamic_tick": dynamic_tick_report,
+            "inventory_bias": inventory_bias_report,
         },
     }

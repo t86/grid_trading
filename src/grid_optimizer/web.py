@@ -8845,6 +8845,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_min_cycle_budget_notional",
         "best_quote_maker_volume_below_soft_cost_gap_scale",
         "best_quote_maker_volume_below_soft_adverse_threshold_scale",
+        "best_quote_maker_volume_dynamic_tick_low_loss_per_10k",
+        "best_quote_maker_volume_dynamic_tick_mid_loss_per_10k",
+        "best_quote_maker_volume_dynamic_tick_low_inventory_ratio",
+        "best_quote_maker_volume_dynamic_tick_high_inventory_ratio",
+        "best_quote_maker_volume_inventory_bias_start_ratio",
+        "best_quote_maker_volume_inventory_bias_reduce_share",
         "elastic_early_micro_abs_return_ratio",
         "elastic_early_micro_amplitude_ratio",
         "elastic_early_safe_inventory_ratio",
@@ -8886,6 +8892,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "inventory_tier_sell_levels",
         "best_quote_maker_volume_quote_offset_ticks",
         "best_quote_maker_volume_defensive_offset_ticks",
+        "best_quote_maker_volume_dynamic_tick_tight_offset_ticks",
+        "best_quote_maker_volume_inventory_bias_same_side_extra_ticks",
+        "best_quote_maker_volume_inventory_bias_reduce_extra_ticks",
     }
     bool_fields = {
         "cancel_stale",
@@ -8902,6 +8911,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_enabled",
         "best_quote_maker_volume_enabled",
         "best_quote_maker_volume_take_profit_guard_enabled",
+        "best_quote_maker_volume_dynamic_tick_enabled",
+        "best_quote_maker_volume_inventory_bias_enabled",
         "elastic_volume_enabled",
         "regime_entry_budget_enabled",
         "regime_entry_budget_report_only",
@@ -9615,6 +9626,30 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_below_soft_cost_gap_scale", 1.0)),
         "--best-quote-maker-volume-below-soft-adverse-threshold-scale",
         str(config.get("best_quote_maker_volume_below_soft_adverse_threshold_scale", 1.0)),
+        "--best-quote-maker-volume-dynamic-tick-enabled"
+        if config.get("best_quote_maker_volume_dynamic_tick_enabled", False)
+        else "--no-best-quote-maker-volume-dynamic-tick-enabled",
+        "--best-quote-maker-volume-dynamic-tick-tight-offset-ticks",
+        str(config.get("best_quote_maker_volume_dynamic_tick_tight_offset_ticks", 2)),
+        "--best-quote-maker-volume-dynamic-tick-low-loss-per-10k",
+        str(config.get("best_quote_maker_volume_dynamic_tick_low_loss_per_10k", 3.0)),
+        "--best-quote-maker-volume-dynamic-tick-mid-loss-per-10k",
+        str(config.get("best_quote_maker_volume_dynamic_tick_mid_loss_per_10k", 5.0)),
+        "--best-quote-maker-volume-dynamic-tick-low-inventory-ratio",
+        str(config.get("best_quote_maker_volume_dynamic_tick_low_inventory_ratio", 0.35)),
+        "--best-quote-maker-volume-dynamic-tick-high-inventory-ratio",
+        str(config.get("best_quote_maker_volume_dynamic_tick_high_inventory_ratio", 0.75)),
+        "--best-quote-maker-volume-inventory-bias-enabled"
+        if config.get("best_quote_maker_volume_inventory_bias_enabled", False)
+        else "--no-best-quote-maker-volume-inventory-bias-enabled",
+        "--best-quote-maker-volume-inventory-bias-start-ratio",
+        str(config.get("best_quote_maker_volume_inventory_bias_start_ratio", 0.25)),
+        "--best-quote-maker-volume-inventory-bias-reduce-share",
+        str(config.get("best_quote_maker_volume_inventory_bias_reduce_share", 0.70)),
+        "--best-quote-maker-volume-inventory-bias-same-side-extra-ticks",
+        str(config.get("best_quote_maker_volume_inventory_bias_same_side_extra_ticks", 2)),
+        "--best-quote-maker-volume-inventory-bias-reduce-extra-ticks",
+        str(config.get("best_quote_maker_volume_inventory_bias_reduce_extra_ticks", -1)),
         "--best-quote-maker-volume-take-profit-guard-enabled"
         if config.get("best_quote_maker_volume_take_profit_guard_enabled", True)
         else "--no-best-quote-maker-volume-take-profit-guard-enabled",

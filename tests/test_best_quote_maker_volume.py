@@ -120,6 +120,49 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertLess(soft["buy_orders"][0]["price"], normal["buy_orders"][0]["price"])
         self.assertGreater(soft["sell_orders"][0]["price"], normal["sell_orders"][0]["price"])
 
+    def test_dynamic_tick_tightens_when_loss_and_inventory_are_low(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                dynamic_tick_enabled=True,
+                dynamic_tick_tight_offset_ticks=2,
+                dynamic_tick_low_loss_per_10k=3.0,
+            ),
+            inputs=_inputs(loss_per_10k_15m=0.2),
+        )
+
+        self.assertEqual(plan["regime"], "normal")
+        self.assertEqual(plan["buy_orders"][0]["price"], 80399.8)
+        self.assertEqual(plan["sell_orders"][0]["price"], 80400.3)
+        self.assertEqual(plan["metrics"]["dynamic_tick"]["offset_ticks"], 2)
+        self.assertEqual(plan["metrics"]["dynamic_tick"]["reason"], "low_loss_low_inventory_tighten")
+
+    def test_inventory_bias_keeps_small_same_side_entry_while_reducing_short(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_short_notional=1_500.0,
+                inventory_soft_ratio=0.6,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=0.25,
+                inventory_bias_reduce_share=0.7,
+                inventory_bias_same_side_extra_ticks=2,
+                inventory_bias_reduce_extra_ticks=-1,
+            ),
+            inputs=_inputs(current_net_qty=-0.004),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_bias")
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["buy_orders"][0]["price"], 80399.8)
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertEqual(plan["sell_orders"][0]["price"], 80400.6)
+        self.assertGreater(plan["buy_orders"][0]["notional"], plan["sell_orders"][0]["notional"])
+        self.assertTrue(plan["metrics"]["inventory_bias"]["applied"])
+
     def test_multiple_entry_orders_are_spaced_by_strategy_step(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True, max_entry_orders_per_side=2),
