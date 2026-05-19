@@ -726,12 +726,12 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         explicit_loss_reduce = reduce_side is not None
         implicit_loss_reduce = implicit_loss_reduce_side is not None
         small_loss_reduce_allowed = (
-            (explicit_loss_reduce or implicit_loss_reduce)
+            (explicit_loss_reduce or (implicit_loss_reduce and not ordinary_entry))
             and small_entry_notional > 0
             and order_notional <= small_entry_notional + 1e-9
         )
         small_loss_reduce_resize_allowed = (
-            (explicit_loss_reduce or implicit_loss_reduce)
+            (explicit_loss_reduce or (implicit_loss_reduce and not ordinary_entry))
             and small_entry_notional > 0
             and order_notional > small_entry_notional + 1e-9
         )
@@ -795,6 +795,20 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
+                if implicit_loss_reduce and ordinary_entry and small_entry_notional > 0:
+                    target_notional = min(order_notional, abs(net_qty) * price)
+                    if (
+                        order_notional <= small_entry_notional + 1e-9
+                        and min_order_notional > 0
+                        and target_notional + 1e-9 < min_order_notional
+                    ):
+                        order["loss_inventory_no_cross_guard"] = "short_dust_cross_allowed"
+                        order["loss_inventory_min_notional"] = min_order_notional
+                        order["loss_inventory_target_notional"] = target_notional
+                        order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        allowed_small_entry_orders.append(dict(order))
+                        kept_place_orders.append(order)
+                        continue
                 if small_loss_reduce_allowed:
                     if implicit_loss_reduce:
                         target_notional = min(order_notional, abs(net_qty) * price)
@@ -854,6 +868,20 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 converted_orders.append(dict(order))
                 kept_place_orders.append(order)
             else:
+                if implicit_loss_reduce and ordinary_entry and small_entry_notional > 0:
+                    target_notional = min(order_notional, abs(net_qty) * price)
+                    if (
+                        order_notional <= small_entry_notional + 1e-9
+                        and min_order_notional > 0
+                        and target_notional + 1e-9 < min_order_notional
+                    ):
+                        order["loss_inventory_no_cross_guard"] = "long_dust_cross_allowed"
+                        order["loss_inventory_min_notional"] = min_order_notional
+                        order["loss_inventory_target_notional"] = target_notional
+                        order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        allowed_small_entry_orders.append(dict(order))
+                        kept_place_orders.append(order)
+                        continue
                 if small_loss_reduce_allowed:
                     if implicit_loss_reduce:
                         target_notional = min(order_notional, abs(net_qty) * price)

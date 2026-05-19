@@ -577,6 +577,46 @@ class SubmitPlanTests(unittest.TestCase):
             "losing_long_sell_below_recovery_floor",
         )
 
+    def test_loss_inventory_guard_allows_best_quote_short_entry_when_losing_long_is_dust(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.5783,
+                    "qty": 48.0,
+                    "quantity": 48.0,
+                    "notional": 27.7584,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1.0,
+            "unrealized_pnl": -0.0081,
+            "current_long_avg_price": 0.5861,
+            "take_profit_min_profit_ratio": 0.00008,
+            "loss_inventory_no_cross_small_entry_notional": 30.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["role"], "best_quote_entry_short")
+        self.assertNotIn("force_reduce_only", order)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "long_dust_cross_allowed")
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
     def test_loss_inventory_guard_allows_small_reduce_only_short_brush_above_recovery_ceiling(self) -> None:
         actions = {
             "place_orders": [
@@ -697,6 +737,46 @@ class SubmitPlanTests(unittest.TestCase):
             guard_report["dropped_orders"][0]["loss_inventory_no_cross_drop_reason"],
             "losing_short_buy_above_recovery_ceiling",
         )
+
+    def test_loss_inventory_guard_allows_best_quote_long_entry_when_losing_short_is_dust(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.5780,
+                    "qty": 48.0,
+                    "quantity": 48.0,
+                    "notional": 27.744,
+                    "role": "best_quote_entry_long",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -1.0,
+            "unrealized_pnl": -0.0081,
+            "current_short_avg_price": 0.5700,
+            "take_profit_min_profit_ratio": 0.00008,
+            "loss_inventory_no_cross_small_entry_notional": 30.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["role"], "best_quote_entry_long")
+        self.assertNotIn("force_reduce_only", order)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "short_dust_cross_allowed")
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
 
     def test_loss_inventory_guard_drops_best_quote_short_entry_during_losing_short_uptrend(self) -> None:
         actions = {
