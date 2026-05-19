@@ -22,6 +22,7 @@ output/*
 # Temp files
 *.log
 *.tmp
+.superpowers/
 
 # Local worktrees
 .worktrees/
