@@ -91,7 +91,7 @@
   "max_new_orders": 3,
   "maker_retries": 2,
   "max_mid_drift_steps": 20.0,
-  "sleep_seconds": 5.0,
+  "sleep_seconds": 3.0,
   "cycle_jitter_seconds": 0.5,
   "leverage": 10,
   "margin_type": "KEEP",

@@ -14538,6 +14538,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         state.pop("synthetic_tp_only_watchdog_state", None)
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        desired_orders = preserve_sticky_exit_orders(
+            existing_orders=open_orders_for_diff,
+            desired_orders=desired_orders,
+            sticky_roles={"best_quote_reduce_long", "best_quote_reduce_short"},
+        )
+        desired_orders = preserve_sticky_entry_orders(
+            existing_orders=open_orders_for_diff,
+            desired_orders=desired_orders,
+            price_tolerance=max(_safe_float(effective_args.step_price), 0.0)
+            * max(_safe_float(getattr(effective_args, "sticky_entry_price_tolerance_steps", 1.0)), 0.0),
+            max_levels_per_group=getattr(effective_args, "sticky_entry_levels", None),
+            preserve_less_aggressive=bool(getattr(effective_args, "sticky_entry_preserve_less_aggressive", True)),
+        )
+        _sync_plan_orders_from_desired_orders(plan, desired_orders)
     if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled") and not bool(
         regime_entry_budget.get("report_only", True)
     ):

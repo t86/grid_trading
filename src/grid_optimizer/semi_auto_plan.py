@@ -2046,7 +2046,7 @@ def preserve_sticky_entry_orders(
         return [dict(order) for order in desired_orders]
 
     adjusted_orders = [dict(order) for order in desired_orders]
-    entry_roles = {"entry_long", "entry_short"}
+    entry_roles = {"entry_long", "entry_short", "best_quote_entry_long", "best_quote_entry_short"}
     take_profit_roles = {"take_profit_long", "take_profit_short"}
     sticky_roles = entry_roles | take_profit_roles
 

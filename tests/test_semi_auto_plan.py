@@ -433,6 +433,42 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(adjusted[0]["price"], 0.14290)
         self.assertEqual(adjusted[1]["price"], 0.14380)
 
+    def test_preserve_sticky_entry_orders_keeps_best_quote_entries(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.6290",
+                "origQty": "57",
+                "positionSide": "BOTH",
+                "role": "best_quote_entry_long",
+            },
+            {
+                "orderId": 2,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.6296",
+                "origQty": "57",
+                "positionSide": "BOTH",
+                "role": "best_quote_entry_short",
+            },
+        ]
+        desired = [
+            {"side": "BUY", "price": 0.6289, "qty": 57.0, "notional": 35.8473, "role": "best_quote_entry_long"},
+            {"side": "SELL", "price": 0.6297, "qty": 57.0, "notional": 35.8929, "role": "best_quote_entry_short"},
+        ]
+
+        adjusted = preserve_sticky_entry_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            price_tolerance=0.0002,
+            preserve_less_aggressive=True,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.6290)
+        self.assertEqual(adjusted[1]["price"], 0.6296)
+
     def test_preserve_sticky_entry_orders_skips_prices_that_collide_with_take_profit(self) -> None:
         existing = [
             {
