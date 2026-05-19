@@ -694,6 +694,8 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         _safe_float(plan_report.get("loss_inventory_no_cross_small_entry_notional")),
         0.0,
     )
+    symbol_info = plan_report.get("symbol_info") if isinstance(plan_report.get("symbol_info"), dict) else {}
+    min_order_notional = max(_safe_float(symbol_info.get("min_notional")), 0.0)
 
     losing_short = net_qty < -1e-12 and unrealized_pnl < -1e-9 and short_ceiling > 0
     losing_long = net_qty > 1e-12 and unrealized_pnl < -1e-9 and long_floor > 0
@@ -722,13 +724,14 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 implicit_loss_reduce_side = "SELL"
         ordinary_entry = entry_side in {"long", "short"} and reduce_side is None
         explicit_loss_reduce = reduce_side is not None
+        implicit_loss_reduce = implicit_loss_reduce_side is not None
         small_loss_reduce_allowed = (
-            explicit_loss_reduce
+            (explicit_loss_reduce or implicit_loss_reduce)
             and small_entry_notional > 0
             and order_notional <= small_entry_notional + 1e-9
         )
         small_loss_reduce_resize_allowed = (
-            explicit_loss_reduce
+            (explicit_loss_reduce or implicit_loss_reduce)
             and small_entry_notional > 0
             and order_notional > small_entry_notional + 1e-9
         )
@@ -793,14 +796,44 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 kept_place_orders.append(order)
             else:
                 if small_loss_reduce_allowed:
+                    if implicit_loss_reduce:
+                        target_notional = min(order_notional, abs(net_qty) * price)
+                        if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_small_reduce_below_min_notional"
+                            dropped["loss_inventory_min_notional"] = min_order_notional
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        resized = _resize_order_to_notional(order, target_notional)
+                        if resized is None:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_small_reduce_resize_failed"
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        order = resized
+                        order["force_reduce_only"] = True
                     order["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_allowed"
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
                 if small_loss_reduce_resize_allowed:
-                    resized = _resize_order_to_notional(order, small_entry_notional)
+                    target_notional = small_entry_notional
+                    if implicit_loss_reduce:
+                        target_notional = min(target_notional, abs(net_qty) * price)
+                    if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                        dropped = dict(order)
+                        dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_small_reduce_below_min_notional"
+                        dropped["loss_inventory_min_notional"] = min_order_notional
+                        dropped["loss_inventory_target_notional"] = target_notional
+                        dropped_orders.append(dropped)
+                        continue
+                    resized = _resize_order_to_notional(order, target_notional)
                     if resized is not None:
+                        if implicit_loss_reduce:
+                            resized["force_reduce_only"] = True
                         resized["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_resized"
                         resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                         resized["loss_inventory_original_notional"] = order_notional
@@ -822,14 +855,44 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
                 kept_place_orders.append(order)
             else:
                 if small_loss_reduce_allowed:
+                    if implicit_loss_reduce:
+                        target_notional = min(order_notional, abs(net_qty) * price)
+                        if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_small_reduce_below_min_notional"
+                            dropped["loss_inventory_min_notional"] = min_order_notional
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        resized = _resize_order_to_notional(order, target_notional)
+                        if resized is None:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_small_reduce_resize_failed"
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        order = resized
+                        order["force_reduce_only"] = True
                     order["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_allowed"
                     order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                     allowed_small_entry_orders.append(dict(order))
                     kept_place_orders.append(order)
                     continue
                 if small_loss_reduce_resize_allowed:
-                    resized = _resize_order_to_notional(order, small_entry_notional)
+                    target_notional = small_entry_notional
+                    if implicit_loss_reduce:
+                        target_notional = min(target_notional, abs(net_qty) * price)
+                    if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                        dropped = dict(order)
+                        dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_small_reduce_below_min_notional"
+                        dropped["loss_inventory_min_notional"] = min_order_notional
+                        dropped["loss_inventory_target_notional"] = target_notional
+                        dropped_orders.append(dropped)
+                        continue
+                    resized = _resize_order_to_notional(order, target_notional)
                     if resized is not None:
+                        if implicit_loss_reduce:
+                            resized["force_reduce_only"] = True
                         resized["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_resized"
                         resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
                         resized["loss_inventory_original_notional"] = order_notional
