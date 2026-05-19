@@ -80,6 +80,7 @@ from .semi_auto_plan import (
     preserve_sticky_entry_orders,
     shift_center_price,
 )
+from .strategy_profile_schema import apply_strategy_profile_schema
 from .submit_plan import (
     _build_client_order_id,
     _ignore_noop_error,
@@ -182,6 +183,7 @@ AUTO_REGIME_PROFILE_STEP_HINTS: dict[str, tuple[float, int]] = {
     AUTO_REGIME_DEFENSIVE_PROFILE: (0.0008, 4),
 }
 BEST_QUOTE_SHORT_PROFILE = "robo_best_quote_short_v1"
+BEST_QUOTE_MAKER_VOLUME_MODE = "best_quote_maker_volume_v1"
 BEST_QUOTE_LONG_PROFILES = {
     "ethusdc_best_quote_long_ping_pong_v1",
     "btcusdc_best_quote_long_ping_pong_v1",
@@ -2029,6 +2031,150 @@ def _resolve_reduce_only_flag(
     return None
 
 
+def _best_quote_repair_price(
+    *,
+    side: str,
+    level: str,
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+) -> tuple[float, bool]:
+    normalized_side = str(side or "").upper().strip()
+    normalized_level = str(level or "passive").strip() or "passive"
+    tick = max(_safe_float(tick_size), 0.0)
+    if normalized_side == "SELL":
+        if normalized_level == "cross":
+            return _round_order_price(bid_price, tick_size, "SELL"), True
+        if normalized_level == "near_cross":
+            raw_price = bid_price + tick if tick > 0 else bid_price
+            return _round_order_price(raw_price, tick_size, "SELL"), False
+        if normalized_level == "touch":
+            return _round_order_price(ask_price, tick_size, "SELL"), False
+    elif normalized_side == "BUY":
+        if normalized_level == "cross":
+            return _round_order_price(ask_price, tick_size, "BUY"), True
+        if normalized_level == "near_cross":
+            raw_price = ask_price - tick if tick > 0 else ask_price
+            return _round_order_price(raw_price, tick_size, "BUY"), False
+        if normalized_level == "touch":
+            return _round_order_price(bid_price, tick_size, "BUY"), False
+    return 0.0, False
+
+
+def apply_best_quote_repair_ladder(
+    *,
+    plan: dict[str, Any],
+    repair_ladder: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    side = str((repair_ladder or {}).get("side") or "").upper().strip()
+    level = str((repair_ladder or {}).get("level") or "passive").strip() or "passive"
+    report = {
+        "active": False,
+        "level": level,
+        "side": side,
+        "dropped_entry_order_count": 0,
+        "repriced_order_count": 0,
+        "capped_order_count": 0,
+        "placed_repair_notional": 0.0,
+        "blocked_reason": "not_enabled",
+    }
+    if not bool((repair_ladder or {}).get("enabled")) or side not in {"SELL", "BUY"}:
+        return report
+
+    reduce_key = "sell_orders" if side == "SELL" else "buy_orders"
+    entry_key = "buy_orders" if side == "SELL" else "sell_orders"
+    reduce_roles = (
+        {
+            "take_profit",
+            "take_profit_long",
+            "active_delever_long",
+            "soft_delever_long",
+            "hard_delever_long",
+            "flow_sleeve_long",
+            "hard_loss_forced_reduce_long",
+        }
+        if side == "SELL"
+        else {
+            "take_profit_short",
+            "active_delever_short",
+            "flow_sleeve_short",
+            "hard_loss_forced_reduce_short",
+        }
+    )
+    report["dropped_entry_order_count"] = len([item for item in plan.get(entry_key, []) if isinstance(item, dict)])
+    plan[entry_key] = []
+
+    templates = []
+    for item in plan.get(reduce_key, []):
+        if not isinstance(item, dict):
+            continue
+        if _order_role(item) not in reduce_roles:
+            report["dropped_entry_order_count"] += 1
+            continue
+        templates.append(dict(item))
+    if not templates:
+        plan[reduce_key] = []
+        report["blocked_reason"] = "no_reduce_orders"
+        return report
+
+    target_notional = max(_safe_float((repair_ladder or {}).get("repair_slice_notional")), 0.0)
+    if target_notional <= 0:
+        target_notional = sum(max(_safe_float(item.get("notional")), 0.0) for item in templates)
+
+    repair_price, aggressive = _best_quote_repair_price(
+        side=side,
+        level=level,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        tick_size=tick_size,
+    )
+    repaired_orders: list[dict[str, Any]] = []
+    remaining_notional = target_notional
+    for item in templates:
+        if remaining_notional <= 1e-12:
+            break
+        order = dict(item)
+        price = repair_price if repair_price > 0 else _safe_float(order.get("price"))
+        if price <= 0:
+            report["capped_order_count"] += 1
+            continue
+        original_qty = max(_safe_float(order.get("qty")), 0.0)
+        original_notional = price * original_qty
+        desired_notional = min(original_notional, remaining_notional)
+        qty = _round_order_qty(desired_notional / price, step_size)
+        notional = price * qty
+        if qty <= 0 or (min_qty is not None and qty < min_qty) or (min_notional is not None and notional < min_notional):
+            report["capped_order_count"] += 1
+            continue
+        if abs(price - _safe_float(order.get("price"))) > 1e-12:
+            report["repriced_order_count"] += 1
+        if notional + 1e-9 < original_notional:
+            report["capped_order_count"] += 1
+        order["price"] = price
+        order["qty"] = qty
+        order["quantity"] = qty
+        order["notional"] = notional
+        order["force_reduce_only"] = True
+        order["repair_ladder_level"] = level
+        if aggressive:
+            order["execution_type"] = "aggressive"
+            order["time_in_force"] = "IOC"
+        repaired_orders.append(order)
+        remaining_notional = max(remaining_notional - notional, 0.0)
+
+    plan[reduce_key] = repaired_orders
+    report["active"] = bool(repaired_orders)
+    report["placed_repair_notional"] = sum(_safe_float(item.get("notional")) for item in repaired_orders)
+    report["blocked_reason"] = None if repaired_orders else "all_repair_orders_below_min"
+    return report
+
+
 
 def assess_synthetic_tp_only_watchdog(
     *,
@@ -2307,12 +2453,20 @@ def _is_one_way_short_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "one_way_short"
 
 
+def _normalize_strategy_mode(strategy_mode: str) -> str:
+    normalized = str(strategy_mode or "").strip() or "one_way_long"
+    if normalized == BEST_QUOTE_MAKER_VOLUME_MODE:
+        return "one_way_long"
+    return normalized
+
+
 def _is_best_quote_short_profile(strategy_profile: str) -> bool:
     return str(strategy_profile).strip() == BEST_QUOTE_SHORT_PROFILE
 
 
 def _is_best_quote_long_profile(strategy_profile: str) -> bool:
-    return str(strategy_profile).strip() in BEST_QUOTE_LONG_PROFILES
+    normalized = str(strategy_profile).strip()
+    return normalized in BEST_QUOTE_LONG_PROFILES or normalized.lower().endswith("_best_quote_maker_volume_v1")
 
 
 def _is_best_quote_neutral_profile(strategy_profile: str) -> bool:
@@ -8245,6 +8399,15 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         levels_scale_defensive=float(getattr(args, "elastic_levels_scale_defensive", 0.65)),
         cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
         state_confirm_cycles=int(getattr(args, "elastic_state_confirm_cycles", 3)),
+        inventory_recover_exit_ratio=float(getattr(args, "elastic_inventory_recover_exit_ratio", 0.45)),
+        repair_stale_cycles=int(getattr(args, "elastic_repair_stale_cycles", 4)),
+        adverse_move_ticks=float(getattr(args, "elastic_adverse_move_ticks", 3.0)),
+        adverse_move_bps=float(getattr(args, "elastic_adverse_move_bps", 5.0)),
+        repair_slice_ratio_passive=float(getattr(args, "elastic_repair_slice_ratio_passive", 0.10)),
+        repair_slice_ratio_touch=float(getattr(args, "elastic_repair_slice_ratio_touch", 0.20)),
+        repair_slice_ratio_near_cross=float(getattr(args, "elastic_repair_slice_ratio_near_cross", 0.30)),
+        repair_slice_ratio_cross=float(getattr(args, "elastic_repair_slice_ratio_cross", 0.60)),
+        max_repair_loss_per_10k=float(getattr(args, "elastic_max_repair_loss_per_10k", 0.0)),
     )
 
 
@@ -8555,7 +8718,7 @@ def apply_hedge_position_notional_caps(
 def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     symbol = args.symbol.upper().strip()
     plan_now = _utc_now()
-    requested_strategy_mode = str(getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    requested_strategy_mode = _normalize_strategy_mode(getattr(args, "strategy_mode", "one_way_long"))
     strategy_mode = requested_strategy_mode
     summary_path = Path(args.summary_jsonl)
     if requested_strategy_mode not in {
@@ -8676,7 +8839,26 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "blocked_reason": None,
         "reasons": [],
     }
-    effective_args = args
+    best_quote_repair_ladder: dict[str, Any] = {
+        "active": False,
+        "level": "",
+        "side": "",
+        "dropped_entry_order_count": 0,
+        "repriced_order_count": 0,
+        "capped_order_count": 0,
+        "placed_repair_notional": 0.0,
+        "blocked_reason": "not_applicable",
+    }
+    effective_args, strategy_profile_schema = apply_strategy_profile_schema(
+        args,
+        enabled=bool(getattr(args, "strict_strategy_profile_schema_enabled", False)),
+    )
+    preflight_profile_schema = getattr(args, "_strategy_profile_schema_preflight_report", None)
+    if isinstance(preflight_profile_schema, dict) and preflight_profile_schema.get("strict_enabled"):
+        strategy_profile_schema = dict(preflight_profile_schema)
+    if strategy_profile_schema.get("strict_enabled") and not bool(strategy_profile_schema.get("strict_ok", True)):
+        unknown_params = ", ".join(strategy_profile_schema.get("unknown_params") or [])
+        raise RuntimeError(f"Strict strategy profile schema rejected unknown params: {unknown_params}")
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
         if symbol != "XAUTUSDT":
@@ -8703,25 +8885,25 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             tick_size=_safe_float(symbol_info.get("tick_size")),
         )
         xaut_adaptive["step_price"] = effective_args.step_price
-    elif getattr(args, "auto_regime_enabled", False) and requested_strategy_mode == "one_way_long":
+    elif getattr(effective_args, "auto_regime_enabled", False) and requested_strategy_mode == "one_way_long":
         regime_report = assess_auto_regime(
             symbol=symbol,
-            stable_15m_max_amplitude_ratio=args.auto_regime_stable_15m_max_amplitude_ratio,
-            stable_60m_max_amplitude_ratio=args.auto_regime_stable_60m_max_amplitude_ratio,
-            stable_60m_return_floor_ratio=args.auto_regime_stable_60m_return_floor_ratio,
-            defensive_15m_amplitude_ratio=args.auto_regime_defensive_15m_amplitude_ratio,
-            defensive_60m_amplitude_ratio=args.auto_regime_defensive_60m_amplitude_ratio,
-            defensive_15m_return_ratio=args.auto_regime_defensive_15m_return_ratio,
-            defensive_60m_return_ratio=args.auto_regime_defensive_60m_return_ratio,
+            stable_15m_max_amplitude_ratio=effective_args.auto_regime_stable_15m_max_amplitude_ratio,
+            stable_60m_max_amplitude_ratio=effective_args.auto_regime_stable_60m_max_amplitude_ratio,
+            stable_60m_return_floor_ratio=effective_args.auto_regime_stable_60m_return_floor_ratio,
+            defensive_15m_amplitude_ratio=effective_args.auto_regime_defensive_15m_amplitude_ratio,
+            defensive_60m_amplitude_ratio=effective_args.auto_regime_defensive_60m_amplitude_ratio,
+            defensive_15m_return_ratio=effective_args.auto_regime_defensive_15m_return_ratio,
+            defensive_60m_return_ratio=effective_args.auto_regime_defensive_60m_return_ratio,
         )
         auto_regime = resolve_auto_regime_profile(
             state=state,
             regime_report=regime_report,
-            confirm_cycles=args.auto_regime_confirm_cycles,
+            confirm_cycles=effective_args.auto_regime_confirm_cycles,
         )
         effective_strategy_profile = str(auto_regime.get("active_profile") or requested_strategy_profile).strip() or requested_strategy_profile
         effective_args = build_effective_runner_args(
-            args=args,
+            args=effective_args,
             active_profile=effective_strategy_profile,
             symbol_info=symbol_info,
             bid_price=bid_price,
@@ -8903,7 +9085,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     fixed_center_roll: dict[str, Any] | None = None
     custom_grid_roll: dict[str, Any] | None = None
     fixed_center_enabled = bool(getattr(args, "fixed_center_enabled", False))
-    if _is_custom_grid_mode(args):
+    if _is_custom_grid_mode(effective_args):
         custom_min_price = _safe_float(
             state.get("custom_grid_runtime_min_price", getattr(args, "custom_grid_min_price", None))
         )
@@ -9127,6 +9309,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 actual_net_notional=actual_net_qty * max(mid_price, 0.0),
                 adaptive_step_raw_scale=_safe_float(adaptive_step.get("raw_scale")),
                 multi_timeframe_bias_regime=str(multi_timeframe_bias.get("regime") or "balanced"),
+                mid_price=mid_price,
+                tick_size=_safe_float(symbol_info.get("tick_size")),
             ),
         )
         elastic_volume["applied"] = True
@@ -9158,8 +9342,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     0.0,
                 )
             if not bool(elastic_volume.get("entry_allowed")):
-                effective_args.buy_levels = 0
-                effective_args.sell_levels = 0
+                repair_ladder = elastic_volume.get("repair_ladder") if isinstance(elastic_volume.get("repair_ladder"), dict) else {}
+                repair_side = str(repair_ladder.get("side") or "").upper().strip()
+                if bool(repair_ladder.get("enabled")) and repair_side == "SELL":
+                    effective_args.buy_levels = 0
+                elif bool(repair_ladder.get("enabled")) and repair_side == "BUY":
+                    effective_args.sell_levels = 0
+                else:
+                    effective_args.buy_levels = 0
+                    effective_args.sell_levels = 0
             elif not bool(elastic_volume.get("allow_entry_long")) and current_long_notional >= current_short_notional:
                 effective_args.buy_levels = 0
             elif not bool(elastic_volume.get("allow_entry_short")) and current_short_notional > current_long_notional:
@@ -9440,7 +9631,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "reason": "unsupported",
     }
 
-    if startup_pending and not _is_custom_grid_mode(args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
+    if startup_pending and not _is_custom_grid_mode(effective_args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
         flat_start_guard = assess_flat_start_guard(
             strategy_mode=requested_strategy_mode,
             actual_net_qty=actual_net_qty,
@@ -9587,7 +9778,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     f"{near_market_entry_state.get('near_market_reentry_confirm_cycles')} cycles"
                 )
 
-    if _is_custom_grid_mode(args):
+    if _is_custom_grid_mode(effective_args):
         excess_inventory_gate["enabled"] = False
         custom_direction = str(getattr(args, "custom_grid_direction", strategy_mode) or strategy_mode).strip().lower()
         if custom_direction not in {"long", "short", "neutral"}:
@@ -11063,7 +11254,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
-    if startup_pending and not _is_custom_grid_mode(args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
+    if startup_pending and not _is_custom_grid_mode(effective_args) and requested_strategy_mode in {"one_way_long", "one_way_short"}:
         warm_start = apply_warm_start_bootstrap_guard(
             plan=plan,
             strategy_mode=strategy_mode,
@@ -11210,6 +11401,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if isinstance(item, dict) and _is_long_exit_order(item)
         ]
 
+    if (
+        (strategy_mode == "one_way_long" and _is_best_quote_long_profile(effective_strategy_profile))
+        or (strategy_mode == "one_way_short" and _is_best_quote_short_profile(effective_strategy_profile))
+    ):
+        repair_ladder = elastic_volume.get("repair_ladder") if isinstance(elastic_volume.get("repair_ladder"), dict) else {}
+        best_quote_repair_ladder = apply_best_quote_repair_ladder(
+            plan=plan,
+            repair_ladder=repair_ladder,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+        )
+
     volume_long_v4_open_orders = (
         _decorate_volume_long_v4_open_orders(open_orders)
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile) and strategy_mode == "one_way_long"
@@ -11296,9 +11503,28 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state["updated_at"] = state_now
     state["version"] = STATE_VERSION
     if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
+        repair_ladder_state = elastic_volume.get("repair_ladder") if isinstance(elastic_volume.get("repair_ladder"), dict) else {}
+        previous_elastic_state = state.get("elastic_volume") if isinstance(state.get("elastic_volume"), dict) else {}
+        previous_repair_side = str(previous_elastic_state.get("repair_side") or "")
+        current_repair_side = str(repair_ladder_state.get("side") or "")
+        previous_stale_cycles = int(_safe_float(previous_elastic_state.get("repair_stale_cycles")))
+        if bool(repair_ladder_state.get("enabled")) and current_repair_side:
+            next_stale_cycles = previous_stale_cycles + 1 if current_repair_side == previous_repair_side else 1
+            repair_reference_price = _safe_float(previous_elastic_state.get("repair_reference_price"))
+            if repair_reference_price <= 0 or current_repair_side != previous_repair_side:
+                repair_reference_price = mid_price
+        else:
+            next_stale_cycles = 0
+            repair_reference_price = 0.0
         state["elastic_volume"] = {
             "regime": elastic_volume.get("regime"),
             "cooldown_until": elastic_volume.get("cooldown_until"),
+            "active_state": elastic_volume.get("active_state"),
+            "strategy_intent": elastic_volume.get("strategy_intent"),
+            "repair_ladder_level": elastic_volume.get("repair_ladder_level"),
+            "repair_side": current_repair_side,
+            "repair_reference_price": repair_reference_price,
+            "repair_stale_cycles": next_stale_cycles,
             "updated_at": state_now,
         }
     else:
@@ -11318,6 +11544,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "requested_strategy_profile": requested_strategy_profile,
         "effective_strategy_profile": effective_strategy_profile,
         "effective_strategy_label": AUTO_REGIME_PROFILE_LABELS.get(effective_strategy_profile),
+        "strategy_profile_schema": strategy_profile_schema,
+        "strategy_intent": elastic_volume.get("strategy_intent") or strategy_profile_schema.get("strategy_intent"),
+        "active_state": elastic_volume.get("active_state"),
+        "state_reason": list(elastic_volume.get("state_reason") or []),
+        "allowed_sides": list(elastic_volume.get("allowed_sides") or []),
+        "ignored_params": list(strategy_profile_schema.get("ignored_params") or []),
         "bid_price": bid_price,
         "ask_price": ask_price,
         "mid_price": mid_price,
@@ -11326,8 +11558,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "step_price": effective_args.step_price,
         "center_source": center_source,
         "custom_grid_roll": custom_grid_roll,
-        "custom_grid_runtime_min_price": custom_min_price if _is_custom_grid_mode(args) else None,
-        "custom_grid_runtime_max_price": custom_max_price if _is_custom_grid_mode(args) else None,
+        "custom_grid_runtime_min_price": custom_min_price if _is_custom_grid_mode(effective_args) else None,
+        "custom_grid_runtime_max_price": custom_max_price if _is_custom_grid_mode(effective_args) else None,
         "fixed_center_roll": fixed_center_roll,
         "startup_pending": startup_pending,
         "flat_start_guard": flat_start_guard,
@@ -11347,6 +11579,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "elastic_volume": elastic_volume,
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
+        "best_quote_repair_ladder": best_quote_repair_ladder,
         "maker_volatility_inventory": maker_volatility_inventory,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
@@ -11928,6 +12161,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--symbol", type=str, default="NIGHTUSDT")
     parser.add_argument("--strategy-profile", type=str, default=AUTO_REGIME_STABLE_PROFILE)
+    parser.add_argument("--strict-strategy-profile-schema-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--strategy-mode",
         type=str,
@@ -12068,6 +12302,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-levels-scale-defensive", type=float, default=0.65)
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
+    parser.add_argument("--elastic-inventory-recover-exit-ratio", type=float, default=0.45)
+    parser.add_argument("--elastic-repair-stale-cycles", type=int, default=4)
+    parser.add_argument("--elastic-adverse-move-ticks", type=float, default=3.0)
+    parser.add_argument("--elastic-adverse-move-bps", type=float, default=5.0)
+    parser.add_argument("--elastic-repair-slice-ratio-passive", type=float, default=0.10)
+    parser.add_argument("--elastic-repair-slice-ratio-touch", type=float, default=0.20)
+    parser.add_argument("--elastic-repair-slice-ratio-near-cross", type=float, default=0.30)
+    parser.add_argument("--elastic-repair-slice-ratio-cross", type=float, default=0.60)
+    parser.add_argument("--elastic-max-repair-loss-per-10k", type=float, default=0.0)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--multi-timeframe-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
@@ -12258,6 +12501,25 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
         print(f"  error: {summary['error_message']}")
     if summary.get("pause_reasons"):
         print(f"  pause: {'; '.join(summary['pause_reasons'])}")
+    if summary.get("strategy_intent") or summary.get("active_state"):
+        allowed_sides = ", ".join(str(item) for item in list(summary.get("allowed_sides") or []))
+        print(
+            "  state: "
+            f"intent={summary.get('strategy_intent') or '-'} "
+            f"active={summary.get('active_state') or '-'} "
+            f"allowed={allowed_sides or '-'}"
+        )
+    best_quote_repair = (
+        summary.get("best_quote_repair_ladder") if isinstance(summary.get("best_quote_repair_ladder"), dict) else {}
+    )
+    if best_quote_repair.get("active"):
+        print(
+            "  best_quote_repair: "
+            f"level={best_quote_repair.get('level') or '-'} "
+            f"side={best_quote_repair.get('side') or '-'} "
+            f"notional={_float(best_quote_repair.get('placed_repair_notional', 0.0))} "
+            f"dropped_entries={int(_safe_float(best_quote_repair.get('dropped_entry_order_count')))}"
+        )
     exposure_escalation = (
         summary.get("exposure_escalation") if isinstance(summary.get("exposure_escalation"), dict) else {}
     )
@@ -12563,6 +12825,12 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
 def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
+    if bool(getattr(args, "strict_strategy_profile_schema_enabled", False)):
+        args, strategy_profile_schema_preflight = apply_strategy_profile_schema(args, enabled=True)
+        if not bool(strategy_profile_schema_preflight.get("strict_ok", True)):
+            unknown_params = ", ".join(strategy_profile_schema_preflight.get("unknown_params") or [])
+            raise SystemExit(f"Strict strategy profile schema rejected unknown params: {unknown_params}")
+        setattr(args, "_strategy_profile_schema_preflight_report", strategy_profile_schema_preflight)
     if args.step_price <= 0:
         raise SystemExit("--step-price must be > 0")
     if args.buy_levels < 0 or args.sell_levels < 0:
@@ -12767,6 +13035,22 @@ def main() -> None:
         raise SystemExit("--elastic-cooldown-seconds must be >= 0")
     if args.elastic_state_confirm_cycles < 1:
         raise SystemExit("--elastic-state-confirm-cycles must be >= 1")
+    if args.elastic_inventory_recover_exit_ratio < 0 or args.elastic_inventory_recover_exit_ratio > 1:
+        raise SystemExit("--elastic-inventory-recover-exit-ratio must be within [0, 1]")
+    if args.elastic_repair_stale_cycles < 1:
+        raise SystemExit("--elastic-repair-stale-cycles must be >= 1")
+    if args.elastic_adverse_move_ticks < 0 or args.elastic_adverse_move_bps < 0:
+        raise SystemExit("--elastic-adverse-move-* thresholds must be >= 0")
+    for value, label in (
+        (args.elastic_repair_slice_ratio_passive, "--elastic-repair-slice-ratio-passive"),
+        (args.elastic_repair_slice_ratio_touch, "--elastic-repair-slice-ratio-touch"),
+        (args.elastic_repair_slice_ratio_near_cross, "--elastic-repair-slice-ratio-near-cross"),
+        (args.elastic_repair_slice_ratio_cross, "--elastic-repair-slice-ratio-cross"),
+    ):
+        if value < 0 or value > 1:
+            raise SystemExit(f"{label} must be within [0, 1]")
+    if args.elastic_max_repair_loss_per_10k < 0:
+        raise SystemExit("--elastic-max-repair-loss-per-10k must be >= 0")
     volatility_entry_pause_thresholds = (
         args.volatility_entry_pause_30s_abs_return_ratio,
         args.volatility_entry_pause_30s_amplitude_ratio,

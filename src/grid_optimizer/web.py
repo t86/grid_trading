@@ -3190,11 +3190,77 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "adaptive_step_enabled": False,
         },
     },
+    "aigensynusdt_best_quote_maker_volume_v1": {
+        "label": "AIGENSYNUSDT Best Quote 冲量",
+        "description": "来自 111 历史 best_quote_maker_volume_v1 备份的 AIGENSYNUSDT 贴盘口冲量模板。1 买 1 卖贴 best bid/ask，默认单笔 750U，并启用 strict profile 和 elastic 修仓报告。",
+        "startable": True,
+        "kind": "one_way",
+        "symbol": "AIGENSYNUSDT",
+        "config": {
+            "symbol": "AIGENSYNUSDT",
+            "strategy_mode": "one_way_long",
+            "strict_strategy_profile_schema_enabled": True,
+            "step_price": 0.00001,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "per_order_notional": 750.0,
+            "startup_entry_multiplier": 1.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": False,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 900.0,
+            "max_position_notional": 1500.0,
+            "max_short_position_notional": None,
+            "max_total_notional": 3000.0,
+            "buy_pause_amp_trigger_ratio": 0.0065,
+            "buy_pause_down_return_trigger_ratio": -0.003,
+            "freeze_shift_abs_return_trigger_ratio": 0.0045,
+            "inventory_tier_start_notional": None,
+            "inventory_tier_end_notional": None,
+            "inventory_tier_buy_levels": None,
+            "inventory_tier_sell_levels": None,
+            "inventory_tier_per_order_notional": None,
+            "inventory_tier_base_position_notional": None,
+            "take_profit_min_profit_ratio": 0.0001,
+            "elastic_volume_enabled": True,
+            "elastic_inventory_soft_ratio": 0.60,
+            "elastic_inventory_hard_ratio": 0.90,
+            "elastic_inventory_recover_exit_ratio": 0.45,
+            "elastic_repair_stale_cycles": 4,
+            "elastic_adverse_move_ticks": 3.0,
+            "elastic_adverse_move_bps": 5.0,
+            "elastic_repair_slice_ratio_passive": 0.10,
+            "elastic_repair_slice_ratio_touch": 0.20,
+            "elastic_repair_slice_ratio_near_cross": 0.30,
+            "elastic_repair_slice_ratio_cross": 0.60,
+            "elastic_max_repair_loss_per_10k": 0.0,
+            "market_bias_enabled": False,
+            "synthetic_flow_sleeve_enabled": False,
+            "synthetic_trend_follow_enabled": False,
+            "custom_grid_enabled": False,
+            "excess_inventory_reduce_only_enabled": False,
+            "adverse_reduce_enabled": False,
+            "volume_trigger_enabled": False,
+            "volume_trigger_stop_close_all_positions": False,
+            "volatility_trigger_enabled": False,
+            "volatility_trigger_stop_close_all_positions": False,
+            "sleep_seconds": 1.5,
+            "leverage": 5,
+            "maker_retries": 2,
+            "max_new_orders": 8,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+        },
+    },
 }
 RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
     {
         "volume_long_v4",
         "based_volume_push_bard_v1",
+        "aigensynusdt_best_quote_maker_volume_v1",
         "based_competition_neutral_v1",
         "based_competition_neutral_aggressive_v1",
         "btcusdc_competition_maker_neutral_v1",
@@ -3242,6 +3308,7 @@ RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
 RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "strategy_profile": "volume_long_v4",
     "strategy_mode": "one_way_long",
+    "strict_strategy_profile_schema_enabled": False,
     "symbol": "NIGHTUSDT",
     "step_price": 0.00002,
     "buy_levels": 8,
@@ -3332,6 +3399,15 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "elastic_levels_scale_defensive": 0.65,
     "elastic_cooldown_seconds": 120.0,
     "elastic_state_confirm_cycles": 3,
+    "elastic_inventory_recover_exit_ratio": 0.45,
+    "elastic_repair_stale_cycles": 4,
+    "elastic_adverse_move_ticks": 3.0,
+    "elastic_adverse_move_bps": 5.0,
+    "elastic_repair_slice_ratio_passive": 0.10,
+    "elastic_repair_slice_ratio_touch": 0.20,
+    "elastic_repair_slice_ratio_near_cross": 0.30,
+    "elastic_repair_slice_ratio_cross": 0.60,
+    "elastic_max_repair_loss_per_10k": 0.0,
     "elastic_cancel_stale_entries_on_cooldown": True,
     "multi_timeframe_bias_enabled": False,
     "multi_timeframe_bias_mode_adapter": "auto",
@@ -8168,6 +8244,14 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "elastic_levels_scale_sprint",
         "elastic_levels_scale_defensive",
         "elastic_cooldown_seconds",
+        "elastic_inventory_recover_exit_ratio",
+        "elastic_adverse_move_ticks",
+        "elastic_adverse_move_bps",
+        "elastic_repair_slice_ratio_passive",
+        "elastic_repair_slice_ratio_touch",
+        "elastic_repair_slice_ratio_near_cross",
+        "elastic_repair_slice_ratio_cross",
+        "elastic_max_repair_loss_per_10k",
         "multi_timeframe_bias_low_zone_threshold",
         "multi_timeframe_bias_high_zone_threshold",
         "multi_timeframe_bias_strong_threshold",
@@ -8311,6 +8395,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "execution_regime_confirm_normal_to_caution",
         "multi_timeframe_bias_max_level_delta",
         "elastic_state_confirm_cycles",
+        "elastic_repair_stale_cycles",
         "synthetic_flow_sleeve_levels",
         "volume_long_v4_flow_sleeve_levels",
         "neutral_center_interval_minutes",
@@ -8321,6 +8406,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "cancel_stale",
         "apply",
         "reset_state",
+        "strict_strategy_profile_schema_enabled",
         "flat_start_enabled",
         "warm_start_enabled",
         "market_bias_enabled",
@@ -8414,6 +8500,24 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "elastic_levels_scale_sprint",
         "elastic_levels_scale_defensive",
         "elastic_cooldown_seconds",
+        "elastic_inventory_recover_exit_ratio",
+        "elastic_adverse_move_ticks",
+        "elastic_adverse_move_bps",
+        "elastic_repair_slice_ratio_passive",
+        "elastic_repair_slice_ratio_touch",
+        "elastic_repair_slice_ratio_near_cross",
+        "elastic_repair_slice_ratio_cross",
+        "elastic_max_repair_loss_per_10k",
+        "multi_timeframe_bias_low_zone_threshold",
+        "multi_timeframe_bias_high_zone_threshold",
+        "multi_timeframe_bias_strong_threshold",
+        "multi_timeframe_bias_max_offset_steps",
+        "multi_timeframe_bias_favored_position_scale",
+        "multi_timeframe_bias_unfavored_position_scale",
+        "multi_timeframe_bias_shock_abs_return_ratio",
+        "multi_timeframe_bias_shock_amplitude_ratio",
+        "multi_timeframe_bias_shock_step_scale",
+        "multi_timeframe_bias_shock_notional_scale",
         "execution_regime_vol_p50_ratio",
         "execution_regime_vol_p95_ratio",
         "execution_regime_spread_p50_bps",
@@ -8961,6 +9065,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--summary-jsonl",
         str(config.get("summary_jsonl", RUNNER_DEFAULT_CONFIG["summary_jsonl"])),
     ]
+    command.append(
+        "--strict-strategy-profile-schema-enabled"
+        if config.get("strict_strategy_profile_schema_enabled", False)
+        else "--no-strict-strategy-profile-schema-enabled"
+    )
     if config.get("sticky_entry_levels") is not None:
         command.extend(["--sticky-entry-levels", str(config["sticky_entry_levels"])])
     if config.get("synthetic_residual_long_flat_notional") is not None:
@@ -9201,6 +9310,15 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         ("elastic_levels_scale_defensive", "--elastic-levels-scale-defensive"),
         ("elastic_cooldown_seconds", "--elastic-cooldown-seconds"),
         ("elastic_state_confirm_cycles", "--elastic-state-confirm-cycles"),
+        ("elastic_inventory_recover_exit_ratio", "--elastic-inventory-recover-exit-ratio"),
+        ("elastic_repair_stale_cycles", "--elastic-repair-stale-cycles"),
+        ("elastic_adverse_move_ticks", "--elastic-adverse-move-ticks"),
+        ("elastic_adverse_move_bps", "--elastic-adverse-move-bps"),
+        ("elastic_repair_slice_ratio_passive", "--elastic-repair-slice-ratio-passive"),
+        ("elastic_repair_slice_ratio_touch", "--elastic-repair-slice-ratio-touch"),
+        ("elastic_repair_slice_ratio_near_cross", "--elastic-repair-slice-ratio-near-cross"),
+        ("elastic_repair_slice_ratio_cross", "--elastic-repair-slice-ratio-cross"),
+        ("elastic_max_repair_loss_per_10k", "--elastic-max-repair-loss-per-10k"),
     ):
         if config.get(key) is not None:
             command.extend([flag, str(config[key])])
@@ -19148,6 +19266,56 @@ MONITOR_PAGE = """<!doctype html>
               </div>
               <div class="runner-form-hint">这一层当前只输出状态和建议参数，不直接改变真实订单。真实生效的下单保护仍由软/硬阈值、分钟停买、volatility trigger 和 adaptive step 执行。</div>
             </section>
+            <section class="runner-form-section" data-runner-section="profile_repair">
+              <h3>Profile 隔离 / 修仓</h3>
+              <div class="runner-form-fields">
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_strict_strategy_profile_schema_enabled" type="checkbox" />
+                    <span>启用严格 profile schema</span>
+                  </span>
+                </label>
+                <label class="inline-check">
+                  <span class="check-row">
+                    <input id="runner_field_elastic_volume_enabled" type="checkbox" />
+                    <span>启用 elastic 状态与修仓</span>
+                  </span>
+                </label>
+                <label>库存 soft 比例
+                  <input id="runner_field_elastic_inventory_soft_ratio" type="number" min="0" step="0.01" />
+                </label>
+                <label>库存 hard 比例
+                  <input id="runner_field_elastic_inventory_hard_ratio" type="number" min="0" step="0.01" />
+                </label>
+                <label>恢复退出比例
+                  <input id="runner_field_elastic_inventory_recover_exit_ratio" type="number" min="0" step="0.01" />
+                </label>
+                <label>修仓滞留轮数
+                  <input id="runner_field_elastic_repair_stale_cycles" type="number" min="1" step="1" />
+                </label>
+                <label>不利移动 ticks
+                  <input id="runner_field_elastic_adverse_move_ticks" type="number" min="0" step="0.1" />
+                </label>
+                <label>不利移动 bps
+                  <input id="runner_field_elastic_adverse_move_bps" type="number" min="0" step="0.1" />
+                </label>
+                <label>被动修仓切片
+                  <input id="runner_field_elastic_repair_slice_ratio_passive" type="number" min="0" step="0.01" />
+                </label>
+                <label>贴盘口修仓切片
+                  <input id="runner_field_elastic_repair_slice_ratio_touch" type="number" min="0" step="0.01" />
+                </label>
+                <label>近穿价修仓切片
+                  <input id="runner_field_elastic_repair_slice_ratio_near_cross" type="number" min="0" step="0.01" />
+                </label>
+                <label>IOC 修仓切片
+                  <input id="runner_field_elastic_repair_slice_ratio_cross" type="number" min="0" step="0.01" />
+                </label>
+                <label>每万允许修仓亏损
+                  <input id="runner_field_elastic_max_repair_loss_per_10k" type="number" min="0" step="0.01" />
+                </label>
+              </div>
+            </section>
             <section class="runner-form-section" data-runner-section="auto_regime">
               <h3>自动切换</h3>
               <div class="runner-form-fields">
@@ -19659,6 +19827,7 @@ MONITOR_PAGE = """<!doctype html>
     const VISIBLE_STRATEGY_PRESET_KEYS = new Set([
       "volume_long_v4",
       "based_volume_push_bard_v1",
+      "aigensynusdt_best_quote_maker_volume_v1",
       "based_competition_neutral_v1",
       "based_competition_neutral_aggressive_v1",
       "btcusdc_competition_maker_neutral_v1",
@@ -20840,6 +21009,72 @@ MONITOR_PAGE = """<!doctype html>
           adaptive_step_enabled: false,
         },
       },
+      {
+        key: "aigensynusdt_best_quote_maker_volume_v1",
+        label: "AIGENSYNUSDT Best Quote 冲量",
+        description: "来自 111 历史 best_quote_maker_volume_v1 备份的 AIGENSYNUSDT 贴盘口冲量模板。1 买 1 卖贴 best bid/ask，默认单笔 750U，并启用 strict profile 和 elastic 修仓报告。",
+        startable: true,
+        kind: "one_way",
+        symbol: "AIGENSYNUSDT",
+        config: {
+          symbol: "AIGENSYNUSDT",
+          strategy_mode: "one_way_long",
+          strict_strategy_profile_schema_enabled: true,
+          step_price: 0.00001,
+          buy_levels: 1,
+          sell_levels: 1,
+          per_order_notional: 750.0,
+          startup_entry_multiplier: 1.0,
+          base_position_notional: 0.0,
+          flat_start_enabled: false,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 900.0,
+          max_position_notional: 1500.0,
+          max_short_position_notional: null,
+          max_total_notional: 3000.0,
+          buy_pause_amp_trigger_ratio: 0.0065,
+          buy_pause_down_return_trigger_ratio: -0.003,
+          freeze_shift_abs_return_trigger_ratio: 0.0045,
+          inventory_tier_start_notional: null,
+          inventory_tier_end_notional: null,
+          inventory_tier_buy_levels: null,
+          inventory_tier_sell_levels: null,
+          inventory_tier_per_order_notional: null,
+          inventory_tier_base_position_notional: null,
+          take_profit_min_profit_ratio: 0.0001,
+          elastic_volume_enabled: true,
+          elastic_inventory_soft_ratio: 0.60,
+          elastic_inventory_hard_ratio: 0.90,
+          elastic_inventory_recover_exit_ratio: 0.45,
+          elastic_repair_stale_cycles: 4,
+          elastic_adverse_move_ticks: 3.0,
+          elastic_adverse_move_bps: 5.0,
+          elastic_repair_slice_ratio_passive: 0.10,
+          elastic_repair_slice_ratio_touch: 0.20,
+          elastic_repair_slice_ratio_near_cross: 0.30,
+          elastic_repair_slice_ratio_cross: 0.60,
+          elastic_max_repair_loss_per_10k: 0.0,
+          market_bias_enabled: false,
+          synthetic_flow_sleeve_enabled: false,
+          synthetic_trend_follow_enabled: false,
+          custom_grid_enabled: false,
+          excess_inventory_reduce_only_enabled: false,
+          adverse_reduce_enabled: false,
+          volume_trigger_enabled: false,
+          volume_trigger_stop_close_all_positions: false,
+          volatility_trigger_enabled: false,
+          volatility_trigger_stop_close_all_positions: false,
+          sleep_seconds: 1.5,
+          leverage: 5,
+          maker_retries: 2,
+          max_new_orders: 8,
+          autotune_symbol_enabled: false,
+          adaptive_step_enabled: false,
+        },
+      },
       competitionSprintPreset({
         key: "ethusdc_competition_maker_neutral_v1",
         label: "UM 冲刺赛 ETHUSDC",
@@ -21879,8 +22114,9 @@ MONITOR_PAGE = """<!doctype html>
       {
         key: "alt",
         title: "Alt 冲刺赛",
-        description: "小币赛道，目前展示 ORDIUSDC 三档和 TRUMPUSDC 做多 v4。",
+        description: "小币赛道，目前展示 AIGENSYN 贴盘口冲量、ORDIUSDC 三档和 TRUMPUSDC 做多 v4。",
         presetKeys: [
+          "aigensynusdt_best_quote_maker_volume_v1",
           "ordiusdc_competition_maker_neutral_conservative_v1",
           "ordiusdc_competition_maker_neutral_v1",
           "ordiusdc_competition_maker_neutral_aggressive_v1",
@@ -21977,6 +22213,19 @@ MONITOR_PAGE = """<!doctype html>
       { key: "adaptive_step_max_scale", id: "runner_field_adaptive_step_max_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_per_order_scale", id: "runner_field_adaptive_step_min_per_order_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "adaptive_step_min_position_limit_scale", id: "runner_field_adaptive_step_min_position_limit_scale", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "strict_strategy_profile_schema_enabled", id: "runner_field_strict_strategy_profile_schema_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_volume_enabled", id: "runner_field_elastic_volume_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_inventory_soft_ratio", id: "runner_field_elastic_inventory_soft_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_inventory_hard_ratio", id: "runner_field_elastic_inventory_hard_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_inventory_recover_exit_ratio", id: "runner_field_elastic_inventory_recover_exit_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_repair_stale_cycles", id: "runner_field_elastic_repair_stale_cycles", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_adverse_move_ticks", id: "runner_field_elastic_adverse_move_ticks", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_adverse_move_bps", id: "runner_field_elastic_adverse_move_bps", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_repair_slice_ratio_passive", id: "runner_field_elastic_repair_slice_ratio_passive", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_repair_slice_ratio_touch", id: "runner_field_elastic_repair_slice_ratio_touch", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_repair_slice_ratio_near_cross", id: "runner_field_elastic_repair_slice_ratio_near_cross", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_repair_slice_ratio_cross", id: "runner_field_elastic_repair_slice_ratio_cross", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "elastic_max_repair_loss_per_10k", id: "runner_field_elastic_max_repair_loss_per_10k", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "execution_regime_enabled", id: "runner_field_execution_regime_enabled", type: "boolean", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "execution_regime_vol_p50_ratio", id: "runner_field_execution_regime_vol_p50_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "execution_regime_vol_p95_ratio", id: "runner_field_execution_regime_vol_p95_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -22077,6 +22326,19 @@ MONITOR_PAGE = """<!doctype html>
       short_cover_pause_amp_trigger_ratio: "做空模式下，振幅过大时暂停买回补空。",
       short_cover_pause_down_return_trigger_ratio: "做空模式下，快速下跌时暂停追着买回补空。",
       take_profit_min_profit_ratio: "轻库存时的保本回补门槛。未达到对应 pause 仓位阈值前，take_profit 单会按持仓均价抬底/压顶，避免亏着出手。",
+      strict_strategy_profile_schema_enabled: "是否启用严格 profile schema。开启后只允许该策略白名单内参数生效，无关旧参数会在报告里标为 ignored 或直接拦截。",
+      elastic_volume_enabled: "是否启用 elastic 状态机。开启后报告会区分刷量状态和修仓状态，并允许库存超 soft 后进入减仓优先路径。",
+      elastic_inventory_soft_ratio: "库存 soft 比例。当前仓位达到硬上限的这个比例后，策略会开始从 fast/normal 切向更保守的修仓状态。",
+      elastic_inventory_hard_ratio: "库存 hard 比例。达到后会更强地限制继续扩仓，优先保留 reduceOnly 修仓挂单。",
+      elastic_inventory_recover_exit_ratio: "修仓退出比例。库存回落到 hard 上限的这个比例以下，并经过确认轮数后，才允许回到 normal/fast。",
+      elastic_repair_stale_cycles: "修仓滞留轮数。连续多轮没有修回 soft 以下时，会从被动减仓逐步升级到贴盘口、近穿价或 IOC 切片。",
+      elastic_adverse_move_ticks: "不利方向移动 tick 数。修仓过程中价格继续朝亏损方向移动超过该 tick 数时，允许升级一档修仓强度。",
+      elastic_adverse_move_bps: "不利方向移动 bps。和 tick 条件并列，适配不同价格尺度的币种。",
+      elastic_repair_slice_ratio_passive: "被动修仓切片比例。normal repair 下每轮最多拿当前库存的这个比例挂 reduceOnly。",
+      elastic_repair_slice_ratio_touch: "贴盘口修仓切片比例。修仓长时间无成交或小幅不利时，用更靠近盘口的 reduceOnly 单处理的比例。",
+      elastic_repair_slice_ratio_near_cross: "近穿价修仓切片比例。继续不利时允许更激进贴近对手盘附近，但仍按切片控制损耗。",
+      elastic_repair_slice_ratio_cross: "IOC 修仓切片比例。极端不利或长时间无法修复时，一次最多允许用 IOC 处理的库存比例。",
+      elastic_max_repair_loss_per_10k: "每万名义允许的修仓损耗上限。设为 0 表示默认不放开额外亏损预算。",
       auto_regime_enabled: "是否启用市场状态自动切换。",
       auto_regime_confirm_cycles: "市场状态切换前需要连续满足条件的轮数。",
       auto_regime_stable_15m_max_amplitude_ratio: "稳定行情判定的 15 分钟振幅阈值。",
@@ -22874,6 +23136,14 @@ MONITOR_PAGE = """<!doctype html>
         focus: [
           "这是 one_way_long maker 刷量，不是中性策略；不会主动开空。",
           "不再按中心价阶梯网格挂远价，盘口附近成交频率会更高；已有多仓会作为 best ask 卖单库存使用。"
+        ],
+      },
+      aigensynusdt_best_quote_maker_volume_v1: {
+        summary: "AIGENSYNUSDT 的历史猛冲量 best quote 档。来自 111 的 best_quote_maker_volume_v1 备份，1 买 1 卖贴盘口，默认单笔 750U。",
+        focus: [
+          "这是交易赛后段冲量模板，不是低磨损日常模板；盘口深度不足时应先降 per_order_notional。",
+          "已启用 strict profile schema，synthetic、custom grid、market bias 等无关模块不会混进来。",
+          "elastic repair 会在库存进入修仓态时清入口、只留 reduceOnly，并在报告里显示 repair_inventory。"
         ],
       },
       volatility_defensive_v1: {
@@ -24981,6 +25251,519 @@ RUNNER_SETTINGS_PAGE = (
         1,
     )
 )
+
+STRATEGY_EDITOR_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <title>策略参数编辑器</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --panel: #ffffff;
+      --line: #d8e0ea;
+      --text: #172033;
+      --muted: #637083;
+      --brand: #0b6f68;
+      --brand-soft: #e7f5f3;
+      --good: #0f7b45;
+      --warn: #b76e00;
+      --bad: #b42318;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      color: var(--text);
+      background: var(--bg);
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    }
+    .wrap { max-width: 1480px; margin: 0 auto; padding: 20px 16px 44px; display: grid; gap: 14px; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 14px;
+    }
+    .top { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; flex-wrap: wrap; }
+    h1 { margin: 0 0 6px; font-size: 24px; letter-spacing: 0; }
+    h2 { margin: 0 0 10px; font-size: 17px; letter-spacing: 0; }
+    p, .meta, .hint { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.55; }
+    .links, .toolbar, .actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; }
+    .links a, button {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: var(--brand-soft);
+      color: #0f4b47;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+    }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    button:disabled { cursor: not-allowed; opacity: 0.58; }
+    label { display: grid; gap: 6px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    input, select, textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      font: inherit;
+    }
+    input, select { height: 36px; padding: 0 10px; }
+    textarea {
+      min-height: 520px;
+      padding: 12px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.55;
+    }
+    .toolbar { margin-top: 12px; }
+    .toolbar label { min-width: 180px; }
+    .toolbar label.symbol-input { min-width: 220px; }
+    .layout { display: grid; grid-template-columns: 0.92fr 1.35fr; gap: 14px; align-items: start; }
+    .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; padding: 11px; min-height: 86px; }
+    .metric .label { color: var(--muted); font-size: 12px; font-weight: 700; }
+    .metric .value { margin-top: 6px; font-size: 19px; font-weight: 800; word-break: break-word; }
+    .metric .sub { margin-top: 6px; color: var(--muted); font-size: 12px; line-height: 1.4; word-break: break-word; }
+    .good { color: var(--good); }
+    .warn { color: var(--warn); }
+    .bad { color: var(--bad); }
+    .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .field-wide { grid-column: 1 / -1; }
+    .explain { display: grid; gap: 8px; }
+    .explain-item { border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; padding: 10px; }
+    .explain-item strong { display: block; margin-bottom: 4px; font-size: 13px; }
+    .explain-item span { color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .split { display: grid; grid-template-columns: 1fr; gap: 14px; }
+    .save-row { margin-top: 10px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    @media (max-width: 1180px) {
+      .layout { grid-template-columns: 1fr; }
+      .status-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 700px) {
+      .status-grid, .fields { grid-template-columns: 1fr; }
+      .toolbar label { min-width: 100%; }
+      .actions button { flex: 1 1 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="panel">
+      <div class="top">
+        <div>
+          <h1>策略参数编辑器</h1>
+          <p>不会自动刷新；点击按钮才读取服务器数据。保存参数只写入 runner 配置，不启动、不停止、不重启策略。</p>
+        </div>
+        <div class="links">
+          <a href="/monitor">重监控页</a>
+          <a href="/running_status">运行状态</a>
+          <a href="/strategies">策略总览</a>
+        </div>
+      </div>
+      <div class="toolbar">
+        <label>常用币种
+          <select id="symbol_select">
+            <option value="AIGENSYNUSDT">AIGENSYNUSDT</option>
+            <option value="BILLUSDT">BILLUSDT</option>
+            <option value="BARDUSDT">BARDUSDT</option>
+            <option value="XAUTUSDT">XAUTUSDT</option>
+            <option value="BTCUSDC">BTCUSDC</option>
+            <option value="ETHUSDC">ETHUSDC</option>
+            <option value="SOONUSDT">SOONUSDT</option>
+          </select>
+        </label>
+        <label class="symbol-input">手动输入
+          <input id="symbol_input" type="text" value="AIGENSYNUSDT" spellcheck="false" />
+        </label>
+        <label class="field-wide">预设
+          <select id="preset_select">
+            <option value="">先刷新状态或点击载入预设参数</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar actions">
+        <button id="refresh_status_btn" type="button" class="primary">刷新状态</button>
+        <button id="load_current_btn" type="button">载入当前参数</button>
+        <button id="load_preset_btn" type="button">载入预设参数</button>
+        <button id="save_params_btn" type="button">保存参数</button>
+      </div>
+      <div id="page_meta" class="meta" style="margin-top:10px">页面已就绪，尚未读取服务器状态。</div>
+    </section>
+
+    <section class="panel">
+      <h2>轻量状态</h2>
+      <div id="status_grid" class="status-grid">
+        <div class="metric"><div class="label">状态</div><div class="value warn">未刷新</div><div class="sub">点击刷新状态读取本地 runner 和最新计划文件。</div></div>
+      </div>
+    </section>
+
+    <section class="layout">
+      <div class="split">
+        <section class="panel">
+          <h2>常用参数</h2>
+          <div class="fields" id="field_grid">
+            <label>strategy_profile<input data-key="strategy_profile" type="text" spellcheck="false" /></label>
+            <label>strategy_mode<input data-key="strategy_mode" type="text" spellcheck="false" /></label>
+            <label>step_price<input data-key="step_price" data-type="number" type="number" step="0.0000001" /></label>
+            <label>buy_levels<input data-key="buy_levels" data-type="integer" type="number" step="1" /></label>
+            <label>sell_levels<input data-key="sell_levels" data-type="integer" type="number" step="1" /></label>
+            <label>per_order_notional<input data-key="per_order_notional" data-type="number" type="number" step="0.01" /></label>
+            <label>base_position_notional<input data-key="base_position_notional" data-type="number" type="number" step="0.01" /></label>
+            <label>max_new_orders<input data-key="max_new_orders" data-type="integer" type="number" step="1" /></label>
+            <label>pause_buy_position_notional<input data-key="pause_buy_position_notional" data-type="number" type="number" step="0.01" /></label>
+            <label>max_position_notional<input data-key="max_position_notional" data-type="number" type="number" step="0.01" /></label>
+            <label>pause_short_position_notional<input data-key="pause_short_position_notional" data-type="number" type="number" step="0.01" /></label>
+            <label>max_short_position_notional<input data-key="max_short_position_notional" data-type="number" type="number" step="0.01" /></label>
+            <label>max_total_notional<input data-key="max_total_notional" data-type="number" type="number" step="0.01" /></label>
+            <label>sleep_seconds<input data-key="sleep_seconds" data-type="number" type="number" step="0.5" /></label>
+            <label>leverage<input data-key="leverage" data-type="integer" type="number" step="1" /></label>
+            <label>take_profit_min_profit_ratio<input data-key="take_profit_min_profit_ratio" data-type="number" type="number" step="0.000001" /></label>
+            <label>strict_strategy_profile_schema_enabled<input data-key="strict_strategy_profile_schema_enabled" data-type="boolean" type="text" spellcheck="false" /></label>
+            <label>elastic_volume_enabled<input data-key="elastic_volume_enabled" data-type="boolean" type="text" spellcheck="false" /></label>
+            <label>elastic_max_repair_ladder<input data-key="elastic_max_repair_ladder" data-type="integer" type="number" step="1" /></label>
+            <label>client_order_prefix<input data-key="client_order_prefix" type="text" spellcheck="false" /></label>
+          </div>
+          <div class="save-row">
+            <button id="sync_fields_btn" type="button">同步常用参数到 JSON</button>
+            <span id="field_meta" class="meta">常用参数只是辅助编辑，最终保存以 JSON 为准。</span>
+          </div>
+        </section>
+        <section class="panel">
+          <h2>参数说明</h2>
+          <div id="explain_box" class="explain">
+            <div class="explain-item"><strong>还没有载入参数</strong><span>点击载入当前参数或载入预设参数后，这里会根据当前 JSON 展示策略用途、挂单密度和库存阈值摘要。</span></div>
+          </div>
+        </section>
+      </div>
+      <section class="panel">
+        <h2>原始 JSON</h2>
+        <textarea id="params_editor" spellcheck="false">{}</textarea>
+        <div class="save-row">
+          <button id="format_json_btn" type="button">格式化 JSON</button>
+          <span id="editor_meta" class="meta">JSON 无自动保存。</span>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <script>
+    const symbolSelect = document.getElementById("symbol_select");
+    const symbolInput = document.getElementById("symbol_input");
+    const presetSelect = document.getElementById("preset_select");
+    const statusGrid = document.getElementById("status_grid");
+    const pageMeta = document.getElementById("page_meta");
+    const paramsEditor = document.getElementById("params_editor");
+    const fieldGrid = document.getElementById("field_grid");
+    const fieldMeta = document.getElementById("field_meta");
+    const editorMeta = document.getElementById("editor_meta");
+    const explainBox = document.getElementById("explain_box");
+    const refreshStatusBtn = document.getElementById("refresh_status_btn");
+    const loadCurrentBtn = document.getElementById("load_current_btn");
+    const loadPresetBtn = document.getElementById("load_preset_btn");
+    const saveParamsBtn = document.getElementById("save_params_btn");
+    const syncFieldsBtn = document.getElementById("sync_fields_btn");
+    const formatJsonBtn = document.getElementById("format_json_btn");
+    let latestStatus = null;
+    let presetCache = new Map();
+
+    function escapeHtml(value) {
+      return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
+    }
+    function normalizeSymbol(value) {
+      const raw = String(value || "").trim().toUpperCase();
+      if (!raw) return "";
+      return /(?:USDT|USDC|FDUSD|BUSD|USD_PERP)$/.test(raw) ? raw : `${raw}USDT`;
+    }
+    function currentSymbol() {
+      return normalizeSymbol(symbolInput.value || symbolSelect.value || "AIGENSYNUSDT");
+    }
+    function fmtNum(value, digits = 4) {
+      const num = Number(value);
+      if (!Number.isFinite(num)) return "--";
+      return num.toLocaleString("zh-CN", { maximumFractionDigits: digits });
+    }
+    function fmtTs(value) {
+      if (!value) return "--";
+      const dt = new Date(value);
+      return Number.isNaN(dt.getTime()) ? String(value) : dt.toLocaleString("zh-CN", { hour12: false });
+    }
+    function statusClass(value) {
+      const raw = String(value || "").toLowerCase();
+      if (raw.includes("normal") || raw.includes("make") || raw.includes("running")) return "good";
+      if (raw.includes("recover") || raw.includes("safe") || raw.includes("repair")) return "warn";
+      if (raw.includes("error") || raw.includes("stopped")) return "bad";
+      return "";
+    }
+    async function fetchEditorStatus() {
+      const symbol = currentSymbol();
+      if (!symbol) throw new Error("symbol is required");
+      const resp = await fetch(`/api/strategy_editor/status?symbol=${encodeURIComponent(symbol)}`);
+      const data = await resp.json();
+      if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+      latestStatus = data;
+      populatePresetOptions(data.presets || [], ((data.runner || {}).config || {}).strategy_profile);
+      return data;
+    }
+    function populatePresetOptions(presets, selectedKey) {
+      presetCache = new Map();
+      const options = [];
+      for (const item of presets || []) {
+        if (!item || !item.key) continue;
+        presetCache.set(String(item.key), item);
+        const label = `${item.label || item.key}${item.startable === false ? "（模板）" : ""}`;
+        options.push(`<option value="${escapeHtml(item.key)}">${escapeHtml(label)}</option>`);
+      }
+      presetSelect.innerHTML = options.length ? options.join("") : '<option value="">没有可用预设</option>';
+      if (selectedKey && presetCache.has(String(selectedKey))) {
+        presetSelect.value = String(selectedKey);
+      }
+    }
+    function renderStatus(data) {
+      const runner = data.runner || {};
+      const cfg = runner.config || {};
+      const pos = data.position || {};
+      const orders = data.orders || {};
+      const loop = data.latest_loop || {};
+      const cards = [
+        ["Runner", runner.running ? "运行中" : "未运行", runner.running ? "good" : "warn", `PID ${runner.pid || "--"} · ${runner.elapsed || "--"}`],
+        ["策略", cfg.strategy_profile || "--", "", cfg.strategy_mode || "--"],
+        ["仓位", pos.summary || "--", Number(pos.net_notional || 0) >= 0 ? "good" : "warn", `Long ${fmtNum(pos.long_notional)}U · Short ${fmtNum(pos.short_notional)}U`],
+        ["挂单", fmtNum(orders.strategy_open_order_count || 0, 0), "", `计划保留 + 本轮新挂`],
+        ["状态", loop.active_state || "--", statusClass(loop.active_state), `intent ${loop.strategy_intent || "--"}`],
+        ["修仓档", loop.repair_ladder_level || "--", statusClass(loop.repair_ladder_level), loop.error_message || "无错误信息"],
+        ["最近循环", loop.cycle !== undefined && loop.cycle !== null ? `#${loop.cycle}` : "--", "", fmtTs(loop.ts)],
+        ["刷新时间", fmtTs(data.updated_at), "", data.symbol || "--"],
+      ];
+      statusGrid.innerHTML = cards.map(([label, value, cls, sub]) => `
+        <div class="metric">
+          <div class="label">${escapeHtml(label)}</div>
+          <div class="value ${escapeHtml(cls)}">${escapeHtml(value)}</div>
+          <div class="sub">${escapeHtml(sub)}</div>
+        </div>
+      `).join("");
+      pageMeta.textContent = `已刷新 ${data.symbol} 的轻量状态。`;
+    }
+    function parseEditorJson() {
+      const text = paramsEditor.value.trim() || "{}";
+      const parsed = JSON.parse(text);
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+        throw new Error("JSON 须为对象");
+      }
+      return parsed;
+    }
+    function setEditorConfig(config, note) {
+      const payload = { ...(config || {}) };
+      payload.symbol = currentSymbol();
+      paramsEditor.value = JSON.stringify(payload, null, 2);
+      syncFieldsFromConfig(payload);
+      renderExplanation(payload);
+      editorMeta.textContent = note || "参数已载入。";
+    }
+    function syncFieldsFromConfig(config) {
+      for (const input of fieldGrid.querySelectorAll("[data-key]")) {
+        const key = input.getAttribute("data-key");
+        const value = config[key];
+        input.value = value === undefined || value === null ? "" : String(value);
+      }
+    }
+    function coerceFieldValue(input) {
+      const raw = input.value.trim();
+      if (raw === "") return undefined;
+      const type = input.getAttribute("data-type") || "string";
+      if (type === "number") {
+        const num = Number(raw);
+        if (!Number.isFinite(num)) throw new Error(`${input.getAttribute("data-key")} 不是有效数字`);
+        return num;
+      }
+      if (type === "integer") {
+        const num = Number(raw);
+        if (!Number.isFinite(num)) throw new Error(`${input.getAttribute("data-key")} 不是有效整数`);
+        return Math.trunc(num);
+      }
+      if (type === "boolean") {
+        if (/^(true|1|yes|y|on|是)$/i.test(raw)) return true;
+        if (/^(false|0|no|n|off|否)$/i.test(raw)) return false;
+        throw new Error(`${input.getAttribute("data-key")} 需要 true 或 false`);
+      }
+      return raw;
+    }
+    function mergeFieldsIntoConfig(config) {
+      const next = { ...(config || {}) };
+      for (const input of fieldGrid.querySelectorAll("[data-key]")) {
+        const key = input.getAttribute("data-key");
+        const value = coerceFieldValue(input);
+        if (value !== undefined) next[key] = value;
+      }
+      next.symbol = currentSymbol();
+      return next;
+    }
+    function slugForSymbol(symbol) {
+      return String(symbol || "symbol").trim().toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "") || "symbol";
+    }
+    function withRuntimePaths(config) {
+      const next = { ...(config || {}) };
+      const symbol = currentSymbol();
+      const slug = slugForSymbol(symbol);
+      next.symbol = symbol;
+      next.state_path = `output/${slug}_loop_state.json`;
+      next.plan_json = `output/${slug}_loop_latest_plan.json`;
+      next.submit_report_json = `output/${slug}_loop_latest_submit.json`;
+      next.summary_jsonl = `output/${slug}_loop_events.jsonl`;
+      return next;
+    }
+    function renderExplanation(config) {
+      const mode = String(config.strategy_mode || "--");
+      const profile = String(config.strategy_profile || "--");
+      const buyLevels = Number(config.buy_levels || 0);
+      const sellLevels = Number(config.sell_levels || 0);
+      const perOrder = Number(config.per_order_notional || 0);
+      const softLong = Number(config.pause_buy_position_notional || 0);
+      const hardLong = Number(config.max_position_notional || 0);
+      const softShort = Number(config.pause_short_position_notional || 0);
+      const hardShort = Number(config.max_short_position_notional || 0);
+      const totalQuote = (buyLevels + sellLevels) * perOrder;
+      const items = [
+        ["策略身份", `${profile} · ${mode}`],
+        ["挂单密度", `买 ${fmtNum(buyLevels, 0)} 档 / 卖 ${fmtNum(sellLevels, 0)} 档，单笔 ${fmtNum(perOrder)}U，单轮理论挂单名义约 ${fmtNum(totalQuote)}U。`],
+        ["多仓阈值", `软停买 ${fmtNum(softLong)}U，硬上限 ${fmtNum(hardLong)}U。进入修仓后应减少新增买单，把成交重心让给减仓。`],
+        ["空仓阈值", `软停空 ${fmtNum(softShort)}U，硬上限 ${fmtNum(hardShort)}U。中性或做空策略会用这一侧控制空头修复节奏。`],
+        ["保存行为", "保存只更新本地 runner 配置；正在运行的策略不会因为这个页面自动重启。"],
+      ];
+      explainBox.innerHTML = items.map(([title, body]) => `
+        <div class="explain-item"><strong>${escapeHtml(title)}</strong><span>${escapeHtml(body)}</span></div>
+      `).join("");
+    }
+    async function refreshStatus() {
+      setBusy(true);
+      pageMeta.textContent = `正在刷新 ${currentSymbol()} 的轻量状态...`;
+      try {
+        const data = await fetchEditorStatus();
+        renderStatus(data);
+      } catch (err) {
+        pageMeta.textContent = `刷新失败: ${err}`;
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function loadCurrentConfig() {
+      setBusy(true);
+      pageMeta.textContent = `正在读取 ${currentSymbol()} 当前 runner 配置...`;
+      try {
+        const data = await fetchEditorStatus();
+        renderStatus(data);
+        const config = (data.runner || {}).config || {};
+        setEditorConfig(config, `已载入 ${data.symbol} 当前参数。`);
+      } catch (err) {
+        editorMeta.textContent = `载入当前参数失败: ${err}`;
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function loadPresetConfig() {
+      setBusy(true);
+      try {
+        if (!presetCache.size) {
+          const data = await fetchEditorStatus();
+          renderStatus(data);
+        }
+        let key = presetSelect.value;
+        if (!key && latestStatus && latestStatus.runner && latestStatus.runner.config) {
+          key = String(latestStatus.runner.config.strategy_profile || "");
+        }
+        if (!key && presetCache.size) {
+          key = presetCache.keys().next().value;
+        }
+        const preset = presetCache.get(String(key));
+        if (!preset) throw new Error("请选择可用预设");
+        const config = withRuntimePaths({ ...(preset.config || {}), strategy_profile: preset.key });
+        setEditorConfig(config, `已载入预设：${preset.label || preset.key}`);
+        presetSelect.value = preset.key;
+      } catch (err) {
+        editorMeta.textContent = `载入预设参数失败: ${err}`;
+      } finally {
+        setBusy(false);
+      }
+    }
+    async function saveParams() {
+      setBusy(true);
+      try {
+        const parsed = parseEditorJson();
+        const payload = mergeFieldsIntoConfig(parsed);
+        paramsEditor.value = JSON.stringify(payload, null, 2);
+        const resp = await fetch("/api/runner/save", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await resp.json();
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        editorMeta.textContent = `保存成功：${payload.symbol} · ${payload.strategy_profile || "--"}`;
+      } catch (err) {
+        editorMeta.textContent = `保存失败: ${err}`;
+      } finally {
+        setBusy(false);
+      }
+    }
+    function formatJson() {
+      try {
+        const parsed = parseEditorJson();
+        paramsEditor.value = JSON.stringify(parsed, null, 2);
+        syncFieldsFromConfig(parsed);
+        renderExplanation(parsed);
+        editorMeta.textContent = "JSON 已格式化。";
+      } catch (err) {
+        editorMeta.textContent = `JSON 解析失败: ${err}`;
+      }
+    }
+    function syncFieldsToJson() {
+      try {
+        const parsed = parseEditorJson();
+        const merged = mergeFieldsIntoConfig(parsed);
+        paramsEditor.value = JSON.stringify(merged, null, 2);
+        renderExplanation(merged);
+        fieldMeta.textContent = "常用参数已同步到 JSON。";
+      } catch (err) {
+        fieldMeta.textContent = `同步失败: ${err}`;
+      }
+    }
+    function setBusy(disabled) {
+      for (const btn of [refreshStatusBtn, loadCurrentBtn, loadPresetBtn, saveParamsBtn, syncFieldsBtn, formatJsonBtn]) {
+        btn.disabled = disabled;
+      }
+    }
+    symbolSelect.addEventListener("change", () => { symbolInput.value = symbolSelect.value; });
+    refreshStatusBtn.addEventListener("click", refreshStatus);
+    loadCurrentBtn.addEventListener("click", loadCurrentConfig);
+    loadPresetBtn.addEventListener("click", loadPresetConfig);
+    saveParamsBtn.addEventListener("click", saveParams);
+    syncFieldsBtn.addEventListener("click", syncFieldsToJson);
+    formatJsonBtn.addEventListener("click", formatJson);
+    paramsEditor.addEventListener("input", () => {
+      try {
+        const parsed = parseEditorJson();
+        syncFieldsFromConfig(parsed);
+        renderExplanation(parsed);
+        editorMeta.textContent = "JSON 可解析，尚未保存。";
+      } catch (_err) {
+        editorMeta.textContent = "JSON 暂不可解析，保存前需要修正。";
+      }
+    });
+  </script>
+</body>
+</html>
+"""
 
 COMPETITION_VOLUME_PAGE = """<!doctype html>
 <html lang="zh-CN">
@@ -31250,6 +32033,140 @@ def _run_loop_monitor_query(query: dict[str, list[str]]) -> dict[str, Any]:
     return snapshot
 
 
+def _normalize_strategy_editor_symbol(symbol: str) -> str:
+    normalized = re.sub(r"[^A-Za-z0-9_]+", "", str(symbol or "").upper().strip())
+    if not normalized:
+        raise ValueError("symbol is required")
+    if normalized.endswith(("USDT", "USDC", "FDUSD", "BUSD", "USD_PERP")):
+        return normalized
+    return f"{normalized}USDT"
+
+
+def _strategy_editor_latest_jsonl_row(path: Path) -> dict[str, Any]:
+    rows = _read_running_status_jsonl_tail(path, limit=1)
+    if not rows:
+        return {}
+    latest = rows[-1]
+    return latest if isinstance(latest, dict) else {}
+
+
+def _strategy_editor_position_summary(long_notional: float, short_notional: float, net_notional: float) -> str:
+    if long_notional <= 0 and short_notional <= 0:
+        return "空仓"
+    if long_notional > 0 and short_notional > 0:
+        return f"Long {long_notional:.4f}U / Short {short_notional:.4f}U"
+    if net_notional >= 0:
+        return f"LONG {long_notional:.4f}U"
+    return f"SHORT {short_notional:.4f}U"
+
+
+def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
+    normalized_symbol = _normalize_strategy_editor_symbol(symbol)
+    config = _load_runner_control_config(normalized_symbol)
+    runner = _read_runner_process_for_symbol(normalized_symbol)
+    if isinstance(runner, dict):
+        runner = dict(runner)
+    else:
+        runner = {}
+    runner_config = runner.get("config") if isinstance(runner.get("config"), dict) else {}
+    if runner_config:
+        runner_config_symbol = str(runner_config.get("symbol", "")).upper().strip()
+        if not runner_config_symbol or runner_config_symbol == normalized_symbol:
+            merged_config = dict(config)
+            merged_config.update(runner_config)
+            config = _normalize_runner_runtime_paths(merged_config, normalized_symbol)
+    config["symbol"] = normalized_symbol
+    config = _normalize_runner_runtime_paths(dict(config), normalized_symbol)
+
+    runtime_paths = _default_runtime_paths_for_symbol(normalized_symbol)
+    summary_path = Path(str(config.get("summary_jsonl") or runtime_paths["summary_jsonl"]))
+    plan_path = Path(str(config.get("plan_json") or runtime_paths["plan_json"]))
+    submit_report_path = Path(str(config.get("submit_report_json") or runtime_paths["submit_report_json"]))
+    latest_event = _strategy_editor_latest_jsonl_row(summary_path)
+    plan_report = _read_json_dict(plan_path) or {}
+    submit_report = _read_json_dict(submit_report_path) or {}
+    runtime_snapshot = _build_status_runtime_snapshot(
+        runner={**runner, "config": config},
+        plan_report=plan_report,
+        submit_report=submit_report,
+    )
+    market = runtime_snapshot.get("market") if isinstance(runtime_snapshot.get("market"), dict) else {}
+    position = runtime_snapshot.get("position") if isinstance(runtime_snapshot.get("position"), dict) else {}
+    mid_price = _status_float(market.get("mid_price"))
+    long_qty = max(_status_float(position.get("long_qty")), 0.0)
+    short_qty = max(_status_float(position.get("short_qty")), 0.0)
+    long_notional = _status_float(plan_report.get("current_long_notional"))
+    short_notional = _status_float(plan_report.get("current_short_notional"))
+    if long_notional <= 0 and mid_price > 0:
+        long_notional = long_qty * mid_price
+    if short_notional <= 0 and mid_price > 0:
+        short_notional = short_qty * mid_price
+    net_notional = long_notional - short_notional
+    elastic_volume = plan_report.get("elastic_volume") if isinstance(plan_report.get("elastic_volume"), dict) else {}
+    active_state = (
+        plan_report.get("active_state")
+        or plan_report.get("elastic_state")
+        or latest_event.get("active_state")
+        or latest_event.get("elastic_state")
+        or ""
+    )
+    latest_loop = {
+        "ts": latest_event.get("ts") or latest_event.get("timestamp") or plan_report.get("ts"),
+        "cycle": latest_event.get("cycle") if latest_event.get("cycle") is not None else plan_report.get("cycle"),
+        "strategy_intent": plan_report.get("strategy_intent") or latest_event.get("strategy_intent") or "",
+        "active_state": active_state,
+        "repair_ladder_level": (
+            elastic_volume.get("repair_ladder_level")
+            or plan_report.get("repair_ladder_level")
+            or latest_event.get("repair_ladder_level")
+            or ""
+        ),
+        "error_message": (
+            plan_report.get("error_message")
+            or latest_event.get("error_message")
+            or latest_event.get("error")
+            or ""
+        ),
+    }
+    open_orders = runtime_snapshot.get("open_orders") if isinstance(runtime_snapshot.get("open_orders"), list) else []
+    return {
+        "ok": True,
+        "symbol": normalized_symbol,
+        "runner": {
+            "running": bool(runner.get("is_running")),
+            "is_running": bool(runner.get("is_running")),
+            "pid": runner.get("pid"),
+            "elapsed": runner.get("elapsed"),
+            "configured": bool(runner.get("configured")),
+            "scope": runner.get("scope"),
+            "config": config,
+        },
+        "position": {
+            "summary": _strategy_editor_position_summary(long_notional, short_notional, net_notional),
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+            "long_notional": long_notional,
+            "short_notional": short_notional,
+            "net_notional": net_notional,
+            "unrealized_pnl": _status_float(position.get("unrealized_pnl")),
+            "mid_price": mid_price,
+        },
+        "orders": {
+            "strategy_open_order_count": len(open_orders),
+            "buy_count": sum(1 for item in open_orders if str((item or {}).get("side", "")).upper() == "BUY"),
+            "sell_count": sum(1 for item in open_orders if str((item or {}).get("side", "")).upper() == "SELL"),
+        },
+        "latest_loop": latest_loop,
+        "paths": {
+            "summary_jsonl": str(summary_path),
+            "plan_json": str(plan_path),
+            "submit_report_json": str(submit_report_path),
+        },
+        "presets": _runner_preset_summaries(normalized_symbol),
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def _running_status_server_entries() -> list[dict[str, str]]:
     raw = os.environ.get("GRID_RUNNING_STATUS_SERVERS", "").strip()
     local_urls = {
@@ -32341,6 +33258,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/runner_settings", "/runner_settings.html"}:
             self._send_html(RUNNER_SETTINGS_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/strategy_editor", "/strategy_editor.html"}:
+            self._send_html(STRATEGY_EDITOR_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/manual_trade", "/manual_trade.html"}:
             self._send_html(MANUAL_TRADE_PAGE, status=HTTPStatus.OK)
             return
@@ -32492,6 +33412,21 @@ class _Handler(BaseHTTPRequestHandler):
         if path.startswith("/api/loop_monitor"):
             try:
                 payload = _run_loop_monitor_query(query)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
+            return
+        if path == "/api/strategy_editor/status":
+            symbol = str(query.get("symbol", [""])[0]).upper().strip()
+            if not symbol:
+                self._send_json({"ok": False, "error": "symbol is required"}, status=400)
+                return
+            try:
+                payload = _build_strategy_editor_status(symbol)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
                 return
@@ -32748,6 +33683,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/strategy_editor", "/strategy_editor.html"}:
+            body = STRATEGY_EDITOR_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/manual_trade", "/manual_trade.html"}:
             body = MANUAL_TRADE_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -32786,6 +33727,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/running_status_overview"
             or path == "/api/strategy_workspace"
             or path.startswith("/api/loop_monitor")
+            or path == "/api/strategy_editor/status"
             or path == "/api/running_status"
             or path == "/api/grid_preview"
             or path == "/api/competition_board"
