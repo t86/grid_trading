@@ -182,6 +182,32 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual([order["price"] for order in plan["buy_orders"]], [0.15968, 0.15949])
         self.assertEqual([order["price"] for order in plan["sell_orders"]], [0.15969, 0.15988])
 
+    def test_ladder_falls_back_to_fewer_slots_when_split_orders_are_too_small(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_entry_orders_per_side=2,
+                min_cycle_budget_notional=6.0,
+            ),
+            inputs=_inputs(
+                bid_price=0.6006,
+                ask_price=0.6007,
+                mid_price=0.60065,
+                cycle_budget_notional=14.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                entry_ladder_spacing=0.00025,
+            ),
+        )
+
+        self.assertEqual(len(plan["buy_orders"]), 1)
+        self.assertEqual(len(plan["sell_orders"]), 1)
+        self.assertGreaterEqual(plan["buy_orders"][0]["notional"], 5.0)
+        self.assertGreaterEqual(plan["sell_orders"][0]["notional"], 5.0)
+
     def test_hedge_mode_entries_use_long_and_short_position_sides(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(enabled=True),
