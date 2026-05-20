@@ -2814,8 +2814,14 @@ def apply_hard_loss_forced_reduce(
     min_qty: float | None,
     min_notional: float | None,
     reason: str | None = None,
+    strategy_mode: str = "one_way_long",
 ) -> dict[str, Any]:
     normalized_side = str(side or "").upper().strip()
+    position_side = (
+        ("LONG" if normalized_side == "SELL" else "SHORT")
+        if str(strategy_mode or "").strip() == "hedge_neutral"
+        else "BOTH"
+    )
     report = {
         "enabled": bool(enabled),
         "active": False,
@@ -2873,7 +2879,7 @@ def apply_hard_loss_forced_reduce(
         "qty": qty,
         "notional": notional,
         "role": "hard_loss_forced_reduce_long" if normalized_side == "SELL" else "hard_loss_forced_reduce_short",
-        "position_side": "BOTH",
+        "position_side": position_side,
         "force_reduce_only": True,
         "execution_type": "aggressive",
         "time_in_force": "IOC",
@@ -7400,8 +7406,14 @@ def _build_adverse_reduce_order(
     min_qty: float | None,
     min_notional: float | None,
     aggressive: bool,
+    strategy_mode: str = "one_way_long",
 ) -> dict[str, Any] | None:
     normalized_side = str(side or "").upper().strip()
+    position_side = (
+        ("LONG" if normalized_side == "SELL" else "SHORT")
+        if str(strategy_mode or "").strip() == "hedge_neutral"
+        else "BOTH"
+    )
     rounded_price = _round_order_price(max(_safe_float(price), 0.0), tick_size, normalized_side)
     if rounded_price is None or rounded_price <= 0:
         return None
@@ -7418,7 +7430,7 @@ def _build_adverse_reduce_order(
         "qty": desired_qty,
         "notional": notional,
         "role": "adverse_reduce_long" if normalized_side == "SELL" else "adverse_reduce_short",
-        "position_side": "BOTH",
+        "position_side": position_side,
         "force_reduce_only": True,
         "execution_type": "aggressive" if aggressive else "maker",
         "time_in_force": "IOC" if aggressive else "GTX",
@@ -7446,6 +7458,7 @@ def apply_adverse_inventory_reduce(
     min_qty: float | None,
     min_notional: float | None,
     maker_timeout_seconds: float = 60.0,
+    strategy_mode: str = "one_way_long",
 ) -> dict[str, Any]:
     state_key = "adverse_inventory_reduce"
     safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
@@ -7499,6 +7512,7 @@ def apply_adverse_inventory_reduce(
             min_qty=min_qty,
             min_notional=min_notional,
             aggressive=aggressive,
+            strategy_mode=strategy_mode,
         )
         adverse_report[f"{normalized_key}_elapsed_seconds"] = elapsed
         adverse_report[f"{normalized_key}_aggressive"] = aggressive
@@ -14552,6 +14566,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     if hard_reduce_disarmed
                     else exposure_escalation.get("reason")
                 ),
+                strategy_mode=strategy_mode,
             )
             hard_loss_forced_reduce["unrealized_pnl"] = _safe_float(exposure_escalation.get("unrealized_pnl"))
         target_base_qty = plan["target_base_qty"]
@@ -14642,6 +14657,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         min_qty=symbol_info.get("min_qty"),
         min_notional=symbol_info.get("min_notional"),
         maker_timeout_seconds=getattr(effective_args, "adverse_reduce_maker_timeout_seconds", 45.0),
+        strategy_mode=strategy_mode,
     )
     if not hard_loss_forced_reduce.get("active") and bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)):
         hard_loss_limit = max(_safe_float(getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None)), 0.0)
@@ -14696,6 +14712,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if hard_reduce_disarmed
                 else "hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered"
             ),
+            strategy_mode=strategy_mode,
         )
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis

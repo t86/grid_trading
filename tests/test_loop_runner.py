@@ -1990,6 +1990,31 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(order["notional"], 400.0)
         self.assertEqual(plan["forced_reduce_orders"], [order])
 
+    def test_apply_hard_loss_forced_reduce_uses_hedge_position_side(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="SELL",
+            current_qty=888.0,
+            current_notional=531.42,
+            target_notional=30.0,
+            max_order_notional=10.0,
+            bid_price=0.5984,
+            ask_price=0.5985,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+            strategy_mode="hedge_neutral",
+        )
+
+        self.assertTrue(report["active"])
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+
     def test_apply_hard_loss_forced_reduce_stops_when_target_above_current(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
 
@@ -2517,6 +2542,53 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
         self.assertEqual(plan["buy_orders"][0]["role"], "adverse_reduce_short")
         self.assertLessEqual(plan["buy_orders"][0]["notional"], 120.0)
+
+    def test_apply_adverse_inventory_reduce_uses_hedge_position_side(self) -> None:
+        report = assess_adverse_inventory_reduce(
+            enabled=True,
+            mid_price=0.59845,
+            current_long_qty=888.0,
+            current_long_notional=531.42,
+            current_short_qty=0.0,
+            current_short_notional=0.0,
+            current_long_cost_price=0.60478,
+            current_short_cost_price=0.0,
+            current_long_cost_basis_source="actual_position_long",
+            current_short_cost_basis_source=None,
+            pause_long_position_notional=520.0,
+            pause_short_position_notional=520.0,
+            long_trigger_ratio=0.004,
+            short_trigger_ratio=0.004,
+        )
+
+        self.assertTrue(report["long_active"])
+        plan = {"bootstrap_orders": [], "buy_orders": [], "sell_orders": []}
+        updated = apply_adverse_inventory_reduce(
+            plan=plan,
+            state={},
+            report=report,
+            now=datetime(2026, 5, 20, 8, 30, tzinfo=timezone.utc),
+            current_long_qty=888.0,
+            current_long_notional=531.42,
+            current_short_qty=0.0,
+            current_short_notional=0.0,
+            pause_long_position_notional=520.0,
+            pause_short_position_notional=520.0,
+            target_ratio=0.35,
+            max_order_notional=10.0,
+            bid_price=0.5984,
+            ask_price=0.5985,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            maker_timeout_seconds=30.0,
+            strategy_mode="hedge_neutral",
+        )
+
+        self.assertEqual(updated["placed_reduce_orders"], 1)
+        self.assertEqual(plan["sell_orders"][0]["role"], "adverse_reduce_long")
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
 
     def test_apply_adverse_inventory_reduce_probes_short_below_pause_when_adverse(self) -> None:
         report = assess_adverse_inventory_reduce(
