@@ -25711,6 +25711,24 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
     function renderDiagnosticsKv(rows) {
       return `<div class="diagnostics-kv">${rows.map(([label, value]) => `<span>${escapeHtml(label)}: ${escapeHtml(value)}</span>`).join("")}</div>`;
     }
+    function hasDiagnosticValue(item, key) {
+      return Object.prototype.hasOwnProperty.call(item || {}, key) && item[key] !== null && item[key] !== undefined;
+    }
+    function formatDiagnosticValue(value) {
+      if (value === null || value === undefined) return "--";
+      if (Array.isArray(value)) return value.length ? value.map((part) => formatDiagnosticValue(part)).join(", ") : "[]";
+      if (typeof value === "object") {
+        try {
+          return JSON.stringify(value);
+        } catch (_err) {
+          return String(value);
+        }
+      }
+      if (typeof value === "number") return Number.isFinite(value) ? fmtNum(value) : "--";
+      if (typeof value === "boolean") return value ? "true" : "false";
+      const text = String(value);
+      return text ? text : "--";
+    }
     function renderDiagnostics(data) {
       const diagnostics = data.strategy_diagnostics || {};
       const sections = Array.isArray(diagnostics.sections) ? diagnostics.sections : [];
@@ -25737,6 +25755,13 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
         const items = Array.isArray(section.items) ? section.items : [];
         const itemsHtml = items.length ? items.map((item) => {
           const severity = String(item.severity || "info").toLowerCase();
+          const valueRows = [];
+          if (hasDiagnosticValue(item, "current_value")) {
+            valueRows.push(["当前值", formatDiagnosticValue(item.current_value)]);
+          }
+          if (hasDiagnosticValue(item, "expected_value")) {
+            valueRows.push(["参考值", formatDiagnosticValue(item.expected_value)]);
+          }
           const detailRows = [
             ["为什么", item.why],
             ["影响", item.impact],
@@ -25750,6 +25775,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
                 <code>${escapeHtml(item.key || "")}</code>
                 <span class="${escapeHtml(severity === "blocker" ? "bad" : severity === "warning" ? "warn" : severity === "ok" ? "good" : "")}">${escapeHtml(diagnosticsStatusLabel(severity))}</span>
               </div>
+              ${valueRows.length ? renderDiagnosticsKv(valueRows) : ""}
               <div class="diagnostics-detail-grid">
                 ${detailRows.map(([label, value]) => `<div class="diagnostics-detail"><b>${escapeHtml(label)}</b> ${escapeHtml(value || "--")}</div>`).join("")}
               </div>
