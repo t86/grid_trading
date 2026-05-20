@@ -23,13 +23,14 @@ def build_strategy_diagnostics(
     volume_targets: Sequence[float] = DEFAULT_VOLUME_TARGETS,
 ) -> dict[str, Any]:
     """Build a lightweight report-only diagnostic summary for strategy editor."""
-    del orders, plan_report
+    del orders
     cfg = dict(config or {})
     startup = dict(startup_preflight or {})
     safety = dict(safety_preflight or {})
     pos = dict(position or {})
     pos_mode = dict(position_mode or {})
     loop = dict(latest_loop or {})
+    plan = dict(plan_report or {})
     submit = dict(submit_report or {})
 
     estimated_order_count = max(
@@ -55,10 +56,10 @@ def build_strategy_diagnostics(
         _empty_section("loss_and_stop_guards", "亏损与停止保护"),
         _empty_section("takeover_modules", "接管模块"),
         _inventory_section(cfg, pos),
-        _state_section(loop, submit, runner_running),
+        _state_section(loop, plan, submit, runner_running),
         _profile_boundary_section(startup, cfg),
     ]
-    targets = _volume_target_items(volume_targets, estimated_notional, safety)
+    targets = _volume_target_items(volume_targets, estimated_order_count, estimated_notional, safety, cfg)
     sections.append(
         {
             "key": "volume_targets",
@@ -71,7 +72,14 @@ def build_strategy_diagnostics(
     blocker_count = sum(1 for section in sections for item in section["items"] if item["severity"] == "blocker")
     warning_count = sum(1 for section in sections for item in section["items"] if item["severity"] == "warning")
     status = "blocked" if blocker_count else "warning" if warning_count else "ready"
-    mode = _classify_state(loop, submit, runner_running)
+    mode = _classify_state(loop, plan, submit, runner_running)
+    no_submit_reason = _first_text(
+        plan.get("no_submit_reason"),
+        plan.get("no_submit_reasons"),
+        loop.get("no_submit_reason"),
+        submit.get("no_submit_reason"),
+        submit.get("no_submit_reasons"),
+    )
 
     return {
         "status": status,
@@ -93,15 +101,188 @@ def build_strategy_diagnostics(
         },
         "state": {
             "mode": mode,
-            "active_state": str(loop.get("active_state") or ""),
-            "repair_ladder_level": str(loop.get("repair_ladder_level") or ""),
-            "error_message": str(loop.get("error_message") or submit.get("error_message") or submit.get("error") or ""),
+            "active_state": str(loop.get("active_state") or plan.get("active_state") or ""),
+            "repair_ladder_level": str(loop.get("repair_ladder_level") or plan.get("repair_ladder_level") or ""),
+            "error_message": str(
+                loop.get("error_message")
+                or plan.get("error_message")
+                or submit.get("error_message")
+                or submit.get("error")
+                or no_submit_reason
+                or ""
+            ),
+            "no_submit_reason": no_submit_reason,
         },
     }
 
 
 def _startup_section(startup: Mapping[str, Any], safety: Mapping[str, Any], position_mode: Mapping[str, Any]) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
+    blocker_codes = _string_list(startup.get("blocker_codes"))
+    warning_codes = _string_list(startup.get("warning_codes"))
+    ignored_params = _string_list(startup.get("ignored_params"))
+    unknown_params = _string_list(startup.get("unknown_params"))
+    strict_ok = _optional_bool(startup.get("strict_ok"))
+    schema_known = _optional_bool(startup.get("schema_known"))
+    if schema_known is None:
+        schema_known = _optional_bool(startup.get("profile_schema_known"))
+    required_mode = str(startup.get("required_position_mode") or "").strip()
+    required_mode_defaulted = _optional_bool(startup.get("required_position_mode_defaulted")) is True
+
+    if blocker_codes:
+        items.append(
+            _diagnostic_item(
+                key="blocker_codes",
+                severity="blocker",
+                category="blocks_start",
+                current_value=blocker_codes,
+                active=True,
+                title="启动阻塞码",
+                why=f"startup_preflight 报告阻塞码: {', '.join(blocker_codes)}。",
+                impact="这些阻塞码表示 runner 启动前应被拦截，避免进入错误或高风险挂单循环。",
+                suggestion="逐一处理阻塞码对应的参数、账户模式或 profile schema 问题后再启动。",
+                tradeoff="清除阻塞通常需要修正配置，或在确认风险后放宽对应安全保护。",
+                related_params=blocker_codes,
+            )
+        )
+
+    if warning_codes:
+        items.append(
+            _diagnostic_item(
+                key="warning_codes",
+                severity="warning",
+                category="blocks_start",
+                current_value=warning_codes,
+                active=True,
+                title="启动预警码",
+                why=f"startup_preflight 报告预警码: {', '.join(warning_codes)}。",
+                impact="这些预警不会必然阻止启动，但可能导致参数被忽略、冲量受限或账户模式解释不明确。",
+                suggestion="启动前确认每个预警码是否符合当前策略意图。",
+                tradeoff="忽略预警可以更快启动，但后续排查策略为何不按预期挂单会更困难。",
+                related_params=warning_codes,
+            )
+        )
+
+    if strict_ok is not None:
+        severity = "ok" if strict_ok else "blocker"
+        items.append(
+            _diagnostic_item(
+                key="strict_schema",
+                severity=severity,
+                category="outside_profile",
+                current_value=strict_ok,
+                expected_value=True,
+                active=not strict_ok,
+                title="严格 profile schema 检查",
+                why=(
+                    "strict_ok=true，当前 profile schema 未发现 active unknown params。"
+                    if strict_ok
+                    else "strict_ok=false，当前 profile schema 发现未知 active 参数。"
+                ),
+                impact=(
+                    "严格 schema 检查通过，不会因为未知 active 参数阻止启动。"
+                    if strict_ok
+                    else "严格 schema 失败时，启动应被阻止，避免旧参数或拼写错误悄悄失效。"
+                ),
+                suggestion=(
+                    "保持 strict profile schema 预检开启。"
+                    if strict_ok
+                    else "删除 unknown_params，或把确实需要的参数加入对应 profile schema。"
+                ),
+                tradeoff="严格 schema 会让新增参数必须同步声明，但能显著减少配置漂移。",
+                related_params=unknown_params,
+            )
+        )
+
+    if schema_known is not None:
+        severity = "info" if schema_known else "warning"
+        items.append(
+            _diagnostic_item(
+                key="schema_known",
+                severity=severity,
+                category="outside_profile",
+                current_value=schema_known,
+                expected_value=True,
+                active=not schema_known,
+                title="profile schema 是否已知",
+                why=(
+                    "schema_known=true，当前策略 profile 有明确 schema 可用于边界检查。"
+                    if schema_known
+                    else "schema_known=false，当前策略 profile 没有明确 schema，只能做 best-effort 诊断。"
+                ),
+                impact=(
+                    "已知 schema 可以解释 allowed、ignored、unknown 参数边界。"
+                    if schema_known
+                    else "未知 schema 会降低诊断置信度，ignored/unknown 参数可能无法完整判定。"
+                ),
+                suggestion="优先使用已登记 schema 的 strategy_profile，或补齐该 profile 的 schema 定义。",
+                tradeoff="补 schema 需要维护参数白名单，但能减少启动前的不确定性。",
+                related_params=["strategy_profile"],
+            )
+        )
+
+    if ignored_params:
+        items.append(
+            _diagnostic_item(
+                key="ignored_params",
+                severity="warning",
+                category="outside_profile",
+                current_value=ignored_params,
+                active=True,
+                title="启动预检发现被忽略参数",
+                why=f"这些参数在当前 profile 边界内会被忽略: {', '.join(ignored_params)}。",
+                impact="被忽略参数不会影响实际计划，可能造成页面配置和执行行为不一致。",
+                suggestion="确认这些参数是否属于另一个 profile；不需要时从当前配置移除。",
+                tradeoff="移除无效参数会让当前配置更清楚，但切换 profile 前需要重新确认功能开关。",
+                related_params=ignored_params,
+            )
+        )
+
+    if unknown_params:
+        severity = "blocker" if (strict_ok is False or "strict_unknown_params" in blocker_codes) else "warning"
+        items.append(
+            _diagnostic_item(
+                key="unknown_params",
+                severity=severity,
+                category="outside_profile",
+                current_value=unknown_params,
+                active=True,
+                title="启动预检发现未知参数",
+                why=f"当前 profile schema 不认识这些 active 参数: {', '.join(unknown_params)}。",
+                impact=(
+                    "严格 schema 下未知 active 参数会阻止启动。"
+                    if severity == "blocker"
+                    else "未知参数可能是旧配置残留或拼写错误，实际执行不会按预期使用它们。"
+                ),
+                suggestion="删除未知参数，或把确实需要的参数加入对应 profile schema。",
+                tradeoff="保留未知参数不会带来功能收益，还会增加启动失败和误判风险。",
+                related_params=unknown_params,
+            )
+        )
+
+    if required_mode or required_mode_defaulted:
+        severity = "warning" if required_mode_defaulted else "info"
+        mode_text = required_mode or "one_way"
+        items.append(
+            _diagnostic_item(
+                key="required_position_mode",
+                severity=severity,
+                category="position_mode",
+                current_value=mode_text,
+                active=True,
+                title="启动预检持仓模式要求",
+                why=(
+                    f"required_position_mode 未显式声明，启动预检按默认 {mode_text} 解释。"
+                    if required_mode_defaulted
+                    else f"启动预检要求账户持仓模式为 {mode_text}。"
+                ),
+                impact="账户持仓模式不匹配时，启动或提交前应被拦截。",
+                suggestion="one-way 策略保持 one_way；只有明确 hedge 策略才设置 hedge。",
+                tradeoff="显式持仓模式能减少误启动，但会拒绝不匹配账户。",
+                related_params=["required_position_mode"],
+            )
+        )
+
     blocking_params = _string_list(startup.get("blocking_params")) or _string_list(safety.get("blocking_params"))
     for param in blocking_params:
         items.append(
@@ -410,10 +591,11 @@ def _threshold_items(
 
 def _state_section(
     latest_loop: Mapping[str, Any],
+    plan_report: Mapping[str, Any],
     submit_report: Mapping[str, Any],
     runner_running: bool | None,
 ) -> dict[str, Any]:
-    mode = _classify_state(latest_loop, submit_report, runner_running)
+    mode = _classify_state(latest_loop, plan_report, submit_report, runner_running)
     severity = "warning" if mode in ("repair", "blocked", "unknown") else "info"
     if mode == "blocked":
         category = "blocks_orders"
@@ -421,8 +603,23 @@ def _state_section(
         category = "forces_repair"
     else:
         category = "inventory_distance"
-    active_state = str(latest_loop.get("active_state") or latest_loop.get("state") or latest_loop.get("mode") or "")
-    ladder = str(latest_loop.get("repair_ladder_level") or "")
+    active_state = str(
+        latest_loop.get("active_state")
+        or latest_loop.get("state")
+        or latest_loop.get("mode")
+        or plan_report.get("active_state")
+        or plan_report.get("state")
+        or plan_report.get("mode")
+        or ""
+    )
+    ladder = str(latest_loop.get("repair_ladder_level") or plan_report.get("repair_ladder_level") or "")
+    no_submit_reason = _first_text(
+        plan_report.get("no_submit_reason"),
+        plan_report.get("no_submit_reasons"),
+        latest_loop.get("no_submit_reason"),
+        submit_report.get("no_submit_reason"),
+        submit_report.get("no_submit_reasons"),
+    )
     items = [
         _diagnostic_item(
             key="state_classification",
@@ -431,7 +628,7 @@ def _state_section(
             current_value=mode,
             active=mode not in ("idle", "unknown"),
             title="当前运行状态分类",
-            why=_state_why(mode, active_state, ladder),
+            why=_state_why(mode, active_state, ladder, no_submit_reason),
             impact=_state_impact(mode),
             suggestion=_state_suggestion(mode),
             tradeoff="状态分类只解释最新轻量状态，不会改变 runner 的状态机或提交行为。",
@@ -535,13 +732,13 @@ def _profile_boundary_section(startup: Mapping[str, Any], config: Mapping[str, A
 
 def _volume_target_items(
     volume_targets: Sequence[float],
+    estimated_order_count: int,
     estimated_notional: float,
     safety: Mapping[str, Any],
+    config: Mapping[str, Any],
 ) -> list[dict[str, Any]]:
     items: list[dict[str, Any]] = []
-    limiting_params = _string_list(safety.get("limiting_params"))
-    blocking_params = _string_list(safety.get("blocking_params"))
-    cap_params = [param for param in ("max_new_orders", "max_total_notional") if param in limiting_params or param in blocking_params]
+    cap_params = _execution_cap_param_names(config, estimated_order_count, estimated_notional, safety)
     cycle_notional = max(estimated_notional, 1.0)
     for target in volume_targets:
         target_notional = max(_as_float(target), 0.0)
@@ -581,6 +778,39 @@ def _volume_target_items(
     return items
 
 
+def _execution_cap_param_names(
+    config: Mapping[str, Any],
+    estimated_order_count: int,
+    estimated_notional: float,
+    safety: Mapping[str, Any],
+) -> list[str]:
+    limiting_params = set(_string_list(safety.get("limiting_params")))
+    blocking_params = set(_string_list(safety.get("blocking_params")))
+    cap_params: list[str] = []
+
+    max_new_orders = _as_float(config.get("max_new_orders"))
+    max_new_orders_limited = (
+        "max_new_orders" in limiting_params
+        or "max_new_orders" in blocking_params
+        or ("max_new_orders" in config and max_new_orders <= 0)
+        or ("max_new_orders" in config and estimated_order_count > 0 and 0 < max_new_orders < estimated_order_count)
+    )
+    if max_new_orders_limited:
+        cap_params.append("max_new_orders")
+
+    max_total_notional = _as_float(config.get("max_total_notional"))
+    max_total_limited = (
+        "max_total_notional" in limiting_params
+        or "max_total_notional" in blocking_params
+        or ("max_total_notional" in config and max_total_notional <= 0)
+        or ("max_total_notional" in config and estimated_notional > 0 and 0 < max_total_notional < estimated_notional)
+    )
+    if max_total_limited:
+        cap_params.append("max_total_notional")
+
+    return cap_params
+
+
 def _inventory_snapshot(config: Mapping[str, Any], position: Mapping[str, Any]) -> dict[str, Any]:
     long_notional = _as_float(position.get("long_notional"))
     short_notional = _as_float(position.get("short_notional"))
@@ -596,9 +826,22 @@ def _inventory_snapshot(config: Mapping[str, Any], position: Mapping[str, Any]) 
     }
 
 
-def _classify_state(latest_loop: Mapping[str, Any], submit_report: Mapping[str, Any], runner_running: bool | None) -> str:
+def _classify_state(
+    latest_loop: Mapping[str, Any],
+    plan_report: Mapping[str, Any],
+    submit_report: Mapping[str, Any],
+    runner_running: bool | None,
+) -> str:
     if runner_running is False:
         return "idle"
+    if _first_text(
+        plan_report.get("no_submit_reason"),
+        plan_report.get("no_submit_reasons"),
+        latest_loop.get("no_submit_reason"),
+        submit_report.get("no_submit_reason"),
+        submit_report.get("no_submit_reasons"),
+    ):
+        return "blocked"
     text = " ".join(
         str(value or "").strip().lower()
         for value in (
@@ -606,10 +849,13 @@ def _classify_state(latest_loop: Mapping[str, Any], submit_report: Mapping[str, 
             latest_loop.get("state"),
             latest_loop.get("mode"),
             latest_loop.get("repair_ladder_level"),
-            latest_loop.get("no_submit_reason"),
             latest_loop.get("error_message"),
+            plan_report.get("active_state"),
+            plan_report.get("state"),
+            plan_report.get("mode"),
+            plan_report.get("repair_ladder_level"),
+            plan_report.get("error_message"),
             submit_report.get("status"),
-            submit_report.get("no_submit_reason"),
             submit_report.get("error"),
             submit_report.get("error_message"),
         )
@@ -625,8 +871,16 @@ def _classify_state(latest_loop: Mapping[str, Any], submit_report: Mapping[str, 
     return "unknown"
 
 
-def _state_why(mode: str, active_state: str, ladder: str) -> str:
-    details = ", ".join(part for part in (f"active_state={active_state}" if active_state else "", f"repair_ladder_level={ladder}" if ladder else "") if part)
+def _state_why(mode: str, active_state: str, ladder: str, no_submit_reason: str = "") -> str:
+    details = ", ".join(
+        part
+        for part in (
+            f"active_state={active_state}" if active_state else "",
+            f"repair_ladder_level={ladder}" if ladder else "",
+            f"no_submit_reason={no_submit_reason}" if no_submit_reason else "",
+        )
+        if part
+    )
     if mode == "repair":
         return f"最新轻量状态包含 recover、safe、repair 或 reduce 信号，当前处于修仓状态；{details or '没有更多状态细节'}。"
     if mode == "volume":
@@ -748,6 +1002,46 @@ def _as_optional_float(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _optional_bool(value: Any) -> bool | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "y", "on"):
+        return True
+    if text in ("0", "false", "no", "n", "off"):
+        return False
+    return None
+
+
+def _first_text(*values: Any) -> str:
+    for value in values:
+        if value is None:
+            continue
+        if isinstance(value, str):
+            text = value.strip()
+            if text:
+                return text
+            continue
+        if isinstance(value, Mapping):
+            text = ", ".join(f"{key}={item}" for key, item in value.items() if str(item).strip())
+            if text:
+                return text
+            continue
+        if isinstance(value, Iterable):
+            text = ", ".join(str(item) for item in value if str(item).strip())
+            if text:
+                return text
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
 
 
 def _string_list(value: Any) -> list[str]:

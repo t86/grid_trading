@@ -143,6 +143,85 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         self.assertIn("unknown_params", keys)
         self.assertIn("required_position_mode", keys)
 
+    def test_plan_report_no_submit_reason_classifies_blocked_mode(self) -> None:
+        report = build_strategy_diagnostics(
+            config={},
+            startup_preflight={"can_start": True, "status": "ready"},
+            plan_report={
+                "active_state": "normal",
+                "no_submit_reason": "position limit reached",
+            },
+            runner_running=True,
+        )
+
+        self.assertEqual(report["mode"], "blocked")
+        state_item = _item(report, "state_machine", "state_classification")
+        self.assertEqual(state_item["current_value"], "blocked")
+        self.assertEqual(state_item["category"], "blocks_orders")
+        self.assertIn("position limit reached", state_item["why"])
+
+    def test_submit_report_no_submit_reason_classifies_blocked_mode(self) -> None:
+        report = build_strategy_diagnostics(
+            config={},
+            startup_preflight={"can_start": True, "status": "ready"},
+            submit_report={"no_submit_reason": "post only guard kept all orders"},
+            runner_running=True,
+        )
+
+        self.assertEqual(report["mode"], "blocked")
+        state_item = _item(report, "state_machine", "state_classification")
+        self.assertEqual(state_item["current_value"], "blocked")
+        self.assertIn("post only guard kept all orders", state_item["why"])
+
+    def test_volume_targets_cite_config_caps_when_safety_preflight_is_stale(self) -> None:
+        report = build_strategy_diagnostics(
+            config={
+                "buy_levels": 2,
+                "sell_levels": 2,
+                "per_order_notional": 120.0,
+                "max_new_orders": 3,
+                "max_total_notional": 400.0,
+            },
+            startup_preflight={"can_start": True, "status": "ready"},
+            safety_preflight={"limiting_params": [], "blocking_params": []},
+        )
+
+        targets = {int(item["target_notional"]): item for item in report["volume_targets"]}
+        self.assertEqual(targets[200_000]["severity"], "warning")
+        self.assertFalse(targets[200_000]["plausible"])
+        self.assertEqual(targets[200_000]["limiting_params"], ["max_new_orders", "max_total_notional"])
+        self.assertIn("max_new_orders", targets[200_000]["suggestion"])
+        self.assertIn("max_total_notional", targets[200_000]["suggestion"])
+
+    def test_startup_section_explains_schema_codes_and_profile_boundary_details(self) -> None:
+        report = build_strategy_diagnostics(
+            config={"required_position_mode": "one_way"},
+            startup_preflight={
+                "can_start": False,
+                "status": "blocked",
+                "strict_ok": False,
+                "schema_known": False,
+                "blocker_codes": ["strict_unknown_params"],
+                "warning_codes": ["required_position_mode_defaulted", "ignored_params"],
+                "ignored_params": ["hard_loss_forced_reduce_enabled"],
+                "unknown_params": ["old_cross_strategy_knob"],
+                "required_position_mode": "one_way",
+                "required_position_mode_defaulted": True,
+            },
+        )
+
+        keys = _item_keys(report, "startup")
+        self.assertIn("blocker_codes", keys)
+        self.assertIn("warning_codes", keys)
+        self.assertIn("strict_schema", keys)
+        self.assertIn("schema_known", keys)
+        self.assertIn("ignored_params", keys)
+        self.assertIn("unknown_params", keys)
+        self.assertIn("required_position_mode", keys)
+        self.assertEqual(_item(report, "startup", "strict_schema")["severity"], "blocker")
+        self.assertEqual(_item(report, "startup", "schema_known")["severity"], "warning")
+        self.assertEqual(_item(report, "startup", "unknown_params")["severity"], "blocker")
+
 
 def _section(report: dict, key: str) -> dict:
     for section in report["sections"]:
