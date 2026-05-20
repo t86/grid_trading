@@ -34,6 +34,7 @@ MIN_ORDER_QTY_BUMP_ROLES = {
     "entry_short",
     "grid_entry",
 }
+VALID_REQUIRED_POSITION_MODES = frozenset({"one_way", "hedge"})
 
 
 def _float(value: float) -> str:
@@ -65,6 +66,10 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _required_position_mode(plan_report: dict[str, Any]) -> str:
+    return str(plan_report.get("required_position_mode") or "one_way").strip().lower()
 
 
 def _quantity_decimal(value: Any) -> Decimal:
@@ -756,12 +761,20 @@ def validate_plan_report(
     errors: list[str] = []
     actions = build_execution_actions(plan_report)
     symbol = str(plan_report.get("symbol", "")).upper().strip()
+    dual_side_position = _truthy(plan_report.get("dual_side_position"))
+    required_position_mode = _required_position_mode(plan_report)
 
     if not symbol:
         errors.append("plan report is missing symbol")
     if symbol != allow_symbol.upper().strip():
         errors.append(f"symbol {symbol or '<empty>'} is not allowed; expected {allow_symbol.upper().strip()}")
-    if _truthy(plan_report.get("dual_side_position")) and not allow_dual_side_position:
+    if required_position_mode not in VALID_REQUIRED_POSITION_MODES:
+        errors.append(f"unsupported required_position_mode={required_position_mode or '<empty>'}")
+    elif required_position_mode == "one_way" and dual_side_position:
+        errors.append("plan requires one-way position mode, but account is in hedge mode")
+    elif required_position_mode == "hedge" and not dual_side_position:
+        errors.append("plan requires hedge position mode, but account is in one-way mode")
+    if dual_side_position and not allow_dual_side_position:
         errors.append("account is in hedge mode; only one-way mode is supported")
     if actions["cancel_count"] > 0 and not cancel_stale:
         errors.append("plan contains stale orders; rerun with --cancel-stale or regenerate the plan")

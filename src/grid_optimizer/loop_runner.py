@@ -80,7 +80,12 @@ from .semi_auto_plan import (
     preserve_sticky_entry_orders,
     shift_center_price,
 )
-from .strategy_profile_schema import apply_strategy_profile_schema
+from .strategy_profile_schema import (
+    HEDGE_POSITION_MODE,
+    ONE_WAY_POSITION_MODE,
+    VALID_POSITION_MODES,
+    apply_strategy_profile_schema,
+)
 from .submit_plan import (
     _build_client_order_id,
     _ignore_noop_error,
@@ -2458,6 +2463,26 @@ def _normalize_strategy_mode(strategy_mode: str) -> str:
     if normalized == BEST_QUOTE_MAKER_VOLUME_MODE:
         return "one_way_long"
     return normalized
+
+
+def _normalize_required_position_mode(
+    value: Any,
+    *,
+    default: str = ONE_WAY_POSITION_MODE,
+    allow_unknown: bool = False,
+) -> str:
+    normalized = str(value or "").strip().lower().replace("-", "_")
+    if normalized in {"oneway", "one_way_mode", "single", "single_side"}:
+        normalized = ONE_WAY_POSITION_MODE
+    elif normalized in {"dual", "dual_side", "hedge_mode"}:
+        normalized = HEDGE_POSITION_MODE
+    if not normalized:
+        normalized = str(default or ONE_WAY_POSITION_MODE).strip().lower().replace("-", "_")
+    if normalized in VALID_POSITION_MODES:
+        return normalized
+    if allow_unknown:
+        return normalized
+    return ONE_WAY_POSITION_MODE
 
 
 def _is_best_quote_short_profile(strategy_profile: str) -> bool:
@@ -9195,6 +9220,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
     open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
     dual_side_position = _truthy(position_mode.get("dualSidePosition"))
+    required_position_mode = _normalize_required_position_mode(
+        strategy_profile_schema.get("required_position_mode"),
+        default=getattr(args, "required_position_mode", ONE_WAY_POSITION_MODE),
+    )
+    position_mode_compatible = (
+        (required_position_mode == HEDGE_POSITION_MODE and dual_side_position)
+        or (required_position_mode == ONE_WAY_POSITION_MODE and not dual_side_position)
+    )
     actual_position = extract_symbol_position(account_info, symbol)
     actual_net_qty = _safe_float(actual_position.get("positionAmt"))
     prefer_entry_price_cost_basis = _uses_entry_price_cost_basis(effective_strategy_profile)
@@ -11546,6 +11579,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_strategy_label": AUTO_REGIME_PROFILE_LABELS.get(effective_strategy_profile),
         "strategy_profile_schema": strategy_profile_schema,
         "strategy_intent": elastic_volume.get("strategy_intent") or strategy_profile_schema.get("strategy_intent"),
+        "required_position_mode": required_position_mode,
+        "required_position_mode_defaulted": bool(strategy_profile_schema.get("required_position_mode_defaulted")),
+        "position_mode_compatible": position_mode_compatible,
         "active_state": elastic_volume.get("active_state"),
         "state_reason": list(elastic_volume.get("state_reason") or []),
         "allowed_sides": list(elastic_volume.get("allowed_sides") or []),
@@ -11734,6 +11770,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
 
 def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
     strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    required_position_mode = _normalize_required_position_mode(
+        plan_report.get("required_position_mode"),
+        default=getattr(args, "required_position_mode", ONE_WAY_POSITION_MODE),
+        allow_unknown=True,
+    )
     effective_max_total_notional = _safe_float(plan_report.get("effective_max_total_notional"))
     validation = validate_plan_report(
         plan_report=plan_report,
@@ -11743,7 +11784,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         cancel_stale=args.cancel_stale,
         max_plan_age_seconds=args.max_plan_age_seconds,
         now=datetime.now(timezone.utc),
-        allow_dual_side_position=(strategy_mode == "hedge_neutral"),
+        allow_dual_side_position=(required_position_mode == HEDGE_POSITION_MODE),
         enforce_place_limits=not bool(args.apply),
     )
 
@@ -11800,6 +11841,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "configuration": {
             "allow_symbol": args.symbol.upper().strip(),
             "strategy_mode": strategy_mode,
+            "required_position_mode": required_position_mode,
             "margin_type": str(args.margin_type).upper().strip(),
             "leverage": args.leverage,
             "cancel_stale": bool(args.cancel_stale),
@@ -11854,6 +11896,14 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
 
     position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
     dual_side_position = _truthy(position_mode.get("dualSidePosition"))
+    if required_position_mode not in VALID_POSITION_MODES:
+        raise RuntimeError(f"unsupported required_position_mode={required_position_mode or '<empty>'}")
+    if required_position_mode == ONE_WAY_POSITION_MODE and dual_side_position:
+        raise RuntimeError("plan requires one-way position mode, but account is in hedge mode")
+    if required_position_mode == HEDGE_POSITION_MODE and not dual_side_position:
+        raise RuntimeError("plan requires hedge position mode, but account is in one-way mode")
+    if required_position_mode == HEDGE_POSITION_MODE and strategy_mode != "hedge_neutral":
+        raise RuntimeError("hedge position mode requires strategy_mode=hedge_neutral")
     if strategy_mode == "hedge_neutral":
         if not dual_side_position:
             raise RuntimeError("中性 Hedge 策略要求账户处于双向持仓模式")
@@ -12175,6 +12225,12 @@ def _build_parser() -> argparse.ArgumentParser:
             "competition_inventory_grid",
             "maker_volatility_inventory_v1",
         ),
+    )
+    parser.add_argument(
+        "--required-position-mode",
+        type=str,
+        default=ONE_WAY_POSITION_MODE,
+        choices=(ONE_WAY_POSITION_MODE, HEDGE_POSITION_MODE),
     )
     parser.add_argument("--step-price", type=float, default=0.00002)
     parser.add_argument("--buy-levels", type=int, default=8)
@@ -13404,6 +13460,11 @@ def main() -> None:
                     "requested_strategy_mode": str(
                         plan_report.get("requested_strategy_mode") or getattr(args, "strategy_mode", "one_way_long")
                     ),
+                    "required_position_mode": str(
+                        plan_report.get("required_position_mode")
+                        or getattr(args, "required_position_mode", ONE_WAY_POSITION_MODE)
+                    ),
+                    "position_mode_compatible": bool(plan_report.get("position_mode_compatible")),
                     "mid_price": _safe_float(plan_report.get("mid_price")),
                     "center_price": _safe_float(plan_report.get("center_price")),
                     "adaptive_step": dict(plan_report.get("adaptive_step") or {}),

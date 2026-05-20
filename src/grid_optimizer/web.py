@@ -2765,6 +2765,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
         "kind": "hedge",
         "config": {
             "strategy_mode": "hedge_neutral",
+            "required_position_mode": "hedge",
             "buy_levels": 8,
             "sell_levels": 8,
             "per_order_notional": 35.0,
@@ -3199,6 +3200,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
         "config": {
             "symbol": "AIGENSYNUSDT",
             "strategy_mode": "one_way_long",
+            "required_position_mode": "one_way",
             "strict_strategy_profile_schema_enabled": True,
             "step_price": 0.00001,
             "buy_levels": 1,
@@ -3255,12 +3257,51 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "adaptive_step_enabled": False,
         },
     },
+    "aigensynusdt_hedge_bq_pingpong_sprint_v1": {
+        "label": "AIGENSYNUSDT Hedge BQ 冲量",
+        "description": "AIGENSYNUSDT 双向持仓专用的 best quote ping-pong 冲量档。Long/Short 两侧各贴 1 档，必须账户已切 Hedge Mode 后显式选择。",
+        "startable": True,
+        "kind": "hedge",
+        "symbol": "AIGENSYNUSDT",
+        "config": {
+            "symbol": "AIGENSYNUSDT",
+            "strategy_mode": "hedge_neutral",
+            "required_position_mode": "hedge",
+            "strict_strategy_profile_schema_enabled": True,
+            "step_price": 0.00001,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "per_order_notional": 750.0,
+            "startup_entry_multiplier": 1.0,
+            "base_position_notional": 0.0,
+            "flat_start_enabled": False,
+            "warm_start_enabled": True,
+            "up_trigger_steps": 1,
+            "down_trigger_steps": 1,
+            "shift_steps": 1,
+            "pause_buy_position_notional": 900.0,
+            "pause_short_position_notional": 900.0,
+            "max_position_notional": 1500.0,
+            "max_short_position_notional": 1500.0,
+            "max_total_notional": 3000.0,
+            "buy_pause_amp_trigger_ratio": 0.0065,
+            "buy_pause_down_return_trigger_ratio": -0.003,
+            "short_cover_pause_amp_trigger_ratio": 0.0065,
+            "short_cover_pause_down_return_trigger_ratio": -0.003,
+            "freeze_shift_abs_return_trigger_ratio": 0.0045,
+            "take_profit_min_profit_ratio": 0.0001,
+            "market_bias_enabled": False,
+            "adaptive_step_enabled": False,
+            "elastic_volume_enabled": False,
+        },
+    },
 }
 RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
     {
         "volume_long_v4",
         "based_volume_push_bard_v1",
         "aigensynusdt_best_quote_maker_volume_v1",
+        "aigensynusdt_hedge_bq_pingpong_sprint_v1",
         "based_competition_neutral_v1",
         "based_competition_neutral_aggressive_v1",
         "btcusdc_competition_maker_neutral_v1",
@@ -3308,6 +3349,7 @@ RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
 RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "strategy_profile": "volume_long_v4",
     "strategy_mode": "one_way_long",
+    "required_position_mode": "one_way",
     "strict_strategy_profile_schema_enabled": False,
     "symbol": "NIGHTUSDT",
     "step_price": 0.00002,
@@ -7719,6 +7761,22 @@ def _runner_preset_map(symbol: str | None = None) -> dict[str, dict[str, Any]]:
     return merged
 
 
+def _runner_required_position_mode(config: dict[str, Any], *, kind: str | None = None, strict: bool = False) -> str:
+    raw = str(config.get("required_position_mode") or "").strip().lower().replace("-", "_")
+    if raw in {"oneway", "one_way_mode", "single", "single_side"}:
+        raw = "one_way"
+    elif raw in {"dual", "dual_side", "hedge_mode"}:
+        raw = "hedge"
+    if raw in {"one_way", "hedge"}:
+        return raw
+    if raw and strict:
+        raise ValueError(f"unsupported required_position_mode: {raw}")
+    strategy_mode = str(config.get("strategy_mode", "")).strip()
+    if strategy_mode == "hedge_neutral" or str(kind or "").strip() == "hedge":
+        return "hedge"
+    return "one_way"
+
+
 def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = None) -> dict[str, Any]:
     normalized = str(profile or "").strip()
     requested_symbol = str((base_config or {}).get("symbol", "")).upper().strip()
@@ -7735,6 +7793,9 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
     resolved_symbol = str(config.get("symbol", "")).upper().strip()
     if preset_symbol and resolved_symbol and resolved_symbol != preset_symbol:
         raise ValueError(f"{preset.get('label', normalized)} requires symbol={preset_symbol}")
+    preset_kind = str(preset.get("kind") or "")
+    preset_config = preset.get("config", {}) if isinstance(preset.get("config"), dict) else {}
+    preset_required_position_mode = _runner_required_position_mode(preset_config, kind=preset_kind)
     if preset.get("kind") == "custom_grid":
         preview_params = dict(preset.get("grid_preview_params") or {})
         preview_summary = dict(preset.get("preview_summary") or {})
@@ -7757,6 +7818,7 @@ def _runner_preset_payload(profile: str, base_config: dict[str, Any] | None = No
             )
         config = _normalize_custom_grid_runtime_config(config)
     config["strategy_profile"] = normalized
+    config["required_position_mode"] = preset_required_position_mode
     return config
 
 
@@ -7774,7 +7836,8 @@ def _runner_strategy_label(profile: str, symbol: str | None = None) -> str:
 def _runner_preset_summaries(symbol: str | None = None) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for key, item in _runner_preset_map(symbol).items():
-        config = item.get("config", {})
+        config = dict(item.get("config", {}))
+        config["required_position_mode"] = _runner_required_position_mode(config, kind=str(item.get("kind") or ""))
         summaries.append(
             {
                 "key": key,
@@ -7796,7 +7859,7 @@ def _runner_preset_summaries(symbol: str | None = None) -> list[dict[str, Any]]:
                 "auto_regime_enabled": config.get("auto_regime_enabled"),
                 "grid_preview_params": item.get("grid_preview_params") if item.get("custom") else None,
                 "preview_summary": item.get("preview_summary") if item.get("custom") else None,
-                "config": dict(config),
+                "config": config,
             }
         )
     return summaries
@@ -8445,6 +8508,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "strategy_profile",
         "strategy_mode",
         "multi_timeframe_bias_mode_adapter",
+        "required_position_mode",
         "elastic_volume_mode",
         "symbol",
         "maker_volatility_window",
@@ -8637,6 +8701,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
 
     config["symbol"] = str(config.get("symbol", "NIGHTUSDT")).upper().strip() or "NIGHTUSDT"
     config["strategy_mode"] = str(config.get("strategy_mode", "one_way_long")).strip() or "one_way_long"
+    config["required_position_mode"] = _runner_required_position_mode(config, strict=True)
     config["margin_type"] = str(config.get("margin_type", "KEEP")).upper().strip() or "KEEP"
     config.update(
         normalize_runtime_guard_payload(
@@ -9006,6 +9071,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("strategy_profile", RUNNER_DEFAULT_CONFIG["strategy_profile"])),
         "--strategy-mode",
         str(config.get("strategy_mode", "one_way_long")),
+        "--required-position-mode",
+        str(config.get("required_position_mode", "one_way")),
         "--step-price",
         str(config["step_price"]),
         "--buy-levels",
@@ -18924,6 +18991,12 @@ MONITOR_PAGE = """<!doctype html>
                     <option value="hedge_neutral">双向中性</option>
                   </select>
                 </label>
+                <label>持仓模式
+                  <select id="runner_field_required_position_mode">
+                    <option value="one_way">单向持仓</option>
+                    <option value="hedge">双向持仓</option>
+                  </select>
+                </label>
                 <label>步长
                   <input id="runner_field_step_price" type="number" step="0.0000001" />
                 </label>
@@ -19828,6 +19901,7 @@ MONITOR_PAGE = """<!doctype html>
       "volume_long_v4",
       "based_volume_push_bard_v1",
       "aigensynusdt_best_quote_maker_volume_v1",
+      "aigensynusdt_hedge_bq_pingpong_sprint_v1",
       "based_competition_neutral_v1",
       "based_competition_neutral_aggressive_v1",
       "btcusdc_competition_maker_neutral_v1",
@@ -21019,6 +21093,7 @@ MONITOR_PAGE = """<!doctype html>
         config: {
           symbol: "AIGENSYNUSDT",
           strategy_mode: "one_way_long",
+          required_position_mode: "one_way",
           strict_strategy_profile_schema_enabled: true,
           step_price: 0.00001,
           buy_levels: 1,
@@ -21067,6 +21142,50 @@ MONITOR_PAGE = """<!doctype html>
           volume_trigger_stop_close_all_positions: false,
           volatility_trigger_enabled: false,
           volatility_trigger_stop_close_all_positions: false,
+          sleep_seconds: 1.5,
+          leverage: 5,
+          maker_retries: 2,
+          max_new_orders: 8,
+          autotune_symbol_enabled: false,
+          adaptive_step_enabled: false,
+        },
+      },
+      {
+        key: "aigensynusdt_hedge_bq_pingpong_sprint_v1",
+        label: "AIGENSYNUSDT Hedge BQ 冲量",
+        description: "AIGENSYNUSDT 双向持仓专用的 best quote ping-pong 冲量档。Long/Short 两侧各贴 1 档，必须账户已切 Hedge Mode 后显式选择。",
+        startable: true,
+        kind: "hedge",
+        symbol: "AIGENSYNUSDT",
+        config: {
+          symbol: "AIGENSYNUSDT",
+          strategy_mode: "hedge_neutral",
+          required_position_mode: "hedge",
+          strict_strategy_profile_schema_enabled: true,
+          step_price: 0.00001,
+          buy_levels: 1,
+          sell_levels: 1,
+          per_order_notional: 750.0,
+          startup_entry_multiplier: 1.0,
+          base_position_notional: 0.0,
+          flat_start_enabled: false,
+          warm_start_enabled: true,
+          up_trigger_steps: 1,
+          down_trigger_steps: 1,
+          shift_steps: 1,
+          pause_buy_position_notional: 900.0,
+          pause_short_position_notional: 900.0,
+          max_position_notional: 1500.0,
+          max_short_position_notional: 1500.0,
+          max_total_notional: 3000.0,
+          buy_pause_amp_trigger_ratio: 0.0065,
+          buy_pause_down_return_trigger_ratio: -0.003,
+          short_cover_pause_amp_trigger_ratio: 0.0065,
+          short_cover_pause_down_return_trigger_ratio: -0.003,
+          freeze_shift_abs_return_trigger_ratio: 0.0045,
+          take_profit_min_profit_ratio: 0.0001,
+          market_bias_enabled: false,
+          elastic_volume_enabled: false,
           sleep_seconds: 1.5,
           leverage: 5,
           maker_retries: 2,
@@ -21744,6 +21863,7 @@ MONITOR_PAGE = """<!doctype html>
         kind: "hedge",
         config: {
           strategy_mode: "hedge_neutral",
+          required_position_mode: "hedge",
           buy_levels: 8,
           sell_levels: 8,
           per_order_notional: 35,
@@ -22117,6 +22237,7 @@ MONITOR_PAGE = """<!doctype html>
         description: "小币赛道，目前展示 AIGENSYN 贴盘口冲量、ORDIUSDC 三档和 TRUMPUSDC 做多 v4。",
         presetKeys: [
           "aigensynusdt_best_quote_maker_volume_v1",
+          "aigensynusdt_hedge_bq_pingpong_sprint_v1",
           "ordiusdc_competition_maker_neutral_conservative_v1",
           "ordiusdc_competition_maker_neutral_v1",
           "ordiusdc_competition_maker_neutral_aggressive_v1",
@@ -22147,6 +22268,7 @@ MONITOR_PAGE = """<!doctype html>
     const LONG_ONLY_RUNNER_MODE_LIST = ["one_way_long"];
     const RUNNER_FORM_FIELDS = [
       { key: "strategy_mode", id: "runner_field_strategy_mode", type: "string", defaultValue: "one_way_long" },
+      { key: "required_position_mode", id: "runner_field_required_position_mode", type: "string", defaultValue: "one_way" },
       { key: "step_price", id: "runner_field_step_price", type: "number", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "buy_levels", id: "runner_field_buy_levels", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "sell_levels", id: "runner_field_sell_levels", type: "integer", modes: GRID_BASED_RUNNER_MODE_LIST },
@@ -22286,6 +22408,7 @@ MONITOR_PAGE = """<!doctype html>
     const RUNNER_PARAM_EXPLAIN = {
       strategy_profile: "策略模板标识。用于区分量优先做空、做多、防守或自定义策略。",
       strategy_mode: "策略方向/模式。one_way_long 做多，one_way_short 做空，neutral/synthetic 是中性或合成中性，competition_inventory_grid 是成交驱动的竞赛库存网格。",
+      required_position_mode: "账户持仓模式要求。默认 one_way；只有明确的 Hedge 策略才设为 hedge，启动前会按该字段拦截不兼容账户。",
       symbol: "当前交易对。",
       step_price: "相邻网格之间的固定价差。越小越贴近盘口、成交更密，但更容易因为手续费和反复换手产生磨损。",
       buy_levels: "买单层数。层数越多，向下承接更深，但资金占用也更高。",
@@ -23144,6 +23267,14 @@ MONITOR_PAGE = """<!doctype html>
           "这是交易赛后段冲量模板，不是低磨损日常模板；盘口深度不足时应先降 per_order_notional。",
           "已启用 strict profile schema，synthetic、custom grid、market bias 等无关模块不会混进来。",
           "elastic repair 会在库存进入修仓态时清入口、只留 reduceOnly，并在报告里显示 repair_inventory。"
+        ],
+      },
+      aigensynusdt_hedge_bq_pingpong_sprint_v1: {
+        summary: "AIGENSYNUSDT 的双向持仓 best quote 冲量档。Long/Short 两边各贴 1 档，默认单笔 750U，只适合已切 Hedge Mode 的账户。",
+        focus: [
+          "这是显式 opt-in 的 hedge 策略，required_position_mode 必须是 hedge；单向账户会在提交前被拦截。",
+          "双向模式能同时保留 long 与 short 两侧库存，适合比赛最后阶段盘口深、成交量大时短时间拉高成交额。",
+          "两侧 pause 和 hard 上限都默认 900U/1500U，超限后应优先修对应方向仓位，而不是继续扩仓。"
         ],
       },
       volatility_defensive_v1: {
@@ -25416,6 +25547,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
           <div class="fields" id="field_grid">
             <label>strategy_profile<input data-key="strategy_profile" type="text" spellcheck="false" /></label>
             <label>strategy_mode<input data-key="strategy_mode" type="text" spellcheck="false" /></label>
+            <label>required_position_mode<input data-key="required_position_mode" type="text" spellcheck="false" /></label>
             <label>step_price<input data-key="step_price" data-type="number" type="number" step="0.0000001" /></label>
             <label>buy_levels<input data-key="buy_levels" data-type="integer" type="number" step="1" /></label>
             <label>sell_levels<input data-key="sell_levels" data-type="integer" type="number" step="1" /></label>
@@ -25522,7 +25654,8 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
       for (const item of presets || []) {
         if (!item || !item.key) continue;
         presetCache.set(String(item.key), item);
-        const label = `${item.label || item.key}${item.startable === false ? "（模板）" : ""}`;
+        const requiredMode = item.config && item.config.required_position_mode ? ` · ${item.config.required_position_mode}` : "";
+        const label = `${item.label || item.key}${requiredMode}${item.startable === false ? "（模板）" : ""}`;
         options.push(`<option value="${escapeHtml(item.key)}">${escapeHtml(label)}</option>`);
       }
       presetSelect.innerHTML = options.length ? options.join("") : '<option value="">没有可用预设</option>';
@@ -25534,11 +25667,16 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
       const runner = data.runner || {};
       const cfg = runner.config || {};
       const pos = data.position || {};
+      const positionMode = data.position_mode || {};
       const orders = data.orders || {};
       const loop = data.latest_loop || {};
+      const modeCompatible = positionMode.compatible;
+      const modeClass = modeCompatible === true ? "good" : modeCompatible === false ? "bad" : "";
+      const currentMode = positionMode.current || "未知";
       const cards = [
         ["Runner", runner.running ? "运行中" : "未运行", runner.running ? "good" : "warn", `PID ${runner.pid || "--"} · ${runner.elapsed || "--"}`],
         ["策略", cfg.strategy_profile || "--", "", cfg.strategy_mode || "--"],
+        ["持仓模式", positionMode.required || cfg.required_position_mode || "--", modeClass, `当前 ${currentMode} · ${modeCompatible === false ? "不兼容" : modeCompatible === true ? "兼容" : "未确认"}`],
         ["仓位", pos.summary || "--", Number(pos.net_notional || 0) >= 0 ? "good" : "warn", `Long ${fmtNum(pos.long_notional)}U · Short ${fmtNum(pos.short_notional)}U`],
         ["挂单", fmtNum(orders.strategy_open_order_count || 0, 0), "", `计划保留 + 本轮新挂`],
         ["状态", loop.active_state || "--", statusClass(loop.active_state), `intent ${loop.strategy_intent || "--"}`],
@@ -25625,6 +25763,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
     }
     function renderExplanation(config) {
       const mode = String(config.strategy_mode || "--");
+      const requiredMode = String(config.required_position_mode || "--");
       const profile = String(config.strategy_profile || "--");
       const buyLevels = Number(config.buy_levels || 0);
       const sellLevels = Number(config.sell_levels || 0);
@@ -25635,7 +25774,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
       const hardShort = Number(config.max_short_position_notional || 0);
       const totalQuote = (buyLevels + sellLevels) * perOrder;
       const items = [
-        ["策略身份", `${profile} · ${mode}`],
+        ["策略身份", `${profile} · ${mode} · 持仓模式 ${requiredMode}`],
         ["挂单密度", `买 ${fmtNum(buyLevels, 0)} 档 / 卖 ${fmtNum(sellLevels, 0)} 档，单笔 ${fmtNum(perOrder)}U，单轮理论挂单名义约 ${fmtNum(totalQuote)}U。`],
         ["多仓阈值", `软停买 ${fmtNum(softLong)}U，硬上限 ${fmtNum(hardLong)}U。进入修仓后应减少新增买单，把成交重心让给减仓。`],
         ["空仓阈值", `软停空 ${fmtNum(softShort)}U，硬上限 ${fmtNum(hardShort)}U。中性或做空策略会用这一侧控制空头修复节奏。`],
@@ -32077,6 +32216,8 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
             config = _normalize_runner_runtime_paths(merged_config, normalized_symbol)
     config["symbol"] = normalized_symbol
     config = _normalize_runner_runtime_paths(dict(config), normalized_symbol)
+    required_position_mode = _runner_required_position_mode(config)
+    config["required_position_mode"] = required_position_mode
 
     runtime_paths = _default_runtime_paths_for_symbol(normalized_symbol)
     summary_path = Path(str(config.get("summary_jsonl") or runtime_paths["summary_jsonl"]))
@@ -32129,6 +32270,10 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
         ),
     }
     open_orders = runtime_snapshot.get("open_orders") if isinstance(runtime_snapshot.get("open_orders"), list) else []
+    dual_side_raw = plan_report.get("dual_side_position")
+    dual_side_known = dual_side_raw is not None and str(dual_side_raw).strip() != ""
+    current_position_mode = "hedge" if dual_side_known and _truthy(dual_side_raw) else "one_way" if dual_side_known else None
+    position_mode_compatible = None if current_position_mode is None else current_position_mode == required_position_mode
     return {
         "ok": True,
         "symbol": normalized_symbol,
@@ -32150,6 +32295,12 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
             "net_notional": net_notional,
             "unrealized_pnl": _status_float(position.get("unrealized_pnl")),
             "mid_price": mid_price,
+        },
+        "position_mode": {
+            "required": required_position_mode,
+            "current": current_position_mode,
+            "dual_side_position": _truthy(dual_side_raw) if dual_side_known else None,
+            "compatible": position_mode_compatible,
         },
         "orders": {
             "strategy_open_order_count": len(open_orders),

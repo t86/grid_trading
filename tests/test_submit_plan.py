@@ -460,6 +460,107 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertFalse(validation["ok"])
         self.assertEqual(len(validation["errors"]), 3)
 
+    def test_validate_plan_report_rejects_hedge_account_for_one_way_required_profile(self) -> None:
+        now = datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc)
+        report = {
+            "symbol": "AIGENSYNUSDT",
+            "generated_at": now.isoformat(),
+            "dual_side_position": True,
+            "required_position_mode": "one_way",
+            "missing_orders": [{"side": "BUY", "price": 0.02, "qty": 100.0, "notional": 2.0}],
+            "stale_orders": [],
+        }
+
+        validation = validate_plan_report(
+            plan_report=report,
+            allow_symbol="AIGENSYNUSDT",
+            max_new_orders=8,
+            max_total_notional=500.0,
+            cancel_stale=True,
+            max_plan_age_seconds=60,
+            now=now,
+            allow_dual_side_position=True,
+        )
+
+        self.assertFalse(validation["ok"])
+        self.assertIn("requires one-way position mode", " ".join(validation["errors"]))
+
+    def test_validate_plan_report_accepts_hedge_account_for_hedge_required_profile(self) -> None:
+        now = datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc)
+        report = {
+            "symbol": "AIGENSYNUSDT",
+            "generated_at": now.isoformat(),
+            "dual_side_position": True,
+            "required_position_mode": "hedge",
+            "missing_orders": [
+                {"side": "BUY", "position_side": "LONG", "price": 0.02, "qty": 100.0, "notional": 2.0}
+            ],
+            "stale_orders": [],
+        }
+
+        validation = validate_plan_report(
+            plan_report=report,
+            allow_symbol="AIGENSYNUSDT",
+            max_new_orders=8,
+            max_total_notional=500.0,
+            cancel_stale=True,
+            max_plan_age_seconds=60,
+            now=now,
+            allow_dual_side_position=True,
+        )
+
+        self.assertTrue(validation["ok"])
+
+    def test_validate_plan_report_rejects_one_way_account_for_hedge_required_profile(self) -> None:
+        now = datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc)
+        report = {
+            "symbol": "AIGENSYNUSDT",
+            "generated_at": now.isoformat(),
+            "dual_side_position": False,
+            "required_position_mode": "hedge",
+            "missing_orders": [{"side": "BUY", "price": 0.02, "qty": 100.0, "notional": 2.0}],
+            "stale_orders": [],
+        }
+
+        validation = validate_plan_report(
+            plan_report=report,
+            allow_symbol="AIGENSYNUSDT",
+            max_new_orders=8,
+            max_total_notional=500.0,
+            cancel_stale=True,
+            max_plan_age_seconds=60,
+            now=now,
+            allow_dual_side_position=True,
+        )
+
+        self.assertFalse(validation["ok"])
+        self.assertIn("requires hedge position mode", " ".join(validation["errors"]))
+
+    def test_validate_plan_report_rejects_unknown_required_position_mode(self) -> None:
+        now = datetime(2026, 5, 20, 10, 0, tzinfo=timezone.utc)
+        report = {
+            "symbol": "AIGENSYNUSDT",
+            "generated_at": now.isoformat(),
+            "dual_side_position": False,
+            "required_position_mode": "isolated_magic",
+            "missing_orders": [{"side": "BUY", "price": 0.02, "qty": 100.0, "notional": 2.0}],
+            "stale_orders": [],
+        }
+
+        validation = validate_plan_report(
+            plan_report=report,
+            allow_symbol="AIGENSYNUSDT",
+            max_new_orders=8,
+            max_total_notional=500.0,
+            cancel_stale=True,
+            max_plan_age_seconds=60,
+            now=now,
+            allow_dual_side_position=True,
+        )
+
+        self.assertFalse(validation["ok"])
+        self.assertIn("unsupported required_position_mode", " ".join(validation["errors"]))
+
     def test_estimate_mid_drift_steps(self) -> None:
         drift = estimate_mid_drift_steps(
             report_mid_price=0.05043,

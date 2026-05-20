@@ -9,9 +9,15 @@ from typing import Any
 class StrategyProfileSchema:
     family: str
     intent: str
+    required_position_mode: str
     allowed_runtime_switches: frozenset[str]
     allowed_params: frozenset[str]
+    required_position_mode_defaulted: bool = False
 
+
+ONE_WAY_POSITION_MODE = "one_way"
+HEDGE_POSITION_MODE = "hedge"
+VALID_POSITION_MODES = frozenset({ONE_WAY_POSITION_MODE, HEDGE_POSITION_MODE})
 
 RUNTIME_SWITCH_DEFAULTS: dict[str, Any] = {
     "auto_regime_enabled": False,
@@ -227,6 +233,7 @@ COMMON_RUNNER_PARAMS = frozenset(
         "symbol",
         "strategy_profile",
         "strategy_mode",
+        "required_position_mode",
         "strict_strategy_profile_schema_enabled",
         "margin_type",
         "leverage",
@@ -421,6 +428,8 @@ SYNTHETIC_PING_PONG_ALLOWED_PARAMS = (
         }
     )
 )
+HEDGE_BQ_PING_PONG_RUNTIME_SWITCHES = SYNTHETIC_PING_PONG_RUNTIME_SWITCHES
+HEDGE_BQ_PING_PONG_ALLOWED_PARAMS = SYNTHETIC_PING_PONG_ALLOWED_PARAMS
 
 ONE_WAY_LONG_RUNTIME_SWITCHES = frozenset(
     {
@@ -473,6 +482,20 @@ def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str
     mode = str(strategy_mode or "").strip()
     profile = str(strategy_profile or "").strip()
     profile_lower = profile.lower()
+    is_hedge_bq_profile = (
+        profile_lower.startswith(("hedge_bq", "hedge-bq"))
+        or "_hedge_bq" in profile_lower
+        or "-hedge-bq" in profile_lower
+    )
+
+    if mode == "hedge_neutral" or is_hedge_bq_profile:
+        return StrategyProfileSchema(
+            family="hedge_bq_ping_pong",
+            intent="volume",
+            required_position_mode=HEDGE_POSITION_MODE,
+            allowed_runtime_switches=HEDGE_BQ_PING_PONG_RUNTIME_SWITCHES,
+            allowed_params=frozenset(HEDGE_BQ_PING_PONG_ALLOWED_PARAMS),
+        )
 
     if (
         profile in {"ethusdc_best_quote_long_ping_pong_v1", "btcusdc_best_quote_long_ping_pong_v1"}
@@ -483,6 +506,7 @@ def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str
         return StrategyProfileSchema(
             family="best_quote",
             intent="volume",
+            required_position_mode=ONE_WAY_POSITION_MODE,
             allowed_runtime_switches=BEST_QUOTE_RUNTIME_SWITCHES,
             allowed_params=frozenset(BEST_QUOTE_ALLOWED_PARAMS),
         )
@@ -491,6 +515,7 @@ def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str
         return StrategyProfileSchema(
             family="synthetic_ping_pong",
             intent="volume",
+            required_position_mode=ONE_WAY_POSITION_MODE,
             allowed_runtime_switches=SYNTHETIC_PING_PONG_RUNTIME_SWITCHES,
             allowed_params=frozenset(SYNTHETIC_PING_PONG_ALLOWED_PARAMS),
         )
@@ -499,6 +524,7 @@ def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str
         return StrategyProfileSchema(
             family="one_way_long",
             intent="volume",
+            required_position_mode=ONE_WAY_POSITION_MODE,
             allowed_runtime_switches=ONE_WAY_LONG_RUNTIME_SWITCHES,
             allowed_params=frozenset(ONE_WAY_LONG_ALLOWED_PARAMS),
         )
@@ -506,8 +532,10 @@ def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str
     return StrategyProfileSchema(
         family="unknown",
         intent="unknown",
+        required_position_mode=ONE_WAY_POSITION_MODE,
         allowed_runtime_switches=frozenset(RUNTIME_SWITCH_DEFAULTS),
         allowed_params=frozenset(COMMON_RUNNER_PARAMS),
+        required_position_mode_defaulted=True,
     )
 
 
@@ -547,6 +575,8 @@ def apply_strategy_profile_schema(
         "strategy_profile": strategy_profile,
         "profile_family": schema.family,
         "strategy_intent": schema.intent,
+        "required_position_mode": schema.required_position_mode,
+        "required_position_mode_defaulted": schema.required_position_mode_defaulted,
         "allowed_runtime_switches": sorted(schema.allowed_runtime_switches),
         "allowed_params": sorted(schema.allowed_params),
         "ignored_params": sorted(ignored_params),

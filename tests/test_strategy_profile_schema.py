@@ -51,6 +51,8 @@ class StrategyProfileSchemaTests(unittest.TestCase):
 
         self.assertEqual(report["profile_family"], "best_quote")
         self.assertEqual(report["strategy_intent"], "volume")
+        self.assertEqual(report["required_position_mode"], "one_way")
+        self.assertFalse(report["required_position_mode_defaulted"])
         self.assertTrue(report["strict_enabled"])
         self.assertEqual(effective.per_order_notional, 40.0)
         self.assertEqual(effective.buy_levels, 3)
@@ -126,6 +128,33 @@ class StrategyProfileSchemaTests(unittest.TestCase):
         self.assertFalse(report["strict_enabled"])
         self.assertTrue(effective.market_bias_enabled)
         self.assertEqual(report["ignored_params"], [])
+
+    def test_unknown_legacy_profile_defaults_to_one_way_position_mode(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="legacy_neutral",
+                strategy_profile="legacy_unclassified_profile_v1",
+            ),
+            enabled=True,
+        )
+
+        self.assertEqual(report["profile_family"], "unknown")
+        self.assertEqual(report["required_position_mode"], "one_way")
+        self.assertTrue(report["required_position_mode_defaulted"])
+
+    def test_hedge_neutral_bq_ping_pong_profile_requires_hedge_mode(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="hedge_neutral",
+                strategy_profile="aigensynusdt_hedge_bq_pingpong_sprint_v1",
+            ),
+            enabled=True,
+        )
+
+        self.assertEqual(report["profile_family"], "hedge_bq_ping_pong")
+        self.assertEqual(report["strategy_intent"], "volume")
+        self.assertEqual(report["required_position_mode"], "hedge")
+        self.assertFalse(report["required_position_mode_defaulted"])
 
 
 if __name__ == "__main__":

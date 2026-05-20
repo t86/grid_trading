@@ -158,6 +158,7 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertTrue(args.strict_strategy_profile_schema_enabled)
+        self.assertEqual(args.required_position_mode, "one_way")
         self.assertEqual(args.elastic_repair_stale_cycles, 6)
         self.assertEqual(args.elastic_adverse_move_ticks, 5.0)
         self.assertEqual(args.elastic_repair_slice_ratio_touch, 0.25)
@@ -1572,6 +1573,7 @@ class LoopRunnerTests(unittest.TestCase):
         payload: dict[str, object] = {
             "symbol": "BARDUSDT",
             "strategy_mode": "one_way_long",
+            "required_position_mode": "one_way",
             "strategy_profile": "bard_volume_long_v2",
             "step_price": 0.0002,
             "buy_levels": 5,
@@ -1646,6 +1648,70 @@ class LoopRunnerTests(unittest.TestCase):
         }
         payload.update(overrides)
         return Namespace(**payload)
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_generate_plan_report_exposes_required_position_mode_compatibility(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.0199", "ask_price": "0.0201"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "AIGENSYNUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="AIGENSYNUSDT",
+                strategy_profile="aigensynusdt_best_quote_maker_volume_v1",
+                strategy_mode="one_way_long",
+                required_position_mode="one_way",
+                step_price=0.00001,
+                buy_levels=1,
+                sell_levels=1,
+                per_order_notional=750.0,
+                base_position_notional=0.0,
+                pause_buy_position_notional=900.0,
+                max_position_notional=1500.0,
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["required_position_mode"], "one_way")
+        self.assertFalse(report["required_position_mode_defaulted"])
+        self.assertFalse(report["position_mode_compatible"])
 
     @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
@@ -5737,6 +5803,126 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["idle"])
         self.assertEqual(report["plan_snapshot"]["inventory_tier"], {})
         self.assertEqual(report["plan_snapshot"]["synthetic_ledger"], {})
+
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_allows_dual_side_validation_from_required_position_mode(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": False,
+            "errors": ["plan contains no actions to execute"],
+            "actions": {"place_count": 0, "cancel_count": 0},
+        }
+        mock_book_tickers.return_value = [{"bid_price": "1.0000", "ask_price": "1.0002"}]
+        args = Namespace(
+            symbol="AIGENSYNUSDT",
+            strategy_mode="one_way_long",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=True,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/aigensyn_loop_latest_plan.json",
+            apply=False,
+            margin_type="KEEP",
+            leverage=2,
+            maker_retries=2,
+        )
+        plan_report = {
+            "symbol": "AIGENSYNUSDT",
+            "strategy_mode": "one_way_long",
+            "required_position_mode": "hedge",
+            "mid_price": 1.0001,
+            "step_price": 0.0001,
+        }
+
+        execute_plan_report(args, plan_report)
+
+        self.assertTrue(mock_validate_plan_report.call_args.kwargs["allow_dual_side_position"])
+
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_apply_rechecks_required_position_mode_before_orders(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        mock_update_inventory_grid_refs,
+        mock_update_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {"role": "entry_long", "side": "BUY", "position_side": "LONG", "qty": 10.0, "price": 1.0}
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.9999", "ask_price": "1.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [{"symbol": "AIGENSYNUSDT", "positionAmt": "0", "entryPrice": "0"}],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 2}
+
+        args = Namespace(
+            symbol="AIGENSYNUSDT",
+            strategy_mode="hedge_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/aigensyn_loop_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=2,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/aigensyn_loop_state.json",
+        )
+        plan_report = {
+            "symbol": "AIGENSYNUSDT",
+            "strategy_mode": "hedge_neutral",
+            "required_position_mode": "one_way",
+            "mid_price": 1.0,
+            "step_price": 0.0001,
+            "open_order_count": 0,
+            "current_long_qty": 0.0,
+            "current_short_qty": 0.0,
+            "actual_net_qty": 0.0,
+            "symbol_info": {"tick_size": 0.0001, "min_qty": 0.1, "min_notional": 0.1},
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "one-way position mode"):
+            execute_plan_report(args, plan_report)
+
+        mock_post_order.assert_not_called()
+        mock_update_inventory_grid_refs.assert_not_called()
+        mock_update_refs.assert_not_called()
 
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")

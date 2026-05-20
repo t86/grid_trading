@@ -1991,6 +1991,7 @@ class WebSecurityTests(unittest.TestCase):
         payload = _runner_preset_payload("aigensynusdt_best_quote_maker_volume_v1", {"symbol": "AIGENSYNUSDT"})
         self.assertEqual(payload["strategy_profile"], "aigensynusdt_best_quote_maker_volume_v1")
         self.assertEqual(payload["symbol"], "AIGENSYNUSDT")
+        self.assertEqual(payload["required_position_mode"], "one_way")
         self.assertEqual(payload["strategy_mode"], "one_way_long")
         self.assertTrue(payload["strict_strategy_profile_schema_enabled"])
         self.assertEqual(payload["buy_levels"], 1)
@@ -2011,6 +2012,36 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
         self.assertFalse(payload["synthetic_flow_sleeve_enabled"])
         self.assertFalse(payload["custom_grid_enabled"])
+
+    def test_runner_preset_payload_keeps_profile_position_mode_authoritative(self) -> None:
+        one_way_payload = _runner_preset_payload(
+            "aigensynusdt_best_quote_maker_volume_v1",
+            {"symbol": "AIGENSYNUSDT", "required_position_mode": "hedge"},
+        )
+        hedge_payload = _runner_preset_payload(
+            "aigensynusdt_hedge_bq_pingpong_sprint_v1",
+            {"symbol": "AIGENSYNUSDT", "required_position_mode": "one_way"},
+        )
+
+        self.assertEqual(one_way_payload["required_position_mode"], "one_way")
+        self.assertEqual(hedge_payload["required_position_mode"], "hedge")
+
+    def test_runner_preset_payload_applies_aigensyn_hedge_bq_pingpong_profile(self) -> None:
+        payload = _runner_preset_payload("aigensynusdt_hedge_bq_pingpong_sprint_v1", {"symbol": "AIGENSYNUSDT"})
+
+        self.assertEqual(payload["strategy_profile"], "aigensynusdt_hedge_bq_pingpong_sprint_v1")
+        self.assertEqual(payload["symbol"], "AIGENSYNUSDT")
+        self.assertEqual(payload["required_position_mode"], "hedge")
+        self.assertEqual(payload["strategy_mode"], "hedge_neutral")
+        self.assertTrue(payload["strict_strategy_profile_schema_enabled"])
+        self.assertEqual(payload["buy_levels"], 1)
+        self.assertEqual(payload["sell_levels"], 1)
+        self.assertAlmostEqual(payload["per_order_notional"], 750.0)
+        self.assertAlmostEqual(payload["pause_buy_position_notional"], 900.0)
+        self.assertAlmostEqual(payload["pause_short_position_notional"], 900.0)
+        self.assertAlmostEqual(payload["max_position_notional"], 1500.0)
+        self.assertAlmostEqual(payload["max_short_position_notional"], 1500.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 3000.0)
 
     def test_runner_preset_payload_rejects_aigensyn_best_quote_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=AIGENSYNUSDT"):
@@ -2191,6 +2222,7 @@ class WebSecurityTests(unittest.TestCase):
         config = _resolve_runner_start_config({"symbol": "ENSOUSDT", "strategy_profile": "neutral_hedge_v1"})
         self.assertEqual(config["strategy_profile"], "neutral_hedge_v1")
         self.assertEqual(config["strategy_mode"], "hedge_neutral")
+        self.assertEqual(config["required_position_mode"], "hedge")
         self.assertEqual(config["max_short_position_notional"], 500.0)
         self.assertEqual(config["state_path"], "output/ensousdt_loop_state.json")
         self.assertGreater(config["step_price"], 0)
@@ -3952,8 +3984,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(btc_best_quote["config"]["per_order_notional"], 120.0)
         aigensyn_best_quote = aigensyn_summaries["aigensynusdt_best_quote_maker_volume_v1"]
         self.assertEqual(aigensyn_best_quote["label"], "AIGENSYNUSDT Best Quote 冲量")
+        self.assertEqual(aigensyn_best_quote["config"]["required_position_mode"], "one_way")
         self.assertEqual(aigensyn_best_quote["config"]["strategy_mode"], "one_way_long")
         self.assertTrue(aigensyn_best_quote["config"]["strict_strategy_profile_schema_enabled"])
+        aigensyn_hedge = aigensyn_summaries["aigensynusdt_hedge_bq_pingpong_sprint_v1"]
+        self.assertEqual(aigensyn_hedge["config"]["required_position_mode"], "hedge")
+        self.assertEqual(aigensyn_hedge["config"]["strategy_mode"], "hedge_neutral")
         btc_ping_pong = btc_summaries["btcusdc_competition_neutral_ping_pong_v1"]
         self.assertEqual(btc_ping_pong["config"]["strategy_mode"], "synthetic_neutral")
         self.assertFalse(btc_ping_pong["config"]["flat_start_enabled"])
@@ -4387,6 +4423,7 @@ class WebSecurityTests(unittest.TestCase):
                 "symbol": "AIGENSYNUSDT",
                 "strategy_profile": "aigensynusdt_best_quote_maker_volume_v1",
                 "strategy_mode": "one_way_long",
+                "required_position_mode": "one_way",
                 "summary_jsonl": str(summary_path),
                 "plan_json": str(plan_path),
                 "submit_report_json": str(submit_path),
@@ -4408,6 +4445,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["runner"]["pid"], 1234)
         self.assertEqual(payload["runner"]["config"]["symbol"], "AIGENSYNUSDT")
         self.assertEqual(payload["runner"]["config"]["strategy_profile"], "aigensynusdt_best_quote_maker_volume_v1")
+        self.assertEqual(payload["runner"]["config"]["required_position_mode"], "one_way")
+        self.assertEqual(payload["position_mode"]["required"], "one_way")
+        self.assertIn("compatible", payload["position_mode"])
         self.assertEqual(payload["latest_loop"]["cycle"], 17)
         self.assertEqual(payload["latest_loop"]["strategy_intent"], "make_volume")
         self.assertEqual(payload["latest_loop"]["active_state"], "NORMAL")
