@@ -8643,6 +8643,34 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_step_max_scale",
         "adaptive_step_min_per_order_scale",
         "adaptive_step_min_position_limit_scale",
+        "adaptive_regime_router_min_dwell_seconds",
+        "adaptive_regime_router_max_spread_bps",
+        "adaptive_regime_router_min_depth_notional",
+        "adaptive_regime_router_shock_1m_abs_return_ratio",
+        "adaptive_regime_router_shock_1m_amplitude_ratio",
+        "adaptive_regime_router_shock_5m_amplitude_ratio",
+        "adaptive_regime_router_down_1m_return_ratio",
+        "adaptive_regime_router_down_5m_return_ratio",
+        "adaptive_regime_router_up_1m_return_ratio",
+        "adaptive_regime_router_up_5m_return_ratio",
+        "adaptive_regime_router_range_5m_abs_return_ratio",
+        "adaptive_regime_router_range_5m_amplitude_ratio",
+        "adaptive_regime_router_range_step_scale",
+        "adaptive_regime_router_range_per_order_scale",
+        "adaptive_regime_router_range_levels_scale",
+        "adaptive_regime_router_range_position_limit_scale",
+        "adaptive_regime_router_down_step_scale",
+        "adaptive_regime_router_down_per_order_scale",
+        "adaptive_regime_router_down_levels_scale",
+        "adaptive_regime_router_down_position_limit_scale",
+        "adaptive_regime_router_up_step_scale",
+        "adaptive_regime_router_up_per_order_scale",
+        "adaptive_regime_router_up_levels_scale",
+        "adaptive_regime_router_up_position_limit_scale",
+        "adaptive_regime_router_no_trade_step_scale",
+        "adaptive_regime_router_no_trade_per_order_scale",
+        "adaptive_regime_router_no_trade_levels_scale",
+        "adaptive_regime_router_no_trade_position_limit_scale",
         "elastic_loss_per_10k_sprint",
         "elastic_loss_per_10k_cruise",
         "elastic_loss_per_10k_defensive",
@@ -8875,6 +8903,12 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "elastic_max_entry_orders_wide_step",
         "elastic_max_entry_orders_defensive",
         "elastic_state_confirm_cycles",
+        "adaptive_regime_router_confirm_cycles",
+        "adaptive_regime_router_range_max_entry_orders",
+        "adaptive_regime_router_down_max_entry_long_orders",
+        "adaptive_regime_router_down_max_entry_short_orders",
+        "adaptive_regime_router_up_max_entry_long_orders",
+        "adaptive_regime_router_up_max_entry_short_orders",
         "market_bias_regime_switch_confirm_cycles",
         "execution_regime_confirm_exit_to_caution",
         "execution_regime_confirm_caution_to_normal",
@@ -8909,6 +8943,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "market_bias_regime_switch_enabled",
         "take_profit_enabled",
         "adaptive_step_enabled",
+        "adaptive_regime_router_enabled",
+        "adaptive_regime_router_cancel_stale_entries_on_no_trade",
         "best_quote_maker_volume_enabled",
         "best_quote_maker_volume_take_profit_guard_enabled",
         "best_quote_maker_volume_dynamic_tick_enabled",
@@ -8948,6 +8984,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "strategy_mode",
         "multi_timeframe_bias_mode_adapter",
         "elastic_volume_mode",
+        "adaptive_regime_router_mode",
         "symbol",
         "maker_volatility_window",
         "margin_type",
@@ -9923,6 +9960,55 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--adaptive-step-min-per-order-scale", str(config["adaptive_step_min_per_order_scale"])])
     if config.get("adaptive_step_min_position_limit_scale") is not None:
         command.extend(["--adaptive-step-min-position-limit-scale", str(config["adaptive_step_min_position_limit_scale"])])
+    command.append(
+        "--adaptive-regime-router-enabled"
+        if config.get("adaptive_regime_router_enabled", False)
+        else "--no-adaptive-regime-router-enabled"
+    )
+    for key, flag in (
+        ("adaptive_regime_router_mode", "--adaptive-regime-router-mode"),
+        ("adaptive_regime_router_confirm_cycles", "--adaptive-regime-router-confirm-cycles"),
+        ("adaptive_regime_router_min_dwell_seconds", "--adaptive-regime-router-min-dwell-seconds"),
+        ("adaptive_regime_router_max_spread_bps", "--adaptive-regime-router-max-spread-bps"),
+        ("adaptive_regime_router_min_depth_notional", "--adaptive-regime-router-min-depth-notional"),
+        ("adaptive_regime_router_shock_1m_abs_return_ratio", "--adaptive-regime-router-shock-1m-abs-return-ratio"),
+        ("adaptive_regime_router_shock_1m_amplitude_ratio", "--adaptive-regime-router-shock-1m-amplitude-ratio"),
+        ("adaptive_regime_router_shock_5m_amplitude_ratio", "--adaptive-regime-router-shock-5m-amplitude-ratio"),
+        ("adaptive_regime_router_down_1m_return_ratio", "--adaptive-regime-router-down-1m-return-ratio"),
+        ("adaptive_regime_router_down_5m_return_ratio", "--adaptive-regime-router-down-5m-return-ratio"),
+        ("adaptive_regime_router_up_1m_return_ratio", "--adaptive-regime-router-up-1m-return-ratio"),
+        ("adaptive_regime_router_up_5m_return_ratio", "--adaptive-regime-router-up-5m-return-ratio"),
+        ("adaptive_regime_router_range_5m_abs_return_ratio", "--adaptive-regime-router-range-5m-abs-return-ratio"),
+        ("adaptive_regime_router_range_5m_amplitude_ratio", "--adaptive-regime-router-range-5m-amplitude-ratio"),
+        ("adaptive_regime_router_range_step_scale", "--adaptive-regime-router-range-step-scale"),
+        ("adaptive_regime_router_range_per_order_scale", "--adaptive-regime-router-range-per-order-scale"),
+        ("adaptive_regime_router_range_levels_scale", "--adaptive-regime-router-range-levels-scale"),
+        ("adaptive_regime_router_range_position_limit_scale", "--adaptive-regime-router-range-position-limit-scale"),
+        ("adaptive_regime_router_range_max_entry_orders", "--adaptive-regime-router-range-max-entry-orders"),
+        ("adaptive_regime_router_down_step_scale", "--adaptive-regime-router-down-step-scale"),
+        ("adaptive_regime_router_down_per_order_scale", "--adaptive-regime-router-down-per-order-scale"),
+        ("adaptive_regime_router_down_levels_scale", "--adaptive-regime-router-down-levels-scale"),
+        ("adaptive_regime_router_down_position_limit_scale", "--adaptive-regime-router-down-position-limit-scale"),
+        ("adaptive_regime_router_down_max_entry_long_orders", "--adaptive-regime-router-down-max-entry-long-orders"),
+        ("adaptive_regime_router_down_max_entry_short_orders", "--adaptive-regime-router-down-max-entry-short-orders"),
+        ("adaptive_regime_router_up_step_scale", "--adaptive-regime-router-up-step-scale"),
+        ("adaptive_regime_router_up_per_order_scale", "--adaptive-regime-router-up-per-order-scale"),
+        ("adaptive_regime_router_up_levels_scale", "--adaptive-regime-router-up-levels-scale"),
+        ("adaptive_regime_router_up_position_limit_scale", "--adaptive-regime-router-up-position-limit-scale"),
+        ("adaptive_regime_router_up_max_entry_long_orders", "--adaptive-regime-router-up-max-entry-long-orders"),
+        ("adaptive_regime_router_up_max_entry_short_orders", "--adaptive-regime-router-up-max-entry-short-orders"),
+        ("adaptive_regime_router_no_trade_step_scale", "--adaptive-regime-router-no-trade-step-scale"),
+        ("adaptive_regime_router_no_trade_per_order_scale", "--adaptive-regime-router-no-trade-per-order-scale"),
+        ("adaptive_regime_router_no_trade_levels_scale", "--adaptive-regime-router-no-trade-levels-scale"),
+        ("adaptive_regime_router_no_trade_position_limit_scale", "--adaptive-regime-router-no-trade-position-limit-scale"),
+    ):
+        if config.get(key) is not None:
+            command.extend([flag, str(config[key])])
+    command.append(
+        "--adaptive-regime-router-cancel-stale-entries-on-no-trade"
+        if config.get("adaptive_regime_router_cancel_stale_entries_on_no_trade", True)
+        else "--no-adaptive-regime-router-cancel-stale-entries-on-no-trade"
+    )
     command.append("--elastic-volume-enabled" if config.get("elastic_volume_enabled", False) else "--no-elastic-volume-enabled")
     for key, flag in (
         ("elastic_volume_mode", "--elastic-volume-mode"),

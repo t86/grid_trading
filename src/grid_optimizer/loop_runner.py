@@ -39,6 +39,12 @@ from .best_quote_maker_volume import (
     BestQuoteMakerVolumeInputs,
     build_best_quote_maker_volume_plan,
 )
+from .adaptive_regime_router import (
+    AdaptiveRegimeRouterConfig,
+    AdaptiveRegimeRouterInputs,
+    adaptive_regime_router_state_snapshot,
+    resolve_adaptive_regime_router_control,
+)
 from .competition_elastic_volume import ElasticVolumeConfig, ElasticVolumeInputs, resolve_elastic_volume_control
 from .data import (
     FuturesMarketStream,
@@ -10691,6 +10697,52 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
     )
 
 
+def _adaptive_regime_router_config(args: argparse.Namespace) -> AdaptiveRegimeRouterConfig:
+    return AdaptiveRegimeRouterConfig(
+        enabled=bool(getattr(args, "adaptive_regime_router_enabled", False)),
+        mode=str(getattr(args, "adaptive_regime_router_mode", "profit_adaptive_v1") or "profit_adaptive_v1"),
+        confirm_cycles=int(getattr(args, "adaptive_regime_router_confirm_cycles", 2)),
+        min_dwell_seconds=float(getattr(args, "adaptive_regime_router_min_dwell_seconds", 120.0)),
+        max_spread_bps=float(getattr(args, "adaptive_regime_router_max_spread_bps", 22.0)),
+        min_depth_notional=float(getattr(args, "adaptive_regime_router_min_depth_notional", 0.0)),
+        shock_1m_abs_return_ratio=float(getattr(args, "adaptive_regime_router_shock_1m_abs_return_ratio", 0.018)),
+        shock_1m_amplitude_ratio=float(getattr(args, "adaptive_regime_router_shock_1m_amplitude_ratio", 0.028)),
+        shock_5m_amplitude_ratio=float(getattr(args, "adaptive_regime_router_shock_5m_amplitude_ratio", 0.055)),
+        down_1m_return_ratio=float(getattr(args, "adaptive_regime_router_down_1m_return_ratio", -0.004)),
+        down_5m_return_ratio=float(getattr(args, "adaptive_regime_router_down_5m_return_ratio", -0.010)),
+        up_1m_return_ratio=float(getattr(args, "adaptive_regime_router_up_1m_return_ratio", 0.006)),
+        up_5m_return_ratio=float(getattr(args, "adaptive_regime_router_up_5m_return_ratio", 0.014)),
+        range_5m_abs_return_ratio=float(getattr(args, "adaptive_regime_router_range_5m_abs_return_ratio", 0.006)),
+        range_5m_amplitude_ratio=float(getattr(args, "adaptive_regime_router_range_5m_amplitude_ratio", 0.018)),
+        range_step_scale=float(getattr(args, "adaptive_regime_router_range_step_scale", 1.0)),
+        range_per_order_scale=float(getattr(args, "adaptive_regime_router_range_per_order_scale", 1.0)),
+        range_levels_scale=float(getattr(args, "adaptive_regime_router_range_levels_scale", 1.0)),
+        range_position_limit_scale=float(getattr(args, "adaptive_regime_router_range_position_limit_scale", 1.0)),
+        range_max_entry_orders=int(getattr(args, "adaptive_regime_router_range_max_entry_orders", 4)),
+        down_step_scale=float(getattr(args, "adaptive_regime_router_down_step_scale", 1.8)),
+        down_per_order_scale=float(getattr(args, "adaptive_regime_router_down_per_order_scale", 0.55)),
+        down_levels_scale=float(getattr(args, "adaptive_regime_router_down_levels_scale", 0.65)),
+        down_position_limit_scale=float(getattr(args, "adaptive_regime_router_down_position_limit_scale", 0.70)),
+        down_max_entry_long_orders=int(getattr(args, "adaptive_regime_router_down_max_entry_long_orders", 0)),
+        down_max_entry_short_orders=int(getattr(args, "adaptive_regime_router_down_max_entry_short_orders", 2)),
+        up_step_scale=float(getattr(args, "adaptive_regime_router_up_step_scale", 1.5)),
+        up_per_order_scale=float(getattr(args, "adaptive_regime_router_up_per_order_scale", 0.75)),
+        up_levels_scale=float(getattr(args, "adaptive_regime_router_up_levels_scale", 0.75)),
+        up_position_limit_scale=float(getattr(args, "adaptive_regime_router_up_position_limit_scale", 0.85)),
+        up_max_entry_long_orders=int(getattr(args, "adaptive_regime_router_up_max_entry_long_orders", 2)),
+        up_max_entry_short_orders=int(getattr(args, "adaptive_regime_router_up_max_entry_short_orders", 0)),
+        no_trade_step_scale=float(getattr(args, "adaptive_regime_router_no_trade_step_scale", 2.5)),
+        no_trade_per_order_scale=float(getattr(args, "adaptive_regime_router_no_trade_per_order_scale", 0.35)),
+        no_trade_levels_scale=float(getattr(args, "adaptive_regime_router_no_trade_levels_scale", 0.50)),
+        no_trade_position_limit_scale=float(
+            getattr(args, "adaptive_regime_router_no_trade_position_limit_scale", 0.60)
+        ),
+        cancel_stale_entries_on_no_trade=bool(
+            getattr(args, "adaptive_regime_router_cancel_stale_entries_on_no_trade", True)
+        ),
+    )
+
+
 def _regime_entry_budget_config(args: argparse.Namespace) -> RegimeEntryBudgetConfig:
     return RegimeEntryBudgetConfig(
         enabled=bool(getattr(args, "regime_entry_budget_enabled", False)),
@@ -11384,6 +11436,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "applied": False,
         "reasons": [],
     }
+    adaptive_regime_router: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "adaptive_regime_router_enabled", False)),
+        "regime": (
+            "disabled"
+            if not bool(getattr(effective_args, "adaptive_regime_router_enabled", False))
+            else "not_evaluated"
+        ),
+        "applied": False,
+        "reasons": [],
+    }
     regime_entry_budget: dict[str, Any] = {
         "enabled": bool(getattr(effective_args, "regime_entry_budget_enabled", False)),
         "report_only": bool(getattr(effective_args, "regime_entry_budget_report_only", True)),
@@ -11775,6 +11837,103 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             elif not bool(elastic_volume.get("allow_entry_short")) and current_short_notional > current_long_notional:
                 effective_args.sell_levels = 0
 
+    adaptive_regime_router_config = _adaptive_regime_router_config(effective_args)
+    if adaptive_regime_router_config.enabled:
+        adaptive_metrics_for_router = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
+        window_1m_for_router = (
+            adaptive_metrics_for_router.get("window_1m")
+            if isinstance(adaptive_metrics_for_router.get("window_1m"), dict)
+            else {}
+        )
+        window_5m_for_router = (
+            adaptive_metrics_for_router.get("window_5m")
+            if isinstance(adaptive_metrics_for_router.get("window_5m"), dict)
+            else {}
+        )
+        spread_bps = ((ask_price - bid_price) / mid_price * 10_000.0) if mid_price > 0 else 0.0
+        adaptive_regime_router = resolve_adaptive_regime_router_control(
+            config=adaptive_regime_router_config,
+            inputs=AdaptiveRegimeRouterInputs(
+                now=plan_now,
+                last_state=state.get("adaptive_regime_router")
+                if isinstance(state.get("adaptive_regime_router"), dict)
+                else {},
+                return_1m_ratio=_safe_float(window_1m_for_router.get("return_ratio")),
+                amplitude_1m_ratio=_safe_float(window_1m_for_router.get("amplitude_ratio")),
+                return_5m_ratio=_safe_float(window_5m_for_router.get("return_ratio")),
+                amplitude_5m_ratio=_safe_float(window_5m_for_router.get("amplitude_ratio")),
+                spread_bps=spread_bps,
+                depth_notional=getattr(effective_args, "execution_regime_depth_value", None),
+                long_notional=current_long_notional,
+                short_notional=current_short_notional,
+                actual_net_notional=actual_net_qty * max(mid_price, 0.0),
+            ),
+        )
+        adaptive_regime_router["applied"] = True
+        if adaptive_regime_router.get("enabled"):
+            effective_args = argparse.Namespace(**vars(effective_args))
+            effective_args.step_price = max(
+                _safe_float(getattr(effective_args, "step_price", 0.0))
+                * _safe_float(adaptive_regime_router.get("step_scale")),
+                0.0,
+            )
+            effective_args.per_order_notional = max(
+                _safe_float(getattr(effective_args, "per_order_notional", 0.0))
+                * _safe_float(adaptive_regime_router.get("per_order_scale")),
+                0.0,
+            )
+            effective_args.buy_levels = max(
+                int(
+                    round(
+                        int(getattr(effective_args, "buy_levels", 0))
+                        * _safe_float(adaptive_regime_router.get("levels_scale"))
+                    )
+                ),
+                0,
+            )
+            effective_args.sell_levels = max(
+                int(
+                    round(
+                        int(getattr(effective_args, "sell_levels", 0))
+                        * _safe_float(adaptive_regime_router.get("levels_scale"))
+                    )
+                ),
+                0,
+            )
+            position_limit_scale = _safe_float(adaptive_regime_router.get("position_limit_scale")) or 1.0
+            pause_scale = _safe_float(adaptive_regime_router.get("pause_scale")) or 1.0
+            max_total_scale = _safe_float(adaptive_regime_router.get("max_total_scale")) or 1.0
+            if getattr(effective_args, "threshold_position_notional", None) is not None:
+                effective_args.threshold_position_notional = max(
+                    _safe_float(effective_args.threshold_position_notional) * position_limit_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_buy_position_notional", None) is not None:
+                effective_args.pause_buy_position_notional = max(
+                    _safe_float(effective_args.pause_buy_position_notional) * pause_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_short_position_notional", None) is not None:
+                effective_args.pause_short_position_notional = max(
+                    _safe_float(effective_args.pause_short_position_notional) * pause_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "max_position_notional", None) is not None:
+                effective_args.max_position_notional = max(
+                    _safe_float(effective_args.max_position_notional) * position_limit_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "max_short_position_notional", None) is not None:
+                effective_args.max_short_position_notional = max(
+                    _safe_float(effective_args.max_short_position_notional) * position_limit_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "max_total_notional", None) is not None:
+                effective_args.max_total_notional = max(
+                    _safe_float(effective_args.max_total_notional) * max_total_scale,
+                    0.0,
+                )
+
     regime_entry_budget_config = _regime_entry_budget_config(effective_args)
     if regime_entry_budget_config.enabled:
         budget_open_orders = _decorate_synthetic_open_orders(state=state, open_orders=open_orders) if _is_synthetic_neutral_mode(strategy_mode) else _filter_futures_strategy_orders(open_orders, symbol)
@@ -11801,7 +11960,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             inputs=RegimeEntryBudgetInputs(
                 now=plan_now,
                 last_state=state.get("regime_entry_budget") if isinstance(state.get("regime_entry_budget"), dict) else {},
-                candidate_regime=str(elastic_volume.get("regime") or "ping-pong-safe"),
+                candidate_regime=str(
+                    (
+                        adaptive_regime_router.get("regime")
+                        if isinstance(adaptive_regime_router, dict) and adaptive_regime_router.get("enabled")
+                        else None
+                    )
+                    or elastic_volume.get("regime")
+                    or "ping-pong-safe"
+                ),
                 mid_price=mid_price,
                 tick_size=_safe_float(symbol_info.get("tick_size")),
                 current_long_notional=current_long_notional,
@@ -14610,10 +14777,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         and regime_entry_budget.get("enabled")
         and not bool(regime_entry_budget.get("report_only", True))
     )
+    adaptive_regime_router_controls_entry = bool(
+        isinstance(adaptive_regime_router, dict) and adaptive_regime_router.get("enabled")
+    )
+    if adaptive_regime_router_controls_entry and not regime_entry_budget_controls_entry:
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            allow_entry_long=bool(adaptive_regime_router.get("allow_entry_long", True)),
+            allow_entry_short=bool(adaptive_regime_router.get("allow_entry_short", True)),
+            max_entry_long_orders=adaptive_regime_router.get("max_entry_long_orders"),
+            max_entry_short_orders=adaptive_regime_router.get("max_entry_short_orders"),
+        )
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
     if (
         loss_recovery_brush.get("active")
         and not regime_entry_budget_controls_entry
         and not (isinstance(elastic_volume, dict) and elastic_volume.get("enabled"))
+        and not adaptive_regime_router_controls_entry
     ):
         entry_permission_gate = apply_entry_permission_gate(
             plan,
@@ -14625,7 +14809,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 *plan["buy_orders"],
                 *plan["sell_orders"],
             ]
-    if isinstance(elastic_volume, dict) and elastic_volume.get("enabled") and not regime_entry_budget_controls_entry:
+    if (
+        isinstance(elastic_volume, dict)
+        and elastic_volume.get("enabled")
+        and not regime_entry_budget_controls_entry
+        and not adaptive_regime_router_controls_entry
+    ):
         entry_permission_gate = apply_entry_permission_gate(
             plan,
             allow_entry_long=bool(elastic_volume.get("allow_entry_long", True)),
@@ -14657,6 +14846,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         state["elastic_volume"] = _elastic_volume_state_snapshot(elastic_volume, updated_at=state_now)
     else:
         state.pop("elastic_volume", None)
+    if isinstance(adaptive_regime_router, dict) and adaptive_regime_router.get("enabled"):
+        state["adaptive_regime_router"] = adaptive_regime_router_state_snapshot(
+            adaptive_regime_router,
+            updated_at=state_now,
+        )
+    else:
+        state.pop("adaptive_regime_router", None)
     if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled"):
         state["regime_entry_budget"] = regime_entry_budget_state_snapshot(regime_entry_budget, updated_at=state_now)
     else:
@@ -14707,6 +14903,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "adaptive_step": adaptive_step,
         "multi_timeframe_bias": multi_timeframe_bias,
         "elastic_volume": elastic_volume,
+        "adaptive_regime_router": adaptive_regime_router,
         "regime_entry_budget": regime_entry_budget,
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
@@ -15751,6 +15948,47 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--adaptive-regime-router-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--adaptive-regime-router-mode", type=str, default="profit_adaptive_v1")
+    parser.add_argument("--adaptive-regime-router-confirm-cycles", type=int, default=2)
+    parser.add_argument("--adaptive-regime-router-min-dwell-seconds", type=float, default=120.0)
+    parser.add_argument("--adaptive-regime-router-max-spread-bps", type=float, default=22.0)
+    parser.add_argument("--adaptive-regime-router-min-depth-notional", type=float, default=0.0)
+    parser.add_argument("--adaptive-regime-router-shock-1m-abs-return-ratio", type=float, default=0.018)
+    parser.add_argument("--adaptive-regime-router-shock-1m-amplitude-ratio", type=float, default=0.028)
+    parser.add_argument("--adaptive-regime-router-shock-5m-amplitude-ratio", type=float, default=0.055)
+    parser.add_argument("--adaptive-regime-router-down-1m-return-ratio", type=float, default=-0.004)
+    parser.add_argument("--adaptive-regime-router-down-5m-return-ratio", type=float, default=-0.010)
+    parser.add_argument("--adaptive-regime-router-up-1m-return-ratio", type=float, default=0.006)
+    parser.add_argument("--adaptive-regime-router-up-5m-return-ratio", type=float, default=0.014)
+    parser.add_argument("--adaptive-regime-router-range-5m-abs-return-ratio", type=float, default=0.006)
+    parser.add_argument("--adaptive-regime-router-range-5m-amplitude-ratio", type=float, default=0.018)
+    parser.add_argument("--adaptive-regime-router-range-step-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-per-order-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-levels-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-max-entry-orders", type=int, default=4)
+    parser.add_argument("--adaptive-regime-router-down-step-scale", type=float, default=1.8)
+    parser.add_argument("--adaptive-regime-router-down-per-order-scale", type=float, default=0.55)
+    parser.add_argument("--adaptive-regime-router-down-levels-scale", type=float, default=0.65)
+    parser.add_argument("--adaptive-regime-router-down-position-limit-scale", type=float, default=0.70)
+    parser.add_argument("--adaptive-regime-router-down-max-entry-long-orders", type=int, default=0)
+    parser.add_argument("--adaptive-regime-router-down-max-entry-short-orders", type=int, default=2)
+    parser.add_argument("--adaptive-regime-router-up-step-scale", type=float, default=1.5)
+    parser.add_argument("--adaptive-regime-router-up-per-order-scale", type=float, default=0.75)
+    parser.add_argument("--adaptive-regime-router-up-levels-scale", type=float, default=0.75)
+    parser.add_argument("--adaptive-regime-router-up-position-limit-scale", type=float, default=0.85)
+    parser.add_argument("--adaptive-regime-router-up-max-entry-long-orders", type=int, default=2)
+    parser.add_argument("--adaptive-regime-router-up-max-entry-short-orders", type=int, default=0)
+    parser.add_argument("--adaptive-regime-router-no-trade-step-scale", type=float, default=2.5)
+    parser.add_argument("--adaptive-regime-router-no-trade-per-order-scale", type=float, default=0.35)
+    parser.add_argument("--adaptive-regime-router-no-trade-levels-scale", type=float, default=0.50)
+    parser.add_argument("--adaptive-regime-router-no-trade-position-limit-scale", type=float, default=0.60)
+    parser.add_argument(
+        "--adaptive-regime-router-cancel-stale-entries-on-no-trade",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
     parser.add_argument("--regime-entry-budget-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--regime-entry-budget-report-only", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--regime-entry-budget-base-per-order-notional", type=float, default=60.0)
@@ -16483,6 +16721,59 @@ def main() -> None:
     _validate_multi_timeframe_bias_args(args)
     if args.elastic_volume_enabled and str(args.elastic_volume_mode).strip() != "competition_elastic_volume_v1":
         raise SystemExit("--elastic-volume-mode must be competition_elastic_volume_v1")
+    if args.adaptive_regime_router_enabled and str(args.adaptive_regime_router_mode).strip() != "profit_adaptive_v1":
+        raise SystemExit("--adaptive-regime-router-mode must be profit_adaptive_v1")
+    if args.adaptive_regime_router_confirm_cycles < 1:
+        raise SystemExit("--adaptive-regime-router-confirm-cycles must be >= 1")
+    if args.adaptive_regime_router_min_dwell_seconds < 0:
+        raise SystemExit("--adaptive-regime-router-min-dwell-seconds must be >= 0")
+    if args.adaptive_regime_router_max_spread_bps < 0 or args.adaptive_regime_router_min_depth_notional < 0:
+        raise SystemExit("--adaptive-regime-router spread/depth guards must be >= 0")
+    if (
+        args.adaptive_regime_router_shock_1m_abs_return_ratio < 0
+        or args.adaptive_regime_router_shock_1m_amplitude_ratio < 0
+        or args.adaptive_regime_router_shock_5m_amplitude_ratio < 0
+    ):
+        raise SystemExit("--adaptive-regime-router shock thresholds must be >= 0")
+    if args.adaptive_regime_router_down_1m_return_ratio > 0 or args.adaptive_regime_router_down_5m_return_ratio > 0:
+        raise SystemExit("--adaptive-regime-router down return thresholds must be <= 0")
+    if args.adaptive_regime_router_up_1m_return_ratio < 0 or args.adaptive_regime_router_up_5m_return_ratio < 0:
+        raise SystemExit("--adaptive-regime-router up return thresholds must be >= 0")
+    if (
+        args.adaptive_regime_router_range_5m_abs_return_ratio < 0
+        or args.adaptive_regime_router_range_5m_amplitude_ratio < 0
+    ):
+        raise SystemExit("--adaptive-regime-router range thresholds must be >= 0")
+    if any(
+        value <= 0
+        for value in (
+            args.adaptive_regime_router_range_step_scale,
+            args.adaptive_regime_router_range_per_order_scale,
+            args.adaptive_regime_router_range_levels_scale,
+            args.adaptive_regime_router_range_position_limit_scale,
+            args.adaptive_regime_router_down_step_scale,
+            args.adaptive_regime_router_down_per_order_scale,
+            args.adaptive_regime_router_down_levels_scale,
+            args.adaptive_regime_router_down_position_limit_scale,
+            args.adaptive_regime_router_up_step_scale,
+            args.adaptive_regime_router_up_per_order_scale,
+            args.adaptive_regime_router_up_levels_scale,
+            args.adaptive_regime_router_up_position_limit_scale,
+            args.adaptive_regime_router_no_trade_step_scale,
+            args.adaptive_regime_router_no_trade_per_order_scale,
+            args.adaptive_regime_router_no_trade_levels_scale,
+            args.adaptive_regime_router_no_trade_position_limit_scale,
+        )
+    ):
+        raise SystemExit("--adaptive-regime-router scale values must be > 0")
+    if min(
+        args.adaptive_regime_router_range_max_entry_orders,
+        args.adaptive_regime_router_down_max_entry_long_orders,
+        args.adaptive_regime_router_down_max_entry_short_orders,
+        args.adaptive_regime_router_up_max_entry_long_orders,
+        args.adaptive_regime_router_up_max_entry_short_orders,
+    ) < 0:
+        raise SystemExit("--adaptive-regime-router max entry order values must be >= 0")
     if args.elastic_loss_per_10k_sprint < 0 or args.elastic_loss_per_10k_cruise < 0:
         raise SystemExit("--elastic-loss-per-10k sprint/cruise thresholds must be >= 0")
     if args.elastic_loss_per_10k_defensive < 0 or args.elastic_loss_per_10k_cooldown < 0:
@@ -17149,6 +17440,28 @@ def main() -> None:
                         (plan_report.get("elastic_volume") or {}).get("per_order_scale")
                     ),
                     "elastic_volume_levels_scale": _safe_float((plan_report.get("elastic_volume") or {}).get("levels_scale")),
+                    "adaptive_regime_router": dict(plan_report.get("adaptive_regime_router") or {}),
+                    "adaptive_regime_router_enabled": bool(
+                        (plan_report.get("adaptive_regime_router") or {}).get("enabled")
+                    ),
+                    "adaptive_regime_router_regime": str(
+                        (plan_report.get("adaptive_regime_router") or {}).get("regime") or ""
+                    ),
+                    "adaptive_regime_router_candidate_regime": str(
+                        (plan_report.get("adaptive_regime_router") or {}).get("candidate_regime") or ""
+                    ),
+                    "adaptive_regime_router_reasons": list(
+                        (plan_report.get("adaptive_regime_router") or {}).get("reasons") or []
+                    ),
+                    "adaptive_regime_router_step_scale": _safe_float(
+                        (plan_report.get("adaptive_regime_router") or {}).get("step_scale")
+                    ),
+                    "adaptive_regime_router_per_order_scale": _safe_float(
+                        (plan_report.get("adaptive_regime_router") or {}).get("per_order_scale")
+                    ),
+                    "adaptive_regime_router_levels_scale": _safe_float(
+                        (plan_report.get("adaptive_regime_router") or {}).get("levels_scale")
+                    ),
                     "regime_entry_budget": dict(plan_report.get("regime_entry_budget") or {}),
                     "regime_entry_budget_enabled": bool((plan_report.get("regime_entry_budget") or {}).get("enabled")),
                     "regime_entry_budget_state": str((plan_report.get("regime_entry_budget") or {}).get("state") or ""),
