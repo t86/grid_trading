@@ -3511,6 +3511,8 @@ def _infer_synthetic_order_ref_from_trade(trade: dict[str, Any]) -> dict[str, An
         role = "take_profit_short" if side == "BUY" else "take_profit_long"
     elif compact_role == "activede":
         role = "active_delever_short" if side == "BUY" else "active_delever_long"
+    elif compact_role == "adverser":
+        role = "adverse_reduce_short" if side == "BUY" else "adverse_reduce_long"
     elif compact_role == "flowslee":
         role = "flow_sleeve_short" if side == "BUY" else "flow_sleeve_long"
     elif compact_role == "softdele":
@@ -3555,6 +3557,8 @@ def _decorate_synthetic_open_orders(
         if ref is None:
             client_order_id = str(order.get("clientOrderId", "")).strip()
             ref = client_refs.get(client_order_id)
+        if ref is None:
+            ref = _infer_synthetic_order_ref_from_trade(order)
         if isinstance(ref, dict):
             role = str(ref.get("role", "")).strip()
             if role:
@@ -7930,8 +7934,7 @@ def apply_active_delever_long(
         if isinstance(item, dict) and _order_role(item) == "take_profit_long"
     ]
     if not take_profit_orders and (
-        pause_trigger_active
-        or inventory_pause_timeout_trigger_active
+        inventory_pause_timeout_trigger_active
         or force_release_trigger_active
     ):
         take_profit_orders = _build_near_market_release_seed_orders(
@@ -8111,14 +8114,7 @@ def apply_active_delever_long(
         shifted_take_profit_orders.append(shifted)
 
     active_orders: list[dict[str, Any]] = []
-    release_active = (
-        trigger_mode in {"threshold", "pause"}
-        and pause_notional > 0
-        and current_long_notional >= pause_notional - 1e-12
-    ) or (
-        force_release_trigger_active
-        and bool(trigger_mode)
-    )
+    release_active = force_release_trigger_active and bool(trigger_mode)
     release_floor_price: float | None = None
     release_order_count = 0
     pruned_flow_sleeve_count = 0
@@ -8298,9 +8294,7 @@ def apply_active_delever_short(
         if isinstance(item, dict) and _order_role(item) == "take_profit_short"
     ]
     if not take_profit_orders and (
-        pause_trigger_active
-        or threshold_timeout_trigger_active
-        or threshold_trigger_active
+        threshold_timeout_trigger_active
         or inventory_pause_timeout_trigger_active
         or force_release_trigger_active
     ):
@@ -8486,14 +8480,7 @@ def apply_active_delever_short(
         shifted_take_profit_orders.append(shifted)
 
     active_orders: list[dict[str, Any]] = []
-    release_active = (
-        trigger_mode in {"threshold", "pause"}
-        and pause_notional > 0
-        and current_short_notional >= pause_notional - 1e-12
-    ) or (
-        force_release_trigger_active
-        and bool(trigger_mode)
-    )
+    release_active = force_release_trigger_active and bool(trigger_mode)
     release_ceiling_price: float | None = None
     release_order_count = 0
     pruned_flow_sleeve_count = 0
