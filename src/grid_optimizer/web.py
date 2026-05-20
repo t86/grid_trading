@@ -7896,7 +7896,7 @@ def _tail_jsonl_dicts(path: Path, limit: int = 20) -> list[dict[str, Any]]:
     return rows[-limit:]
 
 
-def _safe_float(value: Any) -> float | None:
+def _safe_optional_float(value: Any) -> float | None:
     try:
         if value in {None, ""}:
             return None
@@ -7937,7 +7937,7 @@ def _runner_start_safety_preflight(
             execution_errors.append(error_message)
         if event.get("volatility_entry_pause_active"):
             post_shock_active = True
-        scale = _safe_float(event.get("adaptive_step_scale"))
+        scale = _safe_optional_float(event.get("adaptive_step_scale"))
         if scale is not None and scale > 1.2:
             post_shock_active = True
         if event.get("manual_intervention_detected") or event.get("manual_intervention"):
@@ -7963,8 +7963,8 @@ def _runner_start_safety_preflight(
 
     if plan and not spot:
         buy_paused = bool(plan.get("buy_paused"))
-        current_long = _safe_float(plan.get("current_long_notional")) or 0.0
-        pause_long = _safe_float(
+        current_long = _safe_optional_float(plan.get("current_long_notional")) or 0.0
+        pause_long = _safe_optional_float(
             plan.get("effective_pause_buy_position_notional")
             if plan.get("effective_pause_buy_position_notional") is not None
             else config.get("pause_buy_position_notional")

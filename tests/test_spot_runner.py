@@ -624,6 +624,52 @@ class SpotRunnerTests(unittest.TestCase):
             first_pythonpath = env["PYTHONPATH"].split(os.pathsep)[0]
             self.assertEqual(first_pythonpath, str(Path(web.__file__).resolve().parents[1]))
 
+    @patch("grid_optimizer.web.time.sleep")
+    @patch("grid_optimizer.web.subprocess.Popen")
+    @patch("grid_optimizer.web._build_spot_runner_command")
+    @patch("grid_optimizer.web._save_spot_runner_control_config")
+    @patch("grid_optimizer.web._cancel_spot_strategy_orders")
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_start_spot_runner_process_ignores_missing_adaptive_scale_in_old_events(
+        self,
+        mock_read_runner,
+        mock_cancel_orders,
+        _mock_save_config,
+        mock_build_command,
+        mock_popen,
+        _mock_sleep,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            events_path = tmp_path / "spot_events.jsonl"
+            events_path.write_text('{"symbol":"ETHU","runtime_status":"running"}\n', encoding="utf-8")
+            log_path = tmp_path / "spot_runner.log"
+            pid_path = tmp_path / "spot_runner.pid"
+
+            config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+            config.update(
+                {
+                    "symbol": "ETHU",
+                    "reset_state": False,
+                    "state_path": str(tmp_path / "spot_state.json"),
+                    "summary_jsonl": str(events_path),
+                }
+            )
+            mock_read_runner.side_effect = [
+                {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}},
+                {"configured": True, "pid": 4321, "is_running": True, "args": None, "config": config},
+            ]
+            mock_cancel_orders.return_value = {"canceled": 0}
+            mock_build_command.return_value = ["python3", "-m", "grid_optimizer.spot_loop_runner"]
+            mock_popen.return_value = MagicMock(pid=4321)
+
+            with patch("grid_optimizer.web._spot_runner_log_path", return_value=log_path), patch(
+                "grid_optimizer.web._spot_runner_pid_path", return_value=pid_path
+            ):
+                result = _start_spot_runner_process(config)
+
+            self.assertTrue(result["started"])
+
 
 if __name__ == "__main__":
     unittest.main()
