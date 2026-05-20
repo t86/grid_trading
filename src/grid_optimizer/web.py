@@ -432,6 +432,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_min_cycle_budget_notional": 20.0,
             "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
             "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
+            "best_quote_maker_volume_inventory_cost_gate_enabled": True,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "autotune_symbol_enabled": False,
@@ -480,6 +481,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_min_cycle_budget_notional": 10.0,
             "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
             "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
+            "best_quote_maker_volume_inventory_cost_gate_enabled": False,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "autotune_symbol_enabled": False,
@@ -9016,6 +9018,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adaptive_regime_router_cancel_stale_entries_on_no_trade",
         "best_quote_maker_volume_enabled",
         "best_quote_maker_volume_take_profit_guard_enabled",
+        "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_dynamic_tick_enabled",
         "best_quote_maker_volume_inventory_bias_enabled",
         "elastic_volume_enabled",
@@ -9734,6 +9737,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_below_soft_cost_gap_scale", 1.0)),
         "--best-quote-maker-volume-below-soft-adverse-threshold-scale",
         str(config.get("best_quote_maker_volume_below_soft_adverse_threshold_scale", 1.0)),
+        "--best-quote-maker-volume-inventory-cost-gate-enabled"
+        if config.get("best_quote_maker_volume_inventory_cost_gate_enabled", True)
+        else "--no-best-quote-maker-volume-inventory-cost-gate-enabled",
         "--best-quote-maker-volume-dynamic-tick-enabled"
         if config.get("best_quote_maker_volume_dynamic_tick_enabled", False)
         else "--no-best-quote-maker-volume-dynamic-tick-enabled",
