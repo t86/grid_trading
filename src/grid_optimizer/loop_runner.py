@@ -13912,6 +13912,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_take_profit_guard_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_take_profit_guard_enabled", True)
         )
+        best_quote_long_guard_roles = {"best_quote_reduce_long"}
+        best_quote_short_guard_roles = {"best_quote_reduce_short"}
+        if not hedge_best_quote:
+            best_quote_long_guard_roles.add("best_quote_entry_short")
+            best_quote_short_guard_roles.add("best_quote_entry_long")
         take_profit_guard = apply_take_profit_profit_guard(
             plan=plan,
             current_long_qty=current_long_qty,
@@ -13928,12 +13933,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             tick_size=symbol_info.get("tick_size"),
             bid_price=bid_price,
             ask_price=ask_price,
-            extra_long_guard_roles={"best_quote_entry_short", "best_quote_reduce_long"}
-            if best_quote_take_profit_guard_enabled
-            else None,
-            extra_short_guard_roles={"best_quote_entry_long", "best_quote_reduce_short"}
-            if best_quote_take_profit_guard_enabled
-            else None,
+            extra_long_guard_roles=best_quote_long_guard_roles if best_quote_take_profit_guard_enabled else None,
+            extra_short_guard_roles=best_quote_short_guard_roles if best_quote_take_profit_guard_enabled else None,
         )
         take_profit_guard["best_quote_guard_enabled"] = best_quote_take_profit_guard_enabled
         best_quote_profitable_exit_offset_cap = _cap_best_quote_profitable_inventory_exit_offset(

@@ -764,8 +764,8 @@ class LoopRunnerTests(unittest.TestCase):
         mock_account_info.return_value = {
             "multiAssetsMargin": False,
             "positions": [
-                {"symbol": "BTCUSDC", "positionSide": "LONG", "positionAmt": "0", "entryPrice": "0"},
-                {"symbol": "BTCUSDC", "positionSide": "SHORT", "positionAmt": "0", "entryPrice": "0"},
+                {"symbol": "BTCUSDC", "positionSide": "LONG", "positionAmt": "0.001", "entryPrice": "80400.05"},
+                {"symbol": "BTCUSDC", "positionSide": "SHORT", "positionAmt": "0.001", "entryPrice": "80400.05"},
             ],
         }
         mock_open_orders.return_value = []
@@ -788,6 +788,8 @@ class LoopRunnerTests(unittest.TestCase):
                 best_quote_maker_volume_max_long_notional=1_500.0,
                 best_quote_maker_volume_max_short_notional=1_500.0,
                 best_quote_maker_volume_loss_per_10k_15m=0.2,
+                best_quote_maker_volume_below_soft_cost_gap_scale=0.0,
+                best_quote_maker_volume_below_soft_adverse_threshold_scale=0.0,
                 reset_state=True,
             )
 
@@ -797,6 +799,8 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["best_quote_maker_volume"]["regime"], "normal")
         self.assertEqual(report["buy_orders"][0]["position_side"], "LONG")
         self.assertEqual(report["sell_orders"][0]["position_side"], "SHORT")
+        self.assertEqual(report["buy_orders"][0]["price"], 80400.0)
+        self.assertEqual(report["sell_orders"][0]["price"], 80400.1)
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
