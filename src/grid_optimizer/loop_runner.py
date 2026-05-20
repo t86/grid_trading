@@ -12985,6 +12985,23 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
         )
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
         target_base_qty = plan["target_long_base_qty"]
         bootstrap_qty = plan["bootstrap_long_qty"]
     elif _is_synthetic_neutral_mode(strategy_mode):
