@@ -14035,6 +14035,39 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                         0.0,
                     )
                 ),
+                dynamic_control_trend_inventory_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled", False)
+                ),
+                dynamic_control_trend_inventory_guard_start_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_start_ratio", 0.70)
+                ),
+                dynamic_control_trend_inventory_guard_min_score=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_min_score", 0.55)
+                ),
+                dynamic_control_trend_inventory_guard_min_volatility_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_min_volatility_ratio",
+                        0.0035,
+                    )
+                ),
+                dynamic_control_trend_inventory_guard_entry_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_entry_budget_scale",
+                        0.25,
+                    )
+                ),
+                dynamic_control_trend_inventory_guard_reduce_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_budget_scale",
+                        0.50,
+                    )
+                ),
+                dynamic_control_trend_inventory_guard_reduce_extra_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks", 4)
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -16359,6 +16392,33 @@ def _build_parser() -> argparse.ArgumentParser:
         "--best-quote-maker-volume-dynamic-control-trend-entry-guard-opposite-budget-scale",
         type=float,
         default=0.0,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-inventory-guard-start-ratio", type=float, default=0.70)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-inventory-guard-min-score", type=float, default=0.55)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-min-volatility-ratio",
+        type=float,
+        default=0.0035,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-entry-budget-scale",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-reduce-budget-scale",
+        type=float,
+        default=0.50,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-reduce-extra-ticks",
+        type=int,
+        default=4,
     )
     parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)

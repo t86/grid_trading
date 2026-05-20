@@ -55,6 +55,13 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_trend_entry_guard_min_volatility_ratio: float = 0.0
     dynamic_control_trend_entry_guard_conflict_ratio: float = 0.25
     dynamic_control_trend_entry_guard_opposite_budget_scale: float = 0.0
+    dynamic_control_trend_inventory_guard_enabled: bool = False
+    dynamic_control_trend_inventory_guard_start_ratio: float = 0.70
+    dynamic_control_trend_inventory_guard_min_score: float = 0.55
+    dynamic_control_trend_inventory_guard_min_volatility_ratio: float = 0.0035
+    dynamic_control_trend_inventory_guard_entry_budget_scale: float = 0.25
+    dynamic_control_trend_inventory_guard_reduce_budget_scale: float = 0.50
+    dynamic_control_trend_inventory_guard_reduce_extra_ticks: int = 4
 
 
 @dataclass(frozen=True)
@@ -373,6 +380,25 @@ def build_best_quote_maker_volume_plan(
         "conflict_ratio": _safe_float(config.dynamic_control_trend_entry_guard_conflict_ratio),
         "opposite_budget_scale": _safe_float(config.dynamic_control_trend_entry_guard_opposite_budget_scale),
     }
+    trend_inventory_guard_report = {
+        "enabled": bool(config.dynamic_control_trend_inventory_guard_enabled),
+        "applied": False,
+        "reason": None,
+        "guard_long_inventory": False,
+        "guard_short_inventory": False,
+        "long_entry_budget_scale": 1.0,
+        "short_entry_budget_scale": 1.0,
+        "reduce_long_budget_scale": 1.0,
+        "reduce_short_budget_scale": 1.0,
+        "reduce_long_extra_ticks": 0,
+        "reduce_short_extra_ticks": 0,
+        "start_ratio": _safe_float(config.dynamic_control_trend_inventory_guard_start_ratio),
+        "min_score": _safe_float(config.dynamic_control_trend_inventory_guard_min_score),
+        "min_volatility_ratio": _safe_float(config.dynamic_control_trend_inventory_guard_min_volatility_ratio),
+        "entry_budget_scale": _safe_float(config.dynamic_control_trend_inventory_guard_entry_budget_scale),
+        "reduce_budget_scale": _safe_float(config.dynamic_control_trend_inventory_guard_reduce_budget_scale),
+        "reduce_extra_ticks": int(_safe_float(config.dynamic_control_trend_inventory_guard_reduce_extra_ticks)),
+    }
     if config.dynamic_control_enabled and regime != "loss_defensive":
         return_1m = _safe_float(inputs.market_return_1m)
         return_5m = _safe_float(inputs.market_return_5m)
@@ -501,6 +527,53 @@ def build_best_quote_maker_volume_plan(
             if trend_entry_guard_report["blocked_short_entry"] and opposite_scale <= 0:
                 allow_entry_short = False
 
+    if config.dynamic_control_enabled and config.dynamic_control_trend_inventory_guard_enabled and not hard_loss:
+        min_score = _clamp(_safe_float(config.dynamic_control_trend_inventory_guard_min_score), 0.0, 1.0)
+        min_volatility = max(_safe_float(config.dynamic_control_trend_inventory_guard_min_volatility_ratio), 0.0)
+        start_ratio = max(_safe_float(config.dynamic_control_trend_inventory_guard_start_ratio), 0.0)
+        entry_scale = _clamp(_safe_float(config.dynamic_control_trend_inventory_guard_entry_budget_scale), 0.0, 1.0)
+        reduce_scale = _clamp(_safe_float(config.dynamic_control_trend_inventory_guard_reduce_budget_scale), 0.0, 1.0)
+        reduce_extra_ticks = max(int(_safe_float(config.dynamic_control_trend_inventory_guard_reduce_extra_ticks)), 0)
+        trend_score = _clamp(_safe_float(dynamic_control_report.get("trend_score")), -1.0, 1.0)
+        volatility_ratio = max(_safe_float(dynamic_control_report.get("volatility_ratio")), 0.0)
+        volatility_ok = min_volatility <= 0 or volatility_ratio >= min_volatility
+        long_guard = volatility_ok and long_inventory_ratio >= start_ratio and trend_score <= -min_score
+        short_guard = volatility_ok and short_inventory_ratio >= start_ratio and trend_score >= min_score
+        if long_guard or short_guard:
+            if long_guard:
+                trend_inventory_guard_report.update(
+                    {
+                        "guard_long_inventory": True,
+                        "long_entry_budget_scale": entry_scale,
+                        "reduce_long_budget_scale": reduce_scale,
+                        "reduce_long_extra_ticks": reduce_extra_ticks,
+                    }
+                )
+            if short_guard:
+                trend_inventory_guard_report.update(
+                    {
+                        "guard_short_inventory": True,
+                        "short_entry_budget_scale": entry_scale,
+                        "reduce_short_budget_scale": reduce_scale,
+                        "reduce_short_extra_ticks": reduce_extra_ticks,
+                    }
+                )
+            trend_inventory_guard_report.update(
+                {
+                    "applied": True,
+                    "reason": "adverse_trend_inventory_guard",
+                    "start_ratio": start_ratio,
+                    "min_score": min_score,
+                    "min_volatility_ratio": min_volatility,
+                    "entry_budget_scale": entry_scale,
+                    "reduce_budget_scale": reduce_scale,
+                    "reduce_extra_ticks": reduce_extra_ticks,
+                    "trend_score": trend_score,
+                    "volatility_ratio": volatility_ratio,
+                }
+            )
+            reasons.append("trend_inventory_guard")
+
     dynamic_tick_report = {
         "enabled": bool(config.dynamic_tick_enabled),
         "base_offset_ticks": int(offset_ticks),
@@ -525,6 +598,10 @@ def build_best_quote_maker_volume_plan(
             offset_ticks = new_ticks
     dynamic_tick_report["offset_ticks"] = int(offset_ticks)
     gap = _tick_gap(inputs.tick_size, offset_ticks)
+    reduce_long_extra_ticks = max(int(_safe_float(trend_inventory_guard_report["reduce_long_extra_ticks"])), 0)
+    reduce_short_extra_ticks = max(int(_safe_float(trend_inventory_guard_report["reduce_short_extra_ticks"])), 0)
+    reduce_long_gap = _tick_gap(inputs.tick_size, max(int(offset_ticks) + reduce_long_extra_ticks, 0))
+    reduce_short_gap = _tick_gap(inputs.tick_size, max(int(offset_ticks) + reduce_short_extra_ticks, 0))
     buy_slot_active = allow_entry_long or (short_notional > 0 and not allow_entry_short)
     sell_slot_active = allow_entry_short or (long_notional > 0 and not allow_entry_long)
     active_side_count = max((1 if buy_slot_active else 0) + (1 if sell_slot_active else 0), 1)
@@ -541,6 +618,18 @@ def build_best_quote_maker_volume_plan(
         dynamic_control_report["sell_budget_share"] = sell_share
     long_entry_budget_scale = _clamp(_safe_float(trend_entry_guard_report["long_entry_budget_scale"]), 0.0, 1.0)
     short_entry_budget_scale = _clamp(_safe_float(trend_entry_guard_report["short_entry_budget_scale"]), 0.0, 1.0)
+    long_entry_budget_scale *= _clamp(
+        _safe_float(trend_inventory_guard_report["long_entry_budget_scale"]), 0.0, 1.0
+    )
+    short_entry_budget_scale *= _clamp(
+        _safe_float(trend_inventory_guard_report["short_entry_budget_scale"]), 0.0, 1.0
+    )
+    reduce_long_budget_scale = _clamp(
+        _safe_float(trend_inventory_guard_report["reduce_long_budget_scale"]), 0.0, 1.0
+    )
+    reduce_short_budget_scale = _clamp(
+        _safe_float(trend_inventory_guard_report["reduce_short_budget_scale"]), 0.0, 1.0
+    )
 
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
@@ -644,9 +733,7 @@ def build_best_quote_maker_volume_plan(
             can_bias_short = short_inventory_ratio > long_inventory_ratio
             can_bias_long = not can_bias_short
     if can_bias_short or can_bias_long:
-        reduce_ticks = max(int(offset_ticks) + int(config.inventory_bias_reduce_extra_ticks), 0)
         same_side_ticks = max(int(offset_ticks) + max(int(config.inventory_bias_same_side_extra_ticks), 0), 0)
-        reduce_gap = _tick_gap(inputs.tick_size, reduce_ticks)
         same_side_gap = _tick_gap(inputs.tick_size, same_side_ticks)
         reduce_notional = cycle_budget * bias_reduce_share
         same_side_notional = cycle_budget * bias_entry_share
@@ -658,7 +745,7 @@ def build_best_quote_maker_volume_plan(
                 "side": "short" if can_bias_short else "long",
                 "reduce_share": bias_reduce_share,
                 "same_side_entry_share": bias_entry_share,
-                "reduce_offset_ticks": reduce_ticks,
+                "reduce_offset_ticks": None,
                 "same_side_offset_ticks": same_side_ticks,
                 "min_ratio_gap": bias_min_ratio_gap,
                 "min_notional_gap": bias_min_notional_gap,
@@ -666,12 +753,18 @@ def build_best_quote_maker_volume_plan(
             }
         )
         if can_bias_short:
+            short_reduce_ticks = max(
+                int(offset_ticks) + int(config.inventory_bias_reduce_extra_ticks) + reduce_short_extra_ticks,
+                0,
+            )
+            short_reduce_gap = _tick_gap(inputs.tick_size, short_reduce_ticks)
+            inventory_bias_report["reduce_offset_ticks"] = short_reduce_ticks
             _append_order(
                 buy_orders,
                 _build_order(
                     side="BUY",
-                    price=_price_with_gap(bid, reduce_gap, -1),
-                    notional=min(reduce_notional, short_notional),
+                    price=_price_with_gap(bid, short_reduce_gap, -1),
+                    notional=min(reduce_notional * reduce_short_budget_scale, short_notional),
                     role="best_quote_reduce_short",
                     inputs=inputs,
                     position_side=reduce_short_position_side,
@@ -691,12 +784,18 @@ def build_best_quote_maker_volume_plan(
                 )
             )
         else:
+            long_reduce_ticks = max(
+                int(offset_ticks) + int(config.inventory_bias_reduce_extra_ticks) + reduce_long_extra_ticks,
+                0,
+            )
+            long_reduce_gap = _tick_gap(inputs.tick_size, long_reduce_ticks)
+            inventory_bias_report["reduce_offset_ticks"] = long_reduce_ticks
             _append_order(
                 sell_orders,
                 _build_order(
                     side="SELL",
-                    price=_price_with_gap(ask, reduce_gap, 1),
-                    notional=min(reduce_notional, long_notional),
+                    price=_price_with_gap(ask, long_reduce_gap, 1),
+                    notional=min(reduce_notional * reduce_long_budget_scale, long_notional),
                     role="best_quote_reduce_long",
                     inputs=inputs,
                     position_side=reduce_long_position_side,
@@ -725,8 +824,8 @@ def build_best_quote_maker_volume_plan(
             buy_orders,
             _build_order(
                 side="BUY",
-                price=_price_with_gap(bid, gap, -1),
-                notional=min(buy_side_notional, short_notional),
+                price=_price_with_gap(bid, reduce_short_gap, -1),
+                notional=min(buy_side_notional * reduce_short_budget_scale, short_notional),
                 role="best_quote_reduce_short",
                 inputs=inputs,
                 position_side=reduce_short_position_side,
@@ -755,8 +854,8 @@ def build_best_quote_maker_volume_plan(
     elif not inventory_bias_report["applied"] and short_notional > 0:
         reduce_short_order = _build_order(
             side="BUY",
-            price=_price_with_gap(bid, gap, -1),
-            notional=min(buy_side_notional, short_notional),
+            price=_price_with_gap(bid, reduce_short_gap, -1),
+            notional=min(buy_side_notional * reduce_short_budget_scale, short_notional),
             role="best_quote_reduce_short",
             inputs=inputs,
             position_side=reduce_short_position_side,
@@ -788,8 +887,8 @@ def build_best_quote_maker_volume_plan(
             sell_orders,
             _build_order(
                 side="SELL",
-                price=_price_with_gap(ask, gap, 1),
-                notional=min(sell_side_notional, long_notional),
+                price=_price_with_gap(ask, reduce_long_gap, 1),
+                notional=min(sell_side_notional * reduce_long_budget_scale, long_notional),
                 role="best_quote_reduce_long",
                 inputs=inputs,
                 position_side=reduce_long_position_side,
@@ -818,8 +917,8 @@ def build_best_quote_maker_volume_plan(
     elif long_notional > 0:
         reduce_long_order = _build_order(
             side="SELL",
-            price=_price_with_gap(ask, gap, 1),
-            notional=min(sell_side_notional, long_notional),
+            price=_price_with_gap(ask, reduce_long_gap, 1),
+            notional=min(sell_side_notional * reduce_long_budget_scale, long_notional),
             role="best_quote_reduce_long",
             inputs=inputs,
             position_side=reduce_long_position_side,
@@ -885,6 +984,7 @@ def build_best_quote_maker_volume_plan(
             "effective_ladder_spacing": _safe_float(inputs.entry_ladder_spacing),
             "dynamic_control": dynamic_control_report,
             "trend_entry_guard": trend_entry_guard_report,
+            "trend_inventory_guard": trend_inventory_guard_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,
         },
