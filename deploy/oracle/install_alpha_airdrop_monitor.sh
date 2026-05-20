@@ -48,11 +48,11 @@ EOF
 
 sudo tee "$TIMER_FILE" >/dev/null <<EOF
 [Unit]
-Description=Run Binance Alpha airdrop X monitor every 10 minutes
+Description=Run Binance Alpha airdrop X monitor every 10 minutes from 14:00 to 22:50
 
 [Timer]
-OnBootSec=2min
-OnUnitActiveSec=10min
+OnCalendar=*-*-* 14..22:0/10:00
+Persistent=false
 AccuracySec=30s
 Unit=${TIMER_UNIT_NAME}.service
 

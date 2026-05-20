@@ -83,7 +83,8 @@ def test_alpha_airdrop_monitor_installer_writes_expected_systemd_units() -> None
     assert '--accounts ${ACCOUNTS}' in script
     assert '--state-path ${STATE_PATH}' in script
     assert '--alert-config-path ${ALERT_CONFIG_PATH}' in script
-    assert 'OnUnitActiveSec=10min' in script
+    assert 'OnCalendar=*-*-* 14..22:0/10:00' in script
+    assert 'Persistent=false' in script
     assert 'sudo systemctl restart "${TIMER_UNIT_NAME}.timer"' in script
 
 
