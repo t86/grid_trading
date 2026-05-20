@@ -269,6 +269,42 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertLess(plan["buy_orders"][0]["notional"], plan["sell_orders"][0]["notional"])
         self.assertAlmostEqual(plan["sell_orders"][0]["notional"], 30.0, delta=1.0)
 
+    def test_hedge_inventory_recover_keeps_small_same_side_entry_when_other_side_is_dust(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=700.0,
+                max_short_notional=700.0,
+                inventory_soft_ratio=0.5,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=0.9,
+                inventory_bias_min_ratio_gap=0.35,
+                inventory_bias_min_notional_gap_soft_ratio=0.35,
+                inventory_bias_reduce_share=0.8,
+            ),
+            inputs=_inputs(
+                bid_price=0.6048,
+                ask_price=0.6049,
+                mid_price=0.60485,
+                current_long_qty=5.0,
+                current_short_qty=552.0,
+                current_net_qty=0.0,
+                cycle_budget_notional=40.0,
+                pending_entry_buffer_notional=20.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_recover")
+        self.assertTrue(plan["metrics"]["inventory_bias"]["recover_applied"])
+        self.assertEqual(plan["metrics"]["inventory_bias"]["side"], "short")
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertLess(plan["sell_orders"][0]["notional"], plan["buy_orders"][0]["notional"])
+
     def test_hedge_mode_reduces_short_side_when_short_is_above_soft_band(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

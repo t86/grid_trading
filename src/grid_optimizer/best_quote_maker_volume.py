@@ -608,18 +608,34 @@ def build_best_quote_maker_volume_plan(
             )
         )
     elif not inventory_bias_report["applied"] and short_notional > 0:
-        _append_order(
-            buy_orders,
-            _build_order(
-                side="BUY",
-                price=_price_with_gap(bid, gap, -1),
-                notional=min(buy_side_notional, short_notional),
-                role="best_quote_reduce_short",
-                inputs=inputs,
-                position_side=reduce_short_position_side,
-                force_reduce_only=True,
-            ),
+        reduce_short_order = _build_order(
+            side="BUY",
+            price=_price_with_gap(bid, gap, -1),
+            notional=min(buy_side_notional, short_notional),
+            role="best_quote_reduce_short",
+            inputs=inputs,
+            position_side=reduce_short_position_side,
+            force_reduce_only=True,
         )
+        _append_order(buy_orders, reduce_short_order)
+        if (
+            reduce_short_order is None
+            and inventory_bias_report["recover_applied"]
+            and inventory_bias_report["side"] == "long"
+            and buy_side_notional > 0
+        ):
+            buy_orders.extend(
+                _build_entry_ladder(
+                    side="BUY",
+                    anchor_price=bid,
+                    base_gap=gap,
+                    total_notional=buy_side_notional,
+                    slots=max_entry_orders_per_side,
+                    role="best_quote_entry_long",
+                    inputs=inputs,
+                    position_side=long_entry_position_side,
+                )
+            )
     if inventory_bias_report["applied"]:
         pass
     elif long_notional > 0 and not allow_entry_long:
@@ -655,18 +671,34 @@ def build_best_quote_maker_volume_plan(
             )
         )
     elif long_notional > 0:
-        _append_order(
-            sell_orders,
-            _build_order(
-                side="SELL",
-                price=_price_with_gap(ask, gap, 1),
-                notional=min(sell_side_notional, long_notional),
-                role="best_quote_reduce_long",
-                inputs=inputs,
-                position_side=reduce_long_position_side,
-                force_reduce_only=True,
-            ),
+        reduce_long_order = _build_order(
+            side="SELL",
+            price=_price_with_gap(ask, gap, 1),
+            notional=min(sell_side_notional, long_notional),
+            role="best_quote_reduce_long",
+            inputs=inputs,
+            position_side=reduce_long_position_side,
+            force_reduce_only=True,
         )
+        _append_order(sell_orders, reduce_long_order)
+        if (
+            reduce_long_order is None
+            and inventory_bias_report["recover_applied"]
+            and inventory_bias_report["side"] == "short"
+            and sell_side_notional > 0
+        ):
+            sell_orders.extend(
+                _build_entry_ladder(
+                    side="SELL",
+                    anchor_price=ask,
+                    base_gap=gap,
+                    total_notional=sell_side_notional,
+                    slots=max_entry_orders_per_side,
+                    role="best_quote_entry_short",
+                    inputs=inputs,
+                    position_side=short_entry_position_side,
+                )
+            )
 
     planned = sum(order["notional"] for order in [*buy_orders, *sell_orders])
     return {
