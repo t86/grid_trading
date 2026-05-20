@@ -13842,6 +13842,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
             defensive_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_defensive_offset_ticks", 3)),
         )
+        adaptive_metrics = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
+
+        def _adaptive_window_metric(window_name: str, metric_name: str) -> float:
+            window = adaptive_metrics.get(window_name)
+            if isinstance(window, dict) and metric_name in window:
+                return _safe_float(window.get(metric_name))
+            return _safe_float(adaptive_step.get(f"{window_name}_{metric_name}"))
+
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
@@ -13887,6 +13895,45 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 inventory_bias_reduce_extra_ticks=int(
                     getattr(effective_args, "best_quote_maker_volume_inventory_bias_reduce_extra_ticks", -1)
                 ),
+                dynamic_control_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_enabled", False)
+                ),
+                dynamic_control_low_volatility_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_ratio", 0.0015)
+                ),
+                dynamic_control_high_volatility_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_ratio", 0.0035)
+                ),
+                dynamic_control_extreme_volatility_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_ratio", 0.007)
+                ),
+                dynamic_control_low_volatility_budget_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_budget_scale", 1.15)
+                ),
+                dynamic_control_high_volatility_budget_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_budget_scale", 0.75)
+                ),
+                dynamic_control_extreme_volatility_budget_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_budget_scale", 0.45)
+                ),
+                dynamic_control_high_volatility_extra_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_extra_offset_ticks", 3)
+                ),
+                dynamic_control_extreme_volatility_extra_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_extra_offset_ticks", 8)
+                ),
+                dynamic_control_high_volatility_step_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_step_scale", 1.5)
+                ),
+                dynamic_control_extreme_volatility_step_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_step_scale", 2.5)
+                ),
+                dynamic_control_trend_return_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_return_ratio", 0.002)
+                ),
+                dynamic_control_trend_bias_max=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_bias_max", 0.35)
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -13907,6 +13954,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_long_qty=current_long_qty,
                 current_short_qty=current_short_qty,
                 position_side_mode="hedge" if hedge_best_quote else "one_way",
+                market_return_1m=_adaptive_window_metric("window_1m", "return_ratio"),
+                market_amplitude_1m=_adaptive_window_metric("window_1m", "amplitude_ratio"),
+                market_return_5m=_adaptive_window_metric("window_5m", "return_ratio"),
+                market_amplitude_5m=_adaptive_window_metric("window_5m", "amplitude_ratio"),
             ),
         )
         best_quote_take_profit_guard_enabled = bool(
@@ -16157,6 +16208,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-share", type=float, default=0.70)
     parser.add_argument("--best-quote-maker-volume-inventory-bias-same-side-extra-ticks", type=int, default=2)
     parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-extra-ticks", type=int, default=-1)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-ratio", type=float, default=0.0015)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-ratio", type=float, default=0.0035)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-ratio", type=float, default=0.007)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-budget-scale", type=float, default=1.15)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-budget-scale", type=float, default=0.75)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-budget-scale", type=float, default=0.45)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-extra-offset-ticks", type=int, default=3)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-extra-offset-ticks", type=int, default=8)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-step-scale", type=float, default=1.5)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-step-scale", type=float, default=2.5)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-return-ratio", type=float, default=0.002)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-bias-max", type=float, default=0.35)
     parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
     parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)

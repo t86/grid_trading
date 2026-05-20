@@ -223,6 +223,76 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
         self.assertEqual(plan["sell_orders"], [])
 
+    def test_dynamic_control_scales_budget_and_widens_spacing_when_volatile(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_entry_orders_per_side=2,
+                dynamic_control_enabled=True,
+                dynamic_control_high_volatility_ratio=0.003,
+                dynamic_control_high_volatility_budget_scale=0.5,
+                dynamic_control_high_volatility_extra_offset_ticks=4,
+                dynamic_control_high_volatility_step_scale=2.0,
+            ),
+            inputs=_inputs(
+                bid_price=0.6050,
+                ask_price=0.6051,
+                mid_price=0.60505,
+                cycle_budget_notional=40.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                entry_ladder_spacing=0.00025,
+                market_amplitude_5m=0.004,
+            ),
+        )
+
+        control = plan["metrics"]["dynamic_control"]
+        self.assertTrue(control["applied"])
+        self.assertEqual(control["reason"], "high_volatility_defensive")
+        self.assertAlmostEqual(plan["metrics"]["cycle_budget_notional"], 20.0)
+        self.assertAlmostEqual(plan["metrics"]["effective_ladder_spacing"], 0.0005)
+        self.assertEqual(plan["metrics"]["dynamic_tick"]["offset_ticks"], 7)
+
+    def test_dynamic_control_biases_budget_toward_trend_side(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                dynamic_control_enabled=True,
+                dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_bias_max=0.30,
+            ),
+            inputs=_inputs(cycle_budget_notional=400.0, market_return_1m=0.002),
+        )
+
+        self.assertGreater(plan["metrics"]["buy_side_notional"], plan["metrics"]["sell_side_notional"])
+        self.assertGreater(plan["buy_orders"][0]["notional"], plan["sell_orders"][0]["notional"])
+        self.assertGreater(plan["metrics"]["dynamic_control"]["trend_score"], 0.0)
+
+    def test_hedge_inventory_bias_reduces_short_but_keeps_small_short_entry(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_short_notional=1_500.0,
+                inventory_soft_ratio=0.6,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=0.25,
+                inventory_bias_reduce_share=0.7,
+                inventory_bias_same_side_extra_ticks=2,
+                inventory_bias_reduce_extra_ticks=-1,
+            ),
+            inputs=_inputs(position_side_mode="hedge", current_short_qty=0.004),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_bias")
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(plan["buy_orders"][0]["position_side"], "SHORT")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "SHORT")
+        self.assertGreater(plan["buy_orders"][0]["notional"], plan["sell_orders"][0]["notional"])
+
 
 if __name__ == "__main__":
     unittest.main()

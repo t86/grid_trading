@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal
 from typing import Any
 
@@ -31,6 +31,19 @@ class BestQuoteMakerVolumeConfig:
     inventory_bias_reduce_share: float = 0.70
     inventory_bias_same_side_extra_ticks: int = 2
     inventory_bias_reduce_extra_ticks: int = -1
+    dynamic_control_enabled: bool = False
+    dynamic_control_low_volatility_ratio: float = 0.0015
+    dynamic_control_high_volatility_ratio: float = 0.0035
+    dynamic_control_extreme_volatility_ratio: float = 0.007
+    dynamic_control_low_volatility_budget_scale: float = 1.15
+    dynamic_control_high_volatility_budget_scale: float = 0.75
+    dynamic_control_extreme_volatility_budget_scale: float = 0.45
+    dynamic_control_high_volatility_extra_offset_ticks: int = 3
+    dynamic_control_extreme_volatility_extra_offset_ticks: int = 8
+    dynamic_control_high_volatility_step_scale: float = 1.5
+    dynamic_control_extreme_volatility_step_scale: float = 2.5
+    dynamic_control_trend_return_ratio: float = 0.002
+    dynamic_control_trend_bias_max: float = 0.35
 
 
 @dataclass(frozen=True)
@@ -53,6 +66,10 @@ class BestQuoteMakerVolumeInputs:
     current_long_qty: float | None = None
     current_short_qty: float | None = None
     position_side_mode: str = "one_way"
+    market_return_1m: float = 0.0
+    market_amplitude_1m: float = 0.0
+    market_return_5m: float = 0.0
+    market_amplitude_5m: float = 0.0
 
 
 def _safe_float(value: Any) -> float:
@@ -250,6 +267,78 @@ def build_best_quote_maker_volume_plan(
         cycle_budget *= _clamp(_safe_float(config.soft_loss_budget_scale), 0.0, 1.0)
 
     offset_ticks = config.defensive_offset_ticks if regime in {"loss_soft", "inventory_recover"} else config.quote_offset_ticks
+    base_cycle_budget = cycle_budget
+    base_ladder_spacing = max(_safe_float(inputs.entry_ladder_spacing), 0.0)
+    dynamic_control_report = {
+        "enabled": bool(config.dynamic_control_enabled),
+        "applied": False,
+        "reason": None,
+        "volatility_ratio": 0.0,
+        "trend_score": 0.0,
+        "budget_scale": 1.0,
+        "step_scale": 1.0,
+        "extra_offset_ticks": 0,
+        "buy_budget_share": None,
+        "sell_budget_share": None,
+        "base_cycle_budget_notional": base_cycle_budget,
+        "effective_cycle_budget_notional": cycle_budget,
+        "base_ladder_spacing": base_ladder_spacing,
+        "effective_ladder_spacing": base_ladder_spacing,
+    }
+    if config.dynamic_control_enabled and regime != "loss_defensive":
+        return_1m = _safe_float(inputs.market_return_1m)
+        return_5m = _safe_float(inputs.market_return_5m)
+        amplitude_1m = max(_safe_float(inputs.market_amplitude_1m), 0.0)
+        amplitude_5m = max(_safe_float(inputs.market_amplitude_5m), 0.0)
+        volatility_ratio = max(abs(return_1m), abs(return_5m), amplitude_1m, amplitude_5m)
+        low_vol = max(_safe_float(config.dynamic_control_low_volatility_ratio), 0.0)
+        high_vol = max(_safe_float(config.dynamic_control_high_volatility_ratio), low_vol)
+        extreme_vol = max(_safe_float(config.dynamic_control_extreme_volatility_ratio), high_vol)
+        budget_scale = 1.0
+        step_scale = 1.0
+        extra_offset_ticks = 0
+        reason = "normal"
+        if extreme_vol > 0 and volatility_ratio >= extreme_vol:
+            budget_scale = _clamp(_safe_float(config.dynamic_control_extreme_volatility_budget_scale), 0.0, 1.0)
+            step_scale = max(_safe_float(config.dynamic_control_extreme_volatility_step_scale), 1.0)
+            extra_offset_ticks = max(int(config.dynamic_control_extreme_volatility_extra_offset_ticks), 0)
+            reason = "extreme_volatility_defensive"
+        elif high_vol > 0 and volatility_ratio >= high_vol:
+            budget_scale = _clamp(_safe_float(config.dynamic_control_high_volatility_budget_scale), 0.0, 1.0)
+            step_scale = max(_safe_float(config.dynamic_control_high_volatility_step_scale), 1.0)
+            extra_offset_ticks = max(int(config.dynamic_control_high_volatility_extra_offset_ticks), 0)
+            reason = "high_volatility_defensive"
+        elif low_vol > 0 and 0 < volatility_ratio <= low_vol and inventory_ratio < 0.75 and not soft_loss:
+            budget_scale = max(_safe_float(config.dynamic_control_low_volatility_budget_scale), 1.0)
+            reason = "low_volatility_expand"
+        trend_threshold = max(_safe_float(config.dynamic_control_trend_return_ratio), 1e-12)
+        trend_score = _clamp(((return_1m * 0.65) + (return_5m * 0.35)) / trend_threshold, -1.0, 1.0)
+        cycle_budget *= budget_scale
+        if extra_offset_ticks > 0:
+            offset_ticks = int(offset_ticks) + extra_offset_ticks
+        effective_ladder_spacing = base_ladder_spacing * step_scale if base_ladder_spacing > 0 else base_ladder_spacing
+        if effective_ladder_spacing > 0 and abs(effective_ladder_spacing - base_ladder_spacing) > 1e-12:
+            inputs = replace(inputs, entry_ladder_spacing=effective_ladder_spacing)
+        dynamic_control_report.update(
+            {
+                "applied": True,
+                "reason": reason,
+                "volatility_ratio": volatility_ratio,
+                "trend_score": trend_score,
+                "budget_scale": budget_scale,
+                "step_scale": step_scale,
+                "extra_offset_ticks": extra_offset_ticks,
+                "effective_cycle_budget_notional": cycle_budget,
+                "effective_ladder_spacing": effective_ladder_spacing,
+                "market_return_1m": return_1m,
+                "market_amplitude_1m": amplitude_1m,
+                "market_return_5m": return_5m,
+                "market_amplitude_5m": amplitude_5m,
+            }
+        )
+        if reason != "normal":
+            reasons.append(reason)
+
     dynamic_tick_report = {
         "enabled": bool(config.dynamic_tick_enabled),
         "base_offset_ticks": int(offset_ticks),
@@ -276,7 +365,18 @@ def build_best_quote_maker_volume_plan(
     gap = _tick_gap(inputs.tick_size, offset_ticks)
     buy_slot_active = allow_entry_long or (short_notional > 0 and not allow_entry_short)
     sell_slot_active = allow_entry_short or (long_notional > 0 and not allow_entry_long)
-    per_side = cycle_budget / max((1 if buy_slot_active else 0) + (1 if sell_slot_active else 0), 1)
+    active_side_count = max((1 if buy_slot_active else 0) + (1 if sell_slot_active else 0), 1)
+    buy_side_notional = cycle_budget / active_side_count
+    sell_side_notional = cycle_budget / active_side_count
+    if config.dynamic_control_enabled and buy_slot_active and sell_slot_active:
+        max_bias = _clamp(_safe_float(config.dynamic_control_trend_bias_max), 0.0, 0.45)
+        trend_score = _clamp(_safe_float(dynamic_control_report.get("trend_score")), -1.0, 1.0)
+        buy_share = _clamp(0.5 + (trend_score * max_bias), 0.05, 0.95)
+        sell_share = 1.0 - buy_share
+        buy_side_notional = cycle_budget * buy_share
+        sell_side_notional = cycle_budget * sell_share
+        dynamic_control_report["buy_budget_share"] = buy_share
+        dynamic_control_report["sell_budget_share"] = sell_share
 
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
@@ -300,9 +400,8 @@ def build_best_quote_maker_volume_plan(
     bias_entry_share = max(1.0 - bias_reduce_share, 0.0)
     can_bias_short = (
         config.inventory_bias_enabled
-        and not hedge_position_sides
         and regime == "normal"
-        and net_qty < 0
+        and short_notional > 0
         and allow_entry_long
         and allow_entry_short
         and short_soft > 0
@@ -310,14 +409,16 @@ def build_best_quote_maker_volume_plan(
     )
     can_bias_long = (
         config.inventory_bias_enabled
-        and not hedge_position_sides
         and regime == "normal"
-        and net_qty > 0
+        and long_notional > 0
         and allow_entry_long
         and allow_entry_short
         and long_soft > 0
         and long_notional >= long_soft * bias_start
     )
+    if can_bias_short and can_bias_long:
+        can_bias_short = short_inventory_ratio >= long_inventory_ratio
+        can_bias_long = not can_bias_short
     if can_bias_short or can_bias_long:
         reduce_ticks = max(int(offset_ticks) + int(config.inventory_bias_reduce_extra_ticks), 0)
         same_side_ticks = max(int(offset_ticks) + max(int(config.inventory_bias_same_side_extra_ticks), 0), 0)
@@ -337,7 +438,7 @@ def build_best_quote_maker_volume_plan(
                 "same_side_offset_ticks": same_side_ticks,
             }
         )
-        if can_bias_short and not hedge_position_sides:
+        if can_bias_short:
             _append_order(
                 buy_orders,
                 _build_order(
@@ -362,7 +463,7 @@ def build_best_quote_maker_volume_plan(
                     position_side=short_entry_position_side,
                 )
             )
-        elif not hedge_position_sides:
+        else:
             _append_order(
                 sell_orders,
                 _build_order(
@@ -398,7 +499,7 @@ def build_best_quote_maker_volume_plan(
             _build_order(
                 side="BUY",
                 price=_price_with_gap(bid, gap, -1),
-                notional=min(per_side, short_notional),
+                notional=min(buy_side_notional, short_notional),
                 role="best_quote_reduce_short",
                 inputs=inputs,
                 position_side=reduce_short_position_side,
@@ -406,7 +507,7 @@ def build_best_quote_maker_volume_plan(
             ),
         )
     elif not inventory_bias_report["applied"] and allow_entry_long:
-        long_entry_notional = per_side
+        long_entry_notional = buy_side_notional
         if long_limit > 0:
             long_entry_notional = min(
                 long_entry_notional,
@@ -430,7 +531,7 @@ def build_best_quote_maker_volume_plan(
             _build_order(
                 side="BUY",
                 price=_price_with_gap(bid, gap, -1),
-                notional=min(per_side, short_notional),
+                notional=min(buy_side_notional, short_notional),
                 role="best_quote_reduce_short",
                 inputs=inputs,
                 position_side=reduce_short_position_side,
@@ -445,7 +546,7 @@ def build_best_quote_maker_volume_plan(
             _build_order(
                 side="SELL",
                 price=_price_with_gap(ask, gap, 1),
-                notional=min(per_side, long_notional),
+                notional=min(sell_side_notional, long_notional),
                 role="best_quote_reduce_long",
                 inputs=inputs,
                 position_side=reduce_long_position_side,
@@ -453,7 +554,7 @@ def build_best_quote_maker_volume_plan(
             ),
         )
     elif allow_entry_short:
-        short_entry_notional = per_side
+        short_entry_notional = sell_side_notional
         if short_limit > 0:
             short_entry_notional = min(
                 short_entry_notional,
@@ -477,7 +578,7 @@ def build_best_quote_maker_volume_plan(
             _build_order(
                 side="SELL",
                 price=_price_with_gap(ask, gap, 1),
-                notional=min(per_side, long_notional),
+                notional=min(sell_side_notional, long_notional),
                 role="best_quote_reduce_long",
                 inputs=inputs,
                 position_side=reduce_long_position_side,
@@ -507,9 +608,14 @@ def build_best_quote_maker_volume_plan(
             "projected_long_entry_notional": projected_long_entry_notional,
             "projected_short_entry_notional": projected_short_entry_notional,
             "cycle_budget_notional": cycle_budget,
+            "base_cycle_budget_notional": base_cycle_budget,
             "long_inventory_ratio": long_inventory_ratio,
             "short_inventory_ratio": short_inventory_ratio,
             "inventory_ratio": inventory_ratio,
+            "buy_side_notional": buy_side_notional,
+            "sell_side_notional": sell_side_notional,
+            "effective_ladder_spacing": _safe_float(inputs.entry_ladder_spacing),
+            "dynamic_control": dynamic_control_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,
         },
