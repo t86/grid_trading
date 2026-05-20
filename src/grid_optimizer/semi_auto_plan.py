@@ -2179,9 +2179,22 @@ def preserve_sticky_exit_orders(
             return (-price, price)
         return (price, price)
 
+    def _role(order: dict[str, Any]) -> str:
+        role = str(order.get("role", "")).strip()
+        if role:
+            return role
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _position_side(order)
+        if _truthy(order.get("reduceOnly", order.get("reduce_only", order.get("force_reduce_only")))):
+            if side == "BUY" and position_side == "SHORT":
+                return "best_quote_reduce_short"
+            if side == "SELL" and position_side == "LONG":
+                return "best_quote_reduce_long"
+        return ""
+
     desired_groups: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
     for index, order in enumerate(adjusted_orders):
-        role = str(order.get("role", "")).strip()
+        role = _role(order)
         if role not in normalized_roles:
             continue
         side = str(order.get("side", "")).upper().strip()
@@ -2192,7 +2205,7 @@ def preserve_sticky_exit_orders(
 
     existing_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for order in existing_orders:
-        role = str(order.get("role", "")).strip()
+        role = _role(order)
         if role not in normalized_roles:
             continue
         side = str(order.get("side", "")).upper().strip()
