@@ -2901,6 +2901,38 @@ def apply_hard_loss_forced_reduce(
     return report
 
 
+def _resolve_hard_loss_reduce_target_notional(
+    *,
+    configured_target_notional: float | None,
+    pause_position_notional: float | None,
+) -> float:
+    safe_target = max(_safe_float(configured_target_notional), 0.0)
+    safe_pause = max(_safe_float(pause_position_notional), 0.0)
+    if safe_pause > 0:
+        return max(safe_target, safe_pause)
+    return safe_target
+
+
+def _position_unrealized_or_estimate(
+    *,
+    position: dict[str, Any],
+    qty: float,
+    cost_basis_price: float,
+    mid_price: float,
+    side: str,
+) -> float:
+    if "unRealizedProfit" in position or "unrealizedProfit" in position:
+        return _position_unrealized_pnl(position)
+    safe_qty = max(_safe_float(qty), 0.0)
+    safe_cost = max(_safe_float(cost_basis_price), 0.0)
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    if safe_qty <= 1e-12 or safe_cost <= 0 or safe_mid <= 0:
+        return 0.0
+    if str(side or "").upper().strip() == "SELL":
+        return (safe_mid - safe_cost) * safe_qty
+    return (safe_cost - safe_mid) * safe_qty
+
+
 def _is_long_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
     position_side = _order_position_side(order)
@@ -14531,10 +14563,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 triggered=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
                 side="SELL",
                 current_notional=controls["current_long_notional"],
-                target_notional=(
-                    getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
-                    if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
-                    else exposure_escalation.get("target_notional")
+                target_notional=_resolve_hard_loss_reduce_target_notional(
+                    configured_target_notional=(
+                        getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
+                        if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
+                        else exposure_escalation.get("target_notional")
+                    ),
+                    pause_position_notional=effective_args.pause_buy_position_notional,
                 ),
                 unrealized_pnl=_safe_float(exposure_escalation.get("unrealized_pnl")),
                 hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
@@ -14549,10 +14584,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 side="SELL",
                 current_qty=current_long_qty,
                 current_notional=controls["current_long_notional"],
-                target_notional=(
-                    getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
-                    if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
-                    else exposure_escalation.get("target_notional")
+                target_notional=_resolve_hard_loss_reduce_target_notional(
+                    configured_target_notional=(
+                        getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
+                        if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
+                        else exposure_escalation.get("target_notional")
+                    ),
+                    pause_position_notional=effective_args.pause_buy_position_notional,
                 ),
                 max_order_notional=getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None),
                 bid_price=bid_price,
@@ -14661,31 +14699,79 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     )
     if not hard_loss_forced_reduce.get("active") and bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)):
         hard_loss_limit = max(_safe_float(getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None)), 0.0)
-        hard_side = None
-        hard_qty = 0.0
-        hard_notional = 0.0
-        hard_unrealized = 0.0
-        hard_cost_basis = 0.0
+        hard_candidates: list[dict[str, Any]] = []
+        if current_long_qty > 1e-12:
+            long_notional_for_hard = controls.get("current_long_notional", current_long_notional)
+            hard_candidates.append(
+                {
+                    "side": "SELL",
+                    "qty": current_long_qty,
+                    "notional": long_notional_for_hard,
+                    "target_notional": _resolve_hard_loss_reduce_target_notional(
+                        configured_target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+                        pause_position_notional=effective_args.pause_buy_position_notional,
+                    ),
+                    "cost_basis": adverse_long_cost_price,
+                    "unrealized": _position_unrealized_or_estimate(
+                        position=long_position,
+                        qty=current_long_qty,
+                        cost_basis_price=adverse_long_cost_price,
+                        mid_price=mid_price,
+                        side="SELL",
+                    ),
+                }
+            )
         if current_short_qty > 1e-12:
-            hard_side = "BUY"
-            hard_qty = current_short_qty
-            hard_notional = controls.get("current_short_notional", current_short_notional)
-            hard_cost_basis = adverse_short_cost_price
-            hard_unrealized = (hard_cost_basis - mid_price) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
-        elif current_long_qty > 1e-12:
-            hard_side = "SELL"
-            hard_qty = current_long_qty
-            hard_notional = controls.get("current_long_notional", current_long_notional)
-            hard_cost_basis = adverse_long_cost_price
-            hard_unrealized = (mid_price - hard_cost_basis) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
-        hard_loss_active = hard_loss_limit > 0 and hard_unrealized <= -hard_loss_limit
+            short_notional_for_hard = controls.get("current_short_notional", current_short_notional)
+            hard_candidates.append(
+                {
+                    "side": "BUY",
+                    "qty": current_short_qty,
+                    "notional": short_notional_for_hard,
+                    "target_notional": _resolve_hard_loss_reduce_target_notional(
+                        configured_target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+                        pause_position_notional=effective_args.pause_short_position_notional,
+                    ),
+                    "cost_basis": adverse_short_cost_price,
+                    "unrealized": _position_unrealized_or_estimate(
+                        position=short_position,
+                        qty=current_short_qty,
+                        cost_basis_price=adverse_short_cost_price,
+                        mid_price=mid_price,
+                        side="BUY",
+                    ),
+                }
+            )
+        active_candidates = [
+            candidate
+            for candidate in hard_candidates
+            if hard_loss_limit > 0
+            and _safe_float(candidate.get("unrealized")) <= -hard_loss_limit
+            and _safe_float(candidate.get("notional")) > _safe_float(candidate.get("target_notional")) + 1e-12
+        ]
+        selected_hard_candidate = (
+            min(active_candidates, key=lambda item: _safe_float(item.get("unrealized")))
+            if active_candidates
+            else (
+                min(hard_candidates, key=lambda item: _safe_float(item.get("unrealized")))
+                if hard_candidates
+                else None
+            )
+        )
+        hard_side = str((selected_hard_candidate or {}).get("side") or "")
+        hard_qty = _safe_float((selected_hard_candidate or {}).get("qty"))
+        hard_notional = _safe_float((selected_hard_candidate or {}).get("notional"))
+        hard_target_notional = _safe_float((selected_hard_candidate or {}).get("target_notional"))
+        hard_unrealized = _safe_float((selected_hard_candidate or {}).get("unrealized"))
+        hard_cost_basis = _safe_float((selected_hard_candidate or {}).get("cost_basis"))
+        hard_loss_active = selected_hard_candidate in active_candidates
         hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
             state=state,
             enabled=True,
             triggered=bool(hard_side) and hard_loss_active,
             side=hard_side,
             current_notional=hard_notional,
-            target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+            target_notional=hard_target_notional,
             unrealized_pnl=hard_unrealized,
             hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
             now=plan_now,
@@ -14699,7 +14785,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             side=hard_side or "SELL",
             current_qty=hard_qty,
             current_notional=hard_notional,
-            target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+            target_notional=hard_target_notional,
             max_order_notional=getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None),
             bid_price=bid_price,
             ask_price=ask_price,

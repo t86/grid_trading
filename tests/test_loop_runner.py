@@ -43,6 +43,8 @@ from grid_optimizer.loop_runner import (
     _resolve_custom_grid_roll,
     _resolve_best_quote_dynamic_offsets,
     _resolve_synthetic_resync_price,
+    _resolve_hard_loss_reduce_target_notional,
+    _position_unrealized_or_estimate,
     _shift_custom_grid_bounds,
     _run_periodic_reconcile,
     _cap_best_quote_profitable_inventory_exit_offset,
@@ -2014,6 +2016,33 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(report["active"])
         self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+
+    def test_resolve_hard_loss_reduce_target_notional_never_below_pause(self) -> None:
+        self.assertAlmostEqual(
+            _resolve_hard_loss_reduce_target_notional(
+                configured_target_notional=30.0,
+                pause_position_notional=520.0,
+            ),
+            520.0,
+        )
+        self.assertAlmostEqual(
+            _resolve_hard_loss_reduce_target_notional(
+                configured_target_notional=650.0,
+                pause_position_notional=520.0,
+            ),
+            650.0,
+        )
+
+    def test_position_unrealized_or_estimate_prefers_exchange_unrealized(self) -> None:
+        unrealized = _position_unrealized_or_estimate(
+            position={"unRealizedProfit": "-0.47"},
+            qty=51.0,
+            cost_basis_price=0.7164,
+            mid_price=0.5967,
+            side="SELL",
+        )
+
+        self.assertAlmostEqual(unrealized, -0.47)
 
     def test_apply_hard_loss_forced_reduce_stops_when_target_above_current(self) -> None:
         plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
