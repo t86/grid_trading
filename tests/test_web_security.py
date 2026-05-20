@@ -2801,6 +2801,7 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_soft_loss_budget_scale": 0.5,
                 "best_quote_maker_volume_below_soft_cost_gap_scale": 0.25,
                 "best_quote_maker_volume_below_soft_adverse_threshold_scale": 5.0,
+                "volatility_entry_pause_tiny_inventory_ignore_notional": 10.0,
                 "elastic_volume_enabled": True,
                 "elastic_early_micro_abs_return_ratio": 0.001,
                 "elastic_early_micro_amplitude_ratio": 0.0015,
@@ -2837,6 +2838,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--best-quote-maker-volume-below-soft-adverse-threshold-scale", command)
         self.assertIn("0.25", command)
         self.assertIn("5.0", command)
+        self.assertIn("--volatility-entry-pause-tiny-inventory-ignore-notional", command)
+        tiny_index = command.index("--volatility-entry-pause-tiny-inventory-ignore-notional")
+        self.assertEqual(command[tiny_index + 1], "10.0")
         self.assertIn("--elastic-early-micro-abs-return-ratio", command)
         self.assertIn("--elastic-early-micro-amplitude-ratio", command)
         self.assertIn("--elastic-early-safe-inventory-ratio", command)

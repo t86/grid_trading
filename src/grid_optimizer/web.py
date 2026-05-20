@@ -3786,6 +3786,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "volatility_entry_pause_recover_confirm_cycles": 1,
     "volatility_entry_pause_min_observation_seconds": 180.0,
     "volatility_entry_pause_inventory_recover_ratio": 0.75,
+    "volatility_entry_pause_tiny_inventory_ignore_notional": 0.0,
     "anti_chase_entry_guard_enabled": True,
     "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
     "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -10288,6 +10289,11 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
             "--volatility-entry-pause-inventory-recover-ratio",
             str(config["volatility_entry_pause_inventory_recover_ratio"]),
         ])
+    if config.get("volatility_entry_pause_tiny_inventory_ignore_notional") is not None:
+        command.extend([
+            "--volatility-entry-pause-tiny-inventory-ignore-notional",
+            str(config["volatility_entry_pause_tiny_inventory_ignore_notional"]),
+        ])
     command.append(
         "--anti-chase-entry-guard-enabled"
         if config.get(
@@ -10727,6 +10733,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
             "volatility_entry_pause_recover_confirm_cycles",
             "volatility_entry_pause_min_observation_seconds",
             "volatility_entry_pause_inventory_recover_ratio",
+            "volatility_entry_pause_tiny_inventory_ignore_notional",
             "synthetic_trend_follow_enabled",
             "synthetic_trend_follow_1m_abs_return_ratio",
             "synthetic_trend_follow_1m_amplitude_ratio",
@@ -20769,6 +20776,9 @@ MONITOR_PAGE = """<!doctype html>
                 <label>库存回落比例
                   <input id="runner_field_volatility_entry_pause_inventory_recover_ratio" type="number" min="0.01" max="1" step="0.01" />
                 </label>
+                <label>小库存忽略阈值
+                  <input id="runner_field_volatility_entry_pause_tiny_inventory_ignore_notional" type="number" min="0" step="0.1" />
+                </label>
                 <label>恢复确认轮数
                   <input id="runner_field_volatility_entry_pause_recover_confirm_cycles" type="number" min="1" step="1" />
                 </label>
@@ -23782,6 +23792,7 @@ MONITOR_PAGE = """<!doctype html>
       { key: "volatility_entry_pause_5m_amplitude_ratio", id: "runner_field_volatility_entry_pause_5m_amplitude_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_min_observation_seconds", id: "runner_field_volatility_entry_pause_min_observation_seconds", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_inventory_recover_ratio", id: "runner_field_volatility_entry_pause_inventory_recover_ratio", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
+      { key: "volatility_entry_pause_tiny_inventory_ignore_notional", id: "runner_field_volatility_entry_pause_tiny_inventory_ignore_notional", type: "number", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "volatility_entry_pause_recover_confirm_cycles", id: "runner_field_volatility_entry_pause_recover_confirm_cycles", type: "integer", allowNull: true, modes: GRID_BASED_RUNNER_MODE_LIST },
       { key: "auto_regime_enabled", id: "runner_field_auto_regime_enabled", type: "boolean", modes: LONG_ONLY_RUNNER_MODE_LIST },
       { key: "auto_regime_confirm_cycles", id: "runner_field_auto_regime_confirm_cycles", type: "integer", modes: LONG_ONLY_RUNNER_MODE_LIST },

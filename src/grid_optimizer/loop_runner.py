@@ -860,6 +860,7 @@ def resolve_volatility_entry_pause(
     current_long_notional: float | None = None,
     current_short_notional: float | None = None,
     inventory_recover_ratio: float = 1.0,
+    tiny_inventory_ignore_notional: float = 0.0,
 ) -> dict[str, Any]:
     metrics = dict(adaptive_step.get("metrics") or {}) if isinstance(adaptive_step, dict) else {}
     memory = dict((state or {}).get("volatility_entry_pause_state") or {}) if isinstance(state, dict) else {}
@@ -880,6 +881,8 @@ def resolve_volatility_entry_pause(
         "metrics": metrics,
         "observation_remaining_seconds": 0.0,
         "inventory_gate_active": False,
+        "tiny_inventory_ignore_notional": max(_safe_float(tiny_inventory_ignore_notional), 0.0),
+        "tiny_inventory_ignored": False,
         "state": {},
     }
     if not enabled:
@@ -937,6 +940,8 @@ def resolve_volatility_entry_pause(
     short_notional = max(_safe_float(current_short_notional), 0.0)
     current_inventory_notional = max(long_notional, short_notional)
     inventory_ratio_required = min(max(float(inventory_recover_ratio or 1.0), 0.0), 1.0)
+    tiny_inventory_limit = max(_safe_float(tiny_inventory_ignore_notional), 0.0)
+    tiny_inventory_ignored = False
     if candidates:
         recover_count = 0
         active = True
@@ -962,7 +967,12 @@ def resolve_volatility_entry_pause(
         )
         observation_remaining_seconds = max(float(min_observation_seconds or 0.0) - elapsed_seconds, 0.0)
         inventory_recover_limit = trigger_inventory_notional * inventory_ratio_required if trigger_inventory_notional > 0 else 0.0
-        inventory_gate_active = trigger_inventory_notional > 0 and current_inventory_notional > inventory_recover_limit
+        tiny_inventory_ignored = bool(tiny_inventory_limit > 0 and 0 < current_inventory_notional <= tiny_inventory_limit)
+        inventory_gate_active = (
+            trigger_inventory_notional > 0
+            and current_inventory_notional > inventory_recover_limit
+            and not tiny_inventory_ignored
+        )
         recover_gate_open = observation_remaining_seconds <= 0 and not inventory_gate_active
         recover_count = previous_recover + 1 if was_active and recover_gate_open else 0 if was_active else required_recover
         active = was_active and (not recover_gate_open or recover_count < required_recover)
@@ -996,6 +1006,8 @@ def resolve_volatility_entry_pause(
             "reason": reason,
             "observation_remaining_seconds": observation_remaining_seconds,
             "inventory_gate_active": inventory_gate_active,
+            "tiny_inventory_ignore_notional": tiny_inventory_limit,
+            "tiny_inventory_ignored": tiny_inventory_ignored,
         }
     )
     report["state"] = {
@@ -11781,6 +11793,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_long_notional=current_long_notional,
         current_short_notional=current_short_notional,
         inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
+        tiny_inventory_ignore_notional=getattr(
+            effective_args,
+            "volatility_entry_pause_tiny_inventory_ignore_notional",
+            0.0,
+        ),
     )
     observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
     execution_regime = build_execution_regime_report(
@@ -16227,6 +16244,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volatility-entry-pause-recover-confirm-cycles", type=int, default=1)
     parser.add_argument("--volatility-entry-pause-min-observation-seconds", type=float, default=180.0)
     parser.add_argument("--volatility-entry-pause-inventory-recover-ratio", type=float, default=0.75)
+    parser.add_argument("--volatility-entry-pause-tiny-inventory-ignore-notional", type=float, default=0.0)
     parser.add_argument("--anti-chase-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--anti-chase-entry-guard-1m-abs-return-ratio", type=float, default=0.0025)
     parser.add_argument("--anti-chase-entry-guard-1m-amplitude-ratio", type=float, default=0.0035)
@@ -17036,6 +17054,8 @@ def main() -> None:
         or args.volatility_entry_pause_inventory_recover_ratio > 1
     ):
         raise SystemExit("--volatility-entry-pause-inventory-recover-ratio must be within (0, 1]")
+    if args.volatility_entry_pause_tiny_inventory_ignore_notional < 0:
+        raise SystemExit("--volatility-entry-pause-tiny-inventory-ignore-notional must be >= 0")
     if args.volatility_entry_pause_enabled and not any(threshold > 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("volatility entry pause requires at least one positive trigger threshold")
     anti_chase_entry_guard_thresholds = (

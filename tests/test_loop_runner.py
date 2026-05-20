@@ -219,6 +219,56 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(still_blocked["inventory_gate_active"])
         self.assertIn("inventory", still_blocked["reason"])
 
+    def test_resolve_volatility_entry_pause_ignores_tiny_inventory_recovery_gate(self) -> None:
+        trigger_now = datetime(2026, 5, 20, 1, 30, tzinfo=timezone.utc)
+        triggered = resolve_volatility_entry_pause(
+            adaptive_step={"metrics": {"window_10s": {"return_ratio": -0.0049, "amplitude_ratio": 0.0049}}},
+            state={},
+            enabled=True,
+            window_10s_abs_return_ratio=0.004,
+            window_10s_amplitude_ratio=0.006,
+            window_30s_abs_return_ratio=0.0,
+            window_30s_amplitude_ratio=0.0,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_3m_amplitude_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            window_5m_amplitude_ratio=0.0,
+            recover_confirm_cycles=1,
+            now=trigger_now,
+            min_observation_seconds=0.0,
+            current_long_notional=8.0,
+            current_short_notional=0.0,
+            inventory_recover_ratio=0.75,
+        )
+        recovered = resolve_volatility_entry_pause(
+            adaptive_step={"metrics": {}},
+            state={"volatility_entry_pause_state": triggered["state"]},
+            enabled=True,
+            window_10s_abs_return_ratio=0.004,
+            window_10s_amplitude_ratio=0.006,
+            window_30s_abs_return_ratio=0.0,
+            window_30s_amplitude_ratio=0.0,
+            window_1m_abs_return_ratio=0.0,
+            window_1m_amplitude_ratio=0.0,
+            window_3m_abs_return_ratio=0.0,
+            window_3m_amplitude_ratio=0.0,
+            window_5m_abs_return_ratio=0.0,
+            window_5m_amplitude_ratio=0.0,
+            recover_confirm_cycles=1,
+            now=trigger_now + timedelta(seconds=5),
+            min_observation_seconds=0.0,
+            current_long_notional=6.2,
+            current_short_notional=0.0,
+            inventory_recover_ratio=0.75,
+            tiny_inventory_ignore_notional=10.0,
+        )
+
+        self.assertFalse(recovered["active"])
+        self.assertFalse(recovered["inventory_gate_active"])
+        self.assertTrue(recovered["tiny_inventory_ignored"])
+
     def test_remove_take_profit_exit_orders_keeps_active_delever(self) -> None:
         plan = {
             "buy_orders": [
@@ -9577,6 +9627,11 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.synthetic_tiny_long_residual_notional, 45.0)
         self.assertEqual(args.synthetic_tiny_short_residual_notional, 55.0)
+
+    def test_build_parser_accepts_volatility_entry_pause_tiny_inventory_ignore_notional(self) -> None:
+        args = _build_parser().parse_args(["--volatility-entry-pause-tiny-inventory-ignore-notional", "10"])
+
+        self.assertEqual(args.volatility_entry_pause_tiny_inventory_ignore_notional, 10.0)
 
     def test_build_parser_accepts_take_profit_min_profit_ratio(self) -> None:
         args = _build_parser().parse_args(["--take-profit-min-profit-ratio", "0.0005"])

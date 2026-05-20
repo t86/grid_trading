@@ -79,6 +79,7 @@
   "volatility_entry_pause_recover_confirm_cycles": 2,
   "volatility_entry_pause_min_observation_seconds": 90.0,
   "volatility_entry_pause_inventory_recover_ratio": 1.0,
+  "volatility_entry_pause_tiny_inventory_ignore_notional": 10.0,
   "anti_chase_entry_guard_enabled": true,
   "anti_chase_entry_guard_1m_abs_return_ratio": 0.018,
   "anti_chase_entry_guard_1m_amplitude_ratio": 0.026,
