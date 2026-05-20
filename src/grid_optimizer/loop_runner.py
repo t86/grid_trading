@@ -16051,6 +16051,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--loss-reentry-cooldown-seconds", type=float, default=300.0)
     parser.add_argument("--loss-reentry-cost-buffer-steps", type=float, default=1.0)
     parser.add_argument("--loss-reentry-trend-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--loss-reentry-trend-return-ratio", type=float, default=0.0)
     parser.add_argument("--max-order-position-notional", type=float, default=80.0)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -16844,6 +16845,8 @@ def main() -> None:
         raise SystemExit("--loss-reentry-cooldown-seconds must be >= 0")
     if args.loss_reentry_cost_buffer_steps < 0:
         raise SystemExit("--loss-reentry-cost-buffer-steps must be >= 0")
+    if args.loss_reentry_trend_return_ratio < 0:
+        raise SystemExit("--loss-reentry-trend-return-ratio must be >= 0")
     if args.max_order_position_notional < 0:
         raise SystemExit("--max-order-position-notional must be >= 0")
     if args.max_position_notional is not None and args.max_position_notional <= 0:

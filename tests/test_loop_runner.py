@@ -9661,6 +9661,16 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(args.take_profit_min_profit_ratio, 0.0005)
 
+    def test_build_parser_accepts_loss_reentry_trend_return_ratio(self) -> None:
+        args = _build_parser().parse_args(["--loss-reentry-trend-return-ratio", "0.0015"])
+
+        self.assertEqual(args.loss_reentry_trend_return_ratio, 0.0015)
+
+    def test_build_parser_defaults_loss_reentry_trend_return_ratio_to_disabled(self) -> None:
+        args = _build_parser().parse_args([])
+
+        self.assertEqual(args.loss_reentry_trend_return_ratio, 0.0)
+
     def test_build_parser_accepts_adaptive_step_long_window_amplitude_thresholds(self) -> None:
         args = _build_parser().parse_args(
             [
