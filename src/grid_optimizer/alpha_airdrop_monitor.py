@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, timezone
 from html import unescape
@@ -24,6 +25,7 @@ DEFAULT_REQUEST_TIMEOUT_SECONDS = 20
 DEFAULT_BARK_URL = "https://api.day.app"
 DEFAULT_BARK_LEVEL = "critical"
 DEFAULT_BARK_SOUND = "alarm"
+NITTER_RSS_BASE_URL = "https://nitter.net"
 
 _POINTS_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"at least\s+(\d{2,6})\s+binance alpha points", re.IGNORECASE),
@@ -104,9 +106,15 @@ def _parse_created_at(value: str) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
         return None
-    for fmt in ("%a %b %d %H:%M:%S %z %Y", "%Y-%m-%dT%H:%M:%S%z", "%Y-%m-%dT%H:%M:%S.%f%z"):
+    for fmt in (
+        "%a %b %d %H:%M:%S %z %Y",
+        "%a, %d %b %Y %H:%M:%S %z",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
+    ):
         try:
-            return datetime.strptime(raw, fmt)
+            normalized = raw[:-3] + "+0000" if raw.endswith(" GMT") else raw
+            return datetime.strptime(normalized, fmt)
         except ValueError:
             continue
     return None
@@ -235,6 +243,45 @@ def _extract_entries_from_syndication_html(html: str) -> list[dict[str, Any]]:
     return [entry for entry in entries if isinstance(entry, dict)]
 
 
+def _strip_html(value: str) -> str:
+    text = re.sub(r"<[^>]+>", " ", str(value or ""))
+    return _normalize_text(text)
+
+
+def _extract_entries_from_nitter_rss(xml_text: str) -> list[dict[str, Any]]:
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in root.findall("./channel/item"):
+        title = _normalize_text(item.findtext("title") or "")
+        description = _strip_html(item.findtext("description") or "")
+        text = title or description
+        if description and description not in text:
+            text = _normalize_text(f"{text} {description}")
+        link = _normalize_text(item.findtext("link") or "")
+        tweet_id_match = re.search(r"/status/(\d+)", link)
+        tweet_id = tweet_id_match.group(1) if tweet_id_match else ""
+        created_at = _parse_created_at(item.findtext("pubDate") or "")
+        if not tweet_id or not text or created_at is None:
+            continue
+        entries.append(
+            {
+                "type": "tweet",
+                "entry_id": f"tweet-{tweet_id}",
+                "content": {
+                    "tweet": {
+                        "id_str": tweet_id,
+                        "created_at": created_at.strftime("%a %b %d %H:%M:%S %z %Y"),
+                        "full_text": text,
+                    }
+                },
+            }
+        )
+    return entries
+
+
 def _fetch_account_entries(account: str, *, timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS) -> list[dict[str, Any]]:
     url = f"https://syndication.twitter.com/srv/timeline-profile/screen-name/{account}"
     response = requests.get(
@@ -244,6 +291,35 @@ def _fetch_account_entries(account: str, *, timeout_seconds: int = DEFAULT_REQUE
     )
     response.raise_for_status()
     return _extract_entries_from_syndication_html(response.text)
+
+
+def _fetch_account_entries_from_nitter_rss(
+    account: str,
+    *,
+    timeout_seconds: int = DEFAULT_REQUEST_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    url = f"{NITTER_RSS_BASE_URL}/{account}/rss"
+    response = requests.get(
+        url,
+        timeout=timeout_seconds,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; grid-optimizer-alpha-monitor/1.0)"},
+    )
+    response.raise_for_status()
+    return _extract_entries_from_nitter_rss(response.text)
+
+
+def _merge_entries(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    merged: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for entry in [*primary, *secondary]:
+        tweet = ((entry.get("content") or {}).get("tweet") or {}) if isinstance(entry, dict) else {}
+        tweet_id = str(tweet.get("id_str") or tweet.get("id") or entry.get("entry_id") or "").strip()
+        if tweet_id and tweet_id in seen:
+            continue
+        if tweet_id:
+            seen.add(tweet_id)
+        merged.append(entry)
+    return merged
 
 
 def _extract_matches_for_account(account: str, entries: list[dict[str, Any]], *, now: datetime, tz_offset_hours: int) -> list[dict[str, Any]]:
@@ -492,22 +568,32 @@ def check_alpha_airdrop_posts(
     errors: list[str] = []
 
     for account in accounts:
+        account_errors: list[str] = []
+        entries: list[dict[str, Any]] = []
+        fetched = False
         try:
             entries = _fetch_account_entries(account)
-            account_matches = _extract_matches_for_account(
-                account,
-                entries,
-                now=current_now,
-                tz_offset_hours=tz_offset_hours,
-            )
-            account_results.append(
-                AccountCheckResult(account=account, fetched=True, matches=account_matches, error=None)
-            )
-            matches.extend(account_matches)
+            fetched = True
         except Exception as exc:
-            error = f"{account}: {type(exc).__name__}: {exc}"
-            account_results.append(AccountCheckResult(account=account, fetched=False, matches=[], error=error))
+            account_errors.append(f"syndication {type(exc).__name__}: {exc}")
+        try:
+            rss_entries = _fetch_account_entries_from_nitter_rss(account)
+            entries = _merge_entries(entries, rss_entries)
+            fetched = True
+        except Exception as exc:
+            account_errors.append(f"nitter_rss {type(exc).__name__}: {exc}")
+
+        account_matches = _extract_matches_for_account(
+            account,
+            entries,
+            now=current_now,
+            tz_offset_hours=tz_offset_hours,
+        )
+        error = f"{account}: {'; '.join(account_errors)}" if account_errors else None
+        if error:
             errors.append(error)
+        account_results.append(AccountCheckResult(account=account, fetched=fetched, matches=account_matches, error=error))
+        matches.extend(account_matches)
 
     candidates = _select_notification_candidates(matches, state, now=current_now)
     emails_sent, email_results, bark_sent, bark_results = _send_notifications(

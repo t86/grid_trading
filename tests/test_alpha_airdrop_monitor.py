@@ -15,6 +15,7 @@ from grid_optimizer.alpha_airdrop_monitor import (
     _build_email_body,
     _build_match_key,
     _extract_entries_from_syndication_html,
+    _extract_entries_from_nitter_rss,
     _extract_time_hint_text,
     _is_today_in_tz,
     _load_state,
@@ -60,6 +61,33 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
 
         self.assertEqual(len(entries), 1)
         self.assertEqual(entries[0]["entry_id"], "tweet-1")
+
+    def test_extract_entries_from_nitter_rss_reads_zest_airdrop(self) -> None:
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>Binance Alpha will be the first platform to feature Zest Protocol (ZEST) on May 19.
+
+Eligible users can claim their airdrop using Binance Alpha Points on the Alpha Events page once trading opens.</title>
+      <link>https://nitter.net/BinanceWallet/status/2056730000000000000#m</link>
+      <pubDate>Mon, 18 May 2026 11:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>
+"""
+
+        entries = _extract_entries_from_nitter_rss(rss)
+        tweet = entries[0]["content"]["tweet"]
+        matched = _match_alpha_airdrop_post(
+            tweet,
+            now=datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc),
+            tz_offset_hours=8,
+        )
+
+        self.assertEqual(tweet["id_str"], "2056730000000000000")
+        self.assertIsNotNone(matched)
+        self.assertIn("Zest Protocol", matched["text"])
 
     def test_match_alpha_airdrop_post_requires_points_threshold(self) -> None:
         now = datetime(2026, 5, 15, 6, 0, tzinfo=timezone.utc)
@@ -377,6 +405,61 @@ class AlphaAirdropMonitorTests(unittest.TestCase):
             saved_state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertEqual(saved_state["binancezh:300"]["notification_count"], 1)
             self.assertEqual(saved_state["BinanceWallet:300"]["notification_count"], 1)
+
+    def test_check_alpha_airdrop_posts_uses_nitter_rss_when_syndication_is_rate_limited(self) -> None:
+        rss = """<?xml version="1.0" encoding="UTF-8"?>
+<rss version="2.0">
+  <channel>
+    <item>
+      <title>Binance Alpha will be the first platform to feature Zest Protocol (ZEST) on May 19.
+
+Eligible users can claim their airdrop using Binance Alpha Points on the Alpha Events page once trading opens.</title>
+      <link>https://nitter.net/BinanceWallet/status/2056730000000000000#m</link>
+      <pubDate>Mon, 18 May 2026 11:00:00 GMT</pubDate>
+    </item>
+  </channel>
+</rss>
+"""
+
+        class DummyResponse:
+            def __init__(self, text: str, status_code: int = 200) -> None:
+                self.text = text
+                self.status_code = status_code
+
+            def raise_for_status(self) -> None:
+                if self.status_code >= 400:
+                    raise RuntimeError(f"HTTP {self.status_code}")
+
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "alpha_state.json"
+            now = datetime(2026, 5, 18, 12, 0, tzinfo=timezone.utc)
+            sent_subjects: list[str] = []
+
+            def fake_get(url, *args, **kwargs):
+                if "syndication.twitter.com" in str(url):
+                    return DummyResponse("", status_code=429)
+                return DummyResponse(rss)
+
+            def fake_send_alert_email(*, subject: str, body: str, config_path=None):
+                sent_subjects.append(subject)
+                return {"sent": True, "subject": subject, "body": body}
+
+            with (
+                patch("grid_optimizer.alpha_airdrop_monitor.requests.get", side_effect=fake_get),
+                patch("grid_optimizer.alpha_airdrop_monitor.requests.post"),
+                patch("grid_optimizer.alpha_airdrop_monitor.send_alert_email", side_effect=fake_send_alert_email),
+            ):
+                result = check_alpha_airdrop_posts(
+                    accounts=("BinanceWallet",),
+                    now=now,
+                    state_path=state_path,
+                    bark_config_path=Path(tmpdir) / "missing_bark.json",
+                )
+
+        self.assertEqual(result["emails_sent"], 1)
+        self.assertEqual(len(result["matches"]), 1)
+        self.assertEqual(sent_subjects, ["！！！空投 xxx"])
+        self.assertIn("BinanceWallet", result["matches"][0]["account"])
 
     def test_check_alpha_airdrop_posts_records_fetch_errors(self) -> None:
         with TemporaryDirectory() as tmpdir:
