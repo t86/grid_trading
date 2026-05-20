@@ -482,6 +482,38 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertGreater(plan["sell_orders"][0]["price"], 0.14365)
         self.assertEqual(plan["sell_orders"][0]["profitable_inventory_exit_offset_cap"]["max_price"], 0.14552)
 
+    def test_best_quote_profitable_short_exit_cap_skips_paired_reduce(self) -> None:
+        plan = {
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.6012,
+                    "qty": 13.0,
+                    "notional": 7.8156,
+                    "role": "best_quote_reduce_short",
+                    "paired_entry_reduce": True,
+                }
+            ],
+            "sell_orders": [],
+        }
+
+        report = _cap_best_quote_profitable_inventory_exit_offset(
+            plan=plan,
+            current_long_qty=0.0,
+            current_short_qty=900.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6017,
+            bid_price=0.6027,
+            ask_price=0.6028,
+            tick_size=0.0001,
+            configured_quote_offset_ticks=3,
+            min_profit_ratio=0.00008,
+        )
+
+        self.assertEqual(report["adjusted_buy_orders"], 0)
+        self.assertEqual(plan["buy_orders"][0]["price"], 0.6012)
+        self.assertNotIn("profitable_inventory_exit_offset_cap", plan["buy_orders"][0])
+
     @patch("grid_optimizer.loop_runner.resolve_adaptive_step_price")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")

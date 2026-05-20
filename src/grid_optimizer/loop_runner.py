@@ -816,6 +816,7 @@ def _cap_best_quote_profitable_inventory_exit_offset(
         price = _safe_float(order.get("price"))
         profitable_short_exit = (
             current_short_qty > 1e-12
+            and not bool(order.get("paired_entry_reduce"))
             and role in {"best_quote_entry_long", "best_quote_reduce_short"}
             and short_ceiling > 0
             and min_buy_price <= short_ceiling
