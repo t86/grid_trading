@@ -51,10 +51,10 @@ def build_strategy_diagnostics(
     sections = [
         _startup_section(startup, safety, pos_mode),
         _execution_caps_section(cfg, estimated_order_count, estimated_notional, safety),
-        _empty_section("order_refresh", "挂单刷新"),
-        _empty_section("drift_guards", "盘口漂移保护"),
-        _empty_section("loss_and_stop_guards", "亏损与停止保护"),
-        _empty_section("takeover_modules", "接管模块"),
+        _order_refresh_section(safety),
+        _drift_guards_section(safety),
+        _loss_stop_section(safety),
+        _takeover_section(safety),
         _inventory_section(cfg, pos),
         _state_section(loop, plan, submit, runner_running),
         _profile_boundary_section(startup, cfg),
@@ -300,7 +300,7 @@ def _startup_section(startup: Mapping[str, Any], safety: Mapping[str, Any], posi
             )
         )
 
-    if startup.get("can_start") is False and not items:
+    if startup.get("can_start") is False and not any(item["severity"] == "blocker" for item in items):
         codes = _string_list(startup.get("blocker_codes")) or ["startup_preflight"]
         items.append(
             _diagnostic_item(
@@ -446,6 +446,160 @@ def _execution_cap_item(
     )
 
 
+def _order_refresh_section(safety: Mapping[str, Any]) -> dict[str, Any]:
+    items = _safety_section_items(
+        safety,
+        keys=("cancel_stale",),
+        severity_by_key={"cancel_stale": "blocker" if "cancel_stale" in _string_list(safety.get("blocking_params")) else "warning"},
+        category_by_key={"cancel_stale": "blocks_orders"},
+        default_title_by_key={"cancel_stale": "撤旧挂新关闭"},
+        default_impact="贴盘口策略可能无法撤掉旧单并刷新到买一卖一，表现为不下单或挂单停在旧价位。",
+        default_suggestion="BQ / ping-pong 这类贴盘口策略默认应开启 cancel_stale。",
+        default_tradeoff="开启撤旧挂新会增加撤单频率，但能降低 stale orders 卡住策略的概率。",
+    )
+    return {"key": "order_refresh", "title": "挂单刷新", "status": _max_status(item["severity"] for item in items), "items": items}
+
+
+def _drift_guards_section(safety: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "max_mid_drift_steps",
+        "near_market_entry_max_center_distance_steps",
+        "grid_inventory_rebalance_min_center_distance_steps",
+    )
+    warning_params = set(_string_list(safety.get("warning_params")))
+    items = _safety_section_items(
+        safety,
+        keys=keys,
+        severity_by_key={key: "warning" if key in warning_params else "info" for key in keys},
+        category_by_key={key: "limits_volume" for key in keys},
+        default_title_by_key={
+            "max_mid_drift_steps": "盘口漂移保护",
+            "near_market_entry_max_center_distance_steps": "近盘口 entry 距离保护",
+            "grid_inventory_rebalance_min_center_distance_steps": "库存再平衡距离保护",
+        },
+        default_impact="盘口快速波动时，entry 可能被跳过或延后，冲量速度会低于理论值。",
+        default_suggestion="高波动冲量场景可以适当放宽 steps 阈值；保守阶段应保留更紧保护。",
+        default_tradeoff="放宽漂移保护会提升成交机会，也会增加追涨追跌和磨损风险。",
+    )
+    return {"key": "drift_guards", "title": "盘口漂移保护", "status": _max_status(item["severity"] for item in items), "items": items}
+
+
+def _loss_stop_section(safety: Mapping[str, Any]) -> dict[str, Any]:
+    keys = (
+        "rolling_hourly_loss_limit",
+        "max_cumulative_notional",
+        "max_actual_net_notional",
+        "max_synthetic_drift_notional",
+    )
+    stop_params = set(_string_list(safety.get("stop_guard_params")))
+    items = _safety_section_items(
+        safety,
+        keys=keys,
+        severity_by_key={key: "warning" if key in stop_params else "info" for key in keys},
+        category_by_key={key: "stops_runner" for key in keys},
+        default_title_by_key={
+            "rolling_hourly_loss_limit": "滚动小时亏损停机阈值",
+            "max_cumulative_notional": "累计刷量上限",
+            "max_actual_net_notional": "真实净敞口上限",
+            "max_synthetic_drift_notional": "合成漂移上限",
+        },
+        default_impact="达到阈值后 runner 可能停止、冷却或拒绝继续下单。",
+        default_suggestion="启动前确认这些阈值覆盖本轮目标；20万/50万冲量前尤其要检查累计刷量上限。",
+        default_tradeoff="调高停机阈值能减少突然停止，也会放大亏损、敞口或累计风险。",
+    )
+    return {
+        "key": "loss_and_stop_guards",
+        "title": "亏损与停止保护",
+        "status": _max_status(item["severity"] for item in items),
+        "items": items,
+    }
+
+
+def _takeover_section(safety: Mapping[str, Any]) -> dict[str, Any]:
+    keys = ("hard_loss_forced_reduce_enabled", "excess_inventory_reduce_only_enabled", "adverse_reduce_enabled")
+    takeover_params = set(_string_list(safety.get("takeover_params")))
+    limiting_params = set(_string_list(safety.get("limiting_params")))
+    items = _safety_section_items(
+        safety,
+        keys=keys,
+        severity_by_key={
+            key: "warning" if key in takeover_params or key in limiting_params else "info"
+            for key in keys
+        },
+        category_by_key={
+            "hard_loss_forced_reduce_enabled": "takes_over_orders",
+            "excess_inventory_reduce_only_enabled": "limits_volume",
+            "adverse_reduce_enabled": "takes_over_orders",
+        },
+        default_title_by_key={
+            "hard_loss_forced_reduce_enabled": "亏损强制减仓接管",
+            "excess_inventory_reduce_only_enabled": "库存超限 reduce-only",
+            "adverse_reduce_enabled": "逆向行情减仓接管",
+        },
+        default_impact="开启后策略可能从刷量挂单切换为减仓/限制 entry，导致下单数量变少或方向变化。",
+        default_suggestion="只有当前 profile 明确授权这类模块时才开启；冲量策略启动前应确认它们不会跨策略生效。",
+        default_tradeoff="关闭接管模块能保持冲量节奏，但会减少极端亏损或库存失控时的自动保护。",
+    )
+    return {"key": "takeover_modules", "title": "接管模块", "status": _max_status(item["severity"] for item in items), "items": items}
+
+
+def _safety_section_items(
+    safety: Mapping[str, Any],
+    *,
+    keys: Sequence[str],
+    severity_by_key: Mapping[str, str],
+    category_by_key: Mapping[str, str],
+    default_title_by_key: Mapping[str, str],
+    default_impact: str,
+    default_suggestion: str,
+    default_tradeoff: str,
+) -> list[dict[str, Any]]:
+    safety_items = _safety_items_by_key(safety)
+    active_sets = (
+        set(_string_list(safety.get("blocking_params"))),
+        set(_string_list(safety.get("limiting_params"))),
+        set(_string_list(safety.get("warning_params"))),
+        set(_string_list(safety.get("stop_guard_params"))),
+        set(_string_list(safety.get("takeover_params"))),
+    )
+    result: list[dict[str, Any]] = []
+    for key in keys:
+        item = safety_items.get(key)
+        active = key in set().union(*active_sets) or bool(item and item.get("active"))
+        if not active:
+            continue
+        severity = severity_by_key.get(key, "warning")
+        result.append(
+            _diagnostic_item(
+                key=key,
+                severity=severity,
+                category=category_by_key.get(key, "limits_volume"),
+                current_value=item.get("value") if item else None,
+                active=True,
+                title=default_title_by_key.get(key, key),
+                why=str((item or {}).get("detail") or (item or {}).get("effect") or f"{key} 当前处于生效状态。"),
+                impact=str((item or {}).get("effect") or default_impact),
+                suggestion=default_suggestion,
+                tradeoff=default_tradeoff,
+                related_params=[key],
+            )
+        )
+    return result
+
+
+def _safety_items_by_key(safety: Mapping[str, Any]) -> dict[str, Mapping[str, Any]]:
+    items: dict[str, Mapping[str, Any]] = {}
+    raw_items = safety.get("items")
+    if isinstance(raw_items, Iterable) and not isinstance(raw_items, (str, bytes, Mapping)):
+        for raw in raw_items:
+            if not isinstance(raw, Mapping):
+                continue
+            key = str(raw.get("key") or "").strip()
+            if key:
+                items[key] = raw
+    return items
+
+
 def _inventory_section(config: Mapping[str, Any], position: Mapping[str, Any]) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     long_notional = _as_float(position.get("long_notional"))
@@ -463,13 +617,20 @@ def _inventory_section(config: Mapping[str, Any], position: Mapping[str, Any]) -
 
     long_basis = long_notional if long_notional > 0 else max(net_notional, 0.0)
     short_basis = short_notional if short_notional > 0 else max(-net_notional, 0.0)
-    one_way_long = mode_label in ("one_way_long", "long", "best_quote_maker_volume", "unknown") or "hedge" not in mode_label
+    one_way_short = mode_label in ("one_way_short", "short") or ("short" in mode_label and "long" not in mode_label)
+    one_way_long = (
+        mode_label in ("one_way_long", "long", "best_quote_maker_volume")
+        or ("long" in mode_label and "short" not in mode_label)
+    )
 
-    if one_way_long:
+    if one_way_short:
+        items.extend(_threshold_items("short", "空头", short_basis, short_soft, short_hard, best_effort=False))
+    elif one_way_long:
         items.extend(_threshold_items("long", "多头", long_basis, long_soft, long_hard, best_effort=(mode_label == "unknown")))
     else:
-        items.extend(_threshold_items("long", "多头", long_basis, long_soft, long_hard, best_effort=False))
-        items.extend(_threshold_items("short", "空头", short_basis, short_soft, short_hard, best_effort=False))
+        best_effort = mode_label == "unknown"
+        items.extend(_threshold_items("long", "多头", long_basis, long_soft, long_hard, best_effort=best_effort))
+        items.extend(_threshold_items("short", "空头", short_basis, short_soft, short_hard, best_effort=best_effort))
 
     if not items:
         items.append(
@@ -744,7 +905,9 @@ def _volume_target_items(
         target_notional = max(_as_float(target), 0.0)
         cycles_per_hour = target_notional / cycle_notional
         seconds_per_cycle = 3600.0 / cycles_per_hour if cycles_per_hour > 0 else 0.0
-        severity = "warning" if cap_params or seconds_per_cycle < 15.0 else "info"
+        target_limits = _target_limit_param_names(target_notional, safety, config)
+        limiting_params = sorted(set(cap_params + target_limits))
+        severity = "warning" if limiting_params or seconds_per_cycle < 15.0 else "info"
         items.append(
             _diagnostic_item(
                 key=f"target_{int(target_notional)}",
@@ -761,7 +924,7 @@ def _volume_target_items(
                 impact="这是容量可行性检查，不承诺成交；真实成交取决于深度、价差、排队位置和波动。",
                 suggestion=(
                     "若目标不可行，优先提高单轮容量、缩短安全刷新周期，或降低小时目标；"
-                    f"当前限制参数: {', '.join(cap_params) if cap_params else '无明显执行容量限制'}。"
+                    f"当前限制参数: {', '.join(limiting_params) if limiting_params else '无明显执行容量限制'}。"
                 ),
                 tradeoff="提高冲量能力通常会增加挂单磨损、瞬时敞口和被动成交的不确定性。",
                 related_params=["buy_levels", "sell_levels", "per_order_notional", "max_new_orders", "max_total_notional"],
@@ -770,8 +933,8 @@ def _volume_target_items(
                     "required_full_cycles_per_hour": round(cycles_per_hour, 4),
                     "required_seconds_per_full_cycle": round(seconds_per_cycle, 4),
                     "required_full_cycles_per_minute": round(cycles_per_hour / 60.0, 4),
-                    "limiting_params": cap_params,
-                    "plausible": not cap_params and seconds_per_cycle >= 15.0,
+                    "limiting_params": limiting_params,
+                    "plausible": not limiting_params and seconds_per_cycle >= 15.0,
                 },
             )
         )
@@ -809,6 +972,23 @@ def _execution_cap_param_names(
         cap_params.append("max_total_notional")
 
     return cap_params
+
+
+def _target_limit_param_names(target_notional: float, safety: Mapping[str, Any], config: Mapping[str, Any]) -> list[str]:
+    limit_params: list[str] = []
+    safety_items = _safety_items_by_key(safety)
+
+    max_cumulative = _as_optional_float(config.get("max_cumulative_notional"))
+    if max_cumulative is None and "max_cumulative_notional" in safety_items:
+        max_cumulative = _as_optional_float(safety_items["max_cumulative_notional"].get("value"))
+    if max_cumulative is not None and max_cumulative > 0 and max_cumulative < target_notional:
+        limit_params.append("max_cumulative_notional")
+
+    for key in ("rolling_hourly_loss_limit", "max_actual_net_notional", "max_synthetic_drift_notional"):
+        if key in _string_list(safety.get("stop_guard_params")):
+            limit_params.append(key)
+
+    return limit_params
 
 
 def _inventory_snapshot(config: Mapping[str, Any], position: Mapping[str, Any]) -> dict[str, Any]:
@@ -925,7 +1105,7 @@ def _summary(status: str, mode: str, blocker_count: int, warning_count: int) -> 
         "unknown": "未知状态",
     }.get(mode, "未知状态")
     if status == "blocked":
-        return f"当前处于{mode_text}，有 {blocker_count} 个阻塞项和 {warning_count} 个风险项。"
+        return f"当前处于{mode_text}，不可启动或不可继续冲量，有 {blocker_count} 个阻塞项和 {warning_count} 个风险项。"
     if status == "warning":
         return f"当前处于{mode_text}，可启动，但有 {warning_count} 个风险会影响冲量或状态。"
     return f"当前处于{mode_text}，未发现阻塞或风险项。"

@@ -139,6 +139,7 @@ from .running_status import (
     _read_jsonl_tail as _read_running_status_jsonl_tail,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
+from .strategy_diagnostics import build_strategy_diagnostics
 from .strategy_profile_schema import apply_strategy_profile_schema
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
@@ -32379,26 +32380,12 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
     latest_event = _strategy_editor_latest_jsonl_row(summary_path)
     plan_report = _read_json_dict(plan_path) or {}
     submit_report = _read_json_dict(submit_report_path) or {}
-    plan_schema = plan_report.get("strategy_profile_schema") if isinstance(plan_report.get("strategy_profile_schema"), dict) else {}
-    safety_preflight = (
-        plan_schema.get("global_safety_preflight")
-        if isinstance(plan_schema.get("global_safety_preflight"), dict)
-        else {}
+    _, schema_report = apply_strategy_profile_schema(
+        argparse.Namespace(**config),
+        enabled=bool(config.get("strict_strategy_profile_schema_enabled", False)),
     )
-    startup_preflight = (
-        plan_schema.get("startup_preflight")
-        if isinstance(plan_schema.get("startup_preflight"), dict)
-        else {}
-    )
-    if not safety_preflight or not startup_preflight:
-        _, schema_report = apply_strategy_profile_schema(
-            argparse.Namespace(**config),
-            enabled=bool(config.get("strict_strategy_profile_schema_enabled", False)),
-        )
-        if not safety_preflight:
-            safety_preflight = dict(schema_report.get("global_safety_preflight") or {})
-        if not startup_preflight:
-            startup_preflight = dict(schema_report.get("startup_preflight") or {})
+    safety_preflight = dict(schema_report.get("global_safety_preflight") or {})
+    startup_preflight = dict(schema_report.get("startup_preflight") or {})
     runtime_snapshot = _build_status_runtime_snapshot(
         runner={**runner, "config": config},
         plan_report=plan_report,
@@ -32447,42 +32434,59 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
     dual_side_known = dual_side_raw is not None and str(dual_side_raw).strip() != ""
     current_position_mode = "hedge" if dual_side_known and _truthy(dual_side_raw) else "one_way" if dual_side_known else None
     position_mode_compatible = None if current_position_mode is None else current_position_mode == required_position_mode
+    runner_payload = {
+        "running": bool(runner.get("is_running")),
+        "is_running": bool(runner.get("is_running")),
+        "pid": runner.get("pid"),
+        "elapsed": runner.get("elapsed"),
+        "configured": bool(runner.get("configured")),
+        "scope": runner.get("scope"),
+        "config": config,
+    }
+    position_payload = {
+        "summary": _strategy_editor_position_summary(long_notional, short_notional, net_notional),
+        "long_qty": long_qty,
+        "short_qty": short_qty,
+        "long_notional": long_notional,
+        "short_notional": short_notional,
+        "net_notional": net_notional,
+        "unrealized_pnl": _status_float(position.get("unrealized_pnl")),
+        "mid_price": mid_price,
+    }
+    position_mode_payload = {
+        "required": required_position_mode,
+        "current": current_position_mode,
+        "dual_side_position": _truthy(dual_side_raw) if dual_side_known else None,
+        "compatible": position_mode_compatible,
+    }
+    orders_payload = {
+        "strategy_open_order_count": len(open_orders),
+        "buy_count": sum(1 for item in open_orders if str((item or {}).get("side", "")).upper() == "BUY"),
+        "sell_count": sum(1 for item in open_orders if str((item or {}).get("side", "")).upper() == "SELL"),
+    }
+    strategy_diagnostics = build_strategy_diagnostics(
+        config=config,
+        startup_preflight=startup_preflight,
+        safety_preflight=safety_preflight,
+        position=position_payload,
+        position_mode=position_mode_payload,
+        latest_loop=latest_loop,
+        orders=orders_payload,
+        plan_report=plan_report,
+        submit_report=submit_report,
+        runner_running=bool(runner.get("is_running")),
+    )
     return {
         "ok": True,
         "symbol": normalized_symbol,
-        "runner": {
-            "running": bool(runner.get("is_running")),
-            "is_running": bool(runner.get("is_running")),
-            "pid": runner.get("pid"),
-            "elapsed": runner.get("elapsed"),
-            "configured": bool(runner.get("configured")),
-            "scope": runner.get("scope"),
-            "config": config,
-        },
-        "position": {
-            "summary": _strategy_editor_position_summary(long_notional, short_notional, net_notional),
-            "long_qty": long_qty,
-            "short_qty": short_qty,
-            "long_notional": long_notional,
-            "short_notional": short_notional,
-            "net_notional": net_notional,
-            "unrealized_pnl": _status_float(position.get("unrealized_pnl")),
-            "mid_price": mid_price,
-        },
-        "position_mode": {
-            "required": required_position_mode,
-            "current": current_position_mode,
-            "dual_side_position": _truthy(dual_side_raw) if dual_side_known else None,
-            "compatible": position_mode_compatible,
-        },
-        "orders": {
-            "strategy_open_order_count": len(open_orders),
-            "buy_count": sum(1 for item in open_orders if str((item or {}).get("side", "")).upper() == "BUY"),
-            "sell_count": sum(1 for item in open_orders if str((item or {}).get("side", "")).upper() == "SELL"),
-        },
+        "runner": runner_payload,
+        "position": position_payload,
+        "position_mode": position_mode_payload,
+        "orders": orders_payload,
         "latest_loop": latest_loop,
         "safety_preflight": safety_preflight,
         "startup_preflight": startup_preflight,
+        "strategy_diagnostics": strategy_diagnostics,
         "paths": {
             "summary_jsonl": str(summary_path),
             "plan_json": str(plan_path),

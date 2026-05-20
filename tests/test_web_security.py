@@ -4404,6 +4404,24 @@ class WebSecurityTests(unittest.TestCase):
                         "active_state": "NORMAL",
                         "elastic_volume": {"repair_ladder_level": "passive"},
                         "kept_orders": [{"side": "SELL", "price": 0.021, "qty": 100.0}],
+                        "strategy_profile_schema": {
+                            "global_safety_preflight": {
+                                "estimated_cycle_order_count": 1,
+                                "estimated_cycle_notional": 120.0,
+                                "limiting_params": [],
+                                "blocking_params": [],
+                                "warning_params": [],
+                                "stop_guard_params": [],
+                                "takeover_params": [],
+                                "items": [],
+                            },
+                            "startup_preflight": {
+                                "can_start": True,
+                                "status": "ready",
+                                "blocker_codes": [],
+                                "warning_codes": [],
+                            },
+                        },
                     },
                     ensure_ascii=False,
                 ),
@@ -4472,6 +4490,22 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["startup_preflight"]["can_start"])
         self.assertEqual(payload["startup_preflight"]["status"], "blocked")
         self.assertIn("global_safety_blocking_params", payload["startup_preflight"]["blocker_codes"])
+        self.assertIn("strategy_diagnostics", payload)
+        self.assertEqual(payload["strategy_diagnostics"]["status"], "blocked")
+        self.assertEqual(payload["strategy_diagnostics"]["mode"], "volume")
+        self.assertGreaterEqual(payload["strategy_diagnostics"]["issue_count"], 1)
+        self.assertIn(
+            "execution_caps",
+            {section["key"] for section in payload["strategy_diagnostics"]["sections"]},
+        )
+        self.assertIn(
+            200_000,
+            {int(item["target_notional"]) for item in payload["strategy_diagnostics"]["volume_targets"]},
+        )
+        self.assertIn(
+            500_000,
+            {int(item["target_notional"]) for item in payload["strategy_diagnostics"]["volume_targets"]},
+        )
         self.assertIn("aigensynusdt_best_quote_maker_volume_v1", {item["key"] for item in payload["presets"]})
         mock_build_snapshot.assert_not_called()
 

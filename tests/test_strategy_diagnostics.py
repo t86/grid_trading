@@ -222,6 +222,146 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         self.assertEqual(_item(report, "startup", "schema_known")["severity"], "warning")
         self.assertEqual(_item(report, "startup", "unknown_params")["severity"], "blocker")
 
+    def test_can_start_false_is_blocked_even_when_only_warning_items_exist(self) -> None:
+        report = build_strategy_diagnostics(
+            config={"required_position_mode": "one_way"},
+            startup_preflight={
+                "can_start": False,
+                "status": "blocked",
+                "warning_codes": ["ignored_params"],
+                "ignored_params": ["legacy_knob"],
+            },
+        )
+
+        self.assertFalse(report["can_start"])
+        self.assertEqual(report["status"], "blocked")
+        self.assertIn("startup_preflight", _item_keys(report, "startup"))
+        self.assertIn("不可启动", report["summary"])
+
+    def test_one_way_short_inventory_uses_short_thresholds(self) -> None:
+        report = build_strategy_diagnostics(
+            config={
+                "strategy_mode": "one_way_short",
+                "pause_short_position_notional": 1_000.0,
+                "max_short_position_notional": 1_500.0,
+            },
+            startup_preflight={"can_start": True, "status": "ready"},
+            position={"long_notional": 0.0, "short_notional": 1_600.0, "net_notional": -1_600.0},
+        )
+
+        item = _item(report, "inventory_thresholds", "short_hard_threshold")
+        self.assertEqual(item["severity"], "blocker")
+        self.assertEqual(item["category"], "forces_repair")
+        self.assertEqual(report["status"], "blocked")
+
+    def test_global_safety_sections_explain_refresh_drift_stops_and_takeovers(self) -> None:
+        report = build_strategy_diagnostics(
+            config={"buy_levels": 1, "sell_levels": 1, "per_order_notional": 100.0},
+            startup_preflight={"can_start": True, "status": "warning"},
+            safety_preflight={
+                "blocking_params": ["cancel_stale"],
+                "warning_params": ["max_mid_drift_steps"],
+                "stop_guard_params": ["rolling_hourly_loss_limit", "max_cumulative_notional"],
+                "takeover_params": ["hard_loss_forced_reduce_enabled"],
+                "items": [
+                    {
+                        "key": "cancel_stale",
+                        "value": False,
+                        "active": True,
+                        "effect": "关闭后贴盘口策略遇到旧挂单时可能无法撤旧换新。",
+                        "detail": "关闭时 stale orders 可能让贴盘口策略无法撤旧换新。",
+                    },
+                    {
+                        "key": "max_mid_drift_steps",
+                        "value": 1.0,
+                        "active": True,
+                        "effect": "计划生成后盘口漂移过大时拒绝下单。",
+                        "detail": "当前允许漂移 1 steps。",
+                    },
+                    {
+                        "key": "rolling_hourly_loss_limit",
+                        "value": 30.0,
+                        "active": True,
+                        "effect": "滚动小时亏损达到阈值后会触发停机或冷却。",
+                        "detail": "阈值 30。",
+                    },
+                    {
+                        "key": "max_cumulative_notional",
+                        "value": 200_000.0,
+                        "active": True,
+                        "effect": "累计刷量达到上限后停机。",
+                        "detail": "阈值 200000。",
+                    },
+                    {
+                        "key": "hard_loss_forced_reduce_enabled",
+                        "value": True,
+                        "active": True,
+                        "effect": "亏损达到阈值后强制减仓模块可能接管挂单。",
+                        "detail": "开启后亏损强减模块可能接管挂单。",
+                    },
+                ],
+            },
+        )
+
+        self.assertIn("cancel_stale", _item_keys(report, "order_refresh"))
+        self.assertIn("max_mid_drift_steps", _item_keys(report, "drift_guards"))
+        self.assertIn("rolling_hourly_loss_limit", _item_keys(report, "loss_and_stop_guards"))
+        self.assertIn("max_cumulative_notional", _item_keys(report, "loss_and_stop_guards"))
+        self.assertIn("hard_loss_forced_reduce_enabled", _item_keys(report, "takeover_modules"))
+
+    def test_volume_targets_warn_when_cumulative_notional_is_below_target(self) -> None:
+        report = build_strategy_diagnostics(
+            config={
+                "buy_levels": 8,
+                "sell_levels": 8,
+                "per_order_notional": 250.0,
+                "max_cumulative_notional": 100_000.0,
+            },
+            startup_preflight={"can_start": True, "status": "warning"},
+            safety_preflight={
+                "estimated_cycle_order_count": 16,
+                "estimated_cycle_notional": 4_000.0,
+                "stop_guard_params": ["max_cumulative_notional"],
+                "items": [
+                    {
+                        "key": "max_cumulative_notional",
+                        "value": 100_000.0,
+                        "active": True,
+                        "effect": "累计刷量达到上限后停机。",
+                        "detail": "阈值 100000。",
+                    }
+                ],
+            },
+        )
+
+        targets = {int(item["target_notional"]): item for item in report["volume_targets"]}
+        self.assertEqual(targets[200_000]["severity"], "warning")
+        self.assertFalse(targets[200_000]["plausible"])
+        self.assertIn("max_cumulative_notional", targets[200_000]["limiting_params"])
+        self.assertIn("max_cumulative_notional", targets[200_000]["suggestion"])
+
+    def test_takeover_section_reports_adverse_reduce_enabled(self) -> None:
+        report = build_strategy_diagnostics(
+            config={},
+            startup_preflight={"can_start": True, "status": "warning"},
+            safety_preflight={
+                "takeover_params": ["adverse_reduce_enabled"],
+                "items": [
+                    {
+                        "key": "adverse_reduce_enabled",
+                        "value": True,
+                        "active": True,
+                        "effect": "逆向行情减仓模块可能接管挂单。",
+                        "detail": "开启后逆向行情会触发减仓。",
+                    }
+                ],
+            },
+        )
+
+        item = _item(report, "takeover_modules", "adverse_reduce_enabled")
+        self.assertEqual(item["severity"], "warning")
+        self.assertEqual(item["category"], "takes_over_orders")
+
 
 def _section(report: dict, key: str) -> dict:
     for section in report["sections"]:
