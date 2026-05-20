@@ -2151,6 +2151,33 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["active"])
         self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
 
+    def test_apply_hard_loss_forced_reduce_uses_hedge_bq_position_side(self) -> None:
+        plan = {"buy_orders": [], "sell_orders": [], "forced_reduce_orders": []}
+
+        report = apply_hard_loss_forced_reduce(
+            plan=plan,
+            enabled=True,
+            active=True,
+            side="SELL",
+            current_qty=440.0,
+            current_notional=265.0,
+            target_notional=160.0,
+            max_order_notional=12.0,
+            bid_price=0.6028,
+            ask_price=0.6030,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            reason="hard_unrealized_loss_limit",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+        )
+
+        self.assertTrue(report["active"])
+        order = plan["sell_orders"][0]
+        self.assertEqual(order["position_side"], "LONG")
+        self.assertEqual(order["time_in_force"], "IOC")
+
     def test_resolve_hard_loss_reduce_target_notional_prefers_explicit_target(self) -> None:
         self.assertAlmostEqual(
             _resolve_hard_loss_reduce_target_notional(

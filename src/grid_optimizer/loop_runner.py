@@ -2819,7 +2819,7 @@ def apply_hard_loss_forced_reduce(
     normalized_side = str(side or "").upper().strip()
     position_side = (
         ("LONG" if normalized_side == "SELL" else "SHORT")
-        if str(strategy_mode or "").strip() == "hedge_neutral"
+        if _uses_exchange_hedge_position_sides(strategy_mode)
         else "BOTH"
     )
     report = {
