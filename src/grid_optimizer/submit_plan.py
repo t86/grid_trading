@@ -694,6 +694,12 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
         _safe_float(plan_report.get("loss_inventory_no_cross_small_entry_notional")),
         0.0,
     )
+    loss_recovery_brush = plan_report.get("loss_recovery_brush")
+    brush_allows_ordinary_recovery = bool(
+        isinstance(loss_recovery_brush, dict)
+        and _truthy(loss_recovery_brush.get("active"))
+        and _safe_float(loss_recovery_brush.get("entry_notional")) > 0
+    )
     symbol_info = plan_report.get("symbol_info") if isinstance(plan_report.get("symbol_info"), dict) else {}
     min_order_notional = max(_safe_float(symbol_info.get("min_notional")), 0.0)
 
@@ -730,12 +736,28 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
             "best_quote_entry_short",
         }
         small_loss_reduce_allowed = (
-            (explicit_loss_reduce or (implicit_loss_reduce and (not ordinary_entry or best_quote_implicit_loss_reduce)))
+            (
+                explicit_loss_reduce
+                or (
+                    implicit_loss_reduce
+                    and (
+                        not ordinary_entry
+                        or best_quote_implicit_loss_reduce
+                        or brush_allows_ordinary_recovery
+                    )
+                )
+            )
             and small_entry_notional > 0
             and order_notional <= small_entry_notional + 1e-9
         )
         small_loss_reduce_resize_allowed = (
-            (explicit_loss_reduce or (implicit_loss_reduce and not ordinary_entry))
+            (
+                explicit_loss_reduce
+                or (
+                    implicit_loss_reduce
+                    and (not ordinary_entry or brush_allows_ordinary_recovery)
+                )
+            )
             and small_entry_notional > 0
             and order_notional > small_entry_notional + 1e-9
         )

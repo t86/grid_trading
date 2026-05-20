@@ -107,7 +107,10 @@ from grid_optimizer.loop_runner import (
     sync_synthetic_ledger,
     update_synthetic_order_refs,
 )
-from grid_optimizer.submit_plan import apply_loss_reduce_reentry_guard_to_actions
+from grid_optimizer.submit_plan import (
+    apply_loss_inventory_no_cross_entry_guard_to_actions,
+    apply_loss_reduce_reentry_guard_to_actions,
+)
 from grid_optimizer.semi_auto_plan import (
     build_hedge_micro_grid_plan,
     build_maker_volatility_inventory_plan,
@@ -2221,6 +2224,50 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual([order["role"] for order in filtered["place_orders"]], ["take_profit_long", "best_quote_entry_short"])
         self.assertEqual(filtered["loss_reduce_reentry_guard"]["dropped_order_count"], 1)
+
+    def test_loss_recovery_brush_allows_small_ordinary_cross_reducer(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "role": "entry_long",
+                    "qty": 39.0,
+                    "price": 0.58,
+                    "notional": 22.62,
+                }
+            ],
+            "place_count": 1,
+        }
+
+        filtered = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "actual_net_qty": -58.0,
+                "unrealized_pnl": -0.29,
+                "current_short_avg_price": 0.57505,
+                "take_profit_min_profit_ratio": 0.0007,
+                "step_price": 0.00128,
+                "mid_price": 0.58005,
+                "loss_inventory_no_cross_small_entry_notional": 10.0,
+                "loss_recovery_brush": {
+                    "active": True,
+                    "entry_notional": 10.0,
+                },
+                "symbol_info": {
+                    "min_notional": 5.0,
+                    "step_size": 1.0,
+                    "min_qty": 1.0,
+                },
+            },
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(filtered["place_count"], 1)
+        order = filtered["place_orders"][0]
+        self.assertEqual(order["role"], "entry_long")
+        self.assertEqual(order["force_reduce_only"], True)
+        self.assertLessEqual(order["notional"], 10.0)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "short_small_loss_reduce_resized")
 
     def test_apply_entry_permission_gate_limits_entry_order_count(self) -> None:
         plan = {
