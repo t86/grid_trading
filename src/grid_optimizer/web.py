@@ -139,6 +139,7 @@ from .running_status import (
     _read_jsonl_tail as _read_running_status_jsonl_tail,
 )
 from .short_volume_candidates import build_short_volume_candidate_report
+from .strategy_profile_schema import apply_strategy_profile_schema
 from .symbol_lists import (
     DEFAULT_SYMBOL_LISTS,
     get_symbol_list,
@@ -25670,6 +25671,15 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
       const positionMode = data.position_mode || {};
       const orders = data.orders || {};
       const loop = data.latest_loop || {};
+      const safety = data.safety_preflight || {};
+      const safetyRiskCount = [
+        ...(safety.limiting_params || []),
+        ...(safety.blocking_params || []),
+        ...(safety.warning_params || []),
+        ...(safety.stop_guard_params || []),
+        ...(safety.takeover_params || []),
+      ].length;
+      const safetyClass = safety.blocking_params && safety.blocking_params.length ? "bad" : safetyRiskCount ? "warn" : "good";
       const modeCompatible = positionMode.compatible;
       const modeClass = modeCompatible === true ? "good" : modeCompatible === false ? "bad" : "";
       const currentMode = positionMode.current || "未知";
@@ -25679,6 +25689,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
         ["持仓模式", positionMode.required || cfg.required_position_mode || "--", modeClass, `当前 ${currentMode} · ${modeCompatible === false ? "不兼容" : modeCompatible === true ? "兼容" : "未确认"}`],
         ["仓位", pos.summary || "--", Number(pos.net_notional || 0) >= 0 ? "good" : "warn", `Long ${fmtNum(pos.long_notional)}U · Short ${fmtNum(pos.short_notional)}U`],
         ["挂单", fmtNum(orders.strategy_open_order_count || 0, 0), "", `计划保留 + 本轮新挂`],
+        ["安全阀", safetyRiskCount ? `${fmtNum(safetyRiskCount, 0)} 个风险` : "未触发", safetyClass, `预计 ${fmtNum(safety.estimated_cycle_order_count || 0, 0)} 单 / ${fmtNum(safety.estimated_cycle_notional || 0)}U`],
         ["状态", loop.active_state || "--", statusClass(loop.active_state), `intent ${loop.strategy_intent || "--"}`],
         ["修仓档", loop.repair_ladder_level || "--", statusClass(loop.repair_ladder_level), loop.error_message || "无错误信息"],
         ["最近循环", loop.cycle !== undefined && loop.cycle !== null ? `#${loop.cycle}` : "--", "", fmtTs(loop.ts)],
@@ -25773,9 +25784,14 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
       const softShort = Number(config.pause_short_position_notional || 0);
       const hardShort = Number(config.max_short_position_notional || 0);
       const totalQuote = (buyLevels + sellLevels) * perOrder;
+      const maxNewOrders = Number(config.max_new_orders || 0);
+      const maxTotalNotional = Number(config.max_total_notional || 0);
+      const cancelStale = String(config.cancel_stale === undefined ? "true" : config.cancel_stale).toLowerCase();
+      const maxMidDrift = Number(config.max_mid_drift_steps || 0);
       const items = [
         ["策略身份", `${profile} · ${mode} · 持仓模式 ${requiredMode}`],
         ["挂单密度", `买 ${fmtNum(buyLevels, 0)} 档 / 卖 ${fmtNum(sellLevels, 0)} 档，单笔 ${fmtNum(perOrder)}U，单轮理论挂单名义约 ${fmtNum(totalQuote)}U。`],
+        ["全局安全阀", `每轮新单上限 ${maxNewOrders > 0 ? fmtNum(maxNewOrders, 0) : "未启用"}，单轮名义上限 ${maxTotalNotional > 0 ? `${fmtNum(maxTotalNotional)}U` : "未启用"}，撤旧挂新 ${cancelStale === "false" ? "关闭" : "开启"}，漂移阈值 ${maxMidDrift > 0 ? `${fmtNum(maxMidDrift)} steps` : "未启用"}。`],
         ["多仓阈值", `软停买 ${fmtNum(softLong)}U，硬上限 ${fmtNum(hardLong)}U。进入修仓后应减少新增买单，把成交重心让给减仓。`],
         ["空仓阈值", `软停空 ${fmtNum(softShort)}U，硬上限 ${fmtNum(hardShort)}U。中性或做空策略会用这一侧控制空头修复节奏。`],
         ["保存行为", "保存只更新本地 runner 配置；正在运行的策略不会因为这个页面自动重启。"],
@@ -32226,6 +32242,18 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
     latest_event = _strategy_editor_latest_jsonl_row(summary_path)
     plan_report = _read_json_dict(plan_path) or {}
     submit_report = _read_json_dict(submit_report_path) or {}
+    plan_schema = plan_report.get("strategy_profile_schema") if isinstance(plan_report.get("strategy_profile_schema"), dict) else {}
+    safety_preflight = (
+        plan_schema.get("global_safety_preflight")
+        if isinstance(plan_schema.get("global_safety_preflight"), dict)
+        else {}
+    )
+    if not safety_preflight:
+        _, schema_report = apply_strategy_profile_schema(
+            argparse.Namespace(**config),
+            enabled=bool(config.get("strict_strategy_profile_schema_enabled", False)),
+        )
+        safety_preflight = dict(schema_report.get("global_safety_preflight") or {})
     runtime_snapshot = _build_status_runtime_snapshot(
         runner={**runner, "config": config},
         plan_report=plan_report,
@@ -32308,6 +32336,7 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
             "sell_count": sum(1 for item in open_orders if str((item or {}).get("side", "")).upper() == "SELL"),
         },
         "latest_loop": latest_loop,
+        "safety_preflight": safety_preflight,
         "paths": {
             "summary_jsonl": str(summary_path),
             "plan_json": str(plan_path),

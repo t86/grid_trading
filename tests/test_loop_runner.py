@@ -1705,6 +1705,10 @@ class LoopRunnerTests(unittest.TestCase):
                 base_position_notional=0.0,
                 pause_buy_position_notional=900.0,
                 max_position_notional=1500.0,
+                max_new_orders=1,
+                max_total_notional=1000.0,
+                cancel_stale=False,
+                max_mid_drift_steps=1.0,
             )
 
             report = generate_plan_report(args)
@@ -1712,6 +1716,12 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["required_position_mode"], "one_way")
         self.assertFalse(report["required_position_mode_defaulted"])
         self.assertFalse(report["position_mode_compatible"])
+        self.assertEqual(report["global_safety_preflight"]["estimated_cycle_order_count"], 2)
+        self.assertEqual(report["global_safety_preflight"]["estimated_cycle_notional"], 1500.0)
+        self.assertIn("max_new_orders", report["global_safety_preflight"]["limiting_params"])
+        self.assertIn("max_total_notional", report["global_safety_preflight"]["limiting_params"])
+        self.assertIn("cancel_stale", report["global_safety_preflight"]["blocking_params"])
+        self.assertIn("max_mid_drift_steps", report["global_safety_preflight"]["warning_params"])
 
     @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
     @patch("grid_optimizer.loop_runner.assess_market_guard")
