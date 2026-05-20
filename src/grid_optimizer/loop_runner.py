@@ -14701,6 +14701,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 desired_orders=desired_orders,
                 sticky_roles=set(sticky_exit_mode["roles"]),
             )
+        desired_orders = preserve_sticky_exit_orders(
+            existing_orders=open_orders_for_diff,
+            desired_orders=desired_orders,
+            sticky_roles={
+                "active_delever_long",
+                "active_delever_short",
+                "adverse_reduce_long",
+                "adverse_reduce_short",
+            },
+            price_tolerance=effective_args.step_price,
+        )
         entry_reuse_tolerance, entry_reuse_reason = _regime_budget_entry_reuse_tolerance(
             strategy_profile=effective_strategy_profile,
             regime_entry_budget=regime_entry_budget,

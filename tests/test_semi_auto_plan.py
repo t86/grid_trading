@@ -651,6 +651,56 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual([item["price"] for item in adjusted], [0.1731, 0.1733, 0.1734])
 
+    def test_preserve_sticky_exit_orders_respects_price_tolerance(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.5615",
+                "origQty": "17",
+                "positionSide": "BOTH",
+                "role": "adverse_reduce_long",
+            },
+            {
+                "orderId": 2,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.5671",
+                "origQty": "17",
+                "positionSide": "BOTH",
+                "role": "adverse_reduce_long",
+            },
+        ]
+        desired = [
+            {
+                "side": "SELL",
+                "price": 0.5608,
+                "qty": 17.0,
+                "notional": 9.5336,
+                "role": "adverse_reduce_long",
+                "position_side": "BOTH",
+            },
+            {
+                "side": "SELL",
+                "price": 0.5609,
+                "qty": 17.0,
+                "notional": 9.5353,
+                "role": "adverse_reduce_long",
+                "position_side": "BOTH",
+            },
+        ]
+
+        adjusted = preserve_sticky_exit_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            sticky_roles={"adverse_reduce_long"},
+            price_tolerance=0.0016,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.5615)
+        self.assertEqual(adjusted[1]["price"], 0.5609)
+
     def test_build_hedge_micro_grid_plan_builds_both_sides(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=0.05057,

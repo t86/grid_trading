@@ -2149,6 +2149,7 @@ def preserve_sticky_exit_orders(
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
     sticky_roles: set[str] | None = None,
+    price_tolerance: float | None = None,
 ) -> list[dict[str, Any]]:
     normalized_roles = {
         str(role).strip()
@@ -2157,6 +2158,7 @@ def preserve_sticky_exit_orders(
     }
     if not normalized_roles:
         return [dict(order) for order in desired_orders]
+    tolerance = None if price_tolerance is None else max(_safe_float(price_tolerance), 0.0)
 
     adjusted_orders = [dict(order) for order in desired_orders]
 
@@ -2207,9 +2209,12 @@ def preserve_sticky_exit_orders(
             continue
         desired_sorted = sorted(desired_group, key=lambda item: _sort_key(item[1]))
         existing_sorted = sorted(existing_group, key=_sort_key)
-        for (index, _desired_order), existing_order in zip(desired_sorted, existing_sorted):
+        for (index, desired_order), existing_order in zip(desired_sorted, existing_sorted):
             existing_price = _price(existing_order)
             if existing_price <= 0:
+                continue
+            desired_price = _price(desired_order)
+            if tolerance is not None and abs(existing_price - desired_price) > tolerance + 1e-12:
                 continue
             adjusted_order = dict(adjusted_orders[index])
             qty = _qty(adjusted_order)
