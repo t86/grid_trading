@@ -2907,10 +2907,10 @@ def _resolve_hard_loss_reduce_target_notional(
     pause_position_notional: float | None,
 ) -> float:
     safe_target = max(_safe_float(configured_target_notional), 0.0)
+    if safe_target > 0:
+        return safe_target
     safe_pause = max(_safe_float(pause_position_notional), 0.0)
-    if safe_pause > 0:
-        return max(safe_target, safe_pause)
-    return safe_target
+    return safe_pause
 
 
 def _position_unrealized_or_estimate(

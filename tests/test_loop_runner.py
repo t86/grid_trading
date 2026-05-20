@@ -2017,20 +2017,20 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["active"])
         self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
 
-    def test_resolve_hard_loss_reduce_target_notional_never_below_pause(self) -> None:
+    def test_resolve_hard_loss_reduce_target_notional_prefers_explicit_target(self) -> None:
         self.assertAlmostEqual(
             _resolve_hard_loss_reduce_target_notional(
                 configured_target_notional=30.0,
                 pause_position_notional=520.0,
             ),
-            520.0,
+            30.0,
         )
         self.assertAlmostEqual(
             _resolve_hard_loss_reduce_target_notional(
-                configured_target_notional=650.0,
+                configured_target_notional=None,
                 pause_position_notional=520.0,
             ),
-            650.0,
+            520.0,
         )
 
     def test_position_unrealized_or_estimate_prefers_exchange_unrealized(self) -> None:
