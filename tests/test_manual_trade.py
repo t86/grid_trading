@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.web import (
+    FUTURES_USDM_FALLBACK_SYMBOLS,
     _Handler,
     MANUAL_TRADE_PAGE,
     _build_manual_trade_plan,
@@ -195,7 +196,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("/api/manual_trade/book_limit", MANUAL_TRADE_PAGE)
         self.assertIn('id="book_buy_btn"', MANUAL_TRADE_PAGE)
         self.assertIn('id="book_sell_btn"', MANUAL_TRADE_PAGE)
-        self.assertIn('const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["BILLUSDT", "CHIPUSDT"]', MANUAL_TRADE_PAGE)
+        self.assertIn('const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "CHIPUSDT"]', MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/history/delete", MANUAL_TRADE_PAGE)
@@ -213,6 +214,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("history-delete-btn", MANUAL_TRADE_PAGE)
         self.assertIn("deleteHistory", MANUAL_TRADE_PAGE)
         self.assertIn('id="history_type_filter"', MANUAL_TRADE_PAGE)
+
         self.assertIn('<option value="maker">Maker 追盘</option>', MANUAL_TRADE_PAGE)
         self.assertIn('<option value="take">Take 市价</option>', MANUAL_TRADE_PAGE)
         self.assertIn('<option value="book_limit">买一/卖一挂单</option>', MANUAL_TRADE_PAGE)
@@ -230,6 +232,9 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn('data-market-tab="spot"', MANUAL_TRADE_PAGE)
         self.assertIn('market_type: activeMarketType', MANUAL_TRADE_PAGE)
         self.assertIn("现货不使用借贷卖出", MANUAL_TRADE_PAGE)
+
+    def test_manual_trade_futures_fallback_symbols_include_pharos(self) -> None:
+        self.assertIn("PHAROSUSDT", FUTURES_USDM_FALLBACK_SYMBOLS)
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.print")

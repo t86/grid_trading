@@ -165,6 +165,8 @@ from .symbol_lists import (
 )
 from .types import Candle
 
+FUTURES_USDM_FALLBACK_SYMBOLS = ["PHAROSUSDT", "BTCUSDT", "ETHUSDT"]
+
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
 RANKING_CACHE: dict[str, dict[str, Any]] = {}
@@ -19099,7 +19101,7 @@ MANUAL_TRADE_PAGE = """<!doctype html>
     const historySelectAllEl = document.getElementById("history_select_all");
     const historyDeleteSelectedBtn = document.getElementById("history_delete_selected_btn");
     const historySelectionMetaEl = document.getElementById("history_selection_meta");
-    const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["BILLUSDT", "CHIPUSDT"];
+    const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "CHIPUSDT"];
     let activeMarketType = "futures";
     let symbols = [];
     let currentHistory = [];
@@ -35233,7 +35235,7 @@ class _Handler(BaseHTTPRequestHandler):
                     fallback_symbols = (
                         ["BTCUSD_PERP", "ETHUSD_PERP"]
                         if contract_type == "coinm"
-                        else ["BTCUSDT", "ETHUSDT"]
+                        else FUTURES_USDM_FALLBACK_SYMBOLS
                     )
                 self._send_json(
                     {
