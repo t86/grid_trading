@@ -1469,6 +1469,46 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guard["deferred_place_count"], 1)
         self.assertEqual(guard["deferred_place_orders"][0]["role"], "entry_short")
 
+    def test_preserve_queue_priority_cancels_smaller_best_quote_reduce_before_replace(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.6054,
+                    "qty": 52.0,
+                    "notional": 31.4808,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "BUY",
+                    "price": "0.6054000",
+                    "origQty": "13",
+                    "positionSide": "SHORT",
+                    "reduceOnly": True,
+                },
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.6069,
+            live_ask_price=0.6070,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_count"], 1)
+        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_orders"][0]["qty"], 52.0)
+
     def test_preserve_queue_priority_merges_duplicate_take_profit_place_buckets(self) -> None:
         actions = {
             "place_orders": [

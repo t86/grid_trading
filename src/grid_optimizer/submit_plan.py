@@ -1453,6 +1453,11 @@ def preserve_queue_priority_in_execution_actions(
         existing_total = cancel_totals_by_bucket.get(key, Decimal("0"))
         if existing_total <= Decimal("0"):
             continue
+        projected_template = projected_place_templates.get(key) or {}
+        projected_role = str(projected_template.get("role", "")).strip()
+        replace_smaller_reduce = projected_role in {"best_quote_reduce_long", "best_quote_reduce_short"}
+        if replace_smaller_reduce:
+            continue
         bucket_indices = cancel_indices_by_bucket.get(key, [])
         bucket_quantities = [
             _quantity_decimal(cancel_orders[index].get("origQty", cancel_orders[index].get("qty")))
