@@ -25470,6 +25470,25 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
     .good { color: var(--good); }
     .warn { color: var(--warn); }
     .bad { color: var(--bad); }
+    .diagnostics-panel { display: grid; gap: 10px; }
+    .diagnostics-summary { border: 1px solid var(--line); border-radius: 8px; background: #fbfdff; padding: 11px; display: grid; gap: 8px; }
+    .diagnostics-summary strong { font-size: 15px; }
+    .diagnostics-kv { display: flex; flex-wrap: wrap; gap: 8px; }
+    .diagnostics-kv span { border: 1px solid var(--line); border-radius: 999px; background: #fff; color: var(--muted); padding: 4px 8px; font-size: 12px; font-weight: 700; }
+    .diagnostics-section { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 10px; display: grid; gap: 8px; }
+    .diagnostics-section h3 { margin: 0; font-size: 14px; letter-spacing: 0; }
+    .diagnostics-section-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; flex-wrap: wrap; }
+    .diagnostics-item { border-left: 3px solid var(--line); background: #fbfdff; padding: 9px 10px; display: grid; gap: 7px; }
+    .diagnostics-item.blocker { border-left-color: var(--bad); }
+    .diagnostics-item.warning { border-left-color: var(--warn); }
+    .diagnostics-item.info { border-left-color: var(--brand); }
+    .diagnostics-item.ok { border-left-color: var(--good); }
+    .diagnostics-item-title { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-weight: 800; font-size: 13px; }
+    .diagnostics-item-title code { color: var(--muted); font-size: 11px; font-weight: 700; }
+    .diagnostics-detail-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 7px; }
+    .diagnostics-detail { color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .diagnostics-detail b { color: var(--text); }
+    .empty-state { color: var(--muted); font-size: 13px; line-height: 1.5; }
     .fields { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
     .field-wide { grid-column: 1 / -1; }
     .explain { display: grid; gap: 8px; }
@@ -25485,6 +25504,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
     }
     @media (max-width: 700px) {
       .status-grid, .fields { grid-template-columns: 1fr; }
+      .diagnostics-detail-grid { grid-template-columns: 1fr; }
       .toolbar label { min-width: 100%; }
       .actions button { flex: 1 1 100%; }
     }
@@ -25538,6 +25558,13 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
       <h2>轻量状态</h2>
       <div id="status_grid" class="status-grid">
         <div class="metric"><div class="label">状态</div><div class="value warn">未刷新</div><div class="sub">点击刷新状态读取本地 runner 和最新计划文件。</div></div>
+      </div>
+    </section>
+
+    <section class="panel">
+      <h2>极细诊断</h2>
+      <div id="diagnostics_panel" class="diagnostics-panel">
+        <div class="empty-state">点击刷新状态后显示策略诊断。</div>
       </div>
     </section>
 
@@ -25596,6 +25623,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
     const symbolInput = document.getElementById("symbol_input");
     const presetSelect = document.getElementById("preset_select");
     const statusGrid = document.getElementById("status_grid");
+    const diagnosticsPanel = document.getElementById("diagnostics_panel");
     const pageMeta = document.getElementById("page_meta");
     const paramsEditor = document.getElementById("params_editor");
     const fieldGrid = document.getElementById("field_grid");
@@ -25664,6 +25692,82 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
         presetSelect.value = String(selectedKey);
       }
     }
+    function diagnosticsStatusLabel(value) {
+      const raw = String(value || "unknown").toLowerCase();
+      if (raw === "blocked" || raw === "blocker") return "阻塞";
+      if (raw === "warning") return "警告";
+      if (raw === "ready" || raw === "ok") return "正常";
+      if (raw === "info") return "说明";
+      return raw || "unknown";
+    }
+    function diagnosticsModeLabel(value) {
+      const raw = String(value || "unknown").toLowerCase();
+      if (raw === "volume") return "刷量";
+      if (raw === "repair") return "修仓";
+      if (raw === "blocked") return "阻塞";
+      if (raw === "idle") return "未运行";
+      return "未知";
+    }
+    function renderDiagnosticsKv(rows) {
+      return `<div class="diagnostics-kv">${rows.map(([label, value]) => `<span>${escapeHtml(label)}: ${escapeHtml(value)}</span>`).join("")}</div>`;
+    }
+    function renderDiagnostics(data) {
+      const diagnostics = data.strategy_diagnostics || {};
+      const sections = Array.isArray(diagnostics.sections) ? diagnostics.sections : [];
+      const orderCycle = diagnostics.order_cycle || {};
+      const summary = diagnostics.summary || "暂无策略诊断。";
+      const summaryHtml = `
+        <div class="diagnostics-summary">
+          <strong>${escapeHtml(summary)}</strong>
+          ${renderDiagnosticsKv([
+            ["状态", diagnosticsStatusLabel(diagnostics.status)],
+            ["模式", diagnosticsModeLabel(diagnostics.mode)],
+            ["问题", fmtNum(diagnostics.issue_count || 0, 0)],
+            ["阻塞", fmtNum(diagnostics.blocker_count || 0, 0)],
+            ["警告", fmtNum(diagnostics.warning_count || 0, 0)],
+            ["单轮", `${fmtNum(orderCycle.estimated_order_count || 0, 0)} 单 / ${fmtNum(orderCycle.estimated_notional || 0)}U`],
+          ])}
+        </div>
+      `;
+      if (!sections.length) {
+        diagnosticsPanel.innerHTML = `${summaryHtml}<div class="empty-state">当前响应还没有 sections/items 诊断明细。</div>`;
+        return;
+      }
+      const sectionHtml = sections.map((section) => {
+        const items = Array.isArray(section.items) ? section.items : [];
+        const itemsHtml = items.length ? items.map((item) => {
+          const severity = String(item.severity || "info").toLowerCase();
+          const detailRows = [
+            ["为什么", item.why],
+            ["影响", item.impact],
+            ["建议", item.suggestion],
+            ["取舍", item.tradeoff],
+          ];
+          return `
+            <article class="diagnostics-item ${escapeHtml(severity)}">
+              <div class="diagnostics-item-title">
+                <span>${escapeHtml(item.title || item.key || "诊断项")}</span>
+                <code>${escapeHtml(item.key || "")}</code>
+                <span class="${escapeHtml(severity === "blocker" ? "bad" : severity === "warning" ? "warn" : severity === "ok" ? "good" : "")}">${escapeHtml(diagnosticsStatusLabel(severity))}</span>
+              </div>
+              <div class="diagnostics-detail-grid">
+                ${detailRows.map(([label, value]) => `<div class="diagnostics-detail"><b>${escapeHtml(label)}</b> ${escapeHtml(value || "--")}</div>`).join("")}
+              </div>
+            </article>
+          `;
+        }).join("") : '<div class="empty-state">没有诊断项。</div>';
+        return `
+          <section class="diagnostics-section">
+            <div class="diagnostics-section-head">
+              <h3>${escapeHtml(section.title || section.key || "诊断分区")}</h3>
+              <div class="diagnostics-kv"><span>${escapeHtml(diagnosticsStatusLabel(section.status))}</span><span>${escapeHtml(fmtNum(items.length, 0))} items</span></div>
+            </div>
+            ${itemsHtml}
+          </section>
+        `;
+      }).join("");
+      diagnosticsPanel.innerHTML = `${summaryHtml}${sectionHtml}`;
+    }
     function renderStatus(data) {
       const runner = data.runner || {};
       const cfg = runner.config || {};
@@ -25708,6 +25812,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
           <div class="sub">${escapeHtml(sub)}</div>
         </div>
       `).join("");
+      renderDiagnostics(data);
       pageMeta.textContent = `已刷新 ${data.symbol} 的轻量状态。`;
     }
     function parseEditorJson() {
