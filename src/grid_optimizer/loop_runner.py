@@ -11376,6 +11376,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "cooldown_seconds": getattr(args, "exposure_escalation_buy_pause_cooldown_seconds", 0.0),
         "remaining_seconds": 0.0,
     }
+    exposure_hard_long_pause = False
     hard_loss_forced_reduce: dict[str, Any] = {
         "enabled": bool(getattr(args, "hard_loss_forced_reduce_enabled", False)),
         "active": False,
