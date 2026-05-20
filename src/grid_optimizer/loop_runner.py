@@ -13919,6 +13919,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 dynamic_control_low_volatility_budget_scale=float(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_budget_scale", 1.15)
                 ),
+                dynamic_control_low_volatility_budget_max_inventory_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_low_volatility_budget_max_inventory_ratio",
+                        0.75,
+                    )
+                ),
                 dynamic_control_high_volatility_budget_scale=float(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_budget_scale", 0.75)
                 ),
@@ -16231,6 +16238,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-ratio", type=float, default=0.0035)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-ratio", type=float, default=0.007)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-budget-scale", type=float, default=1.15)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-low-volatility-budget-max-inventory-ratio",
+        type=float,
+        default=0.75,
+    )
     parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-budget-scale", type=float, default=0.75)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-budget-scale", type=float, default=0.45)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-extra-offset-ticks", type=int, default=-1)

@@ -357,6 +357,39 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertAlmostEqual(plan["metrics"]["effective_ladder_spacing"], 0.00015)
         self.assertEqual(plan["metrics"]["dynamic_tick"]["offset_ticks"], 1)
 
+    def test_dynamic_control_can_expand_budget_with_configured_inventory_room(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_long_notional=450.0,
+                inventory_soft_ratio=0.8,
+                dynamic_control_enabled=True,
+                dynamic_control_low_volatility_ratio=0.002,
+                dynamic_control_low_volatility_budget_scale=1.35,
+                dynamic_control_low_volatility_budget_max_inventory_ratio=0.85,
+                dynamic_control_low_volatility_step_scale=0.5,
+                dynamic_control_low_volatility_extra_offset_ticks=-2,
+            ),
+            inputs=_inputs(
+                bid_price=0.6050,
+                ask_price=0.6051,
+                mid_price=0.60505,
+                current_net_qty=470.0,
+                cycle_budget_notional=40.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                entry_ladder_spacing=0.0003,
+                market_amplitude_1m=0.001,
+            ),
+        )
+
+        control = plan["metrics"]["dynamic_control"]
+        self.assertEqual(control["reason"], "low_volatility_expand")
+        self.assertAlmostEqual(control["budget_max_inventory_ratio"], 0.85)
+        self.assertAlmostEqual(plan["metrics"]["cycle_budget_notional"], 54.0)
+        self.assertAlmostEqual(plan["metrics"]["effective_ladder_spacing"], 0.00015)
+
     def test_hedge_inventory_bias_reduces_short_but_keeps_small_short_entry(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

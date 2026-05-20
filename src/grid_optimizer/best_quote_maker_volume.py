@@ -39,6 +39,7 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_high_volatility_ratio: float = 0.0035
     dynamic_control_extreme_volatility_ratio: float = 0.007
     dynamic_control_low_volatility_budget_scale: float = 1.15
+    dynamic_control_low_volatility_budget_max_inventory_ratio: float = 0.75
     dynamic_control_high_volatility_budget_scale: float = 0.75
     dynamic_control_extreme_volatility_budget_scale: float = 0.45
     dynamic_control_low_volatility_extra_offset_ticks: int = -1
@@ -284,6 +285,9 @@ def build_best_quote_maker_volume_plan(
         "volatility_ratio": 0.0,
         "trend_score": 0.0,
         "budget_scale": 1.0,
+        "budget_max_inventory_ratio": _safe_float(
+            config.dynamic_control_low_volatility_budget_max_inventory_ratio
+        ),
         "step_scale": 1.0,
         "extra_offset_ticks": 0,
         "buy_budget_share": None,
@@ -317,7 +321,11 @@ def build_best_quote_maker_volume_plan(
             extra_offset_ticks = max(int(config.dynamic_control_high_volatility_extra_offset_ticks), 0)
             reason = "high_volatility_defensive"
         elif low_vol > 0 and 0 < volatility_ratio <= low_vol:
-            if inventory_ratio < 0.75 and not soft_loss:
+            budget_max_inventory_ratio = max(
+                _safe_float(config.dynamic_control_low_volatility_budget_max_inventory_ratio),
+                0.0,
+            )
+            if inventory_ratio < budget_max_inventory_ratio and not soft_loss:
                 budget_scale = max(_safe_float(config.dynamic_control_low_volatility_budget_scale), 1.0)
             step_scale = _clamp(_safe_float(config.dynamic_control_low_volatility_step_scale), 0.1, 1.0)
             extra_offset_ticks = min(int(config.dynamic_control_low_volatility_extra_offset_ticks), 0)
