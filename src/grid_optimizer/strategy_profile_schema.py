@@ -408,10 +408,273 @@ ONE_WAY_LONG_RUNTIME_SWITCHES = frozenset(
 ONE_WAY_LONG_ALLOWED_PARAMS = COMMON_RUNNER_PARAMS | BEST_QUOTE_CORE_PARAMS | ONE_WAY_LONG_RUNTIME_SWITCHES | ELASTIC_PARAMS | RISK_REPAIR_PARAMS
 
 
+GLOBAL_SAFETY_PARAM_INFO: dict[str, dict[str, str]] = {
+    "max_new_orders": {
+        "effect": "限制每轮新挂单数量，多层冲量配置可能被压成少量挂单。",
+        "strategy_boundary": "按策略声明；启动前应大于等于本轮预计新单数。",
+    },
+    "max_total_notional": {
+        "effect": "限制本轮新挂单总名义金额，冲量目标容易被这里截断。",
+        "strategy_boundary": "全局执行安全阀；启动前应覆盖单轮预计挂单名义金额。",
+    },
+    "cancel_stale": {
+        "effect": "关闭后贴盘口策略遇到旧挂单时可能无法撤旧换新。",
+        "strategy_boundary": "BQ / ping-pong 默认应开启。",
+    },
+    "max_mid_drift_steps": {
+        "effect": "计划生成后盘口漂移过大时拒绝下单，波动大时过紧会误伤冲量。",
+        "strategy_boundary": "按波动场景调；最后一天冲量不宜过紧。",
+    },
+    "rolling_hourly_loss_limit": {
+        "effect": "滚动小时亏损达到阈值后会触发停机或冷却。",
+        "strategy_boundary": "全局亏损安全阀，记录但不归属单个策略。",
+    },
+    "max_cumulative_notional": {
+        "effect": "累计刷量达到上限后停机。",
+        "strategy_boundary": "20万/50万目标启动前必须校验上限足够。",
+    },
+    "max_actual_net_notional": {
+        "effect": "真实净敞口超过阈值后会被执行层拦截。",
+        "strategy_boundary": "全局敞口安全阀。",
+    },
+    "max_synthetic_drift_notional": {
+        "effect": "合成多空漂移超过阈值后会被执行层拦截。",
+        "strategy_boundary": "中性/合成策略安全阀。",
+    },
+    "hard_loss_forced_reduce_enabled": {
+        "effect": "亏损达到阈值后强制减仓模块可能接管挂单。",
+        "strategy_boundary": "必须由策略白名单显式授权。",
+    },
+    "excess_inventory_reduce_only_enabled": {
+        "effect": "库存超限后进入 reduce-only，新增刷量单会减少。",
+        "strategy_boundary": "必须由策略白名单显式授权。",
+    },
+    "near_market_entry_max_center_distance_steps": {
+        "effect": "中心距离盘口太远时可能暂停近盘口 entry，避免追涨追跌。",
+        "strategy_boundary": "风险修仓/entry guard，非白名单不应跨策略生效。",
+    },
+    "grid_inventory_rebalance_min_center_distance_steps": {
+        "effect": "中心偏离达到阈值后才允许库存再平衡。",
+        "strategy_boundary": "修仓 guard，非白名单不应跨策略生效。",
+    },
+}
+
+
 def _safe_bool(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_int(value: Any, default: int = 0) -> int:
+    if value is None:
+        return default
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
+def _append_safety_item(
+    items: list[dict[str, Any]],
+    *,
+    key: str,
+    value: Any,
+    active: bool,
+    severity: str,
+    category: str | None = None,
+    detail: str = "",
+) -> None:
+    info = GLOBAL_SAFETY_PARAM_INFO[key]
+    items.append(
+        {
+            "key": key,
+            "value": value,
+            "active": bool(active),
+            "severity": severity,
+            "category": category or severity,
+            "effect": info["effect"],
+            "strategy_boundary": info["strategy_boundary"],
+            "detail": detail,
+        }
+    )
+
+
+def build_global_safety_preflight(args: argparse.Namespace) -> dict[str, Any]:
+    buy_levels = max(_safe_int(getattr(args, "buy_levels", 0), 0), 0)
+    sell_levels = max(_safe_int(getattr(args, "sell_levels", 0), 0), 0)
+    per_order_notional = max(_safe_float(getattr(args, "per_order_notional", 0.0), 0.0), 0.0)
+    estimated_cycle_order_count = buy_levels + sell_levels
+    estimated_cycle_notional = round(estimated_cycle_order_count * per_order_notional, 8)
+    items: list[dict[str, Any]] = []
+    limiting_params: list[str] = []
+    blocking_params: list[str] = []
+    warning_params: list[str] = []
+    stop_guard_params: list[str] = []
+    takeover_params: list[str] = []
+
+    has_max_new_orders = hasattr(args, "max_new_orders")
+    max_new_orders = _safe_int(getattr(args, "max_new_orders", 0), 0)
+    max_new_orders_invalid = has_max_new_orders and max_new_orders <= 0
+    max_new_orders_active = max_new_orders > 0
+    max_new_orders_limiting = max_new_orders_active and estimated_cycle_order_count > max_new_orders
+    if max_new_orders_invalid:
+        blocking_params.append("max_new_orders")
+    if max_new_orders_limiting:
+        limiting_params.append("max_new_orders")
+    _append_safety_item(
+        items,
+        key="max_new_orders",
+        value=max_new_orders,
+        active=max_new_orders_active or max_new_orders_invalid,
+        severity="block" if max_new_orders_invalid else "limit" if max_new_orders_limiting else "ok",
+        category="blocking" if max_new_orders_invalid else "limiting" if max_new_orders_limiting else "capacity",
+        detail=(
+            "执行层要求 max_new_orders > 0。"
+            if max_new_orders_invalid
+            else f"预计 {estimated_cycle_order_count} 单，上限 {max_new_orders} 单。"
+        ),
+    )
+
+    has_max_total_notional = hasattr(args, "max_total_notional")
+    max_total_notional = _safe_float(getattr(args, "max_total_notional", 0.0), 0.0)
+    max_total_notional_invalid = has_max_total_notional and max_total_notional <= 0
+    max_total_notional_active = max_total_notional > 0
+    max_total_notional_limiting = (
+        max_total_notional_active and estimated_cycle_notional > max_total_notional
+    )
+    if max_total_notional_invalid:
+        blocking_params.append("max_total_notional")
+    if max_total_notional_limiting:
+        limiting_params.append("max_total_notional")
+    _append_safety_item(
+        items,
+        key="max_total_notional",
+        value=max_total_notional,
+        active=max_total_notional_active or max_total_notional_invalid,
+        severity="block" if max_total_notional_invalid else "limit" if max_total_notional_limiting else "ok",
+        category="blocking" if max_total_notional_invalid else "limiting" if max_total_notional_limiting else "capacity",
+        detail=(
+            "执行层要求 max_total_notional > 0。"
+            if max_total_notional_invalid
+            else f"预计 {estimated_cycle_notional:g}U，上限 {max_total_notional:g}U。"
+        ),
+    )
+
+    cancel_stale = _safe_bool(getattr(args, "cancel_stale", True))
+    if not cancel_stale:
+        blocking_params.append("cancel_stale")
+    _append_safety_item(
+        items,
+        key="cancel_stale",
+        value=cancel_stale,
+        active=not cancel_stale,
+        severity="block" if not cancel_stale else "ok",
+        category="blocking" if not cancel_stale else "order_refresh",
+        detail="关闭时 stale orders 可能让贴盘口策略无法撤旧换新。",
+    )
+
+    max_mid_drift_steps = _safe_float(getattr(args, "max_mid_drift_steps", 0.0), 0.0)
+    drift_active = max_mid_drift_steps > 0
+    drift_tight = drift_active and max_mid_drift_steps <= 2.0
+    if drift_tight:
+        warning_params.append("max_mid_drift_steps")
+    _append_safety_item(
+        items,
+        key="max_mid_drift_steps",
+        value=max_mid_drift_steps,
+        active=drift_active,
+        severity="warn" if drift_tight else "ok",
+        category="warning" if drift_tight else "drift_guard",
+        detail=f"当前允许漂移 {max_mid_drift_steps:g} steps。",
+    )
+
+    for key in (
+        "rolling_hourly_loss_limit",
+        "max_cumulative_notional",
+        "max_actual_net_notional",
+        "max_synthetic_drift_notional",
+    ):
+        value = _safe_float(getattr(args, key, 0.0), 0.0)
+        active = value > 0
+        if active:
+            stop_guard_params.append(key)
+        _append_safety_item(
+            items,
+            key=key,
+            value=value,
+            active=active,
+            severity="stop_guard" if active else "ok",
+            category="stop_guard" if active else "disabled",
+            detail=f"阈值 {value:g}。" if active else "未启用。",
+        )
+
+    hard_loss_forced_reduce_enabled = _safe_bool(getattr(args, "hard_loss_forced_reduce_enabled", False))
+    if hard_loss_forced_reduce_enabled:
+        takeover_params.append("hard_loss_forced_reduce_enabled")
+    _append_safety_item(
+        items,
+        key="hard_loss_forced_reduce_enabled",
+        value=hard_loss_forced_reduce_enabled,
+        active=hard_loss_forced_reduce_enabled,
+        severity="takeover" if hard_loss_forced_reduce_enabled else "ok",
+        category="takeover" if hard_loss_forced_reduce_enabled else "disabled",
+        detail="开启后亏损强减模块可能接管挂单。",
+    )
+
+    excess_inventory_reduce_only_enabled = _safe_bool(
+        getattr(args, "excess_inventory_reduce_only_enabled", False)
+    )
+    if excess_inventory_reduce_only_enabled:
+        limiting_params.append("excess_inventory_reduce_only_enabled")
+    _append_safety_item(
+        items,
+        key="excess_inventory_reduce_only_enabled",
+        value=excess_inventory_reduce_only_enabled,
+        active=excess_inventory_reduce_only_enabled,
+        severity="limit" if excess_inventory_reduce_only_enabled else "ok",
+        category="limiting" if excess_inventory_reduce_only_enabled else "disabled",
+        detail="开启后库存超限时会减少或禁止新增 entry。",
+    )
+
+    for key in (
+        "near_market_entry_max_center_distance_steps",
+        "grid_inventory_rebalance_min_center_distance_steps",
+    ):
+        value = _safe_float(getattr(args, key, 0.0), 0.0)
+        active = value > 0
+        tight = key == "near_market_entry_max_center_distance_steps" and 0 < value < 2.0
+        if tight:
+            warning_params.append(key)
+        _append_safety_item(
+            items,
+            key=key,
+            value=value,
+            active=active,
+            severity="warn" if tight else "ok",
+            category="warning" if tight else "entry_guard",
+            detail=f"当前阈值 {value:g} steps。" if active else "未启用。",
+        )
+
+    return {
+        "estimated_cycle_order_count": estimated_cycle_order_count,
+        "estimated_cycle_notional": estimated_cycle_notional,
+        "items": items,
+        "limiting_params": sorted(set(limiting_params)),
+        "blocking_params": sorted(set(blocking_params)),
+        "warning_params": sorted(set(warning_params)),
+        "stop_guard_params": sorted(set(stop_guard_params)),
+        "takeover_params": sorted(set(takeover_params)),
+    }
 
 
 def _values_equal(left: Any, right: Any) -> bool:
@@ -544,5 +807,6 @@ def apply_strategy_profile_schema(
         "allowed_params": sorted(schema.allowed_params),
         "ignored_params": sorted(ignored_params),
         "unknown_params": sorted(unknown_params),
+        "global_safety_preflight": build_global_safety_preflight(effective),
     }
     return effective, report

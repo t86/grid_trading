@@ -31,6 +31,16 @@ def _args(**overrides):
         "excess_inventory_reduce_only_enabled": True,
         "exposure_escalation_enabled": True,
         "take_profit_min_profit_ratio": 0.0002,
+        "max_new_orders": 12,
+        "max_total_notional": 0.0,
+        "cancel_stale": True,
+        "max_mid_drift_steps": 8.0,
+        "rolling_hourly_loss_limit": 0.0,
+        "max_cumulative_notional": 0.0,
+        "max_actual_net_notional": 0.0,
+        "max_synthetic_drift_notional": 0.0,
+        "near_market_entry_max_center_distance_steps": 2.0,
+        "grid_inventory_rebalance_min_center_distance_steps": 3.0,
         "static_buy_offset_steps": 2.0,
         "static_sell_offset_steps": 3.0,
         "market_bias_max_shift_steps": 4.0,
@@ -155,6 +165,58 @@ class StrategyProfileSchemaTests(unittest.TestCase):
         self.assertEqual(report["strategy_intent"], "volume")
         self.assertEqual(report["required_position_mode"], "hedge")
         self.assertFalse(report["required_position_mode_defaulted"])
+
+    def test_global_safety_preflight_reports_order_limiters_and_stop_guards(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                buy_levels=2,
+                sell_levels=2,
+                per_order_notional=750.0,
+                max_new_orders=3,
+                max_total_notional=2_000.0,
+                cancel_stale=False,
+                max_mid_drift_steps=1.0,
+                rolling_hourly_loss_limit=25.0,
+                max_cumulative_notional=100_000.0,
+                max_actual_net_notional=8_000.0,
+            ),
+            enabled=True,
+        )
+
+        preflight = report["global_safety_preflight"]
+        self.assertEqual(preflight["estimated_cycle_order_count"], 4)
+        self.assertEqual(preflight["estimated_cycle_notional"], 3_000.0)
+        self.assertIn("max_new_orders", preflight["limiting_params"])
+        self.assertIn("max_total_notional", preflight["limiting_params"])
+        self.assertIn("cancel_stale", preflight["blocking_params"])
+        self.assertIn("max_mid_drift_steps", preflight["warning_params"])
+        self.assertIn("rolling_hourly_loss_limit", preflight["stop_guard_params"])
+        self.assertIn("max_cumulative_notional", preflight["stop_guard_params"])
+        self.assertIn("max_actual_net_notional", preflight["stop_guard_params"])
+
+    def test_global_safety_preflight_reports_invalid_execution_caps_as_blocking(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(max_new_orders=0, max_total_notional=0.0),
+            enabled=True,
+        )
+
+        preflight = report["global_safety_preflight"]
+        self.assertIn("max_new_orders", preflight["blocking_params"])
+        self.assertIn("max_total_notional", preflight["blocking_params"])
+
+    def test_global_safety_preflight_reflects_pruned_disallowed_takeover_switches(self) -> None:
+        effective, report = apply_strategy_profile_schema(
+            _args(hard_loss_forced_reduce_enabled=True, excess_inventory_reduce_only_enabled=True),
+            enabled=True,
+        )
+
+        preflight = report["global_safety_preflight"]
+        self.assertFalse(effective.hard_loss_forced_reduce_enabled)
+        self.assertFalse(effective.excess_inventory_reduce_only_enabled)
+        self.assertNotIn("hard_loss_forced_reduce_enabled", preflight["takeover_params"])
+        self.assertNotIn("excess_inventory_reduce_only_enabled", preflight["limiting_params"])
+        self.assertIn("hard_loss_forced_reduce_enabled", report["ignored_params"])
+        self.assertIn("excess_inventory_reduce_only_enabled", report["ignored_params"])
 
 
 if __name__ == "__main__":

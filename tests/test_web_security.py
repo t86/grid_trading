@@ -3998,6 +3998,13 @@ class WebSecurityTests(unittest.TestCase):
                 "plan_json": str(plan_path),
                 "submit_report_json": str(submit_path),
                 "per_order_notional": 120.0,
+                "buy_levels": 2,
+                "sell_levels": 2,
+                "max_new_orders": 3,
+                "max_total_notional": 400.0,
+                "cancel_stale": False,
+                "max_mid_drift_steps": 1.0,
+                "rolling_hourly_loss_limit": 30.0,
             }
             mock_load_config.return_value = config
             mock_read_runner.return_value = {
@@ -4025,6 +4032,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertAlmostEqual(payload["position"]["long_notional"], 2.0)
         self.assertAlmostEqual(payload["position"]["net_notional"], 2.0)
         self.assertEqual(payload["orders"]["strategy_open_order_count"], 2)
+        self.assertEqual(payload["safety_preflight"]["estimated_cycle_order_count"], 4)
+        self.assertEqual(payload["safety_preflight"]["estimated_cycle_notional"], 480.0)
+        self.assertIn("max_new_orders", payload["safety_preflight"]["limiting_params"])
+        self.assertIn("max_total_notional", payload["safety_preflight"]["limiting_params"])
+        self.assertIn("cancel_stale", payload["safety_preflight"]["blocking_params"])
+        self.assertIn("max_mid_drift_steps", payload["safety_preflight"]["warning_params"])
+        self.assertIn("rolling_hourly_loss_limit", payload["safety_preflight"]["stop_guard_params"])
         self.assertIn("aigensynusdt_best_quote_maker_volume_v1", {item["key"] for item in payload["presets"]})
         mock_build_snapshot.assert_not_called()
 

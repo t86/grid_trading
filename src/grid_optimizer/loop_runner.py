@@ -10844,6 +10844,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_strategy_profile": effective_strategy_profile,
         "effective_strategy_label": AUTO_REGIME_PROFILE_LABELS.get(effective_strategy_profile),
         "strategy_profile_schema": strategy_profile_schema,
+        "global_safety_preflight": dict(strategy_profile_schema.get("global_safety_preflight") or {}),
         "strategy_intent": elastic_volume.get("strategy_intent") or strategy_profile_schema.get("strategy_intent"),
         "required_position_mode": required_position_mode,
         "required_position_mode_defaulted": bool(strategy_profile_schema.get("required_position_mode_defaulted")),
