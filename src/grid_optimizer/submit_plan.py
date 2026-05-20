@@ -121,7 +121,7 @@ def _resolve_reduce_only_flag(
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
     normalized_side = str(side or "").upper().strip()
     normalized_role = str(role or "").lower().strip()
-    if normalized_mode == "hedge_neutral":
+    if normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"}:
         return None
     if normalized_role in {"grid_exit", "forced_reduce", "tail_cleanup"}:
         return True
@@ -509,7 +509,7 @@ def cap_reduce_only_place_orders_to_position(
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
     cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
-    if normalized_mode == "hedge_neutral" or not place_orders:
+    if normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"} or not place_orders:
         result = dict(actions)
         result["place_orders"] = place_orders
         result["cancel_orders"] = cancel_orders
@@ -659,7 +659,7 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
 ) -> dict[str, Any]:
     """Prevent losing inventory recovery from turning into a fresh opposite entry."""
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
-    if normalized_mode == "hedge_neutral":
+    if normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"}:
         return actions
 
     net_qty = _safe_float(plan_report.get("actual_net_qty"))

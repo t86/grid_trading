@@ -450,6 +450,55 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "max_total_notional": 1_600.0,
         },
     },
+    "pharosusdt_hedge_best_quote_maker_volume_v1": {
+        "label": "PHAROS 双向 Best Quote 冲量 v1",
+        "description": "PHAROSUSDT 专用双向持仓 maker 冲量策略。用 LONG/SHORT 独立下单，库存越过软带后只保留对应减仓方向。",
+        "startable": True,
+        "kind": "maker",
+        "symbol": "PHAROSUSDT",
+        "config": {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "step_price": 0.0001,
+            "buy_levels": 1,
+            "sell_levels": 1,
+            "per_order_notional": 10.0,
+            "base_position_notional": 0.0,
+            "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_take_profit_guard_enabled": True,
+            "best_quote_maker_volume_cycle_budget_notional": 24.0,
+            "best_quote_maker_volume_target_remaining_notional": 200_000.0,
+            "best_quote_maker_volume_quote_offset_ticks": 0,
+            "best_quote_maker_volume_defensive_offset_ticks": 4,
+            "best_quote_maker_volume_max_long_notional": 320.0,
+            "best_quote_maker_volume_max_short_notional": 120.0,
+            "best_quote_maker_volume_inventory_soft_ratio": 0.90,
+            "best_quote_maker_volume_loss_per_10k_15m": 0.0,
+            "best_quote_maker_volume_loss_per_10k_soft": 1.2,
+            "best_quote_maker_volume_loss_per_10k_hard": 2.2,
+            "best_quote_maker_volume_soft_loss_budget_scale": 0.60,
+            "best_quote_maker_volume_min_cycle_budget_notional": 10.0,
+            "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
+            "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
+            "flat_start_enabled": False,
+            "warm_start_enabled": True,
+            "autotune_symbol_enabled": False,
+            "adaptive_step_enabled": False,
+            "volume_trigger_enabled": False,
+            "volume_trigger_stop_close_all_positions": False,
+            "volatility_trigger_enabled": False,
+            "volatility_trigger_stop_close_all_positions": False,
+            "adverse_reduce_enabled": False,
+            "hard_loss_forced_reduce_enabled": False,
+            "exposure_escalation_enabled": False,
+            "unrealized_loss_entry_guard_enabled": False,
+            "sleep_seconds": 1.4,
+            "leverage": 5,
+            "maker_retries": 2,
+            "max_new_orders": 4,
+            "max_total_notional": 650.0,
+        },
+    },
     "volume_long_v4": {
         "label": "量优先做多 v4",
         "description": "当前实盘主策略。偏多滚动微网格，保留成交量，带分钟熔断和库存分层。",
@@ -3571,6 +3620,7 @@ RUNNER_PRESET_VISIBILITY_WHITELIST: frozenset[str] = frozenset(
         "btcusdt_neutral_regime_budget_ping_pong_v2",
         "btcusdc_best_quote_long_ping_pong_v1",
         "btcusdc_best_quote_maker_volume_v1",
+        "pharosusdt_hedge_best_quote_maker_volume_v1",
         "billusdt_competition_neutral_ping_pong_v1",
         "billusdt_neutral_regime_budget_ping_pong_v2",
         "chipusdt_competition_neutral_ping_pong_v1",
@@ -5338,23 +5388,27 @@ RUNNING_STATUS_GRID_MODE_LIST = [
     "synthetic_neutral",
     "hedge_neutral",
     "inventory_target_neutral",
+    "hedge_best_quote_maker_volume_v1",
 ]
 RUNNING_STATUS_LONG_CAPABLE_MODE_LIST = [
     "one_way_long",
     "synthetic_neutral",
     "hedge_neutral",
     "inventory_target_neutral",
+    "hedge_best_quote_maker_volume_v1",
 ]
 RUNNING_STATUS_SHORT_CAPABLE_MODE_LIST = [
     "one_way_short",
     "synthetic_neutral",
     "hedge_neutral",
     "inventory_target_neutral",
+    "hedge_best_quote_maker_volume_v1",
 ]
 RUNNING_STATUS_NEUTRAL_MODE_LIST = [
     "synthetic_neutral",
     "hedge_neutral",
     "inventory_target_neutral",
+    "hedge_best_quote_maker_volume_v1",
 ]
 RUNNING_STATUS_SYNTHETIC_MODE_LIST = ["synthetic_neutral"]
 RUNNING_STATUS_MODE_OPTIONS = [
@@ -5363,6 +5417,7 @@ RUNNING_STATUS_MODE_OPTIONS = [
     {"value": "synthetic_neutral", "label": "单向合成中性"},
     {"value": "hedge_neutral", "label": "双向中性"},
     {"value": "inventory_target_neutral", "label": "目标仓位中性"},
+    {"value": "hedge_best_quote_maker_volume_v1", "label": "双向 BQ 刷量"},
 ]
 RUNNING_STATUS_FORM_GROUPS: list[dict[str, Any]] = [
     {
@@ -8090,7 +8145,7 @@ def _autotune_runner_symbol_config(config: dict[str, Any]) -> dict[str, Any]:
     max_long_notional = 0.0 if max_long_raw in {None, ""} else _safe_float(max_long_raw, "max_position_notional")
     max_short_notional = 0.0 if max_short_raw in {None, ""} else _safe_float(max_short_raw, "max_short_position_notional")
     target_dual_side_total = 0.0
-    if strategy_mode in {"hedge_neutral", "synthetic_neutral", "inventory_target_neutral"}:
+    if strategy_mode in {"hedge_neutral", "synthetic_neutral", "inventory_target_neutral", "hedge_best_quote_maker_volume_v1"}:
         if max_long_notional > 0:
             target_dual_side_total += max_long_notional
         if max_short_notional > 0:
@@ -9528,7 +9583,7 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         soft_ratio = number("maker_inventory_soft_ratio")
         if soft_ratio is not None and soft_ratio > 1:
             errors.append("maker_inventory_soft_ratio 必须 <= 1")
-    elif strategy_mode == "best_quote_maker_volume_v1":
+    elif strategy_mode in {"best_quote_maker_volume_v1", "hedge_best_quote_maker_volume_v1"}:
         require_positive("best_quote_maker_volume_cycle_budget_notional")
         require_positive("best_quote_maker_volume_max_long_notional")
         require_positive("best_quote_maker_volume_max_short_notional")
@@ -20476,6 +20531,7 @@ MONITOR_PAGE = """<!doctype html>
                     <option value="synthetic_neutral">单向合成中性</option>
                     <option value="inventory_target_neutral">单向目标中性</option>
                     <option value="hedge_neutral">双向中性</option>
+                    <option value="hedge_best_quote_maker_volume_v1">双向 BQ 刷量</option>
                   </select>
                 </label>
                 <label>步长
@@ -23688,12 +23744,12 @@ MONITOR_PAGE = """<!doctype html>
     let latestCustomGridPreview = null;
     let monitorSymbols = [];
     let latestRunnerEditorConfig = null;
-    const GRID_BASED_RUNNER_MODE_LIST = ["one_way_long", "one_way_short", "synthetic_neutral", "hedge_neutral"];
+    const GRID_BASED_RUNNER_MODE_LIST = ["one_way_long", "one_way_short", "synthetic_neutral", "hedge_neutral", "hedge_best_quote_maker_volume_v1"];
     const GRID_BASED_RUNNER_MODES = new Set(GRID_BASED_RUNNER_MODE_LIST);
-    const LONG_CAPABLE_RUNNER_MODE_LIST = ["one_way_long", "synthetic_neutral", "hedge_neutral", "inventory_target_neutral"];
-    const SHORT_CAPABLE_RUNNER_MODE_LIST = ["one_way_short", "synthetic_neutral", "hedge_neutral", "inventory_target_neutral"];
-    const NEUTRAL_RUNNER_MODE_LIST = ["synthetic_neutral", "hedge_neutral", "inventory_target_neutral"];
-    const MARKET_BIAS_RUNNER_MODE_LIST = ["one_way_long", "synthetic_neutral", "hedge_neutral"];
+    const LONG_CAPABLE_RUNNER_MODE_LIST = ["one_way_long", "synthetic_neutral", "hedge_neutral", "inventory_target_neutral", "hedge_best_quote_maker_volume_v1"];
+    const SHORT_CAPABLE_RUNNER_MODE_LIST = ["one_way_short", "synthetic_neutral", "hedge_neutral", "inventory_target_neutral", "hedge_best_quote_maker_volume_v1"];
+    const NEUTRAL_RUNNER_MODE_LIST = ["synthetic_neutral", "hedge_neutral", "inventory_target_neutral", "hedge_best_quote_maker_volume_v1"];
+    const MARKET_BIAS_RUNNER_MODE_LIST = ["one_way_long", "synthetic_neutral", "hedge_neutral", "hedge_best_quote_maker_volume_v1"];
     const SYNTHETIC_RUNNER_MODE_LIST = ["synthetic_neutral"];
     const TARGET_NEUTRAL_RUNNER_MODE_LIST = ["inventory_target_neutral"];
     const LONG_ONLY_RUNNER_MODE_LIST = ["one_way_long"];

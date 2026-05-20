@@ -50,6 +50,9 @@ class BestQuoteMakerVolumeInputs:
     open_entry_short_notional: float = 0.0
     pending_entry_buffer_notional: float = 0.0
     entry_ladder_spacing: float | None = None
+    current_long_qty: float | None = None
+    current_short_qty: float | None = None
+    position_side_mode: str = "one_way"
 
 
 def _safe_float(value: Any) -> float:
@@ -81,6 +84,7 @@ def _build_order(
     notional: float,
     role: str,
     inputs: BestQuoteMakerVolumeInputs,
+    position_side: str = "BOTH",
     force_reduce_only: bool | None = None,
 ) -> dict[str, Any] | None:
     rounded_price = _round_order_price(price, inputs.tick_size, side)
@@ -100,7 +104,7 @@ def _build_order(
         "qty": qty,
         "notional": order_notional,
         "role": role,
-        "position_side": "BOTH",
+        "position_side": str(position_side or "BOTH").upper().strip() or "BOTH",
         "execution_type": "maker",
         "post_only": True,
     }
@@ -123,6 +127,7 @@ def _build_entry_ladder(
     slots: int,
     role: str,
     inputs: BestQuoteMakerVolumeInputs,
+    position_side: str = "BOTH",
 ) -> list[dict[str, Any]]:
     safe_slots = max(int(slots), 0)
     if safe_slots <= 0 or total_notional <= 0:
@@ -142,6 +147,7 @@ def _build_entry_ladder(
                 notional=per_order_notional,
                 role=role,
                 inputs=inputs,
+                position_side=position_side,
             ),
         )
     return orders
@@ -188,9 +194,15 @@ def build_best_quote_maker_volume_plan(
             "reasons": ["budget_below_minimum"],
         }
 
+    hedge_position_sides = str(inputs.position_side_mode or "").strip().lower() == "hedge"
     net_qty = _safe_float(inputs.current_net_qty)
-    long_notional = max(net_qty, 0.0) * mid
-    short_notional = max(-net_qty, 0.0) * mid
+    if hedge_position_sides:
+        long_notional = max(_safe_float(inputs.current_long_qty), 0.0) * mid
+        short_notional = max(_safe_float(inputs.current_short_qty), 0.0) * mid
+        net_qty = (long_notional - short_notional) / mid if mid > 0 else 0.0
+    else:
+        long_notional = max(net_qty, 0.0) * mid
+        short_notional = max(-net_qty, 0.0) * mid
     open_entry_long_notional = max(_safe_float(inputs.open_entry_long_notional), 0.0)
     open_entry_short_notional = max(_safe_float(inputs.open_entry_short_notional), 0.0)
     pending_entry_buffer_notional = max(_safe_float(inputs.pending_entry_buffer_notional), 0.0)
@@ -262,11 +274,17 @@ def build_best_quote_maker_volume_plan(
             offset_ticks = new_ticks
     dynamic_tick_report["offset_ticks"] = int(offset_ticks)
     gap = _tick_gap(inputs.tick_size, offset_ticks)
-    per_side = cycle_budget / max((1 if allow_entry_long or net_qty < 0 else 0) + (1 if allow_entry_short or net_qty > 0 else 0), 1)
+    buy_slot_active = allow_entry_long or (short_notional > 0 and not allow_entry_short)
+    sell_slot_active = allow_entry_short or (long_notional > 0 and not allow_entry_long)
+    per_side = cycle_budget / max((1 if buy_slot_active else 0) + (1 if sell_slot_active else 0), 1)
 
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
     max_entry_orders_per_side = max(int(_safe_float(config.max_entry_orders_per_side)), 1)
+    long_entry_position_side = "LONG" if hedge_position_sides else "BOTH"
+    short_entry_position_side = "SHORT" if hedge_position_sides else "BOTH"
+    reduce_long_position_side = "LONG" if hedge_position_sides else "BOTH"
+    reduce_short_position_side = "SHORT" if hedge_position_sides else "BOTH"
     inventory_bias_report = {
         "enabled": bool(config.inventory_bias_enabled),
         "applied": False,
@@ -282,6 +300,7 @@ def build_best_quote_maker_volume_plan(
     bias_entry_share = max(1.0 - bias_reduce_share, 0.0)
     can_bias_short = (
         config.inventory_bias_enabled
+        and not hedge_position_sides
         and regime == "normal"
         and net_qty < 0
         and allow_entry_long
@@ -291,6 +310,7 @@ def build_best_quote_maker_volume_plan(
     )
     can_bias_long = (
         config.inventory_bias_enabled
+        and not hedge_position_sides
         and regime == "normal"
         and net_qty > 0
         and allow_entry_long
@@ -317,7 +337,7 @@ def build_best_quote_maker_volume_plan(
                 "same_side_offset_ticks": same_side_ticks,
             }
         )
-        if can_bias_short:
+        if can_bias_short and not hedge_position_sides:
             _append_order(
                 buy_orders,
                 _build_order(
@@ -326,6 +346,7 @@ def build_best_quote_maker_volume_plan(
                     notional=min(reduce_notional, short_notional),
                     role="best_quote_reduce_short",
                     inputs=inputs,
+                    position_side=reduce_short_position_side,
                     force_reduce_only=True,
                 ),
             )
@@ -338,9 +359,10 @@ def build_best_quote_maker_volume_plan(
                     slots=max_entry_orders_per_side,
                     role="best_quote_entry_short",
                     inputs=inputs,
+                    position_side=short_entry_position_side,
                 )
             )
-        else:
+        elif not hedge_position_sides:
             _append_order(
                 sell_orders,
                 _build_order(
@@ -349,6 +371,7 @@ def build_best_quote_maker_volume_plan(
                     notional=min(reduce_notional, long_notional),
                     role="best_quote_reduce_long",
                     inputs=inputs,
+                    position_side=reduce_long_position_side,
                     force_reduce_only=True,
                 ),
             )
@@ -361,10 +384,28 @@ def build_best_quote_maker_volume_plan(
                     slots=max_entry_orders_per_side,
                     role="best_quote_entry_long",
                     inputs=inputs,
+                    position_side=long_entry_position_side,
                 )
             )
 
-    if not inventory_bias_report["applied"] and allow_entry_long:
+    if (
+        not inventory_bias_report["applied"]
+        and short_notional > 0
+        and not allow_entry_short
+    ):
+        _append_order(
+            buy_orders,
+            _build_order(
+                side="BUY",
+                price=_price_with_gap(bid, gap, -1),
+                notional=min(per_side, short_notional),
+                role="best_quote_reduce_short",
+                inputs=inputs,
+                position_side=reduce_short_position_side,
+                force_reduce_only=True,
+            ),
+        )
+    elif not inventory_bias_report["applied"] and allow_entry_long:
         long_entry_notional = per_side
         if long_limit > 0:
             long_entry_notional = min(
@@ -380,9 +421,10 @@ def build_best_quote_maker_volume_plan(
                 slots=max_entry_orders_per_side,
                 role="best_quote_entry_long",
                 inputs=inputs,
+                position_side=long_entry_position_side,
             )
         )
-    elif not inventory_bias_report["applied"] and net_qty < 0:
+    elif not inventory_bias_report["applied"] and short_notional > 0:
         _append_order(
             buy_orders,
             _build_order(
@@ -391,12 +433,13 @@ def build_best_quote_maker_volume_plan(
                 notional=min(per_side, short_notional),
                 role="best_quote_reduce_short",
                 inputs=inputs,
+                position_side=reduce_short_position_side,
                 force_reduce_only=True,
             ),
         )
     if inventory_bias_report["applied"]:
         pass
-    elif net_qty > 0 and not allow_entry_long:
+    elif long_notional > 0 and not allow_entry_long:
         _append_order(
             sell_orders,
             _build_order(
@@ -405,6 +448,7 @@ def build_best_quote_maker_volume_plan(
                 notional=min(per_side, long_notional),
                 role="best_quote_reduce_long",
                 inputs=inputs,
+                position_side=reduce_long_position_side,
                 force_reduce_only=True,
             ),
         )
@@ -424,9 +468,10 @@ def build_best_quote_maker_volume_plan(
                 slots=max_entry_orders_per_side,
                 role="best_quote_entry_short",
                 inputs=inputs,
+                position_side=short_entry_position_side,
             )
         )
-    elif net_qty > 0:
+    elif long_notional > 0:
         _append_order(
             sell_orders,
             _build_order(
@@ -435,6 +480,7 @@ def build_best_quote_maker_volume_plan(
                 notional=min(per_side, long_notional),
                 role="best_quote_reduce_long",
                 inputs=inputs,
+                position_side=reduce_long_position_side,
                 force_reduce_only=True,
             ),
         )

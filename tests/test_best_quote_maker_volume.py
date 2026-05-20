@@ -182,6 +182,47 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual([order["price"] for order in plan["buy_orders"]], [0.15968, 0.15949])
         self.assertEqual([order["price"] for order in plan["sell_orders"]], [0.15969, 0.15988])
 
+    def test_hedge_mode_entries_use_long_and_short_position_sides(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(enabled=True),
+            inputs=_inputs(position_side_mode="hedge"),
+        )
+
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertEqual(plan["buy_orders"][0]["position_side"], "LONG")
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "SHORT")
+
+    def test_hedge_mode_reduces_long_side_when_long_is_above_soft_band(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1_000.0,
+                inventory_soft_ratio=0.6,
+            ),
+            inputs=_inputs(position_side_mode="hedge", current_long_qty=0.01),
+        )
+
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
+        self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
+
+    def test_hedge_mode_reduces_short_side_when_short_is_above_soft_band(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_short_notional=1_000.0,
+                inventory_soft_ratio=0.6,
+            ),
+            inputs=_inputs(position_side_mode="hedge", current_short_qty=0.01),
+        )
+
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(plan["buy_orders"][0]["position_side"], "SHORT")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(plan["sell_orders"], [])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -740,6 +740,72 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_hedge_best_quote_maker_volume_generate_plan_report_uses_position_sides(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.1,
+            "step_size": 0.001,
+            "min_qty": 0.001,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "80400.0", "ask_price": "80400.1"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "BTCUSDC", "positionSide": "LONG", "positionAmt": "0", "entryPrice": "0"},
+                {"symbol": "BTCUSDC", "positionSide": "SHORT", "positionAmt": "0", "entryPrice": "0"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="BTCUSDC",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                strategy_profile="btcusdc_hedge_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=400.0,
+                best_quote_maker_volume_max_long_notional=1_500.0,
+                best_quote_maker_volume_max_short_notional=1_500.0,
+                best_quote_maker_volume_loss_per_10k_15m=0.2,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        self.assertEqual(report["strategy_mode"], "hedge_best_quote_maker_volume_v1")
+        self.assertEqual(report["best_quote_maker_volume"]["regime"], "normal")
+        self.assertEqual(report["buy_orders"][0]["position_side"], "LONG")
+        self.assertEqual(report["sell_orders"][0]["position_side"], "SHORT")
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
     def test_best_quote_maker_volume_clamps_entry_short_when_long_is_losing(
         self,
         mock_symbol_config,
@@ -8575,8 +8641,37 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertIsNone(mock_post_order.call_args.kwargs["reduce_only"])
         self.assertEqual(mock_post_order.call_args.kwargs["position_side"], "LONG")
-        mock_update_synthetic_refs.assert_called_once()
-        mock_update_inventory_grid_refs.assert_called_once()
+        mock_post_order.reset_mock(return_value=True, side_effect=True)
+        mock_post_order.return_value = {"orderId": 2, "clientOrderId": "reduce-hedge-bq"}
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {
+                        "role": "best_quote_reduce_long",
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "qty": 16.0,
+                        "price": 0.5985,
+                        "force_reduce_only": True,
+                    },
+                ],
+            },
+        }
+        args.strategy_mode = "hedge_best_quote_maker_volume_v1"
+        args.plan_json = "output/pharosusdt_hedge_best_quote_maker_volume_latest_plan.json"
+        plan_report["strategy_mode"] = "hedge_best_quote_maker_volume_v1"
+
+        execute_plan_report(args, plan_report)
+
+        self.assertIsNone(mock_post_order.call_args.kwargs["reduce_only"])
+        self.assertEqual(mock_post_order.call_args.kwargs["position_side"], "LONG")
+        self.assertEqual(mock_update_synthetic_refs.call_count, 2)
+        self.assertEqual(mock_update_inventory_grid_refs.call_count, 2)
 
     @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
     @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")

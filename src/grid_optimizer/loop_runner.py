@@ -2235,7 +2235,7 @@ def _resolve_adverse_reduce_cost_basis(
     synthetic_snapshot = synthetic_ledger_snapshot or {}
     normalized_mode = str(requested_strategy_mode or "").strip()
     if normalized_side == "long":
-        if normalized_mode == "hedge_neutral":
+        if _uses_exchange_hedge_position_sides(normalized_mode):
             actual_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
             actual_long_price = _position_cost_basis_price(long_position)
             if actual_long_qty > 1e-12 and actual_long_price > 0:
@@ -2247,7 +2247,7 @@ def _resolve_adverse_reduce_cost_basis(
             return synthetic_long_price, "synthetic_ledger"
         return 0.0, None
 
-    if normalized_mode == "hedge_neutral":
+    if _uses_exchange_hedge_position_sides(normalized_mode):
         actual_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
         actual_short_price = _position_cost_basis_price(short_position)
         if actual_short_qty > 1e-12 and actual_short_price > 0:
@@ -3114,7 +3114,7 @@ def _resolve_reduce_only_flag(
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
     normalized_side = str(side or "").upper().strip()
     normalized_role = str(role or "").lower().strip()
-    if normalized_mode == "hedge_neutral":
+    if _uses_exchange_hedge_position_sides(normalized_mode):
         return None
     if normalized_role in {"grid_exit", "forced_reduce", "tail_cleanup"}:
         return True
@@ -3411,7 +3411,16 @@ def _is_maker_volatility_inventory_mode(strategy_mode: str) -> bool:
 
 
 def _is_best_quote_maker_volume_mode(strategy_mode: str) -> bool:
-    return str(strategy_mode).strip() == "best_quote_maker_volume_v1"
+    return str(strategy_mode).strip() in {"best_quote_maker_volume_v1", "hedge_best_quote_maker_volume_v1"}
+
+
+def _is_hedge_best_quote_maker_volume_mode(strategy_mode: str) -> bool:
+    return str(strategy_mode).strip() == "hedge_best_quote_maker_volume_v1"
+
+
+def _uses_exchange_hedge_position_sides(strategy_mode: str) -> bool:
+    normalized = str(strategy_mode or "").strip()
+    return normalized == "hedge_neutral" or _is_hedge_best_quote_maker_volume_mode(normalized)
 
 
 def _is_custom_grid_mode(args: argparse.Namespace) -> bool:
@@ -11336,6 +11345,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "competition_inventory_grid",
         "maker_volatility_inventory_v1",
         "best_quote_maker_volume_v1",
+        "hedge_best_quote_maker_volume_v1",
     }:
         raise RuntimeError(f"Unsupported strategy_mode: {requested_strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
@@ -11829,13 +11839,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         prefer_entry_price=prefer_entry_price_cost_basis,
     )
     actual_break_even_price = max(_safe_float(actual_position.get("breakEvenPrice")), 0.0)
-    long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
-    short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
+    uses_exchange_hedge_positions = _uses_exchange_hedge_position_sides(requested_strategy_mode)
+    long_position = extract_symbol_position(account_info, symbol, "LONG" if uses_exchange_hedge_positions else None)
+    short_position = extract_symbol_position(account_info, symbol, "SHORT") if uses_exchange_hedge_positions else {}
     if (
         _is_inventory_target_neutral_mode(requested_strategy_mode)
         or _is_competition_inventory_grid_mode(requested_strategy_mode)
         or _is_maker_volatility_inventory_mode(requested_strategy_mode)
-        or _is_best_quote_maker_volume_mode(requested_strategy_mode)
+        or (
+            _is_best_quote_maker_volume_mode(requested_strategy_mode)
+            and not _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
+        )
     ):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
@@ -11843,11 +11857,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_long_qty = 0.0
         current_short_qty = max(-actual_net_qty, 0.0)
     else:
-        current_long_qty = max(_position_qty(long_position, position_side="LONG" if requested_strategy_mode == "hedge_neutral" else None), 0.0)
-        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
+        current_long_qty = max(_position_qty(long_position, position_side="LONG" if uses_exchange_hedge_positions else None), 0.0)
+        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if uses_exchange_hedge_positions else 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
-    if requested_strategy_mode == "hedge_neutral":
+    if uses_exchange_hedge_positions:
         unrealized_pnl = _position_unrealized_pnl(long_position) + _position_unrealized_pnl(short_position)
     else:
         unrealized_pnl = _position_unrealized_pnl(actual_position)
@@ -11918,7 +11932,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     }
     current_long_avg_price = 0.0
     current_short_avg_price = 0.0
-    if requested_strategy_mode == "hedge_neutral":
+    if uses_exchange_hedge_positions:
         current_long_avg_price = (
             _position_cost_basis_price(long_position, prefer_entry_price=prefer_entry_price_cost_basis)
             if current_long_qty > 1e-12
@@ -12587,11 +12601,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     if (
         _is_inventory_target_neutral_mode(strategy_mode)
         or _is_maker_volatility_inventory_mode(strategy_mode)
-        or _is_best_quote_maker_volume_mode(strategy_mode)
+        or (
+            _is_best_quote_maker_volume_mode(strategy_mode)
+            and not _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        )
     ):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
-    elif strategy_mode == "hedge_neutral":
+    elif strategy_mode == "hedge_neutral" or _is_hedge_best_quote_maker_volume_mode(strategy_mode):
         current_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
         current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
     elif _is_one_way_short_mode(strategy_mode):
@@ -13801,7 +13818,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         target_base_qty = 0.0
         bootstrap_qty = 0.0
     elif _is_best_quote_maker_volume_mode(strategy_mode):
-        if dual_side_position:
+        hedge_best_quote = _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        if hedge_best_quote and not dual_side_position:
+            raise RuntimeError("hedge best quote maker volume 策略要求账户处于双向持仓模式")
+        if not hedge_best_quote and dual_side_position:
             raise RuntimeError("best quote maker volume 策略要求账户处于单向持仓模式")
         cycle_budget = _safe_float(getattr(effective_args, "best_quote_maker_volume_cycle_budget_notional", 0.0))
         if cycle_budget <= 0:
@@ -13884,6 +13904,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 pending_entry_buffer_notional=cycle_budget * 0.5,
                 entry_ladder_spacing=_safe_float(getattr(effective_args, "step_price", 0.0)),
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                position_side_mode="hedge" if hedge_best_quote else "one_way",
             ),
         )
         best_quote_take_profit_guard_enabled = bool(
@@ -15432,7 +15455,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         cancel_stale=args.cancel_stale,
         max_plan_age_seconds=args.max_plan_age_seconds,
         now=datetime.now(timezone.utc),
-        allow_dual_side_position=(strategy_mode == "hedge_neutral"),
+        allow_dual_side_position=_uses_exchange_hedge_position_sides(strategy_mode),
         enforce_place_limits=not bool(args.apply),
     )
 
@@ -15592,6 +15615,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     if strategy_mode == "hedge_neutral":
         if not dual_side_position:
             raise RuntimeError("中性 Hedge 策略要求账户处于双向持仓模式")
+    elif _is_hedge_best_quote_maker_volume_mode(strategy_mode):
+        if not dual_side_position:
+            raise RuntimeError("Hedge Best Quote 策略要求账户处于双向持仓模式")
     elif _is_synthetic_neutral_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("单向 synthetic neutral 策略要求账户处于单向持仓模式")
@@ -15633,7 +15659,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
     expected_short_qty = _safe_float(plan_report.get("current_short_qty"))
     expected_actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
-    if strategy_mode == "hedge_neutral":
+    if _uses_exchange_hedge_position_sides(strategy_mode):
         current_long_position = extract_symbol_position(account_info, symbol, "LONG")
         current_short_position = extract_symbol_position(account_info, symbol, "SHORT")
         current_long_qty = max(_position_qty(current_long_position, position_side="LONG"), 0.0)
@@ -15700,7 +15726,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
     elif abs(current_long_qty - expected_long_qty) > 1e-9:
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
-    if strategy_mode == "hedge_neutral" and abs(current_short_qty - expected_short_qty) > 1e-9:
+    if _uses_exchange_hedge_position_sides(strategy_mode) and abs(current_short_qty - expected_short_qty) > 1e-9:
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
 
     validation["actions"] = cap_reduce_only_place_orders_to_position(
@@ -15875,7 +15901,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             side=side,
             role=role,
         )
-        if order.get("force_reduce_only") is not None and strategy_mode != "hedge_neutral":
+        if order.get("force_reduce_only") is not None and not _uses_exchange_hedge_position_sides(strategy_mode):
             reduce_only = bool(order.get("force_reduce_only"))
         last_exc: RuntimeError | None = None
         for attempt in range(args.maker_retries + 1):
@@ -16082,6 +16108,7 @@ def _build_parser() -> argparse.ArgumentParser:
             "competition_inventory_grid",
             "maker_volatility_inventory_v1",
             "best_quote_maker_volume_v1",
+            "hedge_best_quote_maker_volume_v1",
         ),
     )
     parser.add_argument("--step-price", type=float, default=0.00002)
