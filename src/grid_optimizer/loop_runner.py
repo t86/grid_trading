@@ -14012,6 +14012,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 dynamic_control_trend_bias_max=float(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_bias_max", 0.35)
                 ),
+                dynamic_control_trend_entry_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled", False)
+                ),
+                dynamic_control_trend_entry_guard_min_score=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score", 0.75)
+                ),
+                dynamic_control_trend_entry_guard_min_volatility_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_entry_guard_min_volatility_ratio",
+                        0.0,
+                    )
+                ),
+                dynamic_control_trend_entry_guard_conflict_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_entry_guard_conflict_ratio", 0.25)
+                ),
+                dynamic_control_trend_entry_guard_opposite_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_entry_guard_opposite_budget_scale",
+                        0.0,
+                    )
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -16320,6 +16343,23 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-step-scale", type=float, default=2.5)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-return-ratio", type=float, default=0.002)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-bias-max", type=float, default=0.35)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-entry-guard-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-score", type=float, default=0.75)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-volatility-ratio",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-entry-guard-conflict-ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-entry-guard-opposite-budget-scale",
+        type=float,
+        default=0.0,
+    )
     parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
     parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)
@@ -17342,6 +17382,18 @@ def main() -> None:
         or args.best_quote_maker_volume_below_soft_adverse_threshold_scale < 0
     ):
         raise SystemExit("--best-quote-maker-volume below-soft scales must be >= 0")
+    if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score < 0:
+        raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-score must be >= 0")
+    if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_volatility_ratio < 0:
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-volatility-ratio must be >= 0"
+        )
+    if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_conflict_ratio < 0:
+        raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-entry-guard-conflict-ratio must be >= 0")
+    if not (0 <= args.best_quote_maker_volume_dynamic_control_trend_entry_guard_opposite_budget_scale <= 1):
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-entry-guard-opposite-budget-scale must be within [0, 1]"
+        )
     if not (
         args.elastic_loss_per_10k_sprint
         <= args.elastic_loss_per_10k_cruise

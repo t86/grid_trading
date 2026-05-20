@@ -371,6 +371,83 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertGreater(plan["buy_orders"][0]["notional"], plan["sell_orders"][0]["notional"])
         self.assertGreater(plan["metrics"]["dynamic_control"]["trend_score"], 0.0)
 
+    def test_trend_entry_guard_blocks_short_entry_during_strong_uptrend(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                dynamic_control_enabled=True,
+                dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_entry_guard_enabled=True,
+                dynamic_control_trend_entry_guard_min_score=0.75,
+                dynamic_control_trend_entry_guard_min_volatility_ratio=0.003,
+            ),
+            inputs=_inputs(
+                cycle_budget_notional=400.0,
+                market_return_1m=0.001,
+                market_return_5m=0.006,
+                market_amplitude_5m=0.007,
+            ),
+        )
+
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_entry_long"])
+        self.assertEqual(plan["sell_orders"], [])
+        guard = plan["metrics"]["trend_entry_guard"]
+        self.assertTrue(guard["applied"])
+        self.assertTrue(guard["blocked_short_entry"])
+        self.assertEqual(guard["reason"], "strong_uptrend_blocks_short_entry")
+        self.assertIn("trend_entry_guard", plan["reasons"])
+
+    def test_trend_entry_guard_blocks_short_entry_on_rebound_after_pullback(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                dynamic_control_enabled=True,
+                dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_bias_max=0.35,
+                dynamic_control_trend_entry_guard_enabled=True,
+                dynamic_control_trend_entry_guard_min_score=0.75,
+                dynamic_control_trend_entry_guard_min_volatility_ratio=0.003,
+            ),
+            inputs=_inputs(
+                cycle_budget_notional=400.0,
+                market_return_1m=0.001,
+                market_return_5m=-0.006,
+                market_amplitude_5m=0.007,
+            ),
+        )
+
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_entry_long"])
+        self.assertEqual(plan["sell_orders"], [])
+        guard = plan["metrics"]["trend_entry_guard"]
+        self.assertTrue(guard["applied"])
+        self.assertTrue(guard["blocked_short_entry"])
+        self.assertEqual(guard["reason"], "conflicting_rebound_blocks_short_entry")
+
+    def test_trend_entry_guard_does_not_block_reduce_orders(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_short_notional=300.0,
+                inventory_soft_ratio=0.5,
+                dynamic_control_enabled=True,
+                dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_entry_guard_enabled=True,
+                dynamic_control_trend_entry_guard_min_score=0.75,
+            ),
+            inputs=_inputs(
+                position_side_mode="hedge",
+                current_short_qty=0.005,
+                cycle_budget_notional=400.0,
+                market_return_1m=0.001,
+                market_return_5m=0.006,
+                market_amplitude_5m=0.007,
+            ),
+        )
+
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_reduce_short"])
+        self.assertEqual(plan["buy_orders"][0]["position_side"], "SHORT")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+
     def test_dynamic_control_shortens_base_spacing_when_volume_conditions_are_quiet(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

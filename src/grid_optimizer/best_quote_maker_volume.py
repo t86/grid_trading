@@ -50,6 +50,11 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_extreme_volatility_step_scale: float = 2.5
     dynamic_control_trend_return_ratio: float = 0.002
     dynamic_control_trend_bias_max: float = 0.35
+    dynamic_control_trend_entry_guard_enabled: bool = False
+    dynamic_control_trend_entry_guard_min_score: float = 0.75
+    dynamic_control_trend_entry_guard_min_volatility_ratio: float = 0.0
+    dynamic_control_trend_entry_guard_conflict_ratio: float = 0.25
+    dynamic_control_trend_entry_guard_opposite_budget_scale: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -355,6 +360,19 @@ def build_best_quote_maker_volume_plan(
         "base_ladder_spacing": base_ladder_spacing,
         "effective_ladder_spacing": base_ladder_spacing,
     }
+    trend_entry_guard_report = {
+        "enabled": bool(config.dynamic_control_trend_entry_guard_enabled),
+        "applied": False,
+        "reason": None,
+        "blocked_long_entry": False,
+        "blocked_short_entry": False,
+        "long_entry_budget_scale": 1.0,
+        "short_entry_budget_scale": 1.0,
+        "min_score": _safe_float(config.dynamic_control_trend_entry_guard_min_score),
+        "min_volatility_ratio": _safe_float(config.dynamic_control_trend_entry_guard_min_volatility_ratio),
+        "conflict_ratio": _safe_float(config.dynamic_control_trend_entry_guard_conflict_ratio),
+        "opposite_budget_scale": _safe_float(config.dynamic_control_trend_entry_guard_opposite_budget_scale),
+    }
     if config.dynamic_control_enabled and regime != "loss_defensive":
         return_1m = _safe_float(inputs.market_return_1m)
         return_5m = _safe_float(inputs.market_return_5m)
@@ -416,6 +434,73 @@ def build_best_quote_maker_volume_plan(
         if reason != "normal":
             reasons.append(reason)
 
+    if config.dynamic_control_enabled and config.dynamic_control_trend_entry_guard_enabled and not hard_loss:
+        trend_threshold = max(_safe_float(config.dynamic_control_trend_return_ratio), 1e-12)
+        min_score = _clamp(_safe_float(config.dynamic_control_trend_entry_guard_min_score), 0.0, 1.0)
+        min_volatility = max(_safe_float(config.dynamic_control_trend_entry_guard_min_volatility_ratio), 0.0)
+        conflict_ratio = max(_safe_float(config.dynamic_control_trend_entry_guard_conflict_ratio), 0.0)
+        opposite_scale = _clamp(_safe_float(config.dynamic_control_trend_entry_guard_opposite_budget_scale), 0.0, 1.0)
+        trend_score = _clamp(_safe_float(dynamic_control_report.get("trend_score")), -1.0, 1.0)
+        volatility_ratio = max(_safe_float(dynamic_control_report.get("volatility_ratio")), 0.0)
+        return_1m = _safe_float(dynamic_control_report.get("market_return_1m"))
+        return_5m = _safe_float(dynamic_control_report.get("market_return_5m"))
+        volatility_ok = min_volatility <= 0 or volatility_ratio >= min_volatility
+        strong_up = (
+            volatility_ok
+            and trend_score >= min_score
+            and return_5m >= trend_threshold
+            and return_1m >= -trend_threshold * conflict_ratio
+        )
+        strong_down = (
+            volatility_ok
+            and trend_score <= -min_score
+            and return_5m <= -trend_threshold
+            and return_1m <= trend_threshold * conflict_ratio
+        )
+        conflict_rebound = (
+            volatility_ok
+            and return_5m <= -trend_threshold
+            and return_1m >= trend_threshold * conflict_ratio
+        )
+        conflict_pullback = (
+            volatility_ok
+            and return_5m >= trend_threshold
+            and return_1m <= -trend_threshold * conflict_ratio
+        )
+        guard_reason = None
+        if strong_up:
+            guard_reason = "strong_uptrend_blocks_short_entry"
+            trend_entry_guard_report["blocked_short_entry"] = True
+            trend_entry_guard_report["short_entry_budget_scale"] = opposite_scale
+        elif strong_down:
+            guard_reason = "strong_downtrend_blocks_long_entry"
+            trend_entry_guard_report["blocked_long_entry"] = True
+            trend_entry_guard_report["long_entry_budget_scale"] = opposite_scale
+        elif conflict_rebound:
+            guard_reason = "conflicting_rebound_blocks_short_entry"
+            trend_entry_guard_report["blocked_short_entry"] = True
+            trend_entry_guard_report["short_entry_budget_scale"] = opposite_scale
+        elif conflict_pullback:
+            guard_reason = "conflicting_pullback_blocks_long_entry"
+            trend_entry_guard_report["blocked_long_entry"] = True
+            trend_entry_guard_report["long_entry_budget_scale"] = opposite_scale
+        if guard_reason:
+            trend_entry_guard_report.update(
+                {
+                    "applied": True,
+                    "reason": guard_reason,
+                    "min_score": min_score,
+                    "min_volatility_ratio": min_volatility,
+                    "conflict_ratio": conflict_ratio,
+                    "opposite_budget_scale": opposite_scale,
+                }
+            )
+            reasons.append("trend_entry_guard")
+            if trend_entry_guard_report["blocked_long_entry"] and opposite_scale <= 0:
+                allow_entry_long = False
+            if trend_entry_guard_report["blocked_short_entry"] and opposite_scale <= 0:
+                allow_entry_short = False
+
     dynamic_tick_report = {
         "enabled": bool(config.dynamic_tick_enabled),
         "base_offset_ticks": int(offset_ticks),
@@ -454,6 +539,8 @@ def build_best_quote_maker_volume_plan(
         sell_side_notional = cycle_budget * sell_share
         dynamic_control_report["buy_budget_share"] = buy_share
         dynamic_control_report["sell_budget_share"] = sell_share
+    long_entry_budget_scale = _clamp(_safe_float(trend_entry_guard_report["long_entry_budget_scale"]), 0.0, 1.0)
+    short_entry_budget_scale = _clamp(_safe_float(trend_entry_guard_report["short_entry_budget_scale"]), 0.0, 1.0)
 
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
@@ -596,7 +683,7 @@ def build_best_quote_maker_volume_plan(
                     side="SELL",
                     anchor_price=ask,
                     base_gap=same_side_gap,
-                    total_notional=same_side_notional,
+                    total_notional=same_side_notional * short_entry_budget_scale,
                     slots=max_entry_orders_per_side,
                     role="best_quote_entry_short",
                     inputs=inputs,
@@ -621,7 +708,7 @@ def build_best_quote_maker_volume_plan(
                     side="BUY",
                     anchor_price=bid,
                     base_gap=same_side_gap,
-                    total_notional=same_side_notional,
+                    total_notional=same_side_notional * long_entry_budget_scale,
                     slots=max_entry_orders_per_side,
                     role="best_quote_entry_long",
                     inputs=inputs,
@@ -647,7 +734,7 @@ def build_best_quote_maker_volume_plan(
             ),
         )
     elif not inventory_bias_report["applied"] and allow_entry_long:
-        long_entry_notional = buy_side_notional
+        long_entry_notional = buy_side_notional * long_entry_budget_scale
         if long_limit > 0:
             long_entry_notional = min(
                 long_entry_notional,
@@ -687,7 +774,7 @@ def build_best_quote_maker_volume_plan(
                     side="BUY",
                     anchor_price=bid,
                     base_gap=gap,
-                    total_notional=buy_side_notional,
+                    total_notional=buy_side_notional * long_entry_budget_scale,
                     slots=max_entry_orders_per_side,
                     role="best_quote_entry_long",
                     inputs=inputs,
@@ -710,7 +797,7 @@ def build_best_quote_maker_volume_plan(
             ),
         )
     elif allow_entry_short:
-        short_entry_notional = sell_side_notional
+        short_entry_notional = sell_side_notional * short_entry_budget_scale
         if short_limit > 0:
             short_entry_notional = min(
                 short_entry_notional,
@@ -749,7 +836,7 @@ def build_best_quote_maker_volume_plan(
                 side="SELL",
                 anchor_price=ask,
                 base_gap=gap,
-                total_notional=sell_side_notional,
+                total_notional=sell_side_notional * short_entry_budget_scale,
                 slots=max_entry_orders_per_side,
                 role="best_quote_entry_short",
                 inputs=inputs,
@@ -797,6 +884,7 @@ def build_best_quote_maker_volume_plan(
             "sell_side_notional": sell_side_notional,
             "effective_ladder_spacing": _safe_float(inputs.entry_ladder_spacing),
             "dynamic_control": dynamic_control_report,
+            "trend_entry_guard": trend_entry_guard_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,
         },
