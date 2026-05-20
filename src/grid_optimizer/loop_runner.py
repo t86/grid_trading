@@ -15227,6 +15227,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
             sticky_roles={"best_quote_reduce_long", "best_quote_reduce_short"},
+            price_tolerance=max(_safe_float(effective_args.step_price), 0.0),
         )
         _sync_plan_orders_from_desired_orders(plan, desired_orders)
         best_quote_paired_reduce_separation = _separate_paired_best_quote_reduce_orders(

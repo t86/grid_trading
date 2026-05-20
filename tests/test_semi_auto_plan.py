@@ -763,6 +763,38 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(adjusted[0]["price"], 0.6015)
         self.assertAlmostEqual(adjusted[0]["notional"], 31.8795)
 
+    def test_preserve_sticky_exit_orders_releases_best_quote_reduce_outside_tolerance(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.6076",
+                "origQty": "52",
+                "positionSide": "SHORT",
+            }
+        ]
+        desired = [
+            {
+                "side": "BUY",
+                "price": 0.6080,
+                "qty": 52.0,
+                "notional": 31.616,
+                "role": "best_quote_reduce_short",
+                "position_side": "SHORT",
+                "force_reduce_only": True,
+            }
+        ]
+
+        adjusted = preserve_sticky_exit_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            sticky_roles={"best_quote_reduce_short"},
+            price_tolerance=0.00025,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.6080)
+
     def test_build_hedge_micro_grid_plan_builds_both_sides(self) -> None:
         plan = build_hedge_micro_grid_plan(
             center_price=0.05057,
