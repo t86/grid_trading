@@ -347,6 +347,36 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(len(diff["stale_orders"]), 0)
         self.assertEqual(len(diff["missing_orders"]), 0)
 
+    def test_diff_open_orders_replaces_smaller_best_quote_reduce_order(self) -> None:
+        existing = [
+            {
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.60540",
+                "origQty": "13",
+                "orderId": 1,
+                "positionSide": "SHORT",
+            },
+        ]
+        desired = [
+            {
+                "side": "BUY",
+                "price": 0.6054,
+                "qty": 52.0,
+                "notional": 31.4808,
+                "role": "best_quote_reduce_short",
+                "position_side": "SHORT",
+                "force_reduce_only": True,
+            },
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 1)
+        self.assertEqual(len(diff["missing_orders"]), 1)
+        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 52.0, places=8)
+
     def test_diff_open_orders_merges_duplicate_desired_bucket_when_no_existing_order(self) -> None:
         desired = [
             {"side": "SELL", "price": 0.14362, "qty": 74.0, "notional": 10.62788, "level": 1, "role": "take_profit_long"},

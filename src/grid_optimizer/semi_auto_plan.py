@@ -1967,6 +1967,10 @@ def diff_open_orders(
         )
         return _clone_order_with_qty(orders[0], total_qty)
 
+    def _desired_replaces_smaller_existing(orders: list[dict[str, Any]]) -> bool:
+        roles = {str(order.get("role", "")).strip() for order in orders}
+        return bool(roles & {"best_quote_reduce_long", "best_quote_reduce_short"})
+
     desired_by_bucket: dict[str, list[dict[str, Any]]] = {}
     for order in desired_orders:
         key = _order_bucket_key(
@@ -2020,6 +2024,10 @@ def diff_open_orders(
             stale_orders.extend(existing_group)
             continue
         if existing_total < desired_total:
+            if _desired_replaces_smaller_existing(desired_group):
+                stale_orders.extend(existing_group)
+                missing_orders.append(_merged_desired_order(desired_group))
+                continue
             kept_orders.extend(existing_group)
             continue
 
