@@ -29,6 +29,7 @@ class BestQuoteMakerVolumeConfig:
     inventory_bias_enabled: bool = False
     inventory_bias_start_ratio: float = 0.25
     inventory_bias_min_ratio_gap: float = 0.05
+    inventory_bias_min_notional_gap: float = 10.0
     inventory_bias_reduce_share: float = 0.70
     inventory_bias_same_side_extra_ticks: int = 2
     inventory_bias_reduce_extra_ticks: int = -1
@@ -405,16 +406,23 @@ def build_best_quote_maker_volume_plan(
         "same_side_offset_ticks": None,
         "ratio_gap": abs(short_inventory_ratio - long_inventory_ratio),
         "min_ratio_gap": None,
+        "notional_gap": abs(short_notional - long_notional),
+        "min_notional_gap": None,
     }
     bias_start = _clamp(_safe_float(config.inventory_bias_start_ratio), 0.0, 1.0)
     bias_min_ratio_gap = max(_safe_float(config.inventory_bias_min_ratio_gap), 0.0)
+    bias_min_notional_gap = max(_safe_float(config.inventory_bias_min_notional_gap), 0.0)
     inventory_bias_report["min_ratio_gap"] = bias_min_ratio_gap
+    inventory_bias_report["min_notional_gap"] = bias_min_notional_gap
     bias_reduce_share = _clamp(_safe_float(config.inventory_bias_reduce_share), 0.0, 1.0)
     bias_entry_share = max(1.0 - bias_reduce_share, 0.0)
+    short_notional_gap = short_notional - long_notional
+    long_notional_gap = long_notional - short_notional
     can_bias_short = (
         config.inventory_bias_enabled
         and regime == "normal"
         and short_notional > 0
+        and short_notional_gap >= bias_min_notional_gap
         and allow_entry_long
         and allow_entry_short
         and short_soft > 0
@@ -424,6 +432,7 @@ def build_best_quote_maker_volume_plan(
         config.inventory_bias_enabled
         and regime == "normal"
         and long_notional > 0
+        and long_notional_gap >= bias_min_notional_gap
         and allow_entry_long
         and allow_entry_short
         and long_soft > 0
@@ -455,6 +464,7 @@ def build_best_quote_maker_volume_plan(
                 "reduce_offset_ticks": reduce_ticks,
                 "same_side_offset_ticks": same_side_ticks,
                 "min_ratio_gap": bias_min_ratio_gap,
+                "min_notional_gap": bias_min_notional_gap,
             }
         )
         if can_bias_short:

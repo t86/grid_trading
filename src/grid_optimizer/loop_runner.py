@@ -13889,6 +13889,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 inventory_bias_min_ratio_gap=float(
                     getattr(effective_args, "best_quote_maker_volume_inventory_bias_min_ratio_gap", 0.05)
                 ),
+                inventory_bias_min_notional_gap=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_min_notional_gap", 10.0)
+                ),
                 inventory_bias_reduce_share=float(
                     getattr(effective_args, "best_quote_maker_volume_inventory_bias_reduce_share", 0.70)
                 ),
@@ -16215,6 +16218,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-inventory-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-inventory-bias-start-ratio", type=float, default=0.25)
     parser.add_argument("--best-quote-maker-volume-inventory-bias-min-ratio-gap", type=float, default=0.05)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-min-notional-gap", type=float, default=10.0)
     parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-share", type=float, default=0.70)
     parser.add_argument("--best-quote-maker-volume-inventory-bias-same-side-extra-ticks", type=int, default=2)
     parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-extra-ticks", type=int, default=-1)

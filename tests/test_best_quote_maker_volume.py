@@ -413,6 +413,42 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
 
+    def test_hedge_inventory_bias_requires_absolute_notional_gap(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_long_notional=125.0,
+                max_short_notional=125.0,
+                inventory_soft_ratio=0.8,
+                min_cycle_budget_notional=6.0,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=0.7,
+                inventory_bias_min_ratio_gap=0.05,
+                inventory_bias_min_notional_gap=10.0,
+            ),
+            inputs=_inputs(
+                bid_price=1.0,
+                ask_price=1.01,
+                mid_price=1.005,
+                cycle_budget_notional=14.0,
+                tick_size=0.01,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+                current_long_qty=70.0,
+                current_short_qty=78.0,
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "normal")
+        self.assertFalse(plan["metrics"]["inventory_bias"]["applied"])
+        self.assertGreaterEqual(plan["metrics"]["inventory_bias"]["ratio_gap"], 0.05)
+        self.assertLess(plan["metrics"]["inventory_bias"]["notional_gap"], 10.0)
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+
 
 if __name__ == "__main__":
     unittest.main()
