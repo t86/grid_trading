@@ -143,6 +143,36 @@ class StrategyDiagnosticsTests(unittest.TestCase):
         self.assertIn("unknown_params", keys)
         self.assertIn("required_position_mode", keys)
 
+    def test_profile_boundary_shows_overlay_details(self) -> None:
+        report = build_strategy_diagnostics(
+            config={"required_position_mode": "one_way"},
+            startup_preflight={
+                "can_start": True,
+                "status": "warning",
+                "profile_boundary": {
+                    "profile_key": "aigensynusdt_best_quote_maker_volume_v1",
+                    "overlay_known": True,
+                    "status": "blocked",
+                    "active_allowed_params": ["per_order_notional", "elastic_volume_enabled"],
+                    "active_global_safety_params": ["max_new_orders", "max_total_notional"],
+                    "forbidden_active_params": ["hard_loss_forced_reduce_enabled"],
+                    "required_missing_params": ["per_order_notional"],
+                    "ignored_params": ["synthetic_flow_sleeve_enabled"],
+                    "unknown_params": [],
+                },
+            },
+        )
+
+        keys = _item_keys(report, "profile_boundary")
+        self.assertIn("profile_overlay", keys)
+        self.assertIn("active_allowed_params", keys)
+        self.assertIn("active_global_safety_params", keys)
+        self.assertIn("forbidden_active_params", keys)
+        self.assertIn("required_missing_params", keys)
+        self.assertIn("ignored_params", keys)
+        self.assertEqual(_item(report, "profile_boundary", "required_missing_params")["severity"], "blocker")
+        self.assertEqual(_item(report, "profile_boundary", "forbidden_active_params")["severity"], "warning")
+
     def test_plan_report_no_submit_reason_classifies_blocked_mode(self) -> None:
         report = build_strategy_diagnostics(
             config={},

@@ -4490,12 +4490,23 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["startup_preflight"]["can_start"])
         self.assertEqual(payload["startup_preflight"]["status"], "blocked")
         self.assertIn("global_safety_blocking_params", payload["startup_preflight"]["blocker_codes"])
+        self.assertIn("strategy_profile_schema", payload)
+        self.assertIn("profile_boundary", payload["strategy_profile_schema"])
+        self.assertTrue(payload["strategy_profile_schema"]["profile_boundary"]["overlay_known"])
+        self.assertEqual(
+            payload["strategy_profile_schema"]["profile_boundary"]["profile_key"],
+            "aigensynusdt_best_quote_maker_volume_v1",
+        )
         self.assertIn("strategy_diagnostics", payload)
         self.assertEqual(payload["strategy_diagnostics"]["status"], "blocked")
         self.assertEqual(payload["strategy_diagnostics"]["mode"], "volume")
         self.assertGreaterEqual(payload["strategy_diagnostics"]["issue_count"], 1)
         self.assertIn(
             "execution_caps",
+            {section["key"] for section in payload["strategy_diagnostics"]["sections"]},
+        )
+        self.assertIn(
+            "profile_boundary",
             {section["key"] for section in payload["strategy_diagnostics"]["sections"]},
         )
         self.assertIn(

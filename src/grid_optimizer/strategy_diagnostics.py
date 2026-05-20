@@ -806,9 +806,119 @@ def _state_section(
 
 def _profile_boundary_section(startup: Mapping[str, Any], config: Mapping[str, Any]) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
-    ignored_params = _string_list(startup.get("ignored_params"))
-    unknown_params = _string_list(startup.get("unknown_params"))
+    boundary_raw = startup.get("profile_boundary")
+    boundary = dict(boundary_raw) if isinstance(boundary_raw, Mapping) else {}
+    ignored_params = _string_list(boundary.get("ignored_params")) or _string_list(startup.get("ignored_params"))
+    unknown_params = _string_list(boundary.get("unknown_params")) or _string_list(startup.get("unknown_params"))
     required_mode = str(startup.get("required_position_mode") or config.get("required_position_mode") or "").strip()
+
+    if boundary:
+        profile_key = str(boundary.get("profile_key") or config.get("strategy_profile") or "").strip()
+        overlay_known = bool(boundary.get("overlay_known"))
+        boundary_status = str(boundary.get("status") or "unknown").strip().lower()
+        overlay_severity = "info" if overlay_known and boundary_status in ("ready", "info", "ok") else "warning"
+        if boundary_status == "blocked":
+            overlay_severity = "warning"
+        items.append(
+            _diagnostic_item(
+                key="profile_overlay",
+                severity=overlay_severity,
+                category="outside_profile" if not overlay_known else "inventory_distance",
+                current_value={
+                    "profile": profile_key,
+                    "overlay_known": overlay_known,
+                    "status": boundary_status,
+                },
+                expected_value=True,
+                active=not overlay_known or boundary_status != "ready",
+                title="profile 级参数边界",
+                why=(
+                    f"{profile_key or '当前 profile'} 已匹配 profile-level overlay，边界状态为 {boundary_status}。"
+                    if overlay_known
+                    else f"{profile_key or '当前 profile'} 还没有 profile-level overlay，诊断退回 family schema。"
+                ),
+                impact=(
+                    "profile overlay 能把策略自有参数、全局安全阀、禁止参数分开显示。"
+                    if overlay_known
+                    else "未知 overlay 时只能按策略族做 best-effort 判断，旧参数混入风险更高。"
+                ),
+                suggestion="优先为常跑 profile 补齐 overlay，再逐步打开更严格的保存或启动校验。",
+                tradeoff="维护 overlay 需要同步新增参数，但能显著降低跨策略参数误生效。",
+                related_params=["strategy_profile"],
+            )
+        )
+
+        active_allowed_params = _string_list(boundary.get("active_allowed_params"))
+        if active_allowed_params:
+            items.append(
+                _diagnostic_item(
+                    key="active_allowed_params",
+                    severity="info",
+                    category="inventory_distance",
+                    current_value=active_allowed_params,
+                    active=True,
+                    title="当前活跃的策略自有参数",
+                    why=f"这些参数在当前 profile overlay 内被允许且当前有有效值: {', '.join(active_allowed_params)}。",
+                    impact="它们是当前策略最可能真实影响挂单、档位、金额和状态机的参数。",
+                    suggestion="调参时优先围绕这些参数复盘，不要把全局安全阀误当成策略逻辑。",
+                    tradeoff="只看活跃参数会隐藏未启用的可选能力；需要完整白名单时查看 schema report。",
+                    related_params=active_allowed_params,
+                )
+            )
+
+        active_global_safety_params = _string_list(boundary.get("active_global_safety_params"))
+        if active_global_safety_params:
+            items.append(
+                _diagnostic_item(
+                    key="active_global_safety_params",
+                    severity="info",
+                    category="limits_volume",
+                    current_value=active_global_safety_params,
+                    active=True,
+                    title="当前活跃的全局安全阀",
+                    why=f"这些参数属于执行层或全局安全阀: {', '.join(active_global_safety_params)}。",
+                    impact="它们不属于单个策略，但可能让策略少下单、停止、冷却或被容量上限截断。",
+                    suggestion="冲量前确认这些阈值覆盖单轮容量和小时目标，尤其是 20万/50万 目标。",
+                    tradeoff="调高安全阀能提升冲量连续性，也会放大敞口、损耗和停机阈值风险。",
+                    related_params=active_global_safety_params,
+                )
+            )
+
+        forbidden_active_params = _string_list(boundary.get("forbidden_active_params"))
+        if forbidden_active_params:
+            items.append(
+                _diagnostic_item(
+                    key="forbidden_active_params",
+                    severity="warning",
+                    category="outside_profile",
+                    current_value=forbidden_active_params,
+                    active=True,
+                    title="profile 明确禁止但正在活跃的参数",
+                    why=f"这些参数不应在当前 profile 中生效: {', '.join(forbidden_active_params)}。",
+                    impact="它们可能来自其他策略，容易造成未到阈值却修仓、强减、少下单或方向偏移。",
+                    suggestion="确认是否属于旧配置残留；不需要时从当前 profile 配置移除。",
+                    tradeoff="移除后当前 profile 更干净，但切换到其他策略时需要重新载入对应 profile。",
+                    related_params=forbidden_active_params,
+                )
+            )
+
+        required_missing_params = _string_list(boundary.get("required_missing_params"))
+        if required_missing_params:
+            items.append(
+                _diagnostic_item(
+                    key="required_missing_params",
+                    severity="blocker",
+                    category="blocks_start",
+                    current_value=required_missing_params,
+                    active=True,
+                    title="profile 必需参数缺失或为空",
+                    why=f"当前 profile 缺少这些必需参数: {', '.join(required_missing_params)}。",
+                    impact="虽然当前版本只报告不改变启动行为，但这些参数缺失时很难判断是否会正常挂单。",
+                    suggestion="补齐这些参数，再检查 execution caps 和刷量目标可行性。",
+                    tradeoff="必需参数越明确，profile 越干净，但新增策略时需要同步维护 schema。",
+                    related_params=required_missing_params,
+                )
+            )
 
     if ignored_params:
         items.append(

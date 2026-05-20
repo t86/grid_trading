@@ -32486,6 +32486,7 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
         "latest_loop": latest_loop,
         "safety_preflight": safety_preflight,
         "startup_preflight": startup_preflight,
+        "strategy_profile_schema": schema_report,
         "strategy_diagnostics": strategy_diagnostics,
         "paths": {
             "summary_jsonl": str(summary_path),

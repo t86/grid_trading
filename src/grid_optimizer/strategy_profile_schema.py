@@ -15,6 +15,17 @@ class StrategyProfileSchema:
     required_position_mode_defaulted: bool = False
 
 
+@dataclass(frozen=True)
+class ProfileBoundaryOverlay:
+    key: str
+    label: str
+    allowed_params: frozenset[str]
+    forbidden_params: frozenset[str]
+    required_params: frozenset[str]
+    global_safety_params: frozenset[str]
+    runtime_switches: frozenset[str]
+
+
 ONE_WAY_POSITION_MODE = "one_way"
 HEDGE_POSITION_MODE = "hedge"
 VALID_POSITION_MODES = frozenset({ONE_WAY_POSITION_MODE, HEDGE_POSITION_MODE})
@@ -444,6 +455,35 @@ ONE_WAY_LONG_RUNTIME_SWITCHES = frozenset(
 )
 ONE_WAY_LONG_ALLOWED_PARAMS = COMMON_RUNNER_PARAMS | BEST_QUOTE_CORE_PARAMS | ONE_WAY_LONG_RUNTIME_SWITCHES | ELASTIC_PARAMS | RISK_REPAIR_PARAMS
 
+COMPETITION_INVENTORY_GRID_RUNTIME_SWITCHES = frozenset[str]()
+COMPETITION_INVENTORY_GRID_ALLOWED_PARAMS = COMMON_RUNNER_PARAMS | frozenset(
+    {
+        "step_price",
+        "buy_levels",
+        "sell_levels",
+        "per_order_notional",
+        "first_order_multiplier",
+        "startup_entry_multiplier",
+        "base_position_notional",
+        "flat_start_enabled",
+        "warm_start_enabled",
+        "max_order_position_notional",
+        "threshold_position_notional",
+        "max_position_notional",
+        "pause_buy_position_notional",
+        "take_profit_min_profit_ratio",
+        "up_trigger_steps",
+        "down_trigger_steps",
+        "shift_steps",
+        "center_price",
+        "fixed_center_enabled",
+        "fixed_center_roll_enabled",
+        "fixed_center_roll_trigger_steps",
+        "fixed_center_roll_confirm_cycles",
+        "fixed_center_roll_shift_steps",
+    }
+)
+
 
 GLOBAL_SAFETY_PARAM_INFO: dict[str, dict[str, str]] = {
     "max_new_orders": {
@@ -494,6 +534,155 @@ GLOBAL_SAFETY_PARAM_INFO: dict[str, dict[str, str]] = {
         "effect": "中心偏离达到阈值后才允许库存再平衡。",
         "strategy_boundary": "修仓 guard，非白名单不应跨策略生效。",
     },
+}
+
+PROFILE_GLOBAL_SAFETY_PARAMS = frozenset(
+    {
+        "max_new_orders",
+        "max_total_notional",
+        "cancel_stale",
+        "max_mid_drift_steps",
+        "rolling_hourly_loss_limit",
+        "max_cumulative_notional",
+        "max_actual_net_notional",
+        "max_synthetic_drift_notional",
+    }
+)
+
+BEST_QUOTE_REQUIRED_PARAMS = frozenset(
+    {
+        "strategy_profile",
+        "strategy_mode",
+        "required_position_mode",
+        "buy_levels",
+        "sell_levels",
+        "per_order_notional",
+        "max_new_orders",
+        "max_total_notional",
+        "cancel_stale",
+    }
+)
+COMPETITION_INVENTORY_GRID_REQUIRED_PARAMS = frozenset(
+    {
+        "strategy_profile",
+        "strategy_mode",
+        "required_position_mode",
+        "per_order_notional",
+        "first_order_multiplier",
+        "threshold_position_notional",
+        "max_order_position_notional",
+        "max_position_notional",
+        "max_new_orders",
+    }
+)
+
+ONE_WAY_FORBIDDEN_PARAMS = frozenset(
+    {
+        "pause_short_position_notional",
+        "max_short_position_notional",
+        "auto_regime_enabled",
+        "market_bias_enabled",
+        "market_bias_regime_switch_enabled",
+        "multi_timeframe_bias_enabled",
+        "synthetic_flow_sleeve_enabled",
+        "synthetic_trend_follow_enabled",
+        "volume_long_v4_flow_sleeve_enabled",
+        "custom_grid_enabled",
+        "hard_loss_forced_reduce_enabled",
+        "adverse_reduce_enabled",
+        "exposure_escalation_enabled",
+        "excess_inventory_reduce_only_enabled",
+        "adaptive_step_enabled",
+    }
+)
+HEDGE_BQ_FORBIDDEN_PARAMS = frozenset(
+    {
+        "auto_regime_enabled",
+        "volume_long_v4_flow_sleeve_enabled",
+        "custom_grid_enabled",
+        "hard_loss_forced_reduce_enabled",
+        "adverse_reduce_enabled",
+        "exposure_escalation_enabled",
+        "excess_inventory_reduce_only_enabled",
+        "adaptive_step_enabled",
+    }
+)
+SYNTHETIC_PING_PONG_FORBIDDEN_PARAMS = frozenset(
+    {
+        "auto_regime_enabled",
+        "volume_long_v4_flow_sleeve_enabled",
+        "custom_grid_enabled",
+        "excess_inventory_reduce_only_enabled",
+        "adaptive_step_enabled",
+    }
+)
+COMPETITION_INVENTORY_GRID_FORBIDDEN_PARAMS = frozenset(
+    {
+        "pause_short_position_notional",
+        "max_short_position_notional",
+        "auto_regime_enabled",
+        "market_bias_enabled",
+        "market_bias_regime_switch_enabled",
+        "multi_timeframe_bias_enabled",
+        "synthetic_flow_sleeve_enabled",
+        "synthetic_trend_follow_enabled",
+        "volume_long_v4_flow_sleeve_enabled",
+        "custom_grid_enabled",
+        "elastic_volume_enabled",
+        "hard_loss_forced_reduce_enabled",
+        "adverse_reduce_enabled",
+        "exposure_escalation_enabled",
+        "excess_inventory_reduce_only_enabled",
+        "adaptive_step_enabled",
+    }
+)
+
+PROFILE_BOUNDARY_OVERLAYS: dict[str, ProfileBoundaryOverlay] = {
+    "aigensynusdt_best_quote_maker_volume_v1": ProfileBoundaryOverlay(
+        key="aigensynusdt_best_quote_maker_volume_v1",
+        label="AIGENSYNUSDT Best Quote 冲量",
+        allowed_params=frozenset(BEST_QUOTE_ALLOWED_PARAMS - {"pause_short_position_notional", "max_short_position_notional"}),
+        forbidden_params=ONE_WAY_FORBIDDEN_PARAMS,
+        required_params=BEST_QUOTE_REQUIRED_PARAMS,
+        global_safety_params=PROFILE_GLOBAL_SAFETY_PARAMS,
+        runtime_switches=BEST_QUOTE_RUNTIME_SWITCHES,
+    ),
+    "aigensynusdt_hedge_bq_pingpong_sprint_v1": ProfileBoundaryOverlay(
+        key="aigensynusdt_hedge_bq_pingpong_sprint_v1",
+        label="AIGENSYNUSDT Hedge BQ 冲量",
+        allowed_params=frozenset(HEDGE_BQ_PING_PONG_ALLOWED_PARAMS),
+        forbidden_params=HEDGE_BQ_FORBIDDEN_PARAMS,
+        required_params=BEST_QUOTE_REQUIRED_PARAMS,
+        global_safety_params=PROFILE_GLOBAL_SAFETY_PARAMS,
+        runtime_switches=HEDGE_BQ_PING_PONG_RUNTIME_SWITCHES,
+    ),
+    "volume_long_v4": ProfileBoundaryOverlay(
+        key="volume_long_v4",
+        label="量优先做多 v4",
+        allowed_params=frozenset(ONE_WAY_LONG_ALLOWED_PARAMS - {"pause_short_position_notional", "max_short_position_notional"}),
+        forbidden_params=ONE_WAY_FORBIDDEN_PARAMS,
+        required_params=BEST_QUOTE_REQUIRED_PARAMS,
+        global_safety_params=PROFILE_GLOBAL_SAFETY_PARAMS,
+        runtime_switches=ONE_WAY_LONG_RUNTIME_SWITCHES,
+    ),
+    "volume_neutral_ping_pong_v1": ProfileBoundaryOverlay(
+        key="volume_neutral_ping_pong_v1",
+        label="量优先中性 v1",
+        allowed_params=frozenset(SYNTHETIC_PING_PONG_ALLOWED_PARAMS),
+        forbidden_params=SYNTHETIC_PING_PONG_FORBIDDEN_PARAMS,
+        required_params=BEST_QUOTE_REQUIRED_PARAMS,
+        global_safety_params=PROFILE_GLOBAL_SAFETY_PARAMS,
+        runtime_switches=SYNTHETIC_PING_PONG_RUNTIME_SWITCHES,
+    ),
+    "competition_inventory_grid_v1": ProfileBoundaryOverlay(
+        key="competition_inventory_grid_v1",
+        label="合约竞赛库存网格",
+        allowed_params=frozenset(COMPETITION_INVENTORY_GRID_ALLOWED_PARAMS),
+        forbidden_params=COMPETITION_INVENTORY_GRID_FORBIDDEN_PARAMS,
+        required_params=COMPETITION_INVENTORY_GRID_REQUIRED_PARAMS,
+        global_safety_params=PROFILE_GLOBAL_SAFETY_PARAMS,
+        runtime_switches=COMPETITION_INVENTORY_GRID_RUNTIME_SWITCHES,
+    ),
 }
 
 
@@ -724,12 +913,16 @@ def build_startup_preflight(
     ignored_params: list[str],
     unknown_params: list[str],
     global_safety_preflight: dict[str, Any],
+    profile_boundary: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     blocking_params = sorted(set(global_safety_preflight.get("blocking_params") or []))
     limiting_params = sorted(set(global_safety_preflight.get("limiting_params") or []))
     warning_params = sorted(set(global_safety_preflight.get("warning_params") or []))
     stop_guard_params = sorted(set(global_safety_preflight.get("stop_guard_params") or []))
     takeover_params = sorted(set(global_safety_preflight.get("takeover_params") or []))
+    boundary = dict(profile_boundary or {})
+    forbidden_active_params = sorted(set(boundary.get("forbidden_active_params") or []))
+    required_missing_params = sorted(set(boundary.get("required_missing_params") or []))
     blocker_codes: list[str] = []
     warning_codes: list[str] = []
     messages: list[str] = []
@@ -750,6 +943,15 @@ def build_startup_preflight(
     if ignored_params:
         warning_codes.append("ignored_params")
         messages.append("存在会被严格 schema 忽略的旧参数；它们不会生效。")
+    if boundary and not bool(boundary.get("overlay_known")):
+        warning_codes.append("profile_overlay_unknown")
+        messages.append("当前策略没有 profile-level overlay，诊断退回 family schema。")
+    if forbidden_active_params:
+        warning_codes.append("profile_forbidden_active_params")
+        messages.append("profile overlay 发现显式禁止参数处于 active 状态；当前版本只报告不阻止启动。")
+    if required_missing_params:
+        warning_codes.append("profile_required_missing_params")
+        messages.append("profile overlay 发现必需参数缺失或为空；当前版本只报告不阻止启动。")
     if limiting_params:
         warning_codes.append("global_safety_limiting_params")
         messages.append("全局执行安全阀会限制单轮挂单数量或名义金额。")
@@ -779,6 +981,9 @@ def build_startup_preflight(
         "required_position_mode_defaulted": bool(required_position_mode_defaulted),
         "ignored_params": sorted(set(ignored_params)),
         "unknown_params": sorted(set(unknown_params)),
+        "profile_boundary": boundary,
+        "forbidden_active_params": forbidden_active_params,
+        "required_missing_params": required_missing_params,
         "blocking_params": blocking_params,
         "limiting_params": limiting_params,
         "warning_params": warning_params,
@@ -812,6 +1017,132 @@ def _is_active_unknown_value(value: Any) -> bool:
     if isinstance(value, (list, tuple, set, dict)):
         return len(value) > 0
     return True
+
+
+def _profile_key(strategy_profile: str) -> str:
+    return str(strategy_profile or "").strip().lower()
+
+
+def _is_boundary_active_value(key: str, value: Any) -> bool:
+    if key == "cancel_stale" and isinstance(value, bool):
+        return True
+    return _is_active_unknown_value(value)
+
+
+def _module_switch_for_param(key: str) -> str:
+    if key.startswith("elastic_") and key != "elastic_volume_enabled":
+        return "elastic_volume_enabled"
+    if key.startswith("hard_loss_forced_reduce_") and key != "hard_loss_forced_reduce_enabled":
+        return "hard_loss_forced_reduce_enabled"
+    if key.startswith("adverse_reduce_") and key != "adverse_reduce_enabled":
+        return "adverse_reduce_enabled"
+    if key.startswith("exposure_escalation_") and key != "exposure_escalation_enabled":
+        return "exposure_escalation_enabled"
+    if key.startswith("synthetic_flow_sleeve_") and key != "synthetic_flow_sleeve_enabled":
+        return "synthetic_flow_sleeve_enabled"
+    if key.startswith("synthetic_trend_follow_") and key != "synthetic_trend_follow_enabled":
+        return "synthetic_trend_follow_enabled"
+    if key.startswith("market_bias_") and key not in {"market_bias_enabled", "market_bias_regime_switch_enabled"}:
+        return "market_bias_enabled"
+    if key.startswith("custom_grid_") and key != "custom_grid_enabled":
+        return "custom_grid_enabled"
+    if key.startswith("volume_long_v4_flow_sleeve_") and key != "volume_long_v4_flow_sleeve_enabled":
+        return "volume_long_v4_flow_sleeve_enabled"
+    return ""
+
+
+def _is_boundary_active_param(args: argparse.Namespace, key: str) -> bool:
+    if not hasattr(args, key):
+        return False
+    value = getattr(args, key)
+    if key in PARAMETER_NEUTRAL_DEFAULTS and _values_equal(value, PARAMETER_NEUTRAL_DEFAULTS[key]):
+        return False
+    switch_key = _module_switch_for_param(key)
+    if switch_key and not _safe_bool(getattr(args, switch_key, False)):
+        return False
+    return _is_boundary_active_value(key, value)
+
+
+def _required_param_missing(args: argparse.Namespace, key: str) -> bool:
+    if not hasattr(args, key):
+        return True
+    value = getattr(args, key)
+    if isinstance(value, bool):
+        return False
+    return not _is_active_unknown_value(value)
+
+
+def build_profile_boundary_report(
+    *,
+    args: argparse.Namespace,
+    schema: StrategyProfileSchema,
+    strategy_profile: str,
+    strict_enabled: bool,
+    strict_ok: bool,
+    ignored_params: list[str],
+    unknown_params: list[str],
+) -> dict[str, Any]:
+    profile_key = _profile_key(strategy_profile)
+    overlay = PROFILE_BOUNDARY_OVERLAYS.get(profile_key)
+    overlay_known = overlay is not None
+    allowed_params = frozenset(overlay.allowed_params if overlay else schema.allowed_params)
+    forbidden_params = frozenset(overlay.forbidden_params if overlay else frozenset())
+    required_params = frozenset(overlay.required_params if overlay else frozenset())
+    global_safety_params = frozenset(overlay.global_safety_params if overlay else PROFILE_GLOBAL_SAFETY_PARAMS)
+
+    active_allowed_params = sorted(
+        key
+        for key in allowed_params - global_safety_params - COMMON_RUNNER_PARAMS
+        if _is_boundary_active_param(args, key)
+    )
+    active_global_safety_params = sorted(
+        key
+        for key in global_safety_params
+        if hasattr(args, key) and _is_boundary_active_value(key, getattr(args, key))
+    )
+    forbidden_active_params = sorted(
+        key
+        for key in forbidden_params
+        if hasattr(args, key) and _is_boundary_active_value(key, getattr(args, key))
+    )
+    required_missing_params = sorted(key for key in required_params if _required_param_missing(args, key))
+
+    messages: list[str] = []
+    if not overlay_known:
+        messages.append("当前 profile 还没有 profile-level overlay，诊断退回 family schema。")
+    if required_missing_params:
+        messages.append("profile overlay 发现必需参数缺失或为空；v1 只报告，不阻止启动。")
+    if forbidden_active_params:
+        messages.append("profile overlay 发现显式禁止参数正在活跃；v1 只报告，不改变执行。")
+    if ignored_params:
+        messages.append("family schema 已把部分跨策略参数归零或忽略。")
+    if unknown_params:
+        messages.append("存在 family schema 不认识的 active 参数。")
+
+    if (strict_enabled and not strict_ok and unknown_params) or required_missing_params:
+        status = "blocked"
+    elif forbidden_active_params or ignored_params or unknown_params or not overlay_known or schema.required_position_mode_defaulted:
+        status = "warning"
+    else:
+        status = "ready"
+
+    return {
+        "profile_key": profile_key,
+        "overlay_known": overlay_known,
+        "overlay_label": overlay.label if overlay else "",
+        "status": status,
+        "allowed_params": sorted(allowed_params),
+        "active_allowed_params": active_allowed_params,
+        "global_safety_params": sorted(global_safety_params),
+        "active_global_safety_params": active_global_safety_params,
+        "forbidden_params": sorted(forbidden_params),
+        "forbidden_active_params": forbidden_active_params,
+        "required_params": sorted(required_params),
+        "required_missing_params": required_missing_params,
+        "ignored_params": sorted(set(ignored_params)),
+        "unknown_params": sorted(set(unknown_params)),
+        "messages": messages,
+    }
 
 
 def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str) -> StrategyProfileSchema:
@@ -856,6 +1187,15 @@ def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str
             allowed_params=frozenset(SYNTHETIC_PING_PONG_ALLOWED_PARAMS),
         )
 
+    if mode == "competition_inventory_grid" or profile_lower == "competition_inventory_grid_v1":
+        return StrategyProfileSchema(
+            family="competition_inventory_grid",
+            intent="volume",
+            required_position_mode=ONE_WAY_POSITION_MODE,
+            allowed_runtime_switches=COMPETITION_INVENTORY_GRID_RUNTIME_SWITCHES,
+            allowed_params=frozenset(COMPETITION_INVENTORY_GRID_ALLOWED_PARAMS),
+        )
+
     if mode == "one_way_long":
         return StrategyProfileSchema(
             family="one_way_long",
@@ -884,6 +1224,7 @@ def apply_strategy_profile_schema(
     strategy_mode = str(getattr(args, "strategy_mode", "") or "").strip()
     strategy_profile = str(getattr(args, "strategy_profile", "") or "").strip()
     schema = resolve_strategy_profile_schema(strategy_mode=strategy_mode, strategy_profile=strategy_profile)
+    overlay = PROFILE_BOUNDARY_OVERLAYS.get(_profile_key(strategy_profile))
     ignored_params: list[str] = []
     unknown_params: list[str] = []
 
@@ -895,7 +1236,10 @@ def apply_strategy_profile_schema(
             if not _values_equal(current_value, default_value):
                 ignored_params.append(key)
             setattr(effective, key, default_value)
-        known_params = schema.allowed_params | frozenset(PARAMETER_NEUTRAL_DEFAULTS)
+        overlay_known_params = (
+            overlay.allowed_params | overlay.forbidden_params if overlay else frozenset()
+        )
+        known_params = schema.allowed_params | frozenset(PARAMETER_NEUTRAL_DEFAULTS) | overlay_known_params
         for key, value in vars(args).items():
             if key.startswith("_") or key in known_params:
                 continue
@@ -908,6 +1252,15 @@ def apply_strategy_profile_schema(
     ignored_params_sorted = sorted(ignored_params)
     unknown_params_sorted = sorted(unknown_params)
     global_safety_preflight = build_global_safety_preflight(effective)
+    profile_boundary = build_profile_boundary_report(
+        args=args,
+        schema=schema,
+        strategy_profile=strategy_profile,
+        strict_enabled=strict_enabled,
+        strict_ok=strict_ok,
+        ignored_params=ignored_params_sorted,
+        unknown_params=unknown_params_sorted,
+    )
     startup_preflight = build_startup_preflight(
         strict_enabled=strict_enabled,
         strict_ok=strict_ok,
@@ -917,6 +1270,7 @@ def apply_strategy_profile_schema(
         ignored_params=ignored_params_sorted,
         unknown_params=unknown_params_sorted,
         global_safety_preflight=global_safety_preflight,
+        profile_boundary=profile_boundary,
     )
 
     report = {
@@ -932,8 +1286,14 @@ def apply_strategy_profile_schema(
         "required_position_mode_defaulted": schema.required_position_mode_defaulted,
         "allowed_runtime_switches": sorted(schema.allowed_runtime_switches),
         "allowed_params": sorted(schema.allowed_params),
+        "active_allowed_params": profile_boundary["active_allowed_params"],
+        "forbidden_params": profile_boundary["forbidden_params"],
+        "forbidden_active_params": profile_boundary["forbidden_active_params"],
+        "required_missing_params": profile_boundary["required_missing_params"],
+        "boundary_status": profile_boundary["status"],
         "ignored_params": ignored_params_sorted,
         "unknown_params": unknown_params_sorted,
+        "profile_boundary": profile_boundary,
         "global_safety_preflight": global_safety_preflight,
         "startup_preflight": startup_preflight,
     }

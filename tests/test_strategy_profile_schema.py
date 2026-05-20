@@ -256,6 +256,196 @@ class StrategyProfileSchemaTests(unittest.TestCase):
         self.assertIn("hard_loss_forced_reduce_enabled", report["ignored_params"])
         self.assertIn("excess_inventory_reduce_only_enabled", report["ignored_params"])
 
+    def test_aigensyn_best_quote_profile_boundary_reports_active_allowed_and_global_safety_params(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="one_way_long",
+                strategy_profile="aigensynusdt_best_quote_maker_volume_v1",
+                required_position_mode="one_way",
+                buy_levels=1,
+                sell_levels=1,
+                per_order_notional=750.0,
+                pause_short_position_notional=None,
+                max_short_position_notional=None,
+                max_new_orders=8,
+                max_total_notional=3_000.0,
+                cancel_stale=True,
+                auto_regime_enabled=False,
+                elastic_volume_enabled=True,
+                market_bias_regime_switch_enabled=False,
+                market_bias_enabled=False,
+                multi_timeframe_bias_enabled=False,
+                synthetic_flow_sleeve_enabled=False,
+                synthetic_flow_sleeve_notional=0.0,
+                synthetic_flow_sleeve_levels=0,
+                synthetic_residual_long_flat_notional=None,
+                synthetic_trend_follow_enabled=False,
+                volume_long_v4_flow_sleeve_enabled=False,
+                volume_long_v4_soft_loss_steps=0.5,
+                custom_grid_enabled=False,
+                custom_grid_n=None,
+                hard_loss_forced_reduce_enabled=False,
+                adverse_reduce_enabled=False,
+                excess_inventory_reduce_only_enabled=False,
+                exposure_escalation_enabled=False,
+                static_buy_offset_steps=0.0,
+                static_sell_offset_steps=0.0,
+                market_bias_max_shift_steps=0.75,
+            ),
+            enabled=True,
+        )
+
+        boundary = report["profile_boundary"]
+        self.assertTrue(boundary["overlay_known"])
+        self.assertEqual(boundary["profile_key"], "aigensynusdt_best_quote_maker_volume_v1")
+        self.assertEqual(boundary["status"], "ready")
+        self.assertIn("per_order_notional", boundary["allowed_params"])
+        self.assertIn("per_order_notional", boundary["active_allowed_params"])
+        self.assertIn("elastic_volume_enabled", boundary["active_allowed_params"])
+        self.assertIn("max_new_orders", boundary["global_safety_params"])
+        self.assertIn("max_total_notional", boundary["active_global_safety_params"])
+        self.assertIn("cancel_stale", boundary["active_global_safety_params"])
+        self.assertEqual(boundary["forbidden_active_params"], [])
+        self.assertEqual(boundary["required_missing_params"], [])
+
+    def test_profile_boundary_reports_forbidden_active_params_without_changing_effective_args(self) -> None:
+        effective, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="hedge_neutral",
+                strategy_profile="aigensynusdt_hedge_bq_pingpong_sprint_v1",
+                required_position_mode="hedge",
+                hard_loss_forced_reduce_enabled=True,
+                adverse_reduce_enabled=True,
+                max_total_notional=3_000.0,
+            ),
+            enabled=True,
+        )
+
+        boundary = report["profile_boundary"]
+        self.assertTrue(boundary["overlay_known"])
+        self.assertEqual(boundary["status"], "warning")
+        self.assertIn("hard_loss_forced_reduce_enabled", boundary["forbidden_active_params"])
+        self.assertIn("adverse_reduce_enabled", boundary["forbidden_active_params"])
+        self.assertTrue(effective.hard_loss_forced_reduce_enabled)
+        self.assertTrue(effective.adverse_reduce_enabled)
+        self.assertTrue(report["startup_preflight"]["can_start"])
+        self.assertIn("profile_forbidden_active_params", report["startup_preflight"]["warning_codes"])
+
+    def test_profile_boundary_reports_required_missing_params(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="one_way_long",
+                strategy_profile="aigensynusdt_best_quote_maker_volume_v1",
+                required_position_mode="one_way",
+                per_order_notional=0.0,
+                max_total_notional=3_000.0,
+            ),
+            enabled=True,
+        )
+
+        boundary = report["profile_boundary"]
+        self.assertEqual(boundary["status"], "blocked")
+        self.assertIn("per_order_notional", boundary["required_missing_params"])
+        self.assertTrue(report["startup_preflight"]["can_start"])
+        self.assertIn("profile_required_missing_params", report["startup_preflight"]["warning_codes"])
+
+    def test_competition_inventory_grid_profile_has_known_overlay(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="competition_inventory_grid",
+                strategy_profile="competition_inventory_grid_v1",
+                required_position_mode="one_way",
+                buy_levels=0,
+                sell_levels=0,
+                first_order_multiplier=4.0,
+                threshold_position_notional=50.0,
+                max_order_position_notional=80.0,
+                max_position_notional=120.0,
+                pause_short_position_notional=None,
+                max_short_position_notional=None,
+                max_total_notional=560.0,
+                auto_regime_enabled=False,
+                market_bias_regime_switch_enabled=False,
+                market_bias_enabled=False,
+                multi_timeframe_bias_enabled=False,
+                synthetic_flow_sleeve_enabled=False,
+                synthetic_flow_sleeve_notional=0.0,
+                synthetic_flow_sleeve_levels=0,
+                synthetic_residual_long_flat_notional=None,
+                synthetic_trend_follow_enabled=False,
+                volume_long_v4_flow_sleeve_enabled=False,
+                volume_long_v4_soft_loss_steps=0.5,
+                custom_grid_enabled=False,
+                custom_grid_n=None,
+                elastic_volume_enabled=False,
+                hard_loss_forced_reduce_enabled=False,
+                adverse_reduce_enabled=False,
+                excess_inventory_reduce_only_enabled=False,
+                exposure_escalation_enabled=False,
+                static_buy_offset_steps=0.0,
+                static_sell_offset_steps=0.0,
+                market_bias_max_shift_steps=0.75,
+            ),
+            enabled=True,
+        )
+
+        boundary = report["profile_boundary"]
+        self.assertEqual(report["profile_family"], "competition_inventory_grid")
+        self.assertTrue(report["schema_known"])
+        self.assertTrue(boundary["overlay_known"])
+        self.assertEqual(boundary["status"], "ready")
+        self.assertIn("first_order_multiplier", boundary["active_allowed_params"])
+        self.assertIn("threshold_position_notional", boundary["active_allowed_params"])
+
+    def test_unknown_profile_boundary_warns_but_uses_family_fallback(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="one_way_long",
+                strategy_profile="local_unregistered_one_way_profile_v1",
+                required_position_mode="one_way",
+                max_total_notional=1_000.0,
+            ),
+            enabled=True,
+        )
+
+        boundary = report["profile_boundary"]
+        self.assertEqual(report["profile_family"], "one_way_long")
+        self.assertTrue(report["schema_known"])
+        self.assertFalse(boundary["overlay_known"])
+        self.assertEqual(boundary["status"], "warning")
+        self.assertIn("per_order_notional", boundary["allowed_params"])
+        self.assertIn("profile_overlay_unknown", report["startup_preflight"]["warning_codes"])
+
+    def test_profile_boundary_active_allowed_params_hide_disabled_module_defaults(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                strategy_mode="one_way_long",
+                strategy_profile="volume_long_v4",
+                required_position_mode="one_way",
+                elastic_volume_enabled=False,
+                elastic_repair_stale_cycles=4,
+                hard_loss_forced_reduce_enabled=False,
+                hard_loss_forced_reduce_unrealized_loss_limit=10.0,
+                adverse_reduce_enabled=False,
+                adverse_reduce_short_trigger_ratio=0.01,
+                exposure_escalation_enabled=False,
+                exposure_escalation_hold_seconds=600.0,
+                volume_long_v4_flow_sleeve_enabled=False,
+                volume_long_v4_soft_loss_steps=0.5,
+                max_total_notional=1_000.0,
+            ),
+            enabled=True,
+        )
+
+        active_allowed = set(report["profile_boundary"]["active_allowed_params"])
+        self.assertIn("per_order_notional", active_allowed)
+        self.assertIn("buy_levels", active_allowed)
+        self.assertNotIn("elastic_repair_stale_cycles", active_allowed)
+        self.assertNotIn("adverse_reduce_short_trigger_ratio", active_allowed)
+        self.assertNotIn("hard_loss_forced_reduce_unrealized_loss_limit", active_allowed)
+        self.assertNotIn("exposure_escalation_hold_seconds", active_allowed)
+        self.assertNotIn("volume_long_v4_soft_loss_steps", active_allowed)
+
 
 if __name__ == "__main__":
     unittest.main()
