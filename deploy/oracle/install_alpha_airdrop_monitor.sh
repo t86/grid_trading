@@ -63,7 +63,6 @@ EOF
 sudo systemctl daemon-reload
 sudo systemctl enable "${TIMER_UNIT_NAME}.timer"
 sudo systemctl restart "${TIMER_UNIT_NAME}.timer"
-sudo systemctl start "${TIMER_UNIT_NAME}.service"
 
 echo "Installed ${TIMER_UNIT_NAME}.service and ${TIMER_UNIT_NAME}.timer"
 sudo systemctl --no-pager --full status "${TIMER_UNIT_NAME}.service" | sed -n '1,20p'

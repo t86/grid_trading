@@ -86,6 +86,7 @@ def test_alpha_airdrop_monitor_installer_writes_expected_systemd_units() -> None
     assert 'OnCalendar=*-*-* 14..22:0/10:00' in script
     assert 'Persistent=false' in script
     assert 'sudo systemctl restart "${TIMER_UNIT_NAME}.timer"' in script
+    assert 'sudo systemctl start "${TIMER_UNIT_NAME}.service"' not in script
 
 
 def test_recovery_stall_monitor_installer_runs_every_minute() -> None:
