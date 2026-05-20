@@ -449,6 +449,41 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
 
+    def test_hedge_inventory_bias_uses_soft_threshold_ratio_for_notional_gap(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_long_notional=300.0,
+                max_short_notional=300.0,
+                inventory_soft_ratio=0.8,
+                min_cycle_budget_notional=6.0,
+                inventory_bias_enabled=True,
+                inventory_bias_start_ratio=1.0,
+                inventory_bias_min_ratio_gap=0.35,
+                inventory_bias_min_notional_gap=10.0,
+                inventory_bias_min_notional_gap_soft_ratio=0.5,
+            ),
+            inputs=_inputs(
+                bid_price=0.6006,
+                ask_price=0.6007,
+                mid_price=0.60065,
+                cycle_budget_notional=14.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                position_side_mode="hedge",
+                current_long_qty=360.0,
+                current_short_qty=190.0,
+            ),
+        )
+
+        bias = plan["metrics"]["inventory_bias"]
+        self.assertEqual(plan["regime"], "normal")
+        self.assertFalse(bias["applied"])
+        self.assertAlmostEqual(bias["min_notional_gap"], 120.0)
+        self.assertAlmostEqual(bias["min_notional_gap_soft_ratio"], 0.5)
+        self.assertLess(bias["notional_gap"], 120.0)
+
 
 if __name__ == "__main__":
     unittest.main()

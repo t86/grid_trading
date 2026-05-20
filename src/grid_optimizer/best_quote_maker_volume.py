@@ -30,6 +30,7 @@ class BestQuoteMakerVolumeConfig:
     inventory_bias_start_ratio: float = 0.25
     inventory_bias_min_ratio_gap: float = 0.05
     inventory_bias_min_notional_gap: float = 10.0
+    inventory_bias_min_notional_gap_soft_ratio: float = 0.0
     inventory_bias_reduce_share: float = 0.70
     inventory_bias_same_side_extra_ticks: int = 2
     inventory_bias_reduce_extra_ticks: int = -1
@@ -408,12 +409,17 @@ def build_best_quote_maker_volume_plan(
         "min_ratio_gap": None,
         "notional_gap": abs(short_notional - long_notional),
         "min_notional_gap": None,
+        "min_notional_gap_soft_ratio": None,
     }
     bias_start = _clamp(_safe_float(config.inventory_bias_start_ratio), 0.0, 1.0)
     bias_min_ratio_gap = max(_safe_float(config.inventory_bias_min_ratio_gap), 0.0)
     bias_min_notional_gap = max(_safe_float(config.inventory_bias_min_notional_gap), 0.0)
+    bias_min_notional_gap_soft_ratio = max(_safe_float(config.inventory_bias_min_notional_gap_soft_ratio), 0.0)
+    if bias_min_notional_gap_soft_ratio > 0:
+        bias_min_notional_gap = max(long_soft, short_soft) * bias_min_notional_gap_soft_ratio
     inventory_bias_report["min_ratio_gap"] = bias_min_ratio_gap
     inventory_bias_report["min_notional_gap"] = bias_min_notional_gap
+    inventory_bias_report["min_notional_gap_soft_ratio"] = bias_min_notional_gap_soft_ratio
     bias_reduce_share = _clamp(_safe_float(config.inventory_bias_reduce_share), 0.0, 1.0)
     bias_entry_share = max(1.0 - bias_reduce_share, 0.0)
     short_notional_gap = short_notional - long_notional
@@ -465,6 +471,7 @@ def build_best_quote_maker_volume_plan(
                 "same_side_offset_ticks": same_side_ticks,
                 "min_ratio_gap": bias_min_ratio_gap,
                 "min_notional_gap": bias_min_notional_gap,
+                "min_notional_gap_soft_ratio": bias_min_notional_gap_soft_ratio,
             }
         )
         if can_bias_short:
