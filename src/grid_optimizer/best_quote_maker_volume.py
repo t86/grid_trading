@@ -28,6 +28,7 @@ class BestQuoteMakerVolumeConfig:
     dynamic_tick_high_inventory_ratio: float = 0.75
     inventory_bias_enabled: bool = False
     inventory_bias_start_ratio: float = 0.25
+    inventory_bias_min_ratio_gap: float = 0.05
     inventory_bias_reduce_share: float = 0.70
     inventory_bias_same_side_extra_ticks: int = 2
     inventory_bias_reduce_extra_ticks: int = -1
@@ -310,11 +311,12 @@ def build_best_quote_maker_volume_plan(
             step_scale = max(_safe_float(config.dynamic_control_high_volatility_step_scale), 1.0)
             extra_offset_ticks = max(int(config.dynamic_control_high_volatility_extra_offset_ticks), 0)
             reason = "high_volatility_defensive"
-        elif low_vol > 0 and 0 < volatility_ratio <= low_vol and inventory_ratio < 0.75 and not soft_loss:
-            budget_scale = max(_safe_float(config.dynamic_control_low_volatility_budget_scale), 1.0)
+        elif low_vol > 0 and 0 < volatility_ratio <= low_vol:
+            if inventory_ratio < 0.75 and not soft_loss:
+                budget_scale = max(_safe_float(config.dynamic_control_low_volatility_budget_scale), 1.0)
             step_scale = _clamp(_safe_float(config.dynamic_control_low_volatility_step_scale), 0.1, 1.0)
             extra_offset_ticks = min(int(config.dynamic_control_low_volatility_extra_offset_ticks), 0)
-            reason = "low_volatility_expand"
+            reason = "low_volatility_expand" if budget_scale > 1.0 else "low_volatility_tighten"
         trend_threshold = max(_safe_float(config.dynamic_control_trend_return_ratio), 1e-12)
         trend_score = _clamp(((return_1m * 0.65) + (return_5m * 0.35)) / trend_threshold, -1.0, 1.0)
         cycle_budget *= budget_scale
@@ -398,8 +400,12 @@ def build_best_quote_maker_volume_plan(
         "same_side_entry_share": None,
         "reduce_offset_ticks": None,
         "same_side_offset_ticks": None,
+        "ratio_gap": abs(short_inventory_ratio - long_inventory_ratio),
+        "min_ratio_gap": None,
     }
     bias_start = _clamp(_safe_float(config.inventory_bias_start_ratio), 0.0, 1.0)
+    bias_min_ratio_gap = max(_safe_float(config.inventory_bias_min_ratio_gap), 0.0)
+    inventory_bias_report["min_ratio_gap"] = bias_min_ratio_gap
     bias_reduce_share = _clamp(_safe_float(config.inventory_bias_reduce_share), 0.0, 1.0)
     bias_entry_share = max(1.0 - bias_reduce_share, 0.0)
     can_bias_short = (
@@ -421,8 +427,13 @@ def build_best_quote_maker_volume_plan(
         and long_notional >= long_soft * bias_start
     )
     if can_bias_short and can_bias_long:
-        can_bias_short = short_inventory_ratio >= long_inventory_ratio
-        can_bias_long = not can_bias_short
+        inventory_ratio_gap = abs(short_inventory_ratio - long_inventory_ratio)
+        if inventory_ratio_gap < bias_min_ratio_gap:
+            can_bias_short = False
+            can_bias_long = False
+        else:
+            can_bias_short = short_inventory_ratio > long_inventory_ratio
+            can_bias_long = not can_bias_short
     if can_bias_short or can_bias_long:
         reduce_ticks = max(int(offset_ticks) + int(config.inventory_bias_reduce_extra_ticks), 0)
         same_side_ticks = max(int(offset_ticks) + max(int(config.inventory_bias_same_side_extra_ticks), 0), 0)
@@ -440,6 +451,7 @@ def build_best_quote_maker_volume_plan(
                 "same_side_entry_share": bias_entry_share,
                 "reduce_offset_ticks": reduce_ticks,
                 "same_side_offset_ticks": same_side_ticks,
+                "min_ratio_gap": bias_min_ratio_gap,
             }
         )
         if can_bias_short:
