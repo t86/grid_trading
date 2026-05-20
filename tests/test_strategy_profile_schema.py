@@ -204,6 +204,44 @@ class StrategyProfileSchemaTests(unittest.TestCase):
         self.assertIn("max_new_orders", preflight["blocking_params"])
         self.assertIn("max_total_notional", preflight["blocking_params"])
 
+    def test_startup_preflight_blocks_strict_unknowns_and_safety_blockers(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                experimental_leftover_knob=123.0,
+                max_new_orders=0,
+                max_total_notional=0.0,
+                cancel_stale=False,
+            ),
+            enabled=True,
+        )
+
+        preflight = report["startup_preflight"]
+        self.assertFalse(preflight["can_start"])
+        self.assertEqual(preflight["status"], "blocked")
+        self.assertIn("strict_unknown_params", preflight["blocker_codes"])
+        self.assertIn("global_safety_blocking_params", preflight["blocker_codes"])
+        self.assertIn("experimental_leftover_knob", preflight["unknown_params"])
+        self.assertIn("max_new_orders", preflight["blocking_params"])
+        self.assertIn("max_total_notional", preflight["blocking_params"])
+        self.assertIn("cancel_stale", preflight["blocking_params"])
+
+    def test_startup_preflight_warns_for_ignored_params_without_blocking(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                max_total_notional=1_000.0,
+                hard_loss_forced_reduce_enabled=True,
+                excess_inventory_reduce_only_enabled=True,
+            ),
+            enabled=True,
+        )
+
+        preflight = report["startup_preflight"]
+        self.assertTrue(preflight["can_start"])
+        self.assertEqual(preflight["status"], "warning")
+        self.assertIn("ignored_params", preflight["warning_codes"])
+        self.assertIn("hard_loss_forced_reduce_enabled", preflight["ignored_params"])
+        self.assertIn("excess_inventory_reduce_only_enabled", preflight["ignored_params"])
+
     def test_global_safety_preflight_reflects_pruned_disallowed_takeover_switches(self) -> None:
         effective, report = apply_strategy_profile_schema(
             _args(hard_loss_forced_reduce_enabled=True, excess_inventory_reduce_only_enabled=True),

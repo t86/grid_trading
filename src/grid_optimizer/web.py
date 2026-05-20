@@ -25672,6 +25672,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
       const orders = data.orders || {};
       const loop = data.latest_loop || {};
       const safety = data.safety_preflight || {};
+      const startup = data.startup_preflight || {};
       const safetyRiskCount = [
         ...(safety.limiting_params || []),
         ...(safety.blocking_params || []),
@@ -25680,6 +25681,10 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
         ...(safety.takeover_params || []),
       ].length;
       const safetyClass = safety.blocking_params && safety.blocking_params.length ? "bad" : safetyRiskCount ? "warn" : "good";
+      const startupStatus = String(startup.status || "unknown");
+      const startupClass = startupStatus === "blocked" ? "bad" : startupStatus === "warning" ? "warn" : startupStatus === "ready" ? "good" : "";
+      const startupLabel = startupStatus === "blocked" ? "不可启动" : startupStatus === "warning" ? "可启动，有警告" : startupStatus === "ready" ? "可启动" : "--";
+      const startupIssueCount = (startup.blocker_codes || []).length + (startup.warning_codes || []).length;
       const modeCompatible = positionMode.compatible;
       const modeClass = modeCompatible === true ? "good" : modeCompatible === false ? "bad" : "";
       const currentMode = positionMode.current || "未知";
@@ -25689,6 +25694,7 @@ STRATEGY_EDITOR_PAGE = """<!doctype html>
         ["持仓模式", positionMode.required || cfg.required_position_mode || "--", modeClass, `当前 ${currentMode} · ${modeCompatible === false ? "不兼容" : modeCompatible === true ? "兼容" : "未确认"}`],
         ["仓位", pos.summary || "--", Number(pos.net_notional || 0) >= 0 ? "good" : "warn", `Long ${fmtNum(pos.long_notional)}U · Short ${fmtNum(pos.short_notional)}U`],
         ["挂单", fmtNum(orders.strategy_open_order_count || 0, 0), "", `计划保留 + 本轮新挂`],
+        ["启动检查", startupLabel, startupClass, startupIssueCount ? `${fmtNum(startupIssueCount, 0)} 个原因` : "没有阻塞项"],
         ["安全阀", safetyRiskCount ? `${fmtNum(safetyRiskCount, 0)} 个风险` : "未触发", safetyClass, `预计 ${fmtNum(safety.estimated_cycle_order_count || 0, 0)} 单 / ${fmtNum(safety.estimated_cycle_notional || 0)}U`],
         ["状态", loop.active_state || "--", statusClass(loop.active_state), `intent ${loop.strategy_intent || "--"}`],
         ["修仓档", loop.repair_ladder_level || "--", statusClass(loop.repair_ladder_level), loop.error_message || "无错误信息"],
@@ -32248,12 +32254,20 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
         if isinstance(plan_schema.get("global_safety_preflight"), dict)
         else {}
     )
-    if not safety_preflight:
+    startup_preflight = (
+        plan_schema.get("startup_preflight")
+        if isinstance(plan_schema.get("startup_preflight"), dict)
+        else {}
+    )
+    if not safety_preflight or not startup_preflight:
         _, schema_report = apply_strategy_profile_schema(
             argparse.Namespace(**config),
             enabled=bool(config.get("strict_strategy_profile_schema_enabled", False)),
         )
-        safety_preflight = dict(schema_report.get("global_safety_preflight") or {})
+        if not safety_preflight:
+            safety_preflight = dict(schema_report.get("global_safety_preflight") or {})
+        if not startup_preflight:
+            startup_preflight = dict(schema_report.get("startup_preflight") or {})
     runtime_snapshot = _build_status_runtime_snapshot(
         runner={**runner, "config": config},
         plan_report=plan_report,
@@ -32337,6 +32351,7 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
         },
         "latest_loop": latest_loop,
         "safety_preflight": safety_preflight,
+        "startup_preflight": startup_preflight,
         "paths": {
             "summary_jsonl": str(summary_path),
             "plan_json": str(plan_path),

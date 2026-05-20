@@ -1722,6 +1722,9 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIn("max_total_notional", report["global_safety_preflight"]["limiting_params"])
         self.assertIn("cancel_stale", report["global_safety_preflight"]["blocking_params"])
         self.assertIn("max_mid_drift_steps", report["global_safety_preflight"]["warning_params"])
+        self.assertFalse(report["startup_preflight"]["can_start"])
+        self.assertEqual(report["startup_preflight"]["status"], "blocked")
+        self.assertIn("global_safety_blocking_params", report["startup_preflight"]["blocker_codes"])
 
     @patch("grid_optimizer.loop_runner._resolve_custom_grid_roll")
     @patch("grid_optimizer.loop_runner.assess_market_guard")

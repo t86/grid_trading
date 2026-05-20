@@ -4469,6 +4469,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("cancel_stale", payload["safety_preflight"]["blocking_params"])
         self.assertIn("max_mid_drift_steps", payload["safety_preflight"]["warning_params"])
         self.assertIn("rolling_hourly_loss_limit", payload["safety_preflight"]["stop_guard_params"])
+        self.assertFalse(payload["startup_preflight"]["can_start"])
+        self.assertEqual(payload["startup_preflight"]["status"], "blocked")
+        self.assertIn("global_safety_blocking_params", payload["startup_preflight"]["blocker_codes"])
         self.assertIn("aigensynusdt_best_quote_maker_volume_v1", {item["key"] for item in payload["presets"]})
         mock_build_snapshot.assert_not_called()
 

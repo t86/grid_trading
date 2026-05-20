@@ -714,6 +714,79 @@ def build_global_safety_preflight(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+def build_startup_preflight(
+    *,
+    strict_enabled: bool,
+    strict_ok: bool,
+    schema_known: bool,
+    required_position_mode: str,
+    required_position_mode_defaulted: bool,
+    ignored_params: list[str],
+    unknown_params: list[str],
+    global_safety_preflight: dict[str, Any],
+) -> dict[str, Any]:
+    blocking_params = sorted(set(global_safety_preflight.get("blocking_params") or []))
+    limiting_params = sorted(set(global_safety_preflight.get("limiting_params") or []))
+    warning_params = sorted(set(global_safety_preflight.get("warning_params") or []))
+    stop_guard_params = sorted(set(global_safety_preflight.get("stop_guard_params") or []))
+    takeover_params = sorted(set(global_safety_preflight.get("takeover_params") or []))
+    blocker_codes: list[str] = []
+    warning_codes: list[str] = []
+    messages: list[str] = []
+
+    if strict_enabled and not strict_ok and unknown_params:
+        blocker_codes.append("strict_unknown_params")
+        messages.append("严格 profile schema 发现未知活跃参数，启动会被拒绝。")
+    if blocking_params:
+        blocker_codes.append("global_safety_blocking_params")
+        messages.append("全局执行安全阀存在阻塞项，可能无法启动或无法下单。")
+
+    if not schema_known:
+        warning_codes.append("unknown_profile_schema")
+        messages.append("当前策略未匹配到已知 profile schema，无法完整隔离旧参数。")
+    if required_position_mode_defaulted:
+        warning_codes.append("position_mode_defaulted")
+        messages.append("持仓模式要求由系统默认到 one_way，请确认该策略不是 hedge-only。")
+    if ignored_params:
+        warning_codes.append("ignored_params")
+        messages.append("存在会被严格 schema 忽略的旧参数；它们不会生效。")
+    if limiting_params:
+        warning_codes.append("global_safety_limiting_params")
+        messages.append("全局执行安全阀会限制单轮挂单数量或名义金额。")
+    if warning_params:
+        warning_codes.append("global_safety_warning_params")
+        messages.append("存在波动/盘口漂移等告警参数，极端行情下可能少下单。")
+    if stop_guard_params:
+        warning_codes.append("global_safety_stop_guards")
+        messages.append("存在滚动亏损、累计刷量或敞口停机阈值。")
+    if takeover_params:
+        warning_codes.append("global_safety_takeover_params")
+        messages.append("存在可能接管挂单的强制减仓类模块。")
+
+    blocker_codes = sorted(set(blocker_codes))
+    warning_codes = sorted(set(warning_codes))
+    status = "blocked" if blocker_codes else "warning" if warning_codes else "ready"
+    return {
+        "can_start": not blocker_codes,
+        "status": status,
+        "blocker_codes": blocker_codes,
+        "warning_codes": warning_codes,
+        "messages": messages,
+        "strict_enabled": bool(strict_enabled),
+        "strict_ok": bool(strict_ok),
+        "schema_known": bool(schema_known),
+        "required_position_mode": required_position_mode,
+        "required_position_mode_defaulted": bool(required_position_mode_defaulted),
+        "ignored_params": sorted(set(ignored_params)),
+        "unknown_params": sorted(set(unknown_params)),
+        "blocking_params": blocking_params,
+        "limiting_params": limiting_params,
+        "warning_params": warning_params,
+        "stop_guard_params": stop_guard_params,
+        "takeover_params": takeover_params,
+    }
+
+
 def _values_equal(left: Any, right: Any) -> bool:
     if isinstance(left, bool) or isinstance(right, bool):
         return _safe_bool(left) == _safe_bool(right)
@@ -829,11 +902,28 @@ def apply_strategy_profile_schema(
             if _is_active_unknown_value(value):
                 unknown_params.append(key)
 
+    strict_enabled = bool(enabled)
+    strict_ok = not unknown_params
+    schema_known = schema.family != "unknown"
+    ignored_params_sorted = sorted(ignored_params)
+    unknown_params_sorted = sorted(unknown_params)
+    global_safety_preflight = build_global_safety_preflight(effective)
+    startup_preflight = build_startup_preflight(
+        strict_enabled=strict_enabled,
+        strict_ok=strict_ok,
+        schema_known=schema_known,
+        required_position_mode=schema.required_position_mode,
+        required_position_mode_defaulted=schema.required_position_mode_defaulted,
+        ignored_params=ignored_params_sorted,
+        unknown_params=unknown_params_sorted,
+        global_safety_preflight=global_safety_preflight,
+    )
+
     report = {
         "enabled": True,
-        "strict_enabled": bool(enabled),
-        "strict_ok": not unknown_params,
-        "schema_known": schema.family != "unknown",
+        "strict_enabled": strict_enabled,
+        "strict_ok": strict_ok,
+        "schema_known": schema_known,
         "strategy_mode": strategy_mode,
         "strategy_profile": strategy_profile,
         "profile_family": schema.family,
@@ -842,8 +932,9 @@ def apply_strategy_profile_schema(
         "required_position_mode_defaulted": schema.required_position_mode_defaulted,
         "allowed_runtime_switches": sorted(schema.allowed_runtime_switches),
         "allowed_params": sorted(schema.allowed_params),
-        "ignored_params": sorted(ignored_params),
-        "unknown_params": sorted(unknown_params),
-        "global_safety_preflight": build_global_safety_preflight(effective),
+        "ignored_params": ignored_params_sorted,
+        "unknown_params": unknown_params_sorted,
+        "global_safety_preflight": global_safety_preflight,
+        "startup_preflight": startup_preflight,
     }
     return effective, report
