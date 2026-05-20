@@ -8462,6 +8462,104 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_hedge_reduce_orders_omit_reduce_only(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        mock_update_synthetic_refs,
+        mock_update_inventory_grid_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {
+                        "role": "adverse_reduce_long",
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "qty": 16.0,
+                        "price": 0.5985,
+                        "force_reduce_only": True,
+                    },
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.5984", "ask_price": "0.5985"}]
+        mock_premium_index.return_value = [{"markPrice": "0.59845", "lastFundingRate": "0.0"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "888", "entryPrice": "0.6047"},
+                {"symbol": "PHAROSUSDT", "positionSide": "SHORT", "positionAmt": "0", "entryPrice": "0"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 10}
+        mock_post_order.return_value = {"orderId": 1, "clientOrderId": "reduce"}
+
+        args = Namespace(
+            symbol="PHAROSUSDT",
+            strategy_mode="hedge_neutral",
+            max_new_orders=20,
+            max_total_notional=1000.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=4.0,
+            plan_json="output/pharosusdt_hedge_neutral_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=10,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/pharosusdt_hedge_neutral_state.json",
+        )
+        plan_report = {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_neutral",
+            "mid_price": 0.59845,
+            "step_price": 0.0008,
+            "open_order_count": 0,
+            "current_long_qty": 888.0,
+            "current_short_qty": 0.0,
+            "actual_net_qty": 888.0,
+            "symbol_info": {
+                "tick_size": 0.0001,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        execute_plan_report(args, plan_report)
+
+        self.assertIsNone(mock_post_order.call_args.kwargs["reduce_only"])
+        self.assertEqual(mock_post_order.call_args.kwargs["position_side"], "LONG")
+        mock_update_synthetic_refs.assert_called_once()
+        mock_update_inventory_grid_refs.assert_called_once()
+
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
     def test_execute_plan_report_caps_one_way_reduce_only_orders_to_net_position(
         self,
         mock_validate_plan_report,

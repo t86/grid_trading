@@ -15789,7 +15789,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             side=side,
             role=role,
         )
-        if order.get("force_reduce_only") is not None:
+        if order.get("force_reduce_only") is not None and strategy_mode != "hedge_neutral":
             reduce_only = bool(order.get("force_reduce_only"))
         last_exc: RuntimeError | None = None
         for attempt in range(args.maker_retries + 1):
