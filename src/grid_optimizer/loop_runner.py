@@ -13916,11 +13916,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 dynamic_control_extreme_volatility_budget_scale=float(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_budget_scale", 0.45)
                 ),
+                dynamic_control_low_volatility_extra_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_extra_offset_ticks", -1)
+                ),
                 dynamic_control_high_volatility_extra_offset_ticks=int(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_extra_offset_ticks", 3)
                 ),
                 dynamic_control_extreme_volatility_extra_offset_ticks=int(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_extra_offset_ticks", 8)
+                ),
+                dynamic_control_low_volatility_step_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_step_scale", 0.75)
                 ),
                 dynamic_control_high_volatility_step_scale=float(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_step_scale", 1.5)
@@ -16215,8 +16221,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-budget-scale", type=float, default=1.15)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-budget-scale", type=float, default=0.75)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-budget-scale", type=float, default=0.45)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-extra-offset-ticks", type=int, default=-1)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-extra-offset-ticks", type=int, default=3)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-extra-offset-ticks", type=int, default=8)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-step-scale", type=float, default=0.75)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-step-scale", type=float, default=1.5)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-step-scale", type=float, default=2.5)
     parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-return-ratio", type=float, default=0.002)

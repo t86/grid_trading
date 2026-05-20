@@ -269,6 +269,36 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertGreater(plan["buy_orders"][0]["notional"], plan["sell_orders"][0]["notional"])
         self.assertGreater(plan["metrics"]["dynamic_control"]["trend_score"], 0.0)
 
+    def test_dynamic_control_shortens_base_spacing_when_volume_conditions_are_quiet(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                quote_offset_ticks=3,
+                max_entry_orders_per_side=2,
+                dynamic_control_enabled=True,
+                dynamic_control_low_volatility_ratio=0.002,
+                dynamic_control_low_volatility_budget_scale=1.2,
+                dynamic_control_low_volatility_step_scale=0.5,
+                dynamic_control_low_volatility_extra_offset_ticks=-2,
+            ),
+            inputs=_inputs(
+                bid_price=0.6050,
+                ask_price=0.6051,
+                mid_price=0.60505,
+                cycle_budget_notional=40.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                entry_ladder_spacing=0.0003,
+                market_amplitude_1m=0.001,
+            ),
+        )
+
+        control = plan["metrics"]["dynamic_control"]
+        self.assertEqual(control["reason"], "low_volatility_expand")
+        self.assertAlmostEqual(plan["metrics"]["cycle_budget_notional"], 48.0)
+        self.assertAlmostEqual(plan["metrics"]["effective_ladder_spacing"], 0.00015)
+        self.assertEqual(plan["metrics"]["dynamic_tick"]["offset_ticks"], 1)
+
     def test_hedge_inventory_bias_reduces_short_but_keeps_small_short_entry(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

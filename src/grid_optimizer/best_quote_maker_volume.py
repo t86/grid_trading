@@ -38,8 +38,10 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_low_volatility_budget_scale: float = 1.15
     dynamic_control_high_volatility_budget_scale: float = 0.75
     dynamic_control_extreme_volatility_budget_scale: float = 0.45
+    dynamic_control_low_volatility_extra_offset_ticks: int = -1
     dynamic_control_high_volatility_extra_offset_ticks: int = 3
     dynamic_control_extreme_volatility_extra_offset_ticks: int = 8
+    dynamic_control_low_volatility_step_scale: float = 0.75
     dynamic_control_high_volatility_step_scale: float = 1.5
     dynamic_control_extreme_volatility_step_scale: float = 2.5
     dynamic_control_trend_return_ratio: float = 0.002
@@ -310,12 +312,14 @@ def build_best_quote_maker_volume_plan(
             reason = "high_volatility_defensive"
         elif low_vol > 0 and 0 < volatility_ratio <= low_vol and inventory_ratio < 0.75 and not soft_loss:
             budget_scale = max(_safe_float(config.dynamic_control_low_volatility_budget_scale), 1.0)
+            step_scale = _clamp(_safe_float(config.dynamic_control_low_volatility_step_scale), 0.1, 1.0)
+            extra_offset_ticks = min(int(config.dynamic_control_low_volatility_extra_offset_ticks), 0)
             reason = "low_volatility_expand"
         trend_threshold = max(_safe_float(config.dynamic_control_trend_return_ratio), 1e-12)
         trend_score = _clamp(((return_1m * 0.65) + (return_5m * 0.35)) / trend_threshold, -1.0, 1.0)
         cycle_budget *= budget_scale
-        if extra_offset_ticks > 0:
-            offset_ticks = int(offset_ticks) + extra_offset_ticks
+        if extra_offset_ticks != 0:
+            offset_ticks = max(int(offset_ticks) + extra_offset_ticks, 0)
         effective_ladder_spacing = base_ladder_spacing * step_scale if base_ladder_spacing > 0 else base_ladder_spacing
         if effective_ladder_spacing > 0 and abs(effective_ladder_spacing - base_ladder_spacing) > 1e-12:
             inputs = replace(inputs, entry_ladder_spacing=effective_ladder_spacing)
