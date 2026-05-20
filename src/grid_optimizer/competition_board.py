@@ -362,6 +362,13 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         url="https://www.binance.com/zh-CN/activity/trading-competition/futures-aigensyn-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
+        slug="futures_pharos",
+        symbol="PHAROS",
+        market="futures",
+        label="PHAROS 合约交易挑战赛",
+        url="https://www.bsmkweb.cc/activity/trading-competition/futures-pharos-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
         slug="futures_tradfi_week1",
         symbol="TRADFI",
         market="futures",
@@ -1493,6 +1500,28 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
 平分 480,000 AIGENSYN
 第 51 - 200 名
 平分 960,000 AIGENSYN
+""",
+            }
+        ]
+    },
+    "futures_pharos": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 0,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "PHAROS",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/14 18:00 - 2026/05/21 07:59",
+                "activityEndAt": "2026-05-21T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/14 18:00 - 2026/05/21 07:59
+累计 PHAROS U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
 """,
             }
         ]

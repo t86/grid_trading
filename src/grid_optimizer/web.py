@@ -3628,6 +3628,11 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "threshold_position_notional": 0.0,
     "short_threshold_timeout_seconds": 60.0,
     "inventory_pause_timeout_seconds": 0.0,
+    "loss_reentry_guard_enabled": False,
+    "loss_reentry_cooldown_seconds": 0.0,
+    "loss_reentry_cost_buffer_steps": 0.0,
+    "loss_reentry_trend_guard_enabled": False,
+    "loss_reentry_trend_return_ratio": 0.0,
     "synthetic_tiny_long_residual_notional": None,
     "synthetic_tiny_short_residual_notional": None,
     "static_buy_offset_steps": 0.0,
@@ -9809,6 +9814,22 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--threshold-position-notional", str(config["threshold_position_notional"])])
     if config.get("short_threshold_timeout_seconds") is not None:
         command.extend(["--short-threshold-timeout-seconds", str(config["short_threshold_timeout_seconds"])])
+    command.append(
+        "--loss-reentry-guard-enabled"
+        if config.get("loss_reentry_guard_enabled", False)
+        else "--no-loss-reentry-guard-enabled"
+    )
+    if config.get("loss_reentry_cooldown_seconds") is not None:
+        command.extend(["--loss-reentry-cooldown-seconds", str(config["loss_reentry_cooldown_seconds"])])
+    if config.get("loss_reentry_cost_buffer_steps") is not None:
+        command.extend(["--loss-reentry-cost-buffer-steps", str(config["loss_reentry_cost_buffer_steps"])])
+    command.append(
+        "--loss-reentry-trend-guard-enabled"
+        if config.get("loss_reentry_trend_guard_enabled", False)
+        else "--no-loss-reentry-trend-guard-enabled"
+    )
+    if config.get("loss_reentry_trend_return_ratio") is not None:
+        command.extend(["--loss-reentry-trend-return-ratio", str(config["loss_reentry_trend_return_ratio"])])
     command.append("--adverse-reduce-enabled" if config.get("adverse_reduce_enabled", False) else "--no-adverse-reduce-enabled")
     if config.get("adverse_reduce_short_trigger_ratio") is not None:
         command.extend(["--adverse-reduce-short-trigger-ratio", str(config["adverse_reduce_short_trigger_ratio"])])
@@ -21129,6 +21150,29 @@ MONITOR_PAGE = """<!doctype html>
       </div>
     </section>
 
+    <section class="card monitor-section">
+      <div class="panel-title">
+        <h2>按天成交额</h2>
+        <div class="tiny">UTC+0 自然日 · 北京时间 08:00 切日</div>
+      </div>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>日期</th>
+              <th>成交额</th>
+              <th>笔数</th>
+              <th>买/卖额</th>
+              <th>已实现</th>
+              <th>手续费</th>
+              <th>净已实现</th>
+            </tr>
+          </thead>
+          <tbody id="daily_volume_body"></tbody>
+        </table>
+      </div>
+    </section>
+
     <section class="grid-2 monitor-section">
       <div class="card">
         <div class="panel-title">
@@ -21257,6 +21301,7 @@ MONITOR_PAGE = """<!doctype html>
     const riskTimelineBody = document.getElementById("risk_timeline_body");
     const hourlyBody = document.getElementById("hourly_body");
     const hourlyMetaEl = document.getElementById("hourly_meta");
+    const dailyVolumeBody = document.getElementById("daily_volume_body");
     const metaEl = document.getElementById("meta");
     const alertBoxEl = document.getElementById("alert_box");
     const openOrderMetaEl = document.getElementById("open_order_meta");
@@ -21324,7 +21369,7 @@ MONITOR_PAGE = """<!doctype html>
     const customGridStatusEl = document.getElementById("custom_grid_status");
     const customGridSummaryEl = document.getElementById("custom_grid_summary");
     const customGridPreviewBody = document.getElementById("custom_grid_preview_body");
-    const DEFAULT_MONITOR_SYMBOLS = ["BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "PHAROSUSDT"];
+    const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"];
     const VISIBLE_STRATEGY_PRESET_KEYS = new Set([
       "volume_long_v4",
       "based_volume_push_bard_v1",
@@ -26451,6 +26496,25 @@ MONITOR_PAGE = """<!doctype html>
       `).join("");
     }
 
+    function renderDailyVolume(data) {
+      const rows = ((data.trade_summary && data.trade_summary.daily_volume_rows) || []);
+      if (!rows.length) {
+        dailyVolumeBody.innerHTML = '<tr><td colspan="7" class="empty">当前没有按天成交额统计</td></tr>';
+        return;
+      }
+      dailyVolumeBody.innerHTML = rows.map((row) => `
+        <tr>
+          <td>${escapeHtml(row.date || "--")}</td>
+          <td>${fmtNum(row.gross_notional || 0, 4)}</td>
+          <td>${fmtNum(row.trade_count || 0, 0)}</td>
+          <td>${fmtNum(row.buy_notional || 0, 1)} / ${fmtNum(row.sell_notional || 0, 1)}</td>
+          <td class="${statusClass(Number(row.realized_pnl || 0))}">${fmtMoney(row.realized_pnl || 0)}</td>
+          <td class="bad">${fmtMoney(-Math.abs(Number(row.commission || 0)))}</td>
+          <td class="${statusClass(Number(row.net_realized || 0))}">${fmtMoney(row.net_realized || 0)}</td>
+        </tr>
+      `).join("");
+    }
+
     function renderTrades(data) {
       const rows = ((data.trade_summary && data.trade_summary.recent_trades) || []).slice().reverse();
       if (!rows.length) {
@@ -26718,6 +26782,7 @@ MONITOR_PAGE = """<!doctype html>
           renderOpenOrders(data);
           renderDiagnosticChart(data);
           renderHourlyStats(data);
+          renderDailyVolume(data);
           renderTrades(data);
           renderEvents(data);
           renderRiskTimeline(data);
@@ -30006,8 +30071,9 @@ STRATEGIES_PAGE = """<!doctype html>
   </div>
 
   <script>
-    const DEFAULT_MONITOR_SYMBOLS = ["BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "PHAROSUSDT"];
-    const DEFAULT_COMPETITION_SYMBOLS = ["BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"];
+    const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"];
+    const DEFAULT_COMPETITION_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"];
+    const DEFAULT_SPOT_SYMBOLS = ["TONUSDT", "XAUTUSDT", "SAHARAUSDT", "NIGHTUSDT", "CFGUSDT"];
     const cardsEl = document.getElementById("cards");
     const metaEl = document.getElementById("meta");
     const summaryEl = document.getElementById("summary");

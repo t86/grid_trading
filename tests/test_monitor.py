@@ -72,6 +72,172 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(summary["commission"], 0.02, places=8)
         self.assertEqual(len(summary["series"]), 2)
 
+    def test_summarize_user_trades_accepts_string_trade_ids(self) -> None:
+        trades = [
+            {
+                "id": "23256419:gx-pharosu-bestquot-2-91789828:1779191790879:17.0:0.6348",
+                "time": 1000,
+                "side": "BUY",
+                "price": "0.6348",
+                "qty": "17",
+                "maker": True,
+                "realizedPnl": "0",
+                "commission": "0.01",
+            }
+        ]
+
+        summary = summarize_user_trades(trades)
+
+        self.assertEqual(summary["trade_count"], 1)
+        self.assertAlmostEqual(summary["gross_notional"], 10.7916, places=8)
+
+    def test_summarize_user_trades_groups_daily_volume_by_utc_day(self) -> None:
+        day0 = datetime(2026, 5, 19, 15, 30, tzinfo=timezone.utc)
+        day0_late = datetime(2026, 5, 19, 23, 30, tzinfo=timezone.utc)
+        day1 = datetime(2026, 5, 20, 0, 30, tzinfo=timezone.utc)
+        trades = [
+            {
+                "id": 1,
+                "time": int(day0.timestamp() * 1000),
+                "side": "BUY",
+                "price": "2",
+                "qty": "10",
+                "realizedPnl": "0",
+                "commission": "0",
+            },
+            {
+                "id": 2,
+                "time": int(day0_late.timestamp() * 1000),
+                "side": "SELL",
+                "price": "3",
+                "qty": "10",
+                "realizedPnl": "0",
+                "commission": "0",
+            },
+            {
+                "id": 3,
+                "time": int(day1.timestamp() * 1000),
+                "side": "SELL",
+                "price": "5",
+                "qty": "10",
+                "realizedPnl": "0",
+                "commission": "0",
+            },
+        ]
+
+        summary = summarize_user_trades(trades)
+
+        self.assertEqual(summary["daily_volume_rows"][0]["date"], "2026-05-20")
+        self.assertEqual(summary["daily_volume_rows"][0]["timezone"], "UTC+0")
+        self.assertAlmostEqual(summary["daily_volume_rows"][0]["gross_notional"], 50.0, places=8)
+        self.assertEqual(summary["daily_volume_rows"][1]["date"], "2026-05-19")
+        self.assertEqual(summary["daily_volume_rows"][1]["timezone"], "UTC+0")
+        self.assertAlmostEqual(summary["daily_volume_rows"][1]["gross_notional"], 50.0, places=8)
+
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_trade_rows_merges_audit_with_full_api_window(self, mock_fetch_time_paged) -> None:
+        start = datetime(2026, 5, 14, 10, 0, tzinfo=timezone.utc)
+        old_api_trade = {
+            "id": 1,
+            "time": int((start + timedelta(minutes=1)).timestamp() * 1000),
+            "symbol": "PHAROSUSDT",
+            "price": "1",
+            "qty": "10",
+        }
+        duplicate_trade = {
+            "id": 2,
+            "time": int((start + timedelta(minutes=2)).timestamp() * 1000),
+            "symbol": "PHAROSUSDT",
+            "price": "1",
+            "qty": "20",
+        }
+        audit_only_trade = {
+            "id": 3,
+            "time": int((start + timedelta(minutes=3)).timestamp() * 1000),
+            "symbol": "PHAROSUSDT",
+            "price": "1",
+            "qty": "30",
+        }
+        mock_fetch_time_paged.return_value = [old_api_trade, duplicate_trade]
+
+        with TemporaryDirectory() as tmpdir:
+            audit_path = Path(tmpdir) / "pharosusdt_loop_trade_audit.jsonl"
+            audit_path.write_text(
+                json.dumps(duplicate_trade) + "\n" + json.dumps(audit_only_trade) + "\n",
+                encoding="utf-8",
+            )
+
+            rows, meta = _load_or_fetch_trade_rows(
+                audit_path=audit_path,
+                symbol="PHAROSUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=start,
+            )
+
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 2)
+        self.assertEqual(meta["api_row_count"], 2)
+
+    def test_monitor_stats_anchor_persists_first_data_start(self) -> None:
+        from grid_optimizer.monitor import _resolve_monitor_stats_anchor
+
+        first_trade = datetime(2026, 5, 19, 13, 26, 56, tzinfo=timezone.utc)
+        restarted_session = datetime(2026, 5, 20, 2, 12, 46, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            anchor_path = Path(tmpdir) / "pharosusdt_loop_monitor_anchor.json"
+
+            anchor, meta = _resolve_monitor_stats_anchor(
+                anchor_path=anchor_path,
+                symbol="PHAROSUSDT",
+                candidates=[
+                    ("audit_trade_start", first_trade),
+                    ("session_start", restarted_session),
+                ],
+            )
+            self.assertEqual(anchor, first_trade)
+            self.assertEqual(meta["source"], "audit_trade_start")
+            self.assertTrue(anchor_path.exists())
+
+            anchor, meta = _resolve_monitor_stats_anchor(
+                anchor_path=anchor_path,
+                symbol="PHAROSUSDT",
+                candidates=[("session_start", restarted_session + timedelta(hours=1))],
+            )
+            self.assertEqual(anchor, first_trade)
+            self.assertEqual(meta["source"], "persisted")
+
+    def test_monitor_stats_anchor_moves_earlier_but_never_later(self) -> None:
+        from grid_optimizer.monitor import _resolve_monitor_stats_anchor
+
+        persisted = datetime(2026, 5, 19, 13, 26, 56, tzinfo=timezone.utc)
+        competition_start = datetime(2026, 5, 14, 10, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            anchor_path = Path(tmpdir) / "pharosusdt_loop_monitor_anchor.json"
+            anchor_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "PHAROSUSDT",
+                        "stats_start_at": persisted.isoformat(),
+                        "source": "audit_trade_start",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            anchor, meta = _resolve_monitor_stats_anchor(
+                anchor_path=anchor_path,
+                symbol="PHAROSUSDT",
+                candidates=[
+                    ("competition_start", competition_start),
+                    ("session_start", persisted + timedelta(hours=2)),
+                ],
+            )
+
+        self.assertEqual(anchor, competition_start)
+        self.assertEqual(meta["source"], "competition_start")
+
     def test_summarize_income_sums_funding_fee(self) -> None:
         rows = [
             {"time": 1000, "income": "0.05", "incomeType": "FUNDING_FEE", "asset": "USDT", "info": ""},

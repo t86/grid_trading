@@ -14,6 +14,7 @@ from typing import Any
 
 from .audit import (
     DEFAULT_AUDIT_LOOKBACK_DAYS,
+    append_jsonl,
     build_audit_paths,
     count_jsonl_lines,
     fetch_time_paged,
@@ -26,6 +27,7 @@ from .audit import (
     read_trade_audit_rows,
     trade_row_key,
     trade_row_time_ms,
+    write_json,
 )
 from .data import (
     fetch_futures_account_info_v3,
@@ -46,7 +48,6 @@ from .competition_board import (
     build_reward_volume_targets,
     resolve_active_competition_board,
 )
-
 
 def _safe_float(value: Any) -> float:
     try:
@@ -69,6 +70,13 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _sort_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 RUNNER_PID_PATH = Path("output/night_loop_runner.pid")
@@ -476,6 +484,75 @@ def _filter_events_since(events: list[dict[str, Any]], since: datetime | None) -
     return filtered
 
 
+def _monitor_anchor_path(audit_paths: dict[str, Path]) -> Path:
+    audit_state_path = audit_paths["audit_state"]
+    return audit_state_path.with_name(audit_state_path.name.replace("_audit_state.json", "_monitor_anchor.json"))
+
+
+def _jsonl_time_bounds(path: Path, row_time_ms: Any) -> tuple[datetime | None, datetime | None]:
+    first_ts: datetime | None = None
+    last_ts: datetime | None = None
+    for item in iter_jsonl(path):
+        ts_ms = int(row_time_ms(item) or 0)
+        if ts_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        if first_ts is None or ts < first_ts:
+            first_ts = ts
+        if last_ts is None or ts > last_ts:
+            last_ts = ts
+    return first_ts, last_ts
+
+
+def _resolve_monitor_stats_anchor(
+    *,
+    anchor_path: Path,
+    symbol: str,
+    candidates: list[tuple[str, datetime | None]],
+) -> tuple[datetime | None, dict[str, Any]]:
+    normalized_symbol = str(symbol).upper().strip()
+    persisted_payload = _read_json(anchor_path)
+    persisted_start = _parse_iso_ts((persisted_payload or {}).get("stats_start_at"))
+    selected_start = persisted_start
+    selected_source = "persisted" if persisted_start is not None else None
+    for source, value in candidates:
+        if value is None:
+            continue
+        candidate = value.astimezone(timezone.utc)
+        if selected_start is None or candidate < selected_start:
+            selected_start = candidate
+            selected_source = source
+    if selected_start is None:
+        return None, {
+            "path": str(anchor_path),
+            "source": None,
+            "persisted": False,
+            "updated": False,
+        }
+    updated = (
+        persisted_start is None
+        or selected_start != persisted_start
+        or str((persisted_payload or {}).get("symbol", "")).upper().strip() != normalized_symbol
+    )
+    if updated:
+        write_json(
+            anchor_path,
+            {
+                "symbol": normalized_symbol,
+                "stats_start_at": selected_start.isoformat(),
+                "source": selected_source,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    return selected_start, {
+        "path": str(anchor_path),
+        "source": selected_source,
+        "persisted": persisted_start is not None,
+        "updated": updated,
+        "stats_start_at": selected_start.isoformat(),
+    }
+
+
 def _read_event_window(
     path: Path,
     *,
@@ -514,7 +591,6 @@ def _load_or_fetch_trade_rows(
         limit=0,
         predicate=lambda item: int(trade_row_time_ms(item) or 0) >= floor_ms,
     )
-
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     try:
@@ -531,25 +607,16 @@ def _load_or_fetch_trade_rows(
             row_time_ms=trade_row_time_ms,
             row_key=trade_row_key,
         )
-    except Exception:
-        if not audit_rows:
-            raise
-        return audit_rows, {
-            "source": "audit",
-            "path": str(audit_path),
-            "row_count": len(audit_rows),
-            "start_time": effective_start.isoformat(),
-            "api_error": "fetch_failed",
-        }
-
-    if not audit_rows:
-        return api_rows, {
-            "source": "api",
-            "path": None,
-            "row_count": len(api_rows),
-            "start_time": effective_start.isoformat(),
-        }
-
+    except Exception as exc:
+        if audit_rows:
+            return audit_rows, {
+                "source": "audit",
+                "path": str(audit_path),
+                "row_count": len(audit_rows),
+                "start_time": effective_start.isoformat(),
+                "api_error": f"{type(exc).__name__}: {exc}",
+            }
+        raise
     def _trade_merge_key(row: dict[str, Any]) -> tuple[Any, ...]:
         order_id = row.get("orderId")
         if order_id is not None:
@@ -568,23 +635,39 @@ def _load_or_fetch_trade_rows(
 
     merged: list[dict[str, Any]] = []
     seen: set[tuple[Any, ...]] = set()
+    audit_keys: set[tuple[Any, ...]] = set()
     duplicate_count = 0
-    for row in [*audit_rows, *api_rows]:
+    for row in audit_rows:
         key = _trade_merge_key(row)
+        audit_keys.add(key)
         if key in seen:
             duplicate_count += 1
             continue
         seen.add(key)
         merged.append(row)
-    merged.sort(key=lambda item: (int(trade_row_time_ms(item) or 0), trade_row_key(item)))
-    return merged, {
-        "source": "audit+api",
-        "path": str(audit_path),
-        "row_count": len(merged),
+    missing_api_rows: list[dict[str, Any]] = []
+    for row in api_rows:
+        key = _trade_merge_key(row)
+        if key in seen:
+            duplicate_count += 1
+            continue
+        if key not in audit_keys:
+            missing_api_rows.append(row)
+        seen.add(key)
+        merged.append(row)
+    rows = sorted(merged, key=lambda item: (int(trade_row_time_ms(item) or 0), trade_row_key(item)))
+    for row in missing_api_rows:
+        append_jsonl(audit_path, row)
+    source = "audit+api" if audit_rows and api_rows else ("audit" if audit_rows else "api")
+    return rows, {
+        "source": source,
+        "path": str(audit_path) if audit_rows or missing_api_rows else None,
+        "row_count": len(rows),
         "audit_row_count": len(audit_rows),
         "api_row_count": len(api_rows),
-        "merged_row_count": len(merged),
+        "merged_row_count": len(rows),
         "deduped_row_count": duplicate_count,
+        "missing_api_row_count": len(missing_api_rows),
         "start_time": effective_start.isoformat(),
     }
 
@@ -604,7 +687,6 @@ def _load_or_fetch_income_rows(
         limit=0,
         predicate=lambda item: int(income_row_time_ms(item) or 0) >= floor_ms,
     )
-
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
     try:
@@ -622,46 +704,88 @@ def _load_or_fetch_income_rows(
             row_time_ms=income_row_time_ms,
             row_key=income_row_key,
         )
-    except Exception:
-        if not audit_rows:
-            raise
-        return audit_rows, {
-            "source": "audit",
-            "path": str(audit_path),
-            "row_count": len(audit_rows),
-            "start_time": effective_start.isoformat(),
-            "api_error": "fetch_failed",
-        }
-
-    if not audit_rows:
-        return api_rows, {
-            "source": "api",
-            "path": None,
-            "row_count": len(api_rows),
-            "start_time": effective_start.isoformat(),
-        }
-
+    except Exception as exc:
+        if audit_rows:
+            return audit_rows, {
+                "source": "audit",
+                "path": str(audit_path),
+                "row_count": len(audit_rows),
+                "start_time": effective_start.isoformat(),
+                "api_error": f"{type(exc).__name__}: {exc}",
+            }
+        raise
     merged: list[dict[str, Any]] = []
     seen: set[tuple[int, str]] = set()
+    audit_keys: set[tuple[int, str]] = set()
     duplicate_count = 0
-    for row in [*audit_rows, *api_rows]:
+    for row in audit_rows:
         key = (int(income_row_time_ms(row) or 0), income_row_key(row))
+        audit_keys.add(key)
         if key in seen:
             duplicate_count += 1
             continue
         seen.add(key)
         merged.append(row)
-    merged.sort(key=lambda item: (int(income_row_time_ms(item) or 0), income_row_key(item)))
-    return merged, {
-        "source": "audit+api",
-        "path": str(audit_path),
-        "row_count": len(merged),
+    missing_api_rows: list[dict[str, Any]] = []
+    for row in api_rows:
+        key = (int(income_row_time_ms(row) or 0), income_row_key(row))
+        if key in seen:
+            duplicate_count += 1
+            continue
+        if key not in audit_keys:
+            missing_api_rows.append(row)
+        seen.add(key)
+        merged.append(row)
+    rows = sorted(merged, key=lambda item: (int(income_row_time_ms(item) or 0), income_row_key(item)))
+    for row in missing_api_rows:
+        append_jsonl(audit_path, row)
+    source = "audit+api" if audit_rows and api_rows else ("audit" if audit_rows else "api")
+    return rows, {
+        "source": source,
+        "path": str(audit_path) if audit_rows or missing_api_rows else None,
+        "row_count": len(rows),
         "audit_row_count": len(audit_rows),
         "api_row_count": len(api_rows),
-        "merged_row_count": len(merged),
+        "merged_row_count": len(rows),
         "deduped_row_count": duplicate_count,
+        "missing_api_row_count": len(missing_api_rows),
         "start_time": effective_start.isoformat(),
     }
+
+
+def _merge_time_keyed_rows(
+    *,
+    audit_rows: list[dict[str, Any]],
+    api_rows: list[dict[str, Any]],
+    row_time_ms: Any,
+    row_key: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows_by_identity: dict[tuple[int, str], dict[str, Any]] = {}
+    audit_identities: set[tuple[int, str]] = set()
+    for item in audit_rows:
+        ts_ms = int(row_time_ms(item) or 0)
+        key = str(row_key(item) or "").strip()
+        if ts_ms <= 0 or not key:
+            continue
+        identity = (ts_ms, key)
+        audit_identities.add(identity)
+        rows_by_identity[identity] = item
+
+    missing_api_rows: list[dict[str, Any]] = []
+    for item in api_rows:
+        ts_ms = int(row_time_ms(item) or 0)
+        key = str(row_key(item) or "").strip()
+        if ts_ms <= 0 or not key:
+            continue
+        identity = (ts_ms, key)
+        if identity not in audit_identities:
+            missing_api_rows.append(item)
+        rows_by_identity.setdefault(identity, item)
+
+    rows = list(rows_by_identity.items())
+    rows.sort(key=lambda pair: (pair[0][0], pair[0][1]))
+    missing_api_rows.sort(key=lambda item: (int(row_time_ms(item) or 0), str(row_key(item) or "")))
+    return [item for _, item in rows], missing_api_rows
 
 
 def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: Any | None = None) -> dict[str, Any]:
@@ -682,6 +806,7 @@ def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: An
     cumulative_notional = 0.0
     cumulative_realized = 0.0
     cumulative_net = 0.0
+    daily_rows: dict[str, dict[str, Any]] = {}
 
     for item in sorted_trades:
         price = _safe_float(item.get("price"))
@@ -713,6 +838,39 @@ def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: An
         if _truthy(item.get("maker")):
             maker_count += 1
         ts_ms = int(item.get("time", 0) or 0)
+        trade_day = (
+            datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            if ts_ms
+            else ""
+        )
+        if trade_day:
+            daily = daily_rows.setdefault(
+                trade_day,
+                {
+                    "date": trade_day,
+                    "timezone": "UTC+0",
+                    "trade_count": 0,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "gross_notional": 0.0,
+                    "buy_notional": 0.0,
+                    "sell_notional": 0.0,
+                    "realized_pnl": 0.0,
+                    "commission": 0.0,
+                    "net_realized": 0.0,
+                },
+            )
+            daily["trade_count"] += 1
+            daily["gross_notional"] += trade_notional
+            daily["realized_pnl"] += trade_realized
+            daily["commission"] += trade_commission
+            daily["net_realized"] += trade_realized - trade_commission
+            if side == "BUY":
+                daily["buy_count"] += 1
+                daily["buy_notional"] += trade_notional
+            elif side == "SELL":
+                daily["sell_count"] += 1
+                daily["sell_notional"] += trade_notional
         series.append(
             {
                 "ts": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat() if ts_ms else None,
@@ -733,6 +891,7 @@ def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: An
         "realized_pnl": realized_pnl,
         "commission": commission,
         "commission_raw_by_asset": commission_raw_by_asset,
+        "daily_volume_rows": [daily_rows[key] for key in sorted(daily_rows, reverse=True)],
         "series": series[-240:],
         "recent_trades": [
             {
@@ -2308,7 +2467,19 @@ def _build_monitor_snapshot_uncached(
     )
     session_start, session_last = _build_session_window(events, submit_report)
     session_start = _min_dt(session_start, event_start)
-    stats_start = competition_start or session_start
+    audit_trade_start, _audit_trade_last = _jsonl_time_bounds(audit_paths["trade_audit"], trade_row_time_ms)
+    audit_income_start, _audit_income_last = _jsonl_time_bounds(audit_paths["income_audit"], income_row_time_ms)
+    stats_start, stats_anchor = _resolve_monitor_stats_anchor(
+        anchor_path=_monitor_anchor_path(audit_paths),
+        symbol=normalized_symbol,
+        candidates=[
+            ("competition_start", competition_start),
+            ("audit_trade_start", audit_trade_start),
+            ("audit_income_start", audit_income_start),
+            ("session_start", session_start),
+        ],
+    )
+    stats_start = stats_start or competition_start or session_start
     session_last = _max_dt(session_last, event_last)
     loop_summary = summarize_loop_events(events)
     runner = runner_process or read_symbol_runner_process(normalized_symbol)
@@ -2340,6 +2511,7 @@ def _build_monitor_snapshot_uncached(
             "paths": {key: str(path) for key, path in audit_paths.items()},
             "trade_source": None,
             "income_source": None,
+            "stats_anchor": stats_anchor,
             "trade_row_count": 0,
             "income_row_count": 0,
             "order_event_count": _count_monitor_audit_lines(audit_paths["order_audit"]),
@@ -2441,12 +2613,22 @@ def _build_monitor_snapshot_uncached(
             snapshot["warnings"].append(f"income_refresh_failed: {type(exc).__name__}: {exc}")
         trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
         income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
+        stats_start, stats_anchor = _resolve_monitor_stats_anchor(
+            anchor_path=_monitor_anchor_path(audit_paths),
+            symbol=normalized_symbol,
+            candidates=[
+                ("competition_start", competition_start),
+                ("trade_start", trade_start),
+                ("income_start", income_start),
+                ("session_start", session_start),
+            ],
+        )
         session_start = _min_dt(stats_start, trade_start, income_start)
-        stats_start = competition_start or session_start
         session_last = _max_dt(session_last, trade_last, income_last)
         snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
         snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
         snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
+        snapshot["audit"]["stats_anchor"] = stats_anchor
         commission_converter = _build_commission_converter(user_trades)
         trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
         income_summary = summarize_income(income_rows)

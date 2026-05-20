@@ -3945,6 +3945,11 @@ class WebSecurityTests(unittest.TestCase):
                 "inventory_pause_long_probe_scale": 0.2,
                 "inventory_pause_short_probe_scale": 0.25,
                 "inventory_pause_timeout_seconds": 75.0,
+                "loss_reentry_guard_enabled": True,
+                "loss_reentry_cooldown_seconds": 120.0,
+                "loss_reentry_cost_buffer_steps": 2.0,
+                "loss_reentry_trend_guard_enabled": True,
+                "loss_reentry_trend_return_ratio": 0.0015,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -3978,6 +3983,14 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--inventory-pause-short-probe-scale", command)
         self.assertIn("--inventory-pause-timeout-seconds", command)
         self.assertIn("75.0", command)
+        self.assertIn("--loss-reentry-guard-enabled", command)
+        self.assertIn("--loss-reentry-cooldown-seconds", command)
+        self.assertIn("120.0", command)
+        self.assertIn("--loss-reentry-cost-buffer-steps", command)
+        self.assertIn("2.0", command)
+        self.assertIn("--loss-reentry-trend-guard-enabled", command)
+        self.assertIn("--loss-reentry-trend-return-ratio", command)
+        self.assertIn("0.0015", command)
 
     def test_build_runner_command_includes_exposure_escalation_arguments(self) -> None:
         command = _build_runner_command(
@@ -4575,6 +4588,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("async function loadRunningConfigToEditor", MONITOR_PAGE)
         self.assertIn("小时损益拆解", MONITOR_PAGE)
         self.assertIn('id="hourly_body"', MONITOR_PAGE)
+        self.assertIn("row.loss_per_10k", MONITOR_PAGE)
         self.assertIn('id="custom_grid_name"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_preview_btn"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_save_btn"', MONITOR_PAGE)
@@ -4594,7 +4608,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("硬上限", MONITOR_PAGE)
 
     def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT", "PHAROSUSDT"]', MONITOR_PAGE)
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"]', MONITOR_PAGE)
+
+    def test_monitor_page_reward_targets_render_current_segment_boundary(self) -> None:
+        self.assertIn("zone_moves", MONITOR_PAGE)
+        self.assertIn("当前档", MONITOR_PAGE)
+        self.assertIn("边界 ${targetValueText} USDT", MONITOR_PAGE)
 
     def test_monitor_page_keeps_raw_json_in_advanced_panel(self) -> None:
         self.assertIn('id="runner_params_advanced_panel"', MONITOR_PAGE)
@@ -4651,7 +4670,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"]', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"]', STRATEGIES_PAGE)
 
     def test_monitor_page_ordiusdc_ping_pong_includes_adaptive_step_amplitude_controls(self) -> None:
         self.assertIn("adaptive_step_1m_amplitude_ratio: 0.00375", MONITOR_PAGE)

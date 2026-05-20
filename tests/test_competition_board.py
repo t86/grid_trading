@@ -574,7 +574,35 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(board["threshold_unit"], "USDT")
         self.assertEqual([segment["end_rank"] for segment in board.get("segments", [])], [1, 2, 3, 4, 5, 20, 50, 200])
 
-    def test_aigensyn_reward_volume_targets_use_user_provided_rank_segments(self) -> None:
+    def test_resolve_active_competition_board_falls_back_to_hinted_bill_board(self) -> None:
+        board = resolve_active_competition_board(
+            "BILLUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 15, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "BILL")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["resource_id"], 54211)
+        self.assertEqual(board["activity_start_at"], "2026-05-08T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(len(board.get("segments", [])), 8)
+
+    def test_resolve_active_competition_board_falls_back_to_hinted_pharos_board(self) -> None:
+        board = resolve_active_competition_board(
+            "PHAROSUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 20, 2, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "PHAROS")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["activity_start_at"], "2026-05-14T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-05-21T07:59:00+08:00")
+
+    def test_build_reward_volume_targets_works_for_hinted_aigensyn_board(self) -> None:
         board = resolve_active_competition_board(
             "AIGENSYNUSDT",
             "futures",

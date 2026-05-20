@@ -8,6 +8,7 @@ from typing import Any
 SYMBOL_LISTS_PATH = Path("output/symbol_lists.json")
 DEFAULT_SYMBOL_LISTS: dict[str, list[str]] = {
     "monitor": [
+        "PHAROSUSDT",
         "BILLUSDT",
         "SOONUSDT",
         "CHIPUSDT",
@@ -20,9 +21,9 @@ DEFAULT_SYMBOL_LISTS: dict[str, list[str]] = {
         "ORDIUSDC",
         "TRUMPUSDC",
         "AIGENSYNUSDT",
-        "PHAROSUSDT",
     ],
     "competition": [
+        "PHAROSUSDT",
         "BILLUSDT",
         "SOONUSDT",
         "CHIPUSDT",

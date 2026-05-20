@@ -28,6 +28,9 @@ class SymbolListsTests(unittest.TestCase):
     def test_default_symbol_lists_include_sprint_symbols(self) -> None:
         loaded = load_symbol_lists(self.path)
         for symbol in (
+            "PHAROSUSDT",
+            "BILLUSDT",
+            "AIGENSYNUSDT",
             "CHIPUSDT",
             "BTCUSDC",
             "ETHUSDC",
@@ -42,7 +45,6 @@ class SymbolListsTests(unittest.TestCase):
             self.assertIn(symbol, loaded["monitor"])
             self.assertIn(symbol, loaded["competition"])
         self.assertIn("PHAROSUSDT", loaded["monitor"])
-        self.assertNotIn("PHAROSUSDT", loaded["competition"])
 
     def test_set_symbol_list_normalizes_and_deduplicates(self) -> None:
         symbols = set_symbol_list("monitor", [" soonusdt ", "soonusdt", "SOONUSDT"], self.path)
