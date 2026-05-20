@@ -1028,6 +1028,37 @@ def resolve_volatility_entry_pause(
     return report
 
 
+def apply_volatility_entry_pause_controls(
+    *,
+    controls: dict[str, Any],
+    volatility_entry_pause: dict[str, Any],
+    loss_recovery_brush: dict[str, Any],
+    elastic_volume: dict[str, Any],
+) -> None:
+    if not volatility_entry_pause.get("active"):
+        return
+    if bool(elastic_volume.get("enabled") and elastic_volume.get("applied")):
+        volatility_entry_pause["entry_pause_absorbed_by_elastic"] = True
+        return
+
+    entry_pause_reason = volatility_entry_pause.get("reason") or "active"
+    recovery_active = bool(loss_recovery_brush.get("active"))
+    recovery_side = str(loss_recovery_brush.get("side") or "").lower()
+    bypass_buy_pause = recovery_active and recovery_side == "short"
+    bypass_short_pause = recovery_active and recovery_side == "long"
+    if bypass_buy_pause or bypass_short_pause:
+        volatility_entry_pause["loss_recovery_brush_bypass_side"] = "BUY" if bypass_buy_pause else "SELL"
+
+    if not bypass_buy_pause:
+        controls["buy_paused"] = True
+        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+        controls["pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+    if not bypass_short_pause:
+        controls["short_paused"] = True
+        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
+        controls["short_pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+
+
 def _parse_rescue_guard_time(value: Any) -> datetime | None:
     raw = str(value or "").strip()
     if not raw:
@@ -14713,17 +14744,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         controls["pause_reasons"].append(f"unrealized_loss_entry_guard: {guard_reason}")
         controls["short_pause_reasons"].append(f"unrealized_loss_entry_guard: {guard_reason}")
 
-    elastic_absorbs_volatility_entry_pause = bool(elastic_volume.get("enabled") and elastic_volume.get("applied"))
-    if volatility_entry_pause.get("active") and not elastic_absorbs_volatility_entry_pause:
-        entry_pause_reason = volatility_entry_pause.get("reason") or "active"
-        controls["buy_paused"] = True
-        controls["short_paused"] = True
-        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
-        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
-        controls["pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
-        controls["short_pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
-    elif volatility_entry_pause.get("active"):
-        volatility_entry_pause["entry_pause_absorbed_by_elastic"] = True
+    apply_volatility_entry_pause_controls(
+        controls=controls,
+        volatility_entry_pause=volatility_entry_pause,
+        loss_recovery_brush=loss_recovery_brush,
+        elastic_volume=elastic_volume,
+    )
     if anti_chase_entry_guard.get("block_long_entries"):
         controls["buy_paused"] = True
         controls["pause_reasons"] = list(controls.get("pause_reasons", []))

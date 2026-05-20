@@ -92,6 +92,7 @@ from grid_optimizer.loop_runner import (
     resolve_market_bias_regime_switch,
     resolve_adaptive_step_price,
     resolve_volatility_entry_pause,
+    apply_volatility_entry_pause_controls,
     resolve_interval_locked_center_price,
     resolve_inventory_pause_timeout_state,
     resolve_short_threshold_timeout_state,
@@ -268,6 +269,28 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(recovered["active"])
         self.assertFalse(recovered["inventory_gate_active"])
         self.assertTrue(recovered["tiny_inventory_ignored"])
+
+    def test_apply_volatility_entry_pause_allows_loss_recovery_brush_reduce_side(self) -> None:
+        controls = {
+            "buy_paused": False,
+            "short_paused": False,
+            "pause_reasons": [],
+            "short_pause_reasons": [],
+        }
+        volatility_entry_pause = {"active": True, "reason": "fast move"}
+
+        apply_volatility_entry_pause_controls(
+            controls=controls,
+            volatility_entry_pause=volatility_entry_pause,
+            loss_recovery_brush={"active": True, "side": "short"},
+            elastic_volume={},
+        )
+
+        self.assertFalse(controls["buy_paused"])
+        self.assertTrue(controls["short_paused"])
+        self.assertEqual(controls["pause_reasons"], [])
+        self.assertEqual(controls["short_pause_reasons"], ["volatility_entry_pause: fast move"])
+        self.assertEqual(volatility_entry_pause["loss_recovery_brush_bypass_side"], "BUY")
 
     def test_remove_take_profit_exit_orders_keeps_active_delever(self) -> None:
         plan = {
