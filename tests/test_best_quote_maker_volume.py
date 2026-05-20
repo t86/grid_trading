@@ -304,6 +304,11 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
         self.assertLess(plan["sell_orders"][0]["notional"], plan["buy_orders"][0]["notional"])
+        self.assertEqual(plan["buy_orders"][1]["role"], "best_quote_reduce_short")
+        self.assertTrue(plan["buy_orders"][1]["paired_entry_reduce"])
+        self.assertTrue(plan["buy_orders"][1]["force_reduce_only"])
+        self.assertLess(plan["buy_orders"][1]["price"], plan["sell_orders"][0]["price"])
+        self.assertAlmostEqual(plan["buy_orders"][1]["notional"], plan["sell_orders"][0]["notional"], delta=1.0)
 
     def test_hedge_mode_reduces_short_side_when_short_is_above_soft_band(self) -> None:
         plan = build_best_quote_maker_volume_plan(

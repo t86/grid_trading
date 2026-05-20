@@ -179,6 +179,64 @@ def _build_entry_ladder(
     return []
 
 
+def _build_paired_reduce_orders_for_entries(
+    *,
+    entries: list[dict[str, Any]],
+    inputs: BestQuoteMakerVolumeInputs,
+    bid_price: float,
+    ask_price: float,
+    available_notional: float,
+    position_side: str,
+) -> list[dict[str, Any]]:
+    if not entries or available_notional <= 0:
+        return []
+    tick_gap = _tick_gap(inputs.tick_size, 1)
+    ladder_gap = max(_safe_float(inputs.entry_ladder_spacing), tick_gap)
+    remaining = max(_safe_float(available_notional), 0.0)
+    orders: list[dict[str, Any]] = []
+    for entry in entries:
+        if remaining <= 0:
+            break
+        entry_side = str(entry.get("side", "")).upper().strip()
+        entry_price = _safe_float(entry.get("price"))
+        entry_notional = min(_safe_float(entry.get("notional")), remaining)
+        if entry_side == "SELL" and str(entry.get("position_side", "")).upper().strip() == "SHORT":
+            paired_price = min(
+                _price_with_gap(entry_price, ladder_gap, -1),
+                _price_with_gap(bid_price, tick_gap, -1),
+            )
+            order = _build_order(
+                side="BUY",
+                price=paired_price,
+                notional=entry_notional,
+                role="best_quote_reduce_short",
+                inputs=inputs,
+                position_side=position_side,
+                force_reduce_only=True,
+            )
+        elif entry_side == "BUY" and str(entry.get("position_side", "")).upper().strip() == "LONG":
+            paired_price = max(
+                _price_with_gap(entry_price, ladder_gap, 1),
+                _price_with_gap(ask_price, tick_gap, 1),
+            )
+            order = _build_order(
+                side="SELL",
+                price=paired_price,
+                notional=entry_notional,
+                role="best_quote_reduce_long",
+                inputs=inputs,
+                position_side=position_side,
+                force_reduce_only=True,
+            )
+        else:
+            order = None
+        if order is not None:
+            order["paired_entry_reduce"] = True
+            orders.append(order)
+            remaining -= _safe_float(order.get("notional"))
+    return orders
+
+
 def build_best_quote_maker_volume_plan(
     *,
     config: BestQuoteMakerVolumeConfig,
@@ -687,16 +745,25 @@ def build_best_quote_maker_volume_plan(
             and inventory_bias_report["side"] == "short"
             and sell_side_notional > 0
         ):
-            sell_orders.extend(
-                _build_entry_ladder(
-                    side="SELL",
-                    anchor_price=ask,
-                    base_gap=gap,
-                    total_notional=sell_side_notional,
-                    slots=max_entry_orders_per_side,
-                    role="best_quote_entry_short",
+            short_entries = _build_entry_ladder(
+                side="SELL",
+                anchor_price=ask,
+                base_gap=gap,
+                total_notional=sell_side_notional,
+                slots=max_entry_orders_per_side,
+                role="best_quote_entry_short",
+                inputs=inputs,
+                position_side=short_entry_position_side,
+            )
+            sell_orders.extend(short_entries)
+            buy_orders.extend(
+                _build_paired_reduce_orders_for_entries(
+                    entries=short_entries,
                     inputs=inputs,
-                    position_side=short_entry_position_side,
+                    bid_price=bid,
+                    ask_price=ask,
+                    available_notional=max(short_notional - sum(_safe_float(o.get("notional")) for o in buy_orders), 0.0),
+                    position_side=reduce_short_position_side,
                 )
             )
 
