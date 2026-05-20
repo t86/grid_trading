@@ -48,6 +48,7 @@ from grid_optimizer.loop_runner import (
     _shift_custom_grid_bounds,
     _run_periodic_reconcile,
     _cap_best_quote_profitable_inventory_exit_offset,
+    _separate_paired_best_quote_reduce_orders,
     prioritize_inventory_reducing_place_orders,
     apply_execution_request_budget_to_actions,
     StartupProtectionError,
@@ -513,6 +514,38 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["adjusted_buy_orders"], 0)
         self.assertEqual(plan["buy_orders"][0]["price"], 0.6012)
         self.assertNotIn("profitable_inventory_exit_offset_cap", plan["buy_orders"][0])
+
+    def test_paired_best_quote_reduce_is_separated_from_main_reduce_bucket(self) -> None:
+        plan = {
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.6045,
+                    "qty": 39.0,
+                    "notional": 23.5755,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                },
+                {
+                    "side": "BUY",
+                    "price": 0.6045,
+                    "qty": 9.0,
+                    "notional": 5.4405,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "paired_entry_reduce": True,
+                },
+            ],
+            "sell_orders": [],
+        }
+
+        report = _separate_paired_best_quote_reduce_orders(plan=plan, tick_size=0.0001)
+
+        self.assertEqual(report["adjusted_buy_orders"], 1)
+        self.assertEqual(plan["buy_orders"][0]["price"], 0.6045)
+        self.assertEqual(plan["buy_orders"][1]["price"], 0.6044)
+        self.assertTrue(plan["buy_orders"][1]["paired_reduce_price_separated"])
+        self.assertAlmostEqual(plan["buy_orders"][1]["notional"], 9.0 * 0.6044)
 
     @patch("grid_optimizer.loop_runner.resolve_adaptive_step_price")
     @patch("grid_optimizer.loop_runner.assess_market_guard")

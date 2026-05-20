@@ -840,6 +840,61 @@ def _cap_best_quote_profitable_inventory_exit_offset(
     return report
 
 
+def _separate_paired_best_quote_reduce_orders(
+    *,
+    plan: dict[str, Any],
+    tick_size: float | None,
+) -> dict[str, Any]:
+    tick = _safe_float(tick_size)
+    report = {"adjusted_buy_orders": 0, "adjusted_sell_orders": 0}
+    if tick <= 0:
+        return report
+
+    def _position_side(order: dict[str, Any]) -> str:
+        return str(order.get("position_side", order.get("positionSide", "BOTH"))).upper().strip() or "BOTH"
+
+    def _separate(bucket_name: str, side: str, direction: int) -> int:
+        orders = [dict(item) for item in plan.get(bucket_name, []) if isinstance(item, dict)]
+        if not orders:
+            return 0
+        occupied = {
+            (
+                _order_role(order),
+                str(order.get("side", "")).upper().strip(),
+                _position_side(order),
+                _safe_float(order.get("price")),
+            )
+            for order in orders
+            if not bool(order.get("paired_entry_reduce")) and _safe_float(order.get("price")) > 0
+        }
+        adjusted = 0
+        separated: list[dict[str, Any]] = []
+        for order in orders:
+            if not bool(order.get("paired_entry_reduce")):
+                separated.append(order)
+                continue
+            role = _order_role(order)
+            order_side = str(order.get("side", "")).upper().strip()
+            position_side = _position_side(order)
+            price = _safe_float(order.get("price"))
+            original_price = price
+            while (role, order_side, position_side, price) in occupied and price > 0:
+                price = _round_order_price(max(price + tick * direction, 0.0), tick_size, side)
+            if price > 0 and abs(price - original_price) > 1e-12:
+                order["price"] = price
+                order["notional"] = _safe_float(order.get("qty")) * price
+                order["paired_reduce_price_separated"] = True
+                adjusted += 1
+            occupied.add((role, order_side, position_side, price))
+            separated.append(order)
+        plan[bucket_name] = separated
+        return adjusted
+
+    report["adjusted_buy_orders"] = _separate("buy_orders", "BUY", -1)
+    report["adjusted_sell_orders"] = _separate("sell_orders", "SELL", 1)
+    return report
+
+
 def resolve_volatility_entry_pause(
     *,
     adaptive_step: dict[str, Any],
@@ -15173,6 +15228,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             desired_orders=desired_orders,
             sticky_roles={"best_quote_reduce_long", "best_quote_reduce_short"},
         )
+        _sync_plan_orders_from_desired_orders(plan, desired_orders)
+        best_quote_paired_reduce_separation = _separate_paired_best_quote_reduce_orders(
+            plan=plan,
+            tick_size=symbol_info.get("tick_size"),
+        )
+        best_quote_maker_volume["paired_reduce_separation"] = dict(best_quote_paired_reduce_separation)
+        desired_orders = [
+            *plan["buy_orders"],
+            *plan["sell_orders"],
+        ]
         desired_orders = preserve_sticky_entry_orders(
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
