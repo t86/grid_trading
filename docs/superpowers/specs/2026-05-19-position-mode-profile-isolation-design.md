@@ -19,6 +19,7 @@ The key rule is:
 One repository supports both modes.
 Each strategy profile requires exactly one mode.
 The runner never silently adapts a profile to the other mode.
+The operational default is one-way mode unless a profile explicitly opts into hedge mode.
 ```
 
 ## Background
@@ -54,7 +55,9 @@ Manual account mode switching remains an operational step. The software should v
 
 Use profile-level mode isolation.
 
-Each runner profile declares:
+Because the current production accounts are one-way accounts, the default required mode is `one_way`. Existing legacy profiles that do not yet declare `required_position_mode` are treated as one-way profiles, and the report should mark that the mode was defaulted. Hedge profiles must opt in explicitly with `required_position_mode=hedge`.
+
+New or migrated runner profiles should declare:
 
 ```json
 {
@@ -78,7 +81,8 @@ The runner validates account mode before planning and before submitting:
 
 - `required_position_mode=one_way` requires `dualSidePosition=false`
 - `required_position_mode=hedge` requires `dualSidePosition=true`
-- missing or unknown mode requirement is invalid when strict profile schema is enabled
+- missing mode requirement defaults to `one_way` for legacy compatibility and should be reported as defaulted
+- unknown mode requirement is invalid when strict profile schema is enabled
 
 The strategy editor and monitor should show the current account mode and label presets as compatible or incompatible.
 
@@ -267,7 +271,9 @@ allowed_params
 Strict schema behavior:
 
 - incompatible parameters are pruned or rejected according to existing strict rules
-- missing `required_position_mode` is an error for strict profiles
+- missing `required_position_mode` defaults to `one_way` for existing legacy profiles
+- hedge profiles must explicitly declare `required_position_mode=hedge`
+- new strict profiles should declare `required_position_mode` even when they are one-way
 - a one-way profile cannot enable hedge-only fields
 - a hedge profile cannot enable synthetic-ledger-only fields
 - ignored parameters are reported in the loop summary and strategy editor status
@@ -277,12 +283,13 @@ Strict schema behavior:
 Plan generation:
 
 1. Load profile schema.
-2. Fetch or read cached account position mode.
-3. Validate `required_position_mode`.
-4. Apply strict profile schema.
-5. Build plan using the selected strategy mode.
-6. Compile order intents according to profile mode.
-7. Write plan report with mode, required mode, and compatibility status.
+2. Resolve `required_position_mode`, defaulting missing legacy profiles to `one_way`.
+3. Fetch or read cached account position mode.
+4. Validate `required_position_mode`.
+5. Apply strict profile schema.
+6. Build plan using the selected strategy mode.
+7. Compile order intents according to profile mode.
+8. Write plan report with mode, required mode, defaulted flag, and compatibility status.
 
 Submit flow:
 
@@ -301,12 +308,14 @@ The lightweight strategy editor should show:
 
 - current account position mode
 - selected profile required mode
+- whether the required mode was explicitly declared or defaulted to one-way
 - compatibility status
 - disabled run/save warnings for incompatible profiles
 - per-profile parameter explanations
 
 Preset list behavior:
 
+- one-way presets appear first because the current accounts are one-way by default
 - compatible presets appear normally
 - incompatible presets are still visible but marked `模式不匹配`
 - loading an incompatible preset is allowed for inspection
@@ -335,11 +344,12 @@ First slice should not migrate every strategy.
 
 Implement:
 
-1. profile-level `required_position_mode`
+1. profile-level `required_position_mode` with legacy default `one_way`
 2. runner and submitter compatibility validation
 3. strategy editor compatibility display
-4. one clean AIGENSYN hedge BQ sprint profile
-5. tests proving one-way profiles are blocked on hedge accounts and hedge profiles are blocked on one-way accounts
+4. one clean AIGENSYN one-way BQ recover profile as the production-safe default
+5. one clean AIGENSYN hedge BQ sprint profile as explicit opt-in
+6. tests proving one-way profiles are blocked on hedge accounts and hedge profiles are blocked on one-way accounts
 
 Defer:
 
@@ -353,7 +363,8 @@ Defer:
 Unit tests:
 
 - schema returns required mode for known one-way and hedge profiles
-- strict schema rejects missing mode requirement
+- schema defaults missing legacy mode requirement to one-way and reports it
+- strict schema rejects unknown mode requirement
 - order intent compiler maps `open_long`, `close_long`, `open_short`, `close_short` correctly
 - hedge compiler omits `reduceOnly`
 - one-way compiler uses `reduceOnly` for close intents
@@ -380,6 +391,7 @@ Manual verification:
 The feature is successful when:
 
 - one-way and hedge profiles cannot accidentally run in the wrong account mode
+- one-way remains the default for existing accounts and legacy profiles
 - strategy editor explains mode compatibility before start
 - AIGENSYN has separate one-way recover and hedge sprint profiles
 - hedge orders never send `reduceOnly`
