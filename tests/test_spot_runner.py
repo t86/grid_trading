@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import grid_optimizer.web as web
 from grid_optimizer.web import (
     SPOT_RUNNER_DEFAULT_CONFIG,
     SPOT_RUNNER_PAGE,
@@ -571,6 +573,56 @@ class SpotRunnerTests(unittest.TestCase):
                 self.assertEqual(result["cleanup"]["canceled"], 2)
                 self.assertFalse(state_path.exists())
                 self.assertEqual(pid_path.read_text(encoding="utf-8"), "4321")
+
+    @patch("grid_optimizer.web.time.sleep")
+    @patch("grid_optimizer.web.subprocess.Popen")
+    @patch("grid_optimizer.web._build_spot_runner_command")
+    @patch("grid_optimizer.web._save_spot_runner_control_config")
+    @patch("grid_optimizer.web._cancel_spot_strategy_orders")
+    @patch("grid_optimizer.web._read_spot_runner_process_for_symbol")
+    def test_start_spot_runner_process_prefers_repo_src_over_runtime_src(
+        self,
+        mock_read_runner,
+        mock_cancel_orders,
+        _mock_save_config,
+        mock_build_command,
+        mock_popen,
+        _mock_sleep,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp_path = Path(tmpdir)
+            runtime_dir = tmp_path / "runtime"
+            runtime_dir.mkdir()
+            log_path = tmp_path / "spot_runner.log"
+            pid_path = tmp_path / "spot_runner.pid"
+
+            config = dict(SPOT_RUNNER_DEFAULT_CONFIG)
+            config.update(
+                {
+                    "symbol": "ETHU",
+                    "reset_state": False,
+                    "state_path": str(tmp_path / "spot_state.json"),
+                    "summary_jsonl": str(tmp_path / "spot_events.jsonl"),
+                }
+            )
+            mock_read_runner.side_effect = [
+                {"configured": False, "pid": None, "is_running": False, "args": None, "config": {}},
+                {"configured": True, "pid": 4321, "is_running": True, "args": None, "config": config},
+            ]
+            mock_cancel_orders.return_value = {"canceled": 0}
+            mock_build_command.return_value = ["python3", "-m", "grid_optimizer.spot_loop_runner"]
+            mock_popen.return_value = MagicMock(pid=4321)
+
+            with patch("grid_optimizer.web.Path.cwd", return_value=runtime_dir), patch(
+                "grid_optimizer.web._spot_runner_log_path", return_value=log_path
+            ), patch("grid_optimizer.web._spot_runner_pid_path", return_value=pid_path), patch.dict(
+                os.environ, {"PYTHONPATH": str(runtime_dir / "src")}, clear=False
+            ):
+                _start_spot_runner_process(config)
+
+            env = mock_popen.call_args.kwargs["env"]
+            first_pythonpath = env["PYTHONPATH"].split(os.pathsep)[0]
+            self.assertEqual(first_pythonpath, str(Path(web.__file__).resolve().parents[1]))
 
 
 if __name__ == "__main__":

@@ -10875,7 +10875,7 @@ def _start_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     pid_path = _runner_pid_path(symbol)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    src_path = str((Path.cwd() / "src").resolve())
+    src_path = str(Path(__file__).resolve().parents[1])
     current_pythonpath = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = src_path if not current_pythonpath else f"{src_path}{os.pathsep}{current_pythonpath}"
 
@@ -10999,7 +10999,7 @@ def _start_flatten_process(config: dict[str, Any]) -> dict[str, Any]:
     pid_path = _flatten_pid_path(symbol)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    src_path = str((Path.cwd() / "src").resolve())
+    src_path = str(Path(__file__).resolve().parents[1])
     current_pythonpath = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = src_path if not current_pythonpath else f"{src_path}{os.pathsep}{current_pythonpath}"
     command = _build_flatten_command(desired)
@@ -13537,7 +13537,7 @@ def _start_spot_runner_process(config: dict[str, Any]) -> dict[str, Any]:
     pid_path = _spot_runner_pid_path(symbol)
     log_path.parent.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
-    src_path = str((Path.cwd() / "src").resolve())
+    src_path = str(Path(__file__).resolve().parents[1])
     current_pythonpath = env.get("PYTHONPATH", "").strip()
     env["PYTHONPATH"] = src_path if not current_pythonpath else f"{src_path}{os.pathsep}{current_pythonpath}"
 
