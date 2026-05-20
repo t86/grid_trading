@@ -710,7 +710,6 @@ class SemiAutoPlanTests(unittest.TestCase):
                 "price": "0.6015",
                 "origQty": "53",
                 "positionSide": "SHORT",
-                "reduceOnly": True,
             }
         ]
         desired = [

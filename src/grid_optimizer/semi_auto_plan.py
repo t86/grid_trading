@@ -2185,6 +2185,10 @@ def preserve_sticky_exit_orders(
             return role
         side = str(order.get("side", "")).upper().strip()
         position_side = _position_side(order)
+        if side == "BUY" and position_side == "SHORT":
+            return "best_quote_reduce_short"
+        if side == "SELL" and position_side == "LONG":
+            return "best_quote_reduce_long"
         if _truthy(order.get("reduceOnly", order.get("reduce_only", order.get("force_reduce_only")))):
             if side == "BUY" and position_side == "SHORT":
                 return "best_quote_reduce_short"
