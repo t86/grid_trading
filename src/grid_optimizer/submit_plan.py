@@ -1066,6 +1066,51 @@ def apply_hard_loss_rescue_entry_guard_to_actions(
     return result
 
 
+def apply_loss_reduce_reentry_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+) -> dict[str, Any]:
+    guard = plan_report.get("loss_reduce_reentry_guard")
+    if not isinstance(guard, dict) or not bool(guard.get("active")):
+        return actions
+
+    block_long_entries = bool(guard.get("block_long_entries"))
+    block_short_entries = bool(guard.get("block_short_entries"))
+    if not block_long_entries and not block_short_entries:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        entry_side = _entry_side_from_order(order, strategy_mode=strategy_mode)
+        should_drop = (entry_side == "long" and block_long_entries) or (
+            entry_side == "short" and block_short_entries
+        )
+        if should_drop:
+            dropped = dict(order)
+            dropped["loss_reduce_reentry_drop_reason"] = guard.get("reason") or "loss_reduce_reentry_guard_active"
+            dropped_orders.append(dropped)
+        else:
+            kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["loss_reduce_reentry_guard"] = {
+        "enabled": bool(guard.get("enabled", True)),
+        "active": True,
+        "block_long_entries": block_long_entries,
+        "block_short_entries": block_short_entries,
+        "reason": guard.get("reason"),
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     symbol = str(plan_report.get("symbol", "")).upper().strip()
     forced_reduce_orders = [

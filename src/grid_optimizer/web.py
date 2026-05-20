@@ -3804,6 +3804,10 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "adverse_reduce_maker_timeout_seconds": 45.0,
     "adverse_reduce_max_order_notional": 0.0,
     "adverse_reduce_keep_probe_scale": None,
+    "loss_reentry_guard_enabled": False,
+    "loss_reentry_cooldown_seconds": 300.0,
+    "loss_reentry_cost_buffer_steps": 1.0,
+    "loss_reentry_trend_guard_enabled": False,
     "volume_long_v4_flow_sleeve_enabled": False,
     "volume_long_v4_flow_sleeve_trigger_notional": None,
     "volume_long_v4_flow_sleeve_reduce_to_notional": None,
@@ -8796,6 +8800,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "adverse_reduce_maker_timeout_seconds",
         "adverse_reduce_max_order_notional",
         "adverse_reduce_keep_probe_scale",
+        "loss_reentry_cooldown_seconds",
+        "loss_reentry_cost_buffer_steps",
         "volume_long_v4_flow_sleeve_trigger_notional",
         "volume_long_v4_flow_sleeve_reduce_to_notional",
         "volume_long_v4_flow_sleeve_notional",
@@ -8960,6 +8966,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "synthetic_trend_follow_enabled",
         "synthetic_flow_sleeve_enabled",
         "adverse_reduce_enabled",
+        "loss_reentry_guard_enabled",
+        "loss_reentry_trend_guard_enabled",
         "volume_long_v4_flow_sleeve_enabled",
         "exposure_escalation_enabled",
         "hard_loss_forced_reduce_enabled",
@@ -9812,6 +9820,16 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         command.extend(["--adverse-reduce-max-order-notional", str(config["adverse_reduce_max_order_notional"])])
     if config.get("adverse_reduce_keep_probe_scale") is not None:
         command.extend(["--adverse-reduce-keep-probe-scale", str(config["adverse_reduce_keep_probe_scale"])])
+    command.append("--loss-reentry-guard-enabled" if config.get("loss_reentry_guard_enabled", False) else "--no-loss-reentry-guard-enabled")
+    if config.get("loss_reentry_cooldown_seconds") is not None:
+        command.extend(["--loss-reentry-cooldown-seconds", str(config["loss_reentry_cooldown_seconds"])])
+    if config.get("loss_reentry_cost_buffer_steps") is not None:
+        command.extend(["--loss-reentry-cost-buffer-steps", str(config["loss_reentry_cost_buffer_steps"])])
+    command.append(
+        "--loss-reentry-trend-guard-enabled"
+        if config.get("loss_reentry_trend_guard_enabled", False)
+        else "--no-loss-reentry-trend-guard-enabled"
+    )
     if str(config.get("strategy_mode", "")).strip() == "competition_inventory_grid":
         if config.get("first_order_multiplier") is not None:
             command.extend(["--first-order-multiplier", str(config["first_order_multiplier"])])

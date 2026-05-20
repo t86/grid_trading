@@ -99,6 +99,7 @@ from grid_optimizer.loop_runner import (
     resolve_auto_regime_profile,
     resolve_xaut_adaptive_state,
     resolve_anti_chase_entry_guard,
+    resolve_loss_reduce_reentry_guard,
     apply_synthetic_trend_follow_guard,
     apply_entry_permission_gate,
     assess_unrealized_loss_entry_guard,
@@ -106,6 +107,7 @@ from grid_optimizer.loop_runner import (
     sync_synthetic_ledger,
     update_synthetic_order_refs,
 )
+from grid_optimizer.submit_plan import apply_loss_reduce_reentry_guard_to_actions
 from grid_optimizer.semi_auto_plan import (
     build_hedge_micro_grid_plan,
     build_maker_volatility_inventory_plan,
@@ -2128,6 +2130,97 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["bootstrap_orders"], [])
         self.assertEqual(plan["buy_orders"], [])
         self.assertEqual(plan["sell_orders"], [{"side": "SELL", "role": "take_profit_long"}])
+
+    def test_loss_reduce_reentry_guard_blocks_long_rebuy_after_adverse_reduce(self) -> None:
+        now = datetime(2026, 5, 20, 4, 10, tzinfo=timezone.utc)
+        state: dict[str, object] = {}
+
+        guard = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={
+                "enabled": True,
+                "long_active": True,
+                "placed_reduce_orders": 1,
+                "forced_reduce_orders": [{"side": "SELL", "price": 0.5660}],
+            },
+            hard_loss_forced_reduce={},
+            current_long_notional=190.0,
+            current_short_notional=0.0,
+            mid_price=0.5658,
+            effective_step_price=0.0001,
+            now=now,
+            cooldown_seconds=300.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertTrue(guard["active"])
+        self.assertTrue(guard["block_long_entries"])
+        self.assertFalse(guard["block_short_entries"])
+        self.assertEqual(guard["side"], "SELL")
+        self.assertEqual(guard["source"], "adverse_reduce")
+
+        still_blocked = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            current_long_notional=180.0,
+            current_short_notional=0.0,
+            mid_price=0.5659,
+            effective_step_price=0.0001,
+            now=now + timedelta(seconds=120),
+            cooldown_seconds=300.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertTrue(still_blocked["active"])
+        self.assertTrue(still_blocked["block_long_entries"])
+        self.assertGreater(still_blocked["min_remaining_seconds"], 0)
+
+        recovered = resolve_loss_reduce_reentry_guard(
+            state=state,
+            enabled=True,
+            adverse_inventory_reduce={"enabled": True, "placed_reduce_orders": 0},
+            hard_loss_forced_reduce={},
+            current_long_notional=180.0,
+            current_short_notional=0.0,
+            mid_price=0.5662,
+            effective_step_price=0.0001,
+            now=now + timedelta(seconds=301),
+            cooldown_seconds=300.0,
+            recover_buffer_steps=1.0,
+        )
+
+        self.assertFalse(recovered["active"])
+        self.assertEqual(recovered["reason"], "recovered")
+        self.assertNotIn("loss_reduce_reentry_guard", state)
+
+    def test_loss_reduce_reentry_guard_action_filter_keeps_reducers(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "role": "best_quote_entry_long", "qty": 10, "price": 0.565, "notional": 5.65},
+                {"side": "SELL", "role": "take_profit_long", "qty": 10, "price": 0.567, "notional": 5.67},
+                {"side": "SELL", "role": "best_quote_entry_short", "qty": 10, "price": 0.568, "notional": 5.68},
+            ],
+            "place_count": 3,
+        }
+
+        filtered = apply_loss_reduce_reentry_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "loss_reduce_reentry_guard": {
+                    "active": True,
+                    "block_long_entries": True,
+                    "block_short_entries": False,
+                    "reason": "loss_reduce_reentry_cooldown",
+                }
+            },
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual([order["role"] for order in filtered["place_orders"]], ["take_profit_long", "best_quote_entry_short"])
+        self.assertEqual(filtered["loss_reduce_reentry_guard"]["dropped_order_count"], 1)
 
     def test_apply_entry_permission_gate_limits_entry_order_count(self) -> None:
         plan = {

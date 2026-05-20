@@ -106,6 +106,7 @@ from .submit_plan import (
     apply_anti_chase_entry_guard_to_actions,
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
+    apply_loss_reduce_reentry_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
@@ -1169,6 +1170,142 @@ def resolve_hard_loss_rescue_entry_guard(
         "one_min_calm": one_min_calm,
         "three_min_calm": three_min_calm,
         "reason": ";".join(item for item in reasons if item),
+    }
+
+
+def _loss_reduce_side_from_reports(
+    *,
+    adverse_inventory_reduce: dict[str, Any],
+    hard_loss_forced_reduce: dict[str, Any],
+) -> tuple[str | None, str | None, float | None]:
+    hard_side = str(hard_loss_forced_reduce.get("side") or "").upper().strip()
+    if bool(hard_loss_forced_reduce.get("active")) and hard_side in {"BUY", "SELL"}:
+        return hard_side, "hard_loss", None
+
+    adverse_orders = [
+        item
+        for item in adverse_inventory_reduce.get("forced_reduce_orders", [])
+        if isinstance(item, dict)
+    ]
+    if bool(adverse_inventory_reduce.get("enabled")) and int(adverse_inventory_reduce.get("placed_reduce_orders") or 0) > 0:
+        if bool(adverse_inventory_reduce.get("long_active")):
+            order_price = _safe_float(adverse_orders[0].get("price")) if adverse_orders else 0.0
+            return "SELL", "adverse_reduce", order_price or None
+        if bool(adverse_inventory_reduce.get("short_active")):
+            order_price = _safe_float(adverse_orders[0].get("price")) if adverse_orders else 0.0
+            return "BUY", "adverse_reduce", order_price or None
+        if adverse_orders:
+            order_side = str(adverse_orders[0].get("side") or "").upper().strip()
+            if order_side in {"BUY", "SELL"}:
+                order_price = _safe_float(adverse_orders[0].get("price"))
+                return order_side, "adverse_reduce", order_price or None
+    return None, None, None
+
+
+def resolve_loss_reduce_reentry_guard(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    adverse_inventory_reduce: dict[str, Any],
+    hard_loss_forced_reduce: dict[str, Any],
+    current_long_notional: float,
+    current_short_notional: float,
+    mid_price: float,
+    effective_step_price: float | None,
+    now: datetime,
+    cooldown_seconds: float = 300.0,
+    recover_buffer_steps: float = 1.0,
+) -> dict[str, Any]:
+    if not enabled:
+        state.pop("loss_reduce_reentry_guard", None)
+        return {"enabled": False, "active": False, "reason": "disabled"}
+
+    safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    memory = dict(state.get("loss_reduce_reentry_guard") or {})
+    trigger_side, trigger_source, trigger_price = _loss_reduce_side_from_reports(
+        adverse_inventory_reduce=adverse_inventory_reduce,
+        hard_loss_forced_reduce=hard_loss_forced_reduce,
+    )
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    if trigger_side in {"BUY", "SELL"}:
+        reference_price = max(_safe_float(trigger_price), safe_mid, 0.0)
+        memory = {
+            "side": trigger_side,
+            "source": trigger_source or "loss_reduce",
+            "started_at": _isoformat(safe_now),
+            "updated_at": _isoformat(safe_now),
+            "reference_price": reference_price,
+        }
+        state["loss_reduce_reentry_guard"] = memory
+
+    side = str(memory.get("side") or "").upper().strip()
+    started_at = _parse_rescue_guard_time(memory.get("started_at"))
+    if side not in {"BUY", "SELL"} or started_at is None:
+        state.pop("loss_reduce_reentry_guard", None)
+        return {"enabled": True, "active": False, "reason": "no_recent_loss_reduce"}
+
+    elapsed_seconds = max((safe_now - started_at).total_seconds(), 0.0)
+    min_remaining_seconds = max(_safe_float(cooldown_seconds) - elapsed_seconds, 0.0)
+    step_price = max(_safe_float(effective_step_price), 0.0)
+    buffer_price = step_price * max(_safe_float(recover_buffer_steps), 0.0)
+    reference_price = max(_safe_float(memory.get("reference_price")), 0.0)
+    if reference_price <= 0:
+        reference_price = safe_mid
+        memory["reference_price"] = reference_price
+
+    gate_price: float | None = None
+    price_recovered = True
+    if reference_price > 0 and buffer_price > 0 and safe_mid > 0:
+        if side == "SELL":
+            gate_price = reference_price + buffer_price
+            price_recovered = safe_mid >= gate_price - 1e-12
+        else:
+            gate_price = max(reference_price - buffer_price, 0.0)
+            price_recovered = safe_mid <= gate_price + 1e-12
+
+    current_rescue_notional = (
+        max(_safe_float(current_short_notional), 0.0)
+        if side == "BUY"
+        else max(_safe_float(current_long_notional), 0.0)
+    )
+    should_protect = min_remaining_seconds > 0 or not price_recovered
+    if not should_protect:
+        state.pop("loss_reduce_reentry_guard", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "reason": "recovered",
+            "side": side,
+            "source": memory.get("source"),
+            "elapsed_seconds": elapsed_seconds,
+            "reference_price": reference_price,
+            "gate_price": gate_price,
+            "mid_price": safe_mid,
+            "current_rescue_notional": current_rescue_notional,
+        }
+
+    reasons: list[str] = []
+    if min_remaining_seconds > 0:
+        reasons.append(f"cooldown_remaining={math.ceil(min_remaining_seconds)}s")
+    if not price_recovered:
+        reasons.append("price_not_recovered")
+    memory["updated_at"] = _isoformat(safe_now)
+    state["loss_reduce_reentry_guard"] = memory
+    return {
+        "enabled": True,
+        "active": True,
+        "side": side,
+        "source": memory.get("source"),
+        "block_long_entries": side == "SELL",
+        "block_short_entries": side == "BUY",
+        "started_at": _isoformat(started_at),
+        "elapsed_seconds": elapsed_seconds,
+        "min_remaining_seconds": min_remaining_seconds,
+        "reference_price": reference_price,
+        "gate_price": gate_price,
+        "mid_price": safe_mid,
+        "current_rescue_notional": current_rescue_notional,
+        "reason": ";".join(reasons) or "loss_reduce_reentry_guard_active",
     }
 
 
@@ -14516,6 +14653,31 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
         loss_recover_ratio=0.75,
     )
+    loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(
+        state=state,
+        enabled=bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),
+        adverse_inventory_reduce=adverse_inventory_reduce,
+        hard_loss_forced_reduce=hard_loss_forced_reduce,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        mid_price=mid_price,
+        effective_step_price=getattr(effective_args, "step_price", None),
+        now=plan_now,
+        cooldown_seconds=getattr(effective_args, "loss_reentry_cooldown_seconds", 300.0),
+        recover_buffer_steps=getattr(effective_args, "loss_reentry_cost_buffer_steps", 1.0),
+    )
+    if loss_reduce_reentry_guard.get("block_long_entries"):
+        controls["buy_paused"] = True
+        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+        controls["pause_reasons"].append(
+            "loss_reduce_reentry_guard: " + str(loss_reduce_reentry_guard.get("reason") or "block_long_entries")
+        )
+    if loss_reduce_reentry_guard.get("block_short_entries"):
+        controls["short_paused"] = True
+        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
+        controls["short_pause_reasons"].append(
+            "loss_reduce_reentry_guard: " + str(loss_reduce_reentry_guard.get("reason") or "block_short_entries")
+        )
 
     unrealized_loss_entry_guard = assess_unrealized_loss_entry_guard(
         enabled=bool(getattr(effective_args, "unrealized_loss_entry_guard_enabled", False)),
@@ -14922,6 +15084,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "hard_loss_forced_reduce": hard_loss_forced_reduce,
         "hard_loss_forced_reduce_episode": hard_loss_forced_reduce_episode,
         "hard_loss_rescue_entry_guard": hard_loss_rescue_entry_guard,
+        "loss_reduce_reentry_guard": loss_reduce_reentry_guard,
         "unrealized_loss_entry_guard": unrealized_loss_entry_guard,
         "loss_recovery_brush": loss_recovery_brush,
         "loss_inventory_no_cross_small_entry_notional": effective_loss_inventory_no_cross_small_entry_notional,
@@ -14973,6 +15136,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_adverse_reduce_maker_timeout_seconds": getattr(effective_args, "adverse_reduce_maker_timeout_seconds", None),
         "effective_adverse_reduce_max_order_notional": getattr(effective_args, "adverse_reduce_max_order_notional", None),
         "effective_adverse_reduce_keep_probe_scale": getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
+        "effective_loss_reentry_guard_enabled": bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),
+        "effective_loss_reentry_cooldown_seconds": getattr(effective_args, "loss_reentry_cooldown_seconds", None),
+        "effective_loss_reentry_cost_buffer_steps": getattr(effective_args, "loss_reentry_cost_buffer_steps", None),
         "effective_short_threshold_timeout_seconds": getattr(effective_args, "short_threshold_timeout_seconds", None),
         "effective_synthetic_residual_long_flat_notional": getattr(
             effective_args,
@@ -15143,6 +15309,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         strategy_mode=strategy_mode,
     )
     validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_loss_reduce_reentry_guard_to_actions(
         actions=validation["actions"],
         plan_report=plan_report,
         strategy_mode=strategy_mode,
@@ -15380,6 +15551,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         strategy_mode=strategy_mode,
     )
     validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_loss_reduce_reentry_guard_to_actions(
         actions=validation["actions"],
         plan_report=plan_report,
         strategy_mode=strategy_mode,
@@ -15828,6 +16004,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adverse-reduce-maker-timeout-seconds", type=float, default=45.0)
     parser.add_argument("--adverse-reduce-max-order-notional", type=float, default=0.0)
     parser.add_argument("--adverse-reduce-keep-probe-scale", type=float, default=None)
+    parser.add_argument("--loss-reentry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--loss-reentry-cooldown-seconds", type=float, default=300.0)
+    parser.add_argument("--loss-reentry-cost-buffer-steps", type=float, default=1.0)
+    parser.add_argument("--loss-reentry-trend-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--max-order-position-notional", type=float, default=80.0)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -16616,6 +16796,10 @@ def main() -> None:
         args.adverse_reduce_keep_probe_scale < 0 or args.adverse_reduce_keep_probe_scale > 1
     ):
         raise SystemExit("--adverse-reduce-keep-probe-scale must be within [0, 1]")
+    if args.loss_reentry_cooldown_seconds < 0:
+        raise SystemExit("--loss-reentry-cooldown-seconds must be >= 0")
+    if args.loss_reentry_cost_buffer_steps < 0:
+        raise SystemExit("--loss-reentry-cost-buffer-steps must be >= 0")
     if args.max_order_position_notional < 0:
         raise SystemExit("--max-order-position-notional must be >= 0")
     if args.max_position_notional is not None and args.max_position_notional <= 0:
