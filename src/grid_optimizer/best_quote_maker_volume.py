@@ -418,6 +418,7 @@ def build_best_quote_maker_volume_plan(
         "notional_gap": abs(short_notional - long_notional),
         "min_notional_gap": None,
         "min_notional_gap_soft_ratio": None,
+        "recover_applied": False,
     }
     bias_start = _clamp(_safe_float(config.inventory_bias_start_ratio), 0.0, 1.0)
     bias_min_ratio_gap = max(_safe_float(config.inventory_bias_min_ratio_gap), 0.0)
@@ -432,6 +433,43 @@ def build_best_quote_maker_volume_plan(
     bias_entry_share = max(1.0 - bias_reduce_share, 0.0)
     short_notional_gap = short_notional - long_notional
     long_notional_gap = long_notional - short_notional
+    if config.inventory_bias_enabled and regime == "inventory_recover" and not hard_loss:
+        recover_reduce_notional = cycle_budget * bias_reduce_share
+        recover_other_notional = cycle_budget * bias_entry_share
+        if (
+            reduce_long_only
+            and not reduce_short_only
+            and long_notional_gap >= bias_min_notional_gap
+            and long_soft > 0
+            and long_notional >= long_soft * bias_start
+        ):
+            sell_side_notional = recover_reduce_notional
+            buy_side_notional = recover_other_notional
+            inventory_bias_report.update(
+                {
+                    "recover_applied": True,
+                    "side": "long",
+                    "reduce_share": bias_reduce_share,
+                    "same_side_entry_share": bias_entry_share,
+                }
+            )
+        elif (
+            reduce_short_only
+            and not reduce_long_only
+            and short_notional_gap >= bias_min_notional_gap
+            and short_soft > 0
+            and short_notional >= short_soft * bias_start
+        ):
+            buy_side_notional = recover_reduce_notional
+            sell_side_notional = recover_other_notional
+            inventory_bias_report.update(
+                {
+                    "recover_applied": True,
+                    "side": "short",
+                    "reduce_share": bias_reduce_share,
+                    "same_side_entry_share": bias_entry_share,
+                }
+            )
     can_bias_short = (
         config.inventory_bias_enabled
         and regime == "normal"
