@@ -366,10 +366,10 @@ class WebSecurityTests(unittest.TestCase):
     def test_handler_routes_runner_frozen_inventory_updates(self, mock_update_frozen) -> None:
         mock_update_frozen.return_value = {
             "symbol": "PHAROSUSDT",
-            "action": "clear_long",
+            "action": "reduce_long",
             "frozen_inventory": {},
         }
-        payload = b'{"symbol":"PHAROSUSDT","action":"clear_long"}'
+        payload = b'{"symbol":"PHAROSUSDT","action":"reduce_long"}'
         handler = object.__new__(_Handler)
         handler.path = "/api/runner/frozen_inventory"
         handler.headers = {"Content-Length": str(len(payload))}
@@ -379,7 +379,7 @@ class WebSecurityTests(unittest.TestCase):
 
         _Handler.do_POST(handler)
 
-        mock_update_frozen.assert_called_once_with({"symbol": "PHAROSUSDT", "action": "clear_long"})
+        mock_update_frozen.assert_called_once_with({"symbol": "PHAROSUSDT", "action": "reduce_long"})
         handler._send_json.assert_called_once()
         self.assertTrue(handler._send_json.call_args.args[0]["ok"])
 
@@ -388,8 +388,8 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertIn("冻结仓位账本", page)
         self.assertIn("/api/runner/frozen_inventory", page)
-        self.assertIn("标记多已处理", page)
-        self.assertIn("这里仅更新策略账本，不直接下单。", page)
+        self.assertIn("清理冻结多仓", page)
+        self.assertIn("由 runner 下 reduce-only 单处理", page)
 
     def test_running_status_overview_page_restores_cross_server_table(self) -> None:
         page = _render_running_status_overview_page()

@@ -2524,6 +2524,88 @@ def _apply_best_quote_reduce_freeze(
     return report
 
 
+def apply_best_quote_frozen_inventory_manual_reduce(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    report: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    hedge_mode: bool,
+) -> dict[str, Any]:
+    directive = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
+    ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    reduce_report = {
+        "enabled": bool(directive),
+        "requested_long": bool((directive.get("long") or {}).get("requested")),
+        "requested_short": bool((directive.get("short") or {}).get("requested")),
+        "placed_long": False,
+        "placed_short": False,
+        "orders": [],
+        "blocked_reasons": [],
+    }
+    safe_min_notional = max(_safe_float(min_notional), 0.0)
+
+    def _build_order(*, side_key: str) -> dict[str, Any] | None:
+        is_long = side_key == "long"
+        requested = bool((directive.get(side_key) or {}).get("requested"))
+        frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
+        if not requested:
+            return None
+        if frozen_qty <= 1e-12:
+            directive.pop(side_key, None)
+            reduce_report["blocked_reasons"].append(f"{side_key}_frozen_qty_empty")
+            return None
+        side = "SELL" if is_long else "BUY"
+        raw_price = bid_price if is_long else ask_price
+        price = _round_order_price(max(_safe_float(raw_price), 0.0), tick_size, side)
+        if price <= 0:
+            reduce_report["blocked_reasons"].append(f"{side_key}_missing_price")
+            return None
+        qty = _round_order_qty(frozen_qty, step_size)
+        if qty <= 0 or (min_qty is not None and qty < _safe_float(min_qty)):
+            reduce_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
+            return None
+        notional = qty * price
+        if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
+            reduce_report["blocked_reasons"].append(f"{side_key}_below_min_notional")
+            return None
+        return {
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "notional": notional,
+            "role": f"frozen_inventory_manual_reduce_{side_key}",
+            "position_side": ("LONG" if is_long else "SHORT") if hedge_mode else "BOTH",
+            "force_reduce_only": True,
+            "execution_type": "aggressive",
+            "time_in_force": "IOC",
+            "manual_frozen_inventory_reduce": True,
+        }
+
+    long_order = _build_order(side_key="long")
+    if long_order is not None:
+        plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
+        reduce_report["placed_long"] = True
+        reduce_report["orders"].append(dict(long_order))
+    short_order = _build_order(side_key="short")
+    if short_order is not None:
+        plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
+        reduce_report["placed_short"] = True
+        reduce_report["orders"].append(dict(short_order))
+
+    if directive:
+        state["best_quote_frozen_inventory_manual_reduce"] = directive
+    else:
+        state.pop("best_quote_frozen_inventory_manual_reduce", None)
+    reduce_report["active"] = bool(reduce_report["placed_long"] or reduce_report["placed_short"])
+    return reduce_report
+
+
 TAKE_PROFIT_EXIT_ROLES = {"take_profit", "take_profit_long", "take_profit_short"}
 
 
@@ -14553,6 +14635,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             configured_quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
             min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
         )
+        best_quote_frozen_manual_reduce = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report=best_quote_reduce_freeze,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            hedge_mode=hedge_best_quote,
+        )
         best_quote_inventory_cost_gate = {
             "enabled": bool(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_enabled", True)),
             "blocked_buy_orders": 0,
@@ -14845,6 +14939,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "profitable_exit_offset_cap": dict(best_quote_profitable_exit_offset_cap),
             "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
             "reduce_freeze": dict(best_quote_reduce_freeze),
+            "frozen_manual_reduce": dict(best_quote_frozen_manual_reduce),
         }
         inventory_tier = {
             "enabled": False,

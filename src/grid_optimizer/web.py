@@ -6135,9 +6135,9 @@ def _render_running_status_page(symbol: str | None = None) -> str:
               <div id="frozen_inventory_body" class="rs-ledger-grid"></div>
               <div class="rs-drawer-action-group">
                 <button id="frozen_set_btn" type="button">手动设置</button>
-                <button id="frozen_clear_long_btn" type="button">标记多已处理</button>
-                <button id="frozen_clear_short_btn" type="button">标记空已处理</button>
-                <button id="frozen_reset_btn" type="button" class="danger">清空账本</button>
+                <button id="frozen_clear_long_btn" type="button">清理冻结多仓</button>
+                <button id="frozen_clear_short_btn" type="button">清理冻结空仓</button>
+                <button id="frozen_reset_btn" type="button" class="danger">仅清空账本</button>
               </div>
             </section>
           </div>
@@ -6678,7 +6678,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         <div class="rs-ledger-item">冻结多仓<strong>${fmtNum(ledger.long_qty, 6)} @ ${fmtNum(ledger.long_entry_price, 8)}</strong><span>${fmtNum(ledger.long_notional, 2)}U · ${escapeHtml(ledger.long_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">冻结空仓<strong>${fmtNum(ledger.short_qty, 6)} @ ${fmtNum(ledger.short_entry_price, 8)}</strong><span>${fmtNum(ledger.short_notional, 2)}U · ${escapeHtml(ledger.short_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">多空可抵扣<strong>${fmtNum(ledger.offset_qty, 6)}</strong><span>${fmtNum(ledger.offset_notional, 2)}U</span></div>
-        <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>这里仅更新策略账本，不直接下单。</span></div>
+        <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>清理按钮会写入策略指令，由 runner 下 reduce-only 单处理。</span></div>
       `;
       frozenClearLongBtn.disabled = !editable || !(ledger.long_qty > 0);
       frozenClearShortBtn.disabled = !editable || !(ledger.short_qty > 0);
@@ -6813,7 +6813,8 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     async function updateFrozenInventory(action, extra = {}) {
       const card = state.drawerCard;
       if (!card) return;
-      setDrawerStatus(`正在更新 ${card.symbol} 冻结账本...`);
+      const actionLabel = action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本";
+      setDrawerStatus(`正在${actionLabel} ${card.symbol}...`);
       try {
         const resp = await fetch("/api/runner/frozen_inventory", {
           method: "POST",
@@ -6822,10 +6823,10 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         });
         const data = await readJsonResponse(resp);
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        setDrawerStatus(`${card.symbol} 冻结账本已更新。`);
+        setDrawerStatus(`${card.symbol} ${actionLabel}已提交。`);
         await loadPage({ preserveDrawer: true });
       } catch (err) {
-        setDrawerStatus(`更新冻结账本失败: ${String(err)}`, true);
+        setDrawerStatus(`${actionLabel}失败: ${String(err)}`, true);
       }
     }
 
@@ -6872,10 +6873,10 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     drawerSaveBtn.addEventListener("click", () => saveCurrentConfig(false));
     drawerApplyBtn.addEventListener("click", () => saveCurrentConfig(true));
     drawerStopBtn.addEventListener("click", () => stopAndFlattenCurrentRunner());
-    frozenClearLongBtn.addEventListener("click", () => updateFrozenInventory("clear_long"));
-    frozenClearShortBtn.addEventListener("click", () => updateFrozenInventory("clear_short"));
+    frozenClearLongBtn.addEventListener("click", () => updateFrozenInventory("reduce_long"));
+    frozenClearShortBtn.addEventListener("click", () => updateFrozenInventory("reduce_short"));
     frozenResetBtn.addEventListener("click", () => {
-      if (window.confirm("确认清空冻结仓位账本？这只更新策略账本，不会向交易所下单。")) {
+      if (window.confirm("确认仅清空冻结仓位账本？这不会向交易所下单，只用于账本纠错。")) {
         updateFrozenInventory("reset");
       }
     });
@@ -9966,7 +9967,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     if not symbol:
         raise ValueError("symbol is required")
     action = str(payload.get("action", "set")).strip().lower() or "set"
-    if action not in {"set", "clear_long", "clear_short", "reset"}:
+    if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "reset"}:
         raise ValueError("unsupported frozen inventory action")
     state_path = _runner_frozen_inventory_state_path(symbol)
     state = _read_json_dict(state_path) or {}
@@ -9975,6 +9976,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
 
     if action == "reset":
         state.pop("best_quote_frozen_inventory", None)
+        state.pop("best_quote_frozen_inventory_manual_reduce", None)
         ledger = {}
     else:
         if action == "set":
@@ -9996,6 +9998,15 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             ledger["short_notional"] = 0.0
             ledger["short_entry_price"] = 0.0
             ledger["short_frozen_at"] = ""
+        elif action in {"reduce_long", "reduce_short"}:
+            directive = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
+            side_key = "long" if action == "reduce_long" else "short"
+            directive[side_key] = {
+                "requested": True,
+                "requested_at": now_iso,
+                "source": "running_status_ui",
+            }
+            state["best_quote_frozen_inventory_manual_reduce"] = directive
         ledger["offset_qty"] = min(
             max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0),
             max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0),

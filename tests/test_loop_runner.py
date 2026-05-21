@@ -46,6 +46,7 @@ from grid_optimizer.loop_runner import (
     _resolve_hard_loss_reduce_target_notional,
     _best_quote_reduce_freeze_report,
     _apply_best_quote_reduce_freeze,
+    apply_best_quote_frozen_inventory_manual_reduce,
     _position_unrealized_or_estimate,
     _is_long_exit_order,
     _is_short_exit_order,
@@ -782,6 +783,38 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertFalse(report["isolates_risk_metrics"])
         self.assertAlmostEqual(report["managed_unrealized_pnl"], -2.0)
+
+    def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {"requested": True, "requested_at": "2026-05-22T00:00:00+00:00"}
+            },
+        }
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report={},
+            bid_price=0.98,
+            ask_price=0.981,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["placed_long"])
+        order = plan["sell_orders"][0]
+        self.assertEqual(order["role"], "frozen_inventory_manual_reduce_long")
+        self.assertEqual(order["side"], "SELL")
+        self.assertEqual(order["position_side"], "LONG")
+        self.assertTrue(order["force_reduce_only"])
+        self.assertEqual(order["execution_type"], "aggressive")
+        self.assertEqual(order["time_in_force"], "IOC")
 
     def test_best_quote_maker_volume_net_loss_reduce_credits_recent_realized_profit(self) -> None:
         plan = build_best_quote_maker_volume_plan(
