@@ -44,6 +44,8 @@ from grid_optimizer.loop_runner import (
     _resolve_best_quote_dynamic_offsets,
     _resolve_synthetic_resync_price,
     _resolve_hard_loss_reduce_target_notional,
+    _best_quote_reduce_freeze_report,
+    _apply_best_quote_reduce_freeze,
     _position_unrealized_or_estimate,
     _is_long_exit_order,
     _is_short_exit_order,
@@ -689,6 +691,60 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
         self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
         self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
+
+    def test_best_quote_reduce_freeze_marks_losing_reduce_inventory_unmanaged(self) -> None:
+        state: dict[str, object] = {}
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=100.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.0,
+            current_short_avg_price=0.0,
+            mid_price=0.989,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [{"role": "best_quote_reduce_long"}], "buy_orders": []},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            current_long_qty=100.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.0,
+            current_short_avg_price=0.0,
+            mid_price=0.989,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["frozen_long_qty"], 100.0)
+        self.assertEqual(report["managed_long_qty"], 0.0)
+        self.assertEqual(report["offset_qty"], 0.0)
+        ledger = state["best_quote_frozen_inventory"]
+        self.assertEqual(ledger["long_qty"], 100.0)
+
+    def test_best_quote_reduce_freeze_reports_frozen_side_offset(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 120.0,
+                "short_qty": 80.0,
+            }
+        }
+
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=120.0,
+            current_short_qty=100.0,
+            current_long_avg_price=1.0,
+            current_short_avg_price=1.0,
+            mid_price=0.5,
+        )
+
+        self.assertEqual(report["offset_qty"], 80.0)
+        self.assertEqual(report["offset_notional"], 40.0)
+        self.assertEqual(report["managed_long_qty"], 0.0)
+        self.assertEqual(report["managed_short_qty"], 20.0)
 
     def test_best_quote_maker_volume_net_loss_reduce_credits_recent_realized_profit(self) -> None:
         plan = build_best_quote_maker_volume_plan(

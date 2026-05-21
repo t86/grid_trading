@@ -439,6 +439,10 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_net_loss_reduce_ratio": 0.0,
             "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
             "best_quote_maker_volume_net_loss_reduce_min_inventory_notional": 0.0,
+            "best_quote_maker_volume_reduce_freeze_enabled": False,
+            "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+            "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+            "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
             "best_quote_maker_volume_same_side_entry_price_guard_enabled": False,
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 0.0,
             "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
@@ -497,6 +501,10 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_net_loss_reduce_ratio": 0.0,
             "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
             "best_quote_maker_volume_net_loss_reduce_min_inventory_notional": 0.0,
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+            "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+            "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
             "best_quote_maker_volume_same_side_entry_price_guard_enabled": False,
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 0.0,
             "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
@@ -3986,6 +3994,10 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_net_loss_reduce_ratio": 0.0,
     "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
     "best_quote_maker_volume_net_loss_reduce_min_inventory_notional": 0.0,
+    "best_quote_maker_volume_reduce_freeze_enabled": False,
+    "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+    "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+    "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
     "best_quote_maker_volume_same_side_entry_price_guard_enabled": False,
     "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 0.0,
     "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
@@ -8999,6 +9011,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_net_loss_reduce_ratio",
         "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio",
         "best_quote_maker_volume_net_loss_reduce_min_inventory_notional",
+        "best_quote_maker_volume_reduce_freeze_loss_ratio",
+        "best_quote_maker_volume_reduce_freeze_min_notional",
+        "best_quote_maker_volume_reduce_freeze_soft_ratio_scale",
         "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
         "best_quote_maker_volume_dynamic_tick_low_loss_per_10k",
         "best_quote_maker_volume_dynamic_tick_mid_loss_per_10k",
@@ -9115,6 +9130,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_take_profit_guard_enabled",
         "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_net_loss_reduce_enabled",
+        "best_quote_maker_volume_reduce_freeze_enabled",
         "best_quote_maker_volume_same_side_entry_price_guard_enabled",
         "best_quote_maker_volume_dynamic_tick_enabled",
         "best_quote_maker_volume_inventory_bias_enabled",
@@ -9706,11 +9722,16 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             "best_quote_maker_volume_net_loss_reduce_ratio",
             "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio",
             "best_quote_maker_volume_net_loss_reduce_min_inventory_notional",
+            "best_quote_maker_volume_reduce_freeze_loss_ratio",
+            "best_quote_maker_volume_reduce_freeze_min_notional",
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
         ):
             value = number(field)
             if value is not None and value < 0:
                 errors.append(f"{field} 必须 >= 0")
+        reduce_freeze_soft_scale = number("best_quote_maker_volume_reduce_freeze_soft_ratio_scale")
+        if reduce_freeze_soft_scale is not None and not (0 < reduce_freeze_soft_scale <= 1):
+            errors.append("best_quote_maker_volume_reduce_freeze_soft_ratio_scale 必须在 (0, 1] 内")
         same_side_gap_ticks = number("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks")
         if same_side_gap_ticks is not None and same_side_gap_ticks < 0:
             errors.append("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks 必须 >= 0")
@@ -9870,6 +9891,15 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_net_loss_reduce_realized_credit_ratio", 1.0)),
         "--best-quote-maker-volume-net-loss-reduce-min-inventory-notional",
         str(config.get("best_quote_maker_volume_net_loss_reduce_min_inventory_notional", 0.0)),
+        "--best-quote-maker-volume-reduce-freeze-enabled"
+        if config.get("best_quote_maker_volume_reduce_freeze_enabled", False)
+        else "--no-best-quote-maker-volume-reduce-freeze-enabled",
+        "--best-quote-maker-volume-reduce-freeze-loss-ratio",
+        str(config.get("best_quote_maker_volume_reduce_freeze_loss_ratio", 0.01)),
+        "--best-quote-maker-volume-reduce-freeze-min-notional",
+        str(config.get("best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
+        "--best-quote-maker-volume-reduce-freeze-soft-ratio-scale",
+        str(config.get("best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 0.70)),
         "--best-quote-maker-volume-same-side-entry-price-guard-enabled"
         if config.get("best_quote_maker_volume_same_side_entry_price_guard_enabled", False)
         else "--no-best-quote-maker-volume-same-side-entry-price-guard-enabled",

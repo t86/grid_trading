@@ -2324,6 +2324,165 @@ def _order_role(order: dict[str, Any]) -> str:
     return str(order.get("role", "")).lower().strip()
 
 
+def _best_quote_reduce_freeze_report(
+    *,
+    state: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+) -> dict[str, Any]:
+    ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    long_qty = min(max(_safe_float(ledger.get("long_qty")), 0.0), max(_safe_float(current_long_qty), 0.0))
+    short_qty = min(max(_safe_float(ledger.get("short_qty")), 0.0), max(_safe_float(current_short_qty), 0.0))
+    long_notional = long_qty * max(_safe_float(mid_price), 0.0)
+    short_notional = short_qty * max(_safe_float(mid_price), 0.0)
+    offset_qty = min(long_qty, short_qty)
+    offset_notional = offset_qty * max(_safe_float(mid_price), 0.0)
+    if long_qty > 0 or short_qty > 0 or ledger:
+        ledger.update(
+            {
+                "long_qty": long_qty,
+                "short_qty": short_qty,
+                "long_notional": long_notional,
+                "short_notional": short_notional,
+                "offset_qty": offset_qty,
+                "offset_notional": offset_notional,
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+        state["best_quote_frozen_inventory"] = ledger
+    else:
+        state.pop("best_quote_frozen_inventory", None)
+    return {
+        "enabled": False,
+        "applied": False,
+        "events": [],
+        "threshold_loss_ratio": 0.0,
+        "min_notional": 0.0,
+        "current_long_unrealized_ratio": (
+            (_safe_float(mid_price) - _safe_float(current_long_avg_price)) / _safe_float(current_long_avg_price)
+            if _safe_float(mid_price) > 0 and _safe_float(current_long_avg_price) > 0
+            else None
+        ),
+        "current_short_unrealized_ratio": (
+            (_safe_float(current_short_avg_price) - _safe_float(mid_price)) / _safe_float(current_short_avg_price)
+            if _safe_float(mid_price) > 0 and _safe_float(current_short_avg_price) > 0
+            else None
+        ),
+        "frozen_long_qty": long_qty,
+        "frozen_short_qty": short_qty,
+        "frozen_long_notional": long_notional,
+        "frozen_short_notional": short_notional,
+        "offset_qty": offset_qty,
+        "offset_notional": offset_notional,
+        "managed_long_qty": max(_safe_float(current_long_qty) - long_qty, 0.0),
+        "managed_short_qty": max(_safe_float(current_short_qty) - short_qty, 0.0),
+        "ledger": dict(ledger) if ledger else {},
+    }
+
+
+def _apply_best_quote_reduce_freeze(
+    *,
+    state: dict[str, Any],
+    plan: dict[str, Any],
+    report: dict[str, Any],
+    enabled: bool,
+    threshold_loss_ratio: float,
+    min_notional: float,
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+) -> dict[str, Any]:
+    report = dict(report)
+    report["enabled"] = bool(enabled)
+    report["threshold_loss_ratio"] = max(_safe_float(threshold_loss_ratio), 0.0)
+    report["min_notional"] = max(_safe_float(min_notional), 0.0)
+    if not enabled or report["threshold_loss_ratio"] <= 0 or _safe_float(mid_price) <= 0:
+        report["managed_long_qty"] = max(_safe_float(current_long_qty), 0.0)
+        report["managed_short_qty"] = max(_safe_float(current_short_qty), 0.0)
+        return report
+
+    reduce_long_planned = any(
+        isinstance(item, dict) and _order_role(item) == "best_quote_reduce_long"
+        for item in list(plan.get("sell_orders") or [])
+    )
+    reduce_short_planned = any(
+        isinstance(item, dict) and _order_role(item) == "best_quote_reduce_short"
+        for item in list(plan.get("buy_orders") or [])
+    )
+    ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    events = list(report.get("events") or [])
+    min_notional_value = _safe_float(report["min_notional"])
+
+    long_loss_ratio = 0.0
+    if _safe_float(current_long_avg_price) > 0:
+        long_loss_ratio = max((_safe_float(current_long_avg_price) - _safe_float(mid_price)) / _safe_float(current_long_avg_price), 0.0)
+    short_loss_ratio = 0.0
+    if _safe_float(current_short_avg_price) > 0:
+        short_loss_ratio = max((_safe_float(mid_price) - _safe_float(current_short_avg_price)) / _safe_float(current_short_avg_price), 0.0)
+
+    long_notional = max(_safe_float(current_long_qty), 0.0) * _safe_float(mid_price)
+    short_notional = max(_safe_float(current_short_qty), 0.0) * _safe_float(mid_price)
+    threshold = _safe_float(report["threshold_loss_ratio"])
+    if (
+        reduce_long_planned
+        and long_notional >= min_notional_value
+        and long_loss_ratio >= threshold
+        and max(_safe_float(current_long_qty), 0.0) > _safe_float(ledger.get("long_qty")) + 1e-12
+    ):
+        ledger["long_qty"] = max(_safe_float(current_long_qty), 0.0)
+        ledger["long_entry_price"] = max(_safe_float(current_long_avg_price), 0.0)
+        ledger["long_frozen_at"] = _utc_now().isoformat()
+        events.append(
+            {
+                "side": "LONG",
+                "reason": "reduce_loss_ratio_threshold",
+                "loss_ratio": long_loss_ratio,
+                "qty": ledger["long_qty"],
+                "notional": long_notional,
+            }
+        )
+    if (
+        reduce_short_planned
+        and short_notional >= min_notional_value
+        and short_loss_ratio >= threshold
+        and max(_safe_float(current_short_qty), 0.0) > _safe_float(ledger.get("short_qty")) + 1e-12
+    ):
+        ledger["short_qty"] = max(_safe_float(current_short_qty), 0.0)
+        ledger["short_entry_price"] = max(_safe_float(current_short_avg_price), 0.0)
+        ledger["short_frozen_at"] = _utc_now().isoformat()
+        events.append(
+            {
+                "side": "SHORT",
+                "reason": "reduce_loss_ratio_threshold",
+                "loss_ratio": short_loss_ratio,
+                "qty": ledger["short_qty"],
+                "notional": short_notional,
+            }
+        )
+
+    if events:
+        state["best_quote_frozen_inventory"] = ledger
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+        )
+        report["enabled"] = True
+        report["applied"] = True
+        report["threshold_loss_ratio"] = threshold
+        report["min_notional"] = min_notional_value
+        report["events"] = events
+    return report
+
+
 TAKE_PROFIT_EXIT_ROLES = {"take_profit", "take_profit_long", "take_profit_short"}
 
 
@@ -13929,6 +14088,84 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 return _safe_float(window.get(metric_name))
             return _safe_float(adaptive_step.get(f"{window_name}_{metric_name}"))
 
+        best_quote_reduce_freeze_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_enabled", False)
+        )
+        best_quote_reduce_freeze_loss_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_loss_ratio", 0.01)),
+            0.0,
+        )
+        best_quote_reduce_freeze_min_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_soft_scale = _clamp(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 1.0)),
+            1e-12,
+            1.0,
+        )
+        best_quote_inventory_soft_ratio = float(
+            getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)
+        )
+        if best_quote_reduce_freeze_enabled:
+            best_quote_inventory_soft_ratio *= best_quote_reduce_freeze_soft_scale
+        best_quote_reduce_freeze = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+        )
+        best_quote_reduce_freeze.update(
+            {
+                "enabled": best_quote_reduce_freeze_enabled,
+                "threshold_loss_ratio": best_quote_reduce_freeze_loss_ratio,
+                "min_notional": best_quote_reduce_freeze_min_notional,
+                "soft_ratio_scale": best_quote_reduce_freeze_soft_scale,
+                "base_inventory_soft_ratio": float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)
+                ),
+                "effective_inventory_soft_ratio": best_quote_inventory_soft_ratio,
+                "actual_long_qty": current_long_qty,
+                "actual_short_qty": current_short_qty,
+                "actual_long_notional": current_long_notional,
+                "actual_short_notional": current_short_notional,
+            }
+        )
+        freeze_fake_plan = {"buy_orders": [], "sell_orders": []}
+        long_soft_for_freeze = (
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0))
+            * best_quote_inventory_soft_ratio
+        )
+        short_soft_for_freeze = (
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0))
+            * best_quote_inventory_soft_ratio
+        )
+        if current_long_notional >= max(long_soft_for_freeze, best_quote_reduce_freeze_min_notional) > 0:
+            freeze_fake_plan["sell_orders"].append({"role": "best_quote_reduce_long"})
+        if current_short_notional >= max(short_soft_for_freeze, best_quote_reduce_freeze_min_notional) > 0:
+            freeze_fake_plan["buy_orders"].append({"role": "best_quote_reduce_short"})
+        best_quote_reduce_freeze = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan=freeze_fake_plan,
+            report=best_quote_reduce_freeze,
+            enabled=best_quote_reduce_freeze_enabled,
+            threshold_loss_ratio=best_quote_reduce_freeze_loss_ratio,
+            min_notional=best_quote_reduce_freeze_min_notional,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+        )
+        managed_long_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_long_qty")), 0.0)
+        managed_short_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_short_qty")), 0.0)
+        current_long_qty = managed_long_qty
+        current_short_qty = managed_short_qty
+        current_long_notional = current_long_qty * mid_price
+        current_short_notional = current_short_qty * mid_price
+
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
@@ -13940,7 +14177,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ),
                 max_long_notional=float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 1_500.0)),
                 max_short_notional=float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 1_500.0)),
-                inventory_soft_ratio=float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)),
+                inventory_soft_ratio=best_quote_inventory_soft_ratio,
                 loss_per_10k_soft=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_soft", 0.5)),
                 loss_per_10k_hard=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_hard", 0.8)),
                 soft_loss_budget_scale=float(getattr(effective_args, "best_quote_maker_volume_soft_loss_budget_scale", 0.50)),
@@ -14545,6 +14782,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "dynamic_offsets": dict(best_quote_dynamic_offsets),
             "profitable_exit_offset_cap": dict(best_quote_profitable_exit_offset_cap),
             "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
+            "reduce_freeze": dict(best_quote_reduce_freeze),
         }
         inventory_tier = {
             "enabled": False,
@@ -16591,6 +16829,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-inventory-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-loss-ratio", type=float, default=0.01)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-min-notional", type=float, default=10.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale", type=float, default=0.70)
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-min-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-gap-ticks", type=int, default=0)
@@ -17754,6 +17996,13 @@ def main() -> None:
         or args.best_quote_maker_volume_net_loss_reduce_min_inventory_notional < 0
     ):
         raise SystemExit("--best-quote-maker-volume-net-loss-reduce values must be >= 0")
+    if (
+        args.best_quote_maker_volume_reduce_freeze_loss_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_min_notional < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-reduce-freeze values must be >= 0")
+    if not (0 < args.best_quote_maker_volume_reduce_freeze_soft_ratio_scale <= 1):
+        raise SystemExit("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale must be within (0, 1]")
     if (
         args.best_quote_maker_volume_same_side_entry_price_guard_min_notional < 0
         or args.best_quote_maker_volume_same_side_entry_price_guard_gap_ticks < 0

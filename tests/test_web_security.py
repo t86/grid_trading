@@ -2807,6 +2807,10 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_net_loss_reduce_ratio": 0.01,
                 "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
                 "best_quote_maker_volume_net_loss_reduce_min_inventory_notional": 40.0,
+                "best_quote_maker_volume_reduce_freeze_enabled": True,
+                "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+                "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+                "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.7,
                 "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
                 "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 10.0,
                 "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
@@ -2857,6 +2861,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(command[net_loss_ratio_index + 1], "0.01")
         net_loss_floor_index = command.index("--best-quote-maker-volume-net-loss-reduce-min-inventory-notional")
         self.assertEqual(command[net_loss_floor_index + 1], "40.0")
+        self.assertIn("--best-quote-maker-volume-reduce-freeze-enabled", command)
+        reduce_freeze_loss_index = command.index("--best-quote-maker-volume-reduce-freeze-loss-ratio")
+        self.assertEqual(command[reduce_freeze_loss_index + 1], "0.01")
+        reduce_freeze_min_index = command.index("--best-quote-maker-volume-reduce-freeze-min-notional")
+        self.assertEqual(command[reduce_freeze_min_index + 1], "10.0")
+        reduce_freeze_soft_index = command.index("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale")
+        self.assertEqual(command[reduce_freeze_soft_index + 1], "0.7")
         self.assertIn("--best-quote-maker-volume-same-side-entry-price-guard-enabled", command)
         same_side_min_index = command.index("--best-quote-maker-volume-same-side-entry-price-guard-min-notional")
         self.assertEqual(command[same_side_min_index + 1], "10.0")
