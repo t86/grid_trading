@@ -14130,6 +14130,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 net_loss_reduce_realized_credit_ratio=float(
                     getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio", 1.0)
                 ),
+                net_loss_reduce_min_inventory_notional=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_min_inventory_notional", 0.0)
+                ),
+                same_side_entry_price_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_enabled", False)
+                ),
+                same_side_entry_price_guard_min_notional=float(
+                    getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_min_notional", 0.0)
+                ),
+                same_side_entry_price_guard_gap_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks", 0)
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -14149,6 +14161,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 entry_ladder_spacing=_safe_float(getattr(effective_args, "step_price", 0.0)),
                 current_long_qty=current_long_qty,
                 current_short_qty=current_short_qty,
+                current_long_avg_price=current_long_avg_price,
+                current_short_avg_price=current_short_avg_price,
                 position_side_mode="hedge" if hedge_best_quote else "one_way",
                 market_return_1m=_adaptive_window_metric("window_1m", "return_ratio"),
                 market_amplitude_1m=_adaptive_window_metric("window_1m", "amplitude_ratio"),
@@ -16534,6 +16548,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-loss", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-inventory-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-min-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-gap-ticks", type=int, default=0)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-tight-offset-ticks", type=int, default=2)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-low-loss-per-10k", type=float, default=3.0)
@@ -17661,8 +17679,14 @@ def main() -> None:
         args.best_quote_maker_volume_net_loss_reduce_min_loss < 0
         or args.best_quote_maker_volume_net_loss_reduce_ratio < 0
         or args.best_quote_maker_volume_net_loss_reduce_realized_credit_ratio < 0
+        or args.best_quote_maker_volume_net_loss_reduce_min_inventory_notional < 0
     ):
         raise SystemExit("--best-quote-maker-volume-net-loss-reduce values must be >= 0")
+    if (
+        args.best_quote_maker_volume_same_side_entry_price_guard_min_notional < 0
+        or args.best_quote_maker_volume_same_side_entry_price_guard_gap_ticks < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-same-side-entry-price-guard values must be >= 0")
     if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score < 0:
         raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-score must be >= 0")
     if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_volatility_ratio < 0:

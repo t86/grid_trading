@@ -724,6 +724,101 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
 
+    def test_best_quote_maker_volume_net_loss_reduce_leaves_target_inventory(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                net_loss_reduce_enabled=True,
+                net_loss_reduce_min_loss=2.0,
+                net_loss_reduce_ratio=0.01,
+                net_loss_reduce_min_inventory_notional=40.0,
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=0.6416,
+                ask_price=0.6417,
+                mid_price=0.64165,
+                current_net_qty=69.0,
+                current_long_qty=69.0,
+                current_short_qty=0.0,
+                position_side_mode="hedge",
+                cycle_budget_notional=60.0,
+                loss_per_10k_15m=0.2,
+                target_volume_remaining=10_000.0,
+                unrealized_pnl=-3.0,
+                recent_realized_pnl=0.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=1.0,
+            ),
+        )
+
+        guard = plan["metrics"]["net_loss_reduce"]
+        self.assertTrue(guard["active"])
+        self.assertEqual(guard["min_inventory_notional"], 40.0)
+        self.assertLessEqual(plan["sell_orders"][0]["notional"], 4.3)
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
+
+    def test_best_quote_maker_volume_same_side_guard_blocks_short_entry_below_existing_cost(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                same_side_entry_price_guard_enabled=True,
+                same_side_entry_price_guard_min_notional=10.0,
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=0.0990,
+                ask_price=0.0991,
+                mid_price=0.09905,
+                current_net_qty=-1010.0,
+                current_short_qty=1010.0,
+                current_short_avg_price=0.1000,
+                position_side_mode="hedge",
+                cycle_budget_notional=40.0,
+                loss_per_10k_15m=0.0,
+                target_volume_remaining=10_000.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+            ),
+        )
+
+        guard = plan["metrics"]["same_side_entry_price_guard"]
+        self.assertTrue(guard["blocked_short_entry"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertIn("same_side_entry_price_guard", plan["reasons"])
+
+    def test_best_quote_maker_volume_same_side_guard_blocks_long_entry_above_existing_cost(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                same_side_entry_price_guard_enabled=True,
+                same_side_entry_price_guard_min_notional=10.0,
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=0.1010,
+                ask_price=0.1011,
+                mid_price=0.10105,
+                current_net_qty=990.0,
+                current_long_qty=990.0,
+                current_long_avg_price=0.1000,
+                position_side_mode="hedge",
+                cycle_budget_notional=40.0,
+                loss_per_10k_15m=0.0,
+                target_volume_remaining=10_000.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+            ),
+        )
+
+        guard = plan["metrics"]["same_side_entry_price_guard"]
+        self.assertTrue(guard["blocked_long_entry"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertIn("same_side_entry_price_guard", plan["reasons"])
+
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")

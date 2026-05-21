@@ -71,6 +71,10 @@ class BestQuoteMakerVolumeConfig:
     net_loss_reduce_min_loss: float = 0.0
     net_loss_reduce_ratio: float = 0.0
     net_loss_reduce_realized_credit_ratio: float = 1.0
+    net_loss_reduce_min_inventory_notional: float = 0.0
+    same_side_entry_price_guard_enabled: bool = False
+    same_side_entry_price_guard_min_notional: float = 0.0
+    same_side_entry_price_guard_gap_ticks: int = 0
 
 
 @dataclass(frozen=True)
@@ -92,6 +96,8 @@ class BestQuoteMakerVolumeInputs:
     entry_ladder_spacing: float | None = None
     current_long_qty: float | None = None
     current_short_qty: float | None = None
+    current_long_avg_price: float = 0.0
+    current_short_avg_price: float = 0.0
     position_side_mode: str = "one_way"
     market_return_1m: float = 0.0
     market_amplitude_1m: float = 0.0
@@ -357,6 +363,8 @@ def build_best_quote_maker_volume_plan(
         "loss_ratio": 0.0,
         "min_loss": max(_safe_float(config.net_loss_reduce_min_loss), 0.0),
         "threshold_ratio": max(_safe_float(config.net_loss_reduce_ratio), 0.0),
+        "min_inventory_notional": max(_safe_float(config.net_loss_reduce_min_inventory_notional), 0.0),
+        "target_remaining_notional": 0.0,
     }
     realized_credit_ratio = max(_safe_float(config.net_loss_reduce_realized_credit_ratio), 0.0)
     net_pnl = _safe_float(inputs.unrealized_pnl) + (_safe_float(inputs.recent_realized_pnl) * realized_credit_ratio)
@@ -372,9 +380,12 @@ def build_best_quote_maker_volume_plan(
             "loss_ratio": net_loss_ratio,
         }
     )
+    net_loss_reduce_floor = max(_safe_float(config.net_loss_reduce_min_inventory_notional), 0.0)
+    net_loss_reduce_report["target_remaining_notional"] = min(net_loss_reduce_floor, exposure_notional)
     if (
         config.net_loss_reduce_enabled
         and exposure_notional > 0
+        and exposure_notional > net_loss_reduce_floor + 1e-12
         and net_loss_reduce_report["min_loss"] > 0
         and net_loss_reduce_report["threshold_ratio"] > 0
         and net_loss >= net_loss_reduce_report["min_loss"]
@@ -764,6 +775,16 @@ def build_best_quote_maker_volume_plan(
         _clamp(_safe_float(trend_loss_reduce_guard_report["reduce_short_budget_scale"]), 0.0, 1.0),
     )
 
+    def _net_loss_reduce_cap(side_notional: float) -> float:
+        side_notional = max(_safe_float(side_notional), 0.0)
+        if not net_loss_reduce_report.get("active"):
+            return side_notional
+        floor = max(_safe_float(net_loss_reduce_report.get("min_inventory_notional")), 0.0)
+        if floor <= 0:
+            return side_notional
+        other_notional = max(exposure_notional - side_notional, 0.0)
+        return max(exposure_notional - floor - other_notional, 0.0)
+
     buy_orders: list[dict[str, Any]] = []
     sell_orders: list[dict[str, Any]] = []
     max_entry_orders_per_side = max(int(_safe_float(config.max_entry_orders_per_side)), 1)
@@ -897,7 +918,11 @@ def build_best_quote_maker_volume_plan(
                 _build_order(
                     side="BUY",
                     price=_price_with_gap(bid, short_reduce_gap, -1),
-                    notional=min(reduce_notional * reduce_short_budget_scale, short_notional),
+                    notional=min(
+                        reduce_notional * reduce_short_budget_scale,
+                        short_notional,
+                        _net_loss_reduce_cap(short_notional),
+                    ),
                     role="best_quote_reduce_short",
                     inputs=inputs,
                     position_side=reduce_short_position_side,
@@ -928,7 +953,11 @@ def build_best_quote_maker_volume_plan(
                 _build_order(
                     side="SELL",
                     price=_price_with_gap(ask, long_reduce_gap, 1),
-                    notional=min(reduce_notional * reduce_long_budget_scale, long_notional),
+                    notional=min(
+                        reduce_notional * reduce_long_budget_scale,
+                        long_notional,
+                        _net_loss_reduce_cap(long_notional),
+                    ),
                     role="best_quote_reduce_long",
                     inputs=inputs,
                     position_side=reduce_long_position_side,
@@ -958,7 +987,11 @@ def build_best_quote_maker_volume_plan(
             _build_order(
                 side="BUY",
                 price=_price_with_gap(bid, reduce_short_gap, -1),
-                notional=min(buy_side_notional * reduce_short_budget_scale, short_notional),
+                notional=min(
+                    buy_side_notional * reduce_short_budget_scale,
+                    short_notional,
+                    _net_loss_reduce_cap(short_notional),
+                ),
                 role="best_quote_reduce_short",
                 inputs=inputs,
                 position_side=reduce_short_position_side,
@@ -988,7 +1021,11 @@ def build_best_quote_maker_volume_plan(
         reduce_short_order = _build_order(
             side="BUY",
             price=_price_with_gap(bid, reduce_short_gap, -1),
-            notional=min(buy_side_notional * reduce_short_budget_scale, short_notional),
+            notional=min(
+                buy_side_notional * reduce_short_budget_scale,
+                short_notional,
+                _net_loss_reduce_cap(short_notional),
+            ),
             role="best_quote_reduce_short",
             inputs=inputs,
             position_side=reduce_short_position_side,
@@ -1021,7 +1058,11 @@ def build_best_quote_maker_volume_plan(
             _build_order(
                 side="SELL",
                 price=_price_with_gap(ask, reduce_long_gap, 1),
-                notional=min(sell_side_notional * reduce_long_budget_scale, long_notional),
+                notional=min(
+                    sell_side_notional * reduce_long_budget_scale,
+                    long_notional,
+                    _net_loss_reduce_cap(long_notional),
+                ),
                 role="best_quote_reduce_long",
                 inputs=inputs,
                 position_side=reduce_long_position_side,
@@ -1051,7 +1092,11 @@ def build_best_quote_maker_volume_plan(
         reduce_long_order = _build_order(
             side="SELL",
             price=_price_with_gap(ask, reduce_long_gap, 1),
-            notional=min(sell_side_notional * reduce_long_budget_scale, long_notional),
+            notional=min(
+                sell_side_notional * reduce_long_budget_scale,
+                long_notional,
+                _net_loss_reduce_cap(long_notional),
+            ),
             role="best_quote_reduce_long",
             inputs=inputs,
             position_side=reduce_long_position_side,
@@ -1085,6 +1130,68 @@ def build_best_quote_maker_volume_plan(
                     position_side=reduce_short_position_side,
                 )
             )
+
+    same_side_entry_price_guard_report = {
+        "enabled": bool(config.same_side_entry_price_guard_enabled),
+        "applied": False,
+        "blocked_long_entry": False,
+        "blocked_short_entry": False,
+        "min_inventory_notional": max(_safe_float(config.same_side_entry_price_guard_min_notional), 0.0),
+        "gap_ticks": max(int(_safe_float(config.same_side_entry_price_guard_gap_ticks)), 0),
+        "long_reference_price": None,
+        "short_reference_price": None,
+        "blocked_buy_orders": 0,
+        "blocked_sell_orders": 0,
+    }
+    if config.same_side_entry_price_guard_enabled:
+        guard_gap = _tick_gap(inputs.tick_size, int(same_side_entry_price_guard_report["gap_ticks"]))
+        min_guard_notional = _safe_float(same_side_entry_price_guard_report["min_inventory_notional"])
+        long_reference_price = _safe_float(inputs.current_long_avg_price)
+        short_reference_price = _safe_float(inputs.current_short_avg_price)
+        same_side_entry_price_guard_report["long_reference_price"] = (
+            long_reference_price if long_reference_price > 0 else None
+        )
+        same_side_entry_price_guard_report["short_reference_price"] = (
+            short_reference_price if short_reference_price > 0 else None
+        )
+        if long_notional >= min_guard_notional and long_reference_price > 0:
+            max_long_entry_price = max(long_reference_price - guard_gap, 0.0)
+            kept_buy_orders: list[dict[str, Any]] = []
+            blocked_buy_orders: list[dict[str, Any]] = []
+            for order in buy_orders:
+                if (
+                    str(order.get("role", "")).lower().strip() == "best_quote_entry_long"
+                    and _safe_float(order.get("price")) > max_long_entry_price + 1e-12
+                ):
+                    blocked_buy_orders.append(order)
+                else:
+                    kept_buy_orders.append(order)
+            if blocked_buy_orders:
+                buy_orders = kept_buy_orders
+                same_side_entry_price_guard_report["applied"] = True
+                same_side_entry_price_guard_report["blocked_long_entry"] = True
+                same_side_entry_price_guard_report["blocked_buy_orders"] = len(blocked_buy_orders)
+                same_side_entry_price_guard_report["max_long_entry_price"] = max_long_entry_price
+        if short_notional >= min_guard_notional and short_reference_price > 0:
+            min_short_entry_price = short_reference_price + guard_gap
+            kept_sell_orders: list[dict[str, Any]] = []
+            blocked_sell_orders: list[dict[str, Any]] = []
+            for order in sell_orders:
+                if (
+                    str(order.get("role", "")).lower().strip() == "best_quote_entry_short"
+                    and _safe_float(order.get("price")) + 1e-12 < min_short_entry_price
+                ):
+                    blocked_sell_orders.append(order)
+                else:
+                    kept_sell_orders.append(order)
+            if blocked_sell_orders:
+                sell_orders = kept_sell_orders
+                same_side_entry_price_guard_report["applied"] = True
+                same_side_entry_price_guard_report["blocked_short_entry"] = True
+                same_side_entry_price_guard_report["blocked_sell_orders"] = len(blocked_sell_orders)
+                same_side_entry_price_guard_report["min_short_entry_price"] = min_short_entry_price
+        if same_side_entry_price_guard_report["applied"]:
+            reasons.append("same_side_entry_price_guard")
 
     planned = sum(order["notional"] for order in [*buy_orders, *sell_orders])
     return {
@@ -1120,6 +1227,7 @@ def build_best_quote_maker_volume_plan(
             "trend_inventory_guard": trend_inventory_guard_report,
             "trend_loss_reduce_guard": trend_loss_reduce_guard_report,
             "net_loss_reduce": net_loss_reduce_report,
+            "same_side_entry_price_guard": same_side_entry_price_guard_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,
         },
