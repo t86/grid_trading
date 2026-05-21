@@ -26854,6 +26854,219 @@ STRATEGY_WORKSPACE_PAGE = """<!doctype html>
 """
 
 
+CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="icon" href="data:," />
+  <title>中央策略配置工作台</title>
+  <style>
+    :root {
+      --bg: #f7f8f6;
+      --panel: #ffffff;
+      --line: #dfe5df;
+      --text: #17211c;
+      --muted: #62706a;
+      --brand: #16715f;
+      --brand-soft: #e6f4ef;
+      --warn: #a86610;
+      --bad: #b42318;
+      --ink: #253833;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    .wrap { width: min(1380px, calc(100% - 28px)); margin: 0 auto; padding: 18px 0 28px; }
+    .panel { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 14px; margin-bottom: 12px; }
+    .top, .toolbar, .actions, .section-head { display: flex; align-items: end; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+    h1 { margin: 0 0 4px; font-size: 24px; letter-spacing: 0; }
+    h2 { margin: 0; font-size: 16px; letter-spacing: 0; }
+    p, .meta { margin: 0; color: var(--muted); font-size: 13px; line-height: 1.5; }
+    label { display: grid; gap: 5px; color: var(--muted); font-size: 12px; font-weight: 700; }
+    input, select {
+      width: 100%;
+      height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      color: var(--text);
+      padding: 0 10px;
+      font: inherit;
+    }
+    button, a.nav {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 36px;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 8px 12px;
+      background: var(--brand-soft);
+      color: #0d5447;
+      text-decoration: none;
+      font-size: 13px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    button.primary { background: var(--brand); border-color: var(--brand); color: #fff; }
+    button:disabled { cursor: not-allowed; opacity: 0.58; }
+    .toolbar { justify-content: flex-start; margin-top: 12px; }
+    .toolbar label { min-width: 220px; }
+    .status-grid { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--line); border-radius: 8px; background: #fbfdfc; padding: 10px; min-height: 78px; }
+    .metric .label { color: var(--muted); font-size: 12px; font-weight: 800; }
+    .metric .value { margin-top: 6px; color: var(--ink); font-size: 17px; font-weight: 900; word-break: break-word; }
+    .metric .sub { margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.4; word-break: break-word; }
+    .sections { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .param-section { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 12px; min-width: 0; }
+    .param-section.warning { border-color: #e6c989; background: #fffaf0; }
+    .param-section.danger { border-color: #efb4ad; background: #fff7f6; }
+    .param-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 10px; }
+    .param-grid label { min-width: 0; }
+    .param-grid input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .empty { color: var(--muted); font-size: 13px; padding: 10px 0 2px; }
+    .tag { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--muted); font-size: 12px; font-weight: 800; }
+    @media (max-width: 980px) {
+      .status-grid, .sections, .param-grid { grid-template-columns: 1fr; }
+      .toolbar label, .actions button { min-width: 100%; flex: 1 1 100%; }
+    }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <section class="panel">
+      <div class="top">
+        <div>
+          <h1>中央策略配置工作台</h1>
+          <p>当前垂直切片：PHAROS hedge best-quote 参数分区与预检。</p>
+        </div>
+        <div class="actions">
+          <a class="nav" href="/strategy_editor">本机策略编辑器</a>
+          <a class="nav" href="/strategy_workspace">策略工作区</a>
+        </div>
+      </div>
+      <div class="toolbar">
+        <label>服务器
+          <select id="server_id">
+            <option value="114">114 · PHAROS</option>
+            <option value="150">150 · PHAROS</option>
+          </select>
+        </label>
+        <label>币种
+          <input id="symbol" value="PHAROSUSDT" spellcheck="false" />
+        </label>
+        <label>策略 Profile
+          <select id="strategy_profile">
+            <option value="pharosusdt_hedge_best_quote_maker_volume_v1">pharosusdt_hedge_best_quote_maker_volume_v1</option>
+          </select>
+        </label>
+      </div>
+      <div class="toolbar actions">
+        <button id="refresh_btn" type="button" class="primary">刷新参数</button>
+        <button id="save_btn" type="button" disabled>保存参数（下一阶段开放）</button>
+        <button id="apply_btn" type="button" disabled>保存并启动（下一阶段开放）</button>
+      </div>
+      <div id="meta" class="meta" style="margin-top:10px">页面已就绪。</div>
+    </section>
+
+    <section class="panel">
+      <div id="status_grid" class="status-grid">
+        <div class="metric"><div class="label">状态</div><div class="value">未刷新</div><div class="sub">点击刷新参数读取目标服务器。</div></div>
+      </div>
+    </section>
+
+    <section class="sections" id="sections"></section>
+  </main>
+  <script>
+    const sectionLabels = {
+      common: "通用执行参数",
+      profile: "策略自身参数",
+      global_safety: "全局安全阀",
+      forbidden: "禁止跨策略参数",
+      unknown: "未知遗留参数",
+    };
+    const sectionHints = {
+      common: "类型通用，但只对当前服务器、币种、profile 生效。",
+      profile: "PHAROS hedge best-quote 刷量策略自己的调节项。",
+      global_safety: "会限制下单、撤单、目标刷量或停机。",
+      forbidden: "当前 profile 不应接管的其他策略模块。",
+      unknown: "schema 尚未识别，下一步需要归类或清理。",
+    };
+    const metaEl = document.getElementById("meta");
+    const statusGridEl = document.getElementById("status_grid");
+    const sectionsEl = document.getElementById("sections");
+    function esc(value) {
+      return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
+    }
+    function valueOf(entry) {
+      if (entry && typeof entry === "object" && Object.prototype.hasOwnProperty.call(entry, "value")) return entry.value;
+      return entry;
+    }
+    function fieldType(value) {
+      if (typeof value === "number") return "number";
+      return "text";
+    }
+    function renderStatus(payload) {
+      const scope = payload.scope || {};
+      const preflight = payload.startup_preflight || payload.preflight || {};
+      const boundary = payload.profile_boundary || {};
+      statusGridEl.innerHTML = [
+        ["目标", `${scope.server_id || "--"} / ${scope.symbol || "--"}`, scope.strategy_profile || "--"],
+        ["Profile", payload.profile_family || boundary.profile_family || "--", `overlay: ${boundary.overlay_known === false ? "unknown" : "known"}`],
+        ["预检", preflight.status || (payload.ok ? "ready" : "error"), preflight.can_start === false ? "blocked" : "can start"],
+        ["读取时间", payload.updated_at || "--", payload.source || ""],
+      ].map(([label, value, sub]) => `<div class="metric"><div class="label">${esc(label)}</div><div class="value">${esc(value)}</div><div class="sub">${esc(sub)}</div></div>`).join("");
+    }
+    function renderSection(name, entries) {
+      const keys = Object.keys(entries || {}).sort();
+      const tone = name === "forbidden" || name === "unknown" ? (name === "forbidden" ? "warning" : "danger") : "";
+      const fields = keys.length
+        ? keys.map((key) => {
+            const raw = valueOf(entries[key]);
+            const value = typeof raw === "object" ? JSON.stringify(raw) : raw;
+            return `<label title="${esc(key)}">${esc(key)}<input data-section="${esc(name)}" data-key="${esc(key)}" type="${fieldType(value)}" value="${esc(value)}" /></label>`;
+          }).join("")
+        : `<div class="empty">暂无参数</div>`;
+      return `<section class="param-section ${tone}">
+        <div class="section-head"><h2>${esc(sectionLabels[name] || name)}</h2><span class="tag">${keys.length} 项</span></div>
+        <p>${esc(sectionHints[name] || "")}</p>
+        <div class="param-grid">${fields}</div>
+      </section>`;
+    }
+    function renderSections(payload) {
+      const sections = payload.sections || {};
+      sectionsEl.innerHTML = ["common", "profile", "global_safety", "forbidden", "unknown"]
+        .map((name) => renderSection(name, sections[name] || {}))
+        .join("");
+    }
+    async function refresh() {
+      const serverId = document.getElementById("server_id").value;
+      const symbol = document.getElementById("symbol").value.trim().toUpperCase();
+      const profile = document.getElementById("strategy_profile").value;
+      metaEl.textContent = "正在读取目标服务器参数...";
+      const url = `/api/central_strategy_workbench/status?server_id=${encodeURIComponent(serverId)}&symbol=${encodeURIComponent(symbol)}&strategy_profile=${encodeURIComponent(profile)}`;
+      const resp = await fetch(url);
+      const payload = await resp.json();
+      if (!resp.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${resp.status}`);
+      renderStatus(payload);
+      renderSections(payload);
+      metaEl.textContent = `最后刷新 ${new Date().toLocaleString("zh-CN")}`;
+    }
+    document.getElementById("refresh_btn").addEventListener("click", () => refresh().catch((err) => {
+      metaEl.textContent = err.message;
+      statusGridEl.innerHTML = `<div class="metric"><div class="label">状态</div><div class="value">${esc("读取失败")}</div><div class="sub">${esc(err.message)}</div></div>`;
+    }));
+  </script>
+</body>
+</html>
+"""
+
+
 SPOT_RUNNER_PAGE = """<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -32498,6 +32711,20 @@ def _build_strategy_editor_status(symbol: str) -> dict[str, Any]:
     }
 
 
+def build_remote_workbench_status(server_id: str, symbol: str, strategy_profile: str) -> dict[str, Any]:
+    from .central_strategy_workbench import build_remote_workbench_status as _build_remote_workbench_status
+
+    return _build_remote_workbench_status(server_id, symbol, strategy_profile)
+
+
+def _build_central_strategy_workbench_status(
+    server_id: str,
+    symbol: str,
+    strategy_profile: str,
+) -> dict[str, Any]:
+    return build_remote_workbench_status(server_id, symbol, strategy_profile)
+
+
 def _running_status_server_entries() -> list[dict[str, str]]:
     raw = os.environ.get("GRID_RUNNING_STATUS_SERVERS", "").strip()
     local_urls = {
@@ -33592,6 +33819,9 @@ class _Handler(BaseHTTPRequestHandler):
         if path in {"/strategy_editor", "/strategy_editor.html"}:
             self._send_html(STRATEGY_EDITOR_PAGE, status=HTTPStatus.OK)
             return
+        if path in {"/central_strategy_workbench", "/central_strategy_workbench.html"}:
+            self._send_html(CENTRAL_STRATEGY_WORKBENCH_PAGE, status=HTTPStatus.OK)
+            return
         if path in {"/manual_trade", "/manual_trade.html"}:
             self._send_html(MANUAL_TRADE_PAGE, status=HTTPStatus.OK)
             return
@@ -33755,6 +33985,23 @@ class _Handler(BaseHTTPRequestHandler):
                 return
             try:
                 payload = _build_strategy_editor_status(symbol)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+                return
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+                return
+            self._send_json(payload, status=HTTPStatus.OK)
+            return
+        if path == "/api/central_strategy_workbench/status":
+            server_id = str(query.get("server_id", ["114"])[0]).strip() or "114"
+            symbol = str(query.get("symbol", ["PHAROSUSDT"])[0]).upper().strip() or "PHAROSUSDT"
+            strategy_profile = (
+                str(query.get("strategy_profile", ["pharosusdt_hedge_best_quote_maker_volume_v1"])[0]).strip()
+                or "pharosusdt_hedge_best_quote_maker_volume_v1"
+            )
+            try:
+                payload = _build_central_strategy_workbench_status(server_id, symbol, strategy_profile)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)
                 return
@@ -34020,6 +34267,12 @@ class _Handler(BaseHTTPRequestHandler):
             self._send_common_headers("text/html; charset=utf-8", len(body))
             self.end_headers()
             return
+        if path in {"/central_strategy_workbench", "/central_strategy_workbench.html"}:
+            body = CENTRAL_STRATEGY_WORKBENCH_PAGE.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self._send_common_headers("text/html; charset=utf-8", len(body))
+            self.end_headers()
+            return
         if path in {"/manual_trade", "/manual_trade.html"}:
             body = MANUAL_TRADE_PAGE.encode("utf-8")
             self.send_response(HTTPStatus.OK)
@@ -34059,6 +34312,7 @@ class _Handler(BaseHTTPRequestHandler):
             or path == "/api/strategy_workspace"
             or path.startswith("/api/loop_monitor")
             or path == "/api/strategy_editor/status"
+            or path == "/api/central_strategy_workbench/status"
             or path == "/api/running_status"
             or path == "/api/grid_preview"
             or path == "/api/competition_board"

@@ -309,6 +309,17 @@ BEST_QUOTE_CORE_PARAMS = frozenset(
     }
 )
 
+BEST_QUOTE_MAKER_VOLUME_PARAMS = frozenset(
+    {
+        "best_quote_maker_volume_enabled",
+        "best_quote_maker_volume_cycle_budget_notional",
+        "best_quote_maker_volume_target_remaining_notional",
+        "best_quote_maker_volume_quote_offset_ticks",
+        "best_quote_maker_volume_max_long_notional",
+        "best_quote_maker_volume_max_short_notional",
+    }
+)
+
 ELASTIC_PARAMS = frozenset(
     {
         "elastic_volume_enabled",
@@ -441,6 +452,63 @@ SYNTHETIC_PING_PONG_ALLOWED_PARAMS = (
 )
 HEDGE_BQ_PING_PONG_RUNTIME_SWITCHES = SYNTHETIC_PING_PONG_RUNTIME_SWITCHES
 HEDGE_BQ_PING_PONG_ALLOWED_PARAMS = SYNTHETIC_PING_PONG_ALLOWED_PARAMS
+
+HEDGE_BEST_QUOTE_MAKER_VOLUME_RUNTIME_SWITCHES = frozenset(
+    {
+        "best_quote_maker_volume_enabled",
+        "hard_loss_forced_reduce_enabled",
+        "volatility_entry_pause_enabled",
+        "anti_chase_entry_guard_enabled",
+    }
+)
+HEDGE_BEST_QUOTE_MAKER_VOLUME_ALLOWED_PARAMS = (
+    COMMON_RUNNER_PARAMS
+    | BEST_QUOTE_CORE_PARAMS
+    | BEST_QUOTE_MAKER_VOLUME_PARAMS
+    | HEDGE_BEST_QUOTE_MAKER_VOLUME_RUNTIME_SWITCHES
+    | RISK_REPAIR_PARAMS
+    | frozenset(
+        {
+            "volatility_entry_pause_30s_abs_return_ratio",
+            "volatility_entry_pause_30s_amplitude_ratio",
+            "volatility_entry_pause_1m_abs_return_ratio",
+            "volatility_entry_pause_1m_amplitude_ratio",
+            "volatility_entry_pause_3m_abs_return_ratio",
+            "volatility_entry_pause_3m_amplitude_ratio",
+            "volatility_entry_pause_5m_abs_return_ratio",
+            "volatility_entry_pause_5m_amplitude_ratio",
+            "anti_chase_entry_guard_1m_abs_return_ratio",
+            "anti_chase_entry_guard_1m_amplitude_ratio",
+            "anti_chase_entry_guard_3m_abs_return_ratio",
+            "anti_chase_entry_guard_3m_amplitude_ratio",
+        }
+    )
+)
+PHAROS_HEDGE_BQ_ALLOWED_PARAM_PREFIXES = frozenset(
+    {
+        "adaptive_regime_router_",
+        "best_quote_maker_volume_",
+        "execution_cancel_",
+        "execution_place_",
+        "execution_request_",
+        "loss_inventory_",
+        "loss_recovery_brush_",
+        "loss_reentry_",
+        "rolling_hourly_loss_per_10k_",
+        "sticky_entry_",
+        "unrealized_loss_entry_guard_",
+        "volatility_entry_pause_",
+        "volatility_trigger_",
+        "volume_trigger_",
+    }
+)
+PHAROS_HEDGE_BQ_ALLOWED_EXACT_PARAMS = frozenset(
+    {
+        "cycle_jitter_seconds",
+        "startup_jitter_seconds",
+        "strategy_label",
+    }
+)
 
 ONE_WAY_LONG_RUNTIME_SWITCHES = frozenset(
     {
@@ -607,6 +675,22 @@ HEDGE_BQ_FORBIDDEN_PARAMS = frozenset(
         "adaptive_step_enabled",
     }
 )
+PHAROS_HEDGE_BQ_FORBIDDEN_PARAMS = frozenset(
+    {
+        "auto_regime_enabled",
+        "market_bias_enabled",
+        "market_bias_regime_switch_enabled",
+        "multi_timeframe_bias_enabled",
+        "synthetic_flow_sleeve_enabled",
+        "synthetic_trend_follow_enabled",
+        "volume_long_v4_flow_sleeve_enabled",
+        "custom_grid_enabled",
+        "adverse_reduce_enabled",
+        "exposure_escalation_enabled",
+        "excess_inventory_reduce_only_enabled",
+        "adaptive_step_enabled",
+    }
+)
 SYNTHETIC_PING_PONG_FORBIDDEN_PARAMS = frozenset(
     {
         "auto_regime_enabled",
@@ -655,6 +739,15 @@ PROFILE_BOUNDARY_OVERLAYS: dict[str, ProfileBoundaryOverlay] = {
         required_params=BEST_QUOTE_REQUIRED_PARAMS,
         global_safety_params=PROFILE_GLOBAL_SAFETY_PARAMS,
         runtime_switches=HEDGE_BQ_PING_PONG_RUNTIME_SWITCHES,
+    ),
+    "pharosusdt_hedge_best_quote_maker_volume_v1": ProfileBoundaryOverlay(
+        key="pharosusdt_hedge_best_quote_maker_volume_v1",
+        label="PHAROSUSDT Hedge Best Quote 冲量",
+        allowed_params=frozenset(HEDGE_BEST_QUOTE_MAKER_VOLUME_ALLOWED_PARAMS),
+        forbidden_params=PHAROS_HEDGE_BQ_FORBIDDEN_PARAMS,
+        required_params=BEST_QUOTE_REQUIRED_PARAMS,
+        global_safety_params=PROFILE_GLOBAL_SAFETY_PARAMS,
+        runtime_switches=HEDGE_BEST_QUOTE_MAKER_VOLUME_RUNTIME_SWITCHES,
     ),
     "volume_long_v4": ProfileBoundaryOverlay(
         key="volume_long_v4",
@@ -1030,10 +1123,18 @@ def _is_boundary_active_value(key: str, value: Any) -> bool:
 
 
 def _module_switch_for_param(key: str) -> str:
+    if key.startswith("best_quote_maker_volume_") and key != "best_quote_maker_volume_enabled":
+        return "best_quote_maker_volume_enabled"
+    if key.startswith("adaptive_regime_router_") and key != "adaptive_regime_router_enabled":
+        return "adaptive_regime_router_enabled"
     if key.startswith("elastic_") and key != "elastic_volume_enabled":
         return "elastic_volume_enabled"
     if key.startswith("hard_loss_forced_reduce_") and key != "hard_loss_forced_reduce_enabled":
         return "hard_loss_forced_reduce_enabled"
+    if key.startswith("volatility_entry_pause_") and key != "volatility_entry_pause_enabled":
+        return "volatility_entry_pause_enabled"
+    if key.startswith("anti_chase_entry_guard_") and key != "anti_chase_entry_guard_enabled":
+        return "anti_chase_entry_guard_enabled"
     if key.startswith("adverse_reduce_") and key != "adverse_reduce_enabled":
         return "adverse_reduce_enabled"
     if key.startswith("exposure_escalation_") and key != "exposure_escalation_enabled":
@@ -1049,6 +1150,14 @@ def _module_switch_for_param(key: str) -> str:
     if key.startswith("volume_long_v4_flow_sleeve_") and key != "volume_long_v4_flow_sleeve_enabled":
         return "volume_long_v4_flow_sleeve_enabled"
     return ""
+
+
+def _is_pharos_hedge_bq_known_param(strategy_profile: str, key: str) -> bool:
+    if _profile_key(strategy_profile) != "pharosusdt_hedge_best_quote_maker_volume_v1":
+        return False
+    if key in PHAROS_HEDGE_BQ_ALLOWED_EXACT_PARAMS:
+        return True
+    return any(key.startswith(prefix) for prefix in PHAROS_HEDGE_BQ_ALLOWED_PARAM_PREFIXES)
 
 
 def _is_boundary_active_param(args: argparse.Namespace, key: str) -> bool:
@@ -1154,6 +1263,19 @@ def resolve_strategy_profile_schema(*, strategy_mode: str, strategy_profile: str
         or "_hedge_bq" in profile_lower
         or "-hedge-bq" in profile_lower
     )
+    is_hedge_best_quote_maker_volume_profile = (
+        mode == "hedge_best_quote_maker_volume_v1"
+        or profile_lower == "pharosusdt_hedge_best_quote_maker_volume_v1"
+    )
+
+    if is_hedge_best_quote_maker_volume_profile:
+        return StrategyProfileSchema(
+            family="hedge_best_quote_maker_volume",
+            intent="volume",
+            required_position_mode=HEDGE_POSITION_MODE,
+            allowed_runtime_switches=HEDGE_BEST_QUOTE_MAKER_VOLUME_RUNTIME_SWITCHES,
+            allowed_params=frozenset(HEDGE_BEST_QUOTE_MAKER_VOLUME_ALLOWED_PARAMS),
+        )
 
     if mode == "hedge_neutral" or is_hedge_bq_profile:
         return StrategyProfileSchema(
@@ -1241,7 +1363,7 @@ def apply_strategy_profile_schema(
         )
         known_params = schema.allowed_params | frozenset(PARAMETER_NEUTRAL_DEFAULTS) | overlay_known_params
         for key, value in vars(args).items():
-            if key.startswith("_") or key in known_params:
+            if key.startswith("_") or key in known_params or _is_pharos_hedge_bq_known_param(strategy_profile, key):
                 continue
             if _is_active_unknown_value(value):
                 unknown_params.append(key)

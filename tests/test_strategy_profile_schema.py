@@ -308,6 +308,84 @@ class StrategyProfileSchemaTests(unittest.TestCase):
         self.assertEqual(boundary["forbidden_active_params"], [])
         self.assertEqual(boundary["required_missing_params"], [])
 
+    def test_pharos_hedge_best_quote_maker_volume_requires_hedge_and_known_overlay(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                symbol="PHAROSUSDT",
+                strategy_profile="pharosusdt_hedge_best_quote_maker_volume_v1",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_cycle_budget_notional=40.0,
+                best_quote_maker_volume_target_remaining_notional=200_000.0,
+                best_quote_maker_volume_quote_offset_ticks=3,
+                best_quote_maker_volume_max_long_notional=700.0,
+                best_quote_maker_volume_max_short_notional=700.0,
+                hard_loss_forced_reduce_enabled=True,
+                hard_loss_forced_reduce_target_notional=220.0,
+                volatility_entry_pause_enabled=True,
+                anti_chase_entry_guard_enabled=True,
+                max_total_notional=1450.0,
+                required_position_mode="hedge",
+            ),
+            enabled=True,
+        )
+
+        self.assertEqual(report["profile_family"], "hedge_best_quote_maker_volume")
+        self.assertEqual(report["required_position_mode"], "hedge")
+        self.assertTrue(report["profile_boundary"]["overlay_known"])
+        self.assertNotIn("best_quote_maker_volume_enabled", report["unknown_params"])
+
+    def test_pharos_overlay_marks_unrelated_modules_forbidden(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                symbol="PHAROSUSDT",
+                strategy_profile="pharosusdt_hedge_best_quote_maker_volume_v1",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                required_position_mode="hedge",
+                synthetic_flow_sleeve_enabled=True,
+                volume_long_v4_flow_sleeve_enabled=True,
+                custom_grid_enabled=True,
+                best_quote_maker_volume_enabled=True,
+                max_total_notional=1450.0,
+            ),
+            enabled=True,
+        )
+
+        forbidden_active = report["profile_boundary"]["forbidden_active_params"]
+        self.assertIn("synthetic_flow_sleeve_enabled", forbidden_active)
+        self.assertIn("volume_long_v4_flow_sleeve_enabled", forbidden_active)
+        self.assertIn("custom_grid_enabled", forbidden_active)
+
+    def test_pharos_hedge_best_quote_maker_volume_accepts_runtime_param_families(self) -> None:
+        _, report = apply_strategy_profile_schema(
+            _args(
+                symbol="PHAROSUSDT",
+                strategy_profile="pharosusdt_hedge_best_quote_maker_volume_v1",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                required_position_mode="hedge",
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_dynamic_control_enabled=True,
+                best_quote_maker_volume_inventory_bias_enabled=True,
+                best_quote_maker_volume_trend_guard_enabled=True,
+                best_quote_maker_volume_defensive_offset_ticks=4,
+                adaptive_regime_router_enabled=True,
+                adaptive_regime_router_mode="auto",
+                execution_request_budget_per_cycle=8,
+                execution_request_min_interval_seconds=0.05,
+                loss_reentry_guard_enabled=True,
+                loss_recovery_brush_entry_notional=10.0,
+                rolling_hourly_loss_per_10k_limit=3.0,
+                unrealized_loss_entry_guard_ratio=0.4,
+                volatility_entry_pause_10s_abs_return_ratio=0.0015,
+            ),
+            enabled=True,
+        )
+
+        self.assertTrue(report["strict_ok"])
+        self.assertNotIn("best_quote_maker_volume_dynamic_control_enabled", report["unknown_params"])
+        self.assertNotIn("adaptive_regime_router_enabled", report["unknown_params"])
+        self.assertNotIn("loss_reentry_guard_enabled", report["unknown_params"])
+
     def test_profile_boundary_reports_forbidden_active_params_without_changing_effective_args(self) -> None:
         effective, report = apply_strategy_profile_schema(
             _args(

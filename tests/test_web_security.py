@@ -4591,6 +4591,42 @@ class WebSecurityTests(unittest.TestCase):
         self.assertNotIn("/api/runner/start", STRATEGY_EDITOR_PAGE)
         self.assertNotIn("/api/runner/stop", STRATEGY_EDITOR_PAGE)
 
+    def test_central_strategy_workbench_page_is_available(self) -> None:
+        page = web_module.CENTRAL_STRATEGY_WORKBENCH_PAGE
+
+        self.assertIn("中央策略配置工作台", page)
+        self.assertIn('rel="icon"', page)
+        self.assertIn("/api/central_strategy_workbench/status", page)
+        self.assertIn("PHAROSUSDT", page)
+        self.assertNotIn("setInterval(", page)
+
+    @patch("grid_optimizer.web.build_remote_workbench_status")
+    def test_central_strategy_workbench_status_api_returns_grouped_sections(self, mock_status) -> None:
+        mock_status.return_value = {
+            "ok": True,
+            "scope": {
+                "server_id": "114",
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+            },
+            "sections": {
+                "common": {"max_new_orders": {"value": 5}},
+                "profile": {"best_quote_maker_volume_cycle_budget_notional": {"value": 40.0}},
+                "global_safety": {},
+                "forbidden": {},
+                "unknown": {},
+            },
+        }
+
+        payload = web_module._build_central_strategy_workbench_status(
+            "114",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+        )
+
+        self.assertTrue(payload["ok"])
+        self.assertIn("common", payload["sections"])
+
     def test_strategy_editor_routes_are_registered(self) -> None:
         source = inspect.getsource(_Handler.do_GET)
         self.assertIn("/strategy_editor", source)
