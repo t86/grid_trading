@@ -362,6 +362,35 @@ class WebSecurityTests(unittest.TestCase):
         handler._send_json.assert_called_once()
         self.assertTrue(handler._send_json.call_args.args[0]["ok"])
 
+    @patch("grid_optimizer.web._update_runner_frozen_inventory")
+    def test_handler_routes_runner_frozen_inventory_updates(self, mock_update_frozen) -> None:
+        mock_update_frozen.return_value = {
+            "symbol": "PHAROSUSDT",
+            "action": "clear_long",
+            "frozen_inventory": {},
+        }
+        payload = b'{"symbol":"PHAROSUSDT","action":"clear_long"}'
+        handler = object.__new__(_Handler)
+        handler.path = "/api/runner/frozen_inventory"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        handler._authorize_request = lambda: True
+        handler._send_json = Mock()
+
+        _Handler.do_POST(handler)
+
+        mock_update_frozen.assert_called_once_with({"symbol": "PHAROSUSDT", "action": "clear_long"})
+        handler._send_json.assert_called_once()
+        self.assertTrue(handler._send_json.call_args.args[0]["ok"])
+
+    def test_running_status_page_contains_frozen_inventory_ledger_controls(self) -> None:
+        page = _render_running_status_page()
+
+        self.assertIn("冻结仓位账本", page)
+        self.assertIn("/api/runner/frozen_inventory", page)
+        self.assertIn("标记多已处理", page)
+        self.assertIn("这里仅更新策略账本，不直接下单。", page)
+
     def test_running_status_overview_page_restores_cross_server_table(self) -> None:
         page = _render_running_status_overview_page()
 

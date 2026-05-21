@@ -6012,6 +6012,36 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       font-size: 12px;
       line-height: 1.6;
     }
+    .rs-ledger-panel {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      background: #fff;
+      padding: 14px;
+    }
+    .rs-ledger-panel h3 {
+      margin: 0 0 10px;
+      font-size: 15px;
+    }
+    .rs-ledger-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
+      margin-bottom: 10px;
+    }
+    .rs-ledger-item {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+      background: #f8fafc;
+      font-size: 12px;
+      color: var(--muted);
+    }
+    .rs-ledger-item strong {
+      display: block;
+      margin-top: 3px;
+      color: var(--text);
+      font-size: 15px;
+    }
     .rs-drawer-actions {
       display: flex;
       justify-content: space-between;
@@ -6100,6 +6130,16 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         <div class="rs-drawer-grid">
           <div class="rs-form-stack">
             __RUNNING_STATUS_FORM_HTML__
+            <section id="frozen_inventory_panel" class="rs-ledger-panel rs-hidden">
+              <h3>冻结仓位账本</h3>
+              <div id="frozen_inventory_body" class="rs-ledger-grid"></div>
+              <div class="rs-drawer-action-group">
+                <button id="frozen_set_btn" type="button">手动设置</button>
+                <button id="frozen_clear_long_btn" type="button">标记多已处理</button>
+                <button id="frozen_clear_short_btn" type="button">标记空已处理</button>
+                <button id="frozen_reset_btn" type="button" class="danger">清空账本</button>
+              </div>
+            </section>
           </div>
           <section class="rs-json-panel">
             <div class="rs-group-head">
@@ -6145,6 +6185,12 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     const drawerApplyBtn = document.getElementById("drawer_apply_btn");
     const drawerStopBtn = document.getElementById("drawer_stop_btn");
     const runnerJsonEditorEl = document.getElementById("runner_json_editor");
+    const frozenInventoryPanelEl = document.getElementById("frozen_inventory_panel");
+    const frozenInventoryBodyEl = document.getElementById("frozen_inventory_body");
+    const frozenSetBtn = document.getElementById("frozen_set_btn");
+    const frozenClearLongBtn = document.getElementById("frozen_clear_long_btn");
+    const frozenClearShortBtn = document.getElementById("frozen_clear_short_btn");
+    const frozenResetBtn = document.getElementById("frozen_reset_btn");
 
     const state = {
       payload: null,
@@ -6406,6 +6452,28 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       return parts.length ? parts.join(" · ") : "未配置";
     }
 
+    function frozenInventory(card) {
+      const ledger = (card && card.frozen_inventory && typeof card.frozen_inventory === "object") ? card.frozen_inventory : {};
+      return {
+        long_qty: Number(ledger.long_qty || 0),
+        short_qty: Number(ledger.short_qty || 0),
+        long_notional: Number(ledger.long_notional || 0),
+        short_notional: Number(ledger.short_notional || 0),
+        long_entry_price: Number(ledger.long_entry_price || 0),
+        short_entry_price: Number(ledger.short_entry_price || 0),
+        long_frozen_at: ledger.long_frozen_at || "",
+        short_frozen_at: ledger.short_frozen_at || "",
+        offset_qty: Number(ledger.offset_qty || 0),
+        offset_notional: Number(ledger.offset_notional || 0),
+      };
+    }
+
+    function formatFrozenInventory(card) {
+      const ledger = frozenInventory(card);
+      if (!(ledger.long_qty > 0 || ledger.short_qty > 0)) return "无";
+      return `多 ${fmtNum(ledger.long_qty, 4)} / 空 ${fmtNum(ledger.short_qty, 4)} · 抵扣 ${fmtNum(ledger.offset_qty, 4)}`;
+    }
+
     function badgeClass(card) {
       if (card.is_running) return "good";
       return "warn";
@@ -6477,6 +6545,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
                 <div class="rs-param-row"><span>软减仓策略</span><strong>${escapeHtml(formatSoftReduce(card))}</strong></div>
                 <div class="rs-param-row"><span>硬减仓策略</span><strong>${escapeHtml(formatHardReduce(card))}</strong></div>
                 <div class="rs-param-row"><span>超时减仓机制</span><strong>${escapeHtml(formatTimeoutReduce(card))}</strong></div>
+                <div class="rs-param-row"><span>冻结账本</span><strong>${escapeHtml(formatFrozenInventory(card))}</strong></div>
               </div>
               <div class="rs-stat-panel">
                 <div class="rs-stat-list">
@@ -6592,11 +6661,29 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       drawerMetaEl.textContent = `${card.server_label || card.server_id || "本机"} · ${card.strategy_profile || card.strategy_name || "--"} · ${card.is_running ? "运行中" : "已保存未启动"}`;
       runnerJsonEditorEl.value = JSON.stringify(state.currentConfig, null, 2);
       syncFormFromConfig(state.currentConfig);
+      renderFrozenInventoryPanel(card);
       state.jsonValid = true;
       setDrawerStatus("参数已载入。");
       syncDrawerActions();
       drawerShellEl.classList.add("open");
       drawerShellEl.setAttribute("aria-hidden", "false");
+    }
+
+    function renderFrozenInventoryPanel(card) {
+      const editable = Boolean(card && !card.server_base_url);
+      const ledger = frozenInventory(card);
+      const active = ledger.long_qty > 0 || ledger.short_qty > 0;
+      frozenInventoryPanelEl.classList.toggle("rs-hidden", !editable);
+      frozenInventoryBodyEl.innerHTML = `
+        <div class="rs-ledger-item">冻结多仓<strong>${fmtNum(ledger.long_qty, 6)} @ ${fmtNum(ledger.long_entry_price, 8)}</strong><span>${fmtNum(ledger.long_notional, 2)}U · ${escapeHtml(ledger.long_frozen_at || "--")}</span></div>
+        <div class="rs-ledger-item">冻结空仓<strong>${fmtNum(ledger.short_qty, 6)} @ ${fmtNum(ledger.short_entry_price, 8)}</strong><span>${fmtNum(ledger.short_notional, 2)}U · ${escapeHtml(ledger.short_frozen_at || "--")}</span></div>
+        <div class="rs-ledger-item">多空可抵扣<strong>${fmtNum(ledger.offset_qty, 6)}</strong><span>${fmtNum(ledger.offset_notional, 2)}U</span></div>
+        <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>这里仅更新策略账本，不直接下单。</span></div>
+      `;
+      frozenClearLongBtn.disabled = !editable || !(ledger.long_qty > 0);
+      frozenClearShortBtn.disabled = !editable || !(ledger.short_qty > 0);
+      frozenResetBtn.disabled = !editable || !active;
+      frozenSetBtn.disabled = !editable;
     }
 
     function closeDrawer() {
@@ -6723,6 +6810,36 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       }
     }
 
+    async function updateFrozenInventory(action, extra = {}) {
+      const card = state.drawerCard;
+      if (!card) return;
+      setDrawerStatus(`正在更新 ${card.symbol} 冻结账本...`);
+      try {
+        const resp = await fetch("/api/runner/frozen_inventory", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ symbol: card.symbol, action, ...extra }),
+        });
+        const data = await readJsonResponse(resp);
+        if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        setDrawerStatus(`${card.symbol} 冻结账本已更新。`);
+        await loadPage({ preserveDrawer: true });
+      } catch (err) {
+        setDrawerStatus(`更新冻结账本失败: ${String(err)}`, true);
+      }
+    }
+
+    function promptNumber(message, currentValue) {
+      const raw = window.prompt(message, String(currentValue ?? 0));
+      if (raw === null) return null;
+      const value = Number(raw);
+      if (!Number.isFinite(value) || value < 0) {
+        window.alert("请输入非负数字");
+        return null;
+      }
+      return value;
+    }
+
     function scheduleAutoRefresh() {
       if (state.timer) {
         clearInterval(state.timer);
@@ -6755,6 +6872,21 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     drawerSaveBtn.addEventListener("click", () => saveCurrentConfig(false));
     drawerApplyBtn.addEventListener("click", () => saveCurrentConfig(true));
     drawerStopBtn.addEventListener("click", () => stopAndFlattenCurrentRunner());
+    frozenClearLongBtn.addEventListener("click", () => updateFrozenInventory("clear_long"));
+    frozenClearShortBtn.addEventListener("click", () => updateFrozenInventory("clear_short"));
+    frozenResetBtn.addEventListener("click", () => {
+      if (window.confirm("确认清空冻结仓位账本？这只更新策略账本，不会向交易所下单。")) {
+        updateFrozenInventory("reset");
+      }
+    });
+    frozenSetBtn.addEventListener("click", () => {
+      const ledger = frozenInventory(state.drawerCard);
+      const longQty = promptNumber("冻结多仓数量", ledger.long_qty);
+      if (longQty === null) return;
+      const shortQty = promptNumber("冻结空仓数量", ledger.short_qty);
+      if (shortQty === null) return;
+      updateFrozenInventory("set", { long_qty: longQty, short_qty: shortQty });
+    });
     refreshBtn.addEventListener("click", () => loadPage({ preserveDrawer: true }));
     toggleRefreshBtn.addEventListener("click", () => {
       state.paused = !state.paused;
@@ -9796,6 +9928,93 @@ def _quick_flatten_runner_symbol(symbol: str) -> dict[str, Any]:
         **result,
         "symbol": normalized_symbol,
         "flatten_allow_loss": True,
+    }
+
+
+def _runner_frozen_inventory_state_path(symbol: str) -> Path:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        raise ValueError("symbol is required")
+    config = _load_runner_control_config(normalized_symbol)
+    state_path = str(config.get("state_path") or _default_runtime_paths_for_symbol(normalized_symbol)["state_path"]).strip()
+    if not state_path:
+        raise ValueError("state_path is required")
+    return Path(state_path)
+
+
+def _normalize_runner_frozen_inventory_ledger(raw: Any) -> dict[str, Any]:
+    ledger = raw if isinstance(raw, dict) else {}
+    long_qty = max(_safe_float(ledger.get("long_qty", 0.0), "long_qty"), 0.0)
+    short_qty = max(_safe_float(ledger.get("short_qty", 0.0), "short_qty"), 0.0)
+    return {
+        "long_qty": long_qty,
+        "short_qty": short_qty,
+        "long_notional": max(_safe_float(ledger.get("long_notional", 0.0), "long_notional"), 0.0),
+        "short_notional": max(_safe_float(ledger.get("short_notional", 0.0), "short_notional"), 0.0),
+        "long_entry_price": max(_safe_float(ledger.get("long_entry_price", 0.0), "long_entry_price"), 0.0),
+        "short_entry_price": max(_safe_float(ledger.get("short_entry_price", 0.0), "short_entry_price"), 0.0),
+        "long_frozen_at": str(ledger.get("long_frozen_at") or ""),
+        "short_frozen_at": str(ledger.get("short_frozen_at") or ""),
+        "offset_qty": min(long_qty, short_qty),
+        "offset_notional": max(_safe_float(ledger.get("offset_notional", 0.0), "offset_notional"), 0.0),
+        "updated_at": str(ledger.get("updated_at") or ""),
+    }
+
+
+def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    if not symbol:
+        raise ValueError("symbol is required")
+    action = str(payload.get("action", "set")).strip().lower() or "set"
+    if action not in {"set", "clear_long", "clear_short", "reset"}:
+        raise ValueError("unsupported frozen inventory action")
+    state_path = _runner_frozen_inventory_state_path(symbol)
+    state = _read_json_dict(state_path) or {}
+    ledger = _normalize_runner_frozen_inventory_ledger(state.get("best_quote_frozen_inventory"))
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    if action == "reset":
+        state.pop("best_quote_frozen_inventory", None)
+        ledger = {}
+    else:
+        if action == "set":
+            if "long_qty" in payload:
+                ledger["long_qty"] = max(_safe_float(payload.get("long_qty"), "long_qty"), 0.0)
+            if "short_qty" in payload:
+                ledger["short_qty"] = max(_safe_float(payload.get("short_qty"), "short_qty"), 0.0)
+            if "long_entry_price" in payload:
+                ledger["long_entry_price"] = max(_safe_float(payload.get("long_entry_price"), "long_entry_price"), 0.0)
+            if "short_entry_price" in payload:
+                ledger["short_entry_price"] = max(_safe_float(payload.get("short_entry_price"), "short_entry_price"), 0.0)
+        elif action == "clear_long":
+            ledger["long_qty"] = 0.0
+            ledger["long_notional"] = 0.0
+            ledger["long_entry_price"] = 0.0
+            ledger["long_frozen_at"] = ""
+        elif action == "clear_short":
+            ledger["short_qty"] = 0.0
+            ledger["short_notional"] = 0.0
+            ledger["short_entry_price"] = 0.0
+            ledger["short_frozen_at"] = ""
+        ledger["offset_qty"] = min(
+            max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0),
+            max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0),
+        )
+        ledger["updated_at"] = now_iso
+        if max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0) > 0 or max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0) > 0:
+            state["best_quote_frozen_inventory"] = ledger
+        else:
+            state.pop("best_quote_frozen_inventory", None)
+            ledger = {}
+
+    state_path.parent.mkdir(parents=True, exist_ok=True)
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    RUNNING_STATUS_API_RESPONSE_CACHE.clear()
+    return {
+        "symbol": symbol,
+        "state_path": str(state_path),
+        "action": action,
+        "frozen_inventory": _normalize_runner_frozen_inventory_ledger(ledger) if ledger else {},
     }
 
 
@@ -36010,7 +36229,14 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
-        if path in {"/api/runner/start", "/api/runner/stop", "/api/runner/save", "/api/runner/quick_start_last", "/api/runner/quick_flatten"}:
+        if path in {
+            "/api/runner/start",
+            "/api/runner/stop",
+            "/api/runner/save",
+            "/api/runner/quick_start_last",
+            "/api/runner/quick_flatten",
+            "/api/runner/frozen_inventory",
+        }:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -36040,6 +36266,8 @@ class _Handler(BaseHTTPRequestHandler):
                     result = _start_runner_process(config)
                 elif path.endswith("/save"):
                     result = _save_runner_config_without_start(payload)
+                elif path.endswith("/frozen_inventory"):
+                    result = _update_runner_frozen_inventory(payload)
                 else:
                     result = _stop_runner_process(
                         payload.get("symbol"),
