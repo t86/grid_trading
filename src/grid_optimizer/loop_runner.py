@@ -3010,11 +3010,18 @@ def _is_long_exit_order(order: dict[str, Any]) -> bool:
         "hard_delever_long",
         "flow_sleeve_long",
         "inventory_unlock_reduce_long",
+        "best_quote_reduce_long",
     }
 
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
-    return _order_role(order) in {"take_profit_short", "active_delever_short", "flow_sleeve_short", "inventory_unlock_reduce_short"}
+    return _order_role(order) in {
+        "take_profit_short",
+        "active_delever_short",
+        "flow_sleeve_short",
+        "inventory_unlock_reduce_short",
+        "best_quote_reduce_short",
+    }
 
 
 def apply_entry_permission_gate(

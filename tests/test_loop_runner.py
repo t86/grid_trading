@@ -45,6 +45,8 @@ from grid_optimizer.loop_runner import (
     _resolve_synthetic_resync_price,
     _resolve_hard_loss_reduce_target_notional,
     _position_unrealized_or_estimate,
+    _is_long_exit_order,
+    _is_short_exit_order,
     _shift_custom_grid_bounds,
     _run_periodic_reconcile,
     _cap_best_quote_profitable_inventory_exit_offset,
@@ -294,6 +296,10 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(controls["pause_reasons"], [])
         self.assertEqual(controls["short_pause_reasons"], ["volatility_entry_pause: fast move"])
         self.assertEqual(volatility_entry_pause["loss_recovery_brush_bypass_side"], "BUY")
+
+    def test_volatility_entry_pause_classifies_best_quote_reduces_as_exits(self) -> None:
+        self.assertTrue(_is_long_exit_order({"role": "best_quote_reduce_long"}))
+        self.assertTrue(_is_short_exit_order({"role": "best_quote_reduce_short"}))
 
     def test_remove_take_profit_exit_orders_keeps_active_delever(self) -> None:
         plan = {
