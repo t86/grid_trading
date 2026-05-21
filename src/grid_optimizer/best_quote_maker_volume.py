@@ -62,6 +62,11 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_trend_inventory_guard_entry_budget_scale: float = 0.25
     dynamic_control_trend_inventory_guard_reduce_budget_scale: float = 0.50
     dynamic_control_trend_inventory_guard_reduce_extra_ticks: int = 4
+    dynamic_control_trend_loss_reduce_guard_enabled: bool = False
+    dynamic_control_trend_loss_reduce_guard_min_score: float = 0.75
+    dynamic_control_trend_loss_reduce_guard_min_volatility_ratio: float = 0.0035
+    dynamic_control_trend_loss_reduce_guard_reduce_budget_scale: float = 0.35
+    dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks: int = 6
 
 
 @dataclass(frozen=True)
@@ -399,6 +404,21 @@ def build_best_quote_maker_volume_plan(
         "reduce_budget_scale": _safe_float(config.dynamic_control_trend_inventory_guard_reduce_budget_scale),
         "reduce_extra_ticks": int(_safe_float(config.dynamic_control_trend_inventory_guard_reduce_extra_ticks)),
     }
+    trend_loss_reduce_guard_report = {
+        "enabled": bool(config.dynamic_control_trend_loss_reduce_guard_enabled),
+        "applied": False,
+        "reason": None,
+        "guard_long_reduce": False,
+        "guard_short_reduce": False,
+        "reduce_long_budget_scale": 1.0,
+        "reduce_short_budget_scale": 1.0,
+        "reduce_long_extra_ticks": 0,
+        "reduce_short_extra_ticks": 0,
+        "min_score": _safe_float(config.dynamic_control_trend_loss_reduce_guard_min_score),
+        "min_volatility_ratio": _safe_float(config.dynamic_control_trend_loss_reduce_guard_min_volatility_ratio),
+        "reduce_budget_scale": _safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_budget_scale),
+        "reduce_extra_ticks": int(_safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks)),
+    }
     if config.dynamic_control_enabled and regime != "loss_defensive":
         return_1m = _safe_float(inputs.market_return_1m)
         return_5m = _safe_float(inputs.market_return_5m)
@@ -574,6 +594,47 @@ def build_best_quote_maker_volume_plan(
             )
             reasons.append("trend_inventory_guard")
 
+    if config.dynamic_control_enabled and config.dynamic_control_trend_loss_reduce_guard_enabled and not hard_loss:
+        min_score = _clamp(_safe_float(config.dynamic_control_trend_loss_reduce_guard_min_score), 0.0, 1.0)
+        min_volatility = max(_safe_float(config.dynamic_control_trend_loss_reduce_guard_min_volatility_ratio), 0.0)
+        reduce_scale = _clamp(_safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_budget_scale), 0.0, 1.0)
+        reduce_extra_ticks = max(int(_safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks)), 0)
+        trend_score = _clamp(_safe_float(dynamic_control_report.get("trend_score")), -1.0, 1.0)
+        volatility_ratio = max(_safe_float(dynamic_control_report.get("volatility_ratio")), 0.0)
+        volatility_ok = min_volatility <= 0 or volatility_ratio >= min_volatility
+        guard_short_reduce = volatility_ok and trend_score >= min_score and short_notional > 0
+        guard_long_reduce = volatility_ok and trend_score <= -min_score and long_notional > 0
+        if guard_long_reduce or guard_short_reduce:
+            if guard_long_reduce:
+                trend_loss_reduce_guard_report.update(
+                    {
+                        "guard_long_reduce": True,
+                        "reduce_long_budget_scale": reduce_scale,
+                        "reduce_long_extra_ticks": reduce_extra_ticks,
+                    }
+                )
+            if guard_short_reduce:
+                trend_loss_reduce_guard_report.update(
+                    {
+                        "guard_short_reduce": True,
+                        "reduce_short_budget_scale": reduce_scale,
+                        "reduce_short_extra_ticks": reduce_extra_ticks,
+                    }
+                )
+            trend_loss_reduce_guard_report.update(
+                {
+                    "applied": True,
+                    "reason": "adverse_trend_reduce_chase_guard",
+                    "min_score": min_score,
+                    "min_volatility_ratio": min_volatility,
+                    "reduce_budget_scale": reduce_scale,
+                    "reduce_extra_ticks": reduce_extra_ticks,
+                    "trend_score": trend_score,
+                    "volatility_ratio": volatility_ratio,
+                }
+            )
+            reasons.append("trend_loss_reduce_guard")
+
     dynamic_tick_report = {
         "enabled": bool(config.dynamic_tick_enabled),
         "base_offset_ticks": int(offset_ticks),
@@ -598,8 +659,16 @@ def build_best_quote_maker_volume_plan(
             offset_ticks = new_ticks
     dynamic_tick_report["offset_ticks"] = int(offset_ticks)
     gap = _tick_gap(inputs.tick_size, offset_ticks)
-    reduce_long_extra_ticks = max(int(_safe_float(trend_inventory_guard_report["reduce_long_extra_ticks"])), 0)
-    reduce_short_extra_ticks = max(int(_safe_float(trend_inventory_guard_report["reduce_short_extra_ticks"])), 0)
+    reduce_long_extra_ticks = max(
+        int(_safe_float(trend_inventory_guard_report["reduce_long_extra_ticks"])),
+        int(_safe_float(trend_loss_reduce_guard_report["reduce_long_extra_ticks"])),
+        0,
+    )
+    reduce_short_extra_ticks = max(
+        int(_safe_float(trend_inventory_guard_report["reduce_short_extra_ticks"])),
+        int(_safe_float(trend_loss_reduce_guard_report["reduce_short_extra_ticks"])),
+        0,
+    )
     reduce_long_gap = _tick_gap(inputs.tick_size, max(int(offset_ticks) + reduce_long_extra_ticks, 0))
     reduce_short_gap = _tick_gap(inputs.tick_size, max(int(offset_ticks) + reduce_short_extra_ticks, 0))
     buy_slot_active = allow_entry_long or (short_notional > 0 and not allow_entry_short)
@@ -629,6 +698,14 @@ def build_best_quote_maker_volume_plan(
     )
     reduce_short_budget_scale = _clamp(
         _safe_float(trend_inventory_guard_report["reduce_short_budget_scale"]), 0.0, 1.0
+    )
+    reduce_long_budget_scale = min(
+        reduce_long_budget_scale,
+        _clamp(_safe_float(trend_loss_reduce_guard_report["reduce_long_budget_scale"]), 0.0, 1.0),
+    )
+    reduce_short_budget_scale = min(
+        reduce_short_budget_scale,
+        _clamp(_safe_float(trend_loss_reduce_guard_report["reduce_short_budget_scale"]), 0.0, 1.0),
     )
 
     buy_orders: list[dict[str, Any]] = []
@@ -985,6 +1062,7 @@ def build_best_quote_maker_volume_plan(
             "dynamic_control": dynamic_control_report,
             "trend_entry_guard": trend_entry_guard_report,
             "trend_inventory_guard": trend_inventory_guard_report,
+            "trend_loss_reduce_guard": trend_loss_reduce_guard_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,
         },

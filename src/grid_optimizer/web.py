@@ -495,6 +495,11 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_dynamic_control_trend_inventory_guard_entry_budget_scale": 0.25,
             "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_budget_scale": 0.50,
             "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks": 4,
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled": True,
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_score": 0.75,
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_volatility_ratio": 0.0035,
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_budget_scale": 0.35,
+            "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks": 6,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "autotune_symbol_enabled": False,
@@ -8987,6 +8992,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_dynamic_control_trend_inventory_guard_min_volatility_ratio",
         "best_quote_maker_volume_dynamic_control_trend_inventory_guard_entry_budget_scale",
         "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_budget_scale",
+        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_score",
+        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_volatility_ratio",
+        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_budget_scale",
         "elastic_early_micro_abs_return_ratio",
         "elastic_early_micro_amplitude_ratio",
         "elastic_early_safe_inventory_ratio",
@@ -9041,6 +9049,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_dynamic_control_extreme_volatility_extra_offset_ticks",
         "best_quote_maker_volume_dynamic_control_low_volatility_extra_offset_ticks",
         "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks",
+        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks",
     }
     bool_fields = {
         "cancel_stale",
@@ -9065,6 +9074,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_dynamic_control_enabled",
         "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled",
         "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled",
+        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled",
         "elastic_volume_enabled",
         "regime_entry_budget_enabled",
         "regime_entry_budget_report_only",
@@ -9873,6 +9883,17 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_budget_scale", 0.50)),
         "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-reduce-extra-ticks",
         str(config.get("best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks", 4)),
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-enabled"
+        if config.get("best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled", False)
+        else "--no-best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-enabled",
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-min-score",
+        str(config.get("best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_score", 0.75)),
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-min-volatility-ratio",
+        str(config.get("best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_volatility_ratio", 0.0035)),
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-reduce-budget-scale",
+        str(config.get("best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_budget_scale", 0.35)),
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-reduce-extra-ticks",
+        str(config.get("best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks", 6)),
         "--best-quote-maker-volume-take-profit-guard-enabled"
         if config.get("best_quote_maker_volume_take_profit_guard_enabled", True)
         else "--no-best-quote-maker-volume-take-profit-guard-enabled",

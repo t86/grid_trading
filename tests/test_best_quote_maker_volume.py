@@ -534,6 +534,93 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertTrue(guard["guard_long_inventory"])
         self.assertEqual(guard["reduce_long_extra_ticks"], 4)
 
+    def test_trend_loss_reduce_guard_slows_short_reduce_even_below_inventory_start(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_short_notional=700.0,
+                inventory_soft_ratio=0.5,
+                dynamic_control_enabled=True,
+                dynamic_control_high_volatility_ratio=1.0,
+                dynamic_control_extreme_volatility_ratio=2.0,
+                dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_entry_guard_enabled=True,
+                dynamic_control_trend_entry_guard_min_score=0.75,
+                dynamic_control_trend_loss_reduce_guard_enabled=True,
+                dynamic_control_trend_loss_reduce_guard_min_score=0.75,
+                dynamic_control_trend_loss_reduce_guard_min_volatility_ratio=0.0035,
+                dynamic_control_trend_loss_reduce_guard_reduce_budget_scale=0.35,
+                dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks=6,
+            ),
+            inputs=_inputs(
+                bid_price=0.6050,
+                ask_price=0.6051,
+                mid_price=0.60505,
+                current_short_qty=120.0,
+                current_net_qty=0.0,
+                cycle_budget_notional=40.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                position_side_mode="hedge",
+                market_return_1m=0.003,
+                market_return_5m=0.006,
+                market_amplitude_5m=0.006,
+            ),
+        )
+
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_reduce_short"])
+        order = plan["buy_orders"][0]
+        self.assertEqual(order["price"], 0.6044)
+        self.assertAlmostEqual(order["notional"], 14.0, delta=0.5)
+        guard = plan["metrics"]["trend_loss_reduce_guard"]
+        self.assertTrue(guard["applied"])
+        self.assertTrue(guard["guard_short_reduce"])
+        self.assertEqual(guard["reduce_short_extra_ticks"], 6)
+        self.assertIn("trend_loss_reduce_guard", plan["reasons"])
+
+    def test_trend_loss_reduce_guard_slows_long_reduce_even_below_inventory_start(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=700.0,
+                inventory_soft_ratio=0.5,
+                dynamic_control_enabled=True,
+                dynamic_control_high_volatility_ratio=1.0,
+                dynamic_control_extreme_volatility_ratio=2.0,
+                dynamic_control_trend_return_ratio=0.002,
+                dynamic_control_trend_entry_guard_enabled=True,
+                dynamic_control_trend_entry_guard_min_score=0.75,
+                dynamic_control_trend_loss_reduce_guard_enabled=True,
+                dynamic_control_trend_loss_reduce_guard_min_score=0.75,
+                dynamic_control_trend_loss_reduce_guard_min_volatility_ratio=0.0035,
+                dynamic_control_trend_loss_reduce_guard_reduce_budget_scale=0.35,
+                dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks=6,
+            ),
+            inputs=_inputs(
+                bid_price=0.6050,
+                ask_price=0.6051,
+                mid_price=0.60505,
+                current_long_qty=120.0,
+                current_net_qty=0.0,
+                cycle_budget_notional=40.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                position_side_mode="hedge",
+                market_return_1m=-0.003,
+                market_return_5m=-0.006,
+                market_amplitude_5m=0.006,
+            ),
+        )
+
+        self.assertEqual([order["role"] for order in plan["sell_orders"]], ["best_quote_reduce_long"])
+        order = plan["sell_orders"][0]
+        self.assertEqual(order["price"], 0.6057)
+        self.assertAlmostEqual(order["notional"], 14.0, delta=0.5)
+        guard = plan["metrics"]["trend_loss_reduce_guard"]
+        self.assertTrue(guard["applied"])
+        self.assertTrue(guard["guard_long_reduce"])
+        self.assertEqual(guard["reduce_long_extra_ticks"], 6)
+
     def test_trend_inventory_guard_cuts_same_side_entry_before_soft(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

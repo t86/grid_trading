@@ -14068,6 +14068,33 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 dynamic_control_trend_inventory_guard_reduce_extra_ticks=int(
                     getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks", 4)
                 ),
+                dynamic_control_trend_loss_reduce_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled", False)
+                ),
+                dynamic_control_trend_loss_reduce_guard_min_score=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_score", 0.75)
+                ),
+                dynamic_control_trend_loss_reduce_guard_min_volatility_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_volatility_ratio",
+                        0.0035,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_reduce_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_budget_scale",
+                        0.35,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks=int(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks",
+                        6,
+                    )
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -16419,6 +16446,27 @@ def _build_parser() -> argparse.ArgumentParser:
         "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-reduce-extra-ticks",
         type=int,
         default=4,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-min-score", type=float, default=0.75)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-min-volatility-ratio",
+        type=float,
+        default=0.0035,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-reduce-budget-scale",
+        type=float,
+        default=0.35,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-reduce-extra-ticks",
+        type=int,
+        default=6,
     )
     parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
