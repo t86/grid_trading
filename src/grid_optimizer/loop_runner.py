@@ -14099,9 +14099,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
             0.0,
         )
-        best_quote_reduce_freeze_soft_scale = _clamp(
-            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 1.0)),
-            1e-12,
+        best_quote_reduce_freeze_soft_scale = min(
+            max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 1.0)),
+                1e-12,
+            ),
             1.0,
         )
         best_quote_inventory_soft_ratio = float(
