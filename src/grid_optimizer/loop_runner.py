@@ -14238,6 +14238,55 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             and not short_cost_gate_inventory_active
         ):
             best_quote_inventory_cost_gate["short_tiny_inventory_exempt"] = True
+        best_quote_cost_gate_reduce_fallback = {
+            "reduce_short_orders": 0,
+            "reduce_long_orders": 0,
+        }
+        best_quote_reduce_short_remaining = max(current_short_notional, 0.0)
+        best_quote_reduce_long_remaining = max(current_long_notional, 0.0)
+        best_quote_cost_gate_gap = _safe_float(symbol_info.get("tick_size")) * max(
+            int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
+            0,
+        )
+
+        def _build_cost_gate_reduce_fallback(
+            *,
+            side: str,
+            role: str,
+            position_side: str,
+            anchor_price: float,
+            direction: int,
+            notional: float,
+            source_order: dict[str, Any],
+        ) -> dict[str, Any] | None:
+            price = _round_order_price(
+                max(float(Decimal(str(anchor_price)) + Decimal(direction) * Decimal(str(best_quote_cost_gate_gap))), 0.0),
+                symbol_info.get("tick_size"),
+                side,
+            )
+            if price <= 0:
+                return None
+            qty = _round_order_qty(notional / price, symbol_info.get("step_size"))
+            order_notional = qty * price
+            if qty <= 0:
+                return None
+            if symbol_info.get("min_qty") is not None and qty < _safe_float(symbol_info.get("min_qty")):
+                return None
+            if symbol_info.get("min_notional") is not None and order_notional < _safe_float(symbol_info.get("min_notional")):
+                return None
+            return {
+                "side": str(side).upper(),
+                "price": price,
+                "qty": qty,
+                "notional": order_notional,
+                "role": role,
+                "position_side": position_side,
+                "execution_type": "maker",
+                "post_only": True,
+                "force_reduce_only": True,
+                "cost_gate_fallback_from_role": _order_role(source_order),
+            }
+
         if best_quote_inventory_cost_gate["enabled"] and long_cost_gate_inventory_active:
             long_unrealized_ratio = (
                 (mid_price - current_long_avg_price) / current_long_avg_price
@@ -14289,6 +14338,27 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                         else "losing_long_entry_above_cost_gate"
                     )
                     blocked_buy_orders.append(blocked)
+                    if best_quote_reduce_short_remaining > 0:
+                        fallback_notional = min(
+                            _safe_float(item.get("notional")),
+                            best_quote_reduce_short_remaining,
+                        )
+                        fallback = _build_cost_gate_reduce_fallback(
+                            side="BUY",
+                            role="best_quote_reduce_short",
+                            position_side="SHORT" if hedge_best_quote else "BOTH",
+                            anchor_price=bid_price,
+                            direction=-1,
+                            notional=fallback_notional,
+                            source_order=item,
+                        )
+                        if fallback is not None:
+                            kept_buy_orders.append(fallback)
+                            best_quote_reduce_short_remaining = max(
+                                best_quote_reduce_short_remaining - _safe_float(fallback.get("notional")),
+                                0.0,
+                            )
+                            best_quote_cost_gate_reduce_fallback["reduce_short_orders"] += 1
                 else:
                     kept_buy_orders.append(item)
             plan["buy_orders"] = kept_buy_orders
@@ -14346,12 +14416,34 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                         else "losing_short_entry_below_cost_gate"
                     )
                     blocked_sell_orders.append(blocked)
+                    if best_quote_reduce_long_remaining > 0:
+                        fallback_notional = min(
+                            _safe_float(item.get("notional")),
+                            best_quote_reduce_long_remaining,
+                        )
+                        fallback = _build_cost_gate_reduce_fallback(
+                            side="SELL",
+                            role="best_quote_reduce_long",
+                            position_side="LONG" if hedge_best_quote else "BOTH",
+                            anchor_price=ask_price,
+                            direction=1,
+                            notional=fallback_notional,
+                            source_order=item,
+                        )
+                        if fallback is not None:
+                            kept_sell_orders.append(fallback)
+                            best_quote_reduce_long_remaining = max(
+                                best_quote_reduce_long_remaining - _safe_float(fallback.get("notional")),
+                                0.0,
+                            )
+                            best_quote_cost_gate_reduce_fallback["reduce_long_orders"] += 1
                 else:
                     kept_sell_orders.append(item)
             plan["sell_orders"] = kept_sell_orders
             best_quote_inventory_cost_gate["blocked_sell_orders"] = len(blocked_sell_orders)
             best_quote_inventory_cost_gate["blocked_sell_order_details"] = blocked_sell_orders
             best_quote_inventory_cost_gate["would_block_sell_orders"] = len(blocked_sell_orders)
+        best_quote_inventory_cost_gate["reduce_fallback"] = best_quote_cost_gate_reduce_fallback
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),

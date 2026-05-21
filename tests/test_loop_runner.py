@@ -1074,6 +1074,82 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
+    def test_best_quote_maker_volume_cost_gate_converts_blocked_entries_to_reduces(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+        mock_premium_index,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_market_guard,
+    ) -> None:
+        mock_symbol_config.return_value = {
+            "tick_size": 0.0001,
+            "step_size": 1.0,
+            "min_qty": 1.0,
+            "min_notional": 5.0,
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.6625", "ask_price": "0.6627"}]
+        mock_premium_index.return_value = [{"funding_rate": "0.0001"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "23", "entryPrice": "0.6483"},
+                {"symbol": "PHAROSUSDT", "positionSide": "SHORT", "positionAmt": "-74", "entryPrice": "0.6630"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_market_guard.return_value = {
+            "buy_pause_active": False,
+            "buy_pause_reasons": [],
+            "short_cover_pause_active": False,
+            "short_cover_pause_reasons": [],
+            "shift_frozen": False,
+        }
+
+        with TemporaryDirectory() as tmpdir:
+            args = self._base_one_way_long_args(
+                tmpdir,
+                symbol="PHAROSUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                strategy_profile="pharosusdt_hedge_best_quote_maker_volume_v1",
+                step_price=0.00025,
+                best_quote_maker_volume_enabled=True,
+                best_quote_maker_volume_inventory_cost_gate_enabled=True,
+                best_quote_maker_volume_inventory_cost_gate_min_notional=10.0,
+                best_quote_maker_volume_cycle_budget_notional=40.0,
+                best_quote_maker_volume_quote_offset_ticks=3,
+                best_quote_maker_volume_max_long_notional=700.0,
+                best_quote_maker_volume_max_short_notional=700.0,
+                best_quote_maker_volume_inventory_soft_ratio=200.0 / 700.0,
+                take_profit_min_profit_ratio=0.00008,
+                reset_state=True,
+            )
+
+            report = generate_plan_report(args)
+
+        gate = report["best_quote_maker_volume"]["inventory_cost_gate"]
+        self.assertEqual(gate["blocked_buy_orders"], 1)
+        self.assertEqual(gate["blocked_sell_orders"], 1)
+        self.assertEqual(report["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(report["buy_orders"][0]["position_side"], "SHORT")
+        self.assertTrue(report["buy_orders"][0]["force_reduce_only"])
+        self.assertEqual(report["sell_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertEqual(report["sell_orders"][0]["position_side"], "LONG")
+        self.assertTrue(report["sell_orders"][0]["force_reduce_only"])
+
+    @patch("grid_optimizer.loop_runner.assess_market_guard")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_premium_index")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.fetch_futures_symbol_config")
     def test_best_quote_maker_volume_blocks_losing_long_entry_above_grid_gap(
         self,
         mock_symbol_config,
