@@ -67,6 +67,12 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_trend_loss_reduce_guard_min_volatility_ratio: float = 0.0035
     dynamic_control_trend_loss_reduce_guard_reduce_budget_scale: float = 0.35
     dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks: int = 6
+    dynamic_control_trend_loss_reduce_guard_recent_loss_min: float = 0.5
+    dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale: float = 0.20
+    dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks: int = 10
+    dynamic_control_trend_loss_reduce_guard_relief_return_ratio: float = 0.0015
+    dynamic_control_trend_loss_reduce_guard_relief_budget_scale: float = 0.50
+    dynamic_control_trend_loss_reduce_guard_relief_extra_ticks: int = 4
     net_loss_reduce_enabled: bool = False
     net_loss_reduce_min_loss: float = 0.0
     net_loss_reduce_ratio: float = 0.0
@@ -485,6 +491,16 @@ def build_best_quote_maker_volume_plan(
         "min_volatility_ratio": _safe_float(config.dynamic_control_trend_loss_reduce_guard_min_volatility_ratio),
         "reduce_budget_scale": _safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_budget_scale),
         "reduce_extra_ticks": int(_safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks)),
+        "recent_loss_min": max(_safe_float(config.dynamic_control_trend_loss_reduce_guard_recent_loss_min), 0.0),
+        "recent_loss_budget_scale": _safe_float(config.dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale),
+        "recent_loss_extra_ticks": int(
+            _safe_float(config.dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks)
+        ),
+        "relief_return_ratio": max(_safe_float(config.dynamic_control_trend_loss_reduce_guard_relief_return_ratio), 0.0),
+        "relief_budget_scale": _safe_float(config.dynamic_control_trend_loss_reduce_guard_relief_budget_scale),
+        "relief_extra_ticks": int(_safe_float(config.dynamic_control_trend_loss_reduce_guard_relief_extra_ticks)),
+        "recent_loss_active": False,
+        "relief_active": False,
     }
     if config.dynamic_control_enabled and regime != "loss_defensive":
         return_1m = _safe_float(inputs.market_return_1m)
@@ -666,36 +682,79 @@ def build_best_quote_maker_volume_plan(
         min_volatility = max(_safe_float(config.dynamic_control_trend_loss_reduce_guard_min_volatility_ratio), 0.0)
         reduce_scale = _clamp(_safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_budget_scale), 0.0, 1.0)
         reduce_extra_ticks = max(int(_safe_float(config.dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks)), 0)
+        recent_loss_min = max(_safe_float(config.dynamic_control_trend_loss_reduce_guard_recent_loss_min), 0.0)
+        recent_loss_scale = _clamp(
+            _safe_float(config.dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale), 0.0, 1.0
+        )
+        recent_loss_extra_ticks = max(
+            int(_safe_float(config.dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks)), 0
+        )
+        relief_return_ratio = max(_safe_float(config.dynamic_control_trend_loss_reduce_guard_relief_return_ratio), 0.0)
+        relief_scale = _clamp(
+            _safe_float(config.dynamic_control_trend_loss_reduce_guard_relief_budget_scale), 0.0, 1.0
+        )
+        relief_extra_ticks = max(int(_safe_float(config.dynamic_control_trend_loss_reduce_guard_relief_extra_ticks)), 0)
         trend_score = _clamp(_safe_float(dynamic_control_report.get("trend_score")), -1.0, 1.0)
         volatility_ratio = max(_safe_float(dynamic_control_report.get("volatility_ratio")), 0.0)
+        return_1m = _safe_float(dynamic_control_report.get("market_return_1m"))
         volatility_ok = min_volatility <= 0 or volatility_ratio >= min_volatility
         guard_short_reduce = volatility_ok and trend_score >= min_score and short_notional > 0
         guard_long_reduce = volatility_ok and trend_score <= -min_score and long_notional > 0
         if guard_long_reduce or guard_short_reduce:
+            recent_loss_active = recent_loss_min > 0 and _safe_float(inputs.recent_realized_pnl) <= -recent_loss_min
+            short_relief_active = guard_short_reduce and relief_return_ratio > 0 and return_1m <= -relief_return_ratio
+            long_relief_active = guard_long_reduce and relief_return_ratio > 0 and return_1m >= relief_return_ratio
+            relief_active = bool(short_relief_active or long_relief_active)
+            effective_reduce_scale = reduce_scale
+            effective_reduce_extra_ticks = reduce_extra_ticks
+            guard_reason = "adverse_trend_reduce_chase_guard"
+            if recent_loss_active:
+                effective_reduce_scale = min(effective_reduce_scale, recent_loss_scale)
+                effective_reduce_extra_ticks = max(effective_reduce_extra_ticks, recent_loss_extra_ticks)
+                guard_reason = "recent_loss_trend_reduce_cooldown"
+            if relief_active:
+                effective_reduce_scale = max(effective_reduce_scale, min(relief_scale, 1.0))
+                effective_reduce_extra_ticks = min(effective_reduce_extra_ticks, relief_extra_ticks)
+                guard_reason = (
+                    "pullback_relief_allows_short_reduce"
+                    if short_relief_active
+                    else "rebound_relief_allows_long_reduce"
+                )
             if guard_long_reduce:
                 trend_loss_reduce_guard_report.update(
                     {
                         "guard_long_reduce": True,
-                        "reduce_long_budget_scale": reduce_scale,
-                        "reduce_long_extra_ticks": reduce_extra_ticks,
+                        "reduce_long_budget_scale": effective_reduce_scale,
+                        "reduce_long_extra_ticks": effective_reduce_extra_ticks,
                     }
                 )
             if guard_short_reduce:
                 trend_loss_reduce_guard_report.update(
                     {
                         "guard_short_reduce": True,
-                        "reduce_short_budget_scale": reduce_scale,
-                        "reduce_short_extra_ticks": reduce_extra_ticks,
+                        "reduce_short_budget_scale": effective_reduce_scale,
+                        "reduce_short_extra_ticks": effective_reduce_extra_ticks,
                     }
                 )
             trend_loss_reduce_guard_report.update(
                 {
                     "applied": True,
-                    "reason": "adverse_trend_reduce_chase_guard",
+                    "reason": guard_reason,
                     "min_score": min_score,
                     "min_volatility_ratio": min_volatility,
                     "reduce_budget_scale": reduce_scale,
                     "reduce_extra_ticks": reduce_extra_ticks,
+                    "effective_reduce_budget_scale": effective_reduce_scale,
+                    "effective_reduce_extra_ticks": effective_reduce_extra_ticks,
+                    "recent_loss_min": recent_loss_min,
+                    "recent_loss_budget_scale": recent_loss_scale,
+                    "recent_loss_extra_ticks": recent_loss_extra_ticks,
+                    "recent_loss_active": recent_loss_active,
+                    "relief_return_ratio": relief_return_ratio,
+                    "relief_budget_scale": relief_scale,
+                    "relief_extra_ticks": relief_extra_ticks,
+                    "relief_active": relief_active,
+                    "return_1m": return_1m,
                     "trend_score": trend_score,
                     "volatility_ratio": volatility_ratio,
                 }

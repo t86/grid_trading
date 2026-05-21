@@ -14118,6 +14118,48 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                         6,
                     )
                 ),
+                dynamic_control_trend_loss_reduce_guard_recent_loss_min=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_min",
+                        0.5,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale",
+                        0.20,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks=int(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks",
+                        10,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_relief_return_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_return_ratio",
+                        0.0015,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_relief_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_budget_scale",
+                        0.50,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_relief_extra_ticks=int(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_extra_ticks",
+                        4,
+                    )
+                ),
                 net_loss_reduce_enabled=bool(
                     getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_enabled", False)
                 ),
@@ -16651,6 +16693,36 @@ def _build_parser() -> argparse.ArgumentParser:
         type=int,
         default=6,
     )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-min",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-budget-scale",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-extra-ticks",
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-return-ratio",
+        type=float,
+        default=0.0015,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-budget-scale",
+        type=float,
+        default=0.50,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-extra-ticks",
+        type=int,
+        default=4,
+    )
     parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--sticky-entry-levels", type=int, default=4)
     parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)
@@ -17698,6 +17770,23 @@ def main() -> None:
     if not (0 <= args.best_quote_maker_volume_dynamic_control_trend_entry_guard_opposite_budget_scale <= 1):
         raise SystemExit(
             "--best-quote-maker-volume-dynamic-control-trend-entry-guard-opposite-budget-scale must be within [0, 1]"
+        )
+    if (
+        args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_min < 0
+        or args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks < 0
+        or args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_return_ratio < 0
+        or args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_extra_ticks < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard loss/relief values must be >= 0")
+    if not (0 <= args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale <= 1):
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-budget-scale "
+            "must be within [0, 1]"
+        )
+    if not (0 <= args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_budget_scale <= 1):
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-budget-scale "
+            "must be within [0, 1]"
         )
     if not (
         args.elastic_loss_per_10k_sprint
