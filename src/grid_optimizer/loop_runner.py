@@ -14165,6 +14165,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "enabled": bool(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_enabled", True)),
             "blocked_buy_orders": 0,
             "blocked_sell_orders": 0,
+            "min_inventory_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_min_notional", 0.0)),
+                0.0,
+            ),
             "long_cost_price": current_long_avg_price if current_long_qty > 1e-12 else None,
             "short_cost_price": current_short_avg_price if current_short_qty > 1e-12 else None,
             "long_unrealized_ratio": None,
@@ -14200,6 +14204,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "short_cost_gap_price": None,
             "long_adverse_trend_threshold_ratio": None,
             "short_adverse_trend_threshold_ratio": None,
+            "long_tiny_inventory_exempt": False,
+            "short_tiny_inventory_exempt": False,
         }
         best_quote_entry_adverse_trend_threshold_ratio = (
             _safe_float(effective_args.step_price) / mid_price
@@ -14207,7 +14213,32 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             else 0.0
         )
         best_quote_inventory_cost_gate["adverse_trend_threshold_ratio"] = best_quote_entry_adverse_trend_threshold_ratio
-        if best_quote_inventory_cost_gate["enabled"] and current_long_qty > 1e-12 and current_long_avg_price > 0:
+        best_quote_cost_gate_min_notional = _safe_float(best_quote_inventory_cost_gate["min_inventory_notional"])
+        long_cost_gate_inventory_active = (
+            current_long_qty > 1e-12
+            and current_long_avg_price > 0
+            and current_long_notional >= best_quote_cost_gate_min_notional
+        )
+        short_cost_gate_inventory_active = (
+            current_short_qty > 1e-12
+            and current_short_avg_price > 0
+            and current_short_notional >= best_quote_cost_gate_min_notional
+        )
+        if (
+            best_quote_inventory_cost_gate["enabled"]
+            and current_long_qty > 1e-12
+            and current_long_avg_price > 0
+            and not long_cost_gate_inventory_active
+        ):
+            best_quote_inventory_cost_gate["long_tiny_inventory_exempt"] = True
+        if (
+            best_quote_inventory_cost_gate["enabled"]
+            and current_short_qty > 1e-12
+            and current_short_avg_price > 0
+            and not short_cost_gate_inventory_active
+        ):
+            best_quote_inventory_cost_gate["short_tiny_inventory_exempt"] = True
+        if best_quote_inventory_cost_gate["enabled"] and long_cost_gate_inventory_active:
             long_unrealized_ratio = (
                 (mid_price - current_long_avg_price) / current_long_avg_price
                 if mid_price > 0
@@ -14264,7 +14295,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             best_quote_inventory_cost_gate["blocked_buy_orders"] = len(blocked_buy_orders)
             best_quote_inventory_cost_gate["blocked_buy_order_details"] = blocked_buy_orders
             best_quote_inventory_cost_gate["would_block_buy_orders"] = len(blocked_buy_orders)
-        if best_quote_inventory_cost_gate["enabled"] and current_short_qty > 1e-12 and current_short_avg_price > 0:
+        if best_quote_inventory_cost_gate["enabled"] and short_cost_gate_inventory_active:
             short_unrealized_ratio = (
                 (current_short_avg_price - mid_price) / current_short_avg_price
                 if mid_price > 0
@@ -16369,6 +16400,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-below-soft-cost-gap-scale", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-below-soft-adverse-threshold-scale", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-min-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-tight-offset-ticks", type=int, default=2)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-low-loss-per-10k", type=float, default=3.0)
@@ -17490,6 +17522,8 @@ def main() -> None:
         or args.best_quote_maker_volume_below_soft_adverse_threshold_scale < 0
     ):
         raise SystemExit("--best-quote-maker-volume below-soft scales must be >= 0")
+    if args.best_quote_maker_volume_inventory_cost_gate_min_notional < 0:
+        raise SystemExit("--best-quote-maker-volume-inventory-cost-gate-min-notional must be >= 0")
     if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score < 0:
         raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-score must be >= 0")
     if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_volatility_ratio < 0:

@@ -433,6 +433,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
             "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
             "best_quote_maker_volume_inventory_cost_gate_enabled": True,
+            "best_quote_maker_volume_inventory_cost_gate_min_notional": 0.0,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "autotune_symbol_enabled": False,
@@ -482,6 +483,7 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
             "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
             "best_quote_maker_volume_inventory_cost_gate_enabled": False,
+            "best_quote_maker_volume_inventory_cost_gate_min_notional": 0.0,
             "best_quote_maker_volume_dynamic_control_enabled": True,
             "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled": True,
             "best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score": 0.75,
@@ -3957,6 +3959,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_take_profit_guard_enabled": True,
     "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
     "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
+    "best_quote_maker_volume_inventory_cost_gate_min_notional": 0.0,
     "max_new_orders": 20,
     "max_total_notional": 1000.0,
     "run_start_time": None,
@@ -8962,6 +8965,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_min_cycle_budget_notional",
         "best_quote_maker_volume_below_soft_cost_gap_scale",
         "best_quote_maker_volume_below_soft_adverse_threshold_scale",
+        "best_quote_maker_volume_inventory_cost_gate_min_notional",
         "best_quote_maker_volume_dynamic_tick_low_loss_per_10k",
         "best_quote_maker_volume_dynamic_tick_mid_loss_per_10k",
         "best_quote_maker_volume_dynamic_tick_low_inventory_ratio",
@@ -9651,6 +9655,9 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         below_soft_adverse_threshold_scale = number("best_quote_maker_volume_below_soft_adverse_threshold_scale")
         if below_soft_adverse_threshold_scale is not None and below_soft_adverse_threshold_scale < 0:
             errors.append("best_quote_maker_volume_below_soft_adverse_threshold_scale 必须 >= 0")
+        cost_gate_min_notional = number("best_quote_maker_volume_inventory_cost_gate_min_notional")
+        if cost_gate_min_notional is not None and cost_gate_min_notional < 0:
+            errors.append("best_quote_maker_volume_inventory_cost_gate_min_notional 必须 >= 0")
         soft_ratio = number("best_quote_maker_volume_inventory_soft_ratio")
         if soft_ratio is not None and soft_ratio > 1:
             errors.append("best_quote_maker_volume_inventory_soft_ratio 必须 <= 1")
@@ -9794,6 +9801,8 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-inventory-cost-gate-enabled"
         if config.get("best_quote_maker_volume_inventory_cost_gate_enabled", True)
         else "--no-best-quote-maker-volume-inventory-cost-gate-enabled",
+        "--best-quote-maker-volume-inventory-cost-gate-min-notional",
+        str(config.get("best_quote_maker_volume_inventory_cost_gate_min_notional", 0.0)),
         "--best-quote-maker-volume-dynamic-tick-enabled"
         if config.get("best_quote_maker_volume_dynamic_tick_enabled", False)
         else "--no-best-quote-maker-volume-dynamic-tick-enabled",
