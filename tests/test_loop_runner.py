@@ -746,6 +746,30 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["managed_long_qty"], 0.0)
         self.assertEqual(report["managed_short_qty"], 20.0)
 
+    def test_best_quote_reduce_freeze_isolates_frozen_unrealized_loss(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 60.0,
+                "long_entry_price": 1.0,
+            }
+        }
+
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=100.0,
+            current_short_qty=0.0,
+            current_long_avg_price=1.0,
+            current_short_avg_price=0.0,
+            mid_price=0.98,
+        )
+
+        self.assertAlmostEqual(report["actual_unrealized_pnl"], -2.0)
+        self.assertAlmostEqual(report["frozen_unrealized_pnl"], -1.2)
+        self.assertAlmostEqual(report["managed_unrealized_pnl"], -0.8)
+        self.assertAlmostEqual(report["strategy_unrealized_pnl"], -0.8)
+        self.assertAlmostEqual(report["managed_long_qty"], 40.0)
+        self.assertTrue(report["isolates_risk_metrics"])
+
     def test_best_quote_maker_volume_net_loss_reduce_credits_recent_realized_profit(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(

@@ -2355,6 +2355,36 @@ def _best_quote_reduce_freeze_report(
         state["best_quote_frozen_inventory"] = ledger
     else:
         state.pop("best_quote_frozen_inventory", None)
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    actual_long_unrealized = (
+        (safe_mid - _safe_float(current_long_avg_price)) * max(_safe_float(current_long_qty), 0.0)
+        if safe_mid > 0 and _safe_float(current_long_avg_price) > 0
+        else 0.0
+    )
+    actual_short_unrealized = (
+        (_safe_float(current_short_avg_price) - safe_mid) * max(_safe_float(current_short_qty), 0.0)
+        if safe_mid > 0 and _safe_float(current_short_avg_price) > 0
+        else 0.0
+    )
+    frozen_long_entry = _safe_float(ledger.get("long_entry_price")) or _safe_float(current_long_avg_price)
+    frozen_short_entry = _safe_float(ledger.get("short_entry_price")) or _safe_float(current_short_avg_price)
+    frozen_long_unrealized = (
+        (safe_mid - frozen_long_entry) * long_qty
+        if safe_mid > 0 and frozen_long_entry > 0
+        else 0.0
+    )
+    frozen_short_unrealized = (
+        (frozen_short_entry - safe_mid) * short_qty
+        if safe_mid > 0 and frozen_short_entry > 0
+        else 0.0
+    )
+    managed_long_unrealized = actual_long_unrealized - frozen_long_unrealized
+    managed_short_unrealized = actual_short_unrealized - frozen_short_unrealized
+    actual_unrealized = actual_long_unrealized + actual_short_unrealized
+    frozen_unrealized = frozen_long_unrealized + frozen_short_unrealized
+    managed_unrealized = managed_long_unrealized + managed_short_unrealized
+    managed_long_qty = max(_safe_float(current_long_qty) - long_qty, 0.0)
+    managed_short_qty = max(_safe_float(current_short_qty) - short_qty, 0.0)
     return {
         "enabled": False,
         "applied": False,
@@ -2375,10 +2405,21 @@ def _best_quote_reduce_freeze_report(
         "frozen_short_qty": short_qty,
         "frozen_long_notional": long_notional,
         "frozen_short_notional": short_notional,
+        "frozen_long_unrealized_pnl": frozen_long_unrealized,
+        "frozen_short_unrealized_pnl": frozen_short_unrealized,
+        "frozen_unrealized_pnl": frozen_unrealized,
         "offset_qty": offset_qty,
         "offset_notional": offset_notional,
-        "managed_long_qty": max(_safe_float(current_long_qty) - long_qty, 0.0),
-        "managed_short_qty": max(_safe_float(current_short_qty) - short_qty, 0.0),
+        "managed_long_qty": managed_long_qty,
+        "managed_short_qty": managed_short_qty,
+        "managed_long_notional": managed_long_qty * safe_mid,
+        "managed_short_notional": managed_short_qty * safe_mid,
+        "managed_long_unrealized_pnl": managed_long_unrealized,
+        "managed_short_unrealized_pnl": managed_short_unrealized,
+        "managed_unrealized_pnl": managed_unrealized,
+        "actual_unrealized_pnl": actual_unrealized,
+        "strategy_unrealized_pnl": managed_unrealized,
+        "isolates_risk_metrics": bool(long_qty > 0 or short_qty > 0),
         "ledger": dict(ledger) if ledger else {},
     }
 
@@ -6496,14 +6537,20 @@ def _maybe_handle_runtime_guard(
         latest_mid_price,
         _safe_float(latest_plan_report.get("synthetic_drift_qty")),
     )
+    guard_actual_net_notional = latest_plan_report.get("strategy_actual_net_notional")
+    if guard_actual_net_notional is None:
+        guard_actual_net_notional = latest_plan_report.get("actual_net_notional")
+    guard_unrealized_pnl = latest_plan_report.get("strategy_unrealized_pnl")
+    if guard_unrealized_pnl is None:
+        guard_unrealized_pnl = latest_plan_report.get("unrealized_pnl")
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=cycle_started_at,
         cumulative_gross_notional=cumulative_gross_notional,
         pnl_events=pnl_events_for_guard,
-        actual_net_notional=_safe_float(latest_plan_report.get("actual_net_notional")),
+        actual_net_notional=_safe_float(guard_actual_net_notional),
         synthetic_drift_notional=latest_synthetic_drift_notional,
-        unrealized_pnl=_safe_float(latest_plan_report.get("unrealized_pnl")),
+        unrealized_pnl=_safe_float(guard_unrealized_pnl),
     )
     if runtime_guard_result.tradable:
         return None
@@ -12087,6 +12134,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         unrealized_pnl = _position_unrealized_pnl(long_position) + _position_unrealized_pnl(short_position)
     else:
         unrealized_pnl = _position_unrealized_pnl(actual_position)
+    exchange_unrealized_pnl = unrealized_pnl
+    strategy_unrealized_pnl = unrealized_pnl
+    strategy_actual_net_qty = actual_net_qty
+    strategy_actual_net_notional = actual_net_qty * max(mid_price, 0.0)
     volatility_entry_pause = resolve_volatility_entry_pause(
         adaptive_step=adaptive_step,
         state=state,
@@ -14163,10 +14214,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         managed_long_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_long_qty")), 0.0)
         managed_short_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_short_qty")), 0.0)
+        best_quote_reduce_freeze["exchange_unrealized_pnl"] = exchange_unrealized_pnl
         current_long_qty = managed_long_qty
         current_short_qty = managed_short_qty
         current_long_notional = current_long_qty * mid_price
         current_short_notional = current_short_qty * mid_price
+        strategy_unrealized_pnl = _safe_float(best_quote_reduce_freeze.get("managed_unrealized_pnl"))
+        best_quote_reduce_freeze["strategy_unrealized_pnl"] = strategy_unrealized_pnl
+        unrealized_pnl = strategy_unrealized_pnl
+        strategy_actual_net_qty = current_long_qty - current_short_qty
+        strategy_actual_net_notional = strategy_actual_net_qty * max(mid_price, 0.0)
 
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
@@ -15972,7 +16029,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "current_short_avg_price": current_short_avg_price,
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_qty * max(mid_price, 0.0),
+        "strategy_actual_net_qty": strategy_actual_net_qty,
+        "strategy_actual_net_notional": strategy_actual_net_notional,
         "unrealized_pnl": unrealized_pnl,
+        "strategy_unrealized_pnl": strategy_unrealized_pnl,
+        "exchange_unrealized_pnl": exchange_unrealized_pnl,
+        "frozen_inventory_unrealized_pnl": exchange_unrealized_pnl - strategy_unrealized_pnl,
         "unrealized_loss_entry_guard_enabled": bool(unrealized_loss_entry_guard.get("enabled")),
         "unrealized_loss_entry_guard_active": bool(unrealized_loss_entry_guard.get("active")),
         "unrealized_loss_entry_guard_reason": unrealized_loss_entry_guard.get("reason"),
@@ -18492,12 +18554,20 @@ def main() -> None:
                     now=cycle_started_at,
                     cumulative_gross_notional=runtime_cumulative_gross_notional,
                     pnl_events=runtime_pnl_events_for_guard,
-                    actual_net_notional=_safe_float(plan_report.get("actual_net_notional")),
+                    actual_net_notional=_safe_float(
+                        plan_report.get("strategy_actual_net_notional")
+                        if plan_report.get("strategy_actual_net_notional") is not None
+                        else plan_report.get("actual_net_notional")
+                    ),
                     synthetic_drift_notional=_synthetic_drift_notional(
                         _safe_float(plan_report.get("mid_price")),
                         _safe_float(plan_report.get("synthetic_drift_qty")),
                     ),
-                    unrealized_pnl=_safe_float(plan_report.get("unrealized_pnl")),
+                    unrealized_pnl=_safe_float(
+                        plan_report.get("strategy_unrealized_pnl")
+                        if plan_report.get("strategy_unrealized_pnl") is not None
+                        else plan_report.get("unrealized_pnl")
+                    ),
                 )
                 runtime_loss_recovery_summary: dict[str, Any] | None = None
                 runtime_loss_only_stop = runtime_guard_result.matched_reasons in (
