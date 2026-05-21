@@ -14219,7 +14219,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = managed_short_qty
         current_long_notional = current_long_qty * mid_price
         current_short_notional = current_short_qty * mid_price
-        strategy_unrealized_pnl = _safe_float(best_quote_reduce_freeze.get("managed_unrealized_pnl"))
+        if bool(best_quote_reduce_freeze.get("isolates_risk_metrics")):
+            strategy_unrealized_pnl = _safe_float(best_quote_reduce_freeze.get("managed_unrealized_pnl"))
+        else:
+            strategy_unrealized_pnl = exchange_unrealized_pnl
         best_quote_reduce_freeze["strategy_unrealized_pnl"] = strategy_unrealized_pnl
         unrealized_pnl = strategy_unrealized_pnl
         strategy_actual_net_qty = current_long_qty - current_short_qty
