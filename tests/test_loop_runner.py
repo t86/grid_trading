@@ -648,6 +648,76 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["price"], 80400.1)
         self.assertTrue(plan["buy_orders"][0]["post_only"])
 
+    def test_best_quote_maker_volume_net_loss_reduce_blocks_entries(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                net_loss_reduce_enabled=True,
+                net_loss_reduce_min_loss=2.0,
+                net_loss_reduce_ratio=0.005,
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                current_net_qty=0.0,
+                current_long_qty=1.0,
+                current_short_qty=1.0,
+                position_side_mode="hedge",
+                cycle_budget_notional=40.0,
+                loss_per_10k_15m=0.2,
+                target_volume_remaining=10_000.0,
+                unrealized_pnl=-3.5,
+                recent_realized_pnl=0.0,
+                tick_size=0.1,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=5.0,
+            ),
+        )
+
+        guard = plan["metrics"]["net_loss_reduce"]
+        self.assertTrue(guard["active"])
+        self.assertIn("net_loss_reduce", plan["reasons"])
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertTrue(plan["buy_orders"][0]["force_reduce_only"])
+        self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
+
+    def test_best_quote_maker_volume_net_loss_reduce_credits_recent_realized_profit(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                net_loss_reduce_enabled=True,
+                net_loss_reduce_min_loss=2.0,
+                net_loss_reduce_ratio=0.005,
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=100.0,
+                ask_price=100.1,
+                mid_price=100.05,
+                current_net_qty=0.0,
+                current_long_qty=1.0,
+                current_short_qty=1.0,
+                position_side_mode="hedge",
+                cycle_budget_notional=40.0,
+                loss_per_10k_15m=0.2,
+                target_volume_remaining=10_000.0,
+                unrealized_pnl=-3.5,
+                recent_realized_pnl=3.0,
+                tick_size=0.1,
+                step_size=0.001,
+                min_qty=0.001,
+                min_notional=5.0,
+            ),
+        )
+
+        guard = plan["metrics"]["net_loss_reduce"]
+        self.assertFalse(guard["active"])
+        self.assertEqual(plan["regime"], "normal")
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")

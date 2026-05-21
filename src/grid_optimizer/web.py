@@ -434,6 +434,10 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
             "best_quote_maker_volume_inventory_cost_gate_enabled": True,
             "best_quote_maker_volume_inventory_cost_gate_min_notional": 0.0,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "best_quote_maker_volume_net_loss_reduce_min_loss": 0.0,
+            "best_quote_maker_volume_net_loss_reduce_ratio": 0.0,
+            "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
             "flat_start_enabled": False,
             "warm_start_enabled": True,
             "autotune_symbol_enabled": False,
@@ -484,6 +488,10 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
             "best_quote_maker_volume_inventory_cost_gate_enabled": False,
             "best_quote_maker_volume_inventory_cost_gate_min_notional": 0.0,
+            "best_quote_maker_volume_net_loss_reduce_enabled": False,
+            "best_quote_maker_volume_net_loss_reduce_min_loss": 0.0,
+            "best_quote_maker_volume_net_loss_reduce_ratio": 0.0,
+            "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
             "best_quote_maker_volume_dynamic_control_enabled": True,
             "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled": True,
             "best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score": 0.75,
@@ -3960,6 +3968,9 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_below_soft_cost_gap_scale": 1.0,
     "best_quote_maker_volume_below_soft_adverse_threshold_scale": 1.0,
     "best_quote_maker_volume_inventory_cost_gate_min_notional": 0.0,
+    "best_quote_maker_volume_net_loss_reduce_min_loss": 0.0,
+    "best_quote_maker_volume_net_loss_reduce_ratio": 0.0,
+    "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
     "max_new_orders": 20,
     "max_total_notional": 1000.0,
     "run_start_time": None,
@@ -8966,6 +8977,9 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_below_soft_cost_gap_scale",
         "best_quote_maker_volume_below_soft_adverse_threshold_scale",
         "best_quote_maker_volume_inventory_cost_gate_min_notional",
+        "best_quote_maker_volume_net_loss_reduce_min_loss",
+        "best_quote_maker_volume_net_loss_reduce_ratio",
+        "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio",
         "best_quote_maker_volume_dynamic_tick_low_loss_per_10k",
         "best_quote_maker_volume_dynamic_tick_mid_loss_per_10k",
         "best_quote_maker_volume_dynamic_tick_low_inventory_ratio",
@@ -9073,6 +9087,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_enabled",
         "best_quote_maker_volume_take_profit_guard_enabled",
         "best_quote_maker_volume_inventory_cost_gate_enabled",
+        "best_quote_maker_volume_net_loss_reduce_enabled",
         "best_quote_maker_volume_dynamic_tick_enabled",
         "best_quote_maker_volume_inventory_bias_enabled",
         "best_quote_maker_volume_dynamic_control_enabled",
@@ -9658,6 +9673,14 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         cost_gate_min_notional = number("best_quote_maker_volume_inventory_cost_gate_min_notional")
         if cost_gate_min_notional is not None and cost_gate_min_notional < 0:
             errors.append("best_quote_maker_volume_inventory_cost_gate_min_notional 必须 >= 0")
+        for field in (
+            "best_quote_maker_volume_net_loss_reduce_min_loss",
+            "best_quote_maker_volume_net_loss_reduce_ratio",
+            "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio",
+        ):
+            value = number(field)
+            if value is not None and value < 0:
+                errors.append(f"{field} 必须 >= 0")
         soft_ratio = number("best_quote_maker_volume_inventory_soft_ratio")
         if soft_ratio is not None and soft_ratio > 1:
             errors.append("best_quote_maker_volume_inventory_soft_ratio 必须 <= 1")
@@ -9803,6 +9826,15 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         else "--no-best-quote-maker-volume-inventory-cost-gate-enabled",
         "--best-quote-maker-volume-inventory-cost-gate-min-notional",
         str(config.get("best_quote_maker_volume_inventory_cost_gate_min_notional", 0.0)),
+        "--best-quote-maker-volume-net-loss-reduce-enabled"
+        if config.get("best_quote_maker_volume_net_loss_reduce_enabled", False)
+        else "--no-best-quote-maker-volume-net-loss-reduce-enabled",
+        "--best-quote-maker-volume-net-loss-reduce-min-loss",
+        str(config.get("best_quote_maker_volume_net_loss_reduce_min_loss", 0.0)),
+        "--best-quote-maker-volume-net-loss-reduce-ratio",
+        str(config.get("best_quote_maker_volume_net_loss_reduce_ratio", 0.0)),
+        "--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio",
+        str(config.get("best_quote_maker_volume_net_loss_reduce_realized_credit_ratio", 1.0)),
         "--best-quote-maker-volume-dynamic-tick-enabled"
         if config.get("best_quote_maker_volume_dynamic_tick_enabled", False)
         else "--no-best-quote-maker-volume-dynamic-tick-enabled",

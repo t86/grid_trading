@@ -12008,18 +12008,34 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     exchange_short_avg_price = current_short_avg_price
 
     elastic_volume_config = _elastic_volume_config(effective_args)
-    if elastic_volume_config.enabled:
+    competition_start_time = None
+    try:
+        competition_start_time = normalize_runtime_guard_config(vars(args)).runtime_guard_stats_start_time
+    except Exception:
         competition_start_time = None
-        try:
-            competition_start_time = normalize_runtime_guard_config(vars(args)).runtime_guard_stats_start_time
-        except Exception:
-            competition_start_time = None
+    elastic_metrics = {
+        "gross_notional_5m": 0.0,
+        "net_pnl_5m": 0.0,
+        "commission_5m": 0.0,
+        "gross_notional_15m": 0.0,
+        "net_pnl_15m": 0.0,
+        "commission_15m": 0.0,
+        "competition_gross_notional": 0.0,
+        "competition_net_pnl": 0.0,
+        "competition_commission": 0.0,
+    }
+    needs_recent_best_quote_pnl = bool(
+        _is_best_quote_maker_volume_mode(requested_strategy_mode)
+        and getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_enabled", False)
+    )
+    if elastic_volume_config.enabled or needs_recent_best_quote_pnl:
         elastic_metrics = _summarize_elastic_volume_windows(
             summary_path,
             symbol=symbol,
             now=plan_now,
             competition_start_time=competition_start_time,
         )
+    if elastic_volume_config.enabled:
         elastic_threshold_position_notional = _safe_float(getattr(effective_args, "threshold_position_notional", None))
         if elastic_threshold_position_notional <= 0:
             elastic_threshold_position_notional = _safe_float(getattr(args, "threshold_position_notional", None))
@@ -14095,6 +14111,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                         6,
                     )
                 ),
+                net_loss_reduce_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_enabled", False)
+                ),
+                net_loss_reduce_min_loss=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_min_loss", 0.0)
+                ),
+                net_loss_reduce_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_ratio", 0.0)
+                ),
+                net_loss_reduce_realized_credit_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio", 1.0)
+                ),
             ),
             inputs=BestQuoteMakerVolumeInputs(
                 bid_price=bid_price,
@@ -14119,6 +14147,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 market_amplitude_1m=_adaptive_window_metric("window_1m", "amplitude_ratio"),
                 market_return_5m=_adaptive_window_metric("window_5m", "return_ratio"),
                 market_amplitude_5m=_adaptive_window_metric("window_5m", "amplitude_ratio"),
+                unrealized_pnl=unrealized_pnl,
+                recent_realized_pnl=_safe_float(elastic_metrics.get("net_pnl_15m")),
             ),
         )
         best_quote_take_profit_guard_enabled = bool(
@@ -16493,6 +16523,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-below-soft-adverse-threshold-scale", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-min-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-loss", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-tight-offset-ticks", type=int, default=2)
     parser.add_argument("--best-quote-maker-volume-dynamic-tick-low-loss-per-10k", type=float, default=3.0)
@@ -17616,6 +17650,12 @@ def main() -> None:
         raise SystemExit("--best-quote-maker-volume below-soft scales must be >= 0")
     if args.best_quote_maker_volume_inventory_cost_gate_min_notional < 0:
         raise SystemExit("--best-quote-maker-volume-inventory-cost-gate-min-notional must be >= 0")
+    if (
+        args.best_quote_maker_volume_net_loss_reduce_min_loss < 0
+        or args.best_quote_maker_volume_net_loss_reduce_ratio < 0
+        or args.best_quote_maker_volume_net_loss_reduce_realized_credit_ratio < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-net-loss-reduce values must be >= 0")
     if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score < 0:
         raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-score must be >= 0")
     if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_volatility_ratio < 0:

@@ -2802,6 +2802,10 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_below_soft_cost_gap_scale": 0.25,
                 "best_quote_maker_volume_below_soft_adverse_threshold_scale": 5.0,
                 "best_quote_maker_volume_inventory_cost_gate_min_notional": 10.0,
+                "best_quote_maker_volume_net_loss_reduce_enabled": True,
+                "best_quote_maker_volume_net_loss_reduce_min_loss": 2.0,
+                "best_quote_maker_volume_net_loss_reduce_ratio": 0.01,
+                "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
                 "volatility_entry_pause_tiny_inventory_ignore_notional": 10.0,
                 "elastic_volume_enabled": True,
                 "elastic_early_micro_abs_return_ratio": 0.001,
@@ -2842,6 +2846,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--best-quote-maker-volume-inventory-cost-gate-min-notional", command)
         cost_gate_min_index = command.index("--best-quote-maker-volume-inventory-cost-gate-min-notional")
         self.assertEqual(command[cost_gate_min_index + 1], "10.0")
+        self.assertIn("--best-quote-maker-volume-net-loss-reduce-enabled", command)
+        net_loss_min_index = command.index("--best-quote-maker-volume-net-loss-reduce-min-loss")
+        self.assertEqual(command[net_loss_min_index + 1], "2.0")
+        net_loss_ratio_index = command.index("--best-quote-maker-volume-net-loss-reduce-ratio")
+        self.assertEqual(command[net_loss_ratio_index + 1], "0.01")
         self.assertIn("--volatility-entry-pause-tiny-inventory-ignore-notional", command)
         tiny_index = command.index("--volatility-entry-pause-tiny-inventory-ignore-notional")
         self.assertEqual(command[tiny_index + 1], "10.0")

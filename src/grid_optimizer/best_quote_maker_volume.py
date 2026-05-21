@@ -67,6 +67,10 @@ class BestQuoteMakerVolumeConfig:
     dynamic_control_trend_loss_reduce_guard_min_volatility_ratio: float = 0.0035
     dynamic_control_trend_loss_reduce_guard_reduce_budget_scale: float = 0.35
     dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks: int = 6
+    net_loss_reduce_enabled: bool = False
+    net_loss_reduce_min_loss: float = 0.0
+    net_loss_reduce_ratio: float = 0.0
+    net_loss_reduce_realized_credit_ratio: float = 1.0
 
 
 @dataclass(frozen=True)
@@ -93,6 +97,8 @@ class BestQuoteMakerVolumeInputs:
     market_amplitude_1m: float = 0.0
     market_return_5m: float = 0.0
     market_amplitude_5m: float = 0.0
+    unrealized_pnl: float = 0.0
+    recent_realized_pnl: float = 0.0
 
 
 def _safe_float(value: Any) -> float:
@@ -337,6 +343,56 @@ def build_best_quote_maker_volume_plan(
     elif not allow_entry_long or not allow_entry_short:
         regime = "inventory_recover"
         reasons.append("open_entry_exposure")
+
+    net_loss_reduce_report = {
+        "enabled": bool(config.net_loss_reduce_enabled),
+        "active": False,
+        "reason": None,
+        "unrealized_pnl": _safe_float(inputs.unrealized_pnl),
+        "recent_realized_pnl": _safe_float(inputs.recent_realized_pnl),
+        "realized_credit_ratio": _safe_float(config.net_loss_reduce_realized_credit_ratio),
+        "net_pnl": 0.0,
+        "net_loss": 0.0,
+        "exposure_notional": long_notional + short_notional,
+        "loss_ratio": 0.0,
+        "min_loss": max(_safe_float(config.net_loss_reduce_min_loss), 0.0),
+        "threshold_ratio": max(_safe_float(config.net_loss_reduce_ratio), 0.0),
+    }
+    realized_credit_ratio = max(_safe_float(config.net_loss_reduce_realized_credit_ratio), 0.0)
+    net_pnl = _safe_float(inputs.unrealized_pnl) + (_safe_float(inputs.recent_realized_pnl) * realized_credit_ratio)
+    exposure_notional = max(long_notional + short_notional, 0.0)
+    net_loss = max(-net_pnl, 0.0)
+    net_loss_ratio = net_loss / exposure_notional if exposure_notional > 0 else 0.0
+    net_loss_reduce_report.update(
+        {
+            "realized_credit_ratio": realized_credit_ratio,
+            "net_pnl": net_pnl,
+            "net_loss": net_loss,
+            "exposure_notional": exposure_notional,
+            "loss_ratio": net_loss_ratio,
+        }
+    )
+    if (
+        config.net_loss_reduce_enabled
+        and exposure_notional > 0
+        and net_loss_reduce_report["min_loss"] > 0
+        and net_loss_reduce_report["threshold_ratio"] > 0
+        and net_loss >= net_loss_reduce_report["min_loss"]
+        and net_loss_ratio >= net_loss_reduce_report["threshold_ratio"]
+    ):
+        allow_entry_long = False
+        allow_entry_short = False
+        regime = "inventory_recover" if regime == "normal" else regime
+        reasons.append("net_loss_reduce")
+        net_loss_reduce_report.update(
+            {
+                "active": True,
+                "reason": (
+                    f"net_loss={net_loss:.4f} ratio={net_loss_ratio:.4%} "
+                    f">= {net_loss_reduce_report['threshold_ratio']:.4%}"
+                ),
+            }
+        )
 
     hard_loss = loss_per_10k >= max(_safe_float(config.loss_per_10k_hard), 0.0) > 0
     soft_loss = loss_per_10k >= max(_safe_float(config.loss_per_10k_soft), 0.0) > 0
@@ -1063,6 +1119,7 @@ def build_best_quote_maker_volume_plan(
             "trend_entry_guard": trend_entry_guard_report,
             "trend_inventory_guard": trend_inventory_guard_report,
             "trend_loss_reduce_guard": trend_loss_reduce_guard_report,
+            "net_loss_reduce": net_loss_reduce_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,
         },
