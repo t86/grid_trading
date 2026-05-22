@@ -118,6 +118,7 @@ from grid_optimizer.loop_runner import (
     remove_take_profit_exit_orders,
     sync_synthetic_ledger,
     update_synthetic_order_refs,
+    _suppress_place_orders_during_runtime_guard_loss_cooldown,
 )
 from grid_optimizer.submit_plan import (
     apply_loss_inventory_no_cross_entry_guard_to_actions,
@@ -1407,6 +1408,33 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(release["active"])
         self.assertIn("pair_pnl_below_buffer", release["blocked_reasons"])
         self.assertLess(release["estimated_pair_pnl"], release["required_profit"])
+
+    @patch("grid_optimizer.loop_runner._runtime_guard_loss_recovery_blocks_submit")
+    def test_runtime_guard_loss_cooldown_allows_frozen_manual_place_orders(self, mock_cooldown) -> None:
+        mock_cooldown.return_value = {"blocked": True, "reason": "runtime_guard_loss_cooling_down"}
+        actions = {
+            "place_count": 2,
+            "place_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "qty": 10.0},
+                {
+                    "role": "frozen_inventory_manual_limit_short",
+                    "side": "BUY",
+                    "qty": 500.0,
+                    "force_reduce_only": True,
+                    "manual_frozen_inventory_limit": True,
+                },
+            ],
+        }
+
+        filtered = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+            actions=actions,
+            args=Namespace(),
+        )
+
+        self.assertEqual(filtered["place_count"], 1)
+        self.assertEqual(filtered["place_orders"][0]["role"], "frozen_inventory_manual_limit_short")
+        self.assertEqual(filtered["dropped_place_count_by_runtime_guard_loss_cooldown"], 1)
+        self.assertEqual(filtered["allowed_place_count_by_runtime_guard_loss_cooldown"], 1)
 
     def test_best_quote_reduce_freeze_drops_normal_reduce_long_when_no_managed_long_remains(self) -> None:
         plan: dict[str, object] = {

@@ -234,6 +234,24 @@ The isolated quantity must not be used by automatic paired release. Pair release
 can only use `pair_eligible_long_qty` and `pair_eligible_short_qty`, i.e. frozen
 inventory not already assigned to a manual limit close order.
 
+Manual limit close orders can be cancelled independently for each side:
+
+- `cancel_limit_long`: remove the frozen-long limit-close directive and release
+  `long_manual_limit_isolated_qty` back into pair-eligible frozen inventory;
+- `cancel_limit_short`: remove the frozen-short limit-close directive and
+  release `short_manual_limit_isolated_qty` back into pair-eligible frozen
+  inventory.
+
+If the post-only order has already reached the exchange, removing the directive
+causes the runner's next reconcile cycle to stop preserving that manual-limit
+order, so the stale order is cancelled by the normal cancel-stale path.
+
+Manual frozen-inventory cleanup directives are operator actions, not normal
+volume generation. Runtime loss cooldown must still block ordinary entry/place
+orders, but it must allow frozen manual reduce-only IOC orders, frozen manual
+limit reduce-only GTX orders, and one-shot frozen pair-release reduce-only
+orders to be generated and submitted.
+
 ## Automatic Paired Frozen Release
 
 When both sides have meaningful frozen inventory, the strategy may reduce gross

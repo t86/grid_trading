@@ -394,6 +394,10 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn('updateFrozenInventory("pair_release", { requested_qty: qty })', page)
         self.assertIn("限价平冻结多", page)
         self.assertIn('updateFrozenInventory("limit_long"', page)
+        self.assertIn("撤限价平多", page)
+        self.assertIn('updateFrozenInventory("cancel_limit_long")', page)
+        self.assertIn("撤限价平空", page)
+        self.assertIn('updateFrozenInventory("cancel_limit_short")', page)
         self.assertIn("已限价挂单接管的冻结仓位不再参与对等释放", page)
         self.assertIn("清理冻结多仓数量", page)
         self.assertIn("清理冻结多仓", page)
@@ -482,6 +486,42 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(ledger["long_manual_limit_isolated_qty"], 8.0)
         self.assertEqual(ledger["pair_eligible_long_qty"], 42.0)
         self.assertEqual(ledger["offset_qty"], 40.0)
+
+    def test_update_frozen_inventory_cancel_limit_order_releases_isolated_qty(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 50.0,
+                            "short_qty": 40.0,
+                            "long_manual_limit_isolated_qty": 8.0,
+                            "short_manual_limit_isolated_qty": 12.0,
+                        },
+                        "best_quote_frozen_inventory_manual_limit": {
+                            "long": {"requested": True, "requested_qty": 8.0, "price": 1.02},
+                            "short": {"requested": True, "requested_qty": 12.0, "price": 0.98},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                result = _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "cancel_limit_short"}
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertIn("long", state["best_quote_frozen_inventory_manual_limit"])
+        self.assertNotIn("short", state["best_quote_frozen_inventory_manual_limit"])
+        ledger = result["frozen_inventory"]
+        self.assertEqual(ledger["long_manual_limit_isolated_qty"], 8.0)
+        self.assertEqual(ledger["short_manual_limit_isolated_qty"], 0.0)
+        self.assertEqual(ledger["pair_eligible_short_qty"], 40.0)
 
     def test_frozen_inventory_normalization_hides_cleared_side_metadata(self) -> None:
         ledger = _normalize_frozen_inventory_ledger(

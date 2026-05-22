@@ -14,7 +14,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .audit import (
     DEFAULT_AUDIT_LOOKBACK_DAYS,
@@ -6897,6 +6897,32 @@ def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now:
     }
 
 
+def _is_frozen_inventory_manual_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
+    role = str((order or {}).get("role") or "").strip()
+    return (
+        role.startswith("frozen_inventory_manual_reduce_")
+        or role.startswith("frozen_inventory_manual_limit_")
+        or role.startswith("frozen_inventory_pair_release_")
+        or bool((order or {}).get("manual_frozen_inventory_limit"))
+        or bool((order or {}).get("frozen_inventory_pair_release"))
+    )
+
+
+def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    manual_reduce = state.get("best_quote_frozen_inventory_manual_reduce") if isinstance(state, Mapping) else None
+    manual_limit = state.get("best_quote_frozen_inventory_manual_limit") if isinstance(state, Mapping) else None
+    pair_release = state.get("best_quote_frozen_inventory_pair_release") if isinstance(state, Mapping) else None
+
+    def _has_requested(raw: Any) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        if bool(raw.get("requested")):
+            return True
+        return any(isinstance(item, dict) and bool(item.get("requested")) for item in raw.values())
+
+    return _has_requested(manual_reduce) or _has_requested(manual_limit) or _has_requested(pair_release)
+
+
 def _suppress_place_orders_during_runtime_guard_loss_cooldown(
     *,
     actions: dict[str, Any],
@@ -6907,13 +6933,18 @@ def _suppress_place_orders_during_runtime_guard_loss_cooldown(
     if not cooldown.get("blocked"):
         return actions
     updated = dict(actions)
-    dropped = [dict(item) for item in list(updated.get("place_orders") or []) if isinstance(item, dict)]
-    updated["place_orders"] = []
-    updated["place_count"] = 0
+    place_orders = [dict(item) for item in list(updated.get("place_orders") or []) if isinstance(item, dict)]
+    allowed = [dict(item) for item in place_orders if _is_frozen_inventory_manual_order(item)]
+    dropped = [dict(item) for item in place_orders if not _is_frozen_inventory_manual_order(item)]
+    updated["place_orders"] = allowed
+    updated["place_count"] = len(allowed)
     updated["runtime_guard_loss_cooldown"] = cooldown
     if dropped:
         updated["place_orders_dropped_by_runtime_guard_loss_cooldown"] = dropped
         updated["dropped_place_count_by_runtime_guard_loss_cooldown"] = len(dropped)
+    if allowed:
+        updated["place_orders_allowed_by_runtime_guard_loss_cooldown"] = allowed
+        updated["allowed_place_count_by_runtime_guard_loss_cooldown"] = len(allowed)
     return updated
 
 
@@ -7207,6 +7238,29 @@ def _maybe_handle_runtime_guard(
     )
     if runtime_guard_result.tradable:
         return None
+    loss_only_stop = runtime_guard_result.matched_reasons in (
+        ["rolling_hourly_loss_limit_hit"],
+        ["rolling_hourly_loss_per_10k_limit_hit"],
+    )
+    if (
+        loss_only_stop
+        and _runtime_guard_loss_recovery_enabled(args)
+        and _has_pending_frozen_inventory_manual_directive(state)
+    ):
+        _runtime_guard_mark_loss_stop(
+            recovery,
+            stopped_at=cycle_started_at,
+            rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+        )
+        recovery.update(
+            {
+                "last_checked_at": cycle_started_at.isoformat(),
+                "manual_frozen_inventory_override": True,
+                "manual_frozen_inventory_override_reason": "allow_reduce_only_frozen_inventory_directive",
+            }
+        )
+        _write_json(state_path, state)
+        return None
     credentials = load_binance_api_credentials()
     if credentials is None:
         raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
@@ -7223,10 +7277,6 @@ def _maybe_handle_runtime_guard(
         api_key,
         api_secret,
         allow_loss=True,
-    )
-    loss_only_stop = runtime_guard_result.matched_reasons in (
-        ["rolling_hourly_loss_limit_hit"],
-        ["rolling_hourly_loss_per_10k_limit_hit"],
     )
     if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
         stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
@@ -17094,8 +17144,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
         ]
-        validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
-        validation["ok"] = validation["actions"].get("cancel_count", 0) > 0
+        if validation["actions"].get("place_count", 0) > 0:
+            validation["errors"].append(
+                "runtime_guard_loss_cooling_down blocks normal place orders; frozen inventory manual reduce-only orders allowed"
+            )
+        else:
+            validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
 
     report = {
         "plan_json": str(args.plan_json),
@@ -17412,8 +17470,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
         ]
         if "runtime_guard_loss_cooling_down blocks new place orders" not in validation["errors"]:
-            validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
-        validation["ok"] = validation["actions"].get("cancel_count", 0) > 0
+            if validation["actions"].get("place_count", 0) > 0:
+                validation["errors"].append(
+                    "runtime_guard_loss_cooling_down blocks normal place orders; frozen inventory manual reduce-only orders allowed"
+                )
+            else:
+                validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
     effective_place_budget = (

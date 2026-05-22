@@ -6182,6 +6182,8 @@ def _render_running_status_page(symbol: str | None = None) -> str:
                 <button id="frozen_pair_release_btn" type="button">对等释放</button>
                 <button id="frozen_limit_long_btn" type="button">限价平冻结多</button>
                 <button id="frozen_limit_short_btn" type="button">限价平冻结空</button>
+                <button id="frozen_cancel_limit_long_btn" type="button">撤限价平多</button>
+                <button id="frozen_cancel_limit_short_btn" type="button">撤限价平空</button>
                 <button id="frozen_clear_long_btn" type="button">清理冻结多仓</button>
                 <button id="frozen_clear_short_btn" type="button">清理冻结空仓</button>
                 <button id="frozen_reset_btn" type="button" class="danger">仅清空账本</button>
@@ -6238,6 +6240,8 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     const frozenPairReleaseBtn = document.getElementById("frozen_pair_release_btn");
     const frozenLimitLongBtn = document.getElementById("frozen_limit_long_btn");
     const frozenLimitShortBtn = document.getElementById("frozen_limit_short_btn");
+    const frozenCancelLimitLongBtn = document.getElementById("frozen_cancel_limit_long_btn");
+    const frozenCancelLimitShortBtn = document.getElementById("frozen_cancel_limit_short_btn");
     const frozenClearLongBtn = document.getElementById("frozen_clear_long_btn");
     const frozenClearShortBtn = document.getElementById("frozen_clear_short_btn");
     const frozenResetBtn = document.getElementById("frozen_reset_btn");
@@ -6931,9 +6935,11 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       if (!card) return;
       const actionLabel = action === "pair_release"
         ? "提交冻结多空对等释放指令"
+        : (action === "cancel_limit_long" || action === "cancel_limit_short"
+          ? "撤销冻结仓位限价平仓指令"
         : (action === "limit_long" || action === "limit_short"
           ? "提交冻结仓位限价平仓指令"
-          : (action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本"));
+          : (action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本")));
       setDrawerStatus(`正在${actionLabel} ${card.symbol}...`);
       try {
         const resp = await fetch("/api/runner/frozen_inventory", {
@@ -7054,6 +7060,16 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       const price = promptNumber("限价平冻结空仓价格（BUY SHORT）", ledger.short_entry_price);
       if (price === null || price <= 0) return;
       updateFrozenInventory("limit_short", { requested_qty: qty, price });
+    });
+    frozenCancelLimitLongBtn.addEventListener("click", () => {
+      if (window.confirm("确认撤销限价平冻结多指令并释放对应隔离数量？如订单已挂出，runner 下一轮会撤掉它。")) {
+        updateFrozenInventory("cancel_limit_long");
+      }
+    });
+    frozenCancelLimitShortBtn.addEventListener("click", () => {
+      if (window.confirm("确认撤销限价平冻结空指令并释放对应隔离数量？如订单已挂出，runner 下一轮会撤掉它。")) {
+        updateFrozenInventory("cancel_limit_short");
+      }
     });
     frozenResetBtn.addEventListener("click", () => {
       if (window.confirm("确认仅清空冻结仓位账本？这不会向交易所下单，只用于账本纠错。")) {
@@ -10180,7 +10196,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     if not symbol:
         raise ValueError("symbol is required")
     action = str(payload.get("action", "set")).strip().lower() or "set"
-    if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "limit_long", "limit_short", "pair_release", "reset"}:
+    if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "limit_long", "limit_short", "cancel_limit_long", "cancel_limit_short", "pair_release", "reset"}:
         raise ValueError("unsupported frozen inventory action")
     state_path = _runner_frozen_inventory_state_path(symbol)
     state = _read_json_dict(state_path) or {}
@@ -10255,6 +10271,15 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 "source": "running_status_ui",
             }
             state["best_quote_frozen_inventory_manual_limit"] = directive
+        elif action in {"cancel_limit_long", "cancel_limit_short"}:
+            directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
+            side_key = "long" if action == "cancel_limit_long" else "short"
+            directive.pop(side_key, None)
+            if directive:
+                state["best_quote_frozen_inventory_manual_limit"] = directive
+            else:
+                state.pop("best_quote_frozen_inventory_manual_limit", None)
+            ledger[f"{side_key}_manual_limit_isolated_qty"] = 0.0
         elif action == "pair_release":
             if ledger["offset_qty"] <= 1e-12:
                 raise ValueError("frozen long/short offset qty is empty")
