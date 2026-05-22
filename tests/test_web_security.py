@@ -4602,6 +4602,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("PHAROSUSDT", page)
         self.assertIn("保存参数", page)
         self.assertIn("保存并启动", page)
+        self.assertIn("latestScopeMatchesCurrent", page)
+        self.assertIn("请先刷新当前目标，再保存。", page)
         self.assertNotIn("保存参数（下一阶段开放）", page)
         self.assertNotIn("setInterval(", page)
 

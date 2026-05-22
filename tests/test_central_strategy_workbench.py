@@ -125,6 +125,41 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
         self.assertEqual(written["strategy_profile"], "pharosusdt_hedge_best_quote_maker_volume_v1")
         self.assertEqual(written["_central_workbench_action"], "save")
 
+    @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
+    def test_save_remote_workbench_config_strips_non_writable_profile_params(self, mock_run) -> None:
+        mock_run.return_value = Mock(returncode=0, stdout="saved\n", stderr="")
+
+        result = save_remote_workbench_config(
+            "114",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+            {
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "required_position_mode": "hedge",
+                "max_new_orders": 5,
+                "max_total_notional": 1450.0,
+                "cancel_stale": True,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 10.0,
+                "best_quote_maker_volume_enabled": True,
+                "synthetic_flow_sleeve_enabled": False,
+                "adaptive_step_max_scale": 4.5,
+                "old_unknown_knob": "",
+            },
+        )
+
+        written = json.loads(mock_run.call_args.kwargs["input"])
+        self.assertNotIn("synthetic_flow_sleeve_enabled", written)
+        self.assertNotIn("adaptive_step_max_scale", written)
+        self.assertNotIn("old_unknown_knob", written)
+        self.assertEqual(
+            result["stripped_params"],
+            ["adaptive_step_max_scale", "old_unknown_knob", "synthetic_flow_sleeve_enabled"],
+        )
+
     def test_save_remote_workbench_config_rejects_scope_mismatch(self) -> None:
         with self.assertRaisesRegex(ValueError, "strategy_profile"):
             save_remote_workbench_config(

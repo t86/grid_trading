@@ -299,7 +299,20 @@ def _schema_report_for_config(config: dict[str, Any]) -> dict[str, Any]:
 def _normalize_config_for_target(target: CentralStrategyTarget, config: dict[str, Any], *, action: str) -> dict[str, Any]:
     if not isinstance(config, dict):
         raise ValueError("config must be object")
-    normalized = dict(config)
+    normalized: dict[str, Any] = {}
+    stripped_params: list[str] = []
+    for key, value in config.items():
+        key_str = str(key)
+        if key_str.startswith("_"):
+            stripped_params.append(key_str)
+            continue
+        if key_str in {"symbol", "strategy_profile", "strategy_mode", "required_position_mode"}:
+            normalized[key_str] = value
+            continue
+        if _workbench_owner_for_key(target, key_str) in {"common", "profile", "global_safety"}:
+            normalized[key_str] = value
+            continue
+        stripped_params.append(key_str)
     normalized["symbol"] = str(normalized.get("symbol") or target.symbol).upper().strip()
     normalized["strategy_profile"] = str(normalized.get("strategy_profile") or target.strategy_profile).strip()
     normalized["strategy_mode"] = str(normalized.get("strategy_mode") or target.strategy_mode).strip()
@@ -326,6 +339,7 @@ def _normalize_config_for_target(target: CentralStrategyTarget, config: dict[str
     normalized["_central_workbench_action"] = action
     normalized["_central_workbench_saved_at"] = datetime.now(timezone.utc).isoformat()
     normalized["_central_workbench_scope"] = target.scope
+    normalized["_central_workbench_stripped_params"] = sorted(set(stripped_params))
     return normalized
 
 
@@ -489,6 +503,7 @@ def save_remote_workbench_config(
     return {
         **payload,
         "saved": True,
+        "stripped_params": list(normalized.get("_central_workbench_stripped_params") or []),
         "remote_write": write_result,
     }
 

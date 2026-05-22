@@ -27073,10 +27073,23 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
         .map((name) => renderSection(name, sections[name] || {}))
         .join("");
     }
+    function currentSelection() {
+      return {
+        serverId: document.getElementById("server_id").value,
+        symbol: document.getElementById("symbol").value.trim().toUpperCase(),
+        profile: document.getElementById("strategy_profile").value,
+      };
+    }
+    function latestScopeMatchesCurrent() {
+      if (!latestPayload || !latestPayload.scope) return false;
+      const current = currentSelection();
+      const scope = latestPayload.scope || {};
+      return String(scope.server_id || "") === current.serverId
+        && String(scope.symbol || "").toUpperCase() === current.symbol
+        && String(scope.strategy_profile || "") === current.profile;
+    }
     async function refresh() {
-      const serverId = document.getElementById("server_id").value;
-      const symbol = document.getElementById("symbol").value.trim().toUpperCase();
-      const profile = document.getElementById("strategy_profile").value;
+      const {serverId, symbol, profile} = currentSelection();
       metaEl.textContent = "正在读取目标服务器参数...";
       const url = `/api/central_strategy_workbench/status?server_id=${encodeURIComponent(serverId)}&symbol=${encodeURIComponent(symbol)}&strategy_profile=${encodeURIComponent(profile)}`;
       const resp = await fetch(url);
@@ -27089,6 +27102,7 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     }
     function currentConfigFromForm() {
       if (!latestPayload || !latestPayload.raw_config) throw new Error("请先刷新参数，再保存。");
+      if (!latestScopeMatchesCurrent()) throw new Error("请先刷新当前目标，再保存。");
       const config = {...latestPayload.raw_config};
       sectionsEl.querySelectorAll("input[data-key]").forEach((input) => {
         if (input.getAttribute("data-editable") !== "1") return;
@@ -27100,9 +27114,7 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     }
     async function submitConfig(action) {
       if (action === "apply" && !window.confirm("确认保存并重启当前 PHAROS 策略？")) return;
-      const serverId = document.getElementById("server_id").value;
-      const symbol = document.getElementById("symbol").value.trim().toUpperCase();
-      const profile = document.getElementById("strategy_profile").value;
+      const {serverId, symbol, profile} = currentSelection();
       const config = currentConfigFromForm();
       const endpoint = action === "apply" ? "/api/central_strategy_workbench/apply" : "/api/central_strategy_workbench/save";
       metaEl.textContent = action === "apply" ? "正在保存并启动..." : "正在保存参数...";
