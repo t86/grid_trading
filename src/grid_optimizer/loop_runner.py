@@ -2668,6 +2668,124 @@ def apply_best_quote_frozen_inventory_manual_reduce(
     return reduce_report
 
 
+def _cap_best_quote_reduce_orders_to_managed_inventory(
+    *,
+    plan: dict[str, Any],
+    report: dict[str, Any],
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    managed_long_qty = max(_safe_float(report.get("managed_long_qty")), 0.0)
+    managed_short_qty = max(_safe_float(report.get("managed_short_qty")), 0.0)
+    frozen_long_qty = max(_safe_float(report.get("frozen_long_qty")), 0.0)
+    frozen_short_qty = max(_safe_float(report.get("frozen_short_qty")), 0.0)
+    cap_report = {
+        "enabled": bool(frozen_long_qty > 1e-12 or frozen_short_qty > 1e-12),
+        "managed_long_qty": managed_long_qty,
+        "managed_short_qty": managed_short_qty,
+        "frozen_long_qty": frozen_long_qty,
+        "frozen_short_qty": frozen_short_qty,
+        "trimmed_long_orders": 0,
+        "trimmed_short_orders": 0,
+        "dropped_long_orders": 0,
+        "dropped_short_orders": 0,
+        "skipped_manual_reduce_orders": 0,
+    }
+    if not cap_report["enabled"]:
+        return cap_report
+
+    safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
+    safe_min_notional = max(_safe_float(min_notional), 0.0) if min_notional is not None else 0.0
+
+    def _is_manual_frozen_reduce(order: dict[str, Any]) -> bool:
+        role = _order_role(order)
+        return role.startswith("frozen_inventory_manual_reduce_") or bool(order.get("manual_frozen_inventory_reduce"))
+
+    def _is_reduce_long_order(order: dict[str, Any]) -> bool:
+        role = _order_role(order)
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _order_position_side(order)
+        return (
+            side == "SELL"
+            and position_side in {"LONG", "BOTH"}
+            and (role in {"best_quote_reduce_long"} or bool(order.get("force_reduce_only")))
+        )
+
+    def _is_reduce_short_order(order: dict[str, Any]) -> bool:
+        role = _order_role(order)
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _order_position_side(order)
+        return (
+            side == "BUY"
+            and position_side in {"SHORT", "BOTH"}
+            and (role in {"best_quote_reduce_short"} or bool(order.get("force_reduce_only")))
+        )
+
+    def _trim_order(order: dict[str, Any], available_qty: float) -> tuple[dict[str, Any] | None, float, bool]:
+        original_qty = max(_safe_float(order.get("qty")), 0.0)
+        if original_qty <= 1e-12 or available_qty <= 1e-12:
+            return None, available_qty, False
+        qty = min(original_qty, available_qty)
+        if qty + 1e-12 < original_qty:
+            qty = _round_order_qty(qty, step_size)
+        if qty <= 1e-12 or (safe_min_qty > 0 and qty + 1e-12 < safe_min_qty):
+            return None, available_qty, False
+        price = max(_safe_float(order.get("price")), 0.0)
+        notional = qty * price if price > 0 else _safe_float(order.get("notional"))
+        if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
+            return None, available_qty, False
+        trimmed = dict(order)
+        trimmed["qty"] = qty
+        trimmed["notional"] = notional
+        if qty + 1e-12 < original_qty:
+            trimmed["frozen_inventory_managed_qty_capped"] = True
+        return trimmed, max(available_qty - qty, 0.0), bool(qty + 1e-12 < original_qty)
+
+    long_available = managed_long_qty
+    sell_orders: list[dict[str, Any]] = []
+    for raw_order in [item for item in plan.get("sell_orders", []) if isinstance(item, dict)]:
+        order = dict(raw_order)
+        if _is_manual_frozen_reduce(order):
+            cap_report["skipped_manual_reduce_orders"] += 1
+            sell_orders.append(order)
+            continue
+        if not _is_reduce_long_order(order):
+            sell_orders.append(order)
+            continue
+        trimmed, long_available, was_trimmed = _trim_order(order, long_available)
+        if trimmed is None:
+            cap_report["dropped_long_orders"] += 1
+            continue
+        if was_trimmed:
+            cap_report["trimmed_long_orders"] += 1
+        sell_orders.append(trimmed)
+    plan["sell_orders"] = sell_orders
+
+    short_available = managed_short_qty
+    buy_orders: list[dict[str, Any]] = []
+    for raw_order in [item for item in plan.get("buy_orders", []) if isinstance(item, dict)]:
+        order = dict(raw_order)
+        if _is_manual_frozen_reduce(order):
+            cap_report["skipped_manual_reduce_orders"] += 1
+            buy_orders.append(order)
+            continue
+        if not _is_reduce_short_order(order):
+            buy_orders.append(order)
+            continue
+        trimmed, short_available, was_trimmed = _trim_order(order, short_available)
+        if trimmed is None:
+            cap_report["dropped_short_orders"] += 1
+            continue
+        if was_trimmed:
+            cap_report["trimmed_short_orders"] += 1
+        buy_orders.append(trimmed)
+    plan["buy_orders"] = buy_orders
+    cap_report["remaining_managed_long_qty"] = long_available
+    cap_report["remaining_managed_short_qty"] = short_available
+    return cap_report
+
+
 TAKE_PROFIT_EXIT_ROLES = {"take_profit", "take_profit_long", "take_profit_short"}
 
 
@@ -16056,6 +16174,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             preserve_less_aggressive=bool(getattr(effective_args, "sticky_entry_preserve_less_aggressive", True)),
         )
         _sync_plan_orders_from_desired_orders(plan, desired_orders)
+        best_quote_reduce_freeze_order_cap = _cap_best_quote_reduce_orders_to_managed_inventory(
+            plan=plan,
+            report=best_quote_reduce_freeze,
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+        )
+        best_quote_maker_volume["reduce_freeze_order_cap"] = dict(best_quote_reduce_freeze_order_cap)
+        best_quote_maker_volume["reduce_freeze"] = {
+            **dict(best_quote_maker_volume.get("reduce_freeze") or {}),
+            "order_cap": dict(best_quote_reduce_freeze_order_cap),
+        }
+        desired_orders = [
+            *plan["buy_orders"],
+            *plan["sell_orders"],
+        ]
     if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled") and not bool(
         regime_entry_budget.get("report_only", True)
     ):

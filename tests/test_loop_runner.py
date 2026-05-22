@@ -46,6 +46,7 @@ from grid_optimizer.loop_runner import (
     _resolve_hard_loss_reduce_target_notional,
     _best_quote_reduce_freeze_report,
     _apply_best_quote_reduce_freeze,
+    _cap_best_quote_reduce_orders_to_managed_inventory,
     apply_best_quote_frozen_inventory_manual_reduce,
     _position_unrealized_or_estimate,
     _is_long_exit_order,
@@ -990,6 +991,118 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(order["force_reduce_only"])
         self.assertEqual(order["execution_type"], "aggressive")
         self.assertEqual(order["time_in_force"], "IOC")
+
+    def test_best_quote_reduce_freeze_drops_normal_reduce_long_when_no_managed_long_remains(self) -> None:
+        plan: dict[str, object] = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "price": 0.65,
+                    "qty": 20.0,
+                    "notional": 13.0,
+                    "role": "best_quote_reduce_long",
+                    "force_reduce_only": True,
+                },
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "price": 0.65,
+                    "qty": 335.0,
+                    "notional": 217.75,
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "force_reduce_only": True,
+                    "manual_frozen_inventory_reduce": True,
+                },
+            ],
+        }
+
+        report = _cap_best_quote_reduce_orders_to_managed_inventory(
+            plan=plan,
+            report={
+                "frozen_long_qty": 335.0,
+                "frozen_short_qty": 0.0,
+                "managed_long_qty": 0.0,
+                "managed_short_qty": 0.0,
+            },
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual([order["role"] for order in plan["sell_orders"]], ["frozen_inventory_manual_reduce_long"])
+        self.assertEqual(report["dropped_long_orders"], 1)
+        self.assertEqual(report["skipped_manual_reduce_orders"], 1)
+
+    def test_best_quote_reduce_freeze_trims_normal_reduce_long_to_managed_qty(self) -> None:
+        plan: dict[str, object] = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "price": 0.65,
+                    "qty": 12.0,
+                    "notional": 7.8,
+                    "role": "best_quote_reduce_long",
+                    "force_reduce_only": True,
+                }
+            ],
+        }
+
+        report = _cap_best_quote_reduce_orders_to_managed_inventory(
+            plan=plan,
+            report={
+                "frozen_long_qty": 100.0,
+                "frozen_short_qty": 0.0,
+                "managed_long_qty": 5.0,
+                "managed_short_qty": 0.0,
+            },
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=1.0,
+        )
+
+        order = plan["sell_orders"][0]
+        self.assertEqual(order["qty"], 5.0)
+        self.assertEqual(order["notional"], 3.25)
+        self.assertTrue(order["frozen_inventory_managed_qty_capped"])
+        self.assertEqual(report["trimmed_long_orders"], 1)
+
+    def test_best_quote_reduce_freeze_caps_normal_reduce_short_independently(self) -> None:
+        plan: dict[str, object] = {
+            "buy_orders": [
+                {
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "price": 0.66,
+                    "qty": 10.0,
+                    "notional": 6.6,
+                    "role": "best_quote_reduce_short",
+                    "force_reduce_only": True,
+                }
+            ],
+            "sell_orders": [],
+        }
+
+        report = _cap_best_quote_reduce_orders_to_managed_inventory(
+            plan=plan,
+            report={
+                "frozen_long_qty": 0.0,
+                "frozen_short_qty": 20.0,
+                "managed_long_qty": 0.0,
+                "managed_short_qty": 3.0,
+            },
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=1.0,
+        )
+
+        order = plan["buy_orders"][0]
+        self.assertEqual(order["qty"], 3.0)
+        self.assertAlmostEqual(order["notional"], 1.98)
+        self.assertEqual(report["trimmed_short_orders"], 1)
 
     def test_best_quote_maker_volume_net_loss_reduce_credits_recent_realized_profit(self) -> None:
         plan = build_best_quote_maker_volume_plan(
