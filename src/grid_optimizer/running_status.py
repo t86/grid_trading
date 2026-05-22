@@ -446,6 +446,16 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         if bid_price > 0 and ask_price > 0:
             mid_price = (bid_price + ask_price) / 2.0
     reduce_freeze = plan_report.get("reduce_freeze") if isinstance(plan_report.get("reduce_freeze"), dict) else {}
+    best_quote = (
+        plan_report.get("best_quote_maker_volume")
+        if isinstance(plan_report.get("best_quote_maker_volume"), dict)
+        else {}
+    )
+    frozen_pair_release = (
+        best_quote.get("frozen_pair_release")
+        if isinstance(best_quote.get("frozen_pair_release"), dict)
+        else {}
+    )
     frozen_inventory = _normalize_frozen_inventory_ledger(
         state_report.get("best_quote_frozen_inventory") or reduce_freeze.get("ledger") or {},
         mid_price=mid_price,
@@ -486,6 +496,7 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         "fees": total_fees if has_last_run else None,
         "funding_fee": _safe_float(income_summary.get("funding_fee")) if has_last_run else None,
         "frozen_inventory": frozen_inventory,
+        "frozen_pair_release": dict(frozen_pair_release) if has_last_run else {},
     }
 
 
@@ -619,6 +630,7 @@ def build_running_status_card(
         "fees": stats.get("fees"),
         "funding_fee": stats.get("funding_fee"),
         "frozen_inventory": stats.get("frozen_inventory"),
+        "frozen_pair_release": stats.get("frozen_pair_release"),
         "config": merged_config,
         "snapshot": None,
     }
