@@ -48,6 +48,7 @@ from grid_optimizer.loop_runner import (
     _apply_best_quote_reduce_freeze,
     _cap_best_quote_reduce_orders_to_managed_inventory,
     apply_best_quote_frozen_inventory_manual_reduce,
+    apply_best_quote_frozen_inventory_pair_release,
     _position_unrealized_or_estimate,
     _is_long_exit_order,
     _is_short_exit_order,
@@ -992,6 +993,110 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(order["execution_type"], "aggressive")
         self.assertEqual(order["time_in_force"], "IOC")
 
+    def test_best_quote_frozen_pair_release_places_paired_ioc_when_stable_and_profitable(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [{"qty": 50.0, "entry_price": 1.0}],
+                "short_lots": [{"qty": 30.0, "entry_price": 1.03}],
+            }
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=50.0,
+            current_short_qty=30.0,
+            current_long_avg_price=1.0,
+            current_short_avg_price=1.03,
+            mid_price=1.01,
+        )
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report=report,
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=20.0,
+            min_profit_ratio=0.001,
+            max_slippage_ticks=2,
+        )
+
+        self.assertTrue(release["active"])
+        self.assertTrue(release["stable_allowed"])
+        self.assertGreater(release["estimated_pair_pnl"], release["required_profit"])
+        self.assertEqual(release["release_qty"], 19.8)
+        sell_order = plan["sell_orders"][0]
+        buy_order = plan["buy_orders"][0]
+        self.assertEqual(sell_order["role"], "frozen_inventory_pair_release_long")
+        self.assertEqual(buy_order["role"], "frozen_inventory_pair_release_short")
+        self.assertEqual(sell_order["side"], "SELL")
+        self.assertEqual(sell_order["position_side"], "LONG")
+        self.assertEqual(buy_order["side"], "BUY")
+        self.assertEqual(buy_order["position_side"], "SHORT")
+        self.assertEqual(sell_order["time_in_force"], "IOC")
+        self.assertEqual(buy_order["time_in_force"], "IOC")
+        self.assertTrue(sell_order["frozen_inventory_pair_release"])
+        self.assertTrue(buy_order["frozen_inventory_pair_release"])
+
+    def test_best_quote_frozen_pair_release_blocks_when_market_not_stable(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={"frozen_long_qty": 50.0, "frozen_short_qty": 50.0, "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.03}},
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=False,
+            max_notional=20.0,
+            min_profit_ratio=0.001,
+            max_slippage_ticks=2,
+        )
+
+        self.assertFalse(release["active"])
+        self.assertIn("market_not_stable", release["blocked_reasons"])
+        self.assertEqual(plan["buy_orders"], [])
+        self.assertEqual(plan["sell_orders"], [])
+
+    def test_best_quote_frozen_pair_release_blocks_when_pair_pnl_below_buffer(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={
+                "frozen_long_qty": 50.0,
+                "frozen_short_qty": 50.0,
+                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.001},
+            },
+            bid_price=0.999,
+            ask_price=1.001,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=20.0,
+            min_profit_ratio=0.001,
+            max_slippage_ticks=2,
+        )
+
+        self.assertFalse(release["active"])
+        self.assertIn("pair_pnl_below_buffer", release["blocked_reasons"])
+        self.assertLess(release["estimated_pair_pnl"], release["required_profit"])
+
     def test_best_quote_reduce_freeze_drops_normal_reduce_long_when_no_managed_long_remains(self) -> None:
         plan: dict[str, object] = {
             "buy_orders": [],
@@ -1011,9 +1116,9 @@ class LoopRunnerTests(unittest.TestCase):
                     "price": 0.65,
                     "qty": 335.0,
                     "notional": 217.75,
-                    "role": "frozen_inventory_manual_reduce_long",
+                    "role": "frozen_inventory_pair_release_long",
                     "force_reduce_only": True,
-                    "manual_frozen_inventory_reduce": True,
+                    "frozen_inventory_pair_release": True,
                 },
             ],
         }
@@ -1031,7 +1136,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_notional=5.0,
         )
 
-        self.assertEqual([order["role"] for order in plan["sell_orders"]], ["frozen_inventory_manual_reduce_long"])
+        self.assertEqual([order["role"] for order in plan["sell_orders"]], ["frozen_inventory_pair_release_long"])
         self.assertEqual(report["dropped_long_orders"], 1)
         self.assertEqual(report["skipped_manual_reduce_orders"], 1)
 

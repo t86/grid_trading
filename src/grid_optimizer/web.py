@@ -443,6 +443,13 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
             "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
             "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
+            "best_quote_maker_volume_frozen_pair_release_enabled": False,
+            "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
+            "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
+            "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+            "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
+            "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
+            "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
             "best_quote_maker_volume_same_side_entry_price_guard_enabled": False,
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 0.0,
             "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
@@ -505,6 +512,13 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
             "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
             "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
+            "best_quote_maker_volume_frozen_pair_release_enabled": False,
+            "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
+            "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
+            "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+            "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
+            "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
+            "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
             "best_quote_maker_volume_same_side_entry_price_guard_enabled": False,
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 0.0,
             "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
@@ -3998,6 +4012,13 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
     "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
     "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
+    "best_quote_maker_volume_frozen_pair_release_enabled": False,
+    "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
+    "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.0008,
+    "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+    "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
+    "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
+    "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
     "best_quote_maker_volume_same_side_entry_price_guard_enabled": False,
     "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 0.0,
     "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 0,
@@ -9156,6 +9177,11 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_reduce_freeze_loss_ratio",
         "best_quote_maker_volume_reduce_freeze_min_notional",
         "best_quote_maker_volume_reduce_freeze_soft_ratio_scale",
+        "best_quote_maker_volume_frozen_pair_release_max_notional",
+        "best_quote_maker_volume_frozen_pair_release_min_profit_ratio",
+        "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio",
+        "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio",
+        "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio",
         "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
         "best_quote_maker_volume_dynamic_tick_low_loss_per_10k",
         "best_quote_maker_volume_dynamic_tick_mid_loss_per_10k",
@@ -9244,6 +9270,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_dynamic_tick_tight_offset_ticks",
         "best_quote_maker_volume_inventory_bias_same_side_extra_ticks",
         "best_quote_maker_volume_inventory_bias_reduce_extra_ticks",
+        "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks",
         "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks",
         "best_quote_maker_volume_dynamic_control_high_volatility_extra_offset_ticks",
         "best_quote_maker_volume_dynamic_control_extreme_volatility_extra_offset_ticks",
@@ -9273,6 +9300,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_inventory_cost_gate_enabled",
         "best_quote_maker_volume_net_loss_reduce_enabled",
         "best_quote_maker_volume_reduce_freeze_enabled",
+        "best_quote_maker_volume_frozen_pair_release_enabled",
         "best_quote_maker_volume_same_side_entry_price_guard_enabled",
         "best_quote_maker_volume_dynamic_tick_enabled",
         "best_quote_maker_volume_inventory_bias_enabled",
@@ -9866,6 +9894,11 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             "best_quote_maker_volume_net_loss_reduce_min_inventory_notional",
             "best_quote_maker_volume_reduce_freeze_loss_ratio",
             "best_quote_maker_volume_reduce_freeze_min_notional",
+            "best_quote_maker_volume_frozen_pair_release_max_notional",
+            "best_quote_maker_volume_frozen_pair_release_min_profit_ratio",
+            "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio",
+            "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio",
+            "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio",
             "best_quote_maker_volume_same_side_entry_price_guard_min_notional",
         ):
             value = number(field)
@@ -9874,6 +9907,9 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         reduce_freeze_soft_scale = number("best_quote_maker_volume_reduce_freeze_soft_ratio_scale")
         if reduce_freeze_soft_scale is not None and not (0 < reduce_freeze_soft_scale <= 1):
             errors.append("best_quote_maker_volume_reduce_freeze_soft_ratio_scale 必须在 (0, 1] 内")
+        pair_release_slippage_ticks = number("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks")
+        if pair_release_slippage_ticks is not None and pair_release_slippage_ticks < 0:
+            errors.append("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks 必须 >= 0")
         same_side_gap_ticks = number("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks")
         if same_side_gap_ticks is not None and same_side_gap_ticks < 0:
             errors.append("best_quote_maker_volume_same_side_entry_price_guard_gap_ticks 必须 >= 0")
@@ -10139,6 +10175,21 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
         "--best-quote-maker-volume-reduce-freeze-soft-ratio-scale",
         str(config.get("best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 0.70)),
+        "--best-quote-maker-volume-frozen-pair-release-enabled"
+        if config.get("best_quote_maker_volume_frozen_pair_release_enabled", False)
+        else "--no-best-quote-maker-volume-frozen-pair-release-enabled",
+        "--best-quote-maker-volume-frozen-pair-release-max-notional",
+        str(config.get("best_quote_maker_volume_frozen_pair_release_max_notional", 20.0)),
+        "--best-quote-maker-volume-frozen-pair-release-min-profit-ratio",
+        str(config.get("best_quote_maker_volume_frozen_pair_release_min_profit_ratio", 0.0008)),
+        "--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks",
+        str(config.get("best_quote_maker_volume_frozen_pair_release_max_slippage_ticks", 2)),
+        "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
+        str(config.get("best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio", 0.0015)),
+        "--best-quote-maker-volume-frozen-pair-release-max-1m-abs-return-ratio",
+        str(config.get("best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio", 0.0025)),
+        "--best-quote-maker-volume-frozen-pair-release-max-1m-amplitude-ratio",
+        str(config.get("best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio", 0.0035)),
         "--best-quote-maker-volume-same-side-entry-price-guard-enabled"
         if config.get("best_quote_maker_volume_same_side_entry_price_guard_enabled", False)
         else "--no-best-quote-maker-volume-same-side-entry-price-guard-enabled",

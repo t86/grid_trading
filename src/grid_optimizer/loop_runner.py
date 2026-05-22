@@ -2668,6 +2668,147 @@ def apply_best_quote_frozen_inventory_manual_reduce(
     return reduce_report
 
 
+def apply_best_quote_frozen_inventory_pair_release(
+    *,
+    plan: dict[str, Any],
+    report: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    hedge_mode: bool,
+    enabled: bool,
+    stable_allowed: bool,
+    max_notional: float,
+    min_profit_ratio: float,
+    max_slippage_ticks: int,
+) -> dict[str, Any]:
+    ledger = dict(report.get("ledger") or {})
+    release_report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "stable_allowed": bool(stable_allowed),
+        "placed_long": False,
+        "placed_short": False,
+        "orders": [],
+        "blocked_reasons": [],
+        "release_qty": 0.0,
+        "release_notional": 0.0,
+        "estimated_pair_pnl": 0.0,
+        "required_profit": 0.0,
+    }
+    if not enabled:
+        release_report["blocked_reasons"].append("disabled")
+        return release_report
+    if not stable_allowed:
+        release_report["blocked_reasons"].append("market_not_stable")
+        return release_report
+
+    frozen_long_qty = max(_safe_float(report.get("frozen_long_qty")), 0.0)
+    frozen_short_qty = max(_safe_float(report.get("frozen_short_qty")), 0.0)
+    offset_qty = min(frozen_long_qty, frozen_short_qty)
+    safe_bid = max(_safe_float(bid_price), 0.0)
+    safe_ask = max(_safe_float(ask_price), 0.0)
+    mid_price = (safe_bid + safe_ask) / 2.0 if safe_bid > 0 and safe_ask > 0 else 0.0
+    if offset_qty <= 1e-12:
+        release_report["blocked_reasons"].append("no_frozen_offset_qty")
+        return release_report
+    if mid_price <= 0:
+        release_report["blocked_reasons"].append("missing_book_price")
+        return release_report
+
+    max_qty = offset_qty
+    safe_max_notional = max(_safe_float(max_notional), 0.0)
+    if safe_max_notional > 0:
+        max_qty = min(max_qty, safe_max_notional / mid_price)
+    qty = _round_order_qty(max_qty, step_size)
+    safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
+    if qty <= 0 or (safe_min_qty > 0 and qty + 1e-12 < safe_min_qty):
+        release_report["blocked_reasons"].append("below_min_qty")
+        return release_report
+
+    slippage = max(int(max_slippage_ticks), 0) * max(_safe_float(tick_size), 0.0)
+    sell_price = _round_order_price(max(safe_bid - slippage, 0.0), tick_size, "SELL")
+    buy_price = _round_order_price(max(safe_ask + slippage, 0.0), tick_size, "BUY")
+    if sell_price <= 0 or buy_price <= 0:
+        release_report["blocked_reasons"].append("missing_release_price")
+        return release_report
+    release_notional = qty * mid_price
+    safe_min_notional = max(_safe_float(min_notional), 0.0) if min_notional is not None else 0.0
+    if safe_min_notional > 0 and release_notional + 1e-12 < safe_min_notional:
+        release_report["blocked_reasons"].append("below_min_notional")
+        return release_report
+
+    def _weighted_entry(side: str) -> float:
+        lots = ledger.get(f"{side}_lots")
+        raw_lots = lots if isinstance(lots, list) else []
+        remaining = qty
+        total_cost = 0.0
+        total_qty = 0.0
+        for raw_lot in raw_lots:
+            if not isinstance(raw_lot, dict) or remaining <= 1e-12:
+                break
+            lot_qty = min(max(_safe_float(raw_lot.get("qty")), 0.0), remaining)
+            entry = max(_safe_float(raw_lot.get("entry_price")), 0.0)
+            if lot_qty <= 1e-12 or entry <= 0:
+                continue
+            total_cost += lot_qty * entry
+            total_qty += lot_qty
+            remaining -= lot_qty
+        if total_qty > 1e-12:
+            return total_cost / total_qty
+        return max(_safe_float(ledger.get(f"{side}_entry_price")), 0.0)
+
+    long_entry = _weighted_entry("long")
+    short_entry = _weighted_entry("short")
+    if long_entry <= 0 or short_entry <= 0:
+        release_report["blocked_reasons"].append("missing_entry_price")
+        return release_report
+    estimated_pair_pnl = (sell_price - long_entry) * qty + (short_entry - buy_price) * qty
+    required_profit = release_notional * max(_safe_float(min_profit_ratio), 0.0)
+    release_report["estimated_pair_pnl"] = estimated_pair_pnl
+    release_report["required_profit"] = required_profit
+    release_report["release_qty"] = qty
+    release_report["release_notional"] = release_notional
+    if estimated_pair_pnl + 1e-12 < required_profit:
+        release_report["blocked_reasons"].append("pair_pnl_below_buffer")
+        return release_report
+
+    sell_order = {
+        "side": "SELL",
+        "price": sell_price,
+        "qty": qty,
+        "notional": qty * sell_price,
+        "role": "frozen_inventory_pair_release_long",
+        "position_side": "LONG" if hedge_mode else "BOTH",
+        "force_reduce_only": True,
+        "execution_type": "aggressive",
+        "time_in_force": "IOC",
+        "frozen_inventory_pair_release": True,
+    }
+    buy_order = {
+        "side": "BUY",
+        "price": buy_price,
+        "qty": qty,
+        "notional": qty * buy_price,
+        "role": "frozen_inventory_pair_release_short",
+        "position_side": "SHORT" if hedge_mode else "BOTH",
+        "force_reduce_only": True,
+        "execution_type": "aggressive",
+        "time_in_force": "IOC",
+        "frozen_inventory_pair_release": True,
+    }
+    plan["sell_orders"] = [sell_order, *list(plan.get("sell_orders") or [])]
+    plan["buy_orders"] = [buy_order, *list(plan.get("buy_orders") or [])]
+    release_report["placed_long"] = True
+    release_report["placed_short"] = True
+    release_report["active"] = True
+    release_report["orders"] = [dict(sell_order), dict(buy_order)]
+    return release_report
+
+
 def _cap_best_quote_reduce_orders_to_managed_inventory(
     *,
     plan: dict[str, Any],
@@ -2700,7 +2841,12 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
 
     def _is_manual_frozen_reduce(order: dict[str, Any]) -> bool:
         role = _order_role(order)
-        return role.startswith("frozen_inventory_manual_reduce_") or bool(order.get("manual_frozen_inventory_reduce"))
+        return (
+            role.startswith("frozen_inventory_manual_reduce_")
+            or role.startswith("frozen_inventory_pair_release_")
+            or bool(order.get("manual_frozen_inventory_reduce"))
+            or bool(order.get("frozen_inventory_pair_release"))
+        )
 
     def _is_reduce_long_order(order: dict[str, Any]) -> bool:
         role = _order_role(order)
@@ -14468,6 +14614,33 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
             0.0,
         )
+        best_quote_frozen_pair_release_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_enabled", False)
+        )
+        best_quote_frozen_pair_release_max_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_notional", 20.0)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_min_profit_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_min_profit_ratio", 0.0008)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_max_slippage_ticks = max(
+            int(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks", 2)),
+            0,
+        )
+        best_quote_frozen_pair_release_max_30s_abs_return_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio", 0.0015)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_max_1m_abs_return_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio", 0.0025)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_max_1m_amplitude_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio", 0.0035)),
+            0.0,
+        )
         best_quote_reduce_freeze_soft_scale = min(
             max(
                 _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 1.0)),
@@ -14879,6 +15052,46 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             hedge_mode=hedge_best_quote,
         )
+        pair_release_30s_abs_return = abs(_adaptive_window_metric("window_30s", "return_ratio"))
+        pair_release_1m_abs_return = abs(_adaptive_window_metric("window_1m", "return_ratio"))
+        pair_release_1m_amplitude = abs(_adaptive_window_metric("window_1m", "amplitude_ratio"))
+        best_quote_frozen_pair_release_stable_allowed = (
+            pair_release_30s_abs_return <= best_quote_frozen_pair_release_max_30s_abs_return_ratio
+            and pair_release_1m_abs_return <= best_quote_frozen_pair_release_max_1m_abs_return_ratio
+            and pair_release_1m_amplitude <= best_quote_frozen_pair_release_max_1m_amplitude_ratio
+        )
+        best_quote_frozen_pair_release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report=best_quote_reduce_freeze,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            hedge_mode=hedge_best_quote,
+            enabled=(
+                best_quote_frozen_pair_release_enabled
+                and not bool(state.get("best_quote_frozen_inventory_manual_reduce"))
+            ),
+            stable_allowed=best_quote_frozen_pair_release_stable_allowed,
+            max_notional=best_quote_frozen_pair_release_max_notional,
+            min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
+            max_slippage_ticks=best_quote_frozen_pair_release_max_slippage_ticks,
+        )
+        best_quote_frozen_pair_release.update(
+            {
+                "max_notional": best_quote_frozen_pair_release_max_notional,
+                "min_profit_ratio": best_quote_frozen_pair_release_min_profit_ratio,
+                "max_slippage_ticks": best_quote_frozen_pair_release_max_slippage_ticks,
+                "max_30s_abs_return_ratio": best_quote_frozen_pair_release_max_30s_abs_return_ratio,
+                "max_1m_abs_return_ratio": best_quote_frozen_pair_release_max_1m_abs_return_ratio,
+                "max_1m_amplitude_ratio": best_quote_frozen_pair_release_max_1m_amplitude_ratio,
+                "window_30s_abs_return_ratio": pair_release_30s_abs_return,
+                "window_1m_abs_return_ratio": pair_release_1m_abs_return,
+                "window_1m_amplitude_ratio": pair_release_1m_amplitude,
+            }
+        )
         best_quote_inventory_cost_gate = {
             "enabled": bool(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_enabled", True)),
             "blocked_buy_orders": 0,
@@ -15172,6 +15385,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
             "reduce_freeze": dict(best_quote_reduce_freeze),
             "frozen_manual_reduce": dict(best_quote_frozen_manual_reduce),
+            "frozen_pair_release": dict(best_quote_frozen_pair_release),
         }
         inventory_tier = {
             "enabled": False,
@@ -17273,6 +17487,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-loss-ratio", type=float, default=0.01)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-min-notional", type=float, default=10.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale", type=float, default=0.70)
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-notional", type=float, default=20.0)
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio", type=float, default=0.0008)
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks", type=int, default=2)
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
+        type=float,
+        default=0.0015,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-max-1m-abs-return-ratio",
+        type=float,
+        default=0.0025,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-max-1m-amplitude-ratio",
+        type=float,
+        default=0.0035,
+    )
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-min-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-gap-ticks", type=int, default=0)
@@ -18443,6 +18680,15 @@ def main() -> None:
         raise SystemExit("--best-quote-maker-volume-reduce-freeze values must be >= 0")
     if not (0 < args.best_quote_maker_volume_reduce_freeze_soft_ratio_scale <= 1):
         raise SystemExit("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale must be within (0, 1]")
+    if (
+        args.best_quote_maker_volume_frozen_pair_release_max_notional < 0
+        or args.best_quote_maker_volume_frozen_pair_release_min_profit_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_slippage_ticks < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-frozen-pair-release values must be >= 0")
     if (
         args.best_quote_maker_volume_same_side_entry_price_guard_min_notional < 0
         or args.best_quote_maker_volume_same_side_entry_price_guard_gap_ticks < 0

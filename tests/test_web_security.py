@@ -2862,6 +2862,13 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
                 "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
                 "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.7,
+                "best_quote_maker_volume_frozen_pair_release_enabled": True,
+                "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
+                "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.001,
+                "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+                "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
+                "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
+                "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
                 "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
                 "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 10.0,
                 "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
@@ -2919,6 +2926,19 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(command[reduce_freeze_min_index + 1], "10.0")
         reduce_freeze_soft_index = command.index("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale")
         self.assertEqual(command[reduce_freeze_soft_index + 1], "0.7")
+        self.assertIn("--best-quote-maker-volume-frozen-pair-release-enabled", command)
+        pair_release_max_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-notional")
+        self.assertEqual(command[pair_release_max_index + 1], "20.0")
+        pair_release_profit_index = command.index("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio")
+        self.assertEqual(command[pair_release_profit_index + 1], "0.001")
+        pair_release_slippage_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks")
+        self.assertEqual(command[pair_release_slippage_index + 1], "2")
+        pair_release_30s_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio")
+        self.assertEqual(command[pair_release_30s_index + 1], "0.0015")
+        pair_release_1m_return_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-1m-abs-return-ratio")
+        self.assertEqual(command[pair_release_1m_return_index + 1], "0.0025")
+        pair_release_1m_amp_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-1m-amplitude-ratio")
+        self.assertEqual(command[pair_release_1m_amp_index + 1], "0.0035")
         self.assertIn("--best-quote-maker-volume-same-side-entry-price-guard-enabled", command)
         same_side_min_index = command.index("--best-quote-maker-volume-same-side-entry-price-guard-min-notional")
         self.assertEqual(command[same_side_min_index + 1], "10.0")
