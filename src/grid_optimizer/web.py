@@ -26968,8 +26968,8 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       </div>
       <div class="toolbar actions">
         <button id="refresh_btn" type="button" class="primary">刷新参数</button>
-        <button id="save_btn" type="button" disabled>保存参数（下一阶段开放）</button>
-        <button id="apply_btn" type="button" disabled>保存并启动（下一阶段开放）</button>
+        <button id="save_btn" type="button">保存参数</button>
+        <button id="apply_btn" type="button">保存并启动</button>
       </div>
       <div id="meta" class="meta" style="margin-top:10px">页面已就绪。</div>
     </section>
@@ -27000,6 +27000,7 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     const metaEl = document.getElementById("meta");
     const statusGridEl = document.getElementById("status_grid");
     const sectionsEl = document.getElementById("sections");
+    let latestPayload = null;
     function esc(value) {
       return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
     }
@@ -27010,6 +27011,30 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     function fieldType(value) {
       if (typeof value === "number") return "number";
       return "text";
+    }
+    function valueType(value) {
+      if (value === null) return "null";
+      if (Array.isArray(value) || (value && typeof value === "object")) return "json";
+      return typeof value;
+    }
+    function parseFieldValue(input) {
+      const raw = input.value.trim();
+      const type = input.getAttribute("data-value-type") || "string";
+      const key = input.getAttribute("data-key") || "参数";
+      if (type === "number") {
+        const num = Number(raw);
+        if (!Number.isFinite(num)) throw new Error(`${key} 必须是数字`);
+        return num;
+      }
+      if (type === "boolean") {
+        const lowered = raw.toLowerCase();
+        if (lowered === "true" || lowered === "1" || lowered === "yes") return true;
+        if (lowered === "false" || lowered === "0" || lowered === "no") return false;
+        throw new Error(`${key} 必须是 true 或 false`);
+      }
+      if (type === "null") return raw === "" || raw.toLowerCase() === "null" ? null : raw;
+      if (type === "json") return raw ? JSON.parse(raw) : null;
+      return raw;
     }
     function renderStatus(payload) {
       const scope = payload.scope || {};
@@ -27027,9 +27052,13 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       const tone = name === "forbidden" || name === "unknown" ? (name === "forbidden" ? "warning" : "danger") : "";
       const fields = keys.length
         ? keys.map((key) => {
-            const raw = valueOf(entries[key]);
-            const value = typeof raw === "object" ? JSON.stringify(raw) : raw;
-            return `<label title="${esc(key)}">${esc(key)}<input data-section="${esc(name)}" data-key="${esc(key)}" type="${fieldType(value)}" value="${esc(value)}" /></label>`;
+            const entry = entries[key] || {};
+            const raw = valueOf(entry);
+            const type = valueType(raw);
+            const value = type === "json" ? JSON.stringify(raw) : raw;
+            const editable = entry.editable !== false;
+            const locked = editable ? "" : " disabled";
+            return `<label title="${esc(key)}">${esc(key)}<input data-section="${esc(name)}" data-key="${esc(key)}" data-editable="${editable ? "1" : "0"}" data-value-type="${esc(type)}" type="${fieldType(raw)}" value="${esc(value)}"${locked} /></label>`;
           }).join("")
         : `<div class="empty">暂无参数</div>`;
       return `<section class="param-section ${tone}">
@@ -27053,14 +27082,48 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       const resp = await fetch(url);
       const payload = await resp.json();
       if (!resp.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${resp.status}`);
+      latestPayload = payload;
       renderStatus(payload);
       renderSections(payload);
       metaEl.textContent = `最后刷新 ${new Date().toLocaleString("zh-CN")}`;
+    }
+    function currentConfigFromForm() {
+      if (!latestPayload || !latestPayload.raw_config) throw new Error("请先刷新参数，再保存。");
+      const config = {...latestPayload.raw_config};
+      sectionsEl.querySelectorAll("input[data-key]").forEach((input) => {
+        if (input.getAttribute("data-editable") !== "1") return;
+        config[input.getAttribute("data-key")] = parseFieldValue(input);
+      });
+      config.symbol = document.getElementById("symbol").value.trim().toUpperCase();
+      config.strategy_profile = document.getElementById("strategy_profile").value;
+      return config;
+    }
+    async function submitConfig(action) {
+      if (action === "apply" && !window.confirm("确认保存并重启当前 PHAROS 策略？")) return;
+      const serverId = document.getElementById("server_id").value;
+      const symbol = document.getElementById("symbol").value.trim().toUpperCase();
+      const profile = document.getElementById("strategy_profile").value;
+      const config = currentConfigFromForm();
+      const endpoint = action === "apply" ? "/api/central_strategy_workbench/apply" : "/api/central_strategy_workbench/save";
+      metaEl.textContent = action === "apply" ? "正在保存并启动..." : "正在保存参数...";
+      const resp = await fetch(endpoint, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({server_id: serverId, symbol, strategy_profile: profile, config}),
+      });
+      const payload = await resp.json();
+      if (!resp.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${resp.status}`);
+      latestPayload = payload;
+      renderStatus(payload);
+      renderSections(payload);
+      metaEl.textContent = action === "apply" ? "已保存并提交启动。" : "已保存参数。";
     }
     document.getElementById("refresh_btn").addEventListener("click", () => refresh().catch((err) => {
       metaEl.textContent = err.message;
       statusGridEl.innerHTML = `<div class="metric"><div class="label">状态</div><div class="value">${esc("读取失败")}</div><div class="sub">${esc(err.message)}</div></div>`;
     }));
+    document.getElementById("save_btn").addEventListener("click", () => submitConfig("save").catch((err) => { metaEl.textContent = err.message; }));
+    document.getElementById("apply_btn").addEventListener("click", () => submitConfig("apply").catch((err) => { metaEl.textContent = err.message; }));
   </script>
 </body>
 </html>
@@ -32717,12 +32780,62 @@ def build_remote_workbench_status(server_id: str, symbol: str, strategy_profile:
     return _build_remote_workbench_status(server_id, symbol, strategy_profile)
 
 
+def save_remote_workbench_config(
+    server_id: str,
+    symbol: str,
+    strategy_profile: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    from .central_strategy_workbench import save_remote_workbench_config as _save_remote_workbench_config
+
+    return _save_remote_workbench_config(server_id, symbol, strategy_profile, config)
+
+
+def apply_remote_workbench_config(
+    server_id: str,
+    symbol: str,
+    strategy_profile: str,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    from .central_strategy_workbench import apply_remote_workbench_config as _apply_remote_workbench_config
+
+    return _apply_remote_workbench_config(server_id, symbol, strategy_profile, config)
+
+
 def _build_central_strategy_workbench_status(
     server_id: str,
     symbol: str,
     strategy_profile: str,
 ) -> dict[str, Any]:
     return build_remote_workbench_status(server_id, symbol, strategy_profile)
+
+
+def _central_strategy_workbench_payload_scope(payload: dict[str, Any]) -> tuple[str, str, str, dict[str, Any]]:
+    if not isinstance(payload, dict):
+        raise ValueError("JSON body must be object")
+    server_id = str(payload.get("server_id", "")).strip()
+    symbol = str(payload.get("symbol", "")).upper().strip()
+    strategy_profile = str(payload.get("strategy_profile", "")).strip()
+    config = payload.get("config")
+    if not server_id:
+        raise ValueError("server_id is required")
+    if not symbol:
+        raise ValueError("symbol is required")
+    if not strategy_profile:
+        raise ValueError("strategy_profile is required")
+    if not isinstance(config, dict):
+        raise ValueError("config must be object")
+    return server_id, symbol, strategy_profile, config
+
+
+def _save_central_strategy_workbench_config(payload: dict[str, Any]) -> dict[str, Any]:
+    server_id, symbol, strategy_profile, config = _central_strategy_workbench_payload_scope(payload)
+    return save_remote_workbench_config(server_id, symbol, strategy_profile, config)
+
+
+def _apply_central_strategy_workbench_config(payload: dict[str, Any]) -> dict[str, Any]:
+    server_id, symbol, strategy_profile, config = _central_strategy_workbench_payload_scope(payload)
+    return apply_remote_workbench_config(server_id, symbol, strategy_profile, config)
 
 
 def _running_status_server_entries() -> list[dict[str, str]]:
@@ -34427,6 +34540,35 @@ class _Handler(BaseHTTPRequestHandler):
                     result = _save_spot_runner_config_without_start(payload)
                 else:
                     result = _stop_spot_runner_process(payload.get("symbol"))
+                self._send_json({"ok": True, **result}, status=200)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)}, status=400)
+            except Exception as exc:
+                self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
+            return
+        if path in {"/api/central_strategy_workbench/save", "/api/central_strategy_workbench/apply"}:
+            try:
+                content_len = int(self.headers.get("Content-Length", "0"))
+            except ValueError:
+                self._send_json({"ok": False, "error": "Invalid Content-Length"}, status=400)
+                return
+            if content_len <= 0 or content_len > 1024 * 1024:
+                self._send_json({"ok": False, "error": "Invalid payload size"}, status=400)
+                return
+            raw = self.rfile.read(content_len)
+            try:
+                payload = json.loads(raw.decode("utf-8"))
+            except json.JSONDecodeError:
+                self._send_json({"ok": False, "error": "Invalid JSON"}, status=400)
+                return
+            if not isinstance(payload, dict):
+                self._send_json({"ok": False, "error": "JSON body must be object"}, status=400)
+                return
+            try:
+                if path.endswith("/apply"):
+                    result = _apply_central_strategy_workbench_config(payload)
+                else:
+                    result = _save_central_strategy_workbench_config(payload)
                 self._send_json({"ok": True, **result}, status=200)
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)}, status=400)

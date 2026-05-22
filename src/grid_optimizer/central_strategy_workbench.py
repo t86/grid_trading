@@ -17,6 +17,8 @@ from .strategy_profile_schema import (
 
 
 REMOTE_READ_TIMEOUT_SECONDS = 25
+REMOTE_WRITE_TIMEOUT_SECONDS = 25
+REMOTE_RUNNER_TIMEOUT_SECONDS = 60
 PHAROS_SYMBOL = "PHAROSUSDT"
 PHAROS_PROFILE = "pharosusdt_hedge_best_quote_maker_volume_v1"
 
@@ -142,6 +144,7 @@ class CentralStrategyTarget:
     strategy_profile: str
     ssh_host: str
     control_path: str
+    runner_wrapper: str
     common_params: tuple[str, ...]
     profile_params: tuple[str, ...]
     global_safety_params: tuple[str, ...]
@@ -162,6 +165,7 @@ class CentralStrategyTarget:
             "required_position_mode": self.required_position_mode,
             "ssh_host": self.ssh_host,
             "control_path": self.control_path,
+            "runner_wrapper": self.runner_wrapper,
             "scope": {
                 "server_id": self.server_id,
                 "symbol": self.symbol,
@@ -198,6 +202,7 @@ CENTRAL_STRATEGY_TARGETS: tuple[CentralStrategyTarget, ...] = (
         strategy_profile=PHAROS_PROFILE,
         ssh_host="srv-43-155-163-114",
         control_path="/home/ubuntu/wangge/output/pharosusdt_loop_runner_control.json",
+        runner_wrapper="/usr/local/bin/grid-saved-runner",
         common_params=_sorted_tuple(COMMON_EXECUTION_PARAMS),
         profile_params=_sorted_tuple(PHAROS_PROFILE_PARAMS),
         global_safety_params=_sorted_tuple(GLOBAL_SAFETY_PARAMS),
@@ -209,6 +214,7 @@ CENTRAL_STRATEGY_TARGETS: tuple[CentralStrategyTarget, ...] = (
         strategy_profile=PHAROS_PROFILE,
         ssh_host="srv-43-131-232-150",
         control_path="/home/ubuntu/wangge_api2/output/pharosusdt_loop_runner_control.json",
+        runner_wrapper="/usr/local/bin/grid-saved-runner-api2",
         common_params=_sorted_tuple(COMMON_EXECUTION_PARAMS),
         profile_params=_sorted_tuple(PHAROS_PROFILE_PARAMS),
         global_safety_params=_sorted_tuple(GLOBAL_SAFETY_PARAMS),
@@ -287,6 +293,39 @@ def _schema_report_for_config(config: dict[str, Any]) -> dict[str, Any]:
     schema_config.setdefault("required_position_mode", "hedge")
     _, report = apply_strategy_profile_schema(argparse.Namespace(**schema_config), enabled=True)
     return report
+
+
+def _normalize_config_for_target(target: CentralStrategyTarget, config: dict[str, Any], *, action: str) -> dict[str, Any]:
+    if not isinstance(config, dict):
+        raise ValueError("config must be object")
+    normalized = dict(config)
+    normalized["symbol"] = str(normalized.get("symbol") or target.symbol).upper().strip()
+    normalized["strategy_profile"] = str(normalized.get("strategy_profile") or target.strategy_profile).strip()
+    normalized["strategy_mode"] = str(normalized.get("strategy_mode") or target.strategy_mode).strip()
+    normalized["required_position_mode"] = str(
+        normalized.get("required_position_mode") or target.required_position_mode
+    ).strip()
+    if normalized["symbol"] != target.symbol:
+        raise ValueError(f"symbol mismatch for target {target.scope}: {normalized['symbol']}")
+    if normalized["strategy_profile"] != target.strategy_profile:
+        raise ValueError(f"strategy_profile mismatch for target {target.scope}: {normalized['strategy_profile']}")
+    if normalized["strategy_mode"] != target.strategy_mode:
+        raise ValueError(f"strategy_mode mismatch for target {target.scope}: {normalized['strategy_mode']}")
+    if normalized["required_position_mode"] != target.required_position_mode:
+        raise ValueError(
+            f"required_position_mode mismatch for target {target.scope}: {normalized['required_position_mode']}"
+        )
+    schema_report = _schema_report_for_config(normalized)
+    if not bool(schema_report.get("strict_ok", False)):
+        unknown_params = ", ".join(schema_report.get("unknown_params") or [])
+        raise ValueError(f"config has active unknown params: {unknown_params}")
+    forbidden_active = (schema_report.get("profile_boundary") or {}).get("forbidden_active_params") or []
+    if forbidden_active:
+        raise ValueError("config has active forbidden params: " + ", ".join(forbidden_active))
+    normalized["_central_workbench_action"] = action
+    normalized["_central_workbench_saved_at"] = datetime.now(timezone.utc).isoformat()
+    normalized["_central_workbench_scope"] = target.scope
+    return normalized
 
 
 def _starts_with_any(key: str, prefixes: frozenset[str]) -> bool:
@@ -383,6 +422,105 @@ def read_remote_target_config(target: CentralStrategyTarget) -> dict[str, Any]:
     if not isinstance(loaded, dict):
         raise ValueError(f"remote control file for {target.scope} is not a JSON object")
     return dict(loaded)
+
+
+REMOTE_WRITE_CONTROL_SCRIPT = """
+import json
+import os
+import sys
+import tempfile
+
+path = sys.argv[1]
+data = json.load(sys.stdin)
+directory = os.path.dirname(path) or "."
+os.makedirs(directory, exist_ok=True)
+fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\\n")
+    os.replace(tmp_path, path)
+finally:
+    if os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+print(path)
+""".strip()
+
+
+def _write_remote_target_config(target: CentralStrategyTarget, config: dict[str, Any]) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["ssh", target.ssh_host, "python3", "-c", REMOTE_WRITE_CONTROL_SCRIPT, target.control_path],
+        capture_output=True,
+        check=False,
+        input=json.dumps(config, ensure_ascii=False, sort_keys=True),
+        text=True,
+        timeout=REMOTE_WRITE_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"ssh write failed for {target.scope}: {detail or completed.returncode}")
+    return {
+        "stdout": (completed.stdout or "").strip(),
+        "stderr": (completed.stderr or "").strip(),
+    }
+
+
+def save_remote_workbench_config(
+    server_id: Any,
+    symbol: Any,
+    strategy_profile: Any,
+    config: dict[str, Any],
+    *,
+    action: str = "save",
+) -> dict[str, Any]:
+    target = get_central_strategy_target(server_id, symbol, strategy_profile)
+    normalized = _normalize_config_for_target(target, config, action=action)
+    write_result = _write_remote_target_config(target, normalized)
+    payload = build_workbench_payload(target.server_id, target.symbol, target.strategy_profile, normalized)
+    return {
+        **payload,
+        "saved": True,
+        "remote_write": write_result,
+    }
+
+
+def _restart_remote_runner(target: CentralStrategyTarget) -> dict[str, Any]:
+    completed = subprocess.run(
+        ["ssh", target.ssh_host, target.runner_wrapper, "restart", target.symbol],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=REMOTE_RUNNER_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"runner restart failed for {target.scope}: {detail or completed.returncode}")
+    return {
+        "stdout": (completed.stdout or "").strip(),
+        "stderr": (completed.stderr or "").strip(),
+    }
+
+
+def apply_remote_workbench_config(
+    server_id: Any,
+    symbol: Any,
+    strategy_profile: Any,
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    target = get_central_strategy_target(server_id, symbol, strategy_profile)
+    saved = save_remote_workbench_config(
+        target.server_id,
+        target.symbol,
+        target.strategy_profile,
+        config,
+        action="apply",
+    )
+    restart_result = _restart_remote_runner(target)
+    return {
+        **saved,
+        "started": True,
+        "remote_runner": restart_result,
+    }
 
 
 def build_remote_workbench_status(server_id: Any, symbol: Any, strategy_profile: Any) -> dict[str, Any]:

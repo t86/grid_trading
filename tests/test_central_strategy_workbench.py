@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import json
 import unittest
+from unittest.mock import Mock, patch
 
 from grid_optimizer.central_strategy_workbench import (
+    apply_remote_workbench_config,
     build_workbench_payload,
     get_central_strategy_target,
     list_central_strategy_targets,
+    save_remote_workbench_config,
 )
 
 
@@ -83,6 +87,85 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
         self.assertIn("volatility_trigger_enabled", payload["sections"]["global_safety"])
         self.assertIn("startup_jitter_seconds", payload["sections"]["common"])
         self.assertIn("old_unknown_knob", payload["sections"]["unknown"])
+
+    @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
+    def test_save_remote_workbench_config_writes_scoped_control_file(self, mock_run) -> None:
+        mock_run.return_value = Mock(returncode=0, stdout="saved\n", stderr="")
+
+        result = save_remote_workbench_config(
+            "114",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+            {
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "required_position_mode": "hedge",
+                "max_new_orders": 5,
+                "max_total_notional": 1450.0,
+                "cancel_stale": True,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 10.0,
+                "best_quote_maker_volume_enabled": True,
+            },
+        )
+
+        self.assertTrue(result["saved"])
+        self.assertEqual(result["scope"]["server_id"], "114")
+        command = mock_run.call_args.args[0]
+        self.assertEqual(command[0], "ssh")
+        self.assertEqual(command[1], "srv-43-155-163-114")
+        self.assertIn("/home/ubuntu/wangge/output/pharosusdt_loop_runner_control.json", command)
+        written = json.loads(mock_run.call_args.kwargs["input"])
+        self.assertEqual(written["symbol"], "PHAROSUSDT")
+        self.assertEqual(written["strategy_profile"], "pharosusdt_hedge_best_quote_maker_volume_v1")
+        self.assertEqual(written["_central_workbench_action"], "save")
+
+    def test_save_remote_workbench_config_rejects_scope_mismatch(self) -> None:
+        with self.assertRaisesRegex(ValueError, "strategy_profile"):
+            save_remote_workbench_config(
+                "114",
+                "PHAROSUSDT",
+                "pharosusdt_hedge_best_quote_maker_volume_v1",
+                {
+                    "symbol": "PHAROSUSDT",
+                    "strategy_profile": "wrong_profile",
+                    "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                },
+            )
+
+    @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
+    def test_apply_remote_workbench_config_saves_then_restarts_target_runner(self, mock_run) -> None:
+        mock_run.return_value = Mock(returncode=0, stdout="ok\n", stderr="")
+
+        result = apply_remote_workbench_config(
+            "150",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+            {
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "required_position_mode": "hedge",
+                "max_new_orders": 5,
+                "max_total_notional": 1450.0,
+                "cancel_stale": True,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 10.0,
+                "best_quote_maker_volume_enabled": True,
+            },
+        )
+
+        self.assertTrue(result["saved"])
+        self.assertTrue(result["started"])
+        self.assertEqual(mock_run.call_count, 2)
+        restart_command = mock_run.call_args_list[1].args[0]
+        self.assertEqual(
+            restart_command,
+            ["ssh", "srv-43-131-232-150", "/usr/local/bin/grid-saved-runner-api2", "restart", "PHAROSUSDT"],
+        )
 
 
 if __name__ == "__main__":

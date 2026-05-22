@@ -4597,7 +4597,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("中央策略配置工作台", page)
         self.assertIn('rel="icon"', page)
         self.assertIn("/api/central_strategy_workbench/status", page)
+        self.assertIn("/api/central_strategy_workbench/save", page)
+        self.assertIn("/api/central_strategy_workbench/apply", page)
         self.assertIn("PHAROSUSDT", page)
+        self.assertIn("保存参数", page)
+        self.assertIn("保存并启动", page)
+        self.assertNotIn("保存参数（下一阶段开放）", page)
         self.assertNotIn("setInterval(", page)
 
     @patch("grid_optimizer.web.build_remote_workbench_status")
@@ -4626,6 +4631,53 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertTrue(payload["ok"])
         self.assertIn("common", payload["sections"])
+
+    @patch("grid_optimizer.web.save_remote_workbench_config")
+    def test_central_strategy_workbench_save_api_uses_scoped_payload(self, mock_save) -> None:
+        mock_save.return_value = {"ok": True, "saved": True, "scope": {"server_id": "114"}}
+
+        payload = web_module._save_central_strategy_workbench_config(
+            {
+                "server_id": "114",
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "config": {"symbol": "PHAROSUSDT"},
+            },
+        )
+
+        self.assertTrue(payload["saved"])
+        mock_save.assert_called_once_with(
+            "114",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+            {"symbol": "PHAROSUSDT"},
+        )
+
+    @patch("grid_optimizer.web.apply_remote_workbench_config")
+    def test_central_strategy_workbench_apply_api_uses_scoped_payload(self, mock_apply) -> None:
+        mock_apply.return_value = {"ok": True, "saved": True, "started": True, "scope": {"server_id": "150"}}
+
+        payload = web_module._apply_central_strategy_workbench_config(
+            {
+                "server_id": "150",
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "config": {"symbol": "PHAROSUSDT"},
+            },
+        )
+
+        self.assertTrue(payload["started"])
+        mock_apply.assert_called_once_with(
+            "150",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+            {"symbol": "PHAROSUSDT"},
+        )
+
+    def test_central_strategy_workbench_post_routes_are_registered(self) -> None:
+        source = inspect.getsource(_Handler.do_POST)
+        self.assertIn("/api/central_strategy_workbench/save", source)
+        self.assertIn("/api/central_strategy_workbench/apply", source)
 
     def test_strategy_editor_routes_are_registered(self) -> None:
         source = inspect.getsource(_Handler.do_GET)
