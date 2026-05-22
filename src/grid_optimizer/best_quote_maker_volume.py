@@ -1217,12 +1217,39 @@ def build_best_quote_maker_volume_plan(
             max_long_entry_price = max(long_reference_price - guard_gap, 0.0)
             kept_buy_orders: list[dict[str, Any]] = []
             blocked_buy_orders: list[dict[str, Any]] = []
+            reduce_short_remaining = max(
+                short_notional
+                - sum(
+                    _safe_float(order.get("notional"))
+                    for order in buy_orders
+                    if str(order.get("role", "")).lower().strip() == "best_quote_reduce_short"
+                ),
+                0.0,
+            )
             for order in buy_orders:
                 if (
                     str(order.get("role", "")).lower().strip() == "best_quote_entry_long"
                     and _safe_float(order.get("price")) > max_long_entry_price + 1e-12
                 ):
                     blocked_buy_orders.append(order)
+                    if reduce_short_remaining > 0:
+                        fallback_notional = min(_safe_float(order.get("notional")), reduce_short_remaining)
+                        fallback = _build_order(
+                            side="BUY",
+                            price=_price_with_gap(bid, reduce_short_gap, -1),
+                            notional=fallback_notional,
+                            role="best_quote_reduce_short",
+                            inputs=inputs,
+                            position_side=reduce_short_position_side,
+                            force_reduce_only=True,
+                        )
+                        if fallback is not None:
+                            fallback["same_side_entry_guard_fallback_from_role"] = "best_quote_entry_long"
+                            kept_buy_orders.append(fallback)
+                            reduce_short_remaining = max(
+                                reduce_short_remaining - _safe_float(fallback.get("notional")),
+                                0.0,
+                            )
                 else:
                     kept_buy_orders.append(order)
             if blocked_buy_orders:
@@ -1235,12 +1262,39 @@ def build_best_quote_maker_volume_plan(
             min_short_entry_price = short_reference_price + guard_gap
             kept_sell_orders: list[dict[str, Any]] = []
             blocked_sell_orders: list[dict[str, Any]] = []
+            reduce_long_remaining = max(
+                long_notional
+                - sum(
+                    _safe_float(order.get("notional"))
+                    for order in sell_orders
+                    if str(order.get("role", "")).lower().strip() == "best_quote_reduce_long"
+                ),
+                0.0,
+            )
             for order in sell_orders:
                 if (
                     str(order.get("role", "")).lower().strip() == "best_quote_entry_short"
                     and _safe_float(order.get("price")) + 1e-12 < min_short_entry_price
                 ):
                     blocked_sell_orders.append(order)
+                    if reduce_long_remaining > 0:
+                        fallback_notional = min(_safe_float(order.get("notional")), reduce_long_remaining)
+                        fallback = _build_order(
+                            side="SELL",
+                            price=_price_with_gap(ask, reduce_long_gap, 1),
+                            notional=fallback_notional,
+                            role="best_quote_reduce_long",
+                            inputs=inputs,
+                            position_side=reduce_long_position_side,
+                            force_reduce_only=True,
+                        )
+                        if fallback is not None:
+                            fallback["same_side_entry_guard_fallback_from_role"] = "best_quote_entry_short"
+                            kept_sell_orders.append(fallback)
+                            reduce_long_remaining = max(
+                                reduce_long_remaining - _safe_float(fallback.get("notional")),
+                                0.0,
+                            )
                 else:
                     kept_sell_orders.append(order)
             if blocked_sell_orders:
