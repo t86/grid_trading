@@ -22,6 +22,7 @@ REMOTE_WRITE_TIMEOUT_SECONDS = 25
 REMOTE_RUNNER_TIMEOUT_SECONDS = 60
 REMOTE_HISTORY_TIMEOUT_SECONDS = 25
 REMOTE_ROLLBACK_TIMEOUT_SECONDS = 35
+REMOTE_RUNTIME_TIMEOUT_SECONDS = 25
 PHAROS_SYMBOL = "PHAROSUSDT"
 PHAROS_PROFILE = "pharosusdt_hedge_best_quote_maker_volume_v1"
 
@@ -254,6 +255,24 @@ def _jsonable(value: Any) -> Any:
     return value
 
 
+def _as_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def _is_active_value(value: Any) -> bool:
     if value is None:
         return False
@@ -379,6 +398,175 @@ def _workbench_owner_for_key(target: CentralStrategyTarget, key: str) -> str:
     return "unknown"
 
 
+def build_pharos_runtime_summary(
+    events: list[dict[str, Any]] | None,
+    config: dict[str, Any],
+    *,
+    error: str = "",
+) -> dict[str, Any]:
+    valid_events = [event for event in events or [] if isinstance(event, dict)]
+    if not valid_events:
+        return {
+            "ok": False,
+            "state": "unknown",
+            "state_label": "运行数据不足",
+            "reason_codes": ["no_runtime_events"],
+            "event_count": 0,
+            "error": error,
+            "latest": {},
+            "window_gross_notional": 0.0,
+        }
+
+    first = valid_events[0]
+    latest = valid_events[-1]
+    threshold = _as_float(
+        latest.get("threshold_position_notional"),
+        _as_float(config.get("threshold_position_notional"), 0.0),
+    )
+    net_notional = abs(_as_float(latest.get("actual_net_notional")))
+    unrealized_pnl = _as_float(latest.get("unrealized_pnl"), _as_float(latest.get("unrealized_loss")) * -1.0)
+    rolling_loss_per_10k = _as_float(latest.get("rolling_hourly_loss_per_10k"))
+    rolling_gross = _as_float(latest.get("rolling_hourly_gross_notional"))
+    cumulative = _as_float(latest.get("cumulative_gross_notional"))
+    first_cumulative = _as_float(first.get("cumulative_gross_notional"), cumulative)
+    window_gross = max(cumulative - first_cumulative, 0.0)
+    open_orders = _as_int(latest.get("open_order_count"))
+    stale_orders = _as_int(latest.get("stale_order_count"))
+    missing_orders = _as_int(latest.get("missing_order_count"))
+    volatility_paused = bool(latest.get("volatility_entry_pause_active"))
+    max_cumulative = _as_float(latest.get("max_cumulative_notional"), _as_float(config.get("max_cumulative_notional")))
+    remaining_cumulative = max(max_cumulative - cumulative, 0.0) if max_cumulative > 0 else 0.0
+
+    reason_codes: list[str] = []
+    if threshold > 0 and net_notional >= threshold:
+        reason_codes.append("net_inventory_over_soft_threshold")
+    if volatility_paused:
+        reason_codes.append("volatility_entry_pause_active")
+    if stale_orders > 0:
+        reason_codes.append("stale_orders_present")
+    if missing_orders > 0:
+        reason_codes.append("missing_orders_present")
+    if max_cumulative > 0 and remaining_cumulative <= max(max_cumulative * 0.02, 1000.0):
+        reason_codes.append("near_cumulative_volume_limit")
+
+    if "net_inventory_over_soft_threshold" in reason_codes:
+        state = "repair"
+        state_label = "修仓状态：净敞口已超过 soft 阈值"
+    elif volatility_paused:
+        state = "paused"
+        state_label = "暂停刷量：波动保护 active"
+    else:
+        state = "brush"
+        state_label = "刷量状态：normal/fast 可用"
+
+    return {
+        "ok": True,
+        "state": state,
+        "state_label": state_label,
+        "reason_codes": reason_codes,
+        "event_count": len(valid_events),
+        "first_ts": first.get("ts") or "",
+        "latest_ts": latest.get("ts") or "",
+        "latest_cycle": latest.get("cycle"),
+        "window_gross_notional": window_gross,
+        "latest": {
+            "mid_price": _as_float(latest.get("mid_price")),
+            "center_price": _as_float(latest.get("center_price")),
+            "current_long_notional": _as_float(latest.get("current_long_notional")),
+            "current_short_notional": _as_float(latest.get("current_short_notional")),
+            "actual_net_notional": _as_float(latest.get("actual_net_notional")),
+            "unrealized_pnl": unrealized_pnl,
+            "rolling_hourly_gross_notional": rolling_gross,
+            "rolling_hourly_loss": _as_float(latest.get("rolling_hourly_loss")),
+            "rolling_hourly_loss_per_10k": rolling_loss_per_10k,
+            "cumulative_gross_notional": cumulative,
+            "max_cumulative_notional": max_cumulative,
+            "remaining_cumulative_notional": remaining_cumulative,
+            "open_order_count": open_orders,
+            "stale_order_count": stale_orders,
+            "missing_order_count": missing_orders,
+            "volatility_entry_pause_active": volatility_paused,
+            "adaptive_regime_router_regime": latest.get("adaptive_regime_router_regime") or "",
+        },
+        "error": error,
+    }
+
+
+def build_pharos_recommendation_presets(
+    config: dict[str, Any],
+    runtime_summary: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    per_order = max(_as_float(config.get("per_order_notional"), 10.0), 1.0)
+    max_total = max(_as_float(config.get("max_total_notional"), 1450.0), 1.0)
+    cumulative = max(_as_float(config.get("max_cumulative_notional"), 200000.0), 1.0)
+    state = (runtime_summary or {}).get("state") or "unknown"
+    loss_per_10k = _as_float(((runtime_summary or {}).get("latest") or {}).get("rolling_hourly_loss_per_10k"))
+    runtime_note = "当前可刷量" if state == "brush" and loss_per_10k <= 8 else "当前需要结合预检和敞口判断"
+
+    return [
+        {
+            "preset_id": "conservative_profit",
+            "name": "保守盈利",
+            "scenario": "适合交易赛前几天、盘口深度一般、优先降低磨损。",
+            "risk": "成交速度较慢，小时刷量目标不要设太高。",
+            "runtime_note": runtime_note,
+            "patch": {
+                "per_order_notional": min(per_order, 10.0),
+                "max_new_orders": min(_as_int(config.get("max_new_orders"), 5), 3),
+                "max_total_notional": min(max_total, 1000.0),
+                "best_quote_maker_volume_cycle_budget_notional": min(
+                    _as_float(config.get("best_quote_maker_volume_cycle_budget_notional"), 40.0),
+                    25.0,
+                ),
+                "rolling_hourly_loss_limit": min(_as_float(config.get("rolling_hourly_loss_limit"), 8.0), 5.0),
+                "anti_chase_entry_guard_enabled": True,
+                "volatility_entry_pause_enabled": True,
+                "hard_loss_forced_reduce_enabled": True,
+            },
+        },
+        {
+            "preset_id": "balanced_volume",
+            "name": "均衡刷量",
+            "scenario": "适合常规刷量，兼顾速度、磨损和回到 normal/fast 的能力。",
+            "risk": "单边行情下仍可能进入 repair/safe，需要看运行数据。",
+            "runtime_note": runtime_note,
+            "patch": {
+                "per_order_notional": min(max(per_order, 10.0), 15.0),
+                "max_new_orders": 5,
+                "max_total_notional": max(max_total, 1450.0),
+                "best_quote_maker_volume_cycle_budget_notional": max(
+                    _as_float(config.get("best_quote_maker_volume_cycle_budget_notional"), 40.0),
+                    40.0,
+                ),
+                "rolling_hourly_loss_limit": max(_as_float(config.get("rolling_hourly_loss_limit"), 8.0), 8.0),
+                "anti_chase_entry_guard_enabled": True,
+                "volatility_entry_pause_enabled": True,
+            },
+        },
+        {
+            "preset_id": "final_day_volume",
+            "name": "最后一天冲量",
+            "scenario": "适合交易赛最后一天、市场量大、盘口深、有明确 20万/50万 小时目标。",
+            "risk": "磨损和浮亏扩大更快；必须确认累计刷量上限、小时亏损阈值和盘口承接。",
+            "runtime_note": runtime_note,
+            "patch": {
+                "per_order_notional": max(per_order * 2.0, 20.0),
+                "max_new_orders": max(_as_int(config.get("max_new_orders"), 5), 8),
+                "max_total_notional": max(max_total, 2500.0),
+                "max_mid_drift_steps": max(_as_int(config.get("max_mid_drift_steps"), 20), 30),
+                "best_quote_maker_volume_cycle_budget_notional": max(
+                    _as_float(config.get("best_quote_maker_volume_cycle_budget_notional"), 40.0),
+                    120.0,
+                ),
+                "rolling_hourly_loss_limit": max(_as_float(config.get("rolling_hourly_loss_limit"), 8.0), 15.0),
+                "max_cumulative_notional": max(cumulative, 500000.0),
+                "anti_chase_entry_guard_enabled": True,
+                "volatility_entry_pause_enabled": True,
+            },
+        },
+    ]
+
+
 def build_workbench_payload(
     server_id: Any,
     symbol: Any,
@@ -387,6 +575,8 @@ def build_workbench_payload(
     *,
     history: list[dict[str, Any]] | None = None,
     history_error: str = "",
+    runtime_events: list[dict[str, Any]] | None = None,
+    runtime_error: str = "",
 ) -> dict[str, Any]:
     target = get_central_strategy_target(server_id, symbol, strategy_profile)
     config_dict = dict(config or {})
@@ -400,6 +590,8 @@ def build_workbench_payload(
         sections[owner][key] = _section_item(key, value, owner)
 
     schema_report = _schema_report_for_config(config_dict)
+    runtime_summary = build_pharos_runtime_summary(runtime_events or [], config_dict, error=runtime_error)
+    recommendation_presets = build_pharos_recommendation_presets(config_dict, runtime_summary)
     return {
         "ok": True,
         "scope": target.scope_payload(),
@@ -421,6 +613,8 @@ def build_workbench_payload(
         "history": list(history or []),
         "history_error": history_error,
         "can_rollback": len(history or []) >= 2,
+        "runtime_summary": runtime_summary,
+        "recommendation_presets": recommendation_presets,
         "raw_config": {str(key): _jsonable(value) for key, value in config_dict.items()},
         "source": f"ssh:{target.ssh_host}:{target.control_path}",
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -569,6 +763,85 @@ try:
 except FileNotFoundError:
     entries = []
 print(json.dumps(entries[-limit:], ensure_ascii=False, sort_keys=True))
+""".strip()
+
+
+REMOTE_RUNTIME_EVENTS_SCRIPT = """
+import json
+import os
+import subprocess
+import sys
+
+control_path = sys.argv[1]
+limit = int(sys.argv[2]) if len(sys.argv) > 2 else 120
+selected_keys = {
+    "ts",
+    "cycle",
+    "symbol",
+    "strategy_profile",
+    "mid_price",
+    "center_price",
+    "current_long_notional",
+    "current_short_notional",
+    "actual_net_notional",
+    "unrealized_pnl",
+    "unrealized_loss",
+    "open_order_count",
+    "kept_order_count",
+    "missing_order_count",
+    "stale_order_count",
+    "planned_buy_notional",
+    "planned_short_notional",
+    "rolling_hourly_loss",
+    "rolling_hourly_loss_limit",
+    "rolling_hourly_gross_notional",
+    "rolling_hourly_loss_per_10k",
+    "cumulative_gross_notional",
+    "max_cumulative_notional",
+    "max_actual_net_notional",
+    "threshold_position_notional",
+    "volatility_entry_pause_active",
+    "volatility_entry_pause_reason",
+    "adaptive_regime_router_regime",
+    "adaptive_regime_router_candidate_regime",
+}
+
+try:
+    with open(control_path, "r", encoding="utf-8") as handle:
+        control = json.load(handle)
+except FileNotFoundError:
+    print(json.dumps({"events": [], "error": "control file missing"}, ensure_ascii=False, sort_keys=True))
+    sys.exit(0)
+
+summary_path = control.get("summary_jsonl") or "output/pharosusdt_hedge_bq_events.jsonl"
+if not os.path.isabs(summary_path):
+    root = os.path.dirname(os.path.dirname(control_path))
+    summary_path = os.path.join(root, summary_path)
+
+if not os.path.exists(summary_path):
+    print(json.dumps({"events": [], "error": "summary_jsonl missing: " + summary_path}, ensure_ascii=False, sort_keys=True))
+    sys.exit(0)
+
+try:
+    raw = subprocess.check_output(["tail", "-n", str(max(limit, 1)), summary_path], text=True, errors="replace")
+except Exception as exc:
+    print(json.dumps({"events": [], "error": type(exc).__name__ + ": " + str(exc)}, ensure_ascii=False, sort_keys=True))
+    sys.exit(0)
+
+events = []
+for line in raw.splitlines():
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        event = json.loads(line)
+    except json.JSONDecodeError:
+        continue
+    if not isinstance(event, dict):
+        continue
+    events.append({key: event.get(key) for key in selected_keys if key in event})
+
+print(json.dumps({"events": events, "error": ""}, ensure_ascii=False, sort_keys=True))
 """.strip()
 
 
@@ -745,6 +1018,33 @@ def read_remote_target_history(target: CentralStrategyTarget, *, limit: int = 8)
     return [entry for entry in loaded if isinstance(entry, dict)]
 
 
+def read_remote_runtime_events(target: CentralStrategyTarget, *, limit: int = 120) -> tuple[list[dict[str, Any]], str]:
+    remote_command = " ".join(
+        [
+            "python3",
+            "-c",
+            shlex.quote(REMOTE_RUNTIME_EVENTS_SCRIPT),
+            shlex.quote(target.control_path),
+            str(int(limit)),
+        ]
+    )
+    completed = subprocess.run(
+        ["ssh", target.ssh_host, remote_command],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=REMOTE_RUNTIME_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"ssh runtime read failed for {target.scope}: {detail or completed.returncode}")
+    loaded = json.loads(completed.stdout or "{}")
+    if not isinstance(loaded, dict):
+        return [], "runtime response is not an object"
+    events = loaded.get("events") if isinstance(loaded.get("events"), list) else []
+    return [entry for entry in events if isinstance(entry, dict)], str(loaded.get("error") or "")
+
+
 def save_remote_workbench_config(
     server_id: Any,
     symbol: Any,
@@ -896,10 +1196,16 @@ def build_remote_workbench_status(server_id: Any, symbol: Any, strategy_profile:
         config = read_remote_target_config(target)
         history: list[dict[str, Any]] = []
         history_error = ""
+        runtime_events: list[dict[str, Any]] = []
+        runtime_error = ""
         try:
             history = read_remote_target_history(target)
         except Exception as history_exc:
             history_error = f"{type(history_exc).__name__}: {history_exc}"
+        try:
+            runtime_events, runtime_error = read_remote_runtime_events(target)
+        except Exception as runtime_exc:
+            runtime_error = f"{type(runtime_exc).__name__}: {runtime_exc}"
         return build_workbench_payload(
             target.server_id,
             target.symbol,
@@ -907,6 +1213,8 @@ def build_remote_workbench_status(server_id: Any, symbol: Any, strategy_profile:
             config,
             history=history,
             history_error=history_error,
+            runtime_events=runtime_events,
+            runtime_error=runtime_error,
         )
     except Exception as exc:
         return {

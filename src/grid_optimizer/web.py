@@ -26940,10 +26940,14 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     .diff-table { width: 100%; border-collapse: collapse; font-size: 12px; }
     .diff-table th, .diff-table td { border-bottom: 1px solid var(--line); padding: 6px 4px; text-align: left; vertical-align: top; word-break: break-word; }
     .diff-table th { color: var(--muted); font-weight: 800; }
+    .preset-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 9px; }
+    .preset-card { border: 1px solid var(--line); border-radius: 8px; padding: 10px; background: #fbfdfc; display: grid; gap: 7px; min-width: 0; }
+    .preset-card strong { color: var(--ink); font-size: 13px; }
+    .preset-card p { font-size: 12px; }
     .empty { color: var(--muted); font-size: 13px; padding: 10px 0 2px; }
     .tag { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--muted); font-size: 12px; font-weight: 800; }
     @media (max-width: 980px) {
-      .status-grid, .sections, .param-grid, .detail-grid { grid-template-columns: 1fr; }
+      .status-grid, .sections, .param-grid, .detail-grid, .preset-grid { grid-template-columns: 1fr; }
       .toolbar label, .actions button { min-width: 100%; flex: 1 1 100%; }
     }
   </style>
@@ -27007,6 +27011,21 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       </div>
     </section>
 
+    <section class="detail-grid">
+      <div class="detail-box">
+        <h2>推荐档位</h2>
+        <div id="preset_panel" class="preset-grid"><div class="empty">刷新后可套用推荐档位，只改表单，不会自动保存。</div></div>
+      </div>
+      <div class="detail-box">
+        <h2>运行数据</h2>
+        <div id="runtime_panel" class="detail-list"><div>刷新后读取目标事件文件尾部，显示刷量/修仓状态。</div></div>
+      </div>
+      <div class="detail-box">
+        <h2>使用判断</h2>
+        <div id="decision_panel" class="detail-list"><div>结合预检、运行数据和 diff 判断是否保存启动。</div></div>
+      </div>
+    </section>
+
     <section class="sections" id="sections"></section>
   </main>
   <script>
@@ -27030,6 +27049,9 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     const diffPanelEl = document.getElementById("diff_panel");
     const preflightPanelEl = document.getElementById("preflight_panel");
     const historyPanelEl = document.getElementById("history_panel");
+    const presetPanelEl = document.getElementById("preset_panel");
+    const runtimePanelEl = document.getElementById("runtime_panel");
+    const decisionPanelEl = document.getElementById("decision_panel");
     let latestPayload = null;
     function esc(value) {
       return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
@@ -27180,6 +27202,71 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       rows.unshift(`<div class="${payload.can_rollback ? "good" : "warn"}">回滚状态：${payload.can_rollback ? "可回滚到上一版中央保存记录" : "至少需要两版中央保存记录"}</div>`);
       historyPanelEl.innerHTML = rows.join("");
     }
+    function renderRuntime(payload) {
+      const runtime = payload.runtime_summary || {};
+      if (!runtime.ok) {
+        runtimePanelEl.innerHTML = `<div class="warn">${esc(runtime.state_label || "运行数据不足")}${runtime.error ? `：${esc(runtime.error)}` : ""}</div>`;
+        decisionPanelEl.innerHTML = '<div class="warn">运行数据不足时，只能按参数预检判断，不建议直接冲量。</div>';
+        return;
+      }
+      const latest = runtime.latest || {};
+      runtimePanelEl.innerHTML = [
+        `<div class="${runtime.state === "brush" ? "good" : runtime.state === "repair" ? "bad" : "warn"}">${esc(runtime.state_label || "--")}</div>`,
+        `<div>窗口成交增量：${esc(fmtValue(latestNumber(runtime.window_gross_notional, 2)))}</div>`,
+        `<div>滚动小时成交：${esc(fmtValue(latestNumber(latest.rolling_hourly_gross_notional, 2)))}</div>`,
+        `<div>滚动小时亏损/万：${esc(fmtValue(latestNumber(latest.rolling_hourly_loss_per_10k, 4)))}</div>`,
+        `<div>净敞口：${esc(fmtValue(latestNumber(latest.actual_net_notional, 2)))}，浮盈亏：${esc(fmtValue(latestNumber(latest.unrealized_pnl, 4)))}</div>`,
+        `<div>开单/stale/missing：${esc(fmtValue(latest.open_order_count || 0))}/${esc(fmtValue(latest.stale_order_count || 0))}/${esc(fmtValue(latest.missing_order_count || 0))}</div>`,
+        `<div>事件：${esc(fmtValue(runtime.event_count))}，最新 cycle：${esc(fmtValue(runtime.latest_cycle))}</div>`,
+      ].join("");
+      const reasons = runtime.reason_codes || [];
+      decisionPanelEl.innerHTML = [
+        `<div class="${runtime.state === "brush" ? "good" : "warn"}">${runtime.state === "brush" ? "当前偏刷量状态，可优先看 diff 后保存。" : "当前不适合直接冲量，先处理 reason。"} </div>`,
+        `<div>reason：${esc(fmtList(reasons))}</div>`,
+        `<div>剩余累计刷量额度：${esc(fmtValue(latestNumber(latest.remaining_cumulative_notional, 2)))}</div>`,
+      ].join("");
+    }
+    function latestNumber(value, digits) {
+      const num = Number(value);
+      return Number.isFinite(num) ? Number(num.toFixed(digits)) : "--";
+    }
+    function setFormValue(key, value) {
+      const input = sectionsEl.querySelector(`input[data-key="${CSS.escape(key)}"][data-editable="1"]`);
+      if (!input) return false;
+      input.value = typeof value === "object" && value !== null ? JSON.stringify(value) : String(value);
+      input.dispatchEvent(new Event("input", {bubbles: true}));
+      return true;
+    }
+    function applyPreset(presetId) {
+      if (!latestScopeMatchesCurrent()) {
+        metaEl.textContent = "请先刷新当前目标，再套用档位。";
+        renderDiff();
+        return;
+      }
+      const preset = (latestPayload.recommendation_presets || []).find((item) => item.preset_id === presetId);
+      if (!preset) return;
+      const patch = preset.patch || {};
+      const applied = Object.entries(patch).filter(([key, value]) => setFormValue(key, value)).map(([key]) => key);
+      metaEl.textContent = `已套用 ${preset.name || presetId}：${applied.length} 项进入表单，尚未保存。`;
+      renderDiff();
+    }
+    function renderPresets(payload) {
+      const presets = Array.isArray(payload.recommendation_presets) ? payload.recommendation_presets : [];
+      if (!presets.length) {
+        presetPanelEl.innerHTML = '<div class="empty">当前 profile 暂无推荐档位。</div>';
+        return;
+      }
+      presetPanelEl.innerHTML = presets.map((preset) => {
+        const patchCount = Object.keys(preset.patch || {}).length;
+        return `<div class="preset-card">
+          <strong>${esc(preset.name || preset.preset_id)}</strong>
+          <p>${esc(preset.scenario || "")}</p>
+          <p>${esc(preset.risk || "")}</p>
+          <p>${esc(preset.runtime_note || "")}</p>
+          <button type="button" data-preset-id="${esc(preset.preset_id)}">套用 ${esc(preset.name || preset.preset_id)}（${patchCount}项）</button>
+        </div>`;
+      }).join("");
+    }
     function currentSelection() {
       return {
         serverId: document.getElementById("server_id").value,
@@ -27207,6 +27294,8 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       renderSections(payload);
       renderPreflight(payload);
       renderHistory(payload);
+      renderRuntime(payload);
+      renderPresets(payload);
       renderDiff();
       metaEl.textContent = `最后刷新 ${new Date().toLocaleString("zh-CN")}`;
     }
@@ -27241,6 +27330,8 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       renderSections(payload);
       renderPreflight(payload);
       renderHistory(payload);
+      renderRuntime(payload);
+      renderPresets(payload);
       renderDiff();
       const changed = (payload.changed_params || []).length ? `变更 ${payload.changed_params.length} 项` : "无参数变化";
       const stripped = (payload.stripped_params || []).length ? `，剥离 ${payload.stripped_params.length} 项脏参数` : "";
@@ -27269,6 +27360,11 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     document.getElementById("save_btn").addEventListener("click", () => submitConfig("save").catch((err) => { metaEl.textContent = err.message; }));
     document.getElementById("apply_btn").addEventListener("click", () => submitConfig("apply").catch((err) => { metaEl.textContent = err.message; }));
     document.getElementById("rollback_btn").addEventListener("click", () => rollbackConfig().catch((err) => { metaEl.textContent = err.message; }));
+    presetPanelEl.addEventListener("click", (event) => {
+      const button = event.target.closest("button[data-preset-id]");
+      if (!button) return;
+      applyPreset(button.getAttribute("data-preset-id"));
+    });
     sectionsEl.addEventListener("input", () => renderDiff());
     const targetInputs = [
       document.getElementById("server_id"),

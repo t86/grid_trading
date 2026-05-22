@@ -10,8 +10,11 @@ from unittest.mock import Mock, patch
 
 from grid_optimizer.central_strategy_workbench import (
     REMOTE_ROLLBACK_CONTROL_SCRIPT,
+    REMOTE_RUNTIME_EVENTS_SCRIPT,
     REMOTE_WRITE_CONTROL_SCRIPT,
     apply_remote_workbench_config,
+    build_pharos_recommendation_presets,
+    build_pharos_runtime_summary,
     build_workbench_payload,
     get_central_strategy_target,
     list_central_strategy_targets,
@@ -94,6 +97,12 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
         self.assertIn("volatility_trigger_enabled", payload["sections"]["global_safety"])
         self.assertIn("startup_jitter_seconds", payload["sections"]["common"])
         self.assertIn("old_unknown_knob", payload["sections"]["unknown"])
+        self.assertIn("recommendation_presets", payload)
+        self.assertEqual(
+            [item["preset_id"] for item in payload["recommendation_presets"]],
+            ["conservative_profit", "balanced_volume", "final_day_volume"],
+        )
+        self.assertIn("runtime_summary", payload)
 
     @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
     def test_save_remote_workbench_config_writes_scoped_control_file(self, mock_run) -> None:
@@ -325,6 +334,132 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
             history = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
             self.assertEqual(history[-1]["action"], "rollback")
             self.assertEqual(history[-1]["after_config"]["max_new_orders"], 4)
+
+    def test_remote_runtime_events_script_tails_and_filters_summary_jsonl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            control_path = output_dir / "pharosusdt_loop_runner_control.json"
+            summary_path = output_dir / "pharosusdt_hedge_bq_events.jsonl"
+            control_path.write_text(
+                json.dumps({"summary_jsonl": "output/pharosusdt_hedge_bq_events.jsonl"}),
+                encoding="utf-8",
+            )
+            summary_path.write_text(
+                "\n".join(
+                    json.dumps(
+                        {
+                            "ts": f"2026-05-22T04:0{i}:00+00:00",
+                            "cycle": i,
+                            "cumulative_gross_notional": i * 100,
+                            "actual_net_notional": i,
+                            "large_unused_blob": "x" * 100,
+                        },
+                    )
+                    for i in range(5)
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [sys.executable, "-c", REMOTE_RUNTIME_EVENTS_SCRIPT, str(control_path), "2"],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            payload = json.loads(completed.stdout)
+            self.assertEqual(payload["error"], "")
+            self.assertEqual([event["cycle"] for event in payload["events"]], [3, 4])
+            self.assertNotIn("large_unused_blob", payload["events"][0])
+
+    def test_build_pharos_runtime_summary_reports_brush_state_and_loss(self) -> None:
+        summary = build_pharos_runtime_summary(
+            [
+                {
+                    "ts": "2026-05-22T04:00:00+00:00",
+                    "cycle": 10,
+                    "cumulative_gross_notional": 1000.0,
+                    "rolling_hourly_gross_notional": 800.0,
+                    "rolling_hourly_loss": 0.4,
+                    "rolling_hourly_loss_per_10k": 5.0,
+                    "actual_net_notional": 30.0,
+                    "current_long_notional": 40.0,
+                    "current_short_notional": 10.0,
+                    "unrealized_pnl": -0.2,
+                    "open_order_count": 2,
+                    "stale_order_count": 0,
+                    "missing_order_count": 0,
+                    "volatility_entry_pause_active": False,
+                },
+                {
+                    "ts": "2026-05-22T04:05:00+00:00",
+                    "cycle": 12,
+                    "cumulative_gross_notional": 1250.0,
+                    "rolling_hourly_gross_notional": 1050.0,
+                    "rolling_hourly_loss": 0.5,
+                    "rolling_hourly_loss_per_10k": 4.76,
+                    "actual_net_notional": 35.0,
+                    "current_long_notional": 45.0,
+                    "current_short_notional": 10.0,
+                    "unrealized_pnl": -0.3,
+                    "open_order_count": 2,
+                    "stale_order_count": 0,
+                    "missing_order_count": 0,
+                    "volatility_entry_pause_active": False,
+                },
+            ],
+            {"threshold_position_notional": 630.0, "max_cumulative_notional": 200000.0},
+        )
+
+        self.assertTrue(summary["ok"])
+        self.assertEqual(summary["state"], "brush")
+        self.assertEqual(summary["event_count"], 2)
+        self.assertEqual(summary["window_gross_notional"], 250.0)
+        self.assertEqual(summary["latest"]["rolling_hourly_loss_per_10k"], 4.76)
+        self.assertIn("刷量状态", summary["state_label"])
+
+    def test_build_pharos_runtime_summary_reports_repair_state_for_large_inventory(self) -> None:
+        summary = build_pharos_runtime_summary(
+            [
+                {
+                    "ts": "2026-05-22T04:05:00+00:00",
+                    "cumulative_gross_notional": 1250.0,
+                    "rolling_hourly_gross_notional": 1050.0,
+                    "actual_net_notional": 700.0,
+                    "threshold_position_notional": 630.0,
+                    "unrealized_pnl": -3.0,
+                    "open_order_count": 1,
+                    "volatility_entry_pause_active": True,
+                },
+            ],
+            {"threshold_position_notional": 630.0},
+        )
+
+        self.assertEqual(summary["state"], "repair")
+        self.assertIn("修仓状态", summary["state_label"])
+        self.assertIn("net_inventory_over_soft_threshold", summary["reason_codes"])
+
+    def test_build_pharos_recommendation_presets_returns_patch_values(self) -> None:
+        presets = build_pharos_recommendation_presets(
+            {
+                "per_order_notional": 10.0,
+                "max_new_orders": 5,
+                "max_total_notional": 1450.0,
+                "rolling_hourly_loss_limit": 8.0,
+                "max_cumulative_notional": 200000.0,
+            },
+            {"state": "brush", "latest": {"rolling_hourly_loss_per_10k": 3.0}},
+        )
+
+        self.assertEqual([item["preset_id"] for item in presets], ["conservative_profit", "balanced_volume", "final_day_volume"])
+        final_day = presets[-1]
+        self.assertGreater(final_day["patch"]["per_order_notional"], 10.0)
+        self.assertGreaterEqual(final_day["patch"]["max_cumulative_notional"], 500000.0)
+        self.assertIn("适合", final_day["scenario"])
 
     def test_save_remote_workbench_config_rejects_scope_mismatch(self) -> None:
         with self.assertRaisesRegex(ValueError, "strategy_profile"):
