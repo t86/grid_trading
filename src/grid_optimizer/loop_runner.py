@@ -15060,6 +15060,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             and pair_release_1m_abs_return <= best_quote_frozen_pair_release_max_1m_abs_return_ratio
             and pair_release_1m_amplitude <= best_quote_frozen_pair_release_max_1m_amplitude_ratio
         )
+        best_quote_frozen_pair_release_directive = dict(
+            state.get("best_quote_frozen_inventory_pair_release") or {}
+        )
+        best_quote_frozen_pair_release_requested = bool(
+            best_quote_frozen_pair_release_directive.get("requested")
+        )
         best_quote_frozen_pair_release = apply_best_quote_frozen_inventory_pair_release(
             plan=plan,
             report=best_quote_reduce_freeze,
@@ -15071,7 +15077,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             hedge_mode=hedge_best_quote,
             enabled=(
-                best_quote_frozen_pair_release_enabled
+                (best_quote_frozen_pair_release_enabled or best_quote_frozen_pair_release_requested)
                 and not bool(state.get("best_quote_frozen_inventory_manual_reduce"))
             ),
             stable_allowed=best_quote_frozen_pair_release_stable_allowed,
@@ -15081,6 +15087,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         best_quote_frozen_pair_release.update(
             {
+                "one_shot_requested": best_quote_frozen_pair_release_requested,
+                "one_shot_requested_at": str(best_quote_frozen_pair_release_directive.get("requested_at") or ""),
                 "max_notional": best_quote_frozen_pair_release_max_notional,
                 "min_profit_ratio": best_quote_frozen_pair_release_min_profit_ratio,
                 "max_slippage_ticks": best_quote_frozen_pair_release_max_slippage_ticks,
@@ -15092,6 +15100,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "window_1m_amplitude_ratio": pair_release_1m_amplitude,
             }
         )
+        if best_quote_frozen_pair_release_requested and bool(best_quote_frozen_pair_release.get("active")):
+            state.pop("best_quote_frozen_inventory_pair_release", None)
         best_quote_inventory_cost_gate = {
             "enabled": bool(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_enabled", True)),
             "blocked_buy_orders": 0,

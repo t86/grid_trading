@@ -151,12 +151,18 @@ class LoopRunnerTests(unittest.TestCase):
                     "source": "running_status_ui",
                 }
             }
+            pair_release = {
+                "requested": True,
+                "requested_at": "2026-05-22T06:05:00+00:00",
+                "source": "running_status_ui",
+            }
             state_path.write_text(
                 json.dumps(
                     {
                         "version": "old",
                         "best_quote_frozen_inventory": frozen_ledger,
                         "best_quote_frozen_inventory_manual_reduce": manual_reduce,
+                        "best_quote_frozen_inventory_pair_release": pair_release,
                         "runtime_guard_loss_recovery": {"cooldown": True},
                     },
                     ensure_ascii=False,
@@ -191,6 +197,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(state["best_quote_frozen_inventory"], frozen_ledger)
         self.assertEqual(state["best_quote_frozen_inventory_manual_reduce"], manual_reduce)
+        self.assertEqual(state["best_quote_frozen_inventory_pair_release"], pair_release)
         self.assertNotIn("runtime_guard_loss_recovery", state)
         self.assertTrue(state["startup_pending"])
 

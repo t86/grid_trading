@@ -6164,6 +6164,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
               <div id="frozen_inventory_body" class="rs-ledger-grid"></div>
               <div class="rs-drawer-action-group">
                 <button id="frozen_set_btn" type="button">手动设置</button>
+                <button id="frozen_pair_release_btn" type="button">对等释放</button>
                 <button id="frozen_clear_long_btn" type="button">清理冻结多仓</button>
                 <button id="frozen_clear_short_btn" type="button">清理冻结空仓</button>
                 <button id="frozen_reset_btn" type="button" class="danger">仅清空账本</button>
@@ -6217,6 +6218,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     const frozenInventoryPanelEl = document.getElementById("frozen_inventory_panel");
     const frozenInventoryBodyEl = document.getElementById("frozen_inventory_body");
     const frozenSetBtn = document.getElementById("frozen_set_btn");
+    const frozenPairReleaseBtn = document.getElementById("frozen_pair_release_btn");
     const frozenClearLongBtn = document.getElementById("frozen_clear_long_btn");
     const frozenClearShortBtn = document.getElementById("frozen_clear_short_btn");
     const frozenResetBtn = document.getElementById("frozen_reset_btn");
@@ -6739,6 +6741,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       `;
       frozenClearLongBtn.disabled = !editable || !(ledger.long_qty > 0);
       frozenClearShortBtn.disabled = !editable || !(ledger.short_qty > 0);
+      frozenPairReleaseBtn.disabled = !editable || !(ledger.offset_qty > 0);
       frozenResetBtn.disabled = !editable || !active;
       frozenSetBtn.disabled = !editable;
     }
@@ -6870,7 +6873,9 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     async function updateFrozenInventory(action, extra = {}) {
       const card = state.drawerCard;
       if (!card) return;
-      const actionLabel = action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本";
+      const actionLabel = action === "pair_release"
+        ? "提交冻结多空对等释放指令"
+        : (action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本");
       setDrawerStatus(`正在${actionLabel} ${card.symbol}...`);
       try {
         const resp = await fetch("/api/runner/frozen_inventory", {
@@ -6939,6 +6944,11 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     drawerSaveBtn.addEventListener("click", () => saveCurrentConfig(false));
     drawerApplyBtn.addEventListener("click", () => saveCurrentConfig(true));
     drawerStopBtn.addEventListener("click", () => stopAndFlattenCurrentRunner());
+    frozenPairReleaseBtn.addEventListener("click", () => {
+      if (window.confirm("确认提交一次性对等释放指令？runner 会在波动平稳且预估盈亏覆盖 buffer 时下 reduce-only IOC 对等释放单。")) {
+        updateFrozenInventory("pair_release");
+      }
+    });
     frozenClearLongBtn.addEventListener("click", () => updateFrozenInventory("reduce_long"));
     frozenClearShortBtn.addEventListener("click", () => updateFrozenInventory("reduce_short"));
     frozenResetBtn.addEventListener("click", () => {
@@ -10048,7 +10058,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     if not symbol:
         raise ValueError("symbol is required")
     action = str(payload.get("action", "set")).strip().lower() or "set"
-    if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "reset"}:
+    if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "pair_release", "reset"}:
         raise ValueError("unsupported frozen inventory action")
     state_path = _runner_frozen_inventory_state_path(symbol)
     state = _read_json_dict(state_path) or {}
@@ -10058,6 +10068,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     if action == "reset":
         state.pop("best_quote_frozen_inventory", None)
         state.pop("best_quote_frozen_inventory_manual_reduce", None)
+        state.pop("best_quote_frozen_inventory_pair_release", None)
         ledger = {}
     else:
         if action == "set":
@@ -10088,6 +10099,14 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 "source": "running_status_ui",
             }
             state["best_quote_frozen_inventory_manual_reduce"] = directive
+        elif action == "pair_release":
+            if ledger["offset_qty"] <= 1e-12:
+                raise ValueError("frozen long/short offset qty is empty")
+            state["best_quote_frozen_inventory_pair_release"] = {
+                "requested": True,
+                "requested_at": now_iso,
+                "source": "running_status_ui",
+            }
         ledger["offset_qty"] = min(
             max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0),
             max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0),

@@ -55,6 +55,7 @@ from grid_optimizer.web import (
     _start_runner_process,
     _status_commission_usdt,
     _update_custom_grid_runner_preset,
+    _update_runner_frozen_inventory,
     _uses_legacy_runner,
     _validate_runner_required_risk_guards,
     _volatility_reduce_escalation_reason,
@@ -389,9 +390,42 @@ class WebSecurityTests(unittest.TestCase):
 
         self.assertIn("冻结仓位账本", page)
         self.assertIn("/api/runner/frozen_inventory", page)
+        self.assertIn("对等释放", page)
+        self.assertIn('updateFrozenInventory("pair_release")', page)
         self.assertIn("清理冻结多仓", page)
         self.assertIn("由 runner 下 reduce-only 单处理", page)
         self.assertIn("card.frozen_inventory = data.frozen_inventory", page)
+
+    def test_update_frozen_inventory_pair_release_writes_one_shot_directive(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 50.0,
+                            "short_qty": 30.0,
+                            "long_entry_price": 1.0,
+                            "short_entry_price": 1.02,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                result = _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "pair_release"}
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["action"], "pair_release")
+        self.assertEqual(result["frozen_inventory"]["offset_qty"], 30.0)
+        directive = state["best_quote_frozen_inventory_pair_release"]
+        self.assertTrue(directive["requested"])
+        self.assertEqual(directive["source"], "running_status_ui")
 
     def test_frozen_inventory_normalization_hides_cleared_side_metadata(self) -> None:
         ledger = _normalize_frozen_inventory_ledger(
