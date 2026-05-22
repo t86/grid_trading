@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -70,6 +71,48 @@ def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _truncate_two_decimals(value: float) -> float:
+    return math.floor(max(float(value), 0.0) * 100.0) / 100.0
+
+
+def _competition_uses_daily_sqrt_score(board: dict[str, Any] | None) -> bool:
+    if not isinstance(board, dict):
+        return False
+    source_slug = str(board.get("source_slug", "")).strip().lower()
+    symbol = str(board.get("symbol", "")).strip().upper()
+    metric_field = str(board.get("metric_field", "")).strip().lower()
+    return source_slug == "futures_pharos" or (symbol == "PHAROS" and metric_field == "grade")
+
+
+def _competition_daily_sqrt_score(trade_summary: dict[str, Any] | None) -> float:
+    if not isinstance(trade_summary, dict):
+        return 0.0
+    score = 0.0
+    rows = trade_summary.get("daily_volume_rows")
+    if isinstance(rows, list) and rows:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            gross = max(_safe_float(row.get("gross_notional")), 0.0)
+            if gross <= 0:
+                continue
+            score += _truncate_two_decimals(math.sqrt(gross))
+        return float(score)
+    gross = max(_safe_float(trade_summary.get("gross_notional")), 0.0)
+    return _truncate_two_decimals(math.sqrt(gross)) if gross > 0 else 0.0
+
+
+def _competition_current_metric_value(
+    board: dict[str, Any] | None,
+    trade_summary: dict[str, Any] | None,
+) -> float:
+    if _competition_uses_daily_sqrt_score(board):
+        return _competition_daily_sqrt_score(trade_summary)
+    if not isinstance(trade_summary, dict):
+        return 0.0
+    return _safe_float(trade_summary.get("gross_notional"))
 
 
 def _sort_int(value: Any) -> int:
@@ -2663,18 +2706,22 @@ def _build_monitor_snapshot_uncached(
             - trade_summary["commission"]
         )
         trade_summary["net_pnl_estimate"] = net_pnl_est
+        competition_current_metric = _competition_current_metric_value(competition_board, trade_summary)
+        trade_summary["competition_current_metric"] = competition_current_metric
+        if _competition_uses_daily_sqrt_score(competition_board):
+            trade_summary["competition_current_metric_label"] = "每日成交量开根号积分"
         snapshot["trade_summary"] = trade_summary
         snapshot["competition_reward_targets"] = build_reward_volume_targets(
             competition_board,
-            current_volume=trade_summary.get("gross_notional"),
+            current_volume=competition_current_metric,
         )
         snapshot["competition_displacement_volume"] = build_competition_displacement_volume(
             competition_board,
-            current_volume=trade_summary.get("gross_notional"),
+            current_volume=competition_current_metric,
         )
         snapshot["competition_entry_volume_targets"] = build_competition_entry_volume_targets(
             competition_board,
-            current_volume=trade_summary.get("gross_notional"),
+            current_volume=competition_current_metric,
         )
         snapshot["income_summary"] = income_summary
         snapshot["hourly_summary"] = hourly_summary

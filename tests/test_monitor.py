@@ -14,6 +14,7 @@ from grid_optimizer.monitor import (
     _MONITOR_CACHE,
     _MONITOR_CACHE_LOCK,
     _MONITOR_INFLIGHT,
+    _competition_current_metric_value,
     _count_monitor_audit_lines,
     _filter_events_since,
     _filter_rows_since,
@@ -133,6 +134,39 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(summary["daily_volume_rows"][1]["date"], "2026-05-19")
         self.assertEqual(summary["daily_volume_rows"][1]["timezone"], "UTC+0")
         self.assertAlmostEqual(summary["daily_volume_rows"][1]["gross_notional"], 50.0, places=8)
+
+    def test_pharos_competition_metric_uses_daily_sqrt_score(self) -> None:
+        trade_summary = {
+            "gross_notional": 1_250_000.0,
+            "daily_volume_rows": [
+                {"date": "2026-05-21", "gross_notional": 1_000_000.0},
+                {"date": "2026-05-20", "gross_notional": 250_000.9999},
+            ],
+        }
+        board = {
+            "source_slug": "futures_pharos",
+            "symbol": "PHAROS",
+            "metric_field": "grade",
+        }
+
+        current = _competition_current_metric_value(board, trade_summary)
+
+        self.assertAlmostEqual(current, 1500.0, places=8)
+
+    def test_non_pharos_competition_metric_uses_gross_notional(self) -> None:
+        trade_summary = {
+            "gross_notional": 1_250_000.0,
+            "daily_volume_rows": [{"gross_notional": 1_000_000.0}],
+        }
+        board = {
+            "source_slug": "futures_bill",
+            "symbol": "BILL",
+            "metric_field": "tradingVolume",
+        }
+
+        current = _competition_current_metric_value(board, trade_summary)
+
+        self.assertAlmostEqual(current, 1_250_000.0, places=8)
 
     @patch("grid_optimizer.monitor.fetch_time_paged")
     def test_load_or_fetch_trade_rows_merges_audit_with_full_api_window(self, mock_fetch_time_paged) -> None:
@@ -850,6 +884,78 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(snapshot["trade_summary"]["gross_notional"], 8.0, places=8)
         self.assertAlmostEqual(snapshot["risk_controls"]["cumulative_gross_notional"], 8.0, places=8)
         self.assertEqual(snapshot["audit"]["trade_source"]["source"], "audit+api")
+
+    @patch("grid_optimizer.monitor.build_competition_entry_volume_targets", return_value={"targets": []})
+    @patch("grid_optimizer.monitor.build_competition_displacement_volume", return_value={"rank_steps": []})
+    @patch("grid_optimizer.monitor.build_reward_volume_targets", return_value={"tiers": []})
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch(
+        "grid_optimizer.monitor.resolve_active_competition_board",
+        return_value={"source_slug": "futures_pharos", "symbol": "PHAROS", "metric_field": "grade"},
+    )
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [{"symbol": "PHAROSUSDT", "positionAmt": "0", "entryPrice": "0", "breakEvenPrice": "0", "unRealizedProfit": "0"}],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "1"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "1", "ask_price": "1"}])
+    def test_build_monitor_snapshot_uses_pharos_score_for_competition_cards(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_competition,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_income_rows,
+        mock_reward_targets,
+        mock_displacement,
+        mock_entry_targets,
+    ) -> None:
+        day0 = datetime(2026, 5, 21, 1, 0, tzinfo=timezone.utc)
+        day1 = datetime(2026, 5, 22, 1, 0, tzinfo=timezone.utc)
+        trades = [
+            {"id": 1, "time": int(day0.timestamp() * 1000), "side": "BUY", "price": "1000", "qty": "1000", "realizedPnl": "0", "commission": "0"},
+            {"id": 2, "time": int(day1.timestamp() * 1000), "side": "SELL", "price": "500", "qty": "500", "realizedPnl": "0", "commission": "0"},
+        ]
+
+        with TemporaryDirectory() as tmpdir, patch(
+            "grid_optimizer.monitor._load_or_fetch_trade_rows",
+            return_value=(trades, {"source": "audit+api", "row_count": 2}),
+        ):
+            root = Path(tmpdir)
+            events_path = root / "pharosusdt_loop_events.jsonl"
+            plan_path = root / "pharosusdt_loop_latest_plan.json"
+            submit_path = root / "pharosusdt_loop_latest_submit.json"
+            events_path.write_text("{}", encoding="utf-8")
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="PHAROSUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={"configured": True, "is_running": False, "config": {"symbol": "PHAROSUSDT"}},
+            )
+
+        self.assertAlmostEqual(snapshot["trade_summary"]["gross_notional"], 1_250_000.0, places=8)
+        self.assertAlmostEqual(snapshot["trade_summary"]["competition_current_metric"], 1500.0, places=8)
+        self.assertEqual(snapshot["trade_summary"]["competition_current_metric_label"], "每日成交量开根号积分")
+        self.assertAlmostEqual(mock_reward_targets.call_args.kwargs["current_volume"], 1500.0, places=8)
+        self.assertAlmostEqual(mock_displacement.call_args.kwargs["current_volume"], 1500.0, places=8)
+        self.assertAlmostEqual(mock_entry_targets.call_args.kwargs["current_volume"], 1500.0, places=8)
 
     @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
     @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))

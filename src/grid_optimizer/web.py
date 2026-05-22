@@ -26653,6 +26653,8 @@ MONITOR_PAGE = """<!doctype html>
         return null;
       }
       const unit = String(payload.leaderboard_unit || "USDT").trim() || "USDT";
+      const metricName = unit === "积分" ? "积分" : "成交量";
+      const currentMetricLabel = unit === "积分" ? "当前积分" : "当前成交";
       const rowHtml = [];
       if (current) {
         rowHtml.push(`
@@ -26687,10 +26689,10 @@ MONITOR_PAGE = """<!doctype html>
         `);
       });
       return {
-        label: "挤出奖励区量",
+        label: unit === "积分" ? "挤出奖励区积分" : "挤出奖励区量",
         value: payload.current_rank ? `当前第 ${fmtNum(payload.current_rank, 0)} 名` : "--",
         cls: "",
-        sub: `按后续用户逐个超过当前成交量累计 · 当前成交 ${fmtNum(payload.current_volume || 0, 4)} ${unit}`,
+        sub: `按后续用户逐个超过当前${metricName}累计 · ${currentMetricLabel} ${fmtNum(payload.current_volume || 0, 4)} ${unit}`,
         bodyHtml: `<div class="metric-lines">${rowHtml.join("") || `<div class="metric-line">${escapeHtml(message || "当前没有可用的排位挤出量。")}</div>`}</div>`,
       };
     }
@@ -26703,6 +26705,8 @@ MONITOR_PAGE = """<!doctype html>
         return null;
       }
       const unit = String(payload.leaderboard_unit || "USDT").trim() || "USDT";
+      const metricName = unit === "积分" ? "积分" : "交易量";
+      const currentMetricLabel = unit === "积分" ? "当前积分" : "当前成交";
       const rowHtml = rows.map((item) => {
         const reached = String(item.status || "") === "reached";
         const missing = String(item.status || "") === "missing";
@@ -26716,10 +26720,10 @@ MONITOR_PAGE = """<!doctype html>
         `;
       }).join("");
       return {
-        label: "挤进交易量",
+        label: unit === "积分" ? "挤进积分" : "挤进交易量",
         value: "1 / 2 / 3 / 4 / 5 / 20 / 50 / 200",
         cls: "",
-        sub: `按当前成交量计算进入目标名次还差多少 · 当前成交 ${fmtNum(payload.current_volume || 0, 4)} ${unit}`,
+        sub: `按当前${metricName}计算进入目标名次还差多少 · ${currentMetricLabel} ${fmtNum(payload.current_volume || 0, 4)} ${unit}`,
         bodyHtml: `<div class="metric-lines">${rowHtml || `<div class="metric-line">${escapeHtml(message || "当前没有可用的挤进交易量目标。")}</div>`}</div>`,
       };
     }
