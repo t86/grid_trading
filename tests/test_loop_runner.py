@@ -124,11 +124,74 @@ from grid_optimizer.semi_auto_plan import (
     build_hedge_micro_grid_plan,
     build_maker_volatility_inventory_plan,
     build_static_binance_grid_plan,
+    load_or_initialize_state,
 )
 from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_reset_state_preserves_best_quote_frozen_inventory(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            frozen_ledger = {
+                "long_qty": 352.0,
+                "long_entry_price": 0.6442504916363,
+                "long_frozen_at": "2026-05-22T05:30:52.196376+00:00",
+                "short_qty": 77.0,
+                "short_entry_price": 0.6421485022341,
+                "short_frozen_at": "2026-05-22T05:47:48.487386+00:00",
+                "updated_at": "2026-05-22T05:51:23.848287+00:00",
+            }
+            manual_reduce = {
+                "long": {
+                    "requested": True,
+                    "requested_at": "2026-05-22T05:55:00+00:00",
+                    "source": "running_status_ui",
+                }
+            }
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "version": "old",
+                        "best_quote_frozen_inventory": frozen_ledger,
+                        "best_quote_frozen_inventory_manual_reduce": manual_reduce,
+                        "runtime_guard_loss_recovery": {"cooldown": True},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            state = load_or_initialize_state(
+                state_path=state_path,
+                args=Namespace(
+                    symbol="PHAROSUSDT",
+                    strategy_mode="hedge_best_quote_maker_volume_v1",
+                    step_price=0.00025,
+                    buy_levels=1,
+                    sell_levels=1,
+                    per_order_notional=10.0,
+                    base_position_notional=0.0,
+                    center_price=None,
+                    down_trigger_steps=10,
+                    up_trigger_steps=10,
+                    shift_steps=1,
+                ),
+                symbol_info={
+                    "tick_size": 0.0001,
+                    "step_size": 1.0,
+                    "min_qty": 1.0,
+                    "min_notional": 5.0,
+                },
+                mid_price=0.65,
+                reset_state=True,
+            )
+
+        self.assertEqual(state["best_quote_frozen_inventory"], frozen_ledger)
+        self.assertEqual(state["best_quote_frozen_inventory_manual_reduce"], manual_reduce)
+        self.assertNotIn("runtime_guard_loss_recovery", state)
+        self.assertTrue(state["startup_pending"])
+
     def test_resolve_volatility_entry_pause_holds_for_min_observation_window(self) -> None:
         trigger_now = datetime(2026, 5, 16, 4, 7, tzinfo=timezone.utc)
         triggered = resolve_volatility_entry_pause(

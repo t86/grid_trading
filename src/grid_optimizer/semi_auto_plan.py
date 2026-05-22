@@ -2331,6 +2331,8 @@ def load_or_initialize_state(
     reset_state: bool,
 ) -> dict[str, Any]:
     config = _config_payload(args, symbol_info)
+    preserved_frozen_inventory: dict[str, Any] = {}
+    preserved_frozen_manual_reduce: dict[str, Any] = {}
     if state_path.exists() and not reset_state:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if str(state.get("config_signature", "")).strip() != _config_signature(config):
@@ -2343,6 +2345,15 @@ def load_or_initialize_state(
                 raise SystemExit("State config does not match current CLI arguments. Use --reset-state to restart.")
         else:
             return state
+    elif state_path.exists() and reset_state:
+        try:
+            existing_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_state = {}
+        if isinstance(existing_state.get("best_quote_frozen_inventory"), dict):
+            preserved_frozen_inventory = dict(existing_state["best_quote_frozen_inventory"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory_manual_reduce"), dict):
+            preserved_frozen_manual_reduce = dict(existing_state["best_quote_frozen_inventory_manual_reduce"])
 
     center_price = args.center_price if args.center_price is not None else mid_price
     center_price = _round_to_nearest_step(center_price, symbol_info.get("tick_size"))
@@ -2357,6 +2368,10 @@ def load_or_initialize_state(
         "center_price": center_price,
         "last_mid_price": mid_price,
     }
+    if preserved_frozen_inventory:
+        state["best_quote_frozen_inventory"] = preserved_frozen_inventory
+    if preserved_frozen_manual_reduce:
+        state["best_quote_frozen_inventory_manual_reduce"] = preserved_frozen_manual_reduce
     if getattr(args, "custom_grid_enabled", False):
         state.update(
             {
