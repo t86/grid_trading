@@ -61,6 +61,7 @@ from grid_optimizer.web import (
     _volatility_trigger_orphan_recovery_action,
 )
 from grid_optimizer import web as web_module
+from grid_optimizer.running_status import _normalize_frozen_inventory_ledger
 
 
 class WebSecurityTests(unittest.TestCase):
@@ -390,6 +391,27 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/runner/frozen_inventory", page)
         self.assertIn("清理冻结多仓", page)
         self.assertIn("由 runner 下 reduce-only 单处理", page)
+        self.assertIn("card.frozen_inventory = data.frozen_inventory", page)
+
+    def test_frozen_inventory_normalization_hides_cleared_side_metadata(self) -> None:
+        ledger = _normalize_frozen_inventory_ledger(
+            {
+                "long_qty": 0,
+                "long_notional": 217.9,
+                "long_entry_price": 0.64425049,
+                "long_frozen_at": "2026-05-22T05:30:52.196376+00:00",
+                "short_qty": 136,
+                "short_notional": 88.46,
+                "short_entry_price": 0.6433659,
+                "short_frozen_at": "2026-05-22T06:32:41.779485+00:00",
+            }
+        )
+
+        self.assertEqual(ledger["long_qty"], 0.0)
+        self.assertEqual(ledger["long_notional"], 0.0)
+        self.assertEqual(ledger["long_entry_price"], 0.0)
+        self.assertEqual(ledger["long_frozen_at"], "")
+        self.assertEqual(ledger["short_qty"], 136.0)
 
     def test_running_status_overview_page_restores_cross_server_table(self) -> None:
         page = _render_running_status_overview_page()

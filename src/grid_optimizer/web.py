@@ -6823,6 +6823,15 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         });
         const data = await readJsonResponse(resp);
         if (!resp.ok || !data.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        if (data.frozen_inventory && typeof data.frozen_inventory === "object") {
+          card.frozen_inventory = data.frozen_inventory;
+          const cardKey = statusKeyForCard(card);
+          state.cardIndex.set(cardKey, card);
+          if (state.drawerCard && statusKeyForCard(state.drawerCard) === cardKey) {
+            state.drawerCard = card;
+            renderFrozenInventoryPanel(card);
+          }
+        }
         setDrawerStatus(`${card.symbol} ${actionLabel}已提交。`);
         await loadPage({ preserveDrawer: true });
       } catch (err) {
@@ -9950,12 +9959,12 @@ def _normalize_runner_frozen_inventory_ledger(raw: Any) -> dict[str, Any]:
     return {
         "long_qty": long_qty,
         "short_qty": short_qty,
-        "long_notional": max(_safe_float(ledger.get("long_notional", 0.0), "long_notional"), 0.0),
-        "short_notional": max(_safe_float(ledger.get("short_notional", 0.0), "short_notional"), 0.0),
-        "long_entry_price": max(_safe_float(ledger.get("long_entry_price", 0.0), "long_entry_price"), 0.0),
-        "short_entry_price": max(_safe_float(ledger.get("short_entry_price", 0.0), "short_entry_price"), 0.0),
-        "long_frozen_at": str(ledger.get("long_frozen_at") or ""),
-        "short_frozen_at": str(ledger.get("short_frozen_at") or ""),
+        "long_notional": max(_safe_float(ledger.get("long_notional", 0.0), "long_notional"), 0.0) if long_qty > 0 else 0.0,
+        "short_notional": max(_safe_float(ledger.get("short_notional", 0.0), "short_notional"), 0.0) if short_qty > 0 else 0.0,
+        "long_entry_price": max(_safe_float(ledger.get("long_entry_price", 0.0), "long_entry_price"), 0.0) if long_qty > 0 else 0.0,
+        "short_entry_price": max(_safe_float(ledger.get("short_entry_price", 0.0), "short_entry_price"), 0.0) if short_qty > 0 else 0.0,
+        "long_frozen_at": str(ledger.get("long_frozen_at") or "") if long_qty > 0 else "",
+        "short_frozen_at": str(ledger.get("short_frozen_at") or "") if short_qty > 0 else "",
         "offset_qty": min(long_qty, short_qty),
         "offset_notional": max(_safe_float(ledger.get("offset_notional", 0.0), "offset_notional"), 0.0),
         "updated_at": str(ledger.get("updated_at") or ""),
