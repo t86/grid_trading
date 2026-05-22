@@ -20,6 +20,8 @@ from .strategy_profile_schema import (
 REMOTE_READ_TIMEOUT_SECONDS = 25
 REMOTE_WRITE_TIMEOUT_SECONDS = 25
 REMOTE_RUNNER_TIMEOUT_SECONDS = 60
+REMOTE_HISTORY_TIMEOUT_SECONDS = 25
+REMOTE_ROLLBACK_TIMEOUT_SECONDS = 35
 PHAROS_SYMBOL = "PHAROSUSDT"
 PHAROS_PROFILE = "pharosusdt_hedge_best_quote_maker_volume_v1"
 
@@ -382,6 +384,9 @@ def build_workbench_payload(
     symbol: Any,
     strategy_profile: Any,
     config: dict[str, Any],
+    *,
+    history: list[dict[str, Any]] | None = None,
+    history_error: str = "",
 ) -> dict[str, Any]:
     target = get_central_strategy_target(server_id, symbol, strategy_profile)
     config_dict = dict(config or {})
@@ -413,6 +418,9 @@ def build_workbench_payload(
         "global_safety_preflight": schema_report.get("global_safety_preflight") or {},
         "ignored_params": list(schema_report.get("ignored_params") or []),
         "unknown_params": list(schema_report.get("unknown_params") or []),
+        "history": list(history or []),
+        "history_error": history_error,
+        "can_rollback": len(history or []) >= 2,
         "raw_config": {str(key): _jsonable(value) for key, value in config_dict.items()},
         "source": f"ssh:{target.ssh_host}:{target.control_path}",
         "updated_at": datetime.now(timezone.utc).isoformat(),
@@ -439,36 +447,249 @@ def read_remote_target_config(target: CentralStrategyTarget) -> dict[str, Any]:
     return dict(loaded)
 
 
+def _history_path_for_target(target: CentralStrategyTarget) -> str:
+    return f"{target.control_path}.central_workbench_history.jsonl"
+
+
 REMOTE_WRITE_CONTROL_SCRIPT = """
 import json
+from datetime import datetime, timezone
 import os
 import sys
 import tempfile
+import uuid
 
 path = sys.argv[1]
+history_path = sys.argv[2]
 data = json.load(sys.stdin)
 directory = os.path.dirname(path) or "."
 os.makedirs(directory, exist_ok=True)
+history_directory = os.path.dirname(history_path) or "."
+os.makedirs(history_directory, exist_ok=True)
+
+def load_current_config():
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    if isinstance(loaded, dict) and isinstance(loaded.get("config"), dict):
+        return dict(loaded["config"])
+    if isinstance(loaded, dict):
+        return dict(loaded)
+    return {}
+
+def public_config(config):
+    return {str(key): value for key, value in dict(config or {}).items() if not str(key).startswith("_")}
+
+def changed_params(before, after):
+    before_public = public_config(before)
+    after_public = public_config(after)
+    return sorted(
+        key
+        for key in set(before_public) | set(after_public)
+        if before_public.get(key) != after_public.get(key)
+    )
+
+before = load_current_config()
+version_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+entry = {
+    "version_id": version_id,
+    "saved_at": data.get("_central_workbench_saved_at") or datetime.now(timezone.utc).isoformat(),
+    "action": data.get("_central_workbench_action") or "save",
+    "scope": data.get("_central_workbench_scope") or "",
+    "changed_params": changed_params(before, data),
+    "stripped_params": sorted(set(data.get("_central_workbench_stripped_params") or [])),
+    "before_config": before,
+    "after_config": data,
+}
 fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
 try:
     with os.fdopen(fd, "w", encoding="utf-8") as handle:
         json.dump(data, handle, ensure_ascii=False, indent=2, sort_keys=True)
         handle.write("\\n")
     os.replace(tmp_path, path)
+    with open(history_path, "a", encoding="utf-8") as history:
+        history.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\\n")
 finally:
     if os.path.exists(tmp_path):
         os.unlink(tmp_path)
-print(path)
+print(json.dumps({
+    "path": path,
+    "history_path": history_path,
+    "version_id": version_id,
+    "changed_params": entry["changed_params"],
+    "stripped_params": entry["stripped_params"],
+    "history_entry": {
+        "version_id": version_id,
+        "saved_at": entry["saved_at"],
+        "action": entry["action"],
+        "scope": entry["scope"],
+        "changed_params": entry["changed_params"],
+        "stripped_params": entry["stripped_params"],
+    },
+}, ensure_ascii=False, sort_keys=True))
+""".strip()
+
+
+REMOTE_HISTORY_CONTROL_SCRIPT = """
+import json
+import sys
+
+history_path = sys.argv[1]
+scope = sys.argv[2]
+limit = int(sys.argv[3]) if len(sys.argv) > 3 else 8
+
+def summary(entry):
+    return {
+        "version_id": entry.get("version_id") or "",
+        "saved_at": entry.get("saved_at") or "",
+        "action": entry.get("action") or "",
+        "scope": entry.get("scope") or "",
+        "changed_params": list(entry.get("changed_params") or []),
+        "stripped_params": list(entry.get("stripped_params") or []),
+        "rollback_of": entry.get("rollback_of") or "",
+        "restored_version_id": entry.get("restored_version_id") or "",
+    }
+
+entries = []
+try:
+    with open(history_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if scope and entry.get("scope") != scope:
+                continue
+            entries.append(summary(entry))
+except FileNotFoundError:
+    entries = []
+print(json.dumps(entries[-limit:], ensure_ascii=False, sort_keys=True))
+""".strip()
+
+
+REMOTE_ROLLBACK_CONTROL_SCRIPT = """
+from datetime import datetime, timezone
+import json
+import os
+import sys
+import tempfile
+import uuid
+
+path = sys.argv[1]
+history_path = sys.argv[2]
+scope = sys.argv[3]
+
+def load_json_file(file_path):
+    try:
+        with open(file_path, "r", encoding="utf-8") as handle:
+            loaded = json.load(handle)
+    except FileNotFoundError:
+        return {}
+    if isinstance(loaded, dict) and isinstance(loaded.get("config"), dict):
+        return dict(loaded["config"])
+    if isinstance(loaded, dict):
+        return dict(loaded)
+    return {}
+
+def public_config(config):
+    return {str(key): value for key, value in dict(config or {}).items() if not str(key).startswith("_")}
+
+def changed_params(before, after):
+    before_public = public_config(before)
+    after_public = public_config(after)
+    return sorted(
+        key
+        for key in set(before_public) | set(after_public)
+        if before_public.get(key) != after_public.get(key)
+    )
+
+entries = []
+try:
+    with open(history_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if entry.get("scope") != scope:
+                continue
+            if isinstance(entry.get("after_config"), dict):
+                entries.append(entry)
+except FileNotFoundError:
+    entries = []
+
+if len(entries) < 2:
+    print("no previous central workbench saved version", file=sys.stderr)
+    sys.exit(2)
+
+current_entry = entries[-1]
+restore_entry = entries[-2]
+before = load_json_file(path)
+after = dict(restore_entry["after_config"])
+version_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
+entry = {
+    "version_id": version_id,
+    "saved_at": datetime.now(timezone.utc).isoformat(),
+    "action": "rollback",
+    "scope": scope,
+    "rollback_of": current_entry.get("version_id") or "",
+    "restored_version_id": restore_entry.get("version_id") or "",
+    "changed_params": changed_params(before, after),
+    "stripped_params": [],
+    "before_config": before,
+    "after_config": after,
+}
+
+directory = os.path.dirname(path) or "."
+os.makedirs(directory, exist_ok=True)
+fd, tmp_path = tempfile.mkstemp(prefix=os.path.basename(path) + ".", suffix=".tmp", dir=directory)
+try:
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        json.dump(after, handle, ensure_ascii=False, indent=2, sort_keys=True)
+        handle.write("\\n")
+    os.replace(tmp_path, path)
+    with open(history_path, "a", encoding="utf-8") as history:
+        history.write(json.dumps(entry, ensure_ascii=False, sort_keys=True) + "\\n")
+finally:
+    if os.path.exists(tmp_path):
+        os.unlink(tmp_path)
+
+print(json.dumps({
+    "rolled_back": True,
+    "rollback_of": entry["rollback_of"],
+    "restored_version_id": entry["restored_version_id"],
+    "changed_params": entry["changed_params"],
+    "history_entry": {
+        "version_id": version_id,
+        "saved_at": entry["saved_at"],
+        "action": "rollback",
+        "scope": scope,
+        "rollback_of": entry["rollback_of"],
+        "restored_version_id": entry["restored_version_id"],
+        "changed_params": entry["changed_params"],
+        "stripped_params": [],
+    },
+}, ensure_ascii=False, sort_keys=True))
 """.strip()
 
 
 def _write_remote_target_config(target: CentralStrategyTarget, config: dict[str, Any]) -> dict[str, Any]:
+    history_path = _history_path_for_target(target)
     remote_command = " ".join(
         [
             "python3",
             "-c",
             shlex.quote(REMOTE_WRITE_CONTROL_SCRIPT),
             shlex.quote(target.control_path),
+            shlex.quote(history_path),
         ]
     )
     completed = subprocess.run(
@@ -482,10 +703,46 @@ def _write_remote_target_config(target: CentralStrategyTarget, config: dict[str,
     if completed.returncode != 0:
         detail = (completed.stderr or completed.stdout or "").strip()
         raise RuntimeError(f"ssh write failed for {target.scope}: {detail or completed.returncode}")
+    stdout = (completed.stdout or "").strip()
+    parsed: dict[str, Any] = {}
+    if stdout:
+        try:
+            parsed = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed = {"stdout": stdout}
     return {
-        "stdout": (completed.stdout or "").strip(),
+        **parsed,
+        "stdout": stdout,
         "stderr": (completed.stderr or "").strip(),
     }
+
+
+def read_remote_target_history(target: CentralStrategyTarget, *, limit: int = 8) -> list[dict[str, Any]]:
+    history_path = _history_path_for_target(target)
+    remote_command = " ".join(
+        [
+            "python3",
+            "-c",
+            shlex.quote(REMOTE_HISTORY_CONTROL_SCRIPT),
+            shlex.quote(history_path),
+            shlex.quote(target.scope),
+            str(int(limit)),
+        ]
+    )
+    completed = subprocess.run(
+        ["ssh", target.ssh_host, remote_command],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=REMOTE_HISTORY_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"ssh history read failed for {target.scope}: {detail or completed.returncode}")
+    loaded = json.loads(completed.stdout or "[]")
+    if not isinstance(loaded, list):
+        return []
+    return [entry for entry in loaded if isinstance(entry, dict)]
 
 
 def save_remote_workbench_config(
@@ -499,11 +756,27 @@ def save_remote_workbench_config(
     target = get_central_strategy_target(server_id, symbol, strategy_profile)
     normalized = _normalize_config_for_target(target, config, action=action)
     write_result = _write_remote_target_config(target, normalized)
-    payload = build_workbench_payload(target.server_id, target.symbol, target.strategy_profile, normalized)
+    history_entry = write_result.get("history_entry") if isinstance(write_result.get("history_entry"), dict) else None
+    history: list[dict[str, Any]] = [history_entry] if history_entry else []
+    history_error = ""
+    try:
+        history = read_remote_target_history(target)
+    except Exception as exc:
+        history_error = f"{type(exc).__name__}: {exc}"
+    payload = build_workbench_payload(
+        target.server_id,
+        target.symbol,
+        target.strategy_profile,
+        normalized,
+        history=history,
+        history_error=history_error,
+    )
     return {
         **payload,
         "saved": True,
         "stripped_params": list(normalized.get("_central_workbench_stripped_params") or []),
+        "changed_params": list(write_result.get("changed_params") or []),
+        "history_entry": history_entry or {},
         "remote_write": write_result,
     }
 
@@ -547,6 +820,58 @@ def apply_remote_workbench_config(
     }
 
 
+def _rollback_remote_target_config(target: CentralStrategyTarget) -> dict[str, Any]:
+    history_path = _history_path_for_target(target)
+    remote_command = " ".join(
+        [
+            "python3",
+            "-c",
+            shlex.quote(REMOTE_ROLLBACK_CONTROL_SCRIPT),
+            shlex.quote(target.control_path),
+            shlex.quote(history_path),
+            shlex.quote(target.scope),
+        ]
+    )
+    completed = subprocess.run(
+        ["ssh", target.ssh_host, remote_command],
+        capture_output=True,
+        check=False,
+        text=True,
+        timeout=REMOTE_ROLLBACK_TIMEOUT_SECONDS,
+    )
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout or "").strip()
+        raise RuntimeError(f"rollback failed for {target.scope}: {detail or completed.returncode}")
+    stdout = (completed.stdout or "").strip()
+    parsed = json.loads(stdout or "{}")
+    if not isinstance(parsed, dict):
+        raise ValueError(f"rollback response for {target.scope} is not an object")
+    return {
+        **parsed,
+        "stdout": stdout,
+        "stderr": (completed.stderr or "").strip(),
+    }
+
+
+def rollback_remote_workbench_config(
+    server_id: Any,
+    symbol: Any,
+    strategy_profile: Any,
+) -> dict[str, Any]:
+    target = get_central_strategy_target(server_id, symbol, strategy_profile)
+    rollback_result = _rollback_remote_target_config(target)
+    return {
+        "ok": True,
+        "scope": target.scope_payload(),
+        "rolled_back": bool(rollback_result.get("rolled_back")),
+        "rollback_of": rollback_result.get("rollback_of") or "",
+        "restored_version_id": rollback_result.get("restored_version_id") or "",
+        "changed_params": list(rollback_result.get("changed_params") or []),
+        "history_entry": rollback_result.get("history_entry") or {},
+        "remote_rollback": rollback_result,
+    }
+
+
 def build_remote_workbench_status(server_id: Any, symbol: Any, strategy_profile: Any) -> dict[str, Any]:
     try:
         target = get_central_strategy_target(server_id, symbol, strategy_profile)
@@ -569,7 +894,20 @@ def build_remote_workbench_status(server_id: Any, symbol: Any, strategy_profile:
 
     try:
         config = read_remote_target_config(target)
-        return build_workbench_payload(target.server_id, target.symbol, target.strategy_profile, config)
+        history: list[dict[str, Any]] = []
+        history_error = ""
+        try:
+            history = read_remote_target_history(target)
+        except Exception as history_exc:
+            history_error = f"{type(history_exc).__name__}: {history_exc}"
+        return build_workbench_payload(
+            target.server_id,
+            target.symbol,
+            target.strategy_profile,
+            config,
+            history=history,
+            history_error=history_error,
+        )
     except Exception as exc:
         return {
             "ok": False,

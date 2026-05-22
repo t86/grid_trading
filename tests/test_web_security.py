@@ -4602,7 +4602,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("PHAROSUSDT", page)
         self.assertIn("保存参数", page)
         self.assertIn("保存并启动", page)
+        self.assertIn("回滚上一版", page)
+        self.assertIn("变更预览", page)
+        self.assertIn("版本记录", page)
+        self.assertIn("启动预检详情", page)
+        self.assertIn("/api/central_strategy_workbench/rollback", page)
         self.assertIn("latestScopeMatchesCurrent", page)
+        self.assertIn("targetInputs.forEach", page)
         self.assertIn("请先刷新当前目标，再保存。", page)
         self.assertNotIn("保存参数（下一阶段开放）", page)
         self.assertNotIn("setInterval(", page)
@@ -4676,10 +4682,31 @@ class WebSecurityTests(unittest.TestCase):
             {"symbol": "PHAROSUSDT"},
         )
 
+    @patch("grid_optimizer.web.rollback_remote_workbench_config")
+    def test_central_strategy_workbench_rollback_api_uses_scoped_payload(self, mock_rollback) -> None:
+        mock_rollback.return_value = {"ok": True, "rolled_back": True, "scope": {"server_id": "114"}}
+
+        payload = web_module._rollback_central_strategy_workbench_config(
+            {
+                "server_id": "114",
+                "symbol": "PHAROSUSDT",
+                "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "config": {},
+            },
+        )
+
+        self.assertTrue(payload["rolled_back"])
+        mock_rollback.assert_called_once_with(
+            "114",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+        )
+
     def test_central_strategy_workbench_post_routes_are_registered(self) -> None:
         source = inspect.getsource(_Handler.do_POST)
         self.assertIn("/api/central_strategy_workbench/save", source)
         self.assertIn("/api/central_strategy_workbench/apply", source)
+        self.assertIn("/api/central_strategy_workbench/rollback", source)
 
     def test_strategy_editor_routes_are_registered(self) -> None:
         source = inspect.getsource(_Handler.do_GET)

@@ -26929,10 +26929,21 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     .param-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 9px; margin-top: 10px; }
     .param-grid label { min-width: 0; }
     .param-grid input { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12px; }
+    .detail-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+    .detail-box { border: 1px solid var(--line); border-radius: 8px; background: #fff; padding: 12px; min-width: 0; }
+    .detail-box h2 { margin-bottom: 8px; }
+    .detail-list { display: grid; gap: 7px; color: var(--muted); font-size: 12px; line-height: 1.45; }
+    .detail-list div { border-left: 3px solid var(--line); padding-left: 8px; word-break: break-word; }
+    .detail-list div.warn { border-left-color: var(--warn); }
+    .detail-list div.bad { border-left-color: var(--bad); }
+    .detail-list div.good { border-left-color: var(--brand); }
+    .diff-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .diff-table th, .diff-table td { border-bottom: 1px solid var(--line); padding: 6px 4px; text-align: left; vertical-align: top; word-break: break-word; }
+    .diff-table th { color: var(--muted); font-weight: 800; }
     .empty { color: var(--muted); font-size: 13px; padding: 10px 0 2px; }
     .tag { display: inline-flex; border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; color: var(--muted); font-size: 12px; font-weight: 800; }
     @media (max-width: 980px) {
-      .status-grid, .sections, .param-grid { grid-template-columns: 1fr; }
+      .status-grid, .sections, .param-grid, .detail-grid { grid-template-columns: 1fr; }
       .toolbar label, .actions button { min-width: 100%; flex: 1 1 100%; }
     }
   </style>
@@ -26970,6 +26981,7 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
         <button id="refresh_btn" type="button" class="primary">刷新参数</button>
         <button id="save_btn" type="button">保存参数</button>
         <button id="apply_btn" type="button">保存并启动</button>
+        <button id="rollback_btn" type="button">回滚上一版</button>
       </div>
       <div id="meta" class="meta" style="margin-top:10px">页面已就绪。</div>
     </section>
@@ -26977,6 +26989,21 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     <section class="panel">
       <div id="status_grid" class="status-grid">
         <div class="metric"><div class="label">状态</div><div class="value">未刷新</div><div class="sub">点击刷新参数读取目标服务器。</div></div>
+      </div>
+    </section>
+
+    <section class="detail-grid">
+      <div class="detail-box">
+        <h2>变更预览</h2>
+        <div id="diff_panel" class="detail-list"><div>刷新参数后编辑字段，这里显示旧值到新值。</div></div>
+      </div>
+      <div class="detail-box">
+        <h2>启动预检详情</h2>
+        <div id="preflight_panel" class="detail-list"><div>刷新参数后显示 blocker、warning 和安全阀提示。</div></div>
+      </div>
+      <div class="detail-box">
+        <h2>版本记录</h2>
+        <div id="history_panel" class="detail-list"><div>保存后会记录版本；至少两版中央保存记录后可回滚。</div></div>
       </div>
     </section>
 
@@ -27000,6 +27027,9 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     const metaEl = document.getElementById("meta");
     const statusGridEl = document.getElementById("status_grid");
     const sectionsEl = document.getElementById("sections");
+    const diffPanelEl = document.getElementById("diff_panel");
+    const preflightPanelEl = document.getElementById("preflight_panel");
+    const historyPanelEl = document.getElementById("history_panel");
     let latestPayload = null;
     function esc(value) {
       return String(value ?? "").replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/\"/g, "&quot;");
@@ -27073,6 +27103,83 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
         .map((name) => renderSection(name, sections[name] || {}))
         .join("");
     }
+    function fmtList(values) {
+      const list = Array.isArray(values) ? values.filter(Boolean) : [];
+      return list.length ? list.join(", ") : "--";
+    }
+    function fmtValue(value) {
+      if (value === null || value === undefined) return "--";
+      if (typeof value === "object") return JSON.stringify(value);
+      return String(value);
+    }
+    function publicConfig(config) {
+      const out = {};
+      Object.entries(config || {}).forEach(([key, value]) => {
+        if (!String(key).startsWith("_")) out[key] = value;
+      });
+      return out;
+    }
+    function changedRows(before, after) {
+      const left = publicConfig(before);
+      const right = publicConfig(after);
+      const keys = Array.from(new Set([...Object.keys(left), ...Object.keys(right)])).sort();
+      return keys.filter((key) => JSON.stringify(left[key]) !== JSON.stringify(right[key])).map((key) => [key, left[key], right[key]]);
+    }
+    function renderDiff() {
+      if (!latestPayload || !latestPayload.raw_config) {
+        diffPanelEl.innerHTML = "<div>刷新参数后编辑字段，这里显示旧值到新值。</div>";
+        return;
+      }
+      if (!latestScopeMatchesCurrent()) {
+        diffPanelEl.innerHTML = '<div class="warn">当前选择和最近刷新目标不同，请先刷新当前目标。</div>';
+        return;
+      }
+      let nextConfig;
+      try {
+        nextConfig = currentConfigFromForm({requireScope: false});
+      } catch (err) {
+        diffPanelEl.innerHTML = `<div class="bad">${esc(err.message)}</div>`;
+        return;
+      }
+      const rows = changedRows(latestPayload.raw_config, nextConfig);
+      if (!rows.length) {
+        diffPanelEl.innerHTML = '<div class="good">暂无变化。</div>';
+        return;
+      }
+      diffPanelEl.innerHTML = `<table class="diff-table"><thead><tr><th>参数</th><th>旧值</th><th>新值</th></tr></thead><tbody>${rows.slice(0, 30).map(([key, oldValue, newValue]) => `<tr><td>${esc(key)}</td><td>${esc(fmtValue(oldValue))}</td><td>${esc(fmtValue(newValue))}</td></tr>`).join("")}</tbody></table>${rows.length > 30 ? `<div>还有 ${rows.length - 30} 项变化未展开。</div>` : ""}`;
+    }
+    function renderPreflight(payload) {
+      const startup = payload.startup_preflight || {};
+      const globalSafety = payload.global_safety_preflight || {};
+      const boundary = payload.profile_boundary || {};
+      const rows = [];
+      rows.push(`<div class="${startup.can_start === false ? "bad" : startup.status === "warning" ? "warn" : "good"}">启动状态：${esc(startup.status || "--")} · ${startup.can_start === false ? "blocked" : "can start"}</div>`);
+      (startup.messages || []).forEach((message) => rows.push(`<div class="warn">${esc(message)}</div>`));
+      rows.push(`<div>blocker：${esc(fmtList(startup.blocker_codes))}</div>`);
+      rows.push(`<div>warning：${esc(fmtList(startup.warning_codes))}</div>`);
+      rows.push(`<div>限制下单参数：${esc(fmtList(globalSafety.limiting_params))}</div>`);
+      rows.push(`<div>停机/冷却参数：${esc(fmtList(globalSafety.stop_guard_params))}</div>`);
+      rows.push(`<div>接管挂单参数：${esc(fmtList(globalSafety.takeover_params))}</div>`);
+      rows.push(`<div>禁止跨策略 active：${esc(fmtList(boundary.forbidden_active_params))}</div>`);
+      rows.push(`<div>必需参数缺失：${esc(fmtList(boundary.required_missing_params))}</div>`);
+      preflightPanelEl.innerHTML = rows.join("");
+    }
+    function renderHistory(payload) {
+      const history = Array.isArray(payload.history) ? payload.history : [];
+      if (!history.length) {
+        historyPanelEl.innerHTML = payload.history_error
+          ? `<div class="warn">版本记录读取失败：${esc(payload.history_error)}</div>`
+          : "<div>还没有中央工作台保存版本。</div>";
+        return;
+      }
+      const rows = history.slice().reverse().map((entry) => {
+        const changed = (entry.changed_params || []).slice(0, 8).join(", ") || "--";
+        const restored = entry.restored_version_id ? ` · restored ${entry.restored_version_id}` : "";
+        return `<div><strong>${esc(entry.action || "--")} ${esc(entry.version_id || "--")}</strong>${esc(restored)}<br>${esc(entry.saved_at || "--")}<br>变更：${esc(changed)}</div>`;
+      });
+      rows.unshift(`<div class="${payload.can_rollback ? "good" : "warn"}">回滚状态：${payload.can_rollback ? "可回滚到上一版中央保存记录" : "至少需要两版中央保存记录"}</div>`);
+      historyPanelEl.innerHTML = rows.join("");
+    }
     function currentSelection() {
       return {
         serverId: document.getElementById("server_id").value,
@@ -27098,11 +27205,15 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       latestPayload = payload;
       renderStatus(payload);
       renderSections(payload);
+      renderPreflight(payload);
+      renderHistory(payload);
+      renderDiff();
       metaEl.textContent = `最后刷新 ${new Date().toLocaleString("zh-CN")}`;
     }
-    function currentConfigFromForm() {
+    function currentConfigFromForm(options = {}) {
+      const requireScope = options.requireScope !== false;
       if (!latestPayload || !latestPayload.raw_config) throw new Error("请先刷新参数，再保存。");
-      if (!latestScopeMatchesCurrent()) throw new Error("请先刷新当前目标，再保存。");
+      if (requireScope && !latestScopeMatchesCurrent()) throw new Error("请先刷新当前目标，再保存。");
       const config = {...latestPayload.raw_config};
       sectionsEl.querySelectorAll("input[data-key]").forEach((input) => {
         if (input.getAttribute("data-editable") !== "1") return;
@@ -27128,7 +27239,28 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
       latestPayload = payload;
       renderStatus(payload);
       renderSections(payload);
-      metaEl.textContent = action === "apply" ? "已保存并提交启动。" : "已保存参数。";
+      renderPreflight(payload);
+      renderHistory(payload);
+      renderDiff();
+      const changed = (payload.changed_params || []).length ? `变更 ${payload.changed_params.length} 项` : "无参数变化";
+      const stripped = (payload.stripped_params || []).length ? `，剥离 ${payload.stripped_params.length} 项脏参数` : "";
+      metaEl.textContent = action === "apply" ? `已保存并提交启动，${changed}${stripped}。` : `已保存参数，${changed}${stripped}。`;
+    }
+    async function rollbackConfig() {
+      if (!latestPayload || !latestPayload.raw_config) throw new Error("请先刷新参数，再回滚。");
+      if (!latestScopeMatchesCurrent()) throw new Error("请先刷新当前目标，再回滚。");
+      if (!window.confirm("确认回滚到上一版中央工作台保存配置？不会自动启动策略。")) return;
+      const {serverId, symbol, profile} = currentSelection();
+      metaEl.textContent = "正在回滚上一版配置...";
+      const resp = await fetch("/api/central_strategy_workbench/rollback", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({server_id: serverId, symbol, strategy_profile: profile, config: {}}),
+      });
+      const payload = await resp.json();
+      if (!resp.ok || payload.ok === false) throw new Error(payload.error || `HTTP ${resp.status}`);
+      metaEl.textContent = `已回滚：${payload.rollback_of || "--"} → ${payload.restored_version_id || "--"}，正在刷新...`;
+      await refresh();
     }
     document.getElementById("refresh_btn").addEventListener("click", () => refresh().catch((err) => {
       metaEl.textContent = err.message;
@@ -27136,6 +27268,17 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
     }));
     document.getElementById("save_btn").addEventListener("click", () => submitConfig("save").catch((err) => { metaEl.textContent = err.message; }));
     document.getElementById("apply_btn").addEventListener("click", () => submitConfig("apply").catch((err) => { metaEl.textContent = err.message; }));
+    document.getElementById("rollback_btn").addEventListener("click", () => rollbackConfig().catch((err) => { metaEl.textContent = err.message; }));
+    sectionsEl.addEventListener("input", () => renderDiff());
+    const targetInputs = [
+      document.getElementById("server_id"),
+      document.getElementById("symbol"),
+      document.getElementById("strategy_profile"),
+    ];
+    targetInputs.forEach((input) => {
+      input.addEventListener("input", () => renderDiff());
+      input.addEventListener("change", () => renderDiff());
+    });
   </script>
 </body>
 </html>
@@ -32814,6 +32957,16 @@ def apply_remote_workbench_config(
     return _apply_remote_workbench_config(server_id, symbol, strategy_profile, config)
 
 
+def rollback_remote_workbench_config(
+    server_id: str,
+    symbol: str,
+    strategy_profile: str,
+) -> dict[str, Any]:
+    from .central_strategy_workbench import rollback_remote_workbench_config as _rollback_remote_workbench_config
+
+    return _rollback_remote_workbench_config(server_id, symbol, strategy_profile)
+
+
 def _build_central_strategy_workbench_status(
     server_id: str,
     symbol: str,
@@ -32848,6 +33001,11 @@ def _save_central_strategy_workbench_config(payload: dict[str, Any]) -> dict[str
 def _apply_central_strategy_workbench_config(payload: dict[str, Any]) -> dict[str, Any]:
     server_id, symbol, strategy_profile, config = _central_strategy_workbench_payload_scope(payload)
     return apply_remote_workbench_config(server_id, symbol, strategy_profile, config)
+
+
+def _rollback_central_strategy_workbench_config(payload: dict[str, Any]) -> dict[str, Any]:
+    server_id, symbol, strategy_profile, _config = _central_strategy_workbench_payload_scope(payload)
+    return rollback_remote_workbench_config(server_id, symbol, strategy_profile)
 
 
 def _running_status_server_entries() -> list[dict[str, str]]:
@@ -34558,7 +34716,11 @@ class _Handler(BaseHTTPRequestHandler):
             except Exception as exc:
                 self._send_json({"ok": False, "error": f"{type(exc).__name__}: {exc}"}, status=500)
             return
-        if path in {"/api/central_strategy_workbench/save", "/api/central_strategy_workbench/apply"}:
+        if path in {
+            "/api/central_strategy_workbench/save",
+            "/api/central_strategy_workbench/apply",
+            "/api/central_strategy_workbench/rollback",
+        }:
             try:
                 content_len = int(self.headers.get("Content-Length", "0"))
             except ValueError:
@@ -34579,6 +34741,8 @@ class _Handler(BaseHTTPRequestHandler):
             try:
                 if path.endswith("/apply"):
                     result = _apply_central_strategy_workbench_config(payload)
+                elif path.endswith("/rollback"):
+                    result = _rollback_central_strategy_workbench_config(payload)
                 else:
                     result = _save_central_strategy_workbench_config(payload)
                 self._send_json({"ok": True, **result}, status=200)

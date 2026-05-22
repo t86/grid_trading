@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import Mock, patch
 
 from grid_optimizer.central_strategy_workbench import (
+    REMOTE_ROLLBACK_CONTROL_SCRIPT,
+    REMOTE_WRITE_CONTROL_SCRIPT,
     apply_remote_workbench_config,
     build_workbench_payload,
     get_central_strategy_target,
     list_central_strategy_targets,
+    rollback_remote_workbench_config,
     save_remote_workbench_config,
 )
 
@@ -90,7 +97,43 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
 
     @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
     def test_save_remote_workbench_config_writes_scoped_control_file(self, mock_run) -> None:
-        mock_run.return_value = Mock(returncode=0, stdout="saved\n", stderr="")
+        mock_run.side_effect = [
+            Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "changed_params": ["max_new_orders"],
+                        "history_entry": {
+                            "version_id": "v2",
+                            "action": "save",
+                            "scope": "114/PHAROSUSDT/pharosusdt_hedge_best_quote_maker_volume_v1",
+                            "changed_params": ["max_new_orders"],
+                        },
+                    },
+                ),
+                stderr="",
+            ),
+            Mock(
+                returncode=0,
+                stdout=json.dumps(
+                    [
+                        {
+                            "version_id": "v1",
+                            "action": "save",
+                            "scope": "114/PHAROSUSDT/pharosusdt_hedge_best_quote_maker_volume_v1",
+                            "changed_params": ["max_total_notional"],
+                        },
+                        {
+                            "version_id": "v2",
+                            "action": "save",
+                            "scope": "114/PHAROSUSDT/pharosusdt_hedge_best_quote_maker_volume_v1",
+                            "changed_params": ["max_new_orders"],
+                        },
+                    ],
+                ),
+                stderr="",
+            ),
+        ]
 
         result = save_remote_workbench_config(
             "114",
@@ -113,17 +156,63 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
 
         self.assertTrue(result["saved"])
         self.assertEqual(result["scope"]["server_id"], "114")
-        command = mock_run.call_args.args[0]
+        self.assertTrue(result["can_rollback"])
+        self.assertEqual([item["version_id"] for item in result["history"]], ["v1", "v2"])
+        self.assertEqual(result["changed_params"], ["max_new_orders"])
+        command = mock_run.call_args_list[0].args[0]
         self.assertEqual(command[0], "ssh")
         self.assertEqual(command[1], "srv-43-155-163-114")
         self.assertEqual(len(command), 3)
         self.assertIn("python3 -c ", command[2])
         self.assertIn("/home/ubuntu/wangge/output/pharosusdt_loop_runner_control.json", command[2])
         self.assertNotIn("\nimport json", command[2])
-        written = json.loads(mock_run.call_args.kwargs["input"])
+        written = json.loads(mock_run.call_args_list[0].kwargs["input"])
         self.assertEqual(written["symbol"], "PHAROSUSDT")
         self.assertEqual(written["strategy_profile"], "pharosusdt_hedge_best_quote_maker_volume_v1")
         self.assertEqual(written["_central_workbench_action"], "save")
+        self.assertIn("pharosusdt_loop_runner_control.json.central_workbench_history.jsonl", command[2])
+
+    def test_remote_write_script_records_history_entry_and_changed_params(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "pharosusdt_loop_runner_control.json"
+            history_path = Path(tmpdir) / "pharosusdt_loop_runner_control.json.central_workbench_history.jsonl"
+            control_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "PHAROSUSDT",
+                        "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                        "max_new_orders": 4,
+                    },
+                ),
+                encoding="utf-8",
+            )
+
+            completed = subprocess.run(
+                [sys.executable, "-c", REMOTE_WRITE_CONTROL_SCRIPT, str(control_path), str(history_path)],
+                capture_output=True,
+                check=False,
+                input=json.dumps(
+                    {
+                        "symbol": "PHAROSUSDT",
+                        "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                        "max_new_orders": 5,
+                        "_central_workbench_action": "save",
+                        "_central_workbench_scope": "114/PHAROSUSDT/pharosusdt_hedge_best_quote_maker_volume_v1",
+                        "_central_workbench_stripped_params": ["old_unknown_knob"],
+                    },
+                ),
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue(summary["version_id"])
+            self.assertEqual(summary["changed_params"], ["max_new_orders"])
+            self.assertEqual(summary["stripped_params"], ["old_unknown_knob"])
+            history = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(len(history), 1)
+            self.assertEqual(history[0]["after_config"]["max_new_orders"], 5)
+            self.assertEqual(json.loads(control_path.read_text(encoding="utf-8"))["max_new_orders"], 5)
 
     @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
     def test_save_remote_workbench_config_strips_non_writable_profile_params(self, mock_run) -> None:
@@ -151,7 +240,7 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
             },
         )
 
-        written = json.loads(mock_run.call_args.kwargs["input"])
+        written = json.loads(mock_run.call_args_list[0].kwargs["input"])
         self.assertNotIn("synthetic_flow_sleeve_enabled", written)
         self.assertNotIn("adaptive_step_max_scale", written)
         self.assertNotIn("old_unknown_knob", written)
@@ -159,6 +248,83 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
             result["stripped_params"],
             ["adaptive_step_max_scale", "old_unknown_knob", "synthetic_flow_sleeve_enabled"],
         )
+
+    @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
+    def test_rollback_remote_workbench_config_restores_previous_saved_version(self, mock_run) -> None:
+        mock_run.return_value = Mock(
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "rolled_back": True,
+                    "rollback_of": "v2",
+                    "restored_version_id": "v1",
+                    "changed_params": ["max_new_orders"],
+                    "history_entry": {"version_id": "rb1", "action": "rollback"},
+                },
+            ),
+            stderr="",
+        )
+
+        result = rollback_remote_workbench_config(
+            "114",
+            "PHAROSUSDT",
+            "pharosusdt_hedge_best_quote_maker_volume_v1",
+        )
+
+        self.assertTrue(result["rolled_back"])
+        self.assertEqual(result["restored_version_id"], "v1")
+        command = mock_run.call_args.args[0]
+        self.assertEqual(command[0], "ssh")
+        self.assertEqual(command[1], "srv-43-155-163-114")
+        self.assertIn("pharosusdt_loop_runner_control.json.central_workbench_history.jsonl", command[2])
+
+    def test_remote_rollback_script_uses_previous_clean_after_config(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            control_path = Path(tmpdir) / "pharosusdt_loop_runner_control.json"
+            history_path = Path(tmpdir) / "pharosusdt_loop_runner_control.json.central_workbench_history.jsonl"
+            scope = "114/PHAROSUSDT/pharosusdt_hedge_best_quote_maker_volume_v1"
+            history_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "version_id": "v1",
+                                "action": "save",
+                                "scope": scope,
+                                "after_config": {"symbol": "PHAROSUSDT", "max_new_orders": 4},
+                            },
+                        ),
+                        json.dumps(
+                            {
+                                "version_id": "v2",
+                                "action": "save",
+                                "scope": scope,
+                                "after_config": {"symbol": "PHAROSUSDT", "max_new_orders": 5},
+                            },
+                        ),
+                    ],
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            control_path.write_text(json.dumps({"symbol": "PHAROSUSDT", "max_new_orders": 5}), encoding="utf-8")
+
+            completed = subprocess.run(
+                [sys.executable, "-c", REMOTE_ROLLBACK_CONTROL_SCRIPT, str(control_path), str(history_path), scope],
+                capture_output=True,
+                check=False,
+                text=True,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            summary = json.loads(completed.stdout)
+            self.assertTrue(summary["rolled_back"])
+            self.assertEqual(summary["rollback_of"], "v2")
+            self.assertEqual(summary["restored_version_id"], "v1")
+            self.assertEqual(json.loads(control_path.read_text(encoding="utf-8"))["max_new_orders"], 4)
+            history = [json.loads(line) for line in history_path.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual(history[-1]["action"], "rollback")
+            self.assertEqual(history[-1]["after_config"]["max_new_orders"], 4)
 
     def test_save_remote_workbench_config_rejects_scope_mismatch(self) -> None:
         with self.assertRaisesRegex(ValueError, "strategy_profile"):
@@ -198,8 +364,8 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
 
         self.assertTrue(result["saved"])
         self.assertTrue(result["started"])
-        self.assertEqual(mock_run.call_count, 2)
-        restart_command = mock_run.call_args_list[1].args[0]
+        self.assertEqual(mock_run.call_count, 3)
+        restart_command = mock_run.call_args_list[2].args[0]
         self.assertEqual(
             restart_command,
             ["ssh", "srv-43-131-232-150", "/usr/local/bin/grid-saved-runner-api2", "restart", "PHAROSUSDT"],
