@@ -6346,6 +6346,62 @@ def _runtime_guard_mark_loss_stop(
     recovery.pop("recovered_at", None)
 
 
+def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now: datetime | None = None) -> dict[str, Any]:
+    report = {"blocked": False, "reason": None}
+    if not _runtime_guard_loss_recovery_enabled(args):
+        return report
+    state_path_text = str(getattr(args, "state_path", "") or "").strip()
+    if not state_path_text:
+        return report
+    state = read_json(Path(state_path_text)) or {}
+    if not isinstance(state, dict):
+        return report
+    recovery = state.get("runtime_guard_loss_recovery")
+    if not isinstance(recovery, dict):
+        return report
+    stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+    if stopped_at is None:
+        return report
+    recovered_at = _parse_state_datetime(recovery.get("recovered_at"))
+    if recovered_at is not None and recovered_at >= stopped_at:
+        return report
+    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cooldown_seconds = max(
+        _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", recovery.get("cooldown_seconds", 180.0))),
+        0.0,
+    )
+    elapsed = max((checked_at - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+    return {
+        "blocked": True,
+        "reason": "runtime_guard_loss_cooling_down",
+        "stopped_at": stopped_at.isoformat(),
+        "elapsed_seconds": elapsed,
+        "cooldown_seconds": cooldown_seconds,
+        "last_reason": recovery.get("last_reason"),
+        "last_rolling_hourly_loss": recovery.get("last_rolling_hourly_loss"),
+    }
+
+
+def _suppress_place_orders_during_runtime_guard_loss_cooldown(
+    *,
+    actions: dict[str, Any],
+    args: argparse.Namespace,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    cooldown = _runtime_guard_loss_recovery_blocks_submit(args, now=now)
+    if not cooldown.get("blocked"):
+        return actions
+    updated = dict(actions)
+    dropped = [dict(item) for item in list(updated.get("place_orders") or []) if isinstance(item, dict)]
+    updated["place_orders"] = []
+    updated["place_count"] = 0
+    updated["runtime_guard_loss_cooldown"] = cooldown
+    if dropped:
+        updated["place_orders_dropped_by_runtime_guard_loss_cooldown"] = dropped
+        updated["dropped_place_count_by_runtime_guard_loss_cooldown"] = len(dropped)
+    return updated
+
+
 def _filter_pnl_events_after(pnl_events: list[dict[str, Any]], since: datetime | None) -> list[dict[str, Any]]:
     if since is None:
         return pnl_events
@@ -6702,7 +6758,7 @@ def _maybe_handle_runtime_guard(
                 rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
             )
         _write_json(state_path, state)
-    if list(flatten_snapshot.get("orders", [])):
+    if list(flatten_snapshot.get("orders", [])) and not (loss_only_stop and _runtime_guard_loss_recovery_enabled(args)):
         flatten_result = _start_futures_flatten_process(args.symbol.upper().strip(), allow_loss=True)
     summary = _build_runtime_guard_stop_summary(
         args=args,
@@ -16342,6 +16398,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         plan_report=plan_report,
         strategy_mode=strategy_mode,
     )
+    validation["actions"] = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+        actions=validation["actions"],
+        args=args,
+    )
+    if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
+        validation["ok"] = validation["actions"].get("cancel_count", 0) > 0
 
     report = {
         "plan_json": str(args.plan_json),
@@ -16649,6 +16715,17 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
             step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         )
+    validation["actions"] = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+        actions=validation["actions"],
+        args=args,
+    )
+    if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        if "runtime_guard_loss_cooling_down blocks new place orders" not in validation["errors"]:
+            validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
+        validation["ok"] = validation["actions"].get("cancel_count", 0) > 0
     configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
     max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
     effective_place_budget = (
@@ -18510,6 +18587,21 @@ def main() -> None:
             cycle += 1
             cycle_started_at = datetime.now(timezone.utc)
             try:
+                pre_guard_audit_sync = {
+                    "trade_appended": 0,
+                    "income_appended": 0,
+                    "error": None,
+                }
+                try:
+                    pre_guard_audit_sync = _sync_account_audit(
+                        symbol=args.symbol,
+                        cycle=cycle,
+                        summary_path=summary_path,
+                        recv_window=args.recv_window,
+                        args=args,
+                    )
+                except Exception as audit_exc:
+                    pre_guard_audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
                 runtime_guard_summary = _maybe_handle_runtime_guard(
                     args=args,
                     cycle=cycle,
@@ -18517,6 +18609,13 @@ def main() -> None:
                     summary_path=summary_path,
                 )
                 if runtime_guard_summary is not None:
+                    runtime_guard_summary["pre_guard_trade_audit_appended"] = int(
+                        pre_guard_audit_sync.get("trade_appended", 0) or 0
+                    )
+                    runtime_guard_summary["pre_guard_income_audit_appended"] = int(
+                        pre_guard_audit_sync.get("income_appended", 0) or 0
+                    )
+                    runtime_guard_summary["pre_guard_audit_error"] = pre_guard_audit_sync.get("error")
                     _append_jsonl(summary_path, runtime_guard_summary)
                     _print_cycle_summary(runtime_guard_summary)
                     consecutive_errors = 0
@@ -19172,6 +19271,9 @@ def main() -> None:
                     "reconcile_expected_actual_net_qty": _safe_float(reconcile_snapshot.get("expected_actual_net_qty")),
                     "reconcile_actual_actual_net_qty": _safe_float(reconcile_snapshot.get("actual_actual_net_qty")),
                     "executed": bool(submit_report.get("executed")),
+                    "pre_guard_trade_audit_appended": int(pre_guard_audit_sync.get("trade_appended", 0) or 0),
+                    "pre_guard_income_audit_appended": int(pre_guard_audit_sync.get("income_appended", 0) or 0),
+                    "pre_guard_audit_error": pre_guard_audit_sync.get("error"),
                     "trade_audit_appended": int(audit_sync.get("trade_appended", 0) or 0),
                     "income_audit_appended": int(audit_sync.get("income_appended", 0) or 0),
                     "trade_database": audit_sync.get("database"),

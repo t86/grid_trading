@@ -8,7 +8,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
-from grid_optimizer.loop_runner import _cancel_futures_strategy_orders, _maybe_handle_runtime_guard
+from grid_optimizer.loop_runner import (
+    _cancel_futures_strategy_orders,
+    _maybe_handle_runtime_guard,
+    _suppress_place_orders_during_runtime_guard_loss_cooldown,
+)
 
 
 class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
@@ -43,7 +47,7 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
-    def test_runtime_guard_loss_stop_allows_loss_flatten(
+    def test_runtime_guard_loss_stop_uses_cooldown_without_flatten(
         self,
         mock_inputs,
         mock_credentials,
@@ -99,9 +103,46 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
         self.assertEqual(summary["runtime_status"], "cooldown")
         self.assertFalse(summary["stop_triggered"])
         self.assertEqual(summary["stop_reason"], "rolling_hourly_loss_cooling_down")
-        self.assertTrue(summary["flatten_started"])
+        self.assertFalse(summary["flatten_started"])
         mock_snapshot.assert_called_once_with("ORDIUSDC", "key", "secret", allow_loss=True)
-        mock_start_flatten.assert_called_once_with("ORDIUSDC", allow_loss=True)
+        mock_start_flatten.assert_not_called()
+
+    def test_submit_place_orders_are_suppressed_while_loss_recovery_is_unrecovered(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            stopped_at = datetime(2026, 5, 3, 0, 0, tzinfo=timezone.utc)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_guard_loss_recovery": {
+                            "stopped_at": stopped_at.isoformat(),
+                            "last_reason": "rolling_hourly_loss_limit_hit",
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                state_path=str(state_path),
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+            )
+
+            actions = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+                actions={
+                    "place_count": 1,
+                    "cancel_count": 0,
+                    "place_orders": [{"role": "entry_short", "side": "SELL"}],
+                    "cancel_orders": [],
+                },
+                args=args,
+                now=stopped_at + timedelta(seconds=30),
+            )
+
+            self.assertEqual(actions["place_count"], 0)
+            self.assertEqual(actions["place_orders"], [])
+            self.assertEqual(actions["runtime_guard_loss_cooldown"]["reason"], "runtime_guard_loss_cooling_down")
+            self.assertEqual(actions["dropped_place_count_by_runtime_guard_loss_cooldown"], 1)
 
     @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
