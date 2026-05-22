@@ -16496,6 +16496,15 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
     expected_short_qty = _safe_float(plan_report.get("current_short_qty"))
     expected_actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
+    expected_exchange_long_qty = expected_long_qty
+    expected_exchange_short_qty = expected_short_qty
+    if _is_hedge_best_quote_maker_volume_mode(strategy_mode):
+        best_quote_metrics = plan_report.get("best_quote_maker_volume")
+        if isinstance(best_quote_metrics, dict):
+            reduce_freeze = best_quote_metrics.get("reduce_freeze")
+            if isinstance(reduce_freeze, dict) and reduce_freeze.get("isolates_risk_metrics"):
+                expected_exchange_long_qty += max(_safe_float(reduce_freeze.get("frozen_long_qty")), 0.0)
+                expected_exchange_short_qty += max(_safe_float(reduce_freeze.get("frozen_short_qty")), 0.0)
     if _uses_exchange_hedge_position_sides(strategy_mode):
         current_long_position = extract_symbol_position(account_info, symbol, "LONG")
         current_short_position = extract_symbol_position(account_info, symbol, "SHORT")
@@ -16561,9 +16570,9 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     elif _is_one_way_short_mode(strategy_mode):
         if abs(current_short_qty - expected_short_qty) > 1e-9:
             raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
-    elif abs(current_long_qty - expected_long_qty) > 1e-9:
+    elif abs(current_long_qty - expected_exchange_long_qty) > 1e-9:
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
-    if _uses_exchange_hedge_position_sides(strategy_mode) and abs(current_short_qty - expected_short_qty) > 1e-9:
+    if _uses_exchange_hedge_position_sides(strategy_mode) and abs(current_short_qty - expected_exchange_short_qty) > 1e-9:
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
 
     validation["actions"] = cap_reduce_only_place_orders_to_position(
