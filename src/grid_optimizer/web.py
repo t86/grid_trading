@@ -6912,6 +6912,22 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       return value;
     }
 
+    function promptPositiveQty(message, maxValue) {
+      const raw = window.prompt(message, String(maxValue ?? 0));
+      if (raw === null) return null;
+      const value = Number(raw);
+      const cap = Number(maxValue);
+      if (!Number.isFinite(value) || value <= 0) {
+        window.alert("请输入大于 0 的数量");
+        return null;
+      }
+      if (Number.isFinite(cap) && cap > 0 && value > cap) {
+        window.alert(`数量不能超过 ${fmtNum(cap, 8)}`);
+        return null;
+      }
+      return value;
+    }
+
     function scheduleAutoRefresh() {
       if (state.timer) {
         clearInterval(state.timer);
@@ -6945,12 +6961,23 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     drawerApplyBtn.addEventListener("click", () => saveCurrentConfig(true));
     drawerStopBtn.addEventListener("click", () => stopAndFlattenCurrentRunner());
     frozenPairReleaseBtn.addEventListener("click", () => {
+      const ledger = frozenInventory(state.drawerCard);
+      const qty = promptPositiveQty("对等释放数量", ledger.offset_qty);
+      if (qty === null) return;
       if (window.confirm("确认提交一次性对等释放指令？runner 会在波动平稳且预估盈亏覆盖 buffer 时下 reduce-only IOC 对等释放单。")) {
-        updateFrozenInventory("pair_release");
+        updateFrozenInventory("pair_release", { requested_qty: qty });
       }
     });
-    frozenClearLongBtn.addEventListener("click", () => updateFrozenInventory("reduce_long"));
-    frozenClearShortBtn.addEventListener("click", () => updateFrozenInventory("reduce_short"));
+    frozenClearLongBtn.addEventListener("click", () => {
+      const ledger = frozenInventory(state.drawerCard);
+      const qty = promptPositiveQty("清理冻结多仓数量", ledger.long_qty);
+      if (qty !== null) updateFrozenInventory("reduce_long", { requested_qty: qty });
+    });
+    frozenClearShortBtn.addEventListener("click", () => {
+      const ledger = frozenInventory(state.drawerCard);
+      const qty = promptPositiveQty("清理冻结空仓数量", ledger.short_qty);
+      if (qty !== null) updateFrozenInventory("reduce_short", { requested_qty: qty });
+    });
     frozenResetBtn.addEventListener("click", () => {
       if (window.confirm("确认仅清空冻结仓位账本？这不会向交易所下单，只用于账本纠错。")) {
         updateFrozenInventory("reset");
@@ -10093,8 +10120,16 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
         elif action in {"reduce_long", "reduce_short"}:
             directive = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
             side_key = "long" if action == "reduce_long" else "short"
+            side_qty = ledger["long_qty"] if side_key == "long" else ledger["short_qty"]
+            requested_qty = max(_safe_float(payload.get("requested_qty"), "requested_qty"), 0.0)
+            if requested_qty <= 1e-12:
+                raise ValueError("requested_qty must be > 0")
+            requested_qty = min(requested_qty, side_qty)
+            if requested_qty <= 1e-12:
+                raise ValueError(f"frozen {side_key} qty is empty")
             directive[side_key] = {
                 "requested": True,
+                "requested_qty": requested_qty,
                 "requested_at": now_iso,
                 "source": "running_status_ui",
             }
@@ -10102,8 +10137,12 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
         elif action == "pair_release":
             if ledger["offset_qty"] <= 1e-12:
                 raise ValueError("frozen long/short offset qty is empty")
+            requested_qty = max(_safe_float(payload.get("requested_qty"), "requested_qty"), 0.0)
+            if requested_qty <= 1e-12:
+                raise ValueError("requested_qty must be > 0")
             state["best_quote_frozen_inventory_pair_release"] = {
                 "requested": True,
+                "requested_qty": min(requested_qty, ledger["offset_qty"]),
                 "requested_at": now_iso,
                 "source": "running_status_ui",
             }

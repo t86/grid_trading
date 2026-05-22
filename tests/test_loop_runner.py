@@ -1000,6 +1000,30 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(order["execution_type"], "aggressive")
         self.assertEqual(order["time_in_force"], "IOC")
 
+    def test_best_quote_frozen_inventory_manual_reduce_honors_requested_qty(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},
+            "best_quote_frozen_inventory_manual_reduce": {
+                "long": {"requested": True, "requested_qty": 12.0}
+            },
+        }
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report={},
+            bid_price=1.01,
+            ask_price=1.02,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertEqual(plan["sell_orders"][0]["qty"], 12.0)
+
     def test_best_quote_frozen_pair_release_places_paired_ioc_when_stable_and_profitable(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
@@ -1050,6 +1074,36 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(buy_order["time_in_force"], "IOC")
         self.assertTrue(sell_order["frozen_inventory_pair_release"])
         self.assertTrue(buy_order["frozen_inventory_pair_release"])
+
+    def test_best_quote_frozen_pair_release_honors_requested_qty(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={
+                "frozen_long_qty": 50.0,
+                "frozen_short_qty": 30.0,
+                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.03},
+            },
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=100.0,
+            min_profit_ratio=0.001,
+            max_slippage_ticks=2,
+            requested_qty=7.0,
+        )
+
+        self.assertTrue(release["active"])
+        self.assertEqual(release["release_qty"], 7.0)
+        self.assertEqual(plan["sell_orders"][0]["qty"], 7.0)
+        self.assertEqual(plan["buy_orders"][0]["qty"], 7.0)
 
     def test_best_quote_frozen_pair_release_blocks_when_market_not_stable(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}

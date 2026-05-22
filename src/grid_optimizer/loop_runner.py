@@ -2618,6 +2618,7 @@ def apply_best_quote_frozen_inventory_manual_reduce(
         frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
         if not requested:
             return None
+        requested_qty = max(_safe_float((directive.get(side_key) or {}).get("requested_qty")), 0.0)
         if frozen_qty <= 1e-12:
             directive.pop(side_key, None)
             reduce_report["blocked_reasons"].append(f"{side_key}_frozen_qty_empty")
@@ -2628,7 +2629,7 @@ def apply_best_quote_frozen_inventory_manual_reduce(
         if price <= 0:
             reduce_report["blocked_reasons"].append(f"{side_key}_missing_price")
             return None
-        qty = _round_order_qty(frozen_qty, step_size)
+        qty = _round_order_qty(min(frozen_qty, requested_qty) if requested_qty > 0 else frozen_qty, step_size)
         if qty <= 0 or (min_qty is not None and qty < _safe_float(min_qty)):
             reduce_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
             return None
@@ -2684,6 +2685,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     max_notional: float,
     min_profit_ratio: float,
     max_slippage_ticks: int,
+    requested_qty: float | None = None,
 ) -> dict[str, Any]:
     ledger = dict(report.get("ledger") or {})
     release_report = {
@@ -2723,6 +2725,9 @@ def apply_best_quote_frozen_inventory_pair_release(
     safe_max_notional = max(_safe_float(max_notional), 0.0)
     if safe_max_notional > 0:
         max_qty = min(max_qty, safe_max_notional / mid_price)
+    safe_requested_qty = max(_safe_float(requested_qty), 0.0) if requested_qty is not None else 0.0
+    if safe_requested_qty > 0:
+        max_qty = min(max_qty, safe_requested_qty)
     qty = _round_order_qty(max_qty, step_size)
     safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
     if qty <= 0 or (safe_min_qty > 0 and qty + 1e-12 < safe_min_qty):
@@ -15084,11 +15089,22 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             max_notional=best_quote_frozen_pair_release_max_notional,
             min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
             max_slippage_ticks=best_quote_frozen_pair_release_max_slippage_ticks,
+            requested_qty=(
+                _safe_float(best_quote_frozen_pair_release_directive.get("requested_qty"))
+                if best_quote_frozen_pair_release_requested
+                else None
+            ),
         )
         best_quote_frozen_pair_release.update(
             {
                 "one_shot_requested": best_quote_frozen_pair_release_requested,
                 "one_shot_requested_at": str(best_quote_frozen_pair_release_directive.get("requested_at") or ""),
+                "one_shot_requested_qty": max(
+                    _safe_float(best_quote_frozen_pair_release_directive.get("requested_qty")),
+                    0.0,
+                )
+                if best_quote_frozen_pair_release_requested
+                else 0.0,
                 "max_notional": best_quote_frozen_pair_release_max_notional,
                 "min_profit_ratio": best_quote_frozen_pair_release_min_profit_ratio,
                 "max_slippage_ticks": best_quote_frozen_pair_release_max_slippage_ticks,
