@@ -48,6 +48,7 @@ from grid_optimizer.loop_runner import (
     _apply_best_quote_reduce_freeze,
     _cap_best_quote_reduce_orders_to_managed_inventory,
     apply_best_quote_frozen_inventory_manual_reduce,
+    apply_best_quote_frozen_inventory_manual_limit,
     apply_best_quote_frozen_inventory_pair_release,
     _position_unrealized_or_estimate,
     _is_long_exit_order,
@@ -151,6 +152,15 @@ class LoopRunnerTests(unittest.TestCase):
                     "source": "running_status_ui",
                 }
             }
+            manual_limit = {
+                "short": {
+                    "requested": True,
+                    "requested_qty": 100.0,
+                    "price": 0.7,
+                    "requested_at": "2026-05-22T05:58:00+00:00",
+                    "source": "running_status_ui",
+                }
+            }
             pair_release = {
                 "requested": True,
                 "requested_at": "2026-05-22T06:05:00+00:00",
@@ -162,6 +172,7 @@ class LoopRunnerTests(unittest.TestCase):
                         "version": "old",
                         "best_quote_frozen_inventory": frozen_ledger,
                         "best_quote_frozen_inventory_manual_reduce": manual_reduce,
+                        "best_quote_frozen_inventory_manual_limit": manual_limit,
                         "best_quote_frozen_inventory_pair_release": pair_release,
                         "runtime_guard_loss_recovery": {"cooldown": True},
                     },
@@ -197,6 +208,7 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(state["best_quote_frozen_inventory"], frozen_ledger)
         self.assertEqual(state["best_quote_frozen_inventory_manual_reduce"], manual_reduce)
+        self.assertEqual(state["best_quote_frozen_inventory_manual_limit"], manual_limit)
         self.assertEqual(state["best_quote_frozen_inventory_pair_release"], pair_release)
         self.assertNotIn("runtime_guard_loss_recovery", state)
         self.assertTrue(state["startup_pending"])
@@ -1024,6 +1036,82 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertEqual(plan["sell_orders"][0]["qty"], 12.0)
         self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
+
+    def test_best_quote_frozen_inventory_manual_limit_places_persistent_post_only_order(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 50.0,
+                "long_entry_price": 1.0,
+                "long_manual_limit_isolated_qty": 12.0,
+            },
+            "best_quote_frozen_inventory_manual_limit": {
+                "long": {"requested": True, "requested_qty": 12.0, "price": 1.02}
+            },
+        }
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_frozen_inventory_manual_limit(
+            plan=plan,
+            state=state,
+            bid_price=1.01,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertTrue(report["active"])
+        order = plan["sell_orders"][0]
+        self.assertEqual(order["role"], "frozen_inventory_manual_limit_long")
+        self.assertEqual(order["side"], "SELL")
+        self.assertEqual(order["position_side"], "LONG")
+        self.assertEqual(order["qty"], 12.0)
+        self.assertEqual(order["price"], 1.02)
+        self.assertTrue(order["force_reduce_only"])
+        self.assertEqual(order["time_in_force"], "GTX")
+        self.assertIn("best_quote_frozen_inventory_manual_limit", state)
+
+    def test_best_quote_frozen_pair_release_excludes_manual_limit_isolated_qty(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [{"qty": 150.0, "entry_price": 1.0}],
+                "short_lots": [{"qty": 150.0, "entry_price": 1.05}],
+                "long_manual_limit_isolated_qty": 80.0,
+            }
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=150.0,
+            current_short_qty=150.0,
+            current_long_avg_price=1.0,
+            current_short_avg_price=1.05,
+            mid_price=1.01,
+        )
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report=report,
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=100.0,
+            min_side_notional=0.0,
+            min_profit_ratio=0.0,
+            max_slippage_ticks=2,
+        )
+
+        self.assertTrue(release["active"])
+        self.assertEqual(report["frozen_pair_eligible_long_qty"], 70.0)
+        self.assertEqual(release["release_qty"], 70.0)
 
     def test_best_quote_frozen_pair_release_places_paired_ioc_when_stable_and_profitable(self) -> None:
         state: dict[str, object] = {

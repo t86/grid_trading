@@ -6168,6 +6168,8 @@ def _render_running_status_page(symbol: str | None = None) -> str:
               <div class="rs-drawer-action-group">
                 <button id="frozen_set_btn" type="button">手动设置</button>
                 <button id="frozen_pair_release_btn" type="button">对等释放</button>
+                <button id="frozen_limit_long_btn" type="button">限价平冻结多</button>
+                <button id="frozen_limit_short_btn" type="button">限价平冻结空</button>
                 <button id="frozen_clear_long_btn" type="button">清理冻结多仓</button>
                 <button id="frozen_clear_short_btn" type="button">清理冻结空仓</button>
                 <button id="frozen_reset_btn" type="button" class="danger">仅清空账本</button>
@@ -6222,6 +6224,8 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     const frozenInventoryBodyEl = document.getElementById("frozen_inventory_body");
     const frozenSetBtn = document.getElementById("frozen_set_btn");
     const frozenPairReleaseBtn = document.getElementById("frozen_pair_release_btn");
+    const frozenLimitLongBtn = document.getElementById("frozen_limit_long_btn");
+    const frozenLimitShortBtn = document.getElementById("frozen_limit_short_btn");
     const frozenClearLongBtn = document.getElementById("frozen_clear_long_btn");
     const frozenClearShortBtn = document.getElementById("frozen_clear_short_btn");
     const frozenResetBtn = document.getElementById("frozen_reset_btn");
@@ -6497,6 +6501,10 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         short_entry_price: Number(ledger.short_entry_price || 0),
         long_frozen_at: ledger.long_frozen_at || "",
         short_frozen_at: ledger.short_frozen_at || "",
+        long_manual_limit_isolated_qty: Number(ledger.long_manual_limit_isolated_qty || 0),
+        short_manual_limit_isolated_qty: Number(ledger.short_manual_limit_isolated_qty || 0),
+        pair_eligible_long_qty: Number(ledger.pair_eligible_long_qty || 0),
+        pair_eligible_short_qty: Number(ledger.pair_eligible_short_qty || 0),
         offset_qty: Number(ledger.offset_qty || 0),
         offset_notional: Number(ledger.offset_notional || 0),
       };
@@ -6736,7 +6744,9 @@ def _render_running_status_page(symbol: str | None = None) -> str:
         <div class="rs-ledger-item">冻结多仓<strong>${fmtNum(ledger.long_qty, 6)} @ ${fmtNum(ledger.long_entry_price, 8)}</strong><span>${fmtNum(ledger.long_notional, 2)}U · ${escapeHtml(ledger.long_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">冻结空仓<strong>${fmtNum(ledger.short_qty, 6)} @ ${fmtNum(ledger.short_entry_price, 8)}</strong><span>${fmtNum(ledger.short_notional, 2)}U · ${escapeHtml(ledger.short_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">多空可抵扣<strong>${fmtNum(ledger.offset_qty, 6)}</strong><span>${fmtNum(ledger.offset_notional, 2)}U</span></div>
-        <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>清理按钮会写入策略指令，由 runner 下 reduce-only 单处理。</span></div>
+        <div class="rs-ledger-item">限价隔离<strong>多 ${fmtNum(ledger.long_manual_limit_isolated_qty, 6)} / 空 ${fmtNum(ledger.short_manual_limit_isolated_qty, 6)}</strong><span>已限价挂单接管的冻结仓位不再参与对等释放。</span></div>
+        <div class="rs-ledger-item">配对可用<strong>多 ${fmtNum(ledger.pair_eligible_long_qty, 6)} / 空 ${fmtNum(ledger.pair_eligible_short_qty, 6)}</strong><span>对等释放只使用未隔离冻结仓位。</span></div>
+        <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>清理/限价按钮会写入策略指令，由 runner 下 reduce-only 单处理。</span></div>
         <div class="rs-ledger-item">释放状态<strong>${escapeHtml(releaseStatus)}</strong><span>${escapeHtml(releaseReasons || stableText)}</span></div>
         <div class="rs-ledger-item">释放数量<strong>${fmtNum(release.release_qty, 6)}</strong><span>${fmtNum(release.release_notional, 2)}U · 上限 ${fmtNum(release.max_notional, 2)}U</span></div>
         <div class="rs-ledger-item">释放盈亏<strong>${escapeHtml(pnlText)}</strong><span>预估 pair PnL / 要求 buffer</span></div>
@@ -6745,6 +6755,8 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       frozenClearLongBtn.disabled = !editable || !(ledger.long_qty > 0);
       frozenClearShortBtn.disabled = !editable || !(ledger.short_qty > 0);
       frozenPairReleaseBtn.disabled = !editable || !(ledger.offset_qty > 0);
+      frozenLimitLongBtn.disabled = !editable || !(ledger.pair_eligible_long_qty > 0);
+      frozenLimitShortBtn.disabled = !editable || !(ledger.pair_eligible_short_qty > 0);
       frozenResetBtn.disabled = !editable || !active;
       frozenSetBtn.disabled = !editable;
     }
@@ -6907,7 +6919,9 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       if (!card) return;
       const actionLabel = action === "pair_release"
         ? "提交冻结多空对等释放指令"
-        : (action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本");
+        : (action === "limit_long" || action === "limit_short"
+          ? "提交冻结仓位限价平仓指令"
+          : (action === "reduce_long" || action === "reduce_short" ? "提交冻结仓位清理指令" : "更新冻结账本"));
       setDrawerStatus(`正在${actionLabel} ${card.symbol}...`);
       try {
         const resp = await fetch("/api/runner/frozen_inventory", {
@@ -7012,6 +7026,22 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       const ledger = frozenInventory(state.drawerCard);
       const qty = promptPositiveQty("清理冻结空仓数量", ledger.short_qty);
       if (qty !== null) updateFrozenInventory("reduce_short", { requested_qty: qty });
+    });
+    frozenLimitLongBtn.addEventListener("click", () => {
+      const ledger = frozenInventory(state.drawerCard);
+      const qty = promptPositiveQty("限价平冻结多仓数量", ledger.pair_eligible_long_qty);
+      if (qty === null) return;
+      const price = promptNumber("限价平冻结多仓价格（SELL LONG）", ledger.long_entry_price);
+      if (price === null || price <= 0) return;
+      updateFrozenInventory("limit_long", { requested_qty: qty, price });
+    });
+    frozenLimitShortBtn.addEventListener("click", () => {
+      const ledger = frozenInventory(state.drawerCard);
+      const qty = promptPositiveQty("限价平冻结空仓数量", ledger.pair_eligible_short_qty);
+      if (qty === null) return;
+      const price = promptNumber("限价平冻结空仓价格（BUY SHORT）", ledger.short_entry_price);
+      if (price === null || price <= 0) return;
+      updateFrozenInventory("limit_short", { requested_qty: qty, price });
     });
     frozenResetBtn.addEventListener("click", () => {
       if (window.confirm("确认仅清空冻结仓位账本？这不会向交易所下单，只用于账本纠错。")) {
@@ -10102,6 +10132,8 @@ def _normalize_runner_frozen_inventory_ledger(raw: Any) -> dict[str, Any]:
     ledger = raw if isinstance(raw, dict) else {}
     long_qty = max(_safe_float(ledger.get("long_qty", 0.0), "long_qty"), 0.0)
     short_qty = max(_safe_float(ledger.get("short_qty", 0.0), "short_qty"), 0.0)
+    long_isolated = min(max(_safe_float(ledger.get("long_manual_limit_isolated_qty", 0.0), "long_manual_limit_isolated_qty"), 0.0), long_qty)
+    short_isolated = min(max(_safe_float(ledger.get("short_manual_limit_isolated_qty", 0.0), "short_manual_limit_isolated_qty"), 0.0), short_qty)
     return {
         "long_qty": long_qty,
         "short_qty": short_qty,
@@ -10111,7 +10143,11 @@ def _normalize_runner_frozen_inventory_ledger(raw: Any) -> dict[str, Any]:
         "short_entry_price": max(_safe_float(ledger.get("short_entry_price", 0.0), "short_entry_price"), 0.0) if short_qty > 0 else 0.0,
         "long_frozen_at": str(ledger.get("long_frozen_at") or "") if long_qty > 0 else "",
         "short_frozen_at": str(ledger.get("short_frozen_at") or "") if short_qty > 0 else "",
-        "offset_qty": min(long_qty, short_qty),
+        "long_manual_limit_isolated_qty": long_isolated,
+        "short_manual_limit_isolated_qty": short_isolated,
+        "pair_eligible_long_qty": max(long_qty - long_isolated, 0.0),
+        "pair_eligible_short_qty": max(short_qty - short_isolated, 0.0),
+        "offset_qty": min(max(long_qty - long_isolated, 0.0), max(short_qty - short_isolated, 0.0)),
         "offset_notional": max(_safe_float(ledger.get("offset_notional", 0.0), "offset_notional"), 0.0),
         "updated_at": str(ledger.get("updated_at") or ""),
     }
@@ -10122,7 +10158,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     if not symbol:
         raise ValueError("symbol is required")
     action = str(payload.get("action", "set")).strip().lower() or "set"
-    if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "pair_release", "reset"}:
+    if action not in {"set", "clear_long", "clear_short", "reduce_long", "reduce_short", "limit_long", "limit_short", "pair_release", "reset"}:
         raise ValueError("unsupported frozen inventory action")
     state_path = _runner_frozen_inventory_state_path(symbol)
     state = _read_json_dict(state_path) or {}
@@ -10132,6 +10168,7 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     if action == "reset":
         state.pop("best_quote_frozen_inventory", None)
         state.pop("best_quote_frozen_inventory_manual_reduce", None)
+        state.pop("best_quote_frozen_inventory_manual_limit", None)
         state.pop("best_quote_frozen_inventory_pair_release", None)
         ledger = {}
     else:
@@ -10171,6 +10208,31 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 "source": "running_status_ui",
             }
             state["best_quote_frozen_inventory_manual_reduce"] = directive
+        elif action in {"limit_long", "limit_short"}:
+            directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
+            side_key = "long" if action == "limit_long" else "short"
+            side_qty = ledger["long_qty"] if side_key == "long" else ledger["short_qty"]
+            existing_isolated = max(_safe_float(ledger.get(f"{side_key}_manual_limit_isolated_qty"), f"{side_key}_manual_limit_isolated_qty"), 0.0)
+            available_qty = max(side_qty - existing_isolated, 0.0)
+            requested_qty = max(_safe_float(payload.get("requested_qty"), "requested_qty"), 0.0)
+            price = max(_safe_float(payload.get("price"), "price"), 0.0)
+            if requested_qty <= 1e-12:
+                raise ValueError("requested_qty must be > 0")
+            if price <= 0:
+                raise ValueError("price must be > 0")
+            requested_qty = min(requested_qty, available_qty)
+            if requested_qty <= 1e-12:
+                raise ValueError(f"frozen {side_key} qty has no unisolated balance")
+            isolated_qty = existing_isolated + requested_qty
+            ledger[f"{side_key}_manual_limit_isolated_qty"] = isolated_qty
+            directive[side_key] = {
+                "requested": True,
+                "requested_qty": isolated_qty,
+                "price": price,
+                "requested_at": now_iso,
+                "source": "running_status_ui",
+            }
+            state["best_quote_frozen_inventory_manual_limit"] = directive
         elif action == "pair_release":
             if ledger["offset_qty"] <= 1e-12:
                 raise ValueError("frozen long/short offset qty is empty")
@@ -10183,10 +10245,15 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 "requested_at": now_iso,
                 "source": "running_status_ui",
             }
-        ledger["offset_qty"] = min(
-            max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0),
-            max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0),
-        )
+        long_qty = max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0)
+        short_qty = max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0)
+        long_isolated = min(max(_safe_float(ledger.get("long_manual_limit_isolated_qty"), "long_manual_limit_isolated_qty"), 0.0), long_qty)
+        short_isolated = min(max(_safe_float(ledger.get("short_manual_limit_isolated_qty"), "short_manual_limit_isolated_qty"), 0.0), short_qty)
+        ledger["long_manual_limit_isolated_qty"] = long_isolated
+        ledger["short_manual_limit_isolated_qty"] = short_isolated
+        ledger["pair_eligible_long_qty"] = max(long_qty - long_isolated, 0.0)
+        ledger["pair_eligible_short_qty"] = max(short_qty - short_isolated, 0.0)
+        ledger["offset_qty"] = min(ledger["pair_eligible_long_qty"], ledger["pair_eligible_short_qty"])
         ledger["updated_at"] = now_iso
         if max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0) > 0 or max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0) > 0:
             state["best_quote_frozen_inventory"] = ledger

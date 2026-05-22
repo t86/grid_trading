@@ -146,6 +146,10 @@ Supported control actions:
 
 - `reduce_long`: request real reduce-only cleanup of frozen long inventory;
 - `reduce_short`: request real reduce-only cleanup of frozen short inventory;
+- `limit_long`: request a persistent reduce-only limit order for frozen long
+  inventory;
+- `limit_short`: request a persistent reduce-only limit order for frozen short
+  inventory;
 - `clear_long`: mark frozen long as handled only after the actual exchange-side
   position has been independently confirmed clean;
 - `clear_short`: mark frozen short as handled only after the actual exchange-side
@@ -183,6 +187,41 @@ The runner then places explicit frozen cleanup orders:
 
 Only these explicit frozen cleanup roles should be allowed to intentionally
 reduce frozen inventory.
+
+### Manual Limit Close Isolation
+
+Frozen inventory also supports operator-directed limit close orders:
+
+```json
+"best_quote_frozen_inventory_manual_limit": {
+  "short": {
+    "requested": true,
+    "requested_qty": 100.0,
+    "price": 0.7,
+    "requested_at": "...",
+    "source": "running_status_ui"
+  }
+}
+```
+
+When a limit-close directive is submitted, the requested quantity is immediately
+recorded in the frozen ledger as isolated:
+
+```json
+"best_quote_frozen_inventory": {
+  "short_manual_limit_isolated_qty": 100.0,
+  "pair_eligible_short_qty": 2654.0
+}
+```
+
+The runner then keeps a persistent reduce-only post-only limit order in the plan:
+
+- `frozen_inventory_manual_limit_long`: SELL LONG reduce-only GTX
+- `frozen_inventory_manual_limit_short`: BUY SHORT reduce-only GTX
+
+The isolated quantity must not be used by automatic paired release. Pair release
+can only use `pair_eligible_long_qty` and `pair_eligible_short_qty`, i.e. frozen
+inventory not already assigned to a manual limit close order.
 
 ## Automatic Paired Frozen Release
 

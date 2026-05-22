@@ -320,7 +320,11 @@ def _normalize_frozen_inventory_ledger(raw: Any, *, mid_price: float = 0.0) -> d
     reference_price = max(_safe_float(mid_price), 0.0)
     long_notional = (_safe_float(ledger.get("long_notional")) or long_qty * reference_price) if long_qty > 0 else 0.0
     short_notional = (_safe_float(ledger.get("short_notional")) or short_qty * reference_price) if short_qty > 0 else 0.0
-    offset_qty = min(long_qty, short_qty)
+    long_isolated = min(max(_safe_float(ledger.get("long_manual_limit_isolated_qty")), 0.0), long_qty)
+    short_isolated = min(max(_safe_float(ledger.get("short_manual_limit_isolated_qty")), 0.0), short_qty)
+    pair_eligible_long_qty = max(long_qty - long_isolated, 0.0)
+    pair_eligible_short_qty = max(short_qty - short_isolated, 0.0)
+    offset_qty = min(pair_eligible_long_qty, pair_eligible_short_qty)
     offset_notional = _safe_float(ledger.get("offset_notional")) or offset_qty * reference_price
     return {
         "long_qty": long_qty,
@@ -331,6 +335,10 @@ def _normalize_frozen_inventory_ledger(raw: Any, *, mid_price: float = 0.0) -> d
         "short_entry_price": _safe_float(ledger.get("short_entry_price")) if short_qty > 0 else 0.0,
         "long_frozen_at": str(ledger.get("long_frozen_at") or "") if long_qty > 0 else "",
         "short_frozen_at": str(ledger.get("short_frozen_at") or "") if short_qty > 0 else "",
+        "long_manual_limit_isolated_qty": long_isolated,
+        "short_manual_limit_isolated_qty": short_isolated,
+        "pair_eligible_long_qty": pair_eligible_long_qty,
+        "pair_eligible_short_qty": pair_eligible_short_qty,
         "offset_qty": offset_qty,
         "offset_notional": max(offset_notional, 0.0),
         "updated_at": str(ledger.get("updated_at") or ""),

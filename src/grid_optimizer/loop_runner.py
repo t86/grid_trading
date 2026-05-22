@@ -2369,9 +2369,19 @@ def _best_quote_reduce_freeze_report(
     short_lots = _normalized_lots("short", current_short_qty, current_short_avg_price)
     long_qty = sum(_safe_float(lot.get("qty")) for lot in long_lots)
     short_qty = sum(_safe_float(lot.get("qty")) for lot in short_lots)
+    long_manual_limit_isolated_qty = min(
+        max(_safe_float(ledger.get("long_manual_limit_isolated_qty")), 0.0),
+        long_qty,
+    )
+    short_manual_limit_isolated_qty = min(
+        max(_safe_float(ledger.get("short_manual_limit_isolated_qty")), 0.0),
+        short_qty,
+    )
     long_notional = long_qty * max(_safe_float(mid_price), 0.0)
     short_notional = short_qty * max(_safe_float(mid_price), 0.0)
-    offset_qty = min(long_qty, short_qty)
+    pair_eligible_long_qty = max(long_qty - long_manual_limit_isolated_qty, 0.0)
+    pair_eligible_short_qty = max(short_qty - short_manual_limit_isolated_qty, 0.0)
+    offset_qty = min(pair_eligible_long_qty, pair_eligible_short_qty)
     offset_notional = offset_qty * max(_safe_float(mid_price), 0.0)
     if long_qty > 0 or short_qty > 0 or ledger:
         ledger.update(
@@ -2380,6 +2390,10 @@ def _best_quote_reduce_freeze_report(
                 "short_qty": short_qty,
                 "long_notional": long_notional,
                 "short_notional": short_notional,
+                "long_manual_limit_isolated_qty": long_manual_limit_isolated_qty,
+                "short_manual_limit_isolated_qty": short_manual_limit_isolated_qty,
+                "pair_eligible_long_qty": pair_eligible_long_qty,
+                "pair_eligible_short_qty": pair_eligible_short_qty,
                 "long_lots": long_lots,
                 "short_lots": short_lots,
                 "offset_qty": offset_qty,
@@ -2437,6 +2451,10 @@ def _best_quote_reduce_freeze_report(
         "frozen_short_qty": short_qty,
         "frozen_long_notional": long_notional,
         "frozen_short_notional": short_notional,
+        "frozen_long_manual_limit_isolated_qty": long_manual_limit_isolated_qty,
+        "frozen_short_manual_limit_isolated_qty": short_manual_limit_isolated_qty,
+        "frozen_pair_eligible_long_qty": pair_eligible_long_qty,
+        "frozen_pair_eligible_short_qty": pair_eligible_short_qty,
         "frozen_long_unrealized_pnl": frozen_long_unrealized,
         "frozen_short_unrealized_pnl": frozen_short_unrealized,
         "frozen_unrealized_pnl": frozen_unrealized,
@@ -2671,6 +2689,93 @@ def apply_best_quote_frozen_inventory_manual_reduce(
     return reduce_report
 
 
+def apply_best_quote_frozen_inventory_manual_limit(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    hedge_mode: bool,
+) -> dict[str, Any]:
+    directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
+    ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    limit_report = {
+        "enabled": bool(directive),
+        "placed_long": False,
+        "placed_short": False,
+        "orders": [],
+        "blocked_reasons": [],
+    }
+    safe_min_notional = max(_safe_float(min_notional), 0.0)
+
+    def _build_order(*, side_key: str) -> dict[str, Any] | None:
+        side_directive = dict(directive.get(side_key) or {})
+        if not bool(side_directive.get("requested")):
+            return None
+        is_long = side_key == "long"
+        frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
+        isolated_key = f"{side_key}_manual_limit_isolated_qty"
+        requested_qty = max(_safe_float(side_directive.get("requested_qty")), 0.0)
+        isolated_qty = min(max(_safe_float(ledger.get(isolated_key)), requested_qty), frozen_qty)
+        if isolated_qty <= 1e-12:
+            directive.pop(side_key, None)
+            ledger[isolated_key] = 0.0
+            limit_report["blocked_reasons"].append(f"{side_key}_isolated_qty_empty")
+            return None
+        side = "SELL" if is_long else "BUY"
+        fallback_price = bid_price if is_long else ask_price
+        raw_price = _safe_float(side_directive.get("price")) or _safe_float(fallback_price)
+        price = _round_order_price(max(raw_price, 0.0), tick_size, side)
+        if price <= 0:
+            limit_report["blocked_reasons"].append(f"{side_key}_missing_price")
+            return None
+        qty = _round_order_qty(isolated_qty, step_size)
+        if qty <= 0 or (min_qty is not None and qty + 1e-12 < _safe_float(min_qty)):
+            limit_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
+            return None
+        notional = qty * price
+        if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
+            limit_report["blocked_reasons"].append(f"{side_key}_below_min_notional")
+            return None
+        ledger[isolated_key] = qty
+        return {
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "notional": notional,
+            "role": f"frozen_inventory_manual_limit_{side_key}",
+            "position_side": ("LONG" if is_long else "SHORT") if hedge_mode else "BOTH",
+            "force_reduce_only": True,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "manual_frozen_inventory_limit": True,
+        }
+
+    long_order = _build_order(side_key="long")
+    if long_order is not None:
+        plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
+        limit_report["placed_long"] = True
+        limit_report["orders"].append(dict(long_order))
+    short_order = _build_order(side_key="short")
+    if short_order is not None:
+        plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
+        limit_report["placed_short"] = True
+        limit_report["orders"].append(dict(short_order))
+
+    if directive:
+        state["best_quote_frozen_inventory_manual_limit"] = directive
+    else:
+        state.pop("best_quote_frozen_inventory_manual_limit", None)
+    if ledger:
+        state["best_quote_frozen_inventory"] = ledger
+    limit_report["active"] = bool(limit_report["placed_long"] or limit_report["placed_short"])
+    return limit_report
+
+
 def apply_best_quote_frozen_inventory_pair_release(
     *,
     plan: dict[str, Any],
@@ -2714,8 +2819,8 @@ def apply_best_quote_frozen_inventory_pair_release(
         release_report["blocked_reasons"].append("market_not_stable")
         return release_report
 
-    frozen_long_qty = max(_safe_float(report.get("frozen_long_qty")), 0.0)
-    frozen_short_qty = max(_safe_float(report.get("frozen_short_qty")), 0.0)
+    frozen_long_qty = max(_safe_float(report.get("frozen_pair_eligible_long_qty", report.get("frozen_long_qty"))), 0.0)
+    frozen_short_qty = max(_safe_float(report.get("frozen_pair_eligible_short_qty", report.get("frozen_short_qty"))), 0.0)
     offset_qty = min(frozen_long_qty, frozen_short_qty)
     safe_bid = max(_safe_float(bid_price), 0.0)
     safe_ask = max(_safe_float(ask_price), 0.0)
@@ -2865,8 +2970,10 @@ def _cap_best_quote_reduce_orders_to_managed_inventory(
         role = _order_role(order)
         return (
             role.startswith("frozen_inventory_manual_reduce_")
+            or role.startswith("frozen_inventory_manual_limit_")
             or role.startswith("frozen_inventory_pair_release_")
             or bool(order.get("manual_frozen_inventory_reduce"))
+            or bool(order.get("manual_frozen_inventory_limit"))
             or bool(order.get("frozen_inventory_pair_release"))
         )
 
@@ -15080,6 +15187,26 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             hedge_mode=hedge_best_quote,
         )
+        best_quote_frozen_manual_limit = apply_best_quote_frozen_inventory_manual_limit(
+            plan=plan,
+            state=state,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            hedge_mode=hedge_best_quote,
+        )
+        if bool(best_quote_frozen_manual_limit.get("active")):
+            best_quote_reduce_freeze = _best_quote_reduce_freeze_report(
+                state=state,
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                current_long_avg_price=current_long_avg_price,
+                current_short_avg_price=current_short_avg_price,
+                mid_price=mid_price,
+            )
         pair_release_30s_abs_return = abs(_adaptive_window_metric("window_30s", "return_ratio"))
         pair_release_1m_abs_return = abs(_adaptive_window_metric("window_1m", "return_ratio"))
         pair_release_1m_amplitude = abs(_adaptive_window_metric("window_1m", "amplitude_ratio"))
@@ -15436,6 +15563,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
             "reduce_freeze": dict(best_quote_reduce_freeze),
             "frozen_manual_reduce": dict(best_quote_frozen_manual_reduce),
+            "frozen_manual_limit": dict(best_quote_frozen_manual_limit),
             "frozen_pair_release": dict(best_quote_frozen_pair_release),
         }
         inventory_tier = {

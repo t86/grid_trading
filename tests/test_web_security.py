@@ -392,6 +392,9 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/runner/frozen_inventory", page)
         self.assertIn("对等释放", page)
         self.assertIn('updateFrozenInventory("pair_release", { requested_qty: qty })', page)
+        self.assertIn("限价平冻结多", page)
+        self.assertIn('updateFrozenInventory("limit_long"', page)
+        self.assertIn("已限价挂单接管的冻结仓位不再参与对等释放", page)
         self.assertIn("清理冻结多仓数量", page)
         self.assertIn("清理冻结多仓", page)
         self.assertIn("由 runner 下 reduce-only 单处理", page)
@@ -452,6 +455,33 @@ class WebSecurityTests(unittest.TestCase):
         directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
         self.assertTrue(directive["requested"])
         self.assertEqual(directive["requested_qty"], 8.0)
+
+    def test_update_frozen_inventory_limit_order_isolates_qty_from_pair_release(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {"best_quote_frozen_inventory": {"long_qty": 50.0, "short_qty": 40.0, "long_entry_price": 1.0}},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                result = _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "limit_long", "requested_qty": 8.0, "price": 1.02}
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        directive = state["best_quote_frozen_inventory_manual_limit"]["long"]
+        self.assertTrue(directive["requested"])
+        self.assertEqual(directive["requested_qty"], 8.0)
+        self.assertEqual(directive["price"], 1.02)
+        ledger = result["frozen_inventory"]
+        self.assertEqual(ledger["long_manual_limit_isolated_qty"], 8.0)
+        self.assertEqual(ledger["pair_eligible_long_qty"], 42.0)
+        self.assertEqual(ledger["offset_qty"], 40.0)
 
     def test_frozen_inventory_normalization_hides_cleared_side_metadata(self) -> None:
         ledger = _normalize_frozen_inventory_ledger(
