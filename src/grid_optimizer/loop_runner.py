@@ -2458,6 +2458,8 @@ def _apply_best_quote_reduce_freeze(
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
     events = list(report.get("events") or [])
     min_notional_value = _safe_float(report["min_notional"])
+    existing_frozen_long = _safe_float(ledger.get("long_qty")) > 1e-12
+    existing_frozen_short = _safe_float(ledger.get("short_qty")) > 1e-12
 
     long_loss_ratio = 0.0
     if _safe_float(current_long_avg_price) > 0:
@@ -2471,6 +2473,7 @@ def _apply_best_quote_reduce_freeze(
     threshold = _safe_float(report["threshold_loss_ratio"])
     if (
         reduce_long_planned
+        and not existing_frozen_short
         and long_notional >= min_notional_value
         and long_loss_ratio >= threshold
         and max(_safe_float(current_long_qty), 0.0) > _safe_float(ledger.get("long_qty")) + 1e-12
@@ -2487,8 +2490,10 @@ def _apply_best_quote_reduce_freeze(
                 "notional": long_notional,
             }
         )
+        existing_frozen_long = True
     if (
         reduce_short_planned
+        and not existing_frozen_long
         and short_notional >= min_notional_value
         and short_loss_ratio >= threshold
         and max(_safe_float(current_short_qty), 0.0) > _safe_float(ledger.get("short_qty")) + 1e-12

@@ -819,6 +819,42 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_frozen_inventory"]
         self.assertEqual(ledger["short_qty"], 300.0)
 
+    def test_best_quote_reduce_freeze_does_not_auto_freeze_opposite_side(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 352.0,
+                "long_entry_price": 0.6442,
+                "long_frozen_at": "2026-05-22T05:30:52+00:00",
+            }
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=352.0,
+            current_short_qty=110.0,
+            current_long_avg_price=0.6442,
+            current_short_avg_price=0.6449,
+            mid_price=0.6514,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            current_long_qty=352.0,
+            current_short_qty=110.0,
+            current_long_avg_price=0.6442,
+            current_short_avg_price=0.6449,
+            mid_price=0.6514,
+        )
+
+        ledger = state["best_quote_frozen_inventory"]
+        self.assertEqual(ledger["long_qty"], 352.0)
+        self.assertEqual(ledger["short_qty"], 0.0)
+        self.assertFalse(report.get("applied", False))
+
     def test_best_quote_reduce_freeze_reports_frozen_side_offset(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
