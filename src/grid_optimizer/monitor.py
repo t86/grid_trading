@@ -2664,6 +2664,10 @@ def _build_monitor_snapshot_uncached(
         )
         trade_summary["net_pnl_estimate"] = net_pnl_est
         snapshot["trade_summary"] = trade_summary
+        snapshot["competition_reward_targets"] = build_reward_volume_targets(
+            competition_board,
+            current_volume=trade_summary.get("gross_notional"),
+        )
         snapshot["competition_displacement_volume"] = build_competition_displacement_volume(
             competition_board,
             current_volume=trade_summary.get("gross_notional"),

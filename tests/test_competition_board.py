@@ -594,13 +594,20 @@ class CompetitionBoardTests(unittest.TestCase):
             "PHAROSUSDT",
             "futures",
             snapshot={"boards": []},
-            now=datetime(2026, 5, 20, 2, 0, tzinfo=timezone.utc),
+            now=datetime(2026, 5, 22, 2, 0, tzinfo=timezone.utc),
         )
         self.assertIsNotNone(board)
         self.assertEqual(board["symbol"], "PHAROS")
         self.assertEqual(board["market"], "futures")
-        self.assertEqual(board["activity_start_at"], "2026-05-14T18:00:00+08:00")
-        self.assertEqual(board["activity_end_at"], "2026-05-21T07:59:00+08:00")
+        self.assertEqual(board["activity_start_at"], "2026-05-19T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-06-09T07:59:00+08:00")
+
+    def test_pharos_source_uses_official_binance_activity_page(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_pharos")
+        self.assertEqual(
+            source.url,
+            "https://www.binance.com/zh-CN/activity/trading-competition/futures-pharos-challenge?ref=YEK2JZJT",
+        )
 
     def test_build_reward_volume_targets_works_for_hinted_aigensyn_board(self) -> None:
         board = resolve_active_competition_board(

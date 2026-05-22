@@ -366,7 +366,7 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         symbol="PHAROS",
         market="futures",
         label="PHAROS 合约交易挑战赛",
-        url="https://www.bsmkweb.cc/activity/trading-competition/futures-pharos-challenge?ref=YEK2JZJT",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-pharos-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
         slug="futures_tradfi_week1",
@@ -1516,11 +1516,11 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
                 "leaderboardUnitTitle": "交易量",
                 "rankingType": "CUSTOMIZED",
                 "competitionType": "FUTURES",
-                "activityPeriodText": "2026/05/14 18:00 - 2026/05/21 07:59",
-                "activityEndAt": "2026-05-21T07:59:00+08:00",
+                "activityPeriodText": "2026/05/19 18:00 - 2026/06/09 07:59",
+                "activityEndAt": "2026-06-09T07:59:00+08:00",
                 "maxRows": 200,
                 "bodyExcerpt": """
-活动时间：2026/05/14 18:00 - 2026/05/21 07:59
+活动时间：2026/05/19 18:00 - 2026/06/09 07:59
 累计 PHAROS U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
 """,
             }
@@ -3387,6 +3387,7 @@ def build_reward_volume_targets(
     board: dict[str, Any] | None,
     *,
     now: datetime | None = None,
+    current_volume: float | None = None,
     tracked_ranks: tuple[int, ...] = (200, 50, 20),
     loss_per_10k_options: tuple[int, ...] = (3, 4, 5),
 ) -> dict[str, Any] | None:
@@ -3400,6 +3401,7 @@ def build_reward_volume_targets(
             "reward_unit": str(board.get("reward_unit", "")).strip().upper(),
             "reward_price_usdt": None,
             "tiers": [],
+            "zone_moves": [],
             "message": "当前比赛没有可用奖励段，暂时无法估算奖励回本量。",
         }
     ref_time = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
@@ -3412,6 +3414,7 @@ def build_reward_volume_targets(
             "reward_unit": reward_unit,
             "reward_price_usdt": None,
             "tiers": [],
+            "zone_moves": [],
             "message": "当前拿不到奖励币种对 USDT 的价格，暂时无法估算奖励回本量。",
         }
 
@@ -3451,6 +3454,13 @@ def build_reward_volume_targets(
             }
         )
 
+    values_by_rank = _values_by_rank(board)
+    zone_moves = _build_reward_zone_moves(
+        segments,
+        values_by_rank,
+        current_volume=current_volume,
+    )
+
     return {
         "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip() or "-",
         "symbol": str(board.get("symbol", "")).strip(),
@@ -3458,8 +3468,88 @@ def build_reward_volume_targets(
         "reward_price_usdt": float(reward_price),
         "loss_per_10k_options": [int(item) for item in loss_per_10k_options],
         "tiers": tiers,
+        "zone_moves": zone_moves,
         "message": "" if tiers else "奖励段已识别，但没有拿到 20 / 50 / 200 名对应的有效奖励数据。",
     }
+
+
+def _rank_after_volume(values_by_rank: dict[int, float], current_volume: float) -> int | None:
+    if not values_by_rank:
+        return None
+    ranked_values = sorted(values_by_rank.items(), key=lambda item: int(item[0]))
+    for rank, value in ranked_values:
+        if float(current_volume) >= float(value):
+            return int(rank)
+    return int(ranked_values[-1][0]) + 1
+
+
+def _build_reward_zone_moves(
+    segments: list[Any],
+    values_by_rank: dict[int, float],
+    *,
+    current_volume: float | None,
+) -> list[dict[str, Any]]:
+    current_value = _safe_float(current_volume)
+    if current_value is None or current_value <= 0 or not values_by_rank:
+        return []
+    current_rank = _rank_after_volume(values_by_rank, current_value)
+    if current_rank is None:
+        return []
+
+    valid_segments: list[dict[str, int]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        start_rank = _safe_int(segment.get("start_rank"))
+        end_rank = _safe_int(segment.get("end_rank"))
+        if start_rank is None or end_rank is None:
+            continue
+        valid_segments.append({"start_rank": int(start_rank), "end_rank": int(end_rank)})
+    valid_segments.sort(key=lambda item: (item["start_rank"], item["end_rank"]))
+    if not valid_segments:
+        return []
+
+    moves: list[dict[str, Any]] = []
+    current_segment = next(
+        (
+            segment
+            for segment in valid_segments
+            if int(segment["start_rank"]) <= int(current_rank) <= int(segment["end_rank"])
+        ),
+        None,
+    )
+    if current_segment is not None:
+        target_rank = int(current_segment["end_rank"]) + 1
+        target_value = _safe_float(values_by_rank.get(target_rank))
+        if target_value is not None:
+            moves.append(
+                {
+                    "move_type": "current_segment_boundary",
+                    "from_rank": int(current_rank),
+                    "to_rank": target_rank,
+                    "target_rank": target_rank,
+                    "target_value": float(target_value),
+                    "volume_needed": max(0.0, float(target_value) - float(current_value)),
+                    "covered_users": max(0, target_rank - int(current_rank)),
+                }
+            )
+
+    max_reward_rank = max(int(segment["end_rank"]) for segment in valid_segments)
+    reward_exit_rank = max_reward_rank + 1
+    target_value = _safe_float(values_by_rank.get(reward_exit_rank))
+    if target_value is not None and not any(int(item.get("target_rank", 0)) == reward_exit_rank for item in moves):
+        moves.append(
+            {
+                "move_type": "reward_zone_boundary",
+                "from_rank": int(current_rank),
+                "to_rank": reward_exit_rank,
+                "target_rank": reward_exit_rank,
+                "target_value": float(target_value),
+                "volume_needed": max(0.0, float(target_value) - float(current_value)),
+                "covered_users": max(0, reward_exit_rank - int(current_rank)),
+            }
+        )
+    return moves
 
 
 def build_competition_displacement_volume(
