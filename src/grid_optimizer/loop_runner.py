@@ -2655,11 +2655,13 @@ def apply_best_quote_frozen_inventory_manual_reduce(
         plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
         reduce_report["placed_long"] = True
         reduce_report["orders"].append(dict(long_order))
+        directive.pop("long", None)
     short_order = _build_order(side_key="short")
     if short_order is not None:
         plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
         reduce_report["placed_short"] = True
         reduce_report["orders"].append(dict(short_order))
+        directive.pop("short", None)
 
     if directive:
         state["best_quote_frozen_inventory_manual_reduce"] = directive

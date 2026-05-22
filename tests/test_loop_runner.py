@@ -1023,6 +1023,7 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(plan["sell_orders"][0]["qty"], 12.0)
+        self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
 
     def test_best_quote_frozen_pair_release_places_paired_ioc_when_stable_and_profitable(self) -> None:
         state: dict[str, object] = {
