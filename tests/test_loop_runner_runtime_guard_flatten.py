@@ -228,6 +228,111 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             self.assertEqual(actions["runtime_guard_loss_cooldown"]["reason"], "runtime_guard_loss_cooling_down")
             self.assertEqual(actions["dropped_place_count_by_runtime_guard_loss_cooldown"], 1)
 
+    @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
+    @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
+    def test_frozen_inventory_loss_recovery_uses_strategy_flat_exposure(
+        self,
+        mock_inputs,
+        mock_evaluate,
+        mock_credentials,
+        mock_stable,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            now = datetime(2026, 5, 22, 15, 50, tzinfo=timezone.utc)
+            stopped_at = now - timedelta(minutes=10)
+            state_path = Path(tmpdir) / "state.json"
+            plan_path = Path(tmpdir) / "plan.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_guard_loss_recovery": {
+                            "stopped_at": stopped_at.isoformat(),
+                            "last_reason": "rolling_hourly_loss_limit_hit",
+                        },
+                        "runtime_guard_manual_frozen_inventory_override": {
+                            "active": True,
+                            "reason": "allow_reduce_only_frozen_inventory_directive",
+                        },
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 0.0,
+                            "short_qty": 2274.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "mid_price": 0.663,
+                        "current_long_qty": 0.0,
+                        "current_short_qty": 0.0,
+                        "current_long_notional": 0.0,
+                        "current_short_notional": 0.0,
+                        "strategy_actual_net_notional": 0.0,
+                        "synthetic_drift_qty": 0.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                symbol="PHAROSUSDT",
+                recv_window=5000,
+                strategy_profile="test",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                runtime_guard_stats_start_time=None,
+                run_start_time=None,
+                run_end_time=None,
+                rolling_hourly_loss_limit=8.0,
+                rolling_hourly_loss_per_10k_limit=None,
+                rolling_hourly_loss_per_10k_min_notional=None,
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+                runtime_guard_loss_recovery_max_1m_amplitude_ratio=0.012,
+                runtime_guard_loss_recovery_max_3m_amplitude_ratio=0.025,
+                max_cumulative_notional=None,
+                max_actual_net_notional=None,
+                max_synthetic_drift_notional=None,
+                max_unrealized_loss=None,
+                auto_regime_enabled=False,
+                state_path=str(state_path),
+                plan_json=str(plan_path),
+            )
+            mock_inputs.return_value = (1000.0, [], None)
+            mock_evaluate.return_value = argparse.Namespace(
+                tradable=False,
+                runtime_status="stopped",
+                stop_triggered=True,
+                primary_reason="rolling_hourly_loss_limit_hit",
+                matched_reasons=["rolling_hourly_loss_limit_hit"],
+                triggered_at=now.isoformat(),
+                rolling_hourly_loss=9.0,
+                rolling_hourly_gross_notional=1000.0,
+                rolling_hourly_loss_per_10k=90.0,
+                rolling_hourly_loss_per_10k_active=False,
+                cumulative_gross_notional=1000.0,
+                unrealized_loss=0.0,
+            )
+            mock_stable.return_value = (True, {"available": True, "amplitude_1m": 0.002, "amplitude_3m": 0.004})
+
+            summary = _maybe_handle_runtime_guard(
+                args=args,
+                cycle=5,
+                cycle_started_at=now,
+                summary_path=Path(tmpdir) / "events.jsonl",
+            )
+
+            self.assertIsNone(summary)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            recovery = state["runtime_guard_loss_recovery"]
+            self.assertEqual(recovery["flat_basis"], "strategy_exposure_excluding_frozen_inventory")
+            self.assertTrue(recovery["flat"])
+            self.assertIn("recovered_at", recovery)
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
+            mock_credentials.assert_not_called()
+
     def test_submit_place_orders_are_suppressed_during_manual_frozen_override(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"

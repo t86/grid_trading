@@ -6935,6 +6935,13 @@ def _has_best_quote_frozen_inventory_position(state: Mapping[str, Any] | dict[st
     )
 
 
+def _best_quote_frozen_inventory_qtys(state: Mapping[str, Any] | dict[str, Any]) -> tuple[float, float]:
+    ledger = state.get("best_quote_frozen_inventory") if isinstance(state, Mapping) else None
+    if not isinstance(ledger, Mapping):
+        return 0.0, 0.0
+    return max(_safe_float(ledger.get("long_qty")), 0.0), max(_safe_float(ledger.get("short_qty")), 0.0)
+
+
 def _suppress_place_orders_during_runtime_guard_loss_cooldown(
     *,
     actions: dict[str, Any],
@@ -6993,18 +7000,63 @@ def _filter_pnl_events_after(pnl_events: list[dict[str, Any]], since: datetime |
     return filtered
 
 
-def _runtime_guard_snapshot_is_flat(flatten_snapshot: dict[str, Any], *, min_notional: float = 5.0) -> bool:
+def _runtime_guard_snapshot_is_flat(
+    flatten_snapshot: dict[str, Any],
+    *,
+    min_notional: float = 5.0,
+    state: Mapping[str, Any] | dict[str, Any] | None = None,
+) -> bool:
     if list(flatten_snapshot.get("orders", [])):
         return False
     bid_price = _safe_float(flatten_snapshot.get("bid_price"))
     ask_price = _safe_float(flatten_snapshot.get("ask_price"))
     mid_price = (bid_price + ask_price) / 2.0 if bid_price > 0 and ask_price > 0 else max(bid_price, ask_price)
-    net_qty = abs(_safe_float(flatten_snapshot.get("net_qty")))
     long_qty = abs(_safe_float(flatten_snapshot.get("long_qty")))
     short_qty = abs(_safe_float(flatten_snapshot.get("short_qty")))
+    if state is not None:
+        frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
+        long_qty = max(long_qty - frozen_long_qty, 0.0)
+        short_qty = max(short_qty - frozen_short_qty, 0.0)
+    net_qty = abs(long_qty - short_qty)
     if mid_price <= 0:
         return max(net_qty, long_qty, short_qty) <= 1e-12
     return max(net_qty, long_qty, short_qty) * mid_price <= max(_safe_float(min_notional), 0.0)
+
+
+def _runtime_guard_strategy_exposure_is_flat(
+    plan_report: Mapping[str, Any] | dict[str, Any],
+    *,
+    min_notional: float = 5.0,
+) -> bool:
+    mid_price = _safe_float(plan_report.get("mid_price"))
+    if mid_price <= 0:
+        bid_price = _safe_float(plan_report.get("bid_price"))
+        ask_price = _safe_float(plan_report.get("ask_price"))
+        mid_price = (bid_price + ask_price) / 2.0 if bid_price > 0 and ask_price > 0 else max(bid_price, ask_price)
+    current_long_qty = max(_safe_float(plan_report.get("current_long_qty")), 0.0)
+    current_short_qty = max(_safe_float(plan_report.get("current_short_qty")), 0.0)
+    strategy_actual_net_notional = plan_report.get("strategy_actual_net_notional")
+    if strategy_actual_net_notional is not None:
+        strategy_net_notional = abs(_safe_float(strategy_actual_net_notional))
+    elif mid_price > 0:
+        strategy_net_notional = abs(current_long_qty - current_short_qty) * mid_price
+    else:
+        strategy_net_notional = abs(current_long_qty - current_short_qty)
+    long_notional = (
+        abs(_safe_float(plan_report.get("current_long_notional")))
+        if plan_report.get("current_long_notional") is not None
+        else (current_long_qty * mid_price if mid_price > 0 else current_long_qty)
+    )
+    short_notional = (
+        abs(_safe_float(plan_report.get("current_short_notional")))
+        if plan_report.get("current_short_notional") is not None
+        else (current_short_qty * mid_price if mid_price > 0 else current_short_qty)
+    )
+    synthetic_drift_notional = _synthetic_drift_notional(mid_price, _safe_float(plan_report.get("synthetic_drift_qty")))
+    return max(strategy_net_notional, long_notional, short_notional, synthetic_drift_notional) <= max(
+        _safe_float(min_notional),
+        0.0,
+    )
 
 
 def _runtime_guard_market_is_stable_for_recovery(
@@ -7282,18 +7334,57 @@ def _maybe_handle_runtime_guard(
     manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
     if frozen_inventory_present or manual_frozen_directive_pending:
         if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
-            _runtime_guard_mark_loss_stop(
-                recovery,
-                stopped_at=cycle_started_at,
-                rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+            stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+            if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            elif stopped_at is None:
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            cooldown_seconds = max(
+                _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
+                0.0,
             )
+            elapsed = (
+                max((cycle_started_at.astimezone(timezone.utc) - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+                if stopped_at is not None
+                else 0.0
+            )
+            strategy_flat = _runtime_guard_strategy_exposure_is_flat(latest_plan_report)
+            stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=cycle_started_at)
             recovery.update(
                 {
                     "last_checked_at": cycle_started_at.isoformat(),
+                    "cooldown_elapsed_seconds": elapsed,
+                    "cooldown_seconds": cooldown_seconds,
+                    "flat": strategy_flat,
+                    "flat_basis": "strategy_exposure_excluding_frozen_inventory",
+                    "market_stable": stable,
+                    "market": stable_report,
                     "manual_frozen_inventory_override": True,
                     "manual_frozen_inventory_override_reason": "allow_reduce_only_frozen_inventory_directive",
                 }
             )
+            if elapsed >= cooldown_seconds and strategy_flat and stable:
+                recovered_at = cycle_started_at.astimezone(timezone.utc)
+                recovery.update(
+                    {
+                        "recovered_at": recovered_at.isoformat(),
+                        "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
+                        "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                    }
+                )
+                state.pop("runtime_guard_manual_frozen_inventory_override", None)
+                _write_json(state_path, state)
+                return None
         state["runtime_guard_manual_frozen_inventory_override"] = {
             "active": True,
             "last_checked_at": cycle_started_at.isoformat(),
@@ -7340,7 +7431,7 @@ def _maybe_handle_runtime_guard(
                 0.0,
             )
             elapsed = max((cycle_started_at.astimezone(timezone.utc) - stopped_at).total_seconds(), 0.0)
-            flat = _runtime_guard_snapshot_is_flat(flatten_snapshot)
+            flat = _runtime_guard_snapshot_is_flat(flatten_snapshot, state=state)
             stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=cycle_started_at)
             recovery.update(
                 {
