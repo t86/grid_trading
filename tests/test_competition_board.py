@@ -599,6 +599,7 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertIsNotNone(board)
         self.assertEqual(board["symbol"], "PHAROS")
         self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["resource_id"], 56722)
         self.assertEqual(board["activity_start_at"], "2026-05-19T18:00:00+08:00")
         self.assertEqual(board["activity_end_at"], "2026-06-09T07:59:00+08:00")
 

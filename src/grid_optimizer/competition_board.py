@@ -1508,7 +1508,7 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
         "boards": [
             {
                 "tabLabel": "交易量挑战赛",
-                "resourceId": 0,
+                "resourceId": 56722,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "PHAROS",
