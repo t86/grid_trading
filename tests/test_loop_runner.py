@@ -1116,6 +1116,48 @@ class LoopRunnerTests(unittest.TestCase):
                     "price": 0.65,
                     "qty": 335.0,
                     "notional": 217.75,
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "force_reduce_only": True,
+                    "manual_frozen_inventory_reduce": True,
+                },
+            ],
+        }
+
+        report = _cap_best_quote_reduce_orders_to_managed_inventory(
+            plan=plan,
+            report={
+                "frozen_long_qty": 335.0,
+                "frozen_short_qty": 0.0,
+                "managed_long_qty": 0.0,
+                "managed_short_qty": 0.0,
+            },
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+        )
+
+        self.assertEqual([order["role"] for order in plan["sell_orders"]], ["frozen_inventory_manual_reduce_long"])
+        self.assertEqual(report["dropped_long_orders"], 1)
+        self.assertEqual(report["skipped_manual_reduce_orders"], 1)
+
+    def test_best_quote_reduce_freeze_keeps_pair_release_order_when_no_managed_long_remains(self) -> None:
+        plan: dict[str, object] = {
+            "buy_orders": [],
+            "sell_orders": [
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "price": 0.65,
+                    "qty": 12.0,
+                    "notional": 7.8,
+                    "role": "best_quote_reduce_long",
+                },
+                {
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "price": 0.65,
+                    "qty": 335.0,
+                    "notional": 217.75,
                     "role": "frozen_inventory_pair_release_long",
                     "force_reduce_only": True,
                     "frozen_inventory_pair_release": True,
@@ -1127,7 +1169,7 @@ class LoopRunnerTests(unittest.TestCase):
             plan=plan,
             report={
                 "frozen_long_qty": 335.0,
-                "frozen_short_qty": 0.0,
+                "frozen_short_qty": 136.0,
                 "managed_long_qty": 0.0,
                 "managed_short_qty": 0.0,
             },
