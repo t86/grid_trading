@@ -725,6 +725,37 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_frozen_inventory"]
         self.assertEqual(ledger["long_qty"], 100.0)
 
+    def test_best_quote_reduce_freeze_can_trigger_below_soft_inventory(self) -> None:
+        state: dict[str, object] = {}
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+
+        self.assertTrue(report["applied"])
+        self.assertEqual(report["frozen_short_qty"], 300.0)
+        self.assertEqual(report["managed_short_qty"], 0.0)
+        ledger = state["best_quote_frozen_inventory"]
+        self.assertEqual(ledger["short_qty"], 300.0)
+
     def test_best_quote_reduce_freeze_reports_frozen_side_offset(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {

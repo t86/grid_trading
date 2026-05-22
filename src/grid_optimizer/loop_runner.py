@@ -14269,17 +14269,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
         freeze_fake_plan = {"buy_orders": [], "sell_orders": []}
-        long_soft_for_freeze = (
-            _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0))
-            * best_quote_inventory_soft_ratio
-        )
-        short_soft_for_freeze = (
-            _safe_float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0))
-            * best_quote_inventory_soft_ratio
-        )
-        if current_long_notional >= max(long_soft_for_freeze, best_quote_reduce_freeze_min_notional) > 0:
+        # The freeze experiment is meant to split off losing inventory before
+        # any reducer can keep realizing losses. Do not wait for the soft
+        # threshold here; the 30% lower soft limit is still used by the normal
+        # inventory guards, while freeze itself is gated by loss ratio.
+        if current_long_notional >= best_quote_reduce_freeze_min_notional > 0:
             freeze_fake_plan["sell_orders"].append({"role": "best_quote_reduce_long"})
-        if current_short_notional >= max(short_soft_for_freeze, best_quote_reduce_freeze_min_notional) > 0:
+        if current_short_notional >= best_quote_reduce_freeze_min_notional > 0:
             freeze_fake_plan["buy_orders"].append({"role": "best_quote_reduce_short"})
         best_quote_reduce_freeze = _apply_best_quote_reduce_freeze(
             state=state,
