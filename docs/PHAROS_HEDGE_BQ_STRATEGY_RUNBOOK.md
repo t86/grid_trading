@@ -3,6 +3,9 @@
 This runbook documents the PHAROSUSDT hedge best-quote maker-volume setup used on
 114 and 150.
 
+For the 114-only frozen inventory ledger experiment, see
+[PHAROS Frozen Inventory Ledger Experiment](PHAROS_FROZEN_INVENTORY_EXPERIMENT.md).
+
 ## Goal
 
 The strategy is designed to create maker volume on both sides while keeping gross
@@ -224,4 +227,3 @@ Server wrappers:
 
 - 114: `/usr/local/bin/grid-web-update`, `/usr/local/bin/grid-saved-runner`
 - 150: `/usr/local/bin/grid-web-api2-update`, `/usr/local/bin/grid-saved-runner-api2`
-

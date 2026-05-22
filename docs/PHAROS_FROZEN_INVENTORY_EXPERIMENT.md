@@ -1,0 +1,334 @@
+# PHAROS Frozen Inventory Ledger Experiment
+
+This document defines the PHAROSUSDT frozen inventory ledger experiment for the
+hedge best-quote maker-volume runner. It is a strategy experiment, not an
+exchange account mode change.
+
+## Scope
+
+The experiment is intended for `114` first. `150` should stay on the normal
+PHAROS Hedge BQ configuration unless explicitly moved into the experiment.
+
+Production paths:
+
+- `114`: `/home/ubuntu/wangge`, runner `/usr/local/bin/grid-saved-runner`
+- `150`: `/home/ubuntu/wangge_api2_repo` and `/home/ubuntu/wangge_api2`, runner
+  `/usr/local/bin/grid-saved-runner-api2`
+
+The current experiment is for `PHAROSUSDT` with strategy mode
+`hedge_best_quote_maker_volume_v1`.
+
+## Intent
+
+The strategy is split into two conceptual layers:
+
+- BQ volume layer: keeps normal two-sided maker volume and manages only
+  non-frozen inventory.
+- Frozen inventory ledger layer: records losing inventory that should be
+  isolated from BQ volume decisions and handled separately.
+
+The desired behavior is:
+
+- keep BQ volume running when inventory is manageable;
+- when normal reduce starts to become expensive, stop chasing reduce orders;
+- isolate the losing inventory into a strategy ledger;
+- remove the frozen inventory from BQ risk metrics and budget calculations;
+- allow later manual or strategy-directed cleanup without reopening the same
+  loss spiral.
+
+The ledger is a strategy accounting layer. It does not move positions to
+Binance isolated margin and does not create a separate exchange-side position.
+Exchange-side long/short position remains the actual source of truth.
+
+## Trigger Logic
+
+When the runner enters normal reduce for a side:
+
+- allow normal reduce while the side's unrealized loss ratio is below the
+  configured threshold;
+- once unrealized loss reaches or exceeds the threshold, stop normal reduce for
+  that side;
+- record the remaining side inventory into `best_quote_frozen_inventory`;
+- treat that side inventory as frozen and outside the BQ volume layer.
+
+The initial experiment threshold is:
+
+```text
+best_quote_maker_volume_reduce_freeze_loss_ratio = 0.01
+```
+
+This means roughly 1% unrealized loss on the reducing side. The threshold should
+be evaluated against the side's entry price and current market price:
+
+- LONG loss ratio: `(entry_price - mid_price) / entry_price`
+- SHORT loss ratio: `(mid_price - entry_price) / entry_price`
+
+The freeze check must not wait for inventory to reach the soft threshold. A side
+can be frozen below soft if the reduce loss threshold has already been reached.
+
+## Ledger Fields
+
+The strategy state file stores the ledger under:
+
+```json
+"best_quote_frozen_inventory": {
+  "long_qty": 0.0,
+  "short_qty": 0.0,
+  "long_notional": 0.0,
+  "short_notional": 0.0,
+  "long_entry_price": 0.0,
+  "short_entry_price": 0.0,
+  "long_frozen_at": "",
+  "short_frozen_at": "",
+  "offset_qty": 0.0,
+  "offset_notional": 0.0,
+  "updated_at": ""
+}
+```
+
+Rules:
+
+- `long_qty` and `short_qty` represent strategy-frozen exchange inventory.
+- `long_entry_price` and `short_entry_price` are the ledger cost references.
+- `offset_qty` shows how much opposite-side frozen inventory can potentially
+  offset, for example a later frozen short can offset an earlier frozen long.
+- `updated_at` records the latest ledger mutation time.
+
+The ledger must be visible in the running status UI. The intended UI entry point
+is the running-status / monitor surface that already exposes
+`/api/runner/frozen_inventory`.
+
+## Isolation Rules
+
+Frozen inventory must be excluded from the BQ layer's managed risk metrics:
+
+- managed long qty = exchange long qty minus frozen long qty;
+- managed short qty = exchange short qty minus frozen short qty;
+- managed unrealized PnL excludes frozen inventory unrealized PnL;
+- strategy unrealized PnL uses managed unrealized PnL while frozen inventory is
+  present;
+- BQ max-long, max-short, soft, pause, entry, and reduce decisions must be based
+  on managed inventory, not total exchange inventory.
+
+The submit-side position consistency check must still accept exchange position
+equal to `managed + frozen`. Otherwise the runner will reject all submits after
+freezing inventory.
+
+## Reduced Soft Threshold
+
+Because the experiment can accumulate frozen inventory, normal BQ capacity must
+be more conservative while testing. For the experiment host, reduce the soft
+threshold by 30%.
+
+If the normal soft ratio is:
+
+```text
+best_quote_maker_volume_inventory_soft_ratio = 0.5
+```
+
+the experiment target is:
+
+```text
+best_quote_maker_volume_inventory_soft_ratio = 0.35
+```
+
+Do not compensate by raising `max_long_notional`, `max_short_notional`, or
+`max_total_notional` during the experiment. If frozen inventory grows faster
+than expected, stop the runner and review the ledger.
+
+## Allowed Cleanup Path
+
+Manual handling must be real position cleanup, not just a cosmetic ledger mark.
+However, cleanup must be routed through an explicit frozen-inventory directive
+so the strategy can account for it.
+
+Supported control actions:
+
+- `reduce_long`: request real reduce-only cleanup of frozen long inventory;
+- `reduce_short`: request real reduce-only cleanup of frozen short inventory;
+- `clear_long`: mark frozen long as handled only after the actual exchange-side
+  position has been independently confirmed clean;
+- `clear_short`: mark frozen short as handled only after the actual exchange-side
+  position has been independently confirmed clean;
+- `reset`: clear the entire ledger only after manual verification.
+
+The strategy writes a directive:
+
+```json
+"best_quote_frozen_inventory_manual_reduce": {
+  "long": {
+    "requested": true,
+    "requested_at": "...",
+    "source": "running_status_ui"
+  }
+}
+```
+
+or:
+
+```json
+"best_quote_frozen_inventory_manual_reduce": {
+  "short": {
+    "requested": true,
+    "requested_at": "...",
+    "source": "running_status_ui"
+  }
+}
+```
+
+The runner then places explicit frozen cleanup orders:
+
+- `frozen_inventory_manual_reduce_long`: SELL LONG reduce-only IOC
+- `frozen_inventory_manual_reduce_short`: BUY SHORT reduce-only IOC
+
+Only these explicit frozen cleanup roles should be allowed to intentionally
+reduce frozen inventory.
+
+## Forbidden Cleanup Path
+
+Generic manual flatten or close-position orders must not process frozen
+inventory.
+
+Forbidden examples:
+
+- `maker_flatten_runner` close-long / close-short orders;
+- generic close-all-position buttons;
+- manual trade close-short / close-long legs that do not reference the frozen
+  inventory directive;
+- any `mf...closeshort...` or `mf...closelong...` order used as a side effect of
+  runtime loss cooldown.
+
+The incident observed on `114` showed why this matters:
+
+- short inventory was frozen into the ledger;
+- `runtime_guard` entered loss cooldown;
+- the cooldown path still started `maker_flatten_runner`;
+- an `mfpharos_closesho...` BUY SHORT order closed the frozen short inventory;
+- the frozen ledger disappeared and realized loss was taken immediately.
+
+This is not valid experiment behavior.
+
+Loss-only runtime cooldown must cancel normal strategy orders and block new
+place orders. It must not start flattening frozen inventory.
+
+## Runtime Guard Interaction
+
+Runtime loss cooldown is a hard gate for new BQ orders.
+
+When `runtime_guard_loss_recovery` has `stopped_at` and no later `recovered_at`:
+
+- submit must drop all new place orders;
+- cancel actions may still run;
+- normal BQ entry and normal reduce are not allowed;
+- frozen cleanup is allowed only through an explicit frozen-inventory cleanup
+  directive and only after operator intent is clear.
+
+Each runner cycle should sync the latest trade audit before evaluating runtime
+guard. This prevents the sequence:
+
+1. submit new BQ orders;
+2. sync recent losing fills;
+3. discover loss cooldown after the damage is already done.
+
+## Daily Volume Cap Interaction
+
+Daily volume cap remains independent from frozen inventory.
+
+For PHAROS patrol, daily volume is measured per server from Beijing time
+`08:00` to next-day `08:00`, using order-level gross notional from
+`output/pharosusdt_hedge_bq_trade_audit.jsonl`.
+
+Rules:
+
+- dedupe by `orderId`;
+- use `quoteQty` when available;
+- otherwise use `price * abs(qty)`;
+- do not sum partial fills or `tradeId` rows as separate cap volume.
+
+If a host reaches `40000U`, stop that host's PHAROS runner. Do not restart just
+because frozen inventory exists.
+
+## Operating Procedure
+
+Before enabling the experiment on `114`:
+
+1. Confirm runner is stopped.
+2. Confirm open orders are zero or intentionally understood.
+3. Confirm exchange long/short positions.
+4. Confirm `best_quote_frozen_inventory` is either empty or matches exchange
+   inventory that should be isolated.
+5. Confirm runtime cooldown state is understood.
+6. Confirm soft threshold is reduced by 30%.
+7. Start through `/usr/local/bin/grid-saved-runner start PHAROSUSDT` or restart
+   only after the restart gate is satisfied.
+
+During the experiment:
+
+- watch frozen long/short qty and notional;
+- watch managed long/short qty separately from exchange long/short qty;
+- watch whether normal BQ is truly two-sided;
+- watch whether any `mf...close...` order appears;
+- watch whether loss cooldown suppresses new places;
+- watch whether frozen cleanup roles are the only orders touching frozen
+  inventory.
+
+Stop immediately if:
+
+- frozen inventory is reduced by a generic flatten/manual close path;
+- runtime cooldown still places new BQ orders;
+- open-order reconcile drift persists;
+- Binance API errors appear, especially `-4061`;
+- frozen inventory grows without offset or without an operator plan.
+
+## Restart Gate After Incident
+
+After a freeze-ledger incident, do not auto-restart.
+
+Require:
+
+- runner inactive;
+- no live open orders;
+- exchange long/short positions known;
+- frozen ledger reconciled against exchange position;
+- runtime guard state reviewed;
+- recent realized loss reviewed;
+- operator decision recorded: continue experiment, re-freeze residual inventory,
+  or manually flatten and reset ledger.
+
+If the ledger was accidentally cleared by a real order, do not pretend the
+ledger still represents inventory. Either re-create the ledger from current
+exchange position intentionally, or leave it empty and report the realized
+cleanup.
+
+## Known Failure Mode From 2026-05-22
+
+On `114`, frozen short inventory was not preserved:
+
+- frozen short qty existed after reduce-freeze;
+- a loss cooldown path started `maker_flatten_runner`;
+- an `mfpharos_closesho...` BUY SHORT order closed the frozen short;
+- the ledger became empty;
+- later a normal BQ `SELL SHORT` opened a smaller short again.
+
+Fix requirements from this incident:
+
+- loss-only cooldown must not start flatten;
+- submit must suppress all new place orders while loss recovery is unrecovered;
+- audit sync must happen before runtime guard evaluation;
+- generic manual/flatten paths must not be used as frozen cleanup.
+
+## Review Checklist
+
+For each patrol, report:
+
+- runner status;
+- exchange open-order count;
+- exchange long/short qty and notional;
+- ledger long/short qty and notional;
+- managed long/short qty and notional;
+- whether BQ is normal two-sided, soft reduce, hard reduce, or cooldown;
+- whether any frozen cleanup directive is active;
+- whether any forbidden `mf...close...` order appeared;
+- daily 08:00 window volume versus `40000U`;
+- whether parameters were changed.
+
