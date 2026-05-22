@@ -6923,6 +6923,18 @@ def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | di
     return _has_requested(manual_reduce) or _has_requested(manual_limit) or _has_requested(pair_release)
 
 
+def _has_best_quote_frozen_inventory_position(state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    ledger = state.get("best_quote_frozen_inventory") if isinstance(state, Mapping) else None
+    if not isinstance(ledger, Mapping):
+        return False
+    return (
+        _safe_float(ledger.get("long_qty")) > 1e-12
+        or _safe_float(ledger.get("short_qty")) > 1e-12
+        or bool(ledger.get("long_lots"))
+        or bool(ledger.get("short_lots"))
+    )
+
+
 def _suppress_place_orders_during_runtime_guard_loss_cooldown(
     *,
     actions: dict[str, Any],
@@ -6937,16 +6949,13 @@ def _suppress_place_orders_during_runtime_guard_loss_cooldown(
         if isinstance(state, dict):
             raw_override = state.get("runtime_guard_manual_frozen_inventory_override")
             if isinstance(raw_override, dict) and raw_override.get("active"):
-                if _has_pending_frozen_inventory_manual_directive(state):
-                    manual_override = {
-                        "blocked": True,
-                        "reason": "runtime_guard_manual_frozen_inventory_override",
-                        "stop_reasons": list(raw_override.get("stop_reasons") or []),
-                        "last_checked_at": raw_override.get("last_checked_at"),
-                    }
-                else:
-                    state.pop("runtime_guard_manual_frozen_inventory_override", None)
-                    _write_json(state_path, state)
+                manual_override = {
+                    "blocked": True,
+                    "reason": "runtime_guard_manual_frozen_inventory_override",
+                    "stop_reasons": list(raw_override.get("stop_reasons") or []),
+                    "last_checked_at": raw_override.get("last_checked_at"),
+                    "manual_directive_pending": _has_pending_frozen_inventory_manual_directive(state),
+                }
         if not manual_override.get("blocked"):
             return actions
     block = cooldown if cooldown.get("blocked") else manual_override
@@ -7269,7 +7278,9 @@ def _maybe_handle_runtime_guard(
         ["rolling_hourly_loss_limit_hit"],
         ["rolling_hourly_loss_per_10k_limit_hit"],
     )
-    if _has_pending_frozen_inventory_manual_directive(state):
+    frozen_inventory_present = _has_best_quote_frozen_inventory_position(state)
+    manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
+    if frozen_inventory_present or manual_frozen_directive_pending:
         if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
             _runtime_guard_mark_loss_stop(
                 recovery,
@@ -7290,6 +7301,8 @@ def _maybe_handle_runtime_guard(
             "stop_reason": runtime_guard_result.primary_reason,
             "stop_reasons": list(runtime_guard_result.matched_reasons or []),
             "reason": "allow_reduce_only_frozen_inventory_directive",
+            "frozen_inventory_present": frozen_inventory_present,
+            "manual_directive_pending": manual_frozen_directive_pending,
         }
         _write_json(state_path, state)
         return None

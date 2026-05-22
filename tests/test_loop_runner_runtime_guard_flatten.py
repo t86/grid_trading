@@ -274,6 +274,122 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             self.assertEqual(override["reason"], "runtime_guard_manual_frozen_inventory_override")
             self.assertEqual(actions["dropped_place_count_by_runtime_guard_manual_frozen_inventory_override"], 1)
 
+    @patch("grid_optimizer.loop_runner._start_futures_flatten_process")
+    @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
+    @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
+    @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")
+    def test_runtime_guard_non_loss_stop_waits_when_frozen_inventory_exists(
+        self,
+        mock_inputs,
+        mock_evaluate,
+        mock_credentials,
+        mock_cancel,
+        mock_snapshot,
+        mock_start_flatten,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps({"best_quote_frozen_inventory": {"short_qty": 2474.0, "short_entry_price": 0.664}}),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                symbol="PHAROSUSDT",
+                recv_window=5000,
+                strategy_profile="test",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                runtime_guard_stats_start_time=None,
+                run_start_time=None,
+                run_end_time=None,
+                rolling_hourly_loss_limit=None,
+                rolling_hourly_loss_per_10k_limit=None,
+                rolling_hourly_loss_per_10k_min_notional=None,
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+                runtime_guard_loss_recovery_max_1m_amplitude_ratio=0.012,
+                runtime_guard_loss_recovery_max_3m_amplitude_ratio=0.025,
+                max_cumulative_notional=None,
+                max_actual_net_notional=100.0,
+                max_synthetic_drift_notional=None,
+                max_unrealized_loss=None,
+                auto_regime_enabled=False,
+                state_path=str(state_path),
+                plan_json=str(Path(tmpdir) / "plan.json"),
+            )
+            now = datetime(2026, 5, 22, 15, 45, tzinfo=timezone.utc)
+            mock_inputs.return_value = (1000.0, [], None)
+            mock_evaluate.return_value = argparse.Namespace(
+                tradable=False,
+                runtime_status="stopped",
+                stop_triggered=True,
+                primary_reason="max_actual_net_notional_hit",
+                matched_reasons=["max_actual_net_notional_hit"],
+                triggered_at=now.isoformat(),
+                rolling_hourly_loss=0.0,
+                rolling_hourly_gross_notional=0.0,
+                rolling_hourly_loss_per_10k=0.0,
+                rolling_hourly_loss_per_10k_active=False,
+                cumulative_gross_notional=1000.0,
+                unrealized_loss=0.0,
+            )
+
+            summary = _maybe_handle_runtime_guard(
+                args=args,
+                cycle=1,
+                cycle_started_at=now,
+                summary_path=Path(tmpdir) / "events.jsonl",
+            )
+
+            self.assertIsNone(summary)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            override = state["runtime_guard_manual_frozen_inventory_override"]
+            self.assertTrue(override["active"])
+            self.assertTrue(override["frozen_inventory_present"])
+            self.assertFalse(override["manual_directive_pending"])
+            mock_credentials.assert_not_called()
+            mock_cancel.assert_not_called()
+            mock_snapshot.assert_not_called()
+            mock_start_flatten.assert_not_called()
+
+    def test_submit_place_orders_are_blocked_during_frozen_override_without_manual_directive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_guard_manual_frozen_inventory_override": {
+                            "active": True,
+                            "stop_reasons": ["max_actual_net_notional_hit"],
+                            "frozen_inventory_present": True,
+                            "manual_directive_pending": False,
+                        },
+                        "best_quote_frozen_inventory": {"short_qty": 2474.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                state_path=str(state_path),
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+            )
+
+            actions = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+                actions={
+                    "place_count": 1,
+                    "cancel_count": 0,
+                    "place_orders": [{"role": "best_quote_reduce_short", "side": "BUY"}],
+                    "cancel_orders": [],
+                },
+                args=args,
+            )
+
+            self.assertEqual(actions["place_count"], 0)
+            self.assertEqual(actions["place_orders"], [])
+            self.assertEqual(actions["dropped_place_count_by_runtime_guard_manual_frozen_inventory_override"], 1)
+
     @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
     @patch("grid_optimizer.loop_runner._cancel_futures_strategy_orders")
