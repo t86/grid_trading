@@ -5296,6 +5296,10 @@ def _running_status_card_from_snapshot(
         "trade_pnl": float(trade.get("realized_pnl") or 0.0),
         "fees": float(trade.get("commission") or 0.0),
         "funding_fee": float(income.get("funding_fee") or 0.0),
+        "frozen_inventory": snapshot.get("frozen_inventory") if isinstance(snapshot.get("frozen_inventory"), dict) else {},
+        "frozen_pair_release": (
+            snapshot.get("frozen_pair_release") if isinstance(snapshot.get("frozen_pair_release"), dict) else {}
+        ),
         "config": config,
         "snapshot": snapshot,
     }
@@ -5352,6 +5356,10 @@ def _running_status_snapshot_from_config(
             "short_qty": float(fast.get("short_qty") or 0.0),
             "unrealized_pnl": unrealized_pnl,
         },
+        "frozen_inventory": fast.get("frozen_inventory") if isinstance(fast.get("frozen_inventory"), dict) else {},
+        "frozen_pair_release": (
+            fast.get("frozen_pair_release") if isinstance(fast.get("frozen_pair_release"), dict) else {}
+        ),
         "open_orders": [{} for _ in range(open_order_count)],
     }
 
@@ -6495,6 +6503,19 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       return `多 ${fmtNum(ledger.long_qty, 4)} / 空 ${fmtNum(ledger.short_qty, 4)} · 抵扣 ${fmtNum(ledger.offset_qty, 4)}`;
     }
 
+    function frozenPairRelease(card) {
+      return (card && card.frozen_pair_release && typeof card.frozen_pair_release === "object") ? card.frozen_pair_release : {};
+    }
+
+    function formatFrozenPairRelease(card) {
+      const release = frozenPairRelease(card);
+      if (!Object.keys(release).length) return "未上报";
+      if (!release.enabled) return "关闭";
+      if (release.active) return `释放 ${fmtNum(release.release_qty, 4)}`;
+      const reasons = Array.isArray(release.blocked_reasons) ? release.blocked_reasons.filter(Boolean) : [];
+      return reasons.length ? `等待 · ${reasons.join(", ")}` : "等待";
+    }
+
     function badgeClass(card) {
       if (card.is_running) return "good";
       return "warn";
@@ -6567,6 +6588,7 @@ def _render_running_status_page(symbol: str | None = None) -> str:
                 <div class="rs-param-row"><span>硬减仓策略</span><strong>${escapeHtml(formatHardReduce(card))}</strong></div>
                 <div class="rs-param-row"><span>超时减仓机制</span><strong>${escapeHtml(formatTimeoutReduce(card))}</strong></div>
                 <div class="rs-param-row"><span>冻结账本</span><strong>${escapeHtml(formatFrozenInventory(card))}</strong></div>
+                <div class="rs-param-row"><span>冻结释放</span><strong>${escapeHtml(formatFrozenPairRelease(card))}</strong></div>
               </div>
               <div class="rs-stat-panel">
                 <div class="rs-stat-list">
@@ -6693,13 +6715,27 @@ def _render_running_status_page(symbol: str | None = None) -> str:
     function renderFrozenInventoryPanel(card) {
       const editable = Boolean(card && !card.server_base_url);
       const ledger = frozenInventory(card);
+      const release = frozenPairRelease(card);
       const active = ledger.long_qty > 0 || ledger.short_qty > 0;
+      const hasReleaseReport = Object.keys(release).length > 0;
+      const releaseReasons = Array.isArray(release.blocked_reasons) ? release.blocked_reasons.filter(Boolean).join(", ") : "";
+      const releaseStatus = !hasReleaseReport
+        ? "未上报"
+        : (release.active ? "已下释放单" : (release.enabled ? "等待条件" : "关闭"));
+      const stableText = !hasReleaseReport ? "--" : (release.stable_allowed ? "平稳" : "不平稳");
+      const pnlText = hasReleaseReport
+        ? `${fmtSigned(release.estimated_pair_pnl, 6)} / ${fmtNum(release.required_profit, 6)}U`
+        : "--";
       frozenInventoryPanelEl.classList.toggle("rs-hidden", !editable);
       frozenInventoryBodyEl.innerHTML = `
         <div class="rs-ledger-item">冻结多仓<strong>${fmtNum(ledger.long_qty, 6)} @ ${fmtNum(ledger.long_entry_price, 8)}</strong><span>${fmtNum(ledger.long_notional, 2)}U · ${escapeHtml(ledger.long_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">冻结空仓<strong>${fmtNum(ledger.short_qty, 6)} @ ${fmtNum(ledger.short_entry_price, 8)}</strong><span>${fmtNum(ledger.short_notional, 2)}U · ${escapeHtml(ledger.short_frozen_at || "--")}</span></div>
         <div class="rs-ledger-item">多空可抵扣<strong>${fmtNum(ledger.offset_qty, 6)}</strong><span>${fmtNum(ledger.offset_notional, 2)}U</span></div>
         <div class="rs-ledger-item">处理状态<strong>${active ? "有冻结仓位" : "无冻结仓位"}</strong><span>清理按钮会写入策略指令，由 runner 下 reduce-only 单处理。</span></div>
+        <div class="rs-ledger-item">释放状态<strong>${escapeHtml(releaseStatus)}</strong><span>${escapeHtml(releaseReasons || stableText)}</span></div>
+        <div class="rs-ledger-item">释放数量<strong>${fmtNum(release.release_qty, 6)}</strong><span>${fmtNum(release.release_notional, 2)}U · 上限 ${fmtNum(release.max_notional, 2)}U</span></div>
+        <div class="rs-ledger-item">释放盈亏<strong>${escapeHtml(pnlText)}</strong><span>预估 pair PnL / 要求 buffer</span></div>
+        <div class="rs-ledger-item">平稳窗口<strong>${escapeHtml(stableText)}</strong><span>30s ${fmtNum(release.window_30s_abs_return_ratio, 6)} · 1m ${fmtNum(release.window_1m_abs_return_ratio, 6)} · 振幅 ${fmtNum(release.window_1m_amplitude_ratio, 6)}</span></div>
       `;
       frozenClearLongBtn.disabled = !editable || !(ledger.long_qty > 0);
       frozenClearShortBtn.disabled = !editable || !(ledger.short_qty > 0);
@@ -34655,6 +34691,10 @@ def _snapshot_to_running_status_item(snapshot: dict[str, Any]) -> dict[str, Any]
         "open_order_count": len(snapshot.get("open_orders") or []),
         "open_order_summary": _summarize_open_orders_for_status(snapshot),
         "position_summary": _summarize_position_for_status(snapshot),
+        "frozen_inventory": snapshot.get("frozen_inventory") if isinstance(snapshot.get("frozen_inventory"), dict) else {},
+        "frozen_pair_release": (
+            snapshot.get("frozen_pair_release") if isinstance(snapshot.get("frozen_pair_release"), dict) else {}
+        ),
         "runner": {"pid": runner.get("pid"), "elapsed": runner.get("elapsed")},
     }
 
@@ -35002,6 +35042,12 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
     funding_fee = float(income.get("funding_fee") or 0.0)
     unrealized_pnl = float(position.get("unrealized_pnl") or 0.0) if isinstance(position, dict) else 0.0
     total_pnl = trade_pnl + unrealized_pnl + funding_fee - fees
+    best_quote = plan_report.get("best_quote_maker_volume") if isinstance(plan_report.get("best_quote_maker_volume"), dict) else {}
+    reduce_freeze = best_quote.get("reduce_freeze") if isinstance(best_quote.get("reduce_freeze"), dict) else {}
+    frozen_ledger = reduce_freeze.get("ledger") if isinstance(reduce_freeze.get("ledger"), dict) else {}
+    frozen_pair_release = (
+        best_quote.get("frozen_pair_release") if isinstance(best_quote.get("frozen_pair_release"), dict) else {}
+    )
     snapshot = {
         "symbol": symbol,
         "ts": datetime.now(timezone.utc).isoformat(),
@@ -35024,6 +35070,8 @@ def _build_fast_running_status_item(symbol: str, runner: dict[str, Any]) -> dict
         "income_summary": {"funding_fee": funding_fee},
         "position": position,
         "market": runtime_snapshot.get("market") or {},
+        "frozen_inventory": _normalize_runner_frozen_inventory_ledger(frozen_ledger) if frozen_ledger else {},
+        "frozen_pair_release": dict(frozen_pair_release),
         "open_orders": runtime_snapshot.get("open_orders") or [],
     }
     item = _snapshot_to_running_status_item(snapshot)
