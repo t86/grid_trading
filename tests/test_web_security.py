@@ -2924,6 +2924,7 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.7,
                 "best_quote_maker_volume_frozen_pair_release_enabled": True,
                 "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
+                "best_quote_maker_volume_frozen_pair_release_min_side_notional": 100.0,
                 "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.001,
                 "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
                 "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
@@ -2989,6 +2990,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--best-quote-maker-volume-frozen-pair-release-enabled", command)
         pair_release_max_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-notional")
         self.assertEqual(command[pair_release_max_index + 1], "20.0")
+        pair_release_min_side_index = command.index("--best-quote-maker-volume-frozen-pair-release-min-side-notional")
+        self.assertEqual(command[pair_release_min_side_index + 1], "100.0")
         pair_release_profit_index = command.index("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio")
         self.assertEqual(command[pair_release_profit_index + 1], "0.001")
         pair_release_slippage_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks")

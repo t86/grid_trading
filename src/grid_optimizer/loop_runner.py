@@ -2685,6 +2685,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     enabled: bool,
     stable_allowed: bool,
     max_notional: float,
+    min_side_notional: float,
     min_profit_ratio: float,
     max_slippage_ticks: int,
     requested_qty: float | None = None,
@@ -2700,6 +2701,9 @@ def apply_best_quote_frozen_inventory_pair_release(
         "blocked_reasons": [],
         "release_qty": 0.0,
         "release_notional": 0.0,
+        "min_side_notional": max(_safe_float(min_side_notional), 0.0),
+        "frozen_long_notional": 0.0,
+        "frozen_short_notional": 0.0,
         "estimated_pair_pnl": 0.0,
         "required_profit": 0.0,
     }
@@ -2721,6 +2725,17 @@ def apply_best_quote_frozen_inventory_pair_release(
         return release_report
     if mid_price <= 0:
         release_report["blocked_reasons"].append("missing_book_price")
+        return release_report
+    frozen_long_notional = frozen_long_qty * mid_price
+    frozen_short_notional = frozen_short_qty * mid_price
+    release_report["frozen_long_notional"] = frozen_long_notional
+    release_report["frozen_short_notional"] = frozen_short_notional
+    safe_min_side_notional = max(_safe_float(min_side_notional), 0.0)
+    if safe_min_side_notional > 0 and (
+        frozen_long_notional + 1e-12 < safe_min_side_notional
+        or frozen_short_notional + 1e-12 < safe_min_side_notional
+    ):
+        release_report["blocked_reasons"].append("below_min_side_notional")
         return release_report
 
     max_qty = offset_qty
@@ -14628,6 +14643,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_notional", 20.0)),
             0.0,
         )
+        best_quote_frozen_pair_release_min_side_notional = max(
+            _safe_float(
+                getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_min_side_notional", 100.0)
+            ),
+            0.0,
+        )
         best_quote_frozen_pair_release_min_profit_ratio = max(
             _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_min_profit_ratio", 0.0008)),
             0.0,
@@ -15089,6 +15110,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             stable_allowed=best_quote_frozen_pair_release_stable_allowed,
             max_notional=best_quote_frozen_pair_release_max_notional,
+            min_side_notional=best_quote_frozen_pair_release_min_side_notional,
             min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
             max_slippage_ticks=best_quote_frozen_pair_release_max_slippage_ticks,
             requested_qty=(
@@ -15108,6 +15130,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if best_quote_frozen_pair_release_requested
                 else 0.0,
                 "max_notional": best_quote_frozen_pair_release_max_notional,
+                "min_side_notional": best_quote_frozen_pair_release_min_side_notional,
                 "min_profit_ratio": best_quote_frozen_pair_release_min_profit_ratio,
                 "max_slippage_ticks": best_quote_frozen_pair_release_max_slippage_ticks,
                 "max_30s_abs_return_ratio": best_quote_frozen_pair_release_max_30s_abs_return_ratio,
@@ -17521,6 +17544,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=False,
     )
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-notional", type=float, default=20.0)
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-side-notional", type=float, default=100.0)
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio", type=float, default=0.0008)
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks", type=int, default=2)
     parser.add_argument(
@@ -18710,6 +18734,7 @@ def main() -> None:
         raise SystemExit("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale must be within (0, 1]")
     if (
         args.best_quote_maker_volume_frozen_pair_release_max_notional < 0
+        or args.best_quote_maker_volume_frozen_pair_release_min_side_notional < 0
         or args.best_quote_maker_volume_frozen_pair_release_min_profit_ratio < 0
         or args.best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio < 0
         or args.best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio < 0

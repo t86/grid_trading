@@ -1055,6 +1055,7 @@ class LoopRunnerTests(unittest.TestCase):
             enabled=True,
             stable_allowed=True,
             max_notional=20.0,
+            min_side_notional=0.0,
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
         )
@@ -1096,6 +1097,7 @@ class LoopRunnerTests(unittest.TestCase):
             enabled=True,
             stable_allowed=True,
             max_notional=100.0,
+            min_side_notional=0.0,
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
             requested_qty=7.0,
@@ -1105,6 +1107,67 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(release["release_qty"], 7.0)
         self.assertEqual(plan["sell_orders"][0]["qty"], 7.0)
         self.assertEqual(plan["buy_orders"][0]["qty"], 7.0)
+
+    def test_best_quote_frozen_pair_release_requires_both_sides_above_min_notional(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={
+                "frozen_long_qty": 120.0,
+                "frozen_short_qty": 80.0,
+                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.03},
+            },
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=100.0,
+            min_side_notional=100.0,
+            min_profit_ratio=0.0,
+            max_slippage_ticks=2,
+        )
+
+        self.assertFalse(release["active"])
+        self.assertIn("below_min_side_notional", release["blocked_reasons"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["buy_orders"], [])
+
+    def test_best_quote_frozen_pair_release_uses_100u_batch_when_both_sides_are_large(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={
+                "frozen_long_qty": 300.0,
+                "frozen_short_qty": 300.0,
+                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.05},
+            },
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=100.0,
+            min_side_notional=100.0,
+            min_profit_ratio=0.0,
+            max_slippage_ticks=2,
+        )
+
+        self.assertTrue(release["active"])
+        self.assertEqual(release["release_qty"], 99.0)
+        self.assertAlmostEqual(release["release_notional"], 99.99, places=6)
+        self.assertAlmostEqual(plan["sell_orders"][0]["notional"], 99.693, places=6)
+        self.assertAlmostEqual(plan["buy_orders"][0]["notional"], 100.287, places=6)
 
     def test_best_quote_frozen_pair_release_blocks_when_market_not_stable(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
@@ -1122,6 +1185,7 @@ class LoopRunnerTests(unittest.TestCase):
             enabled=True,
             stable_allowed=False,
             max_notional=20.0,
+            min_side_notional=0.0,
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
         )
@@ -1151,6 +1215,7 @@ class LoopRunnerTests(unittest.TestCase):
             enabled=True,
             stable_allowed=True,
             max_notional=20.0,
+            min_side_notional=0.0,
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
         )

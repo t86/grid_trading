@@ -184,6 +184,38 @@ The runner then places explicit frozen cleanup orders:
 Only these explicit frozen cleanup roles should be allowed to intentionally
 reduce frozen inventory.
 
+## Automatic Paired Frozen Release
+
+When both sides have meaningful frozen inventory, the strategy may reduce gross
+exchange exposure by pairing frozen long and frozen short inventory.
+
+The automatic paired release rule is:
+
+- require frozen long notional and frozen short notional to each be at least the
+  configured side threshold;
+- for the 114 experiment, use `100U` as the side threshold;
+- release at most one configured batch per runner cycle;
+- for the 114 experiment, use `100U` as the batch notional;
+- place both legs together as reduce-only IOC orders:
+  - `frozen_inventory_pair_release_long`: SELL LONG reduce-only IOC;
+  - `frozen_inventory_pair_release_short`: BUY SHORT reduce-only IOC;
+- keep the existing market-stability gates before placing the pair:
+  `max_30s_abs_return_ratio`, `max_1m_abs_return_ratio`, and
+  `max_1m_amplitude_ratio`;
+- keep the pair PnL buffer gate unless the operator explicitly changes it.
+
+The intended configuration for this behavior is:
+
+```text
+best_quote_maker_volume_frozen_pair_release_enabled = true
+best_quote_maker_volume_frozen_pair_release_max_notional = 100
+best_quote_maker_volume_frozen_pair_release_min_side_notional = 100
+```
+
+This is not a generic flatten. It is only allowed to touch inventory already
+tracked in `best_quote_frozen_inventory`, and normal managed BQ reduce orders
+must still be capped to managed inventory only.
+
 ## Forbidden Cleanup Path
 
 Generic manual flatten or close-position orders must not process frozen
@@ -331,4 +363,3 @@ For each patrol, report:
 - whether any forbidden `mf...close...` order appeared;
 - daily 08:00 window volume versus `40000U`;
 - whether parameters were changed.
-
