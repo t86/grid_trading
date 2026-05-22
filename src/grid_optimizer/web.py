@@ -6795,6 +6795,35 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       }
     }
 
+    async function refreshOpenDrawerRuntime() {
+      const currentCard = state.drawerCard;
+      if (!currentCard) return;
+      const payload = await fetchRunningStatus();
+      const cards = [];
+      if (payload && payload.view_mode === "local") {
+        Object.values(payload.groups || {}).forEach((group) => {
+          if (Array.isArray(group)) cards.push(...group);
+        });
+      } else {
+        (payload.servers || []).forEach((serverPayload) => {
+          Object.values(serverPayload.groups || {}).forEach((group) => {
+            if (Array.isArray(group)) cards.push(...group);
+          });
+        });
+      }
+      const currentKey = statusKeyForCard(currentCard);
+      const freshCard = cards.find((card) => statusKeyForCard(card) === currentKey);
+      if (!freshCard) return;
+      currentCard.frozen_inventory = freshCard.frozen_inventory || {};
+      currentCard.frozen_pair_release = freshCard.frozen_pair_release || {};
+      currentCard.recent_hour_volume = freshCard.recent_hour_volume;
+      currentCard.recent_hour_pnl = freshCard.recent_hour_pnl;
+      state.drawerCard = currentCard;
+      state.cardIndex.set(currentKey, currentCard);
+      renderFrozenInventoryPanel(currentCard);
+      pageMetaEl.textContent = `冻结账本已更新 ${new Date().toLocaleString("zh-CN")}`;
+    }
+
     async function saveCurrentConfig(applyAfterSave = false) {
       if (!state.drawerCard) return;
       if (!state.jsonValid) {
@@ -6936,7 +6965,10 @@ def _render_running_status_page(symbol: str | None = None) -> str:
       if (state.paused) return;
       const seconds = Math.max(3, Number(refreshSecondsEl.value || 20));
       state.timer = setInterval(() => {
-        if (drawerShellEl.classList.contains("open")) return;
+        if (drawerShellEl.classList.contains("open")) {
+          refreshOpenDrawerRuntime().catch(() => {});
+          return;
+        }
         loadPage({ preserveDrawer: false });
       }, seconds * 1000);
     }

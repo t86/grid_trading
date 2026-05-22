@@ -396,6 +396,8 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("清理冻结多仓", page)
         self.assertIn("由 runner 下 reduce-only 单处理", page)
         self.assertIn("card.frozen_inventory = data.frozen_inventory", page)
+        self.assertIn("async function refreshOpenDrawerRuntime()", page)
+        self.assertIn("refreshOpenDrawerRuntime().catch(() => {})", page)
 
     def test_update_frozen_inventory_pair_release_writes_one_shot_directive(self) -> None:
         with TemporaryDirectory() as tmpdir:
