@@ -6930,21 +6930,46 @@ def _suppress_place_orders_during_runtime_guard_loss_cooldown(
     now: datetime | None = None,
 ) -> dict[str, Any]:
     cooldown = _runtime_guard_loss_recovery_blocks_submit(args, now=now)
+    manual_override: dict[str, Any] = {}
     if not cooldown.get("blocked"):
-        return actions
+        state_path = Path(getattr(args, "state_path", ""))
+        state = read_json(state_path) or {}
+        if isinstance(state, dict):
+            raw_override = state.get("runtime_guard_manual_frozen_inventory_override")
+            if isinstance(raw_override, dict) and raw_override.get("active"):
+                if _has_pending_frozen_inventory_manual_directive(state):
+                    manual_override = {
+                        "blocked": True,
+                        "reason": "runtime_guard_manual_frozen_inventory_override",
+                        "stop_reasons": list(raw_override.get("stop_reasons") or []),
+                        "last_checked_at": raw_override.get("last_checked_at"),
+                    }
+                else:
+                    state.pop("runtime_guard_manual_frozen_inventory_override", None)
+                    _write_json(state_path, state)
+        if not manual_override.get("blocked"):
+            return actions
+    block = cooldown if cooldown.get("blocked") else manual_override
+    block_key = "runtime_guard_loss_cooldown" if cooldown.get("blocked") else "runtime_guard_manual_frozen_inventory_override"
     updated = dict(actions)
     place_orders = [dict(item) for item in list(updated.get("place_orders") or []) if isinstance(item, dict)]
     allowed = [dict(item) for item in place_orders if _is_frozen_inventory_manual_order(item)]
     dropped = [dict(item) for item in place_orders if not _is_frozen_inventory_manual_order(item)]
     updated["place_orders"] = allowed
     updated["place_count"] = len(allowed)
-    updated["runtime_guard_loss_cooldown"] = cooldown
+    updated[block_key] = block
     if dropped:
-        updated["place_orders_dropped_by_runtime_guard_loss_cooldown"] = dropped
-        updated["dropped_place_count_by_runtime_guard_loss_cooldown"] = len(dropped)
+        updated[f"place_orders_dropped_by_{block_key}"] = dropped
+        updated[f"dropped_place_count_by_{block_key}"] = len(dropped)
+        if block_key != "runtime_guard_loss_cooldown":
+            updated["place_orders_dropped_by_runtime_guard_loss_cooldown"] = dropped
+            updated["dropped_place_count_by_runtime_guard_loss_cooldown"] = len(dropped)
     if allowed:
-        updated["place_orders_allowed_by_runtime_guard_loss_cooldown"] = allowed
-        updated["allowed_place_count_by_runtime_guard_loss_cooldown"] = len(allowed)
+        updated[f"place_orders_allowed_by_{block_key}"] = allowed
+        updated[f"allowed_place_count_by_{block_key}"] = len(allowed)
+        if block_key != "runtime_guard_loss_cooldown":
+            updated["place_orders_allowed_by_runtime_guard_loss_cooldown"] = allowed
+            updated["allowed_place_count_by_runtime_guard_loss_cooldown"] = len(allowed)
     return updated
 
 
@@ -7237,30 +7262,39 @@ def _maybe_handle_runtime_guard(
         unrealized_pnl=_safe_float(guard_unrealized_pnl),
     )
     if runtime_guard_result.tradable:
+        if state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None:
+            _write_json(state_path, state)
         return None
     loss_only_stop = runtime_guard_result.matched_reasons in (
         ["rolling_hourly_loss_limit_hit"],
         ["rolling_hourly_loss_per_10k_limit_hit"],
     )
-    if (
-        loss_only_stop
-        and _runtime_guard_loss_recovery_enabled(args)
-        and _has_pending_frozen_inventory_manual_directive(state)
-    ):
-        _runtime_guard_mark_loss_stop(
-            recovery,
-            stopped_at=cycle_started_at,
-            rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
-        )
-        recovery.update(
-            {
-                "last_checked_at": cycle_started_at.isoformat(),
-                "manual_frozen_inventory_override": True,
-                "manual_frozen_inventory_override_reason": "allow_reduce_only_frozen_inventory_directive",
-            }
-        )
+    if _has_pending_frozen_inventory_manual_directive(state):
+        if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+            _runtime_guard_mark_loss_stop(
+                recovery,
+                stopped_at=cycle_started_at,
+                rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+            )
+            recovery.update(
+                {
+                    "last_checked_at": cycle_started_at.isoformat(),
+                    "manual_frozen_inventory_override": True,
+                    "manual_frozen_inventory_override_reason": "allow_reduce_only_frozen_inventory_directive",
+                }
+            )
+        state["runtime_guard_manual_frozen_inventory_override"] = {
+            "active": True,
+            "last_checked_at": cycle_started_at.isoformat(),
+            "runtime_status": runtime_guard_result.runtime_status,
+            "stop_reason": runtime_guard_result.primary_reason,
+            "stop_reasons": list(runtime_guard_result.matched_reasons or []),
+            "reason": "allow_reduce_only_frozen_inventory_directive",
+        }
         _write_json(state_path, state)
         return None
+    if state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None:
+        _write_json(state_path, state)
     credentials = load_binance_api_credentials()
     if credentials is None:
         raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
@@ -17154,6 +17188,20 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             validation["actions"].get("cancel_count", 0) > 0
             or validation["actions"].get("place_count", 0) > 0
         )
+    if (validation["actions"].get("runtime_guard_manual_frozen_inventory_override") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        if validation["actions"].get("place_count", 0) > 0:
+            validation["errors"].append(
+                "runtime_guard manual frozen-inventory override blocks normal place orders; frozen reduce-only orders allowed"
+            )
+        else:
+            validation["errors"].append("runtime_guard manual frozen-inventory override blocks new normal place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
 
     report = {
         "plan_json": str(args.plan_json),
@@ -17476,6 +17524,21 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                 )
             else:
                 validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
+    if (validation["actions"].get("runtime_guard_manual_frozen_inventory_override") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        if "runtime_guard manual frozen-inventory override blocks new normal place orders" not in validation["errors"]:
+            if validation["actions"].get("place_count", 0) > 0:
+                validation["errors"].append(
+                    "runtime_guard manual frozen-inventory override blocks normal place orders; frozen reduce-only orders allowed"
+                )
+            else:
+                validation["errors"].append("runtime_guard manual frozen-inventory override blocks new normal place orders")
         validation["ok"] = (
             validation["actions"].get("cancel_count", 0) > 0
             or validation["actions"].get("place_count", 0) > 0

@@ -308,8 +308,9 @@ The incident observed on `114` showed why this matters:
 
 This is not valid experiment behavior.
 
-Loss-only runtime cooldown must cancel normal strategy orders and block new
-place orders. It must not start flattening frozen inventory.
+Runtime guard stops must cancel/block normal strategy orders. They must not
+start flattening frozen inventory when an explicit frozen-inventory manual
+directive is pending.
 
 ## Runtime Guard Interaction
 
@@ -322,6 +323,15 @@ When `runtime_guard_loss_recovery` has `stopped_at` and no later `recovered_at`:
 - normal BQ entry and normal reduce are not allowed;
 - frozen cleanup is allowed only through an explicit frozen-inventory cleanup
   directive and only after operator intent is clear.
+
+The same exception applies to non-loss runtime stops such as
+`max_actual_net_notional_hit`: if a pending frozen-inventory manual directive is
+present, the runner records
+`runtime_guard_manual_frozen_inventory_override` and continues only far enough
+to submit the explicit frozen reduce-only action. Normal BQ entry, normal BQ
+reduce, and full flatten remain blocked. Manual frozen operations must not be
+blocked by cooldown or max-notional gates, because those are exactly the tools
+used to reduce or release isolated frozen inventory.
 
 Each runner cycle should sync the latest trade audit before evaluating runtime
 guard. This prevents the sequence:
