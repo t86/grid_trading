@@ -4,8 +4,9 @@ import argparse
 import json
 import shlex
 import subprocess
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .strategy_profile_schema import (
@@ -23,8 +24,11 @@ REMOTE_RUNNER_TIMEOUT_SECONDS = 60
 REMOTE_HISTORY_TIMEOUT_SECONDS = 25
 REMOTE_ROLLBACK_TIMEOUT_SECONDS = 35
 REMOTE_RUNTIME_TIMEOUT_SECONDS = 25
+REMOTE_RUNTIME_CACHE_SECONDS = 15.0
+REMOTE_RUNTIME_EVENTS_DEFAULT_LIMIT = 5000
 PHAROS_SYMBOL = "PHAROSUSDT"
 PHAROS_PROFILE = "pharosusdt_hedge_best_quote_maker_volume_v1"
+_REMOTE_RUNTIME_EVENTS_CACHE: dict[tuple[str, int], tuple[float, list[dict[str, Any]], str]] = {}
 
 COMMON_EXECUTION_PARAMS = frozenset(COMMON_RUNNER_PARAMS - PROFILE_GLOBAL_SAFETY_PARAMS) | frozenset(
     {
@@ -273,6 +277,76 @@ def _as_int(value: Any, default: int = 0) -> int:
         return default
 
 
+def _parse_event_ts(value: Any) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _event_gross_notional(event: dict[str, Any], previous: dict[str, Any] | None = None) -> float:
+    for key in ("gross_notional", "trade_notional", "notional"):
+        value = _as_float(event.get(key))
+        if value > 0:
+            return value
+    cumulative = _as_float(event.get("cumulative_gross_notional"))
+    previous_cumulative = _as_float((previous or {}).get("cumulative_gross_notional"), cumulative)
+    return max(cumulative - previous_cumulative, 0.0)
+
+
+def _event_wear(event: dict[str, Any]) -> float:
+    realized = _as_float(event.get("realized_pnl"))
+    commission = _as_float(event.get("commission"), _as_float(event.get("fee")))
+    explicit_wear = _as_float(event.get("wear"))
+    if explicit_wear > 0:
+        return explicit_wear
+    return max(-realized, 0.0) + max(commission, 0.0)
+
+
+def _build_runtime_window(
+    events: list[dict[str, Any]],
+    *,
+    latest_ts: datetime | None,
+    seconds: int,
+) -> dict[str, Any]:
+    if latest_ts is None:
+        window_events = events
+    else:
+        start_ts = latest_ts - timedelta(seconds=seconds)
+        window_events = [
+            event
+            for event in events
+            if (event_ts := _parse_event_ts(event.get("ts"))) is not None and event_ts >= start_ts
+        ]
+    gross = 0.0
+    wear = 0.0
+    maker = 0.0
+    taker = 0.0
+    previous: dict[str, Any] | None = None
+    for event in events:
+        if event not in window_events:
+            previous = event
+            continue
+        gross += _event_gross_notional(event, previous)
+        wear += _event_wear(event)
+        maker += _as_float(event.get("maker_notional"))
+        taker += _as_float(event.get("taker_notional"))
+        previous = event
+    return {
+        "event_count": len(window_events),
+        "gross_notional": round(gross, 8),
+        "wear": round(wear, 8),
+        "wear_per_10k": (wear / gross * 10000.0) if gross > 0 else None,
+        "maker_notional": round(maker, 8),
+        "taker_notional": round(taker, 8),
+    }
+
+
 def _is_active_value(value: Any) -> bool:
     if value is None:
         return False
@@ -419,6 +493,13 @@ def build_pharos_runtime_summary(
 
     first = valid_events[0]
     latest = valid_events[-1]
+    latest_ts = _parse_event_ts(latest.get("ts"))
+    first_ts = _parse_event_ts(first.get("ts"))
+    coverage_seconds = (
+        max((latest_ts - first_ts).total_seconds(), 0.0)
+        if latest_ts is not None and first_ts is not None
+        else 0.0
+    )
     threshold = _as_float(
         latest.get("threshold_position_notional"),
         _as_float(config.get("threshold_position_notional"), 0.0),
@@ -436,6 +517,29 @@ def build_pharos_runtime_summary(
     volatility_paused = bool(latest.get("volatility_entry_pause_active"))
     max_cumulative = _as_float(latest.get("max_cumulative_notional"), _as_float(config.get("max_cumulative_notional")))
     remaining_cumulative = max(max_cumulative - cumulative, 0.0) if max_cumulative > 0 else 0.0
+    windows = {
+        "1h": _build_runtime_window(valid_events, latest_ts=latest_ts, seconds=3600),
+        "24h": _build_runtime_window(valid_events, latest_ts=latest_ts, seconds=86400),
+    }
+    maker_total = windows["24h"]["maker_notional"]
+    taker_total = windows["24h"]["taker_notional"]
+    maker_denominator = maker_total + taker_total
+    if maker_denominator > 0:
+        maker_quality = {
+            "source": "events",
+            "maker_ratio": maker_total / maker_denominator,
+            "maker_notional": maker_total,
+            "taker_notional": taker_total,
+            "required_fields": [],
+        }
+    else:
+        maker_quality = {
+            "source": "missing",
+            "maker_ratio": None,
+            "maker_notional": 0.0,
+            "taker_notional": 0.0,
+            "required_fields": ["maker_notional", "taker_notional"],
+        }
 
     reason_codes: list[str] = []
     if threshold > 0 and net_notional >= threshold:
@@ -451,24 +555,35 @@ def build_pharos_runtime_summary(
 
     if "net_inventory_over_soft_threshold" in reason_codes:
         state = "repair"
+        mode = "recover/safe"
         state_label = "修仓状态：净敞口已超过 soft 阈值"
     elif volatility_paused:
         state = "paused"
+        mode = "safe"
         state_label = "暂停刷量：波动保护 active"
+    elif "stale_orders_present" in reason_codes or "missing_orders_present" in reason_codes:
+        state = "degraded"
+        mode = "safe/watch"
+        state_label = "观察状态：挂单存在 stale/missing"
     else:
         state = "brush"
+        mode = "normal/fast"
         state_label = "刷量状态：normal/fast 可用"
 
     return {
         "ok": True,
         "state": state,
+        "mode": mode,
         "state_label": state_label,
         "reason_codes": reason_codes,
         "event_count": len(valid_events),
         "first_ts": first.get("ts") or "",
         "latest_ts": latest.get("ts") or "",
+        "sample_coverage_seconds": coverage_seconds,
         "latest_cycle": latest.get("cycle"),
         "window_gross_notional": window_gross,
+        "windows": windows,
+        "maker_quality": maker_quality,
         "latest": {
             "mid_price": _as_float(latest.get("mid_price")),
             "center_price": _as_float(latest.get("center_price")),
@@ -773,7 +888,7 @@ import subprocess
 import sys
 
 control_path = sys.argv[1]
-limit = int(sys.argv[2]) if len(sys.argv) > 2 else 120
+limit = int(sys.argv[2]) if len(sys.argv) > 2 else 5000
 selected_keys = {
     "ts",
     "cycle",
@@ -796,6 +911,17 @@ selected_keys = {
     "rolling_hourly_loss_limit",
     "rolling_hourly_gross_notional",
     "rolling_hourly_loss_per_10k",
+    "gross_notional",
+    "trade_notional",
+    "notional",
+    "realized_pnl",
+    "commission",
+    "fee",
+    "wear",
+    "maker_notional",
+    "taker_notional",
+    "maker_count",
+    "taker_count",
     "cumulative_gross_notional",
     "max_cumulative_notional",
     "max_actual_net_notional",
@@ -1018,7 +1144,16 @@ def read_remote_target_history(target: CentralStrategyTarget, *, limit: int = 8)
     return [entry for entry in loaded if isinstance(entry, dict)]
 
 
-def read_remote_runtime_events(target: CentralStrategyTarget, *, limit: int = 120) -> tuple[list[dict[str, Any]], str]:
+def read_remote_runtime_events(
+    target: CentralStrategyTarget,
+    *,
+    limit: int = REMOTE_RUNTIME_EVENTS_DEFAULT_LIMIT,
+) -> tuple[list[dict[str, Any]], str]:
+    cache_key = (target.scope, int(limit))
+    cached = _REMOTE_RUNTIME_EVENTS_CACHE.get(cache_key)
+    now = time.monotonic()
+    if cached and now - cached[0] <= REMOTE_RUNTIME_CACHE_SECONDS:
+        return list(cached[1]), cached[2]
     remote_command = " ".join(
         [
             "python3",
@@ -1042,7 +1177,10 @@ def read_remote_runtime_events(target: CentralStrategyTarget, *, limit: int = 12
     if not isinstance(loaded, dict):
         return [], "runtime response is not an object"
     events = loaded.get("events") if isinstance(loaded.get("events"), list) else []
-    return [entry for entry in events if isinstance(entry, dict)], str(loaded.get("error") or "")
+    parsed_events = [entry for entry in events if isinstance(entry, dict)]
+    error = str(loaded.get("error") or "")
+    _REMOTE_RUNTIME_EVENTS_CACHE[cache_key] = (now, parsed_events, error)
+    return list(parsed_events), error
 
 
 def save_remote_workbench_config(

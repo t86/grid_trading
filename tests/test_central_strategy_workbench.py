@@ -18,6 +18,7 @@ from grid_optimizer.central_strategy_workbench import (
     build_workbench_payload,
     get_central_strategy_target,
     list_central_strategy_targets,
+    read_remote_runtime_events,
     rollback_remote_workbench_config,
     save_remote_workbench_config,
 )
@@ -417,10 +418,90 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
 
         self.assertTrue(summary["ok"])
         self.assertEqual(summary["state"], "brush")
+        self.assertEqual(summary["mode"], "normal/fast")
         self.assertEqual(summary["event_count"], 2)
         self.assertEqual(summary["window_gross_notional"], 250.0)
         self.assertEqual(summary["latest"]["rolling_hourly_loss_per_10k"], 4.76)
         self.assertIn("刷量状态", summary["state_label"])
+
+    def test_build_pharos_runtime_summary_reports_1h_24h_and_maker_quality(self) -> None:
+        summary = build_pharos_runtime_summary(
+            [
+                {
+                    "ts": "2026-05-21T03:59:00+00:00",
+                    "cumulative_gross_notional": 100.0,
+                    "gross_notional": 100.0,
+                    "realized_pnl": -0.1,
+                    "commission": 0.02,
+                    "maker_notional": 100.0,
+                    "taker_notional": 0.0,
+                },
+                {
+                    "ts": "2026-05-21T04:30:00+00:00",
+                    "cumulative_gross_notional": 300.0,
+                    "gross_notional": 200.0,
+                    "realized_pnl": -0.2,
+                    "commission": 0.04,
+                    "maker_notional": 150.0,
+                    "taker_notional": 50.0,
+                },
+                {
+                    "ts": "2026-05-22T03:40:00+00:00",
+                    "cumulative_gross_notional": 600.0,
+                    "gross_notional": 300.0,
+                    "rolling_hourly_gross_notional": 300.0,
+                    "rolling_hourly_loss": 0.25,
+                    "rolling_hourly_loss_per_10k": 8.33,
+                    "realized_pnl": -0.3,
+                    "commission": 0.06,
+                    "maker_notional": 300.0,
+                    "taker_notional": 0.0,
+                    "actual_net_notional": 40.0,
+                    "unrealized_pnl": -0.4,
+                },
+                {
+                    "ts": "2026-05-22T04:10:00+00:00",
+                    "cumulative_gross_notional": 1000.0,
+                    "gross_notional": 400.0,
+                    "rolling_hourly_gross_notional": 700.0,
+                    "rolling_hourly_loss": 0.8,
+                    "rolling_hourly_loss_per_10k": 11.43,
+                    "realized_pnl": -0.4,
+                    "commission": 0.08,
+                    "maker_notional": 250.0,
+                    "taker_notional": 150.0,
+                    "actual_net_notional": 45.0,
+                    "unrealized_pnl": -0.5,
+                    "open_order_count": 2,
+                },
+            ],
+            {"threshold_position_notional": 630.0, "max_cumulative_notional": 200000.0},
+        )
+
+        self.assertEqual(summary["windows"]["1h"]["gross_notional"], 700.0)
+        self.assertEqual(summary["windows"]["24h"]["gross_notional"], 900.0)
+        self.assertEqual(summary["windows"]["1h"]["wear"], 0.84)
+        self.assertAlmostEqual(summary["windows"]["1h"]["wear_per_10k"], 12.0, places=5)
+        self.assertAlmostEqual(summary["maker_quality"]["maker_ratio"], 700.0 / 900.0)
+        self.assertEqual(summary["maker_quality"]["source"], "events")
+
+    def test_build_pharos_runtime_summary_marks_missing_maker_source(self) -> None:
+        summary = build_pharos_runtime_summary(
+            [
+                {
+                    "ts": "2026-05-22T04:10:00+00:00",
+                    "cumulative_gross_notional": 1000.0,
+                    "gross_notional": 400.0,
+                    "actual_net_notional": 45.0,
+                    "unrealized_pnl": -0.5,
+                },
+            ],
+            {"threshold_position_notional": 630.0},
+        )
+
+        self.assertIsNone(summary["maker_quality"]["maker_ratio"])
+        self.assertEqual(summary["maker_quality"]["source"], "missing")
+        self.assertIn("maker_notional", summary["maker_quality"]["required_fields"])
 
     def test_build_pharos_runtime_summary_reports_repair_state_for_large_inventory(self) -> None:
         summary = build_pharos_runtime_summary(
@@ -440,8 +521,49 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
         )
 
         self.assertEqual(summary["state"], "repair")
+        self.assertEqual(summary["mode"], "recover/safe")
         self.assertIn("修仓状态", summary["state_label"])
         self.assertIn("net_inventory_over_soft_threshold", summary["reason_codes"])
+
+    def test_build_pharos_runtime_summary_reports_degraded_state_for_stale_orders(self) -> None:
+        summary = build_pharos_runtime_summary(
+            [
+                {
+                    "ts": "2026-05-22T04:05:00+00:00",
+                    "cumulative_gross_notional": 1250.0,
+                    "rolling_hourly_gross_notional": 1050.0,
+                    "actual_net_notional": 40.0,
+                    "unrealized_pnl": -0.2,
+                    "open_order_count": 2,
+                    "stale_order_count": 1,
+                    "missing_order_count": 1,
+                    "volatility_entry_pause_active": False,
+                },
+            ],
+            {"threshold_position_notional": 630.0},
+        )
+
+        self.assertEqual(summary["state"], "degraded")
+        self.assertEqual(summary["mode"], "safe/watch")
+        self.assertIn("stale_orders_present", summary["reason_codes"])
+
+    @patch("grid_optimizer.central_strategy_workbench.subprocess.run")
+    def test_read_remote_runtime_events_uses_short_cache(self, mock_run) -> None:
+        mock_run.return_value = Mock(
+            returncode=0,
+            stdout=json.dumps({"events": [{"cycle": 1}], "error": ""}),
+            stderr="",
+        )
+        target = get_central_strategy_target("114", "PHAROSUSDT", "pharosusdt_hedge_best_quote_maker_volume_v1")
+
+        first_events, first_error = read_remote_runtime_events(target, limit=120)
+        second_events, second_error = read_remote_runtime_events(target, limit=120)
+
+        self.assertEqual(first_events, [{"cycle": 1}])
+        self.assertEqual(second_events, [{"cycle": 1}])
+        self.assertEqual(first_error, "")
+        self.assertEqual(second_error, "")
+        self.assertEqual(mock_run.call_count, 1)
 
     def test_build_pharos_recommendation_presets_returns_patch_values(self) -> None:
         presets = build_pharos_recommendation_presets(

@@ -27210,9 +27210,18 @@ CENTRAL_STRATEGY_WORKBENCH_PAGE = """<!doctype html>
         return;
       }
       const latest = runtime.latest || {};
+      const oneHour = (runtime.windows || {})["1h"] || {};
+      const dayWindow = (runtime.windows || {})["24h"] || {};
+      const maker = runtime.maker_quality || {};
+      const makerText = maker.source === "events"
+        ? `${latestNumber((maker.maker_ratio || 0) * 100, 2)}%`
+        : `数据源缺失：${fmtList(maker.required_fields || [])}`;
       runtimePanelEl.innerHTML = [
-        `<div class="${runtime.state === "brush" ? "good" : runtime.state === "repair" ? "bad" : "warn"}">${esc(runtime.state_label || "--")}</div>`,
-        `<div>窗口成交增量：${esc(fmtValue(latestNumber(runtime.window_gross_notional, 2)))}</div>`,
+        `<div class="${runtime.state === "brush" ? "good" : runtime.state === "repair" ? "bad" : "warn"}">${esc(runtime.state_label || "--")} · ${esc(runtime.mode || "--")}</div>`,
+        `<div>1h成交：${esc(fmtValue(latestNumber(oneHour.gross_notional, 2)))}，磨损/万：${esc(fmtValue(latestNumber(oneHour.wear_per_10k, 4)))}</div>`,
+        `<div>24h成交：${esc(fmtValue(latestNumber(dayWindow.gross_notional, 2)))}，磨损/万：${esc(fmtValue(latestNumber(dayWindow.wear_per_10k, 4)))}</div>`,
+        `<div>maker比例：${esc(makerText)}</div>`,
+        `<div>样本覆盖：${esc(fmtValue(latestNumber((runtime.sample_coverage_seconds || 0) / 3600, 2)))} 小时</div>`,
         `<div>滚动小时成交：${esc(fmtValue(latestNumber(latest.rolling_hourly_gross_notional, 2)))}</div>`,
         `<div>滚动小时亏损/万：${esc(fmtValue(latestNumber(latest.rolling_hourly_loss_per_10k, 4)))}</div>`,
         `<div>净敞口：${esc(fmtValue(latestNumber(latest.actual_net_notional, 2)))}，浮盈亏：${esc(fmtValue(latestNumber(latest.unrealized_pnl, 4)))}</div>`,
