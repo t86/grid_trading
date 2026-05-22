@@ -840,6 +840,102 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_frozen_inventory"]
         self.assertEqual(ledger["short_qty"], 300.0)
 
+    def test_best_quote_reduce_freeze_waits_for_confirm_cycles(self) -> None:
+        state: dict[str, object] = {}
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+
+        first = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=3,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+        self.assertFalse(first["applied"])
+        self.assertNotIn("best_quote_frozen_inventory", state)
+        self.assertEqual(first["confirmations"]["short"]["count"], 1)
+
+        second = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=first,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=3,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+        self.assertFalse(second["applied"])
+        self.assertEqual(second["confirmations"]["short"]["count"], 2)
+
+        third = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=second,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=3,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+        self.assertTrue(third["applied"])
+        self.assertEqual(third["frozen_short_qty"], 300.0)
+        self.assertNotIn("best_quote_reduce_freeze_confirmation", state)
+
+    def test_best_quote_reduce_freeze_uses_stress_threshold(self) -> None:
+        state: dict[str, object] = {}
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=1,
+            stress_loss_ratio=0.015,
+            stress_active=True,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+
+        self.assertFalse(report["applied"])
+        self.assertEqual(report["effective_threshold_loss_ratio"], 0.015)
+        self.assertNotIn("best_quote_frozen_inventory", state)
+
     def test_best_quote_reduce_freeze_can_add_opposite_side_lot(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {

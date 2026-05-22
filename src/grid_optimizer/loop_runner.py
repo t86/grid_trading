@@ -2482,6 +2482,9 @@ def _apply_best_quote_reduce_freeze(
     enabled: bool,
     threshold_loss_ratio: float,
     min_notional: float,
+    confirm_cycles: int = 1,
+    stress_loss_ratio: float = 0.0,
+    stress_active: bool = False,
     current_long_qty: float,
     current_short_qty: float,
     current_long_avg_price: float,
@@ -2492,7 +2495,11 @@ def _apply_best_quote_reduce_freeze(
     report["enabled"] = bool(enabled)
     report["threshold_loss_ratio"] = max(_safe_float(threshold_loss_ratio), 0.0)
     report["min_notional"] = max(_safe_float(min_notional), 0.0)
+    report["confirm_cycles"] = max(int(confirm_cycles), 1)
+    report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
+    report["stress_active"] = bool(stress_active)
     if not enabled or report["threshold_loss_ratio"] <= 0 or _safe_float(mid_price) <= 0:
+        state.pop("best_quote_reduce_freeze_confirmation", None)
         report["managed_long_qty"] = max(_safe_float(current_long_qty), 0.0)
         report["managed_short_qty"] = max(_safe_float(current_short_qty), 0.0)
         return report
@@ -2507,6 +2514,7 @@ def _apply_best_quote_reduce_freeze(
     )
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
     events = list(report.get("events") or [])
+    confirmations = dict(state.get("best_quote_reduce_freeze_confirmation") or {})
     min_notional_value = _safe_float(report["min_notional"])
 
     long_loss_ratio = 0.0
@@ -2519,17 +2527,53 @@ def _apply_best_quote_reduce_freeze(
     long_notional = max(_safe_float(current_long_qty), 0.0) * _safe_float(mid_price)
     short_notional = max(_safe_float(current_short_qty), 0.0) * _safe_float(mid_price)
     threshold = _safe_float(report["threshold_loss_ratio"])
+    effective_threshold = threshold
+    if bool(stress_active):
+        effective_threshold = max(threshold, _safe_float(stress_loss_ratio))
+    report["effective_threshold_loss_ratio"] = effective_threshold
     frozen_long_qty = _safe_float(report.get("frozen_long_qty"))
     frozen_short_qty = _safe_float(report.get("frozen_short_qty"))
     managed_long_qty = max(_safe_float(current_long_qty) - frozen_long_qty, 0.0)
     managed_short_qty = max(_safe_float(current_short_qty) - frozen_short_qty, 0.0)
     managed_long_notional = managed_long_qty * _safe_float(mid_price)
     managed_short_notional = managed_short_qty * _safe_float(mid_price)
+
+    def _confirmed(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> bool:
+        side_key = side.lower()
+        if not reduce_planned or notional < min_notional_value or qty <= 1e-12 or loss_ratio < effective_threshold:
+            confirmations.pop(side_key, None)
+            return False
+        needed = max(int(confirm_cycles), 1)
+        if needed <= 1:
+            confirmations.pop(side_key, None)
+            return True
+        now_iso = _utc_now().isoformat()
+        previous = confirmations.get(side_key) if isinstance(confirmations.get(side_key), dict) else {}
+        previous_qty = _safe_float(previous.get("qty")) if isinstance(previous, dict) else 0.0
+        previous_threshold = _safe_float(previous.get("effective_threshold_loss_ratio")) if isinstance(previous, dict) else 0.0
+        same_candidate = (
+            abs(previous_qty - qty) <= 1e-9
+            and abs(previous_threshold - effective_threshold) <= 1e-12
+            and bool(previous.get("stress_active")) == bool(stress_active)
+        )
+        count = int(previous.get("count", 0) if same_candidate else 0) + 1
+        confirmations[side_key] = {
+            "side": side.upper(),
+            "count": count,
+            "required_count": needed,
+            "qty": qty,
+            "notional": notional,
+            "loss_ratio": loss_ratio,
+            "base_threshold_loss_ratio": threshold,
+            "effective_threshold_loss_ratio": effective_threshold,
+            "stress_active": bool(stress_active),
+            "first_seen_at": previous.get("first_seen_at") if same_candidate else now_iso,
+            "last_seen_at": now_iso,
+        }
+        return count >= needed
+
     if (
-        reduce_long_planned
-        and managed_long_notional >= min_notional_value
-        and long_loss_ratio >= threshold
-        and managed_long_qty > 1e-12
+        _confirmed("LONG", managed_long_qty, long_loss_ratio, managed_long_notional, reduce_long_planned)
     ):
         frozen_at = _utc_now().isoformat()
         long_lots = list(ledger.get("long_lots") or [])
@@ -2551,15 +2595,16 @@ def _apply_best_quote_reduce_freeze(
                 "side": "LONG",
                 "reason": "reduce_loss_ratio_threshold",
                 "loss_ratio": long_loss_ratio,
+                "effective_threshold_loss_ratio": effective_threshold,
+                "confirm_cycles": max(int(confirm_cycles), 1),
+                "stress_active": bool(stress_active),
                 "qty": managed_long_qty,
                 "notional": managed_long_notional,
             }
         )
+        confirmations.pop("long", None)
     if (
-        reduce_short_planned
-        and managed_short_notional >= min_notional_value
-        and short_loss_ratio >= threshold
-        and managed_short_qty > 1e-12
+        _confirmed("SHORT", managed_short_qty, short_loss_ratio, managed_short_notional, reduce_short_planned)
     ):
         frozen_at = _utc_now().isoformat()
         short_lots = list(ledger.get("short_lots") or [])
@@ -2581,11 +2626,21 @@ def _apply_best_quote_reduce_freeze(
                 "side": "SHORT",
                 "reason": "reduce_loss_ratio_threshold",
                 "loss_ratio": short_loss_ratio,
+                "effective_threshold_loss_ratio": effective_threshold,
+                "confirm_cycles": max(int(confirm_cycles), 1),
+                "stress_active": bool(stress_active),
                 "qty": managed_short_qty,
                 "notional": managed_short_notional,
             }
         )
+        confirmations.pop("short", None)
 
+    if confirmations:
+        state["best_quote_reduce_freeze_confirmation"] = confirmations
+        report["confirmations"] = dict(confirmations)
+    else:
+        state.pop("best_quote_reduce_freeze_confirmation", None)
+        report["confirmations"] = {}
     if events:
         state["best_quote_frozen_inventory"] = ledger
         report = _best_quote_reduce_freeze_report(
@@ -2599,6 +2654,11 @@ def _apply_best_quote_reduce_freeze(
         report["enabled"] = True
         report["applied"] = True
         report["threshold_loss_ratio"] = threshold
+        report["effective_threshold_loss_ratio"] = effective_threshold
+        report["confirm_cycles"] = max(int(confirm_cycles), 1)
+        report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
+        report["stress_active"] = bool(stress_active)
+        report["confirmations"] = dict(confirmations)
         report["min_notional"] = min_notional_value
         report["events"] = events
     return report
@@ -14743,6 +14803,26 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
             0.0,
         )
+        best_quote_reduce_freeze_confirm_cycles = max(
+            int(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_confirm_cycles", 1)),
+            1,
+        )
+        best_quote_reduce_freeze_stress_loss_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_stress_loss_ratio", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_stress_1m_abs_return_ratio = max(
+            _safe_float(
+                getattr(effective_args, "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio", 0.0)
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_stress_1m_amplitude_ratio = max(
+            _safe_float(
+                getattr(effective_args, "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio", 0.0)
+            ),
+            0.0,
+        )
         best_quote_frozen_pair_release_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_enabled", False)
         )
@@ -14800,6 +14880,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             {
                 "enabled": best_quote_reduce_freeze_enabled,
                 "threshold_loss_ratio": best_quote_reduce_freeze_loss_ratio,
+                "confirm_cycles": best_quote_reduce_freeze_confirm_cycles,
+                "stress_loss_ratio": best_quote_reduce_freeze_stress_loss_ratio,
+                "stress_1m_abs_return_ratio": best_quote_reduce_freeze_stress_1m_abs_return_ratio,
+                "stress_1m_amplitude_ratio": best_quote_reduce_freeze_stress_1m_amplitude_ratio,
                 "min_notional": best_quote_reduce_freeze_min_notional,
                 "soft_ratio_scale": best_quote_reduce_freeze_soft_scale,
                 "base_inventory_soft_ratio": float(
@@ -14821,6 +14905,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             freeze_fake_plan["sell_orders"].append({"role": "best_quote_reduce_long"})
         if current_short_notional >= best_quote_reduce_freeze_min_notional > 0:
             freeze_fake_plan["buy_orders"].append({"role": "best_quote_reduce_short"})
+        best_quote_reduce_freeze_stress_active = (
+            (
+                best_quote_reduce_freeze_stress_1m_abs_return_ratio > 0
+                and _adaptive_window_metric("window_1m", "abs_return_ratio")
+                >= best_quote_reduce_freeze_stress_1m_abs_return_ratio
+            )
+            or (
+                best_quote_reduce_freeze_stress_1m_amplitude_ratio > 0
+                and _adaptive_window_metric("window_1m", "amplitude_ratio")
+                >= best_quote_reduce_freeze_stress_1m_amplitude_ratio
+            )
+        )
         best_quote_reduce_freeze = _apply_best_quote_reduce_freeze(
             state=state,
             plan=freeze_fake_plan,
@@ -14828,6 +14924,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             enabled=best_quote_reduce_freeze_enabled,
             threshold_loss_ratio=best_quote_reduce_freeze_loss_ratio,
             min_notional=best_quote_reduce_freeze_min_notional,
+            confirm_cycles=best_quote_reduce_freeze_confirm_cycles,
+            stress_loss_ratio=best_quote_reduce_freeze_stress_loss_ratio,
+            stress_active=best_quote_reduce_freeze_stress_active,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
             current_long_avg_price=current_long_avg_price,
@@ -17665,6 +17764,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-loss-ratio", type=float, default=0.01)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-min-notional", type=float, default=10.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-confirm-cycles", type=int, default=1)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-loss-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale", type=float, default=0.70)
     parser.add_argument(
         "--best-quote-maker-volume-frozen-pair-release-enabled",
@@ -18856,6 +18959,10 @@ def main() -> None:
     if (
         args.best_quote_maker_volume_reduce_freeze_loss_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_min_notional < 0
+        or args.best_quote_maker_volume_reduce_freeze_confirm_cycles < 1
+        or args.best_quote_maker_volume_reduce_freeze_stress_loss_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio < 0
     ):
         raise SystemExit("--best-quote-maker-volume-reduce-freeze values must be >= 0")
     if not (0 < args.best_quote_maker_volume_reduce_freeze_soft_ratio_scale <= 1):

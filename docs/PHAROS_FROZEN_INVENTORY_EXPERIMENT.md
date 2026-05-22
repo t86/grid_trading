@@ -46,8 +46,8 @@ When the runner enters normal reduce for a side:
 
 - allow normal reduce while the side's unrealized loss ratio is below the
   configured threshold;
-- once unrealized loss reaches or exceeds the threshold, stop normal reduce for
-  that side;
+- once unrealized loss reaches or exceeds the effective threshold for enough
+  consecutive confirmation cycles, stop normal reduce for that side;
 - record the remaining side inventory into `best_quote_frozen_inventory`;
 - treat that side inventory as frozen and outside the BQ volume layer.
 
@@ -55,16 +55,27 @@ The initial experiment threshold is:
 
 ```text
 best_quote_maker_volume_reduce_freeze_loss_ratio = 0.01
+best_quote_maker_volume_reduce_freeze_confirm_cycles = 3
+best_quote_maker_volume_reduce_freeze_stress_loss_ratio = 0.015
+best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio = 0.0025
+best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio = 0.0035
 ```
 
-This means roughly 1% unrealized loss on the reducing side. The threshold should
-be evaluated against the side's entry price and current market price:
+This means roughly 1% unrealized loss on the reducing side under normal market
+conditions, confirmed for three consecutive cycles. When the 1m absolute return
+or 1m amplitude crosses the stress thresholds, the freeze threshold is raised to
+1.5% before the same confirmation rule is applied. The threshold should be
+evaluated against the side's entry price and current market price:
 
 - LONG loss ratio: `(entry_price - mid_price) / entry_price`
 - SHORT loss ratio: `(mid_price - entry_price) / entry_price`
 
 The freeze check must not wait for inventory to reach the soft threshold. A side
 can be frozen below soft if the reduce loss threshold has already been reached.
+If the candidate side, managed quantity, effective threshold, or stress state
+changes before confirmation completes, the confirmation count restarts. This is
+intentional: it prevents a short-lived 1% touch, or rapidly changing managed
+inventory, from immediately creating a new frozen lot.
 
 ## Ledger Fields
 

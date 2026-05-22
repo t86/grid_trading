@@ -442,6 +442,10 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_enabled": False,
             "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
             "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+            "best_quote_maker_volume_reduce_freeze_confirm_cycles": 1,
+            "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.0,
+            "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0,
+            "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0,
             "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
             "best_quote_maker_volume_frozen_pair_release_enabled": False,
             "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
@@ -512,6 +516,10 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_enabled": True,
             "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
             "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+            "best_quote_maker_volume_reduce_freeze_confirm_cycles": 3,
+            "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.015,
+            "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0025,
+            "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0035,
             "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
             "best_quote_maker_volume_frozen_pair_release_enabled": False,
             "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
@@ -4013,6 +4021,10 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_reduce_freeze_enabled": False,
     "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
     "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+    "best_quote_maker_volume_reduce_freeze_confirm_cycles": 1,
+    "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.0,
+    "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0,
+    "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0,
     "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.70,
     "best_quote_maker_volume_frozen_pair_release_enabled": False,
     "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
@@ -9314,6 +9326,10 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_net_loss_reduce_min_inventory_notional",
         "best_quote_maker_volume_reduce_freeze_loss_ratio",
         "best_quote_maker_volume_reduce_freeze_min_notional",
+        "best_quote_maker_volume_reduce_freeze_confirm_cycles",
+        "best_quote_maker_volume_reduce_freeze_stress_loss_ratio",
+        "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio",
+        "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio",
         "best_quote_maker_volume_reduce_freeze_soft_ratio_scale",
         "best_quote_maker_volume_frozen_pair_release_max_notional",
         "best_quote_maker_volume_frozen_pair_release_min_side_notional",
@@ -10033,6 +10049,9 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             "best_quote_maker_volume_net_loss_reduce_min_inventory_notional",
             "best_quote_maker_volume_reduce_freeze_loss_ratio",
             "best_quote_maker_volume_reduce_freeze_min_notional",
+            "best_quote_maker_volume_reduce_freeze_stress_loss_ratio",
+            "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio",
+            "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio",
             "best_quote_maker_volume_frozen_pair_release_max_notional",
             "best_quote_maker_volume_frozen_pair_release_min_side_notional",
             "best_quote_maker_volume_frozen_pair_release_min_profit_ratio",
@@ -10044,6 +10063,9 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             value = number(field)
             if value is not None and value < 0:
                 errors.append(f"{field} 必须 >= 0")
+        reduce_freeze_confirm_cycles = number("best_quote_maker_volume_reduce_freeze_confirm_cycles")
+        if reduce_freeze_confirm_cycles is not None and reduce_freeze_confirm_cycles < 1:
+            errors.append("best_quote_maker_volume_reduce_freeze_confirm_cycles 必须 >= 1")
         reduce_freeze_soft_scale = number("best_quote_maker_volume_reduce_freeze_soft_ratio_scale")
         if reduce_freeze_soft_scale is not None and not (0 < reduce_freeze_soft_scale <= 1):
             errors.append("best_quote_maker_volume_reduce_freeze_soft_ratio_scale 必须在 (0, 1] 内")
@@ -10371,6 +10393,14 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_reduce_freeze_loss_ratio", 0.01)),
         "--best-quote-maker-volume-reduce-freeze-min-notional",
         str(config.get("best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
+        "--best-quote-maker-volume-reduce-freeze-confirm-cycles",
+        str(config.get("best_quote_maker_volume_reduce_freeze_confirm_cycles", 1)),
+        "--best-quote-maker-volume-reduce-freeze-stress-loss-ratio",
+        str(config.get("best_quote_maker_volume_reduce_freeze_stress_loss_ratio", 0.0)),
+        "--best-quote-maker-volume-reduce-freeze-stress-1m-abs-return-ratio",
+        str(config.get("best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio", 0.0)),
+        "--best-quote-maker-volume-reduce-freeze-stress-1m-amplitude-ratio",
+        str(config.get("best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio", 0.0)),
         "--best-quote-maker-volume-reduce-freeze-soft-ratio-scale",
         str(config.get("best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 0.70)),
         "--best-quote-maker-volume-frozen-pair-release-enabled"
