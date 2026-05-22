@@ -603,6 +603,20 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(board["activity_start_at"], "2026-05-19T18:00:00+08:00")
         self.assertEqual(board["activity_end_at"], "2026-06-09T07:59:00+08:00")
 
+    def test_hinted_pharos_board_parses_reward_segments(self) -> None:
+        board = resolve_active_competition_board(
+            "PHAROSUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 22, 2, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNotNone(board)
+        by_end_rank = {segment["end_rank"]: segment for segment in board.get("segments", [])}
+        self.assertEqual(by_end_rank[20]["per_user_reward"], 4000.0)
+        self.assertEqual(by_end_rank[50]["per_user_reward"], 2000.0)
+        self.assertEqual(by_end_rank[200]["per_user_reward"], 800.0)
+
     def test_pharos_source_uses_official_binance_activity_page(self) -> None:
         source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_pharos")
         self.assertEqual(
