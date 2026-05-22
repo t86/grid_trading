@@ -229,6 +229,73 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             self.assertEqual(actions["dropped_place_count_by_runtime_guard_loss_cooldown"], 1)
 
     @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
+    def test_submit_loss_recovery_self_heals_when_frozen_inventory_is_strategy_flat(self, mock_stable) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            plan_path = Path(tmpdir) / "plan.json"
+            stopped_at = datetime(2026, 5, 22, 15, 30, tzinfo=timezone.utc)
+            now = stopped_at + timedelta(minutes=10)
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "runtime_guard_loss_recovery": {
+                            "stopped_at": stopped_at.isoformat(),
+                            "last_reason": "rolling_hourly_loss_limit_hit",
+                        },
+                        "runtime_guard_manual_frozen_inventory_override": {"active": True},
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 0.0,
+                            "short_qty": 2274.0,
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "mid_price": 0.663,
+                        "current_long_qty": 0.0,
+                        "current_short_qty": 0.0,
+                        "current_long_notional": 0.0,
+                        "current_short_notional": 0.0,
+                        "strategy_actual_net_notional": 0.0,
+                        "synthetic_drift_qty": 0.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = argparse.Namespace(
+                state_path=str(state_path),
+                plan_json=str(plan_path),
+                symbol="PHAROSUSDT",
+                runtime_guard_loss_recovery_enabled=True,
+                runtime_guard_loss_recovery_cooldown_seconds=180.0,
+                runtime_guard_loss_recovery_max_1m_amplitude_ratio=0.012,
+                runtime_guard_loss_recovery_max_3m_amplitude_ratio=0.025,
+            )
+            mock_stable.return_value = (True, {"available": True})
+
+            actions = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+                actions={
+                    "place_count": 1,
+                    "cancel_count": 0,
+                    "place_orders": [{"role": "entry_short", "side": "SELL"}],
+                    "cancel_orders": [],
+                },
+                args=args,
+                now=now,
+            )
+
+            self.assertEqual(actions["place_count"], 1)
+            self.assertNotIn("runtime_guard_loss_cooldown", actions)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            recovery = state["runtime_guard_loss_recovery"]
+            self.assertIn("recovered_at", recovery)
+            self.assertEqual(recovery["flat_basis"], "strategy_exposure_excluding_frozen_inventory")
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
+
+    @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.evaluate_runtime_guards")
     @patch("grid_optimizer.loop_runner._load_futures_runtime_guard_inputs")

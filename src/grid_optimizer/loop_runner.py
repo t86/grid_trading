@@ -6886,6 +6886,43 @@ def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now:
         0.0,
     )
     elapsed = max((checked_at - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+    if _has_best_quote_frozen_inventory_position(state):
+        plan_path_text = str(getattr(args, "plan_json", "") or "").strip()
+        plan_report = read_json(Path(plan_path_text)) if plan_path_text else {}
+        if not isinstance(plan_report, dict):
+            plan_report = {}
+        strategy_flat = _runtime_guard_strategy_exposure_is_flat(plan_report)
+        try:
+            stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=checked_at)
+        except Exception as exc:
+            stable = bool(recovery.get("market_stable"))
+            stable_report = {
+                "available": False,
+                "warning": f"{type(exc).__name__}: {exc}",
+                **(recovery.get("market") if isinstance(recovery.get("market"), dict) else {}),
+            }
+        recovery.update(
+            {
+                "last_checked_at": checked_at.isoformat(),
+                "cooldown_elapsed_seconds": elapsed,
+                "cooldown_seconds": cooldown_seconds,
+                "flat": strategy_flat,
+                "flat_basis": "strategy_exposure_excluding_frozen_inventory",
+                "market_stable": stable,
+                "market": stable_report,
+            }
+        )
+        if elapsed >= cooldown_seconds and strategy_flat and stable:
+            recovery.update(
+                {
+                    "recovered_at": checked_at.isoformat(),
+                    "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
+                }
+            )
+            state.pop("runtime_guard_manual_frozen_inventory_override", None)
+            _write_json(Path(state_path_text), state)
+            return report
+        _write_json(Path(state_path_text), state)
     return {
         "blocked": True,
         "reason": "runtime_guard_loss_cooling_down",
