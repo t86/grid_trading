@@ -2334,8 +2334,41 @@ def _best_quote_reduce_freeze_report(
     mid_price: float,
 ) -> dict[str, Any]:
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
-    long_qty = min(max(_safe_float(ledger.get("long_qty")), 0.0), max(_safe_float(current_long_qty), 0.0))
-    short_qty = min(max(_safe_float(ledger.get("short_qty")), 0.0), max(_safe_float(current_short_qty), 0.0))
+    safe_mid = max(_safe_float(mid_price), 0.0)
+
+    def _normalized_lots(side: str, current_qty: float, fallback_entry: float) -> list[dict[str, Any]]:
+        raw_lots = ledger.get(f"{side}_lots")
+        source_lots = list(raw_lots) if isinstance(raw_lots, list) else []
+        if not source_lots and _safe_float(ledger.get(f"{side}_qty")) > 0:
+            source_lots = [
+                {
+                    "qty": _safe_float(ledger.get(f"{side}_qty")),
+                    "entry_price": _safe_float(ledger.get(f"{side}_entry_price")) or _safe_float(fallback_entry),
+                    "frozen_at": str(ledger.get(f"{side}_frozen_at") or ""),
+                    "source": "legacy_aggregate",
+                }
+            ]
+        remaining = max(_safe_float(current_qty), 0.0)
+        normalized: list[dict[str, Any]] = []
+        for raw_lot in source_lots:
+            if not isinstance(raw_lot, dict) or remaining <= 1e-12:
+                break
+            qty = min(max(_safe_float(raw_lot.get("qty")), 0.0), remaining)
+            if qty <= 1e-12:
+                continue
+            entry_price = _safe_float(raw_lot.get("entry_price")) or _safe_float(fallback_entry)
+            lot = dict(raw_lot)
+            lot["qty"] = qty
+            lot["entry_price"] = max(entry_price, 0.0)
+            lot["notional"] = qty * safe_mid
+            normalized.append(lot)
+            remaining -= qty
+        return normalized
+
+    long_lots = _normalized_lots("long", current_long_qty, current_long_avg_price)
+    short_lots = _normalized_lots("short", current_short_qty, current_short_avg_price)
+    long_qty = sum(_safe_float(lot.get("qty")) for lot in long_lots)
+    short_qty = sum(_safe_float(lot.get("qty")) for lot in short_lots)
     long_notional = long_qty * max(_safe_float(mid_price), 0.0)
     short_notional = short_qty * max(_safe_float(mid_price), 0.0)
     offset_qty = min(long_qty, short_qty)
@@ -2347,6 +2380,8 @@ def _best_quote_reduce_freeze_report(
                 "short_qty": short_qty,
                 "long_notional": long_notional,
                 "short_notional": short_notional,
+                "long_lots": long_lots,
+                "short_lots": short_lots,
                 "offset_qty": offset_qty,
                 "offset_notional": offset_notional,
                 "updated_at": _utc_now().isoformat(),
@@ -2355,7 +2390,6 @@ def _best_quote_reduce_freeze_report(
         state["best_quote_frozen_inventory"] = ledger
     else:
         state.pop("best_quote_frozen_inventory", None)
-    safe_mid = max(_safe_float(mid_price), 0.0)
     actual_long_unrealized = (
         (safe_mid - _safe_float(current_long_avg_price)) * max(_safe_float(current_long_qty), 0.0)
         if safe_mid > 0 and _safe_float(current_long_avg_price) > 0
@@ -2366,17 +2400,15 @@ def _best_quote_reduce_freeze_report(
         if safe_mid > 0 and _safe_float(current_short_avg_price) > 0
         else 0.0
     )
-    frozen_long_entry = _safe_float(ledger.get("long_entry_price")) or _safe_float(current_long_avg_price)
-    frozen_short_entry = _safe_float(ledger.get("short_entry_price")) or _safe_float(current_short_avg_price)
-    frozen_long_unrealized = (
-        (safe_mid - frozen_long_entry) * long_qty
-        if safe_mid > 0 and frozen_long_entry > 0
-        else 0.0
+    frozen_long_unrealized = sum(
+        (safe_mid - _safe_float(lot.get("entry_price"))) * _safe_float(lot.get("qty"))
+        for lot in long_lots
+        if safe_mid > 0 and _safe_float(lot.get("entry_price")) > 0
     )
-    frozen_short_unrealized = (
-        (frozen_short_entry - safe_mid) * short_qty
-        if safe_mid > 0 and frozen_short_entry > 0
-        else 0.0
+    frozen_short_unrealized = sum(
+        (_safe_float(lot.get("entry_price")) - safe_mid) * _safe_float(lot.get("qty"))
+        for lot in short_lots
+        if safe_mid > 0 and _safe_float(lot.get("entry_price")) > 0
     )
     managed_long_unrealized = actual_long_unrealized - frozen_long_unrealized
     managed_short_unrealized = actual_short_unrealized - frozen_short_unrealized
@@ -2458,8 +2490,6 @@ def _apply_best_quote_reduce_freeze(
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
     events = list(report.get("events") or [])
     min_notional_value = _safe_float(report["min_notional"])
-    existing_frozen_long = _safe_float(ledger.get("long_qty")) > 1e-12
-    existing_frozen_short = _safe_float(ledger.get("short_qty")) > 1e-12
 
     long_loss_ratio = 0.0
     if _safe_float(current_long_avg_price) > 0:
@@ -2471,43 +2501,70 @@ def _apply_best_quote_reduce_freeze(
     long_notional = max(_safe_float(current_long_qty), 0.0) * _safe_float(mid_price)
     short_notional = max(_safe_float(current_short_qty), 0.0) * _safe_float(mid_price)
     threshold = _safe_float(report["threshold_loss_ratio"])
+    frozen_long_qty = _safe_float(report.get("frozen_long_qty"))
+    frozen_short_qty = _safe_float(report.get("frozen_short_qty"))
+    managed_long_qty = max(_safe_float(current_long_qty) - frozen_long_qty, 0.0)
+    managed_short_qty = max(_safe_float(current_short_qty) - frozen_short_qty, 0.0)
+    managed_long_notional = managed_long_qty * _safe_float(mid_price)
+    managed_short_notional = managed_short_qty * _safe_float(mid_price)
     if (
         reduce_long_planned
-        and not existing_frozen_short
-        and long_notional >= min_notional_value
+        and managed_long_notional >= min_notional_value
         and long_loss_ratio >= threshold
-        and max(_safe_float(current_long_qty), 0.0) > _safe_float(ledger.get("long_qty")) + 1e-12
+        and managed_long_qty > 1e-12
     ):
-        ledger["long_qty"] = max(_safe_float(current_long_qty), 0.0)
+        frozen_at = _utc_now().isoformat()
+        long_lots = list(ledger.get("long_lots") or [])
+        long_lots.append(
+            {
+                "qty": managed_long_qty,
+                "entry_price": max(_safe_float(current_long_avg_price), 0.0),
+                "frozen_at": frozen_at,
+                "reason": "reduce_loss_ratio_threshold",
+                "loss_ratio": long_loss_ratio,
+            }
+        )
+        ledger["long_lots"] = long_lots
+        ledger["long_qty"] = frozen_long_qty + managed_long_qty
         ledger["long_entry_price"] = max(_safe_float(current_long_avg_price), 0.0)
-        ledger["long_frozen_at"] = _utc_now().isoformat()
+        ledger["long_frozen_at"] = frozen_at
         events.append(
             {
                 "side": "LONG",
                 "reason": "reduce_loss_ratio_threshold",
                 "loss_ratio": long_loss_ratio,
-                "qty": ledger["long_qty"],
-                "notional": long_notional,
+                "qty": managed_long_qty,
+                "notional": managed_long_notional,
             }
         )
-        existing_frozen_long = True
     if (
         reduce_short_planned
-        and not existing_frozen_long
-        and short_notional >= min_notional_value
+        and managed_short_notional >= min_notional_value
         and short_loss_ratio >= threshold
-        and max(_safe_float(current_short_qty), 0.0) > _safe_float(ledger.get("short_qty")) + 1e-12
+        and managed_short_qty > 1e-12
     ):
-        ledger["short_qty"] = max(_safe_float(current_short_qty), 0.0)
+        frozen_at = _utc_now().isoformat()
+        short_lots = list(ledger.get("short_lots") or [])
+        short_lots.append(
+            {
+                "qty": managed_short_qty,
+                "entry_price": max(_safe_float(current_short_avg_price), 0.0),
+                "frozen_at": frozen_at,
+                "reason": "reduce_loss_ratio_threshold",
+                "loss_ratio": short_loss_ratio,
+            }
+        )
+        ledger["short_lots"] = short_lots
+        ledger["short_qty"] = frozen_short_qty + managed_short_qty
         ledger["short_entry_price"] = max(_safe_float(current_short_avg_price), 0.0)
-        ledger["short_frozen_at"] = _utc_now().isoformat()
+        ledger["short_frozen_at"] = frozen_at
         events.append(
             {
                 "side": "SHORT",
                 "reason": "reduce_loss_ratio_threshold",
                 "loss_ratio": short_loss_ratio,
-                "qty": ledger["short_qty"],
-                "notional": short_notional,
+                "qty": managed_short_qty,
+                "notional": managed_short_notional,
             }
         )
 
