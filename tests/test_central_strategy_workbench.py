@@ -116,7 +116,10 @@ class CentralStrategyWorkbenchTests(unittest.TestCase):
         command = mock_run.call_args.args[0]
         self.assertEqual(command[0], "ssh")
         self.assertEqual(command[1], "srv-43-155-163-114")
-        self.assertIn("/home/ubuntu/wangge/output/pharosusdt_loop_runner_control.json", command)
+        self.assertEqual(len(command), 3)
+        self.assertIn("python3 -c ", command[2])
+        self.assertIn("/home/ubuntu/wangge/output/pharosusdt_loop_runner_control.json", command[2])
+        self.assertNotIn("\nimport json", command[2])
         written = json.loads(mock_run.call_args.kwargs["input"])
         self.assertEqual(written["symbol"], "PHAROSUSDT")
         self.assertEqual(written["strategy_profile"], "pharosusdt_hedge_best_quote_maker_volume_v1")

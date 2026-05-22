@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shlex
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -448,8 +449,16 @@ print(path)
 
 
 def _write_remote_target_config(target: CentralStrategyTarget, config: dict[str, Any]) -> dict[str, Any]:
+    remote_command = " ".join(
+        [
+            "python3",
+            "-c",
+            shlex.quote(REMOTE_WRITE_CONTROL_SCRIPT),
+            shlex.quote(target.control_path),
+        ]
+    )
     completed = subprocess.run(
-        ["ssh", target.ssh_host, "python3", "-c", REMOTE_WRITE_CONTROL_SCRIPT, target.control_path],
+        ["ssh", target.ssh_host, remote_command],
         capture_output=True,
         check=False,
         input=json.dumps(config, ensure_ascii=False, sort_keys=True),
