@@ -9,13 +9,37 @@ from .audit import build_audit_paths, income_row_time_ms, read_jsonl, trade_row_
 from .competition_board import resolve_active_competition_board
 
 
-def _parse_datetime(value: Any, field_name: str) -> datetime | None:
+_BEIJING_TZ = timezone(timedelta(hours=8))
+_BEIJING_DAILY_8_STATS_TOKENS = {
+    "beijing_08_daily",
+    "beijing_8_daily",
+    "beijing_daily_08",
+    "beijing_daily_8",
+    "asia_shanghai_08_daily",
+}
+
+
+def _beijing_daily_8_start(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("now must include timezone information")
+    local = current.astimezone(_BEIJING_TZ)
+    start = local.replace(hour=8, minute=0, second=0, microsecond=0)
+    if local < start:
+        start -= timedelta(days=1)
+    return start.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: Any, field_name: str, *, now: datetime | None = None) -> datetime | None:
     if value in {"", None}:
         return None
     if isinstance(value, datetime):
         dt = value
     else:
-        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        text = str(value).strip()
+        if field_name == "runtime_guard_stats_start_time" and text.lower() in _BEIJING_DAILY_8_STATS_TOKENS:
+            return _beijing_daily_8_start(now=now)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         raise ValueError(f"{field_name} must include timezone information")
     return dt.astimezone(timezone.utc)
@@ -80,7 +104,11 @@ def resolve_runtime_guard_stats_start_time(
     now: datetime | None = None,
 ) -> datetime | None:
     try:
-        explicit_start = _parse_datetime(runtime_guard_stats_start_time, "runtime_guard_stats_start_time")
+        explicit_start = _parse_datetime(
+            runtime_guard_stats_start_time,
+            "runtime_guard_stats_start_time",
+            now=now,
+        )
     except ValueError:
         explicit_start = None
     normalized_symbol = str(symbol or "").upper().strip()
@@ -94,7 +122,7 @@ def resolve_runtime_guard_stats_start_time(
     if not isinstance(board, dict):
         return explicit_start
     try:
-        board_start = _parse_datetime(board.get("activity_start_at"), "activity_start_at")
+        board_start = _parse_datetime(board.get("activity_start_at"), "activity_start_at", now=now)
     except ValueError:
         return explicit_start
     if explicit_start is None:
@@ -182,7 +210,7 @@ def summarize_futures_runtime_guard_inputs(
     return cumulative_gross_notional, pnl_events, metrics_start_time
 
 
-def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
+def normalize_runtime_guard_config(raw: dict[str, Any], *, now: datetime | None = None) -> RuntimeGuardConfig:
     config = RuntimeGuardConfig(
         run_start_time=_parse_datetime(raw.get("run_start_time"), "run_start_time"),
         run_end_time=_parse_datetime(raw.get("run_end_time"), "run_end_time"),
@@ -220,6 +248,7 @@ def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
         runtime_guard_stats_start_time=_parse_datetime(
             raw.get("runtime_guard_stats_start_time"),
             "runtime_guard_stats_start_time",
+            now=now,
         ),
     )
     if config.run_start_time and config.run_end_time and config.run_start_time >= config.run_end_time:
@@ -234,7 +263,7 @@ def normalize_runtime_guard_payload(
     market: str = "futures",
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    config = normalize_runtime_guard_config(raw)
+    config = normalize_runtime_guard_config(raw, now=now)
     normalized_symbol = str(symbol or raw.get("symbol") or "").upper().strip() or None
     resolved_stats_start_time = resolve_runtime_guard_stats_start_time(
         runtime_guard_stats_start_time=config.runtime_guard_stats_start_time,

@@ -37,6 +37,20 @@ class RuntimeGuardsTests(unittest.TestCase):
                 }
             )
 
+    def test_beijing_08_daily_stats_start_resolves_to_current_window(self) -> None:
+        resolved = resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time="beijing_08_daily",
+            now=datetime(2026, 5, 23, 11, 30, tzinfo=timezone.utc),
+        )
+        self.assertEqual(resolved, datetime(2026, 5, 23, 0, 0, tzinfo=timezone.utc))
+
+    def test_beijing_08_daily_stats_start_uses_previous_day_before_8am(self) -> None:
+        resolved = resolve_runtime_guard_stats_start_time(
+            runtime_guard_stats_start_time="beijing_08_daily",
+            now=datetime(2026, 5, 22, 23, 30, tzinfo=timezone.utc),
+        )
+        self.assertEqual(resolved, datetime(2026, 5, 22, 0, 0, tzinfo=timezone.utc))
+
     def test_evaluate_runtime_guards_returns_waiting_before_start(self) -> None:
         now = datetime(2026, 3, 30, 8, 0, tzinfo=timezone.utc)
         cfg = RuntimeGuardConfig(
