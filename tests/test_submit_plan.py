@@ -8,6 +8,7 @@ from grid_optimizer.submit_plan import (
     apply_anti_chase_entry_guard_to_actions,
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
+    apply_reduce_only_no_loss_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
     enforce_execution_action_limits,
@@ -208,6 +209,62 @@ class SubmitPlanTests(unittest.TestCase):
             ("SELL", 0.16091),
         ])
         self.assertEqual(guarded["same_side_spacing_guard"]["suppressed_place_count"], 2)
+
+    def test_reduce_only_no_loss_guard_drops_cost_gate_short_cover_above_ceiling(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 2052.60,
+                    "qty": 0.01,
+                    "notional": 20.526,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "cost_gate_fallback_from_role": "best_quote_entry_long",
+                },
+                {
+                    "side": "BUY",
+                    "price": 2051.00,
+                    "qty": 0.01,
+                    "notional": 20.51,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {
+                    "enabled": True,
+                    "effective_min_profit_ratio": 0.0,
+                    "short_ceiling_price": 2051.20772,
+                },
+                "current_short_avg_price": 2051.20772,
+                "symbol_info": {"tick_size": 0.01, "min_qty": 0.001, "min_notional": 5.0, "step_size": 0.001},
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=2052.50,
+            live_ask_price=2052.61,
+            tick_size=0.01,
+            min_qty=0.001,
+            min_notional=5.0,
+            step_size=0.001,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["price"], 2051.00)
+        dropped = guarded["reduce_only_no_loss_guard"]["dropped_orders"][0]
+        self.assertEqual(dropped["role"], "best_quote_reduce_short")
+        self.assertEqual(dropped["reduce_only_no_loss_drop_reason"], "short_reduce_above_no_loss_ceiling")
+        self.assertAlmostEqual(dropped["reduce_only_no_loss_guard_price"], 2051.20772)
 
     def test_suppress_same_side_nearby_place_orders_preserves_existing_queue(self) -> None:
         actions = {

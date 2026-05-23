@@ -107,6 +107,7 @@ from .submit_plan import (
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
     apply_loss_reduce_reentry_guard_to_actions,
+    apply_reduce_only_no_loss_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
@@ -18143,6 +18144,17 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         actions=validation["actions"],
         args=args,
     )
+    validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+    )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
@@ -18519,6 +18531,17 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     validation["actions"] = _suppress_place_orders_during_runtime_guard_loss_cooldown(
         actions=validation["actions"],
         args=args,
+    )
+    validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [

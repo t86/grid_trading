@@ -1026,6 +1026,110 @@ def apply_loss_inventory_no_cross_entry_guard_to_actions(
     return result
 
 
+def apply_reduce_only_no_loss_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None = None,
+) -> dict[str, Any]:
+    """Drop reduce-only places that would submit beyond the no-loss floor/ceiling."""
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders:
+        result = dict(actions)
+        result["place_orders"] = place_orders
+        result["place_count"] = 0
+        result["place_notional"] = 0.0
+        return result
+
+    guard = plan_report.get("take_profit_guard") if isinstance(plan_report.get("take_profit_guard"), dict) else {}
+    min_profit_ratio = max(
+        _safe_float(guard.get("effective_min_profit_ratio")),
+        _safe_float(plan_report.get("take_profit_min_profit_ratio")),
+        0.0,
+    )
+    long_floor = max(_safe_float(guard.get("long_floor_price")), 0.0)
+    if long_floor <= 0:
+        long_avg = max(_safe_float(plan_report.get("current_long_avg_price")), 0.0)
+        if long_avg > 0:
+            long_floor = long_avg * (1.0 + min_profit_ratio)
+    short_ceiling = max(_safe_float(guard.get("short_ceiling_price")), 0.0)
+    if short_ceiling <= 0:
+        short_avg = max(_safe_float(plan_report.get("current_short_avg_price")), 0.0)
+        if short_avg > 0:
+            short_ceiling = short_avg * (1.0 - min_profit_ratio)
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    for order in place_orders:
+        side = str(order.get("side", "")).upper().strip()
+        role = str(order.get("role", "") or "").strip().lower()
+        if role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}:
+            kept_place_orders.append(order)
+            continue
+        reduce_side = _reduce_only_cap_side(order=order, strategy_mode=strategy_mode)
+        if reduce_side not in {"BUY", "SELL"}:
+            kept_place_orders.append(order)
+            continue
+        prepared_order, skip_reason = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        submitted_price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        drop_reason = ""
+        guard_price = None
+        if reduce_side == "BUY":
+            guard_price = short_ceiling if short_ceiling > 0 else None
+            if short_ceiling > 0 and (submitted_price <= 0 or submitted_price > short_ceiling + 1e-12):
+                drop_reason = "short_reduce_above_no_loss_ceiling"
+        elif reduce_side == "SELL":
+            guard_price = long_floor if long_floor > 0 else None
+            if long_floor > 0 and (submitted_price <= 0 or submitted_price + 1e-12 < long_floor):
+                drop_reason = "long_reduce_below_no_loss_floor"
+        if drop_reason:
+            dropped = dict(order)
+            dropped["reduce_only_no_loss_drop_reason"] = drop_reason
+            dropped["reduce_only_no_loss_guard_price"] = guard_price
+            dropped["reduce_only_no_loss_submitted_price"] = submitted_price
+            if skip_reason:
+                dropped["reduce_only_no_loss_prepare_skip_reason"] = skip_reason
+            dropped_orders.append(dropped)
+            continue
+        order["reduce_only_no_loss_guard"] = "passed"
+        order["reduce_only_no_loss_guard_price"] = guard_price
+        order["reduce_only_no_loss_submitted_price"] = submitted_price
+        kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["reduce_only_no_loss_guard"] = {
+        "enabled": True,
+        "long_floor_price": long_floor if long_floor > 0 else None,
+        "short_ceiling_price": short_ceiling if short_ceiling > 0 else None,
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
 def _entry_side_from_order(order: dict[str, Any], *, strategy_mode: str) -> str | None:
     if _reduce_only_cap_side(order=order, strategy_mode=strategy_mode) is not None:
         return None
@@ -1886,6 +1990,17 @@ def main() -> None:
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
+    validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=str(plan_report.get("strategy_mode", "")).strip() or "one_way_long",
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+    )
 
     _print_preview(plan_report=plan_report, validation=validation, drift_steps=drift_steps)
 
@@ -1963,6 +2078,17 @@ def main() -> None:
             strategy_mode=str(plan_report.get("strategy_mode", "")).strip() or "one_way_long",
             current_actual_net_qty=current_actual_net_qty,
             current_open_orders=current_strategy_open_orders,
+        )
+        validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+            actions=validation["actions"],
+            plan_report=plan_report,
+            strategy_mode=str(plan_report.get("strategy_mode", "")).strip() or "one_way_long",
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+            min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+            step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         )
         validation = enforce_execution_action_limits(
             validation=validation,
