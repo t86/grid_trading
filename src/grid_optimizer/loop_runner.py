@@ -7641,13 +7641,18 @@ def _suppress_place_orders_during_runtime_guard_loss_cooldown(
         if isinstance(state, dict):
             raw_override = state.get("runtime_guard_manual_frozen_inventory_override")
             if isinstance(raw_override, dict) and raw_override.get("active"):
-                manual_override = {
-                    "blocked": True,
-                    "reason": "runtime_guard_manual_frozen_inventory_override",
-                    "stop_reasons": list(raw_override.get("stop_reasons") or []),
-                    "last_checked_at": raw_override.get("last_checked_at"),
-                    "manual_directive_pending": _has_pending_frozen_inventory_manual_directive(state),
-                }
+                manual_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
+                if manual_directive_pending:
+                    manual_override = {
+                        "blocked": True,
+                        "reason": "runtime_guard_manual_frozen_inventory_override",
+                        "stop_reasons": list(raw_override.get("stop_reasons") or []),
+                        "last_checked_at": raw_override.get("last_checked_at"),
+                        "manual_directive_pending": True,
+                    }
+                else:
+                    state.pop("runtime_guard_manual_frozen_inventory_override", None)
+                    _write_json(state_path, state)
         if not manual_override.get("blocked"):
             return actions
     block = cooldown if cooldown.get("blocked") else manual_override
@@ -8023,6 +8028,67 @@ def _maybe_handle_runtime_guard(
     )
     frozen_inventory_present = _has_best_quote_frozen_inventory_position(state)
     manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
+    if frozen_inventory_present and not manual_frozen_directive_pending:
+        if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+            stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+            if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            elif stopped_at is None:
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            cooldown_seconds = max(
+                _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
+                0.0,
+            )
+            elapsed = (
+                max((cycle_started_at.astimezone(timezone.utc) - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+                if stopped_at is not None
+                else 0.0
+            )
+            strategy_flat = _runtime_guard_strategy_exposure_is_flat(latest_plan_report)
+            try:
+                stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=cycle_started_at)
+            except Exception as exc:
+                stable = bool(recovery.get("market_stable"))
+                stable_report = {
+                    "available": False,
+                    "warning": f"{type(exc).__name__}: {exc}",
+                    **(recovery.get("market") if isinstance(recovery.get("market"), dict) else {}),
+                }
+            recovery.update(
+                {
+                    "last_checked_at": cycle_started_at.isoformat(),
+                    "cooldown_elapsed_seconds": elapsed,
+                    "cooldown_seconds": cooldown_seconds,
+                    "flat": strategy_flat,
+                    "flat_basis": "strategy_exposure_excluding_frozen_inventory",
+                    "market_stable": stable,
+                    "market": stable_report,
+                    "frozen_inventory_isolated_from_bq_volume": True,
+                    "last_reason": "rolling_hourly_loss_limit_hit_excluding_frozen_inventory",
+                    "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                    "loss_scope": runtime_guard_loss_scope,
+                }
+            )
+            if elapsed >= cooldown_seconds and strategy_flat and stable:
+                recovery.update(
+                    {
+                        "recovered_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+                        "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
+                    }
+                )
+        if state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None or loss_only_stop:
+            _write_json(state_path, state)
+        return None
     if frozen_inventory_present or manual_frozen_directive_pending:
         if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
             stopped_at = _parse_state_datetime(recovery.get("stopped_at"))

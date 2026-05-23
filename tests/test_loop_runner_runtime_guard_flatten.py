@@ -516,16 +516,13 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
 
             self.assertIsNone(summary)
             state = json.loads(state_path.read_text(encoding="utf-8"))
-            override = state["runtime_guard_manual_frozen_inventory_override"]
-            self.assertTrue(override["active"])
-            self.assertTrue(override["frozen_inventory_present"])
-            self.assertFalse(override["manual_directive_pending"])
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
             mock_credentials.assert_not_called()
             mock_cancel.assert_not_called()
             mock_snapshot.assert_not_called()
             mock_start_flatten.assert_not_called()
 
-    def test_submit_place_orders_are_blocked_during_frozen_override_without_manual_directive(self) -> None:
+    def test_submit_place_orders_are_not_blocked_during_frozen_override_without_manual_directive(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
             state_path.write_text(
@@ -558,9 +555,11 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                 args=args,
             )
 
-            self.assertEqual(actions["place_count"], 0)
-            self.assertEqual(actions["place_orders"], [])
-            self.assertEqual(actions["dropped_place_count_by_runtime_guard_manual_frozen_inventory_override"], 1)
+            self.assertEqual(actions["place_count"], 1)
+            self.assertEqual(actions["place_orders"][0]["role"], "best_quote_reduce_short")
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", actions)
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
 
     @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")
