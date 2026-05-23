@@ -2991,6 +2991,9 @@ class WebSecurityTests(unittest.TestCase):
                 "best_quote_maker_volume_reduce_freeze_enabled": True,
                 "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
                 "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+                "best_quote_maker_volume_reduce_freeze_hard_loss_ratio": 0.045,
+                "best_quote_maker_volume_reduce_freeze_hard_min_notional": 150.0,
+                "best_quote_maker_volume_reduce_freeze_hard_confirm_cycles": 12,
                 "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.7,
                 "best_quote_maker_volume_frozen_pair_release_enabled": True,
                 "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
@@ -3055,6 +3058,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(command[reduce_freeze_loss_index + 1], "0.01")
         reduce_freeze_min_index = command.index("--best-quote-maker-volume-reduce-freeze-min-notional")
         self.assertEqual(command[reduce_freeze_min_index + 1], "10.0")
+        reduce_freeze_hard_loss_index = command.index("--best-quote-maker-volume-reduce-freeze-hard-loss-ratio")
+        self.assertEqual(command[reduce_freeze_hard_loss_index + 1], "0.045")
+        reduce_freeze_hard_min_index = command.index("--best-quote-maker-volume-reduce-freeze-hard-min-notional")
+        self.assertEqual(command[reduce_freeze_hard_min_index + 1], "150.0")
+        reduce_freeze_hard_confirm_index = command.index("--best-quote-maker-volume-reduce-freeze-hard-confirm-cycles")
+        self.assertEqual(command[reduce_freeze_hard_confirm_index + 1], "12")
         reduce_freeze_soft_index = command.index("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale")
         self.assertEqual(command[reduce_freeze_soft_index + 1], "0.7")
         self.assertIn("--best-quote-maker-volume-frozen-pair-release-enabled", command)

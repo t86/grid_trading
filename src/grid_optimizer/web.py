@@ -443,6 +443,9 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
             "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
             "best_quote_maker_volume_reduce_freeze_confirm_cycles": 1,
+            "best_quote_maker_volume_reduce_freeze_hard_loss_ratio": 0.0,
+            "best_quote_maker_volume_reduce_freeze_hard_min_notional": 0.0,
+            "best_quote_maker_volume_reduce_freeze_hard_confirm_cycles": 0,
             "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.0,
             "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0,
             "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0,
@@ -519,6 +522,9 @@ RUNNER_STRATEGY_PRESETS: dict[str, dict[str, Any]] = {
             "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
             "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
             "best_quote_maker_volume_reduce_freeze_confirm_cycles": 3,
+            "best_quote_maker_volume_reduce_freeze_hard_loss_ratio": 0.0,
+            "best_quote_maker_volume_reduce_freeze_hard_min_notional": 0.0,
+            "best_quote_maker_volume_reduce_freeze_hard_confirm_cycles": 0,
             "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.015,
             "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0025,
             "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0035,
@@ -4026,6 +4032,9 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
     "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
     "best_quote_maker_volume_reduce_freeze_confirm_cycles": 1,
+    "best_quote_maker_volume_reduce_freeze_hard_loss_ratio": 0.0,
+    "best_quote_maker_volume_reduce_freeze_hard_min_notional": 0.0,
+    "best_quote_maker_volume_reduce_freeze_hard_confirm_cycles": 0,
     "best_quote_maker_volume_reduce_freeze_stress_loss_ratio": 0.0,
     "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio": 0.0,
     "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio": 0.0,
@@ -9349,6 +9358,8 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_net_loss_reduce_min_inventory_notional",
         "best_quote_maker_volume_reduce_freeze_loss_ratio",
         "best_quote_maker_volume_reduce_freeze_min_notional",
+        "best_quote_maker_volume_reduce_freeze_hard_loss_ratio",
+        "best_quote_maker_volume_reduce_freeze_hard_min_notional",
         "best_quote_maker_volume_reduce_freeze_stress_loss_ratio",
         "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio",
         "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio",
@@ -9449,6 +9460,7 @@ def _normalize_runner_control_payload(payload: dict[str, Any]) -> dict[str, Any]
         "best_quote_maker_volume_quote_offset_ticks",
         "best_quote_maker_volume_defensive_offset_ticks",
         "best_quote_maker_volume_reduce_freeze_confirm_cycles",
+        "best_quote_maker_volume_reduce_freeze_hard_confirm_cycles",
         "best_quote_maker_volume_dynamic_tick_tight_offset_ticks",
         "best_quote_maker_volume_inventory_bias_same_side_extra_ticks",
         "best_quote_maker_volume_inventory_bias_reduce_extra_ticks",
@@ -10089,6 +10101,8 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
             "best_quote_maker_volume_net_loss_reduce_min_inventory_notional",
             "best_quote_maker_volume_reduce_freeze_loss_ratio",
             "best_quote_maker_volume_reduce_freeze_min_notional",
+            "best_quote_maker_volume_reduce_freeze_hard_loss_ratio",
+            "best_quote_maker_volume_reduce_freeze_hard_min_notional",
             "best_quote_maker_volume_reduce_freeze_stress_loss_ratio",
             "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio",
             "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio",
@@ -10107,6 +10121,9 @@ def _validate_runner_required_risk_guards(config: dict[str, Any]) -> None:
         reduce_freeze_confirm_cycles = number("best_quote_maker_volume_reduce_freeze_confirm_cycles")
         if reduce_freeze_confirm_cycles is not None and reduce_freeze_confirm_cycles < 1:
             errors.append("best_quote_maker_volume_reduce_freeze_confirm_cycles 必须 >= 1")
+        reduce_freeze_hard_confirm_cycles = number("best_quote_maker_volume_reduce_freeze_hard_confirm_cycles")
+        if reduce_freeze_hard_confirm_cycles is not None and reduce_freeze_hard_confirm_cycles < 0:
+            errors.append("best_quote_maker_volume_reduce_freeze_hard_confirm_cycles 必须 >= 0")
         reduce_freeze_soft_scale = number("best_quote_maker_volume_reduce_freeze_soft_ratio_scale")
         if reduce_freeze_soft_scale is not None and not (0 < reduce_freeze_soft_scale <= 1):
             errors.append("best_quote_maker_volume_reduce_freeze_soft_ratio_scale 必须在 (0, 1] 内")
@@ -10445,6 +10462,12 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         str(config.get("best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
         "--best-quote-maker-volume-reduce-freeze-confirm-cycles",
         str(int(config.get("best_quote_maker_volume_reduce_freeze_confirm_cycles", 1) or 1)),
+        "--best-quote-maker-volume-reduce-freeze-hard-loss-ratio",
+        str(config.get("best_quote_maker_volume_reduce_freeze_hard_loss_ratio", 0.0)),
+        "--best-quote-maker-volume-reduce-freeze-hard-min-notional",
+        str(config.get("best_quote_maker_volume_reduce_freeze_hard_min_notional", 0.0)),
+        "--best-quote-maker-volume-reduce-freeze-hard-confirm-cycles",
+        str(int(config.get("best_quote_maker_volume_reduce_freeze_hard_confirm_cycles", 0) or 0)),
         "--best-quote-maker-volume-reduce-freeze-stress-loss-ratio",
         str(config.get("best_quote_maker_volume_reduce_freeze_stress_loss_ratio", 0.0)),
         "--best-quote-maker-volume-reduce-freeze-stress-1m-abs-return-ratio",
