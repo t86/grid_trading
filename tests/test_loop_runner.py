@@ -781,7 +781,14 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
 
     def test_best_quote_reduce_freeze_marks_losing_reduce_inventory_unmanaged(self) -> None:
-        state: dict[str, object] = {}
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 100.0, "price": 1.0}],
+                "long_qty": 100.0,
+                "long_avg_price": 1.0,
+                "initialized": True,
+            }
+        }
         report = _best_quote_reduce_freeze_report(
             state=state,
             current_long_qty=100.0,
@@ -813,7 +820,14 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ledger["long_qty"], 100.0)
 
     def test_best_quote_reduce_freeze_can_trigger_below_soft_inventory(self) -> None:
-        state: dict[str, object] = {}
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 300.0, "price": 0.6600}],
+                "short_qty": 300.0,
+                "short_avg_price": 0.6600,
+                "initialized": True,
+            }
+        }
         report = _best_quote_reduce_freeze_report(
             state=state,
             current_long_qty=0.0,
@@ -844,7 +858,14 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ledger["short_qty"], 300.0)
 
     def test_best_quote_reduce_freeze_waits_for_confirm_cycles(self) -> None:
-        state: dict[str, object] = {}
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 300.0, "price": 0.6600}],
+                "short_qty": 300.0,
+                "short_avg_price": 0.6600,
+                "initialized": True,
+            }
+        }
         report = _best_quote_reduce_freeze_report(
             state=state,
             current_long_qty=0.0,
@@ -1042,7 +1063,13 @@ class LoopRunnerTests(unittest.TestCase):
                 "long_qty": 352.0,
                 "long_entry_price": 0.6442,
                 "long_frozen_at": "2026-05-22T05:30:52+00:00",
-            }
+            },
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 110.0, "price": 0.6449}],
+                "short_qty": 110.0,
+                "short_avg_price": 0.6449,
+                "initialized": True,
+            },
         }
         report = _best_quote_reduce_freeze_report(
             state=state,
@@ -1084,7 +1111,13 @@ class LoopRunnerTests(unittest.TestCase):
                         "frozen_at": "2026-05-22T05:30:52+00:00",
                     }
                 ],
-            }
+            },
+            "best_quote_volume_ledger": {
+                "long_lots": [{"qty": 50.0, "price": 1.0}],
+                "long_qty": 50.0,
+                "long_avg_price": 1.0,
+                "initialized": True,
+            },
         }
         report = _best_quote_reduce_freeze_report(
             state=state,
