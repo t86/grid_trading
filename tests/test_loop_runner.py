@@ -1134,6 +1134,31 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_volume_ledger"]
         self.assertNotIn("surplus_reconcile_imported_short_qty", ledger)
 
+    def test_best_quote_volume_ledger_uses_mid_when_surplus_price_is_implausible(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [{"qty": 1070.0, "entry_price": 0.6697483400318}],
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [],
+            },
+        }
+
+        snapshot = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=1100.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.716,
+            mid_price=0.63665,
+        )
+
+        self.assertEqual(snapshot["short_qty"], 30.0)
+        self.assertAlmostEqual(snapshot["short_avg_price"], 0.63665)
+
     def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},

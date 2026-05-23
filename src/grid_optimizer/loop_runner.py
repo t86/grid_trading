@@ -2474,6 +2474,33 @@ def reconcile_best_quote_volume_ledger_surplus(
             }
         ]
 
+    def _plausible_surplus_price(price: float) -> float:
+        safe_price = max(_safe_float(price), 0.0)
+        safe_mid = max(_safe_float(mid_price), 0.0)
+        if safe_price <= 0:
+            return safe_mid
+        if safe_mid > 0 and (safe_price < safe_mid * 0.5 or safe_price > safe_mid * 1.5):
+            return safe_mid
+        return safe_price
+
+    def _sanitize_surplus_lots(lots: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
+        changed = False
+        sanitized: list[dict[str, Any]] = []
+        for raw_lot in lots:
+            lot = dict(raw_lot)
+            if str(lot.get("source") or "") == "exchange_surplus_reconcile":
+                price = max(_safe_float(lot.get("price")), 0.0)
+                safe_price = _plausible_surplus_price(price)
+                if abs(safe_price - price) > 1e-12:
+                    lot["price"] = safe_price
+                    lot["price_source"] = "mid_price_plausibility_guard"
+                    changed = True
+            sanitized.append(lot)
+        return sanitized, changed
+
+    long_lots, sanitized_long = _sanitize_surplus_lots(long_lots)
+    short_lots, sanitized_short = _sanitize_surplus_lots(short_lots)
+
     def _lot_qty_cost(lots: list[dict[str, Any]]) -> tuple[float, float]:
         qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in lots)
         cost = sum(
@@ -2497,8 +2524,7 @@ def reconcile_best_quote_volume_ledger_surplus(
             return active_lots, 0.0, 0.0
         actual_cost = max(_safe_float(actual_qty), 0.0) * max(_safe_float(actual_avg_price), 0.0)
         surplus_price = (actual_cost - active_cost - frozen_cost) / surplus_qty if surplus_qty > 0 else 0.0
-        if surplus_price <= 0:
-            surplus_price = max(_safe_float(actual_avg_price), _safe_float(mid_price), 0.0)
+        surplus_price = _plausible_surplus_price(surplus_price)
         lot = {
             "qty": surplus_qty,
             "price": surplus_price,
@@ -2506,6 +2532,8 @@ def reconcile_best_quote_volume_ledger_surplus(
             "side": side,
             "opened_at": now_iso,
         }
+        if max(_safe_float(mid_price), 0.0) > 0 and abs(surplus_price - _safe_float(mid_price)) <= 1e-12:
+            lot["price_source"] = "mid_price_plausibility_guard"
         return [*active_lots, lot], surplus_qty, surplus_price
 
     long_lots, imported_long_qty, imported_long_price = _import_side(
@@ -2522,7 +2550,12 @@ def reconcile_best_quote_volume_ledger_surplus(
         active_lots=short_lots,
         frozen_lots=frozen_short_lots,
     )
-    if imported_long_qty <= 1e-12 and imported_short_qty <= 1e-12:
+    if (
+        imported_long_qty <= 1e-12
+        and imported_short_qty <= 1e-12
+        and not sanitized_long
+        and not sanitized_short
+    ):
         return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
 
     ledger["long_lots"] = long_lots
