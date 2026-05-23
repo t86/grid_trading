@@ -1294,6 +1294,69 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_volume_ledger"]
         self.assertEqual(ledger["last_applied_trade_count"], 1)
 
+    def test_best_quote_volume_ledger_dedupes_stream_and_rest_trade_rows(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_order_refs": {
+                "41340358": {
+                    "role": "best_quote_entry_long",
+                    "side": "BUY",
+                    "position_side": "LONG",
+                    "client_order_id": "gx-pharosu-bestquot-1-53903073",
+                }
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [],
+                "last_trade_time_ms": 1000,
+                "last_trade_keys_at_time": [],
+            },
+        }
+        trade_time_ms = 2000
+        stream_row = {
+            "id": f"41340358:gx-pharosu-bestquot-1-53903073:{trade_time_ms}:26.0:0.6385",
+            "orderId": 41340358,
+            "clientOrderId": "gx-pharosu-bestquot-1-53903073",
+            "side": "BUY",
+            "positionSide": "LONG",
+            "qty": "26",
+            "price": "0.6385",
+            "quoteQty": "16.601",
+            "time": trade_time_ms,
+        }
+        rest_row = {
+            "id": 6324946,
+            "orderId": 41340358,
+            "side": "BUY",
+            "positionSide": "LONG",
+            "qty": "26",
+            "price": "0.6385",
+            "quoteQty": "16.601",
+            "time": trade_time_ms,
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[rest_row]):
+            snapshot = sync_best_quote_volume_ledger(
+                state=state,
+                symbol="PHAROSUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=26.0,
+                current_short_qty=0.0,
+                current_long_avg_price=0.6385,
+                current_short_avg_price=0.0,
+                mid_price=0.6385,
+                observed_trade_rows=[stream_row],
+            )
+
+        self.assertEqual(snapshot["long_qty"], 26.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["last_applied_trade_count"], 1)
+        self.assertEqual(len(ledger["long_lots"]), 1)
+        self.assertEqual(len(ledger["applied_trade_fill_keys"]), 1)
+
     def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},

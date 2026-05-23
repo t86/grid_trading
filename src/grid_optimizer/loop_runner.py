@@ -2396,6 +2396,27 @@ def _best_quote_trade_role_from_order_ref(
     return ""
 
 
+def _best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
+    side = str((row or {}).get("side") or "").upper().strip()
+    position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
+    time_ms = trade_row_time_ms(dict(row or {}))
+    qty = _safe_float((row or {}).get("qty"))
+    price = _safe_float((row or {}).get("price"))
+    if order_id and side and position_side and time_ms > 0 and qty > 0 and price > 0:
+        return ":".join(
+            [
+                order_id,
+                side,
+                position_side,
+                str(time_ms),
+                format(Decimal(str(qty)), "f").rstrip("0").rstrip("."),
+                format(Decimal(str(price)), "f").rstrip("0").rstrip("."),
+            ]
+        )
+    return trade_row_key(dict(row or {}))
+
+
 def _normalize_best_quote_volume_lots(raw_lots: Any) -> list[dict[str, Any]]:
     lots: list[dict[str, Any]] = []
     if not isinstance(raw_lots, list):
@@ -2624,12 +2645,21 @@ def sync_best_quote_volume_ledger(
         row_time_ms=trade_row_time_ms,
         row_key=trade_row_key,
     )
+    applied_fill_keys = [
+        str(item).strip()
+        for item in list(ledger.get("applied_trade_fill_keys") or [])
+        if str(item).strip()
+    ]
+    applied_fill_key_set = set(applied_fill_keys)
     applied = 0
     unmatched = 0
     realized_delta = 0.0
     commission_delta = 0.0
     gross_delta = 0.0
     for row in fresh_rows:
+        fill_key = _best_quote_trade_fill_key(row)
+        if fill_key and fill_key in applied_fill_key_set:
+            continue
         role = _best_quote_trade_role_from_row(row)
         if not role:
             role = _best_quote_trade_role_from_order_ref(row, state)
@@ -2666,6 +2696,9 @@ def sync_best_quote_volume_ledger(
             short_lots, _, realized_cost = _best_quote_volume_consume_fifo(short_lots, qty)
             realized_delta += realized_cost - qty * price
         applied += 1
+        if fill_key:
+            applied_fill_keys.append(fill_key)
+            applied_fill_key_set.add(fill_key)
 
     ledger["long_lots"] = long_lots
     ledger["short_lots"] = short_lots
@@ -2677,6 +2710,7 @@ def sync_best_quote_volume_ledger(
     ledger["last_unmatched_trade_count"] = unmatched
     ledger["last_trade_time_ms"] = int(trade_last_time_ms or last_time_ms or 0)
     ledger["last_trade_keys_at_time"] = list(trade_keys_at_time)
+    ledger["applied_trade_fill_keys"] = applied_fill_keys[-10000:]
     ledger["updated_at"] = now.isoformat()
     ledger["sync_ok"] = True
     ledger.pop("sync_error", None)
