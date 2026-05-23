@@ -2698,9 +2698,19 @@ def _best_quote_reduce_freeze_report(
     current_short_avg_price: float,
     mid_price: float,
     bq_ledger_report: dict[str, Any] | None = None,
+    position_long_qty: float | None = None,
+    position_short_qty: float | None = None,
 ) -> dict[str, Any]:
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
     safe_mid = max(_safe_float(mid_price), 0.0)
+    effective_position_long_qty = max(
+        _safe_float(current_long_qty if position_long_qty is None else position_long_qty),
+        0.0,
+    )
+    effective_position_short_qty = max(
+        _safe_float(current_short_qty if position_short_qty is None else position_short_qty),
+        0.0,
+    )
 
     def _normalized_lots(side: str, current_qty: float, fallback_entry: float) -> list[dict[str, Any]]:
         raw_lots = ledger.get(f"{side}_lots")
@@ -2731,8 +2741,8 @@ def _best_quote_reduce_freeze_report(
             remaining -= qty
         return normalized
 
-    long_lots = _normalized_lots("long", current_long_qty, current_long_avg_price)
-    short_lots = _normalized_lots("short", current_short_qty, current_short_avg_price)
+    long_lots = _normalized_lots("long", effective_position_long_qty, current_long_avg_price)
+    short_lots = _normalized_lots("short", effective_position_short_qty, current_short_avg_price)
     long_qty = sum(_safe_float(lot.get("qty")) for lot in long_lots)
     short_qty = sum(_safe_float(lot.get("qty")) for lot in short_lots)
     long_manual_limit_isolated_qty = min(
@@ -2771,12 +2781,12 @@ def _best_quote_reduce_freeze_report(
     else:
         state.pop("best_quote_frozen_inventory", None)
     actual_long_unrealized = (
-        (safe_mid - _safe_float(current_long_avg_price)) * max(_safe_float(current_long_qty), 0.0)
+        (safe_mid - _safe_float(current_long_avg_price)) * effective_position_long_qty
         if safe_mid > 0 and _safe_float(current_long_avg_price) > 0
         else 0.0
     )
     actual_short_unrealized = (
-        (_safe_float(current_short_avg_price) - safe_mid) * max(_safe_float(current_short_qty), 0.0)
+        (_safe_float(current_short_avg_price) - safe_mid) * effective_position_short_qty
         if safe_mid > 0 and _safe_float(current_short_avg_price) > 0
         else 0.0
     )
@@ -2795,8 +2805,8 @@ def _best_quote_reduce_freeze_report(
     actual_unrealized = actual_long_unrealized + actual_short_unrealized
     frozen_unrealized = frozen_long_unrealized + frozen_short_unrealized
     managed_unrealized = managed_long_unrealized + managed_short_unrealized
-    managed_long_qty = max(_safe_float(current_long_qty) - long_qty, 0.0)
-    managed_short_qty = max(_safe_float(current_short_qty) - short_qty, 0.0)
+    managed_long_qty = max(effective_position_long_qty - long_qty, 0.0)
+    managed_short_qty = max(effective_position_short_qty - short_qty, 0.0)
     managed_long_avg_price = (
         max(safe_mid - (managed_long_unrealized / managed_long_qty), 0.0)
         if safe_mid > 0 and managed_long_qty > 1e-12
@@ -2857,6 +2867,8 @@ def _best_quote_reduce_freeze_report(
         "managed_unrealized_pnl": managed_unrealized,
         "managed_source": managed_source,
         "volume_ledger": dict(bq_ledger_report or {}),
+        "position_long_qty": effective_position_long_qty,
+        "position_short_qty": effective_position_short_qty,
         "actual_unrealized_pnl": actual_unrealized,
         "strategy_unrealized_pnl": managed_unrealized,
         "isolates_risk_metrics": bool(long_qty > 0 or short_qty > 0),
@@ -16318,6 +16330,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_avg_price=current_short_avg_price,
                 mid_price=mid_price,
                 bq_ledger_report=best_quote_volume_ledger,
+                position_long_qty=_safe_float(best_quote_reduce_freeze.get("position_long_qty")),
+                position_short_qty=_safe_float(best_quote_reduce_freeze.get("position_short_qty")),
             )
         pair_release_30s_abs_return = abs(_adaptive_window_metric("window_30s", "return_ratio"))
         pair_release_1m_abs_return = abs(_adaptive_window_metric("window_1m", "return_ratio"))

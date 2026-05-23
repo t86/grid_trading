@@ -1042,6 +1042,43 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["managed_long_qty"], 0.0)
         self.assertEqual(report["managed_short_qty"], 20.0)
 
+    def test_best_quote_reduce_freeze_uses_position_qty_when_current_is_managed(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [
+                    {"qty": 1000.0, "entry_price": 0.60},
+                    {"qty": 500.0, "entry_price": 0.61},
+                ],
+                "short_manual_limit_isolated_qty": 1200.0,
+            }
+        }
+
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=16.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.62,
+            mid_price=0.645,
+            bq_ledger_report={
+                "initialized": True,
+                "long_qty": 0.0,
+                "short_qty": 16.0,
+                "long_avg_price": 0.0,
+                "short_avg_price": 0.62,
+                "long_unrealized_pnl": 0.0,
+                "short_unrealized_pnl": -0.4,
+                "unrealized_pnl": -0.4,
+            },
+            position_long_qty=0.0,
+            position_short_qty=1516.0,
+        )
+
+        self.assertEqual(report["frozen_short_qty"], 1500.0)
+        self.assertEqual(report["frozen_short_manual_limit_isolated_qty"], 1200.0)
+        self.assertEqual(report["managed_short_qty"], 16.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["short_qty"], 1500.0)
+
     def test_best_quote_reduce_freeze_isolates_frozen_unrealized_loss(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
