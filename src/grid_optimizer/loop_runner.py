@@ -15735,6 +15735,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_frozen_pair_release_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_enabled", False)
         )
+        best_quote_frozen_total_cap_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_total_cap_notional", 0.0)),
+            0.0,
+        )
         best_quote_frozen_pair_release_max_notional = max(
             _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_notional", 20.0)),
             0.0,
@@ -16354,6 +16358,44 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         if best_quote_frozen_pair_release_requested and bool(best_quote_frozen_pair_release.get("active")):
             state.pop("best_quote_frozen_inventory_pair_release", None)
+        best_quote_frozen_total_cap = {
+            "enabled": best_quote_frozen_total_cap_notional > 0,
+            "active": False,
+            "cap_notional": best_quote_frozen_total_cap_notional,
+            "frozen_long_notional": _safe_float(best_quote_reduce_freeze.get("frozen_long_notional")),
+            "frozen_short_notional": _safe_float(best_quote_reduce_freeze.get("frozen_short_notional")),
+            "frozen_total_notional": 0.0,
+            "blocked_buy_entry_orders": 0,
+            "blocked_sell_entry_orders": 0,
+            "reason": None,
+        }
+        best_quote_frozen_total_cap["frozen_total_notional"] = (
+            best_quote_frozen_total_cap["frozen_long_notional"]
+            + best_quote_frozen_total_cap["frozen_short_notional"]
+        )
+        if (
+            best_quote_frozen_total_cap["enabled"]
+            and best_quote_frozen_total_cap["frozen_total_notional"] >= best_quote_frozen_total_cap_notional - 1e-12
+        ):
+            original_buy_orders = list(plan.get("buy_orders") or [])
+            original_sell_orders = list(plan.get("sell_orders") or [])
+            plan["buy_orders"] = [
+                item for item in original_buy_orders if not (isinstance(item, dict) and _is_long_entry_order(item))
+            ]
+            plan["sell_orders"] = [
+                item for item in original_sell_orders if not (isinstance(item, dict) and _is_short_entry_order(item))
+            ]
+            best_quote_frozen_total_cap.update(
+                {
+                    "active": True,
+                    "blocked_buy_entry_orders": len(original_buy_orders) - len(plan["buy_orders"]),
+                    "blocked_sell_entry_orders": len(original_sell_orders) - len(plan["sell_orders"]),
+                    "reason": (
+                        f"frozen_total_notional={_float(best_quote_frozen_total_cap['frozen_total_notional'])} "
+                        f">= cap_notional={_float(best_quote_frozen_total_cap_notional)}"
+                    ),
+                }
+            )
         best_quote_inventory_cost_gate = {
             "enabled": bool(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_enabled", True)),
             "blocked_buy_orders": 0,
@@ -16649,6 +16691,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "frozen_manual_reduce": dict(best_quote_frozen_manual_reduce),
             "frozen_manual_limit": dict(best_quote_frozen_manual_limit),
             "frozen_pair_release": dict(best_quote_frozen_pair_release),
+            "frozen_total_cap": dict(best_quote_frozen_total_cap),
         }
         inventory_tier = {
             "enabled": False,
@@ -18821,6 +18864,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale", type=float, default=0.70)
+    parser.add_argument("--best-quote-maker-volume-frozen-total-cap-notional", type=float, default=0.0)
     parser.add_argument(
         "--best-quote-maker-volume-frozen-pair-release-enabled",
         action=argparse.BooleanOptionalAction,
@@ -20020,6 +20064,7 @@ def main() -> None:
         or args.best_quote_maker_volume_reduce_freeze_stress_loss_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio < 0
+        or args.best_quote_maker_volume_frozen_total_cap_notional < 0
     ):
         raise SystemExit("--best-quote-maker-volume-reduce-freeze values must be >= 0")
     if not (0 < args.best_quote_maker_volume_reduce_freeze_soft_ratio_scale <= 1):
