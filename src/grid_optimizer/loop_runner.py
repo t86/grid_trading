@@ -2326,6 +2326,14 @@ def _order_role(order: dict[str, Any]) -> str:
 
 
 def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    explicit_role = str((row or {}).get("role") or "").lower().strip()
+    if explicit_role in {
+        "best_quote_entry_long",
+        "best_quote_reduce_long",
+        "best_quote_entry_short",
+        "best_quote_reduce_short",
+    }:
+        return explicit_role
     client_order_id = str((row or {}).get("clientOrderId") or (row or {}).get("client_order_id") or "").strip()
     parts = client_order_id.lower().split("-")
     if len(parts) < 3 or parts[0] != "gx":
@@ -2341,6 +2349,42 @@ def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> 
         if side == "BUY" and position_side == "SHORT":
             return "best_quote_reduce_short"
         return ""
+    if side == "BUY" and position_side == "LONG":
+        return "best_quote_entry_long"
+    if side == "SELL" and position_side == "LONG":
+        return "best_quote_reduce_long"
+    if side == "SELL" and position_side == "SHORT":
+        return "best_quote_entry_short"
+    if side == "BUY" and position_side == "SHORT":
+        return "best_quote_reduce_short"
+    return ""
+
+
+def _best_quote_trade_role_from_order_ref(
+    row: Mapping[str, Any] | dict[str, Any],
+    state: Mapping[str, Any] | dict[str, Any],
+) -> str:
+    refs = state.get("best_quote_volume_order_refs") if isinstance(state, Mapping) else None
+    if not isinstance(refs, Mapping):
+        return ""
+    order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
+    if not order_id:
+        return ""
+    ref = refs.get(order_id)
+    if not isinstance(ref, Mapping):
+        return ""
+    role = str(ref.get("role") or "").lower().strip()
+    if role in {
+        "best_quote_entry_long",
+        "best_quote_reduce_long",
+        "best_quote_entry_short",
+        "best_quote_reduce_short",
+    }:
+        return role
+    side = str((row or {}).get("side") or ref.get("side") or "").upper().strip()
+    position_side = str(
+        (row or {}).get("positionSide") or (row or {}).get("position_side") or ref.get("position_side") or ""
+    ).upper().strip()
     if side == "BUY" and position_side == "LONG":
         return "best_quote_entry_long"
     if side == "SELL" and position_side == "LONG":
@@ -2587,6 +2631,8 @@ def sync_best_quote_volume_ledger(
     gross_delta = 0.0
     for row in fresh_rows:
         role = _best_quote_trade_role_from_row(row)
+        if not role:
+            role = _best_quote_trade_role_from_order_ref(row, state)
         if not role:
             compact = str(row.get("clientOrderId") or row.get("client_order_id") or "").lower().split("-")
             if len(compact) >= 3 and compact[2] == "bestquot":
@@ -5694,6 +5740,52 @@ def _update_inventory_grid_order_refs(
         }
 
     state["inventory_grid_order_refs"] = refs
+    try:
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return
+
+
+def update_best_quote_volume_order_refs(
+    *,
+    state_path: Path,
+    strategy_mode: str,
+    submit_report: dict[str, Any],
+) -> None:
+    if not _is_best_quote_maker_volume_mode(strategy_mode) or not state_path.exists():
+        return
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    refs = state.get("best_quote_volume_order_refs")
+    if not isinstance(refs, dict):
+        refs = {}
+
+    for item in submit_report.get("placed_orders", []):
+        if not isinstance(item, dict):
+            continue
+        request = item.get("request", {}) if isinstance(item.get("request"), dict) else {}
+        response = item.get("response", {}) if isinstance(item.get("response"), dict) else {}
+        order_id = epoch_ms(response.get("orderId"))
+        if order_id <= 0:
+            continue
+        refs[str(order_id)] = {
+            "role": str(request.get("role", "")).strip(),
+            "side": str(request.get("side", "")).upper().strip(),
+            "position_side": str(
+                request.get("position_side") or request.get("positionSide") or "BOTH"
+            ).upper().strip()
+            or "BOTH",
+            "client_order_id": str(response.get("clientOrderId", "")).strip(),
+            "updated_at": _isoformat(_utc_now()),
+        }
+
+    if len(refs) > 10000:
+        refs = dict(list(refs.items())[-10000:])
+
+    state["best_quote_volume_order_refs"] = refs
     try:
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
@@ -18865,6 +18957,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         submit_report=report,
     )
     _update_inventory_grid_order_refs(
+        state_path=Path(str(plan_report.get("state_path", args.state_path))),
+        strategy_mode=strategy_mode,
+        submit_report=report,
+    )
+    update_best_quote_volume_order_refs(
         state_path=Path(str(plan_report.get("state_path", args.state_path))),
         strategy_mode=strategy_mode,
         submit_report=report,
