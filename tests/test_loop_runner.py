@@ -48,6 +48,7 @@ from grid_optimizer.loop_runner import (
     _apply_best_quote_reduce_freeze,
     _cap_best_quote_reduce_orders_to_managed_inventory,
     reconcile_best_quote_volume_ledger_surplus,
+    sync_best_quote_volume_ledger,
     apply_best_quote_frozen_inventory_manual_reduce,
     apply_best_quote_frozen_inventory_manual_limit,
     apply_best_quote_frozen_inventory_pair_release,
@@ -1078,7 +1079,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(report["isolates_risk_metrics"])
         self.assertAlmostEqual(report["managed_unrealized_pnl"], -2.0)
 
-    def test_best_quote_volume_ledger_imports_exchange_surplus_above_frozen_inventory(self) -> None:
+    def test_best_quote_volume_ledger_ignores_exchange_surplus_above_frozen_inventory(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
                 "long_lots": [{"qty": 58.0, "entry_price": 0.6452961911638}],
@@ -1102,11 +1103,10 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         self.assertEqual(snapshot["long_qty"], 0.0)
-        self.assertEqual(snapshot["short_qty"], 30.0)
-        self.assertAlmostEqual(snapshot["short_avg_price"], 0.6375)
+        self.assertEqual(snapshot["short_qty"], 0.0)
         ledger = state["best_quote_volume_ledger"]
-        self.assertEqual(ledger["surplus_reconcile_imported_short_qty"], 30.0)
-        self.assertEqual(ledger["short_lots"][0]["source"], "exchange_surplus_reconcile")
+        self.assertNotIn("surplus_reconcile_imported_short_qty", ledger)
+        self.assertEqual(ledger["short_lots"], [])
 
     def test_best_quote_volume_ledger_does_not_import_when_exchange_qty_is_below_tracked(self) -> None:
         state: dict[str, object] = {
@@ -1134,7 +1134,7 @@ class LoopRunnerTests(unittest.TestCase):
         ledger = state["best_quote_volume_ledger"]
         self.assertNotIn("surplus_reconcile_imported_short_qty", ledger)
 
-    def test_best_quote_volume_ledger_uses_mid_when_surplus_price_is_implausible(self) -> None:
+    def test_best_quote_volume_ledger_removes_legacy_exchange_surplus_lots(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
                 "short_lots": [{"qty": 1070.0, "entry_price": 0.6697483400318}],
@@ -1143,7 +1143,10 @@ class LoopRunnerTests(unittest.TestCase):
                 "initialized": True,
                 "sync_ok": True,
                 "long_lots": [],
-                "short_lots": [],
+                "short_lots": [
+                    {"qty": 30.0, "price": 0.63665, "source": "exchange_surplus_reconcile"},
+                    {"qty": 12.0, "price": 0.6375, "source": "trade_fill"},
+                ],
             },
         }
 
@@ -1156,8 +1159,54 @@ class LoopRunnerTests(unittest.TestCase):
             mid_price=0.63665,
         )
 
-        self.assertEqual(snapshot["short_qty"], 30.0)
-        self.assertAlmostEqual(snapshot["short_avg_price"], 0.63665)
+        self.assertEqual(snapshot["short_qty"], 12.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["surplus_reconcile_removed_short_qty"], 30.0)
+        self.assertEqual(len(ledger["short_lots"]), 1)
+        self.assertEqual(ledger["short_lots"][0]["source"], "trade_fill")
+
+    def test_best_quote_volume_ledger_counts_hardloss_reduce_as_managed_reduce(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [{"qty": 100.0, "price": 0.63, "source": "trade_fill"}],
+                "last_trade_time_ms": 1000,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            snapshot = sync_best_quote_volume_ledger(
+                state=state,
+                symbol="PHAROSUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=0.0,
+                current_short_qty=91.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=0.63,
+                mid_price=0.632,
+                observed_trade_rows=[
+                    {
+                        "time": 2000,
+                        "orderId": 41046161,
+                        "clientOrderId": "gx-pharosu-hardloss-1-44382315",
+                        "side": "BUY",
+                        "positionSide": "SHORT",
+                        "qty": "9",
+                        "price": "0.6314",
+                        "quoteQty": "5.6826",
+                    }
+                ],
+            )
+
+        self.assertEqual(snapshot["short_qty"], 91.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["last_applied_trade_count"], 1)
+        self.assertAlmostEqual(ledger["realized_pnl"], -0.0126, places=6)
 
     def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
         state: dict[str, object] = {

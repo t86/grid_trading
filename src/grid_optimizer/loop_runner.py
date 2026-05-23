@@ -2330,10 +2330,16 @@ def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> 
     if len(parts) < 3 or parts[0] != "gx":
         return ""
     compact_role = parts[2].strip()
-    if compact_role != "bestquot":
+    if compact_role not in {"bestquot", "hardloss"}:
         return ""
     side = str((row or {}).get("side") or "").upper().strip()
     position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
+    if compact_role == "hardloss":
+        if side == "SELL" and position_side == "LONG":
+            return "best_quote_reduce_long"
+        if side == "BUY" and position_side == "SHORT":
+            return "best_quote_reduce_short"
+        return ""
     if side == "BUY" and position_side == "LONG":
         return "best_quote_entry_long"
     if side == "SELL" and position_side == "LONG":
@@ -2457,113 +2463,27 @@ def reconcile_best_quote_volume_ledger_surplus(
     now_iso = _utc_now().isoformat()
     long_lots = _normalize_best_quote_volume_lots(ledger.get("long_lots"))
     short_lots = _normalize_best_quote_volume_lots(ledger.get("short_lots"))
-    frozen_long_lots = _normalize_best_quote_volume_lots(frozen.get("long_lots"))
-    frozen_short_lots = _normalize_best_quote_volume_lots(frozen.get("short_lots"))
-    if not frozen_long_lots and _safe_float(frozen.get("long_qty")) > 1e-12:
-        frozen_long_lots = [
-            {
-                "qty": _safe_float(frozen.get("long_qty")),
-                "price": _safe_float(frozen.get("long_entry_price")),
-            }
-        ]
-    if not frozen_short_lots and _safe_float(frozen.get("short_qty")) > 1e-12:
-        frozen_short_lots = [
-            {
-                "qty": _safe_float(frozen.get("short_qty")),
-                "price": _safe_float(frozen.get("short_entry_price")),
-            }
-        ]
 
-    def _plausible_surplus_price(price: float) -> float:
-        safe_price = max(_safe_float(price), 0.0)
-        safe_mid = max(_safe_float(mid_price), 0.0)
-        if safe_price <= 0:
-            return safe_mid
-        if safe_mid > 0 and (safe_price < safe_mid * 0.5 or safe_price > safe_mid * 1.5):
-            return safe_mid
-        return safe_price
-
-    def _sanitize_surplus_lots(lots: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], bool]:
-        changed = False
-        sanitized: list[dict[str, Any]] = []
-        for raw_lot in lots:
-            lot = dict(raw_lot)
+    def _remove_exchange_surplus_lots(lots: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], float]:
+        kept: list[dict[str, Any]] = []
+        removed_qty = 0.0
+        for lot in lots:
             if str(lot.get("source") or "") == "exchange_surplus_reconcile":
-                price = max(_safe_float(lot.get("price")), 0.0)
-                safe_price = _plausible_surplus_price(price)
-                if abs(safe_price - price) > 1e-12:
-                    lot["price"] = safe_price
-                    lot["price_source"] = "mid_price_plausibility_guard"
-                    changed = True
-            sanitized.append(lot)
-        return sanitized, changed
+                removed_qty += max(_safe_float(lot.get("qty")), 0.0)
+                continue
+            kept.append(lot)
+        return kept, removed_qty
 
-    long_lots, sanitized_long = _sanitize_surplus_lots(long_lots)
-    short_lots, sanitized_short = _sanitize_surplus_lots(short_lots)
-
-    def _lot_qty_cost(lots: list[dict[str, Any]]) -> tuple[float, float]:
-        qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in lots)
-        cost = sum(
-            max(_safe_float(item.get("qty")), 0.0) * max(_safe_float(item.get("price")), 0.0)
-            for item in lots
-        )
-        return qty, cost
-
-    def _import_side(
-        *,
-        side: str,
-        actual_qty: float,
-        actual_avg_price: float,
-        active_lots: list[dict[str, Any]],
-        frozen_lots: list[dict[str, Any]],
-    ) -> tuple[list[dict[str, Any]], float, float]:
-        active_qty, active_cost = _lot_qty_cost(active_lots)
-        frozen_qty, frozen_cost = _lot_qty_cost(frozen_lots)
-        surplus_qty = max(_safe_float(actual_qty) - active_qty - frozen_qty, 0.0)
-        if surplus_qty <= 1e-12:
-            return active_lots, 0.0, 0.0
-        actual_cost = max(_safe_float(actual_qty), 0.0) * max(_safe_float(actual_avg_price), 0.0)
-        surplus_price = (actual_cost - active_cost - frozen_cost) / surplus_qty if surplus_qty > 0 else 0.0
-        surplus_price = _plausible_surplus_price(surplus_price)
-        lot = {
-            "qty": surplus_qty,
-            "price": surplus_price,
-            "source": "exchange_surplus_reconcile",
-            "side": side,
-            "opened_at": now_iso,
-        }
-        if max(_safe_float(mid_price), 0.0) > 0 and abs(surplus_price - _safe_float(mid_price)) <= 1e-12:
-            lot["price_source"] = "mid_price_plausibility_guard"
-        return [*active_lots, lot], surplus_qty, surplus_price
-
-    long_lots, imported_long_qty, imported_long_price = _import_side(
-        side="long",
-        actual_qty=current_long_qty,
-        actual_avg_price=current_long_avg_price,
-        active_lots=long_lots,
-        frozen_lots=frozen_long_lots,
-    )
-    short_lots, imported_short_qty, imported_short_price = _import_side(
-        side="short",
-        actual_qty=current_short_qty,
-        actual_avg_price=current_short_avg_price,
-        active_lots=short_lots,
-        frozen_lots=frozen_short_lots,
-    )
-    if (
-        imported_long_qty <= 1e-12
-        and imported_short_qty <= 1e-12
-        and not sanitized_long
-        and not sanitized_short
-    ):
+    long_lots, removed_long_qty = _remove_exchange_surplus_lots(long_lots)
+    short_lots, removed_short_qty = _remove_exchange_surplus_lots(short_lots)
+    if removed_long_qty <= 1e-12 and removed_short_qty <= 1e-12:
         return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
 
     ledger["long_lots"] = long_lots
     ledger["short_lots"] = short_lots
-    ledger["surplus_reconcile_imported_long_qty"] = imported_long_qty
-    ledger["surplus_reconcile_imported_short_qty"] = imported_short_qty
-    ledger["surplus_reconcile_imported_long_price"] = imported_long_price
-    ledger["surplus_reconcile_imported_short_price"] = imported_short_price
+    ledger["surplus_reconcile_disabled_reason"] = "best_quote_volume_ledger_ignores_exchange_total_position"
+    ledger["surplus_reconcile_removed_long_qty"] = removed_long_qty
+    ledger["surplus_reconcile_removed_short_qty"] = removed_short_qty
     ledger["surplus_reconcile_at"] = now_iso
     ledger["updated_at"] = now_iso
     state["best_quote_volume_ledger"] = ledger
