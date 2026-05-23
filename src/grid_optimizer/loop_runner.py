@@ -4491,6 +4491,30 @@ def _all_place_orders_are_forced_hedge_reduces(actions: dict[str, Any]) -> bool:
     return all(bool(order.get("force_reduce_only")) and _is_hedge_side_reduce_order(order) for order in place_orders)
 
 
+def _isolated_frozen_actions_tolerate_position_drift(
+    actions: dict[str, Any],
+    *,
+    expected_long_qty: float,
+    expected_short_qty: float,
+    current_long_qty: float,
+    current_short_qty: float,
+) -> bool:
+    long_deficit = current_long_qty + 1e-9 < expected_long_qty
+    short_deficit = current_short_qty + 1e-9 < expected_short_qty
+    if not long_deficit and not short_deficit:
+        return True
+    for order in [item for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _order_position_side(order)
+        if long_deficit and position_side == "LONG" and side != "BUY":
+            return False
+        if short_deficit and position_side == "SHORT" and side != "SELL":
+            return False
+        if (long_deficit or short_deficit) and position_side == "BOTH":
+            return False
+    return True
+
+
 
 def assess_synthetic_tp_only_watchdog(
     *,
@@ -18424,8 +18448,13 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     )
     allow_isolated_frozen_position_mismatch = (
         isolated_best_quote_reduce_freeze
-        and current_long_qty + 1e-9 >= expected_long_qty
-        and current_short_qty + 1e-9 >= expected_short_qty
+        and _isolated_frozen_actions_tolerate_position_drift(
+            validation["actions"],
+            expected_long_qty=expected_long_qty,
+            expected_short_qty=expected_short_qty,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+        )
     )
     report["position_reconcile"] = {
         "expected_long_qty": expected_long_qty,

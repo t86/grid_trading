@@ -6326,7 +6326,7 @@ class LoopRunnerTests(unittest.TestCase):
         mock_account_info.return_value = {
             "multiAssetsMargin": False,
             "positions": [
-                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "152", "entryPrice": "0.6258"},
+                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "70", "entryPrice": "0.6258"},
                 {"symbol": "PHAROSUSDT", "positionSide": "SHORT", "positionAmt": "-1108", "entryPrice": "0.7158"},
             ],
         }
