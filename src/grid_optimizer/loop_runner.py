@@ -2853,6 +2853,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     min_side_notional: float,
     min_profit_ratio: float,
     max_slippage_ticks: int,
+    allow_loss: bool = False,
     requested_qty: float | None = None,
 ) -> dict[str, Any]:
     ledger = dict(report.get("ledger") or {})
@@ -2871,6 +2872,8 @@ def apply_best_quote_frozen_inventory_pair_release(
         "frozen_short_notional": 0.0,
         "estimated_pair_pnl": 0.0,
         "required_profit": 0.0,
+        "allow_loss": bool(allow_loss),
+        "profit_buffer_bypassed": False,
     }
     if not enabled:
         release_report["blocked_reasons"].append("disabled")
@@ -2959,9 +2962,11 @@ def apply_best_quote_frozen_inventory_pair_release(
     release_report["required_profit"] = required_profit
     release_report["release_qty"] = qty
     release_report["release_notional"] = release_notional
-    if estimated_pair_pnl + 1e-12 < required_profit:
+    if estimated_pair_pnl + 1e-12 < required_profit and not allow_loss:
         release_report["blocked_reasons"].append("pair_pnl_below_buffer")
         return release_report
+    if estimated_pair_pnl + 1e-12 < required_profit:
+        release_report["profit_buffer_bypassed"] = True
 
     sell_order = {
         "side": "SELL",
@@ -15065,6 +15070,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_min_profit_ratio", 0.0008)),
             0.0,
         )
+        best_quote_frozen_pair_release_allow_loss = bool(
+            getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_allow_loss", False)
+        )
         best_quote_frozen_pair_release_max_slippage_ticks = max(
             int(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks", 2)),
             0,
@@ -15564,6 +15572,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_side_notional=best_quote_frozen_pair_release_min_side_notional,
             min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
             max_slippage_ticks=best_quote_frozen_pair_release_max_slippage_ticks,
+            allow_loss=best_quote_frozen_pair_release_allow_loss,
             requested_qty=(
                 _safe_float(best_quote_frozen_pair_release_directive.get("requested_qty"))
                 if best_quote_frozen_pair_release_requested
@@ -15583,6 +15592,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "max_notional": best_quote_frozen_pair_release_max_notional,
                 "min_side_notional": best_quote_frozen_pair_release_min_side_notional,
                 "min_profit_ratio": best_quote_frozen_pair_release_min_profit_ratio,
+                "allow_loss": best_quote_frozen_pair_release_allow_loss,
                 "max_slippage_ticks": best_quote_frozen_pair_release_max_slippage_ticks,
                 "max_30s_abs_return_ratio": best_quote_frozen_pair_release_max_30s_abs_return_ratio,
                 "max_1m_abs_return_ratio": best_quote_frozen_pair_release_max_1m_abs_return_ratio,
@@ -18047,6 +18057,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-notional", type=float, default=20.0)
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-side-notional", type=float, default=100.0)
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio", type=float, default=0.0008)
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-allow-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks", type=int, default=2)
     parser.add_argument(
         "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
