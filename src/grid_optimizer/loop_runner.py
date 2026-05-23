@@ -2324,6 +2324,317 @@ def _order_role(order: dict[str, Any]) -> str:
     return str(order.get("role", "")).lower().strip()
 
 
+def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    client_order_id = str((row or {}).get("clientOrderId") or (row or {}).get("client_order_id") or "").strip()
+    parts = client_order_id.lower().split("-")
+    if len(parts) < 3 or parts[0] != "gx":
+        return ""
+    compact_role = parts[2].strip()
+    if compact_role != "bestquot":
+        return ""
+    side = str((row or {}).get("side") or "").upper().strip()
+    position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
+    if side == "BUY" and position_side == "LONG":
+        return "best_quote_entry_long"
+    if side == "SELL" and position_side == "LONG":
+        return "best_quote_reduce_long"
+    if side == "SELL" and position_side == "SHORT":
+        return "best_quote_entry_short"
+    if side == "BUY" and position_side == "SHORT":
+        return "best_quote_reduce_short"
+    return ""
+
+
+def _normalize_best_quote_volume_lots(raw_lots: Any) -> list[dict[str, Any]]:
+    lots: list[dict[str, Any]] = []
+    if not isinstance(raw_lots, list):
+        return lots
+    for item in raw_lots:
+        if not isinstance(item, dict):
+            continue
+        qty = max(_safe_float(item.get("qty")), 0.0)
+        price = max(_safe_float(item.get("price", item.get("entry_price"))), 0.0)
+        if qty <= 1e-12 or price <= 0:
+            continue
+        lot = dict(item)
+        lot["qty"] = qty
+        lot["price"] = price
+        lots.append(lot)
+    return lots
+
+
+def _best_quote_volume_book_from_lots(lots: list[dict[str, Any]]) -> tuple[float, float]:
+    qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in lots)
+    if qty <= 1e-12:
+        return 0.0, 0.0
+    cost = sum(max(_safe_float(item.get("qty")), 0.0) * max(_safe_float(item.get("price")), 0.0) for item in lots)
+    return qty, cost / qty if qty > 0 else 0.0
+
+
+def _best_quote_volume_consume_fifo(
+    lots: list[dict[str, Any]],
+    qty: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    remaining = max(_safe_float(qty), 0.0)
+    updated = [dict(item) for item in lots]
+    consumed: list[dict[str, Any]] = []
+    realized_cost = 0.0
+    while updated and remaining > 1e-12:
+        head = dict(updated[0])
+        head_qty = max(_safe_float(head.get("qty")), 0.0)
+        head_price = max(_safe_float(head.get("price")), 0.0)
+        take_qty = min(head_qty, remaining)
+        if take_qty <= 1e-12 or head_price <= 0:
+            updated.pop(0)
+            continue
+        consumed_lot = dict(head)
+        consumed_lot["qty"] = take_qty
+        consumed_lot["price"] = head_price
+        consumed.append(consumed_lot)
+        realized_cost += take_qty * head_price
+        if head_qty <= remaining + 1e-12:
+            remaining = max(remaining - head_qty, 0.0)
+            updated.pop(0)
+            continue
+        updated[0]["qty"] = head_qty - remaining
+        remaining = 0.0
+    return updated, consumed, realized_cost
+
+
+def _best_quote_volume_ledger_snapshot(
+    ledger: Mapping[str, Any] | dict[str, Any],
+    *,
+    mid_price: float,
+) -> dict[str, Any]:
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    long_lots = _normalize_best_quote_volume_lots((ledger or {}).get("long_lots"))
+    short_lots = _normalize_best_quote_volume_lots((ledger or {}).get("short_lots"))
+    long_qty, long_avg = _best_quote_volume_book_from_lots(long_lots)
+    short_qty, short_avg = _best_quote_volume_book_from_lots(short_lots)
+    long_unrealized = (safe_mid - long_avg) * long_qty if safe_mid > 0 and long_avg > 0 else 0.0
+    short_unrealized = (short_avg - safe_mid) * short_qty if safe_mid > 0 and short_avg > 0 else 0.0
+    return {
+        "initialized": bool((ledger or {}).get("initialized")),
+        "sync_ok": bool((ledger or {}).get("sync_ok", True)),
+        "sync_error": str((ledger or {}).get("sync_error") or ""),
+        "long_qty": long_qty,
+        "long_avg_price": long_avg,
+        "long_notional": long_qty * safe_mid,
+        "long_unrealized_pnl": long_unrealized,
+        "short_qty": short_qty,
+        "short_avg_price": short_avg,
+        "short_notional": short_qty * safe_mid,
+        "short_unrealized_pnl": short_unrealized,
+        "unrealized_pnl": long_unrealized + short_unrealized,
+        "realized_pnl": _safe_float((ledger or {}).get("realized_pnl")),
+        "commission": _safe_float((ledger or {}).get("commission")),
+        "gross_notional": _safe_float((ledger or {}).get("gross_notional")),
+        "applied_trade_count_total": int((ledger or {}).get("applied_trade_count_total") or 0),
+        "last_trade_time_ms": int((ledger or {}).get("last_trade_time_ms") or 0),
+        "last_trade_keys_at_time": list((ledger or {}).get("last_trade_keys_at_time") or []),
+        "last_transfer_at": str((ledger or {}).get("last_transfer_at") or ""),
+        "transfer_shortfall_qty": _safe_float((ledger or {}).get("transfer_shortfall_qty")),
+    }
+
+
+def sync_best_quote_volume_ledger(
+    *,
+    state: dict[str, Any],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+    observed_trade_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    ledger = dict(state.get("best_quote_volume_ledger") or {})
+    now = _utc_now()
+    if not bool(ledger.get("initialized")):
+        long_lots = []
+        short_lots = []
+        if _safe_float(current_long_qty) > 1e-12 and _safe_float(current_long_avg_price) > 0:
+            long_lots.append(
+                {
+                    "qty": max(_safe_float(current_long_qty), 0.0),
+                    "price": max(_safe_float(current_long_avg_price), 0.0),
+                    "source": "bootstrap_from_exchange_managed_position",
+                    "opened_at": now.isoformat(),
+                }
+            )
+        if _safe_float(current_short_qty) > 1e-12 and _safe_float(current_short_avg_price) > 0:
+            short_lots.append(
+                {
+                    "qty": max(_safe_float(current_short_qty), 0.0),
+                    "price": max(_safe_float(current_short_avg_price), 0.0),
+                    "source": "bootstrap_from_exchange_managed_position",
+                    "opened_at": now.isoformat(),
+                }
+            )
+        ledger.update(
+            {
+                "initialized": True,
+                "schema": "best_quote_volume_ledger_v1",
+                "long_lots": long_lots,
+                "short_lots": short_lots,
+                "realized_pnl": _safe_float(ledger.get("realized_pnl")),
+                "commission": _safe_float(ledger.get("commission")),
+                "gross_notional": _safe_float(ledger.get("gross_notional")),
+                "applied_trade_count_total": int(ledger.get("applied_trade_count_total") or 0),
+                "last_trade_time_ms": int(now.timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "sync_ok": True,
+                "bootstrap_at": now.isoformat(),
+                "bootstrap_source": "exchange_managed_position",
+            }
+        )
+        state["best_quote_volume_ledger"] = ledger
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    long_lots = _normalize_best_quote_volume_lots(ledger.get("long_lots"))
+    short_lots = _normalize_best_quote_volume_lots(ledger.get("short_lots"))
+    last_time_ms = int(ledger.get("last_trade_time_ms") or 0)
+    rows = [dict(row) for row in list(observed_trade_rows or []) if isinstance(row, dict)]
+    now_ms = int(now.timestamp() * 1000)
+    rest_last_sync_ms = int(ledger.get("rest_last_sync_at_ms") or 0)
+    should_rest_sync = rest_last_sync_ms <= 0 or now_ms - rest_last_sync_ms >= 30_000 or not rows
+    if should_rest_sync:
+        try:
+            rows.extend(
+                _fetch_trade_rows_since(
+                    symbol=symbol,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    start_time_ms=last_time_ms,
+                    recv_window=recv_window,
+                )
+            )
+            ledger["rest_last_sync_at_ms"] = now_ms
+        except Exception as exc:
+            ledger["sync_ok"] = False
+            ledger["sync_error"] = f"{type(exc).__name__}: {exc}"
+            state["best_quote_volume_ledger"] = ledger
+            return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    fresh_rows, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
+        rows=rows,
+        last_time_ms=last_time_ms or None,
+        last_keys_at_time=list(ledger.get("last_trade_keys_at_time", [])),
+        row_time_ms=trade_row_time_ms,
+        row_key=trade_row_key,
+    )
+    applied = 0
+    unmatched = 0
+    realized_delta = 0.0
+    commission_delta = 0.0
+    gross_delta = 0.0
+    for row in fresh_rows:
+        role = _best_quote_trade_role_from_row(row)
+        if not role:
+            compact = str(row.get("clientOrderId") or row.get("client_order_id") or "").lower().split("-")
+            if len(compact) >= 3 and compact[2] == "bestquot":
+                unmatched += 1
+            continue
+        qty = max(_safe_float(row.get("qty")), 0.0)
+        price = max(_safe_float(row.get("price")), 0.0)
+        if qty <= 1e-12 or price <= 0:
+            unmatched += 1
+            continue
+        gross_delta += max(_safe_float(row.get("quoteQty")), qty * price)
+        commission_delta += _safe_float(row.get("commission"))
+        opened_at = datetime.fromtimestamp(max(trade_row_time_ms(row), 0) / 1000, tz=timezone.utc).isoformat()
+        lot = {
+            "qty": qty,
+            "price": price,
+            "source": "trade_fill",
+            "role": role,
+            "order_id": row.get("orderId"),
+            "client_order_id": row.get("clientOrderId") or row.get("client_order_id"),
+            "opened_at": opened_at,
+        }
+        if role == "best_quote_entry_long":
+            long_lots.append(lot)
+        elif role == "best_quote_entry_short":
+            short_lots.append(lot)
+        elif role == "best_quote_reduce_long":
+            long_lots, _, realized_cost = _best_quote_volume_consume_fifo(long_lots, qty)
+            realized_delta += qty * price - realized_cost
+        elif role == "best_quote_reduce_short":
+            short_lots, _, realized_cost = _best_quote_volume_consume_fifo(short_lots, qty)
+            realized_delta += realized_cost - qty * price
+        applied += 1
+
+    ledger["long_lots"] = long_lots
+    ledger["short_lots"] = short_lots
+    ledger["realized_pnl"] = _safe_float(ledger.get("realized_pnl")) + realized_delta
+    ledger["commission"] = _safe_float(ledger.get("commission")) + commission_delta
+    ledger["gross_notional"] = _safe_float(ledger.get("gross_notional")) + gross_delta
+    ledger["applied_trade_count_total"] = int(ledger.get("applied_trade_count_total") or 0) + applied
+    ledger["last_applied_trade_count"] = applied
+    ledger["last_unmatched_trade_count"] = unmatched
+    ledger["last_trade_time_ms"] = int(trade_last_time_ms or last_time_ms or 0)
+    ledger["last_trade_keys_at_time"] = list(trade_keys_at_time)
+    ledger["updated_at"] = now.isoformat()
+    ledger["sync_ok"] = True
+    ledger.pop("sync_error", None)
+    state["best_quote_volume_ledger"] = ledger
+    return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+
+def _transfer_best_quote_volume_to_frozen(
+    *,
+    state: dict[str, Any],
+    side: str,
+    qty: float,
+    reason: str,
+    loss_ratio: float,
+) -> dict[str, Any]:
+    normalized_side = str(side or "").lower().strip()
+    ledger = dict(state.get("best_quote_volume_ledger") or {})
+    frozen = dict(state.get("best_quote_frozen_inventory") or {})
+    source_key = "long_lots" if normalized_side == "long" else "short_lots"
+    source_lots = _normalize_best_quote_volume_lots(ledger.get(source_key))
+    remaining_lots, consumed_lots, _ = _best_quote_volume_consume_fifo(source_lots, qty)
+    transfer_qty = sum(_safe_float(item.get("qty")) for item in consumed_lots)
+    now_iso = _utc_now().isoformat()
+    frozen_lots = list(frozen.get(source_key) or [])
+    for item in consumed_lots:
+        frozen_lot = {
+            "qty": _safe_float(item.get("qty")),
+            "entry_price": _safe_float(item.get("price")),
+            "frozen_at": now_iso,
+            "reason": reason,
+            "loss_ratio": max(_safe_float(loss_ratio), 0.0),
+            "source": "bq_volume_ledger_transfer",
+            "source_order_id": item.get("order_id"),
+            "source_client_order_id": item.get("client_order_id"),
+            "source_opened_at": item.get("opened_at"),
+        }
+        frozen_lots.append(frozen_lot)
+    ledger[source_key] = remaining_lots
+    ledger["last_transfer_at"] = now_iso
+    ledger["last_transfer_side"] = normalized_side
+    ledger["last_transfer_qty"] = transfer_qty
+    ledger["transfer_shortfall_qty"] = max(_safe_float(qty) - transfer_qty, 0.0)
+    ledger["sync_ok"] = ledger.get("sync_ok", True) and ledger["transfer_shortfall_qty"] <= 1e-12
+    if ledger["transfer_shortfall_qty"] > 1e-12:
+        ledger["sync_error"] = "bq_volume_ledger_transfer_shortfall"
+    frozen[source_key] = frozen_lots
+    frozen["updated_at"] = now_iso
+    state["best_quote_volume_ledger"] = ledger
+    state["best_quote_frozen_inventory"] = frozen
+    return {
+        "side": normalized_side.upper(),
+        "requested_qty": max(_safe_float(qty), 0.0),
+        "transferred_qty": transfer_qty,
+        "shortfall_qty": max(_safe_float(qty) - transfer_qty, 0.0),
+        "lot_count": len(consumed_lots),
+    }
+
+
 def _best_quote_reduce_freeze_report(
     *,
     state: dict[str, Any],
@@ -2332,6 +2643,7 @@ def _best_quote_reduce_freeze_report(
     current_long_avg_price: float,
     current_short_avg_price: float,
     mid_price: float,
+    bq_ledger_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
     safe_mid = max(_safe_float(mid_price), 0.0)
@@ -2441,6 +2753,16 @@ def _best_quote_reduce_freeze_report(
         if safe_mid > 0 and managed_short_qty > 1e-12
         else 0.0
     )
+    managed_source = "exchange_minus_frozen_inventory"
+    if isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized")):
+        managed_source = "best_quote_volume_ledger"
+        managed_long_qty = max(_safe_float(bq_ledger_report.get("long_qty")), 0.0)
+        managed_short_qty = max(_safe_float(bq_ledger_report.get("short_qty")), 0.0)
+        managed_long_avg_price = max(_safe_float(bq_ledger_report.get("long_avg_price")), 0.0)
+        managed_short_avg_price = max(_safe_float(bq_ledger_report.get("short_avg_price")), 0.0)
+        managed_long_unrealized = _safe_float(bq_ledger_report.get("long_unrealized_pnl"))
+        managed_short_unrealized = _safe_float(bq_ledger_report.get("short_unrealized_pnl"))
+        managed_unrealized = _safe_float(bq_ledger_report.get("unrealized_pnl"))
     return {
         "enabled": False,
         "applied": False,
@@ -2479,6 +2801,8 @@ def _best_quote_reduce_freeze_report(
         "managed_long_unrealized_pnl": managed_long_unrealized,
         "managed_short_unrealized_pnl": managed_short_unrealized,
         "managed_unrealized_pnl": managed_unrealized,
+        "managed_source": managed_source,
+        "volume_ledger": dict(bq_ledger_report or {}),
         "actual_unrealized_pnl": actual_unrealized,
         "strategy_unrealized_pnl": managed_unrealized,
         "isolates_risk_metrics": bool(long_qty > 0 or short_qty > 0),
@@ -2502,6 +2826,7 @@ def _apply_best_quote_reduce_freeze(
     current_long_avg_price: float,
     current_short_avg_price: float,
     mid_price: float,
+    bq_ledger_report: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     report = dict(report)
     report["enabled"] = bool(enabled)
@@ -2524,7 +2849,6 @@ def _apply_best_quote_reduce_freeze(
         isinstance(item, dict) and _order_role(item) == "best_quote_reduce_short"
         for item in list(plan.get("buy_orders") or [])
     )
-    ledger = dict(state.get("best_quote_frozen_inventory") or {})
     events = list(report.get("events") or [])
     confirmations = dict(state.get("best_quote_reduce_freeze_confirmation") or {})
     min_notional_value = _safe_float(report["min_notional"])
@@ -2545,8 +2869,14 @@ def _apply_best_quote_reduce_freeze(
     report["effective_threshold_loss_ratio"] = effective_threshold
     frozen_long_qty = _safe_float(report.get("frozen_long_qty"))
     frozen_short_qty = _safe_float(report.get("frozen_short_qty"))
-    managed_long_qty = max(_safe_float(current_long_qty) - frozen_long_qty, 0.0)
-    managed_short_qty = max(_safe_float(current_short_qty) - frozen_short_qty, 0.0)
+    if isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized")):
+        managed_long_qty = max(_safe_float(bq_ledger_report.get("long_qty")), 0.0)
+        managed_short_qty = max(_safe_float(bq_ledger_report.get("short_qty")), 0.0)
+        current_long_avg_price = max(_safe_float(bq_ledger_report.get("long_avg_price")), 0.0)
+        current_short_avg_price = max(_safe_float(bq_ledger_report.get("short_avg_price")), 0.0)
+    else:
+        managed_long_qty = max(_safe_float(current_long_qty) - frozen_long_qty, 0.0)
+        managed_short_qty = max(_safe_float(current_short_qty) - frozen_short_qty, 0.0)
     managed_long_notional = managed_long_qty * _safe_float(mid_price)
     managed_short_notional = managed_short_qty * _safe_float(mid_price)
 
@@ -2587,21 +2917,13 @@ def _apply_best_quote_reduce_freeze(
     if (
         _confirmed("LONG", managed_long_qty, long_loss_ratio, managed_long_notional, reduce_long_planned)
     ):
-        frozen_at = _utc_now().isoformat()
-        long_lots = list(ledger.get("long_lots") or [])
-        long_lots.append(
-            {
-                "qty": managed_long_qty,
-                "entry_price": max(_safe_float(current_long_avg_price), 0.0),
-                "frozen_at": frozen_at,
-                "reason": "reduce_loss_ratio_threshold",
-                "loss_ratio": long_loss_ratio,
-            }
+        transfer = _transfer_best_quote_volume_to_frozen(
+            state=state,
+            side="long",
+            qty=managed_long_qty,
+            reason="reduce_loss_ratio_threshold",
+            loss_ratio=long_loss_ratio,
         )
-        ledger["long_lots"] = long_lots
-        ledger["long_qty"] = frozen_long_qty + managed_long_qty
-        ledger["long_entry_price"] = max(_safe_float(current_long_avg_price), 0.0)
-        ledger["long_frozen_at"] = frozen_at
         events.append(
             {
                 "side": "LONG",
@@ -2610,29 +2932,24 @@ def _apply_best_quote_reduce_freeze(
                 "effective_threshold_loss_ratio": effective_threshold,
                 "confirm_cycles": max(int(confirm_cycles), 1),
                 "stress_active": bool(stress_active),
-                "qty": managed_long_qty,
-                "notional": managed_long_notional,
+                "qty": _safe_float(transfer.get("transferred_qty")),
+                "requested_qty": managed_long_qty,
+                "shortfall_qty": _safe_float(transfer.get("shortfall_qty")),
+                "notional": _safe_float(transfer.get("transferred_qty")) * _safe_float(mid_price),
+                "transfer": transfer,
             }
         )
         confirmations.pop("long", None)
     if (
         _confirmed("SHORT", managed_short_qty, short_loss_ratio, managed_short_notional, reduce_short_planned)
     ):
-        frozen_at = _utc_now().isoformat()
-        short_lots = list(ledger.get("short_lots") or [])
-        short_lots.append(
-            {
-                "qty": managed_short_qty,
-                "entry_price": max(_safe_float(current_short_avg_price), 0.0),
-                "frozen_at": frozen_at,
-                "reason": "reduce_loss_ratio_threshold",
-                "loss_ratio": short_loss_ratio,
-            }
+        transfer = _transfer_best_quote_volume_to_frozen(
+            state=state,
+            side="short",
+            qty=managed_short_qty,
+            reason="reduce_loss_ratio_threshold",
+            loss_ratio=short_loss_ratio,
         )
-        ledger["short_lots"] = short_lots
-        ledger["short_qty"] = frozen_short_qty + managed_short_qty
-        ledger["short_entry_price"] = max(_safe_float(current_short_avg_price), 0.0)
-        ledger["short_frozen_at"] = frozen_at
         events.append(
             {
                 "side": "SHORT",
@@ -2641,8 +2958,11 @@ def _apply_best_quote_reduce_freeze(
                 "effective_threshold_loss_ratio": effective_threshold,
                 "confirm_cycles": max(int(confirm_cycles), 1),
                 "stress_active": bool(stress_active),
-                "qty": managed_short_qty,
-                "notional": managed_short_notional,
+                "qty": _safe_float(transfer.get("transferred_qty")),
+                "requested_qty": managed_short_qty,
+                "shortfall_qty": _safe_float(transfer.get("shortfall_qty")),
+                "notional": _safe_float(transfer.get("transferred_qty")) * _safe_float(mid_price),
+                "transfer": transfer,
             }
         )
         confirmations.pop("short", None)
@@ -2654,7 +2974,10 @@ def _apply_best_quote_reduce_freeze(
         state.pop("best_quote_reduce_freeze_confirmation", None)
         report["confirmations"] = {}
     if events:
-        state["best_quote_frozen_inventory"] = ledger
+        bq_ledger_report = _best_quote_volume_ledger_snapshot(
+            dict(state.get("best_quote_volume_ledger") or {}),
+            mid_price=mid_price,
+        )
         report = _best_quote_reduce_freeze_report(
             state=state,
             current_long_qty=current_long_qty,
@@ -2662,6 +2985,7 @@ def _apply_best_quote_reduce_freeze(
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
             mid_price=mid_price,
+            bq_ledger_report=bq_ledger_report,
         )
         report["enabled"] = True
         report["applied"] = True
@@ -12642,6 +12966,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "reasons": [],
         "metrics": {},
     }
+    best_quote_volume_ledger: dict[str, Any] = {}
     effective_args = args
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
@@ -13118,6 +13443,23 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price = max(actual_cost_basis_price, 0.0)
     exchange_long_avg_price = current_long_avg_price
     exchange_short_avg_price = current_short_avg_price
+
+    if _is_best_quote_maker_volume_mode(requested_strategy_mode):
+        frozen_bootstrap_long_qty, frozen_bootstrap_short_qty = _best_quote_frozen_inventory_qtys(state)
+        best_quote_volume_ledger = sync_best_quote_volume_ledger(
+            state=state,
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            recv_window=args.recv_window,
+            current_long_qty=max(current_long_qty - frozen_bootstrap_long_qty, 0.0),
+            current_short_qty=max(current_short_qty - frozen_bootstrap_short_qty, 0.0),
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+            observed_trade_rows=observed_trade_rows,
+        )
+        best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
 
     elastic_volume_config = _elastic_volume_config(effective_args)
     competition_start_time = None
@@ -15120,6 +15462,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
             mid_price=mid_price,
+            bq_ledger_report=best_quote_volume_ledger,
         )
         best_quote_reduce_freeze.update(
             {
@@ -15177,7 +15520,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
             mid_price=mid_price,
+            bq_ledger_report=best_quote_volume_ledger,
         )
+        best_quote_volume_ledger = dict(best_quote_reduce_freeze.get("volume_ledger") or best_quote_volume_ledger)
+        best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
         managed_long_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_long_qty")), 0.0)
         managed_short_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_short_qty")), 0.0)
         best_quote_reduce_freeze["exchange_unrealized_pnl"] = exchange_unrealized_pnl
@@ -15204,6 +15550,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_long_notional = current_long_qty * mid_price
         current_short_notional = current_short_qty * mid_price
         if isolated_risk_metrics:
+            uses_bq_volume_ledger = str(best_quote_reduce_freeze.get("managed_source") or "") == "best_quote_volume_ledger"
             volatility_entry_pause = resolve_volatility_entry_pause(
                 adaptive_step=adaptive_step,
                 state=state,
@@ -15233,20 +15580,23 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             volatility_entry_pause["inventory_scope"] = "managed_after_reduce_freeze"
             current_long_avg_price = (
                 _safe_float(best_quote_reduce_freeze.get("managed_long_avg_price"))
-                if reduce_freeze_pnl_sync_ok
+                if (uses_bq_volume_ledger or reduce_freeze_pnl_sync_ok)
                 else 0.0
             )
             current_short_avg_price = (
                 _safe_float(best_quote_reduce_freeze.get("managed_short_avg_price"))
-                if reduce_freeze_pnl_sync_ok
+                if (uses_bq_volume_ledger or reduce_freeze_pnl_sync_ok)
                 else 0.0
             )
-            best_quote_reduce_freeze["managed_cost_basis_source"] = (
-                "derived_from_synced_reduce_freeze" if reduce_freeze_pnl_sync_ok else "invalid_pnl_sync_ignored"
-            )
+            if uses_bq_volume_ledger:
+                best_quote_reduce_freeze["managed_cost_basis_source"] = "best_quote_volume_ledger"
+            elif reduce_freeze_pnl_sync_ok:
+                best_quote_reduce_freeze["managed_cost_basis_source"] = "derived_from_synced_reduce_freeze"
+            else:
+                best_quote_reduce_freeze["managed_cost_basis_source"] = "invalid_pnl_sync_ignored"
             strategy_unrealized_pnl = (
                 _safe_float(best_quote_reduce_freeze.get("managed_unrealized_pnl"))
-                if reduce_freeze_pnl_sync_ok
+                if (uses_bq_volume_ledger or reduce_freeze_pnl_sync_ok)
                 else 0.0
             )
         else:
@@ -15612,6 +15962,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_long_avg_price=current_long_avg_price,
                 current_short_avg_price=current_short_avg_price,
                 mid_price=mid_price,
+                bq_ledger_report=best_quote_volume_ledger,
             )
         pair_release_30s_abs_return = abs(_adaptive_window_metric("window_30s", "return_ratio"))
         pair_release_1m_abs_return = abs(_adaptive_window_metric("window_1m", "return_ratio"))

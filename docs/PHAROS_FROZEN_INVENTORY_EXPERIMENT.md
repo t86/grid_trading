@@ -40,6 +40,40 @@ The ledger is a strategy accounting layer. It does not move positions to
 Binance isolated margin and does not create a separate exchange-side position.
 Exchange-side long/short position remains the actual source of truth.
 
+## Independent Accounting Model
+
+The experiment must use independent strategy ledgers. It must not infer BQ cost
+or BQ PnL from Binance total position, mixed hedge entry price, or exchange
+unrealized PnL after inventory has been frozen.
+
+There are three accounting buckets:
+
+- `best_quote_volume_ledger`: the BQ volume ledger. It owns only normal BQ
+  entry/reduce lots, cost basis, BQ realized PnL, BQ unrealized PnL, fees, and
+  BQ gross notional.
+- `best_quote_frozen_inventory`: the frozen-inventory ledger. It owns frozen
+  lots, frozen cost basis, pair-release/manual-limit/manual-reduce state, and
+  frozen realized/unrealized PnL.
+- manual/external accounting: operator activity that is not a BQ order and not
+  an explicit frozen-inventory directive. This must be reported as external
+  adjustment or drift; it must not silently change BQ PnL.
+
+Rules:
+
+- BQ order placement, BQ inventory caps, BQ soft/pause thresholds, BQ
+  volatility pause, BQ trend guards, and BQ loss gates must read from
+  `best_quote_volume_ledger`, not from frozen ledger fields.
+- Frozen qty, frozen cost, frozen unrealized PnL, manual frozen cleanup PnL, and
+  paired-release PnL must not enter BQ loss or BQ volume metrics.
+- When BQ inventory is frozen, it is an internal transfer: the selected BQ lots
+  and their cost basis are removed from `best_quote_volume_ledger` and appended
+  to `best_quote_frozen_inventory`.
+- Exchange total position is used only for reconciliation and safety checks. It
+  is not a valid source for BQ cost basis once frozen inventory exists.
+- If the BQ ledger cannot match a freeze transfer quantity, the runner must
+  report `bq_volume_ledger_transfer_shortfall` instead of inventing cost from
+  mixed exchange average price.
+
 ## Trigger Logic
 
 When the runner enters normal reduce for a side:
@@ -79,6 +113,34 @@ inventory, from immediately creating a new frozen lot.
 
 ## Ledger Fields
 
+The normal BQ layer stores an independent ledger:
+
+```json
+"best_quote_volume_ledger": {
+  "schema": "best_quote_volume_ledger_v1",
+  "initialized": true,
+  "long_lots": [{"qty": 0.0, "price": 0.0}],
+  "short_lots": [{"qty": 0.0, "price": 0.0}],
+  "realized_pnl": 0.0,
+  "commission": 0.0,
+  "gross_notional": 0.0,
+  "last_trade_time_ms": 0,
+  "last_trade_keys_at_time": [],
+  "sync_ok": true
+}
+```
+
+Only `gx-...-bestquot-...` fills are allowed into this ledger. In hedge mode the
+role is reconstructed from side and position side:
+
+- BUY LONG: `best_quote_entry_long`
+- SELL LONG: `best_quote_reduce_long`
+- SELL SHORT: `best_quote_entry_short`
+- BUY SHORT: `best_quote_reduce_short`
+
+Any `gx-...-frozenin-...` fill is frozen-ledger activity and must be excluded
+from BQ accounting.
+
 The strategy state file stores the ledger under:
 
 ```json
@@ -111,19 +173,26 @@ is the running-status / monitor surface that already exposes
 
 ## Isolation Rules
 
-Frozen inventory must be excluded from the BQ layer's managed risk metrics:
+Frozen inventory must be excluded from the BQ layer's managed risk metrics.
+The current model is:
 
-- managed long qty = exchange long qty minus frozen long qty;
-- managed short qty = exchange short qty minus frozen short qty;
-- managed unrealized PnL excludes frozen inventory unrealized PnL;
-- strategy unrealized PnL uses managed unrealized PnL while frozen inventory is
-  present;
+- managed long qty = `best_quote_volume_ledger.long_qty`;
+- managed short qty = `best_quote_volume_ledger.short_qty`;
+- managed cost basis = BQ ledger lot cost;
+- managed unrealized PnL = BQ ledger unrealized PnL;
+- strategy unrealized PnL uses BQ ledger unrealized PnL while frozen inventory is
+  present, even if exchange total unrealized PnL differs;
 - BQ max-long, max-short, soft, pause, entry, and reduce decisions must be based
-  on managed inventory, not total exchange inventory.
+  on BQ ledger inventory, not total exchange inventory and not frozen inventory.
 
 The submit-side position consistency check must still accept exchange position
 equal to `managed + frozen`. Otherwise the runner will reject all submits after
 freezing inventory.
+
+The older `exchange - frozen` calculation is allowed only as a legacy fallback
+when `best_quote_volume_ledger` is unavailable. It must be marked as a fallback
+source and must not be trusted for PnL-sensitive decisions if exchange PnL sync
+is already known to be inconsistent.
 
 ## Reduced Soft Threshold
 
