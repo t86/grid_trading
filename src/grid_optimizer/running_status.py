@@ -420,9 +420,13 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         else:
             position_amt = long_qty - short_qty
     unrealized_pnl = _safe_float(
-        plan_report.get("unrealized_pnl")
-        if plan_report.get("unrealized_pnl") is not None
-        else submit_plan_snapshot.get("unrealized_pnl")
+        plan_report.get("exchange_unrealized_pnl")
+        if plan_report.get("exchange_unrealized_pnl") is not None
+        else (
+            plan_report.get("unrealized_pnl")
+            if plan_report.get("unrealized_pnl") is not None
+            else submit_plan_snapshot.get("unrealized_pnl")
+        )
     )
     total_fees = _commission_usdt(trade_summary)
     total_pnl = (

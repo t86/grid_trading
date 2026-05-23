@@ -2431,6 +2431,16 @@ def _best_quote_reduce_freeze_report(
     managed_unrealized = managed_long_unrealized + managed_short_unrealized
     managed_long_qty = max(_safe_float(current_long_qty) - long_qty, 0.0)
     managed_short_qty = max(_safe_float(current_short_qty) - short_qty, 0.0)
+    managed_long_avg_price = (
+        max(safe_mid - (managed_long_unrealized / managed_long_qty), 0.0)
+        if safe_mid > 0 and managed_long_qty > 1e-12
+        else 0.0
+    )
+    managed_short_avg_price = (
+        max(safe_mid + (managed_short_unrealized / managed_short_qty), 0.0)
+        if safe_mid > 0 and managed_short_qty > 1e-12
+        else 0.0
+    )
     return {
         "enabled": False,
         "applied": False,
@@ -2464,6 +2474,8 @@ def _best_quote_reduce_freeze_report(
         "managed_short_qty": managed_short_qty,
         "managed_long_notional": managed_long_qty * safe_mid,
         "managed_short_notional": managed_short_qty * safe_mid,
+        "managed_long_avg_price": managed_long_avg_price,
+        "managed_short_avg_price": managed_short_avg_price,
         "managed_long_unrealized_pnl": managed_long_unrealized,
         "managed_short_unrealized_pnl": managed_short_unrealized,
         "managed_unrealized_pnl": managed_unrealized,
@@ -15169,12 +15181,74 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         managed_long_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_long_qty")), 0.0)
         managed_short_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_short_qty")), 0.0)
         best_quote_reduce_freeze["exchange_unrealized_pnl"] = exchange_unrealized_pnl
+        isolated_risk_metrics = bool(best_quote_reduce_freeze.get("isolates_risk_metrics"))
+        reduce_freeze_pnl_sync_diff = abs(
+            _safe_float(best_quote_reduce_freeze.get("actual_unrealized_pnl")) - _safe_float(exchange_unrealized_pnl)
+        )
+        reduce_freeze_pnl_sync_tolerance = max(
+            5.0,
+            (
+                _safe_float(best_quote_reduce_freeze.get("actual_long_notional"))
+                + _safe_float(best_quote_reduce_freeze.get("actual_short_notional"))
+            )
+            * 0.02,
+        )
+        reduce_freeze_pnl_sync_ok = (
+            not isolated_risk_metrics or reduce_freeze_pnl_sync_diff <= reduce_freeze_pnl_sync_tolerance
+        )
+        best_quote_reduce_freeze["pnl_sync_ok"] = reduce_freeze_pnl_sync_ok
+        best_quote_reduce_freeze["pnl_sync_diff"] = reduce_freeze_pnl_sync_diff
+        best_quote_reduce_freeze["pnl_sync_tolerance"] = reduce_freeze_pnl_sync_tolerance
         current_long_qty = managed_long_qty
         current_short_qty = managed_short_qty
         current_long_notional = current_long_qty * mid_price
         current_short_notional = current_short_qty * mid_price
-        if bool(best_quote_reduce_freeze.get("isolates_risk_metrics")):
-            strategy_unrealized_pnl = _safe_float(best_quote_reduce_freeze.get("managed_unrealized_pnl"))
+        if isolated_risk_metrics:
+            volatility_entry_pause = resolve_volatility_entry_pause(
+                adaptive_step=adaptive_step,
+                state=state,
+                enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
+                window_10s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_10s_abs_return_ratio", None),
+                window_10s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_10s_amplitude_ratio", None),
+                window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
+                window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
+                window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+                window_1m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+                window_3m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+                window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+                window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
+                window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
+                recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
+                now=plan_now,
+                min_observation_seconds=getattr(effective_args, "volatility_entry_pause_min_observation_seconds", 180.0),
+                current_long_notional=current_long_notional,
+                current_short_notional=current_short_notional,
+                inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
+                tiny_inventory_ignore_notional=getattr(
+                    effective_args,
+                    "volatility_entry_pause_tiny_inventory_ignore_notional",
+                    0.0,
+                ),
+            )
+            volatility_entry_pause["inventory_scope"] = "managed_after_reduce_freeze"
+            current_long_avg_price = (
+                _safe_float(best_quote_reduce_freeze.get("managed_long_avg_price"))
+                if reduce_freeze_pnl_sync_ok
+                else 0.0
+            )
+            current_short_avg_price = (
+                _safe_float(best_quote_reduce_freeze.get("managed_short_avg_price"))
+                if reduce_freeze_pnl_sync_ok
+                else 0.0
+            )
+            best_quote_reduce_freeze["managed_cost_basis_source"] = (
+                "derived_from_synced_reduce_freeze" if reduce_freeze_pnl_sync_ok else "invalid_pnl_sync_ignored"
+            )
+            strategy_unrealized_pnl = (
+                _safe_float(best_quote_reduce_freeze.get("managed_unrealized_pnl"))
+                if reduce_freeze_pnl_sync_ok
+                else 0.0
+            )
         else:
             strategy_unrealized_pnl = exchange_unrealized_pnl
         best_quote_reduce_freeze["strategy_unrealized_pnl"] = strategy_unrealized_pnl
