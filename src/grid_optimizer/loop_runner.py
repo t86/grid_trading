@@ -7185,6 +7185,142 @@ def _runtime_guard_loss_recovery_state(state: dict[str, Any]) -> dict[str, Any]:
     return recovery
 
 
+def _runtime_guard_best_quote_volume_ledger_synced(state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    ledger = state.get("best_quote_volume_ledger")
+    if not isinstance(ledger, Mapping):
+        return False
+    return bool(ledger.get("initialized")) and bool(ledger.get("sync_ok", True))
+
+
+def _runtime_guard_should_use_bq_isolated_loss(args: argparse.Namespace, state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    return (
+        _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+        and _has_best_quote_frozen_inventory_position(state)
+        and _runtime_guard_best_quote_volume_ledger_synced(state)
+    )
+
+
+def _is_best_quote_volume_runtime_pnl_event(event: Mapping[str, Any] | dict[str, Any], symbol: str) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    client_order_id = str(
+        event.get("client_order_id")
+        or event.get("clientOrderId")
+        or event.get("origClientOrderId")
+        or ""
+    ).lower()
+    if not client_order_id:
+        return False
+    if not client_order_id.startswith(_strategy_client_order_prefix(symbol).lower()):
+        return False
+    if "frozen" in client_order_id or "manual" in client_order_id or "pairrel" in client_order_id:
+        return False
+    return "bestquot" in client_order_id or "bestquote" in client_order_id
+
+
+def _runtime_guard_isolated_bq_pnl_events(
+    *,
+    args: argparse.Namespace,
+    state: Mapping[str, Any] | dict[str, Any],
+    pnl_events: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    if not _runtime_guard_should_use_bq_isolated_loss(args, state):
+        reason = "best_quote_volume_ledger_not_synced"
+        if not _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", ""))):
+            reason = "not_hedge_best_quote_mode"
+        elif not _has_best_quote_frozen_inventory_position(state):
+            reason = "no_frozen_inventory_position"
+        return pnl_events, {
+            "enabled": False,
+            "source": "mixed_runtime_audit",
+            "reason": reason,
+        }
+    filtered = [
+        dict(event)
+        for event in pnl_events
+        if _is_best_quote_volume_runtime_pnl_event(event, symbol)
+    ]
+    return filtered, {
+        "enabled": True,
+        "source": "best_quote_volume_ledger_orders",
+        "reason": "frozen_and_manual_inventory_pnl_isolated",
+        "mixed_event_count": len(pnl_events),
+        "bq_event_count": len(filtered),
+    }
+
+
+def _runtime_guard_bq_isolated_loss_recovery_report(
+    args: argparse.Namespace,
+    state: Mapping[str, Any] | dict[str, Any],
+    *,
+    now: datetime,
+    recovered_at: datetime | None = None,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": _runtime_guard_should_use_bq_isolated_loss(args, state),
+        "clear": False,
+        "source": "mixed_runtime_audit",
+    }
+    if not report["enabled"]:
+        if not _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", ""))):
+            report["reason"] = "not_hedge_best_quote_mode"
+        elif not _has_best_quote_frozen_inventory_position(state):
+            report["reason"] = "no_frozen_inventory_position"
+        else:
+            report["reason"] = "best_quote_volume_ledger_not_synced"
+        return report
+    summary_path_text = str(getattr(args, "summary_jsonl", "") or "").strip()
+    if not summary_path_text:
+        report["reason"] = "summary_jsonl_missing"
+        return report
+    try:
+        runtime_guard_config = normalize_runtime_guard_config(vars(args))
+        cumulative_gross_notional, pnl_events, _stats_start_time = _load_futures_runtime_guard_inputs(
+            Path(summary_path_text),
+            runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
+            symbol=str(getattr(args, "symbol", "") or "").upper().strip(),
+            now=now,
+        )
+        filtered_events = _filter_pnl_events_after(pnl_events, recovered_at)
+        isolated_events, scope = _runtime_guard_isolated_bq_pnl_events(
+            args=args,
+            state=state,
+            pnl_events=filtered_events,
+        )
+        result = evaluate_runtime_guards(
+            config=runtime_guard_config,
+            now=now,
+            cumulative_gross_notional=cumulative_gross_notional,
+            pnl_events=isolated_events,
+            actual_net_notional=0.0,
+            synthetic_drift_notional=0.0,
+            unrealized_pnl=0.0,
+        )
+    except Exception as exc:
+        report.update({"reason": "bq_isolated_loss_check_error", "error": f"{type(exc).__name__}: {exc}"})
+        return report
+    loss_reasons = {
+        "rolling_hourly_loss_limit_hit",
+        "rolling_hourly_loss_per_10k_limit_hit",
+    }
+    matched_loss_reasons = [reason for reason in result.matched_reasons if reason in loss_reasons]
+    report.update(
+        {
+            **scope,
+            "clear": not matched_loss_reasons,
+            "matched_loss_reasons": matched_loss_reasons,
+            "bq_rolling_hourly_loss": result.rolling_hourly_loss,
+            "bq_rolling_hourly_gross_notional": result.rolling_hourly_gross_notional,
+            "bq_rolling_hourly_loss_per_10k": result.rolling_hourly_loss_per_10k,
+            "bq_rolling_hourly_loss_per_10k_active": result.rolling_hourly_loss_per_10k_active,
+        }
+    )
+    return report
+
+
 def _runtime_guard_mark_loss_stop(
     recovery: dict[str, Any],
     *,
@@ -7227,6 +7363,27 @@ def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now:
         0.0,
     )
     elapsed = max((checked_at - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+    bq_loss_report = _runtime_guard_bq_isolated_loss_recovery_report(
+        args,
+        state,
+        now=checked_at,
+        recovered_at=recovered_at,
+    )
+    if bq_loss_report.get("enabled") and bq_loss_report.get("clear"):
+        recovery.update(
+            {
+                "recovered_at": checked_at.isoformat(),
+                "last_reason": "bq_isolated_loss_clear_after_mixed_loss_stop",
+                "cooldown_elapsed_seconds": elapsed,
+                "cooldown_seconds": cooldown_seconds,
+                "bq_isolated_loss": bq_loss_report,
+            }
+        )
+        state.pop("runtime_guard_manual_frozen_inventory_override", None)
+        _write_json(Path(state_path_text), state)
+        return report
+    if bq_loss_report.get("enabled"):
+        recovery["bq_isolated_loss"] = bq_loss_report
     if _has_best_quote_frozen_inventory_position(state):
         plan_path_text = str(getattr(args, "plan_json", "") or "").strip()
         plan_report = read_json(Path(plan_path_text)) if plan_path_text else {}
@@ -7677,6 +7834,11 @@ def _maybe_handle_runtime_guard(
         now=cycle_started_at,
     )
     pnl_events_for_guard = _filter_pnl_events_after(pnl_events, recovered_at)
+    pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
+        args=args,
+        state=state,
+        pnl_events=pnl_events_for_guard,
+    )
     latest_plan_report = read_json(Path(getattr(args, "plan_json", ""))) or {}
     if not isinstance(latest_plan_report, dict):
         latest_plan_report = {}
@@ -7701,6 +7863,7 @@ def _maybe_handle_runtime_guard(
         unrealized_pnl=_safe_float(guard_unrealized_pnl),
     )
     if runtime_guard_result.tradable:
+        recovery["loss_scope"] = runtime_guard_loss_scope
         if state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None:
             _write_json(state_path, state)
         return None
@@ -7758,6 +7921,7 @@ def _maybe_handle_runtime_guard(
                         "recovered_at": recovered_at.isoformat(),
                         "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
                         "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                        "loss_scope": runtime_guard_loss_scope,
                     }
                 )
                 state.pop("runtime_guard_manual_frozen_inventory_override", None)
@@ -7819,6 +7983,7 @@ def _maybe_handle_runtime_guard(
                     "flat": flat,
                     "market_stable": stable,
                     "market": stable_report,
+                    "loss_scope": runtime_guard_loss_scope,
                 }
             )
             if elapsed >= cooldown_seconds and flat and stable:
@@ -7828,6 +7993,7 @@ def _maybe_handle_runtime_guard(
                         "recovered_at": recovered_at.isoformat(),
                         "last_reason": "market_stable_after_loss_stop",
                         "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                        "loss_scope": runtime_guard_loss_scope,
                     }
                 )
                 _write_json(state_path, state)
@@ -7857,6 +8023,7 @@ def _maybe_handle_runtime_guard(
         summary["stop_triggered"] = False
         summary["stop_reason"] = "rolling_hourly_loss_cooling_down"
         summary["runtime_guard_loss_recovery"] = dict(recovery)
+    summary["runtime_guard_loss_scope"] = runtime_guard_loss_scope
     return summary
 
 
@@ -20191,6 +20358,11 @@ def main() -> None:
                 runtime_recovery = _runtime_guard_loss_recovery_state(state)
                 runtime_recovered_at = _parse_state_datetime(runtime_recovery.get("recovered_at"))
                 runtime_pnl_events_for_guard = _filter_pnl_events_after(runtime_pnl_events, runtime_recovered_at)
+                runtime_pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
+                    args=args,
+                    state=state,
+                    pnl_events=runtime_pnl_events_for_guard,
+                )
                 runtime_guard_result = evaluate_runtime_guards(
                     config=runtime_guard_config,
                     now=cycle_started_at,
@@ -20222,6 +20394,7 @@ def main() -> None:
                         stopped_at=cycle_started_at,
                         rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
                     )
+                    runtime_recovery["loss_scope"] = runtime_guard_loss_scope
                     runtime_loss_recovery_summary = dict(runtime_recovery)
                     _write_json(state_path, state)
 
@@ -20727,6 +20900,7 @@ def main() -> None:
                     "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
                     "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
                     "runtime_guard_stats_start_time": runtime_stats_start_time.isoformat() if runtime_stats_start_time else None,
+                    "runtime_guard_loss_scope": runtime_guard_loss_scope,
                     "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
                     "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
                     "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,

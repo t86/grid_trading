@@ -152,6 +152,15 @@ def summarize_futures_runtime_guard_inputs(
                 "ts": trade_ts.isoformat(),
                 "net_pnl": net_pnl,
                 "gross_notional": price * qty,
+                "client_order_id": str(
+                    row.get("clientOrderId")
+                    or row.get("client_order_id")
+                    or row.get("origClientOrderId")
+                    or ""
+                ),
+                "order_id": row.get("orderId") or row.get("order_id"),
+                "side": str(row.get("side") or ""),
+                "position_side": str(row.get("positionSide") or row.get("position_side") or ""),
             }
         )
 
