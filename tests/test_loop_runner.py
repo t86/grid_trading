@@ -6279,6 +6279,9 @@ class LoopRunnerTests(unittest.TestCase):
         mock_update_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
     @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
     @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
     @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
@@ -6286,7 +6289,7 @@ class LoopRunnerTests(unittest.TestCase):
     @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
     @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
     @patch("grid_optimizer.loop_runner.validate_plan_report")
-    def test_execute_plan_report_blocks_hedge_best_quote_entry_when_frozen_ledger_lags(
+    def test_execute_plan_report_allows_hedge_best_quote_entry_when_frozen_ledger_lags(
         self,
         mock_validate_plan_report,
         mock_book_tickers,
@@ -6295,6 +6298,9 @@ class LoopRunnerTests(unittest.TestCase):
         mock_account_info,
         mock_open_orders,
         mock_change_leverage,
+        mock_post_order,
+        mock_update_inventory_grid_refs,
+        mock_update_refs,
     ) -> None:
         mock_validate_plan_report.return_value = {
             "ok": True,
@@ -6326,6 +6332,7 @@ class LoopRunnerTests(unittest.TestCase):
         }
         mock_open_orders.return_value = []
         mock_change_leverage.return_value = {"leverage": 10}
+        mock_post_order.return_value = {"orderId": 1, "clientOrderId": "a"}
 
         args = Namespace(
             symbol="PHAROSUSDT",
@@ -6369,8 +6376,13 @@ class LoopRunnerTests(unittest.TestCase):
             },
         }
 
-        with self.assertRaisesRegex(RuntimeError, "当前持仓与计划生成时不一致"):
-            execute_plan_report(args, plan_report)
+        report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["executed"])
+        self.assertTrue(report["position_reconcile"]["isolated_frozen_position_mismatch_allowed"])
+        self.assertEqual(mock_post_order.call_count, 1)
+        mock_update_refs.assert_called_once()
+        mock_update_inventory_grid_refs.assert_called_once()
 
     def test_apply_synthetic_inventory_exit_priority_prunes_pure_short_inventory_after_pause_threshold(self) -> None:
         plan = {

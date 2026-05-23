@@ -18422,6 +18422,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         and current_long_qty + 1e-9 >= expected_exchange_long_qty
         and current_short_qty + 1e-9 >= expected_exchange_short_qty
     )
+    allow_isolated_frozen_position_mismatch = (
+        isolated_best_quote_reduce_freeze
+        and current_long_qty + 1e-9 >= expected_long_qty
+        and current_short_qty + 1e-9 >= expected_short_qty
+    )
     report["position_reconcile"] = {
         "expected_long_qty": expected_long_qty,
         "expected_short_qty": expected_short_qty,
@@ -18431,6 +18436,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "current_short_qty": current_short_qty,
         "isolated_best_quote_reduce_freeze": isolated_best_quote_reduce_freeze,
         "reduce_only_position_surplus_allowed": allow_reduce_only_position_surplus,
+        "isolated_frozen_position_mismatch_allowed": allow_isolated_frozen_position_mismatch,
     }
     if len(current_strategy_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
@@ -18473,12 +18479,17 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     elif _is_one_way_short_mode(strategy_mode):
         if abs(current_short_qty - expected_short_qty) > 1e-9:
             raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
-    elif abs(current_long_qty - expected_exchange_long_qty) > 1e-9 and not allow_reduce_only_position_surplus:
+    elif (
+        abs(current_long_qty - expected_exchange_long_qty) > 1e-9
+        and not allow_reduce_only_position_surplus
+        and not allow_isolated_frozen_position_mismatch
+    ):
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
     if (
         _uses_exchange_hedge_position_sides(strategy_mode)
         and abs(current_short_qty - expected_exchange_short_qty) > 1e-9
         and not allow_reduce_only_position_surplus
+        and not allow_isolated_frozen_position_mismatch
     ):
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
 
