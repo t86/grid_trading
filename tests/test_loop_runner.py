@@ -6080,6 +6080,215 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertIn("take_profit_long", sell_roles)
         self.assertIn("entry_short", sell_roles)
         self.assertFalse(report["active_delever"]["active"])
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_allows_hedge_best_quote_reduce_only_when_frozen_ledger_lags(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        mock_update_inventory_grid_refs,
+        mock_update_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 2,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "BUY",
+                        "qty": 8.0,
+                        "price": 0.6327,
+                        "position_side": "SHORT",
+                        "force_reduce_only": True,
+                    },
+                    {
+                        "role": "best_quote_reduce_long",
+                        "side": "SELL",
+                        "qty": 47.0,
+                        "price": 0.6337,
+                        "position_side": "LONG",
+                        "force_reduce_only": True,
+                    },
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.6336", "ask_price": "0.6337"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "152", "entryPrice": "0.6258"},
+                {"symbol": "PHAROSUSDT", "positionSide": "SHORT", "positionAmt": "-1108", "entryPrice": "0.7158"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 10}
+        mock_post_order.side_effect = [
+            {"orderId": 1, "clientOrderId": "a"},
+            {"orderId": 2, "clientOrderId": "b"},
+        ]
+
+        args = Namespace(
+            symbol="PHAROSUSDT",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            max_new_orders=20,
+            max_total_notional=1450.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=20.0,
+            plan_json="output/pharosusdt_hedge_bq_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=10,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/pharosusdt_hedge_bq_state.json",
+        )
+        plan_report = {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "effective_strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+            "mid_price": 0.63365,
+            "step_price": 0.00025,
+            "open_order_count": 0,
+            "current_long_qty": 74.0,
+            "current_short_qty": 8.0,
+            "actual_net_qty": 152.0,
+            "dual_side_position": True,
+            "best_quote_maker_volume": {
+                "reduce_freeze": {
+                    "isolates_risk_metrics": True,
+                    "frozen_long_qty": 62.0,
+                    "frozen_short_qty": 1070.0,
+                },
+            },
+            "symbol_info": {
+                "tick_size": 0.0001,
+                "step_size": 1.0,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        report = execute_plan_report(args, plan_report)
+
+        self.assertTrue(report["executed"])
+        self.assertEqual(mock_post_order.call_count, 2)
+        self.assertEqual([call.kwargs["position_side"] for call in mock_post_order.call_args_list], ["SHORT", "LONG"])
+        mock_update_refs.assert_called_once()
+        mock_update_inventory_grid_refs.assert_called_once()
+
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_blocks_hedge_best_quote_entry_when_frozen_ledger_lags(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {
+                        "role": "best_quote_entry_long",
+                        "side": "BUY",
+                        "qty": 16.0,
+                        "price": 0.6327,
+                        "position_side": "LONG",
+                    },
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.6336", "ask_price": "0.6337"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "152", "entryPrice": "0.6258"},
+                {"symbol": "PHAROSUSDT", "positionSide": "SHORT", "positionAmt": "-1108", "entryPrice": "0.7158"},
+            ],
+        }
+        mock_open_orders.return_value = []
+        mock_change_leverage.return_value = {"leverage": 10}
+
+        args = Namespace(
+            symbol="PHAROSUSDT",
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            max_new_orders=20,
+            max_total_notional=1450.0,
+            cancel_stale=False,
+            max_plan_age_seconds=30,
+            max_mid_drift_steps=20.0,
+            plan_json="output/pharosusdt_hedge_bq_latest_plan.json",
+            apply=True,
+            margin_type="KEEP",
+            leverage=10,
+            maker_retries=0,
+            recv_window=5000,
+            state_path="output/pharosusdt_hedge_bq_state.json",
+        )
+        plan_report = {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "effective_strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+            "mid_price": 0.63365,
+            "step_price": 0.00025,
+            "open_order_count": 0,
+            "current_long_qty": 74.0,
+            "current_short_qty": 8.0,
+            "actual_net_qty": 152.0,
+            "dual_side_position": True,
+            "best_quote_maker_volume": {
+                "reduce_freeze": {
+                    "isolates_risk_metrics": True,
+                    "frozen_long_qty": 62.0,
+                    "frozen_short_qty": 1070.0,
+                },
+            },
+            "symbol_info": {
+                "tick_size": 0.0001,
+                "step_size": 1.0,
+                "min_qty": 1.0,
+                "min_notional": 5.0,
+            },
+        }
+
+        with self.assertRaisesRegex(RuntimeError, "当前持仓与计划生成时不一致"):
+            execute_plan_report(args, plan_report)
 
     def test_apply_synthetic_inventory_exit_priority_prunes_pure_short_inventory_after_pause_threshold(self) -> None:
         plan = {

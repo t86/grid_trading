@@ -4341,6 +4341,23 @@ def _resolve_reduce_only_flag(
     return None
 
 
+def _is_hedge_side_reduce_order(order: dict[str, Any]) -> bool:
+    side = str(order.get("side", "")).upper().strip()
+    position_side = _order_position_side(order)
+    if position_side == "LONG" and side == "SELL":
+        return True
+    if position_side == "SHORT" and side == "BUY":
+        return True
+    return False
+
+
+def _all_place_orders_are_forced_hedge_reduces(actions: dict[str, Any]) -> bool:
+    place_orders = [item for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders:
+        return False
+    return all(bool(order.get("force_reduce_only")) and _is_hedge_side_reduce_order(order) for order in place_orders)
+
+
 
 def assess_synthetic_tp_only_watchdog(
     *,
@@ -18101,11 +18118,13 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     expected_actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
     expected_exchange_long_qty = expected_long_qty
     expected_exchange_short_qty = expected_short_qty
+    isolated_best_quote_reduce_freeze = False
     if _is_hedge_best_quote_maker_volume_mode(strategy_mode):
         best_quote_metrics = plan_report.get("best_quote_maker_volume")
         if isinstance(best_quote_metrics, dict):
             reduce_freeze = best_quote_metrics.get("reduce_freeze")
             if isinstance(reduce_freeze, dict) and reduce_freeze.get("isolates_risk_metrics"):
+                isolated_best_quote_reduce_freeze = True
                 expected_exchange_long_qty += max(_safe_float(reduce_freeze.get("frozen_long_qty")), 0.0)
                 expected_exchange_short_qty += max(_safe_float(reduce_freeze.get("frozen_short_qty")), 0.0)
     if _uses_exchange_hedge_position_sides(strategy_mode):
@@ -18132,6 +18151,22 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         else:
             current_long_qty = max(current_actual_net_qty, 0.0)
             current_short_qty = 0.0
+    allow_reduce_only_position_surplus = (
+        isolated_best_quote_reduce_freeze
+        and _all_place_orders_are_forced_hedge_reduces(validation["actions"])
+        and current_long_qty + 1e-9 >= expected_exchange_long_qty
+        and current_short_qty + 1e-9 >= expected_exchange_short_qty
+    )
+    report["position_reconcile"] = {
+        "expected_long_qty": expected_long_qty,
+        "expected_short_qty": expected_short_qty,
+        "expected_exchange_long_qty": expected_exchange_long_qty,
+        "expected_exchange_short_qty": expected_exchange_short_qty,
+        "current_long_qty": current_long_qty,
+        "current_short_qty": current_short_qty,
+        "isolated_best_quote_reduce_freeze": isolated_best_quote_reduce_freeze,
+        "reduce_only_position_surplus_allowed": allow_reduce_only_position_surplus,
+    }
     if len(current_strategy_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
     if _is_synthetic_neutral_mode(strategy_mode):
@@ -18173,9 +18208,13 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     elif _is_one_way_short_mode(strategy_mode):
         if abs(current_short_qty - expected_short_qty) > 1e-9:
             raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
-    elif abs(current_long_qty - expected_exchange_long_qty) > 1e-9:
+    elif abs(current_long_qty - expected_exchange_long_qty) > 1e-9 and not allow_reduce_only_position_surplus:
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
-    if _uses_exchange_hedge_position_sides(strategy_mode) and abs(current_short_qty - expected_exchange_short_qty) > 1e-9:
+    if (
+        _uses_exchange_hedge_position_sides(strategy_mode)
+        and abs(current_short_qty - expected_exchange_short_qty) > 1e-9
+        and not allow_reduce_only_position_surplus
+    ):
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
 
     validation["actions"] = cap_reduce_only_place_orders_to_position(
