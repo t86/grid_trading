@@ -9739,7 +9739,19 @@ def _resolve_runner_start_config(payload: dict[str, Any]) -> dict[str, Any]:
     if preset is None:
         preset = _runner_preset_map().get(profile)
     if preset is None:
-        raise ValueError(f"Unknown strategy_profile: {profile}")
+        runtime_config_path = Path("deploy/oracle/runtime_configs") / f"{profile}.json"
+        if not runtime_config_path.exists():
+            raise ValueError(f"Unknown strategy_profile: {profile}")
+        runtime_payload = _read_json_dict(runtime_config_path)
+        if not runtime_payload:
+            raise ValueError(f"Unknown strategy_profile: {profile}")
+        runtime_payload.update(raw_payload)
+        resolved = _normalize_runner_control_payload(runtime_payload)
+        runtime_paths = _default_runtime_paths_for_symbol(str(resolved.get("symbol", "")))
+        for key, value in runtime_paths.items():
+            if not str(payload.get(key, "")).strip():
+                resolved[key] = value
+        return _autotune_runner_symbol_config(resolved)
     if not preset.get("startable", True):
         raise ValueError(f"{preset.get('label', profile)} 当前是模板预设，页面已展示参数，但还不能直接启动。")
     preset_symbol = str(preset.get("symbol", "")).upper().strip()
