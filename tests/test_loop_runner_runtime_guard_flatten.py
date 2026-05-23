@@ -241,6 +241,8 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                         "runtime_guard_loss_recovery": {
                             "stopped_at": stopped_at.isoformat(),
                             "last_reason": "rolling_hourly_loss_limit_hit",
+                            "manual_frozen_inventory_override": True,
+                            "manual_frozen_inventory_override_reason": "stale",
                         },
                         "runtime_guard_manual_frozen_inventory_override": {"active": True},
                         "best_quote_frozen_inventory": {
@@ -293,6 +295,8 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             recovery = state["runtime_guard_loss_recovery"]
             self.assertIn("recovered_at", recovery)
             self.assertEqual(recovery["flat_basis"], "strategy_exposure_excluding_frozen_inventory")
+            self.assertNotIn("manual_frozen_inventory_override", recovery)
+            self.assertNotIn("manual_frozen_inventory_override_reason", recovery)
             self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
 
     @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
@@ -317,6 +321,8 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                         "runtime_guard_loss_recovery": {
                             "stopped_at": stopped_at.isoformat(),
                             "last_reason": "rolling_hourly_loss_limit_hit",
+                            "manual_frozen_inventory_override": True,
+                            "manual_frozen_inventory_override_reason": "stale",
                         },
                         "runtime_guard_manual_frozen_inventory_override": {
                             "active": True,
@@ -534,6 +540,10 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
                             "frozen_inventory_present": True,
                             "manual_directive_pending": False,
                         },
+                        "runtime_guard_loss_recovery": {
+                            "manual_frozen_inventory_override": True,
+                            "manual_frozen_inventory_override_reason": "stale",
+                        },
                         "best_quote_frozen_inventory": {"short_qty": 2474.0},
                     }
                 ),
@@ -560,6 +570,9 @@ class LoopRunnerRuntimeGuardFlattenTests(unittest.TestCase):
             self.assertNotIn("runtime_guard_manual_frozen_inventory_override", actions)
             state = json.loads(state_path.read_text(encoding="utf-8"))
             self.assertNotIn("runtime_guard_manual_frozen_inventory_override", state)
+            recovery = state["runtime_guard_loss_recovery"]
+            self.assertNotIn("manual_frozen_inventory_override", recovery)
+            self.assertNotIn("manual_frozen_inventory_override_reason", recovery)
 
     @patch("grid_optimizer.loop_runner._runtime_guard_market_is_stable_for_recovery")
     @patch("grid_optimizer.loop_runner.load_live_flatten_snapshot")

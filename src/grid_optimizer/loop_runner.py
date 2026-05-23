@@ -7529,7 +7529,7 @@ def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now:
                 "bq_isolated_loss": bq_loss_report,
             }
         )
-        state.pop("runtime_guard_manual_frozen_inventory_override", None)
+        _clear_runtime_guard_manual_frozen_inventory_override(state)
         _write_json(Path(state_path_text), state)
         return report
     if bq_loss_report.get("enabled"):
@@ -7567,7 +7567,7 @@ def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now:
                     "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
                 }
             )
-            state.pop("runtime_guard_manual_frozen_inventory_override", None)
+            _clear_runtime_guard_manual_frozen_inventory_override(state)
             _write_json(Path(state_path_text), state)
             return report
         _write_json(Path(state_path_text), state)
@@ -7606,6 +7606,20 @@ def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | di
         return any(isinstance(item, dict) and bool(item.get("requested")) for item in raw.values())
 
     return _has_requested(manual_reduce) or _has_requested(manual_limit) or _has_requested(pair_release)
+
+
+def _clear_runtime_guard_manual_frozen_inventory_override(state: dict[str, Any]) -> bool:
+    changed = state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None
+    recovery = state.get("runtime_guard_loss_recovery")
+    if isinstance(recovery, dict):
+        for key in (
+            "manual_frozen_inventory_override",
+            "manual_frozen_inventory_override_reason",
+        ):
+            if key in recovery:
+                recovery.pop(key, None)
+                changed = True
+    return changed
 
 
 def _has_best_quote_frozen_inventory_position(state: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -7651,8 +7665,8 @@ def _suppress_place_orders_during_runtime_guard_loss_cooldown(
                         "manual_directive_pending": True,
                     }
                 else:
-                    state.pop("runtime_guard_manual_frozen_inventory_override", None)
-                    _write_json(state_path, state)
+                    if _clear_runtime_guard_manual_frozen_inventory_override(state):
+                        _write_json(state_path, state)
         if not manual_override.get("blocked"):
             return actions
     block = cooldown if cooldown.get("blocked") else manual_override
@@ -8019,7 +8033,7 @@ def _maybe_handle_runtime_guard(
     )
     if runtime_guard_result.tradable:
         recovery["loss_scope"] = runtime_guard_loss_scope
-        if state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None:
+        if _clear_runtime_guard_manual_frozen_inventory_override(state):
             _write_json(state_path, state)
         return None
     loss_only_stop = runtime_guard_result.matched_reasons in (
@@ -8086,7 +8100,8 @@ def _maybe_handle_runtime_guard(
                         "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
                     }
                 )
-        if state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None or loss_only_stop:
+        cleared_manual_override = _clear_runtime_guard_manual_frozen_inventory_override(state)
+        if cleared_manual_override or loss_only_stop:
             _write_json(state_path, state)
         return None
     if frozen_inventory_present or manual_frozen_directive_pending:
@@ -8140,7 +8155,7 @@ def _maybe_handle_runtime_guard(
                         "loss_scope": runtime_guard_loss_scope,
                     }
                 )
-                state.pop("runtime_guard_manual_frozen_inventory_override", None)
+                _clear_runtime_guard_manual_frozen_inventory_override(state)
                 _write_json(state_path, state)
                 return None
         state["runtime_guard_manual_frozen_inventory_override"] = {
@@ -8155,7 +8170,7 @@ def _maybe_handle_runtime_guard(
         }
         _write_json(state_path, state)
         return None
-    if state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None:
+    if _clear_runtime_guard_manual_frozen_inventory_override(state):
         _write_json(state_path, state)
     credentials = load_binance_api_credentials()
     if credentials is None:
