@@ -10,6 +10,8 @@
   "base_position_notional": 0.0,
   "flat_start_enabled": true,
   "warm_start_enabled": true,
+  "autotune_symbol_enabled": false,
+  "autotune_min_order_notional_only": false,
   "best_quote_maker_volume_enabled": true,
   "best_quote_maker_volume_cycle_budget_notional": 16.0,
   "best_quote_maker_volume_target_remaining_notional": 200000.0,
