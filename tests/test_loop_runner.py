@@ -47,6 +47,7 @@ from grid_optimizer.loop_runner import (
     _best_quote_reduce_freeze_report,
     _apply_best_quote_reduce_freeze,
     _cap_best_quote_reduce_orders_to_managed_inventory,
+    reconcile_best_quote_volume_ledger_surplus,
     apply_best_quote_frozen_inventory_manual_reduce,
     apply_best_quote_frozen_inventory_manual_limit,
     apply_best_quote_frozen_inventory_pair_release,
@@ -1076,6 +1077,62 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertFalse(report["isolates_risk_metrics"])
         self.assertAlmostEqual(report["managed_unrealized_pnl"], -2.0)
+
+    def test_best_quote_volume_ledger_imports_exchange_surplus_above_frozen_inventory(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [{"qty": 58.0, "entry_price": 0.6452961911638}],
+                "short_lots": [{"qty": 1070.0, "entry_price": 0.6697483400318}],
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [],
+            },
+        }
+
+        snapshot = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=58.0,
+            current_short_qty=1100.0,
+            current_long_avg_price=0.6452961911638,
+            current_short_avg_price=((1070.0 * 0.6697483400318) + (30.0 * 0.6375)) / 1100.0,
+            mid_price=0.63665,
+        )
+
+        self.assertEqual(snapshot["long_qty"], 0.0)
+        self.assertEqual(snapshot["short_qty"], 30.0)
+        self.assertAlmostEqual(snapshot["short_avg_price"], 0.6375)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["surplus_reconcile_imported_short_qty"], 30.0)
+        self.assertEqual(ledger["short_lots"][0]["source"], "exchange_surplus_reconcile")
+
+    def test_best_quote_volume_ledger_does_not_import_when_exchange_qty_is_below_tracked(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [{"qty": 1070.0, "entry_price": 0.6697483400318}],
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [{"qty": 30.0, "price": 0.6375}],
+            },
+        }
+
+        snapshot = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=1070.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6697483400318,
+            mid_price=0.63665,
+        )
+
+        self.assertEqual(snapshot["short_qty"], 30.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertNotIn("surplus_reconcile_imported_short_qty", ledger)
 
     def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
         state: dict[str, object] = {

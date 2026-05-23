@@ -2437,6 +2437,106 @@ def _best_quote_volume_ledger_snapshot(
     }
 
 
+def reconcile_best_quote_volume_ledger_surplus(
+    *,
+    state: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+) -> dict[str, Any]:
+    ledger = dict(state.get("best_quote_volume_ledger") or {})
+    if not bool(ledger.get("initialized")) or not bool(ledger.get("sync_ok", True)):
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    frozen = dict(state.get("best_quote_frozen_inventory") or {})
+    if not frozen:
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    now_iso = _utc_now().isoformat()
+    long_lots = _normalize_best_quote_volume_lots(ledger.get("long_lots"))
+    short_lots = _normalize_best_quote_volume_lots(ledger.get("short_lots"))
+    frozen_long_lots = _normalize_best_quote_volume_lots(frozen.get("long_lots"))
+    frozen_short_lots = _normalize_best_quote_volume_lots(frozen.get("short_lots"))
+    if not frozen_long_lots and _safe_float(frozen.get("long_qty")) > 1e-12:
+        frozen_long_lots = [
+            {
+                "qty": _safe_float(frozen.get("long_qty")),
+                "price": _safe_float(frozen.get("long_entry_price")),
+            }
+        ]
+    if not frozen_short_lots and _safe_float(frozen.get("short_qty")) > 1e-12:
+        frozen_short_lots = [
+            {
+                "qty": _safe_float(frozen.get("short_qty")),
+                "price": _safe_float(frozen.get("short_entry_price")),
+            }
+        ]
+
+    def _lot_qty_cost(lots: list[dict[str, Any]]) -> tuple[float, float]:
+        qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in lots)
+        cost = sum(
+            max(_safe_float(item.get("qty")), 0.0) * max(_safe_float(item.get("price")), 0.0)
+            for item in lots
+        )
+        return qty, cost
+
+    def _import_side(
+        *,
+        side: str,
+        actual_qty: float,
+        actual_avg_price: float,
+        active_lots: list[dict[str, Any]],
+        frozen_lots: list[dict[str, Any]],
+    ) -> tuple[list[dict[str, Any]], float, float]:
+        active_qty, active_cost = _lot_qty_cost(active_lots)
+        frozen_qty, frozen_cost = _lot_qty_cost(frozen_lots)
+        surplus_qty = max(_safe_float(actual_qty) - active_qty - frozen_qty, 0.0)
+        if surplus_qty <= 1e-12:
+            return active_lots, 0.0, 0.0
+        actual_cost = max(_safe_float(actual_qty), 0.0) * max(_safe_float(actual_avg_price), 0.0)
+        surplus_price = (actual_cost - active_cost - frozen_cost) / surplus_qty if surplus_qty > 0 else 0.0
+        if surplus_price <= 0:
+            surplus_price = max(_safe_float(actual_avg_price), _safe_float(mid_price), 0.0)
+        lot = {
+            "qty": surplus_qty,
+            "price": surplus_price,
+            "source": "exchange_surplus_reconcile",
+            "side": side,
+            "opened_at": now_iso,
+        }
+        return [*active_lots, lot], surplus_qty, surplus_price
+
+    long_lots, imported_long_qty, imported_long_price = _import_side(
+        side="long",
+        actual_qty=current_long_qty,
+        actual_avg_price=current_long_avg_price,
+        active_lots=long_lots,
+        frozen_lots=frozen_long_lots,
+    )
+    short_lots, imported_short_qty, imported_short_price = _import_side(
+        side="short",
+        actual_qty=current_short_qty,
+        actual_avg_price=current_short_avg_price,
+        active_lots=short_lots,
+        frozen_lots=frozen_short_lots,
+    )
+    if imported_long_qty <= 1e-12 and imported_short_qty <= 1e-12:
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    ledger["long_lots"] = long_lots
+    ledger["short_lots"] = short_lots
+    ledger["surplus_reconcile_imported_long_qty"] = imported_long_qty
+    ledger["surplus_reconcile_imported_short_qty"] = imported_short_qty
+    ledger["surplus_reconcile_imported_long_price"] = imported_long_price
+    ledger["surplus_reconcile_imported_short_price"] = imported_short_price
+    ledger["surplus_reconcile_at"] = now_iso
+    ledger["updated_at"] = now_iso
+    state["best_quote_volume_ledger"] = ledger
+    return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+
 def sync_best_quote_volume_ledger(
     *,
     state: dict[str, Any],
@@ -13642,6 +13742,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price=current_short_avg_price,
             mid_price=mid_price,
             observed_trade_rows=observed_trade_rows,
+        )
+        best_quote_volume_ledger = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
         )
         best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
 
