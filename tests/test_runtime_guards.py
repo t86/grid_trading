@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.runtime_guards import (
@@ -10,6 +13,7 @@ from grid_optimizer.runtime_guards import (
     normalize_runtime_guard_config,
     normalize_runtime_guard_payload,
     resolve_runtime_guard_stats_start_time,
+    summarize_futures_runtime_guard_inputs,
 )
 
 
@@ -50,6 +54,52 @@ class RuntimeGuardsTests(unittest.TestCase):
             now=datetime(2026, 5, 22, 23, 30, tzinfo=timezone.utc),
         )
         self.assertEqual(resolved, datetime(2026, 5, 22, 0, 0, tzinfo=timezone.utc))
+
+    def test_summarize_futures_runtime_guard_inputs_dedupes_order_notional(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            summary_path = Path(tmp) / "pharosusdt_hedge_bq_events.jsonl"
+            trade_path = Path(tmp) / "pharosusdt_hedge_bq_trade_audit.jsonl"
+            rows = [
+                {
+                    "time": 1779570000000,
+                    "orderId": 1001,
+                    "price": "0.6500",
+                    "qty": "10",
+                    "quoteQty": "6.50",
+                    "realizedPnl": "0",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                },
+                {
+                    "time": 1779570000000,
+                    "orderId": 1001,
+                    "price": "0.6500",
+                    "qty": "10",
+                    "quoteQty": "6.50",
+                    "realizedPnl": "0",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                },
+                {
+                    "time": 1779570060000,
+                    "orderId": 1002,
+                    "price": "0.6400",
+                    "qty": "20",
+                    "realizedPnl": "0",
+                    "commission": "0",
+                    "commissionAsset": "USDT",
+                },
+            ]
+            trade_path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
+
+            gross, pnl_events, _ = summarize_futures_runtime_guard_inputs(
+                summary_path,
+                runtime_guard_stats_start_time="2026-05-23T00:00:00+00:00",
+                now=datetime(2026, 5, 23, 23, 30, tzinfo=timezone.utc),
+            )
+
+            self.assertAlmostEqual(gross, 6.50 + 12.80)
+            self.assertEqual(len(pnl_events), 3)
 
     def test_evaluate_runtime_guards_returns_waiting_before_start(self) -> None:
         now = datetime(2026, 3, 30, 8, 0, tzinfo=timezone.utc)

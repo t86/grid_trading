@@ -1939,7 +1939,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertLessEqual(plan["sell_orders"][0]["notional"], 4.3)
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_reduce_long")
 
-    def test_best_quote_maker_volume_same_side_guard_blocks_short_entry_below_existing_cost(self) -> None:
+    def test_best_quote_maker_volume_same_side_guard_reports_short_entry_below_existing_cost(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=True,
@@ -1965,11 +1965,13 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         guard = plan["metrics"]["same_side_entry_price_guard"]
-        self.assertTrue(guard["blocked_short_entry"])
-        self.assertEqual(plan["sell_orders"], [])
-        self.assertIn("same_side_entry_price_guard", plan["reasons"])
+        self.assertTrue(guard["report_only"])
+        self.assertFalse(guard["blocked_short_entry"])
+        self.assertTrue(guard["would_block_short_entry"])
+        self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
+        self.assertNotIn("same_side_entry_price_guard", plan["reasons"])
 
-    def test_best_quote_maker_volume_same_side_guard_blocks_long_entry_above_existing_cost(self) -> None:
+    def test_best_quote_maker_volume_same_side_guard_reports_long_entry_above_existing_cost(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=True,
@@ -1995,9 +1997,11 @@ class LoopRunnerTests(unittest.TestCase):
         )
 
         guard = plan["metrics"]["same_side_entry_price_guard"]
-        self.assertTrue(guard["blocked_long_entry"])
-        self.assertEqual(plan["buy_orders"], [])
-        self.assertIn("same_side_entry_price_guard", plan["reasons"])
+        self.assertTrue(guard["report_only"])
+        self.assertFalse(guard["blocked_long_entry"])
+        self.assertTrue(guard["would_block_long_entry"])
+        self.assertEqual(plan["buy_orders"][0]["role"], "best_quote_entry_long")
+        self.assertNotIn("same_side_entry_price_guard", plan["reasons"])
 
     @patch("grid_optimizer.loop_runner.assess_market_guard")
     @patch("grid_optimizer.loop_runner.fetch_futures_klines")

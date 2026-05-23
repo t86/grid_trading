@@ -64,6 +64,34 @@ def _event_net_pnl(item: dict[str, Any]) -> float:
     return realized + funding - commission - recycle_loss
 
 
+def _trade_order_identity(row: dict[str, Any]) -> str:
+    for key in ("orderId", "order_id", "i"):
+        value = row.get(key)
+        if value not in {"", None}:
+            return str(value)
+    client_id = row.get("clientOrderId") or row.get("client_order_id") or row.get("origClientOrderId")
+    if client_id not in {"", None}:
+        return f"client:{client_id}"
+    trade_id = row.get("tradeId") or row.get("trade_id") or row.get("t")
+    if trade_id not in {"", None}:
+        return f"trade:{trade_id}"
+    return ""
+
+
+def _trade_notional(row: dict[str, Any]) -> float:
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for key in ("quoteQty", "quote_qty", "quote_asset_qty"):
+        quote_qty = abs(_as_float(row.get(key)))
+        if quote_qty > 0:
+            return quote_qty
+    return abs(_as_float(row.get("price")) * _as_float(row.get("qty")))
+
+
 @dataclass(frozen=True)
 class RuntimeGuardConfig:
     run_start_time: datetime | None
@@ -151,6 +179,7 @@ def summarize_futures_runtime_guard_inputs(
     cumulative_gross_notional = 0.0
     pnl_events: list[dict[str, Any]] = []
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    seen_order_notional_keys: set[str] = set()
 
     def _as_float(value: Any) -> float:
         try:
@@ -168,7 +197,14 @@ def summarize_futures_runtime_guard_inputs(
                 continue
         price = _as_float(row.get("price"))
         qty = abs(_as_float(row.get("qty")))
-        cumulative_gross_notional += price * qty
+        notional = _trade_notional(row)
+        order_identity = _trade_order_identity(row)
+        if order_identity:
+            if order_identity not in seen_order_notional_keys:
+                cumulative_gross_notional += notional
+                seen_order_notional_keys.add(order_identity)
+        else:
+            cumulative_gross_notional += notional
         if trade_ts is None:
             continue
         realized_pnl = _as_float(row.get("realizedPnl"))
@@ -179,7 +215,7 @@ def summarize_futures_runtime_guard_inputs(
             {
                 "ts": trade_ts.isoformat(),
                 "net_pnl": net_pnl,
-                "gross_notional": price * qty,
+                "gross_notional": notional,
                 "client_order_id": str(
                     row.get("clientOrderId")
                     or row.get("client_order_id")

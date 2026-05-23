@@ -1193,14 +1193,19 @@ def build_best_quote_maker_volume_plan(
     same_side_entry_price_guard_report = {
         "enabled": bool(config.same_side_entry_price_guard_enabled),
         "applied": False,
+        "report_only": True,
         "blocked_long_entry": False,
         "blocked_short_entry": False,
+        "would_block_long_entry": False,
+        "would_block_short_entry": False,
         "min_inventory_notional": max(_safe_float(config.same_side_entry_price_guard_min_notional), 0.0),
         "gap_ticks": max(int(_safe_float(config.same_side_entry_price_guard_gap_ticks)), 0),
         "long_reference_price": None,
         "short_reference_price": None,
         "blocked_buy_orders": 0,
         "blocked_sell_orders": 0,
+        "would_block_buy_orders": 0,
+        "would_block_sell_orders": 0,
     }
     if config.same_side_entry_price_guard_enabled:
         guard_gap = _tick_gap(inputs.tick_size, int(same_side_entry_price_guard_report["gap_ticks"]))
@@ -1215,96 +1220,30 @@ def build_best_quote_maker_volume_plan(
         )
         if long_notional >= min_guard_notional and long_reference_price > 0:
             max_long_entry_price = max(long_reference_price - guard_gap, 0.0)
-            kept_buy_orders: list[dict[str, Any]] = []
             blocked_buy_orders: list[dict[str, Any]] = []
-            reduce_short_remaining = max(
-                short_notional
-                - sum(
-                    _safe_float(order.get("notional"))
-                    for order in buy_orders
-                    if str(order.get("role", "")).lower().strip() == "best_quote_reduce_short"
-                ),
-                0.0,
-            )
             for order in buy_orders:
                 if (
                     str(order.get("role", "")).lower().strip() == "best_quote_entry_long"
                     and _safe_float(order.get("price")) > max_long_entry_price + 1e-12
                 ):
                     blocked_buy_orders.append(order)
-                    if reduce_short_remaining > 0:
-                        fallback_notional = min(_safe_float(order.get("notional")), reduce_short_remaining)
-                        fallback = _build_order(
-                            side="BUY",
-                            price=_price_with_gap(bid, reduce_short_gap, -1),
-                            notional=fallback_notional,
-                            role="best_quote_reduce_short",
-                            inputs=inputs,
-                            position_side=reduce_short_position_side,
-                            force_reduce_only=True,
-                        )
-                        if fallback is not None:
-                            fallback["same_side_entry_guard_fallback_from_role"] = "best_quote_entry_long"
-                            kept_buy_orders.append(fallback)
-                            reduce_short_remaining = max(
-                                reduce_short_remaining - _safe_float(fallback.get("notional")),
-                                0.0,
-                            )
-                else:
-                    kept_buy_orders.append(order)
             if blocked_buy_orders:
-                buy_orders = kept_buy_orders
-                same_side_entry_price_guard_report["applied"] = True
-                same_side_entry_price_guard_report["blocked_long_entry"] = True
-                same_side_entry_price_guard_report["blocked_buy_orders"] = len(blocked_buy_orders)
+                same_side_entry_price_guard_report["would_block_long_entry"] = True
+                same_side_entry_price_guard_report["would_block_buy_orders"] = len(blocked_buy_orders)
                 same_side_entry_price_guard_report["max_long_entry_price"] = max_long_entry_price
         if short_notional >= min_guard_notional and short_reference_price > 0:
             min_short_entry_price = short_reference_price + guard_gap
-            kept_sell_orders: list[dict[str, Any]] = []
             blocked_sell_orders: list[dict[str, Any]] = []
-            reduce_long_remaining = max(
-                long_notional
-                - sum(
-                    _safe_float(order.get("notional"))
-                    for order in sell_orders
-                    if str(order.get("role", "")).lower().strip() == "best_quote_reduce_long"
-                ),
-                0.0,
-            )
             for order in sell_orders:
                 if (
                     str(order.get("role", "")).lower().strip() == "best_quote_entry_short"
                     and _safe_float(order.get("price")) + 1e-12 < min_short_entry_price
                 ):
                     blocked_sell_orders.append(order)
-                    if reduce_long_remaining > 0:
-                        fallback_notional = min(_safe_float(order.get("notional")), reduce_long_remaining)
-                        fallback = _build_order(
-                            side="SELL",
-                            price=_price_with_gap(ask, reduce_long_gap, 1),
-                            notional=fallback_notional,
-                            role="best_quote_reduce_long",
-                            inputs=inputs,
-                            position_side=reduce_long_position_side,
-                            force_reduce_only=True,
-                        )
-                        if fallback is not None:
-                            fallback["same_side_entry_guard_fallback_from_role"] = "best_quote_entry_short"
-                            kept_sell_orders.append(fallback)
-                            reduce_long_remaining = max(
-                                reduce_long_remaining - _safe_float(fallback.get("notional")),
-                                0.0,
-                            )
-                else:
-                    kept_sell_orders.append(order)
             if blocked_sell_orders:
-                sell_orders = kept_sell_orders
-                same_side_entry_price_guard_report["applied"] = True
-                same_side_entry_price_guard_report["blocked_short_entry"] = True
-                same_side_entry_price_guard_report["blocked_sell_orders"] = len(blocked_sell_orders)
+                same_side_entry_price_guard_report["would_block_short_entry"] = True
+                same_side_entry_price_guard_report["would_block_sell_orders"] = len(blocked_sell_orders)
                 same_side_entry_price_guard_report["min_short_entry_price"] = min_short_entry_price
-        if same_side_entry_price_guard_report["applied"]:
-            reasons.append("same_side_entry_price_guard")
 
     planned = sum(order["notional"] for order in [*buy_orders, *sell_orders])
     return {

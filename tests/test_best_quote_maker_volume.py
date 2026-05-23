@@ -219,7 +219,7 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["role"], "best_quote_entry_short")
         self.assertEqual(plan["sell_orders"][0]["position_side"], "SHORT")
 
-    def test_same_side_guard_replaces_blocked_short_entry_with_reduce_long(self) -> None:
+    def test_same_side_guard_reports_short_entry_risk_without_rewriting_volume_orders(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
                 enabled=True,
@@ -249,12 +249,14 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         )
 
         guard = plan["metrics"]["same_side_entry_price_guard"]
-        self.assertTrue(guard["blocked_short_entry"])
-        self.assertEqual(guard["blocked_sell_orders"], 2)
+        self.assertTrue(guard["report_only"])
+        self.assertFalse(guard["blocked_short_entry"])
+        self.assertTrue(guard["would_block_short_entry"])
+        self.assertEqual(guard["would_block_sell_orders"], 2)
         self.assertTrue(plan["sell_orders"])
-        self.assertTrue(all(order["role"] == "best_quote_reduce_long" for order in plan["sell_orders"]))
-        self.assertTrue(all(order["force_reduce_only"] for order in plan["sell_orders"]))
-        self.assertTrue(all(order["position_side"] == "LONG" for order in plan["sell_orders"]))
+        self.assertTrue(all(order["role"] == "best_quote_entry_short" for order in plan["sell_orders"]))
+        self.assertTrue(all(not order.get("force_reduce_only") for order in plan["sell_orders"]))
+        self.assertTrue(all(order["position_side"] == "SHORT" for order in plan["sell_orders"]))
 
     def test_hedge_mode_reduces_long_side_when_long_is_above_soft_band(self) -> None:
         plan = build_best_quote_maker_volume_plan(
