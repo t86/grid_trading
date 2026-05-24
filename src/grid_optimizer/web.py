@@ -10246,6 +10246,15 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     ledger = _normalize_runner_frozen_inventory_ledger(state.get("best_quote_frozen_inventory"))
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    def _new_frozen_directive(extra: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        return {
+            **extra,
+            "request_id": uuid.uuid4().hex,
+            "requested_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        }
+
     if action == "reset":
         state.pop("best_quote_frozen_inventory", None)
         state.pop("best_quote_frozen_inventory_manual_reduce", None)
@@ -10282,12 +10291,13 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             requested_qty = min(requested_qty, side_qty)
             if requested_qty <= 1e-12:
                 raise ValueError(f"frozen {side_key} qty is empty")
-            directive[side_key] = {
-                "requested": True,
-                "requested_qty": requested_qty,
-                "requested_at": now_iso,
-                "source": "running_status_ui",
-            }
+            directive[side_key] = _new_frozen_directive(
+                {
+                    "requested": True,
+                    "requested_qty": requested_qty,
+                    "source": "running_status_ui",
+                }
+            )
             state["best_quote_frozen_inventory_manual_reduce"] = directive
         elif action in {"limit_long", "limit_short"}:
             directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
@@ -10306,13 +10316,14 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"frozen {side_key} qty has no unisolated balance")
             isolated_qty = existing_isolated + requested_qty
             ledger[f"{side_key}_manual_limit_isolated_qty"] = isolated_qty
-            directive[side_key] = {
-                "requested": True,
-                "requested_qty": isolated_qty,
-                "price": price,
-                "requested_at": now_iso,
-                "source": "running_status_ui",
-            }
+            directive[side_key] = _new_frozen_directive(
+                {
+                    "requested": True,
+                    "requested_qty": isolated_qty,
+                    "price": price,
+                    "source": "running_status_ui",
+                }
+            )
             state["best_quote_frozen_inventory_manual_limit"] = directive
         elif action in {"cancel_limit_long", "cancel_limit_short"}:
             directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
@@ -10329,12 +10340,13 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             requested_qty = max(_safe_float(payload.get("requested_qty"), "requested_qty"), 0.0)
             if requested_qty <= 1e-12:
                 raise ValueError("requested_qty must be > 0")
-            state["best_quote_frozen_inventory_pair_release"] = {
-                "requested": True,
-                "requested_qty": min(requested_qty, ledger["offset_qty"]),
-                "requested_at": now_iso,
-                "source": "running_status_ui",
-            }
+            state["best_quote_frozen_inventory_pair_release"] = _new_frozen_directive(
+                {
+                    "requested": True,
+                    "requested_qty": min(requested_qty, ledger["offset_qty"]),
+                    "source": "running_status_ui",
+                }
+            )
         long_qty = max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0)
         short_qty = max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0)
         long_isolated = min(max(_safe_float(ledger.get("long_manual_limit_isolated_qty"), "long_manual_limit_isolated_qty"), 0.0), long_qty)

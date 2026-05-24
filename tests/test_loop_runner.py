@@ -1861,7 +1861,7 @@ class LoopRunnerTests(unittest.TestCase):
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},
             "best_quote_frozen_inventory_manual_reduce": {
-                "long": {"requested": True, "requested_at": "2026-05-22T00:00:00+00:00"}
+                "long": {"requested": True, "requested_at": "2026-05-22T00:00:00+00:00", "request_id": "req-long", "expires_at": "2099-01-01T00:00:00+00:00"}
             },
         }
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
@@ -1893,7 +1893,7 @@ class LoopRunnerTests(unittest.TestCase):
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},
             "best_quote_frozen_inventory_manual_reduce": {
-                "long": {"requested": True, "requested_qty": 12.0}
+                "long": {"requested": True, "requested_qty": 12.0, "request_id": "req-long", "expires_at": "2099-01-01T00:00:00+00:00"}
             },
         }
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
@@ -1914,7 +1914,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["qty"], 12.0)
         self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
 
-    def test_best_quote_frozen_inventory_manual_limit_places_persistent_post_only_order(self) -> None:
+    def test_best_quote_frozen_inventory_manual_limit_places_one_shot_post_only_order(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
                 "long_qty": 50.0,
@@ -1922,7 +1922,7 @@ class LoopRunnerTests(unittest.TestCase):
                 "long_manual_limit_isolated_qty": 12.0,
             },
             "best_quote_frozen_inventory_manual_limit": {
-                "long": {"requested": True, "requested_qty": 12.0, "price": 1.02}
+                "long": {"requested": True, "requested_qty": 12.0, "price": 1.02, "request_id": "req-limit", "expires_at": "2099-01-01T00:00:00+00:00"}
             },
         }
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
@@ -1948,7 +1948,39 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(order["price"], 1.02)
         self.assertTrue(order["force_reduce_only"])
         self.assertEqual(order["time_in_force"], "GTX")
-        self.assertIn("best_quote_frozen_inventory_manual_limit", state)
+        self.assertEqual(order["frozen_inventory_request_id"], "req-limit")
+        self.assertNotIn("best_quote_frozen_inventory_manual_limit", state)
+
+    def test_best_quote_frozen_inventory_manual_limit_rejects_legacy_unauthorized_directive(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_qty": 50.0,
+                "long_entry_price": 1.0,
+                "long_manual_limit_isolated_qty": 12.0,
+            },
+            "best_quote_frozen_inventory_manual_limit": {
+                "long": {"requested": True, "requested_qty": 12.0, "price": 1.02}
+            },
+        }
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_frozen_inventory_manual_limit(
+            plan=plan,
+            state=state,
+            bid_price=1.01,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=0.1,
+            min_qty=0.1,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertFalse(report["active"])
+        self.assertIn("long_missing_authorization", report["blocked_reasons"])
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertNotIn("best_quote_frozen_inventory_manual_limit", state)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_manual_limit_isolated_qty"], 0.0)
 
     def test_best_quote_frozen_pair_release_excludes_manual_limit_isolated_qty(self) -> None:
         state: dict[str, object] = {
@@ -1984,6 +2016,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_side_notional=0.0,
             min_profit_ratio=0.0,
             max_slippage_ticks=2,
+            request_id="req-pair",
         )
 
         self.assertTrue(release["active"])
@@ -2023,6 +2056,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_side_notional=0.0,
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
+            request_id="req-pair",
         )
 
         self.assertTrue(release["active"])
@@ -2066,6 +2100,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
             requested_qty=7.0,
+            request_id="req-pair",
         )
 
         self.assertTrue(release["active"])
@@ -2096,6 +2131,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_side_notional=100.0,
             min_profit_ratio=0.0,
             max_slippage_ticks=2,
+            request_id="req-pair",
         )
 
         self.assertFalse(release["active"])
@@ -2126,6 +2162,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_side_notional=100.0,
             min_profit_ratio=0.0,
             max_slippage_ticks=2,
+            request_id="req-pair",
         )
 
         self.assertTrue(release["active"])
@@ -2153,6 +2190,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_side_notional=0.0,
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
+            request_id="req-pair",
         )
 
         self.assertFalse(release["active"])
@@ -2183,6 +2221,7 @@ class LoopRunnerTests(unittest.TestCase):
             min_side_notional=0.0,
             min_profit_ratio=0.001,
             max_slippage_ticks=2,
+            request_id="req-pair",
         )
 
         self.assertFalse(release["active"])

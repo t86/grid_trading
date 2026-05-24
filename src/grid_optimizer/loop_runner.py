@@ -3398,6 +3398,27 @@ def _apply_best_quote_reduce_freeze(
     return report
 
 
+def _frozen_inventory_directive_authorized(
+    directive: Mapping[str, Any] | dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    if not isinstance(directive, Mapping):
+        return False, "missing_authorization"
+    request_id = str(directive.get("request_id") or "").strip()
+    if not request_id:
+        return False, "missing_authorization"
+    if bool(directive.get("consumed")):
+        return False, "authorization_consumed"
+    expires_at = _parse_state_datetime(directive.get("expires_at"))
+    if expires_at is None:
+        return False, "authorization_missing_expiry"
+    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if expires_at <= checked_at:
+        return False, "authorization_expired"
+    return True, "authorized"
+
+
 def apply_best_quote_frozen_inventory_manual_reduce(
     *,
     plan: dict[str, Any],
@@ -3424,13 +3445,23 @@ def apply_best_quote_frozen_inventory_manual_reduce(
     }
     safe_min_notional = max(_safe_float(min_notional), 0.0)
 
+    def _authorized(side_directive: dict[str, Any], *, side_key: str) -> bool:
+        ok, reason = _frozen_inventory_directive_authorized(side_directive)
+        if not ok:
+            directive.pop(side_key, None)
+            reduce_report["blocked_reasons"].append(f"{side_key}_{reason}")
+        return ok
+
     def _build_order(*, side_key: str) -> dict[str, Any] | None:
         is_long = side_key == "long"
-        requested = bool((directive.get(side_key) or {}).get("requested"))
+        side_directive = dict(directive.get(side_key) or {})
+        requested = bool(side_directive.get("requested"))
         frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
         if not requested:
             return None
-        requested_qty = max(_safe_float((directive.get(side_key) or {}).get("requested_qty")), 0.0)
+        if not _authorized(side_directive, side_key=side_key):
+            return None
+        requested_qty = max(_safe_float(side_directive.get("requested_qty")), 0.0)
         if frozen_qty <= 1e-12:
             directive.pop(side_key, None)
             reduce_report["blocked_reasons"].append(f"{side_key}_frozen_qty_empty")
@@ -3460,6 +3491,7 @@ def apply_best_quote_frozen_inventory_manual_reduce(
             "execution_type": "aggressive",
             "time_in_force": "IOC",
             "manual_frozen_inventory_reduce": True,
+            "frozen_inventory_request_id": str(side_directive.get("request_id") or "").strip(),
         }
 
     long_order = _build_order(side_key="long")
@@ -3506,9 +3538,19 @@ def apply_best_quote_frozen_inventory_manual_limit(
     }
     safe_min_notional = max(_safe_float(min_notional), 0.0)
 
+    def _authorized(side_directive: dict[str, Any], *, side_key: str) -> bool:
+        ok, reason = _frozen_inventory_directive_authorized(side_directive)
+        if not ok:
+            directive.pop(side_key, None)
+            ledger[f"{side_key}_manual_limit_isolated_qty"] = 0.0
+            limit_report["blocked_reasons"].append(f"{side_key}_{reason}")
+        return ok
+
     def _build_order(*, side_key: str) -> dict[str, Any] | None:
         side_directive = dict(directive.get(side_key) or {})
         if not bool(side_directive.get("requested")):
+            return None
+        if not _authorized(side_directive, side_key=side_key):
             return None
         is_long = side_key == "long"
         frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
@@ -3547,6 +3589,7 @@ def apply_best_quote_frozen_inventory_manual_limit(
             "execution_type": "maker",
             "time_in_force": "GTX",
             "manual_frozen_inventory_limit": True,
+            "frozen_inventory_request_id": str(side_directive.get("request_id") or "").strip(),
         }
 
     long_order = _build_order(side_key="long")
@@ -3554,11 +3597,13 @@ def apply_best_quote_frozen_inventory_manual_limit(
         plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
         limit_report["placed_long"] = True
         limit_report["orders"].append(dict(long_order))
+        directive.pop("long", None)
     short_order = _build_order(side_key="short")
     if short_order is not None:
         plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
         limit_report["placed_short"] = True
         limit_report["orders"].append(dict(short_order))
+        directive.pop("short", None)
 
     if directive:
         state["best_quote_frozen_inventory_manual_limit"] = directive
@@ -3589,6 +3634,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     max_slippage_ticks: int,
     allow_loss: bool = False,
     requested_qty: float | None = None,
+    request_id: str | None = None,
 ) -> dict[str, Any]:
     ledger = dict(report.get("ledger") or {})
     release_report = {
@@ -3611,6 +3657,10 @@ def apply_best_quote_frozen_inventory_pair_release(
     }
     if not enabled:
         release_report["blocked_reasons"].append("disabled")
+        return release_report
+    safe_request_id = str(request_id or "").strip()
+    if not safe_request_id:
+        release_report["blocked_reasons"].append("missing_authorization")
         return release_report
     if not stable_allowed:
         release_report["blocked_reasons"].append("market_not_stable")
@@ -3713,6 +3763,7 @@ def apply_best_quote_frozen_inventory_pair_release(
         "execution_type": "aggressive",
         "time_in_force": "IOC",
         "frozen_inventory_pair_release": True,
+        "frozen_inventory_request_id": safe_request_id,
     }
     buy_order = {
         "side": "BUY",
@@ -3725,6 +3776,7 @@ def apply_best_quote_frozen_inventory_pair_release(
         "execution_type": "aggressive",
         "time_in_force": "IOC",
         "frozen_inventory_pair_release": True,
+        "frozen_inventory_request_id": safe_request_id,
     }
     plan["sell_orders"] = [sell_order, *list(plan.get("sell_orders") or [])]
     plan["buy_orders"] = [buy_order, *list(plan.get("buy_orders") or [])]
@@ -7956,9 +8008,16 @@ def _is_frozen_inventory_manual_order(order: Mapping[str, Any] | dict[str, Any])
         role.startswith("frozen_inventory_manual_reduce_")
         or role.startswith("frozen_inventory_manual_limit_")
         or role.startswith("frozen_inventory_pair_release_")
+        or bool((order or {}).get("manual_frozen_inventory_reduce"))
         or bool((order or {}).get("manual_frozen_inventory_limit"))
         or bool((order or {}).get("frozen_inventory_pair_release"))
     )
+
+
+def _is_authorized_frozen_inventory_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
+    if not _is_frozen_inventory_manual_order(order):
+        return True
+    return bool(str((order or {}).get("frozen_inventory_request_id") or "").strip())
 
 
 def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -16791,6 +16850,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_frozen_pair_release_requested = bool(
             best_quote_frozen_pair_release_directive.get("requested")
         )
+        best_quote_frozen_pair_release_authorized, best_quote_frozen_pair_release_auth_reason = (
+            _frozen_inventory_directive_authorized(best_quote_frozen_pair_release_directive)
+            if best_quote_frozen_pair_release_requested
+            else (False, "not_requested")
+        )
+        if best_quote_frozen_pair_release_requested and not best_quote_frozen_pair_release_authorized:
+            state.pop("best_quote_frozen_inventory_pair_release", None)
         best_quote_frozen_pair_release = apply_best_quote_frozen_inventory_pair_release(
             plan=plan,
             report=best_quote_reduce_freeze,
@@ -16802,7 +16868,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_notional=symbol_info.get("min_notional"),
             hedge_mode=hedge_best_quote,
             enabled=(
-                (best_quote_frozen_pair_release_enabled or best_quote_frozen_pair_release_requested)
+                best_quote_frozen_pair_release_requested
+                and best_quote_frozen_pair_release_authorized
                 and not bool(state.get("best_quote_frozen_inventory_manual_reduce"))
             ),
             stable_allowed=best_quote_frozen_pair_release_stable_allowed,
@@ -16816,9 +16883,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if best_quote_frozen_pair_release_requested
                 else None
             ),
+            request_id=str(best_quote_frozen_pair_release_directive.get("request_id") or ""),
         )
         best_quote_frozen_pair_release.update(
             {
+                "auto_enabled_ignored": bool(best_quote_frozen_pair_release_enabled),
+                "authorization_reason": best_quote_frozen_pair_release_auth_reason,
                 "one_shot_requested": best_quote_frozen_pair_release_requested,
                 "one_shot_requested_at": str(best_quote_frozen_pair_release_directive.get("requested_at") or ""),
                 "one_shot_requested_qty": max(
@@ -19125,6 +19195,20 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         role = str(order.get("role", "entry"))
         side = str(order.get("side", "")).upper().strip()
         position_side = _order_position_side(order)
+        if _is_frozen_inventory_manual_order(order) and not _is_authorized_frozen_inventory_order(order):
+            report["skipped_orders"].append(
+                {
+                    "request": {
+                        "role": role,
+                        "side": side,
+                        "position_side": position_side,
+                        "qty": _safe_float(order.get("qty")),
+                        "desired_price": _safe_float(order.get("price")),
+                    },
+                    "reason": {"reason": "unauthorized_frozen_inventory_order"},
+                }
+            )
+            continue
         post_only = str(order.get("execution_type", "post_only")).strip().lower() != "aggressive"
         time_in_force = (
             "GTX"
