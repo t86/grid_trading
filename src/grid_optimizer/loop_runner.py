@@ -18738,6 +18738,23 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             current_short_qty=current_short_qty,
         )
     )
+    allow_hedge_best_quote_flat_dust_position_mismatch = (
+        _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        and _hedge_best_quote_exchange_effectively_flat(
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            mid_price=_safe_float(plan_report.get("mid_price")),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        )
+        and _hedge_best_quote_exchange_effectively_flat(
+            current_long_qty=expected_exchange_long_qty,
+            current_short_qty=expected_exchange_short_qty,
+            mid_price=_safe_float(plan_report.get("mid_price")),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        )
+        and not current_strategy_open_orders
+        and expected_open_order_count == 0
+    )
     report["position_reconcile"] = {
         "expected_long_qty": expected_long_qty,
         "expected_short_qty": expected_short_qty,
@@ -18748,6 +18765,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "isolated_best_quote_reduce_freeze": isolated_best_quote_reduce_freeze,
         "reduce_only_position_surplus_allowed": allow_reduce_only_position_surplus,
         "isolated_frozen_position_mismatch_allowed": allow_isolated_frozen_position_mismatch,
+        "hedge_best_quote_flat_dust_position_mismatch_allowed": allow_hedge_best_quote_flat_dust_position_mismatch,
     }
     if (
         _is_hedge_best_quote_maker_volume_mode(strategy_mode)
@@ -18828,6 +18846,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         abs(current_long_qty - expected_exchange_long_qty) > 1e-9
         and not allow_reduce_only_position_surplus
         and not allow_isolated_frozen_position_mismatch
+        and not allow_hedge_best_quote_flat_dust_position_mismatch
     ):
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
     if (
@@ -18835,6 +18854,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         and abs(current_short_qty - expected_exchange_short_qty) > 1e-9
         and not allow_reduce_only_position_surplus
         and not allow_isolated_frozen_position_mismatch
+        and not allow_hedge_best_quote_flat_dust_position_mismatch
     ):
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
 
