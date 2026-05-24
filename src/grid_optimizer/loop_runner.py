@@ -2638,6 +2638,24 @@ def _hedge_best_quote_exchange_effectively_flat(
     )
 
 
+def _hedge_best_quote_position_diff_effectively_dust(
+    *,
+    current_long_qty: float,
+    current_short_qty: float,
+    expected_long_qty: float,
+    expected_short_qty: float,
+    mid_price: float,
+    min_notional: Any,
+) -> bool:
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    dust_notional = max(_safe_float(min_notional), 0.0)
+    if dust_notional <= 0:
+        dust_notional = 5.0
+    long_diff_notional = abs(_safe_float(current_long_qty) - _safe_float(expected_long_qty)) * safe_mid
+    short_diff_notional = abs(_safe_float(current_short_qty) - _safe_float(expected_short_qty)) * safe_mid
+    return long_diff_notional <= dust_notional + 1e-12 and short_diff_notional <= dust_notional + 1e-12
+
+
 def reconcile_best_quote_volume_ledger_surplus(
     *,
     state: dict[str, Any],
@@ -19020,15 +19038,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     )
     allow_hedge_best_quote_flat_dust_position_mismatch = (
         _is_hedge_best_quote_maker_volume_mode(strategy_mode)
-        and _hedge_best_quote_exchange_effectively_flat(
+        and _hedge_best_quote_position_diff_effectively_dust(
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
-            mid_price=_safe_float(plan_report.get("mid_price")),
-            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
-        )
-        and _hedge_best_quote_exchange_effectively_flat(
-            current_long_qty=expected_exchange_long_qty,
-            current_short_qty=expected_exchange_short_qty,
+            expected_long_qty=expected_exchange_long_qty,
+            expected_short_qty=expected_exchange_short_qty,
             mid_price=_safe_float(plan_report.get("mid_price")),
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         )

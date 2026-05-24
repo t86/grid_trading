@@ -123,6 +123,7 @@ from grid_optimizer.loop_runner import (
     update_synthetic_order_refs,
     _suppress_place_orders_during_runtime_guard_loss_cooldown,
     _isolated_frozen_actions_tolerate_position_drift,
+    _hedge_best_quote_position_diff_effectively_dust,
 )
 from grid_optimizer.submit_plan import (
     apply_loss_inventory_no_cross_entry_guard_to_actions,
@@ -138,6 +139,28 @@ from grid_optimizer.types import Candle
 
 
 class LoopRunnerTests(unittest.TestCase):
+    def test_hedge_best_quote_position_diff_treats_min_notional_residue_as_dust(self) -> None:
+        self.assertTrue(
+            _hedge_best_quote_position_diff_effectively_dust(
+                current_long_qty=99.0,
+                current_short_qty=24.0,
+                expected_long_qty=98.0,
+                expected_short_qty=24.0,
+                mid_price=0.611,
+                min_notional=5.0,
+            )
+        )
+        self.assertFalse(
+            _hedge_best_quote_position_diff_effectively_dust(
+                current_long_qty=120.0,
+                current_short_qty=24.0,
+                expected_long_qty=98.0,
+                expected_short_qty=24.0,
+                mid_price=0.611,
+                min_notional=5.0,
+            )
+        )
+
     def test_reset_state_preserves_best_quote_frozen_inventory(self) -> None:
         with TemporaryDirectory() as tmpdir:
             state_path = Path(tmpdir) / "state.json"
