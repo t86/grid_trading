@@ -851,6 +851,16 @@ def build_best_quote_maker_volume_plan(
     short_entry_position_side = "SHORT" if hedge_position_sides else "BOTH"
     reduce_long_position_side = "LONG" if hedge_position_sides else "BOTH"
     reduce_short_position_side = "SHORT" if hedge_position_sides else "BOTH"
+    loss_blocked_reduce_fallback_report = {
+        "long_reduce": False,
+        "short_reduce": False,
+        "long_entry": False,
+        "short_entry": False,
+        "reduce_long_price": None,
+        "reduce_short_price": None,
+        "long_avg_price": _safe_float(inputs.current_long_avg_price) or None,
+        "short_avg_price": _safe_float(inputs.current_short_avg_price) or None,
+    }
     inventory_bias_report = {
         "enabled": bool(config.inventory_bias_enabled),
         "applied": False,
@@ -1112,22 +1122,54 @@ def build_best_quote_maker_volume_plan(
     if inventory_bias_report["applied"]:
         pass
     elif long_notional > 0 and not allow_entry_long:
-        _append_order(
-            sell_orders,
-            _build_order(
-                side="SELL",
-                price=_price_with_gap(ask, reduce_long_gap, 1),
-                notional=min(
-                    sell_side_notional * reduce_long_budget_scale,
-                    long_notional,
-                    _net_loss_reduce_cap(long_notional),
-                ),
-                role="best_quote_reduce_long",
-                inputs=inputs,
-                position_side=reduce_long_position_side,
-                force_reduce_only=True,
+        reduce_long_order = _build_order(
+            side="SELL",
+            price=_price_with_gap(ask, reduce_long_gap, 1),
+            notional=min(
+                sell_side_notional * reduce_long_budget_scale,
+                long_notional,
+                _net_loss_reduce_cap(long_notional),
             ),
+            role="best_quote_reduce_long",
+            inputs=inputs,
+            position_side=reduce_long_position_side,
+            force_reduce_only=True,
         )
+        _append_order(sell_orders, reduce_long_order)
+        reduce_long_price = _safe_float(reduce_long_order.get("price")) if reduce_long_order else 0.0
+        long_avg_price = _safe_float(inputs.current_long_avg_price)
+        if (
+            hedge_position_sides
+            and allow_entry_short
+            and reduce_long_price > 0
+            and long_avg_price > 0
+            and reduce_long_price + 1e-12 < long_avg_price
+        ):
+            short_entry_notional = sell_side_notional * short_entry_budget_scale
+            if short_limit > 0:
+                short_entry_notional = min(
+                    short_entry_notional,
+                    max(short_limit - projected_short_entry_notional, 0.0),
+                )
+            short_entries = _build_entry_ladder(
+                side="SELL",
+                anchor_price=ask,
+                base_gap=gap,
+                total_notional=short_entry_notional,
+                slots=max_entry_orders_per_side,
+                role="best_quote_entry_short",
+                inputs=inputs,
+                position_side=short_entry_position_side,
+            )
+            if short_entries:
+                sell_orders.extend(short_entries)
+                loss_blocked_reduce_fallback_report.update(
+                    {
+                        "long_reduce": True,
+                        "short_entry": True,
+                        "reduce_long_price": reduce_long_price,
+                    }
+                )
     elif allow_entry_short:
         short_entry_notional = sell_side_notional * short_entry_budget_scale
         if short_limit > 0:
@@ -1279,6 +1321,7 @@ def build_best_quote_maker_volume_plan(
             "trend_inventory_guard": trend_inventory_guard_report,
             "trend_loss_reduce_guard": trend_loss_reduce_guard_report,
             "net_loss_reduce": net_loss_reduce_report,
+            "loss_blocked_reduce_fallback": loss_blocked_reduce_fallback_report,
             "same_side_entry_price_guard": same_side_entry_price_guard_report,
             "dynamic_tick": dynamic_tick_report,
             "inventory_bias": inventory_bias_report,

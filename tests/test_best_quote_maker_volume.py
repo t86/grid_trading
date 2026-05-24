@@ -273,6 +273,42 @@ class BestQuoteMakerVolumeTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["position_side"], "LONG")
         self.assertTrue(plan["sell_orders"][0]["force_reduce_only"])
 
+    def test_hedge_long_recover_adds_short_entry_when_reduce_long_would_lose(self) -> None:
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=True,
+                max_long_notional=1.0,
+                max_short_notional=1_200.0,
+                max_entry_orders_per_side=2,
+                inventory_soft_ratio=0.6,
+            ),
+            inputs=_inputs(
+                bid_price=0.6437,
+                ask_price=0.6438,
+                mid_price=0.64375,
+                current_long_qty=1_305.0,
+                current_short_qty=0.0,
+                current_long_avg_price=0.6673,
+                current_net_qty=0.0,
+                cycle_budget_notional=80.0,
+                tick_size=0.0001,
+                step_size=1.0,
+                min_qty=1.0,
+                min_notional=5.0,
+                position_side_mode="hedge",
+            ),
+        )
+
+        self.assertEqual(plan["regime"], "inventory_recover")
+        sell_roles = [order["role"] for order in plan["sell_orders"]]
+        self.assertIn("best_quote_reduce_long", sell_roles)
+        self.assertIn("best_quote_entry_short", sell_roles)
+        short_entries = [order for order in plan["sell_orders"] if order["role"] == "best_quote_entry_short"]
+        self.assertTrue(short_entries)
+        self.assertTrue(all(order["position_side"] == "SHORT" for order in short_entries))
+        self.assertTrue(all(not order.get("force_reduce_only") for order in short_entries))
+        self.assertTrue(plan["metrics"]["loss_blocked_reduce_fallback"]["short_entry"])
+
     def test_hedge_inventory_recover_biases_reduce_budget_to_heavy_side(self) -> None:
         plan = build_best_quote_maker_volume_plan(
             config=BestQuoteMakerVolumeConfig(
