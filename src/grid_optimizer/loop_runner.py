@@ -7402,12 +7402,16 @@ def _load_futures_runtime_guard_inputs(
     runtime_guard_stats_start_time: Any = None,
     symbol: str,
     now: datetime | None = None,
+    state_path: Path | None = None,
+    bq_book_scope: str | None = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     return summarize_futures_runtime_guard_inputs(
         summary_path,
         runtime_guard_stats_start_time=runtime_guard_stats_start_time,
         symbol=symbol,
         now=now,
+        bq_order_refs_path=state_path,
+        bq_book_scope=bq_book_scope,
     )
 
 
@@ -7660,6 +7664,12 @@ def _runtime_guard_bq_isolated_loss_recovery_report(
             runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
             symbol=str(getattr(args, "symbol", "") or "").upper().strip(),
             now=now,
+            state_path=Path(str(getattr(args, "state_path", "") or "")),
+            bq_book_scope=(
+                BQ_BOOK_NORMAL
+                if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+                else None
+            ),
         )
         filtered_events = _filter_pnl_events_after(pnl_events, recovered_at)
         isolated_events, scope = _runtime_guard_isolated_bq_pnl_events(
@@ -8228,6 +8238,12 @@ def _maybe_handle_runtime_guard(
         runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
         symbol=args.symbol.upper().strip(),
         now=cycle_started_at,
+        state_path=state_path,
+        bq_book_scope=(
+            BQ_BOOK_NORMAL
+            if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+            else None
+        ),
     )
     pnl_events_for_guard = _filter_pnl_events_after(pnl_events, recovered_at)
     pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
@@ -20966,6 +20982,12 @@ def main() -> None:
                     runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
                     symbol=args.symbol.upper().strip(),
                     now=cycle_started_at,
+                    state_path=state_path,
+                    bq_book_scope=(
+                        BQ_BOOK_NORMAL
+                        if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+                        else None
+                    ),
                 )
                 runtime_recovery = _runtime_guard_loss_recovery_state(state)
                 runtime_recovered_at = _parse_state_datetime(runtime_recovery.get("recovered_at"))
