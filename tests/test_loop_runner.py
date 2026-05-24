@@ -1332,6 +1332,61 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(ledger["short_lots"]), 1)
         self.assertEqual(ledger["short_lots"][0]["source"], "trade_fill")
 
+    def test_best_quote_volume_ledger_can_skip_exchange_bootstrap_for_freeze_isolation(self) -> None:
+        state: dict[str, object] = {}
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            snapshot = sync_best_quote_volume_ledger(
+                state=state,
+                symbol="PHAROSUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=3.0,
+                current_short_qty=960.0,
+                current_long_avg_price=0.66,
+                current_short_avg_price=0.74,
+                mid_price=0.65,
+                observed_trade_rows=[],
+                allow_exchange_position_bootstrap=False,
+            )
+
+        self.assertTrue(snapshot["initialized"])
+        self.assertEqual(snapshot["long_qty"], 0.0)
+        self.assertEqual(snapshot["short_qty"], 0.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["bootstrap_source"], "empty_due_to_reduce_freeze_isolation")
+        self.assertFalse(ledger["exchange_position_bootstrap_allowed"])
+        self.assertEqual(ledger["exchange_position_bootstrap_blocked_long_qty"], 3.0)
+        self.assertEqual(ledger["exchange_position_bootstrap_blocked_short_qty"], 960.0)
+        self.assertEqual(ledger["long_lots"], [])
+        self.assertEqual(ledger["short_lots"], [])
+
+    def test_best_quote_volume_ledger_bootstrap_keeps_legacy_behavior_when_allowed(self) -> None:
+        state: dict[str, object] = {}
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            snapshot = sync_best_quote_volume_ledger(
+                state=state,
+                symbol="PHAROSUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=0.0,
+                current_short_qty=12.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=0.74,
+                mid_price=0.65,
+                observed_trade_rows=[],
+            )
+
+        self.assertEqual(snapshot["long_qty"], 0.0)
+        self.assertEqual(snapshot["short_qty"], 12.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["bootstrap_source"], "exchange_managed_position")
+        self.assertTrue(ledger["exchange_position_bootstrap_allowed"])
+        self.assertEqual(ledger["short_lots"][0]["source"], "bootstrap_from_exchange_managed_position")
+
     def test_best_quote_volume_ledger_counts_hardloss_reduce_as_managed_reduce(self) -> None:
         state: dict[str, object] = {
             "best_quote_volume_ledger": {

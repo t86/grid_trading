@@ -2569,13 +2569,18 @@ def sync_best_quote_volume_ledger(
     current_short_avg_price: float,
     mid_price: float,
     observed_trade_rows: list[dict[str, Any]] | None = None,
+    allow_exchange_position_bootstrap: bool = True,
 ) -> dict[str, Any]:
     ledger = dict(state.get("best_quote_volume_ledger") or {})
     now = _utc_now()
     if not bool(ledger.get("initialized")):
         long_lots = []
         short_lots = []
-        if _safe_float(current_long_qty) > 1e-12 and _safe_float(current_long_avg_price) > 0:
+        if (
+            allow_exchange_position_bootstrap
+            and _safe_float(current_long_qty) > 1e-12
+            and _safe_float(current_long_avg_price) > 0
+        ):
             long_lots.append(
                 {
                     "qty": max(_safe_float(current_long_qty), 0.0),
@@ -2584,7 +2589,11 @@ def sync_best_quote_volume_ledger(
                     "opened_at": now.isoformat(),
                 }
             )
-        if _safe_float(current_short_qty) > 1e-12 and _safe_float(current_short_avg_price) > 0:
+        if (
+            allow_exchange_position_bootstrap
+            and _safe_float(current_short_qty) > 1e-12
+            and _safe_float(current_short_avg_price) > 0
+        ):
             short_lots.append(
                 {
                     "qty": max(_safe_float(current_short_qty), 0.0),
@@ -2607,7 +2616,18 @@ def sync_best_quote_volume_ledger(
                 "last_trade_keys_at_time": [],
                 "sync_ok": True,
                 "bootstrap_at": now.isoformat(),
-                "bootstrap_source": "exchange_managed_position",
+                "bootstrap_source": (
+                    "exchange_managed_position"
+                    if allow_exchange_position_bootstrap
+                    else "empty_due_to_reduce_freeze_isolation"
+                ),
+                "exchange_position_bootstrap_allowed": bool(allow_exchange_position_bootstrap),
+                "exchange_position_bootstrap_blocked_long_qty": (
+                    0.0 if allow_exchange_position_bootstrap else max(_safe_float(current_long_qty), 0.0)
+                ),
+                "exchange_position_bootstrap_blocked_short_qty": (
+                    0.0 if allow_exchange_position_bootstrap else max(_safe_float(current_short_qty), 0.0)
+                ),
             }
         )
         state["best_quote_volume_ledger"] = ledger
@@ -13993,6 +14013,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
 
     if _is_best_quote_maker_volume_mode(requested_strategy_mode):
         frozen_bootstrap_long_qty, frozen_bootstrap_short_qty = _best_quote_frozen_inventory_qtys(state)
+        best_quote_reduce_freeze_bootstrap_isolated = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_enabled", False)
+        )
         best_quote_volume_ledger = sync_best_quote_volume_ledger(
             state=state,
             symbol=symbol,
@@ -14005,6 +14028,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_avg_price=current_short_avg_price,
             mid_price=mid_price,
             observed_trade_rows=observed_trade_rows,
+            allow_exchange_position_bootstrap=not best_quote_reduce_freeze_bootstrap_isolated,
         )
         best_quote_volume_ledger = reconcile_best_quote_volume_ledger_surplus(
             state=state,
