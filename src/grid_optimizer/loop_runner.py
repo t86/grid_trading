@@ -4654,20 +4654,42 @@ def _isolated_frozen_actions_tolerate_position_drift(
     expected_short_qty: float,
     current_long_qty: float,
     current_short_qty: float,
+    frozen_long_qty: float = 0.0,
+    frozen_short_qty: float = 0.0,
 ) -> bool:
     long_deficit = current_long_qty + 1e-9 < expected_long_qty
     short_deficit = current_short_qty + 1e-9 < expected_short_qty
     if not long_deficit and not short_deficit:
         return True
+    reduce_long_qty = 0.0
+    reduce_short_qty = 0.0
     for order in [item for item in actions.get("place_orders", []) if isinstance(item, dict)]:
         side = str(order.get("side", "")).upper().strip()
         position_side = _order_position_side(order)
-        if long_deficit and position_side == "LONG" and side != "BUY":
-            return False
-        if short_deficit and position_side == "SHORT" and side != "SELL":
-            return False
         if (long_deficit or short_deficit) and position_side == "BOTH":
             return False
+        if position_side == "LONG" and side == "SELL" and bool(order.get("force_reduce_only")):
+            reduce_long_qty += max(_safe_float(order.get("qty", order.get("quantity"))), 0.0)
+        if position_side == "SHORT" and side == "BUY" and bool(order.get("force_reduce_only")):
+            reduce_short_qty += max(_safe_float(order.get("qty", order.get("quantity"))), 0.0)
+        if long_deficit and position_side == "LONG":
+            if side == "BUY":
+                continue
+            if side == "SELL" and bool(order.get("force_reduce_only")):
+                continue
+            return False
+        if short_deficit and position_side == "SHORT":
+            if side == "SELL":
+                continue
+            if side == "BUY" and bool(order.get("force_reduce_only")):
+                continue
+            return False
+    normal_long_available = max(_safe_float(current_long_qty) - max(_safe_float(frozen_long_qty), 0.0), 0.0)
+    normal_short_available = max(_safe_float(current_short_qty) - max(_safe_float(frozen_short_qty), 0.0), 0.0)
+    if reduce_long_qty > normal_long_available + 1e-9:
+        return False
+    if reduce_short_qty > normal_short_available + 1e-9:
+        return False
     return True
 
 
@@ -18709,6 +18731,8 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             expected_short_qty=expected_short_qty,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
+            frozen_long_qty=max(expected_exchange_long_qty - expected_long_qty, 0.0),
+            frozen_short_qty=max(expected_exchange_short_qty - expected_short_qty, 0.0),
         )
     )
     report["position_reconcile"] = {

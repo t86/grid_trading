@@ -122,6 +122,7 @@ from grid_optimizer.loop_runner import (
     sync_synthetic_ledger,
     update_synthetic_order_refs,
     _suppress_place_orders_during_runtime_guard_loss_cooldown,
+    _isolated_frozen_actions_tolerate_position_drift,
 )
 from grid_optimizer.submit_plan import (
     apply_loss_inventory_no_cross_entry_guard_to_actions,
@@ -292,6 +293,59 @@ class LoopRunnerTests(unittest.TestCase):
         ref = state["best_quote_volume_order_refs"]["41974647"]
         self.assertEqual(ref["book"], "frozen_bq")
         self.assertEqual(ref["role"], "frozen_inventory_manual_reduce_long")
+
+    def test_isolated_frozen_position_drift_allows_reduce_only_with_normal_available_qty(self) -> None:
+        allowed = _isolated_frozen_actions_tolerate_position_drift(
+            {
+                "place_orders": [
+                    {
+                        "role": "best_quote_reduce_long",
+                        "side": "SELL",
+                        "position_side": "LONG",
+                        "qty": 153.0,
+                        "force_reduce_only": True,
+                    },
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "qty": 154.0,
+                        "force_reduce_only": True,
+                    },
+                ]
+            },
+            expected_long_qty=943.0,
+            expected_short_qty=755.0,
+            current_long_qty=592.0,
+            current_short_qty=4823.0,
+            frozen_long_qty=0.0,
+            frozen_short_qty=3729.0,
+        )
+
+        self.assertTrue(allowed)
+
+    def test_isolated_frozen_position_drift_blocks_reduce_only_that_would_touch_frozen_qty(self) -> None:
+        allowed = _isolated_frozen_actions_tolerate_position_drift(
+            {
+                "place_orders": [
+                    {
+                        "role": "best_quote_reduce_short",
+                        "side": "BUY",
+                        "position_side": "SHORT",
+                        "qty": 1200.0,
+                        "force_reduce_only": True,
+                    },
+                ]
+            },
+            expected_long_qty=943.0,
+            expected_short_qty=755.0,
+            current_long_qty=592.0,
+            current_short_qty=4823.0,
+            frozen_long_qty=0.0,
+            frozen_short_qty=3729.0,
+        )
+
+        self.assertFalse(allowed)
 
     def test_resolve_volatility_entry_pause_holds_for_min_observation_window(self) -> None:
         trigger_now = datetime(2026, 5, 16, 4, 7, tzinfo=timezone.utc)
