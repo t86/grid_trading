@@ -2406,6 +2406,52 @@ def _apply_best_quote_entry_inventory_cap_guard(
     return guard
 
 
+def _apply_best_quote_entry_level_guard(
+    plan: dict[str, Any],
+    *,
+    buy_levels: int,
+    sell_levels: int,
+) -> dict[str, Any]:
+    guard = {
+        "enabled": True,
+        "buy_levels": max(int(_safe_float(buy_levels)), 0),
+        "sell_levels": max(int(_safe_float(sell_levels)), 0),
+        "blocked_buy_orders": 0,
+        "blocked_sell_orders": 0,
+        "blocked_buy_order_details": [],
+        "blocked_sell_order_details": [],
+    }
+    if not isinstance(plan, dict):
+        return guard
+    if guard["buy_levels"] <= 0:
+        kept_buy_orders: list[dict[str, Any]] = []
+        blocked_buy_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("buy_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_long":
+                blocked = dict(item)
+                blocked["block_reason"] = "buy_levels_disabled"
+                blocked_buy_orders.append(blocked)
+            else:
+                kept_buy_orders.append(item)
+        plan["buy_orders"] = kept_buy_orders
+        guard["blocked_buy_orders"] = len(blocked_buy_orders)
+        guard["blocked_buy_order_details"] = blocked_buy_orders
+    if guard["sell_levels"] <= 0:
+        kept_sell_orders: list[dict[str, Any]] = []
+        blocked_sell_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("sell_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_short":
+                blocked = dict(item)
+                blocked["block_reason"] = "sell_levels_disabled"
+                blocked_sell_orders.append(blocked)
+            else:
+                kept_sell_orders.append(item)
+        plan["sell_orders"] = kept_sell_orders
+        guard["blocked_sell_orders"] = len(blocked_sell_orders)
+        guard["blocked_sell_order_details"] = blocked_sell_orders
+    return guard
+
+
 def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
     explicit_role = str((row or {}).get("role") or "").lower().strip()
     if explicit_role in {
@@ -17415,6 +17461,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             max_long_notional=getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0),
             max_short_notional=getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0),
         )
+        best_quote_entry_level_guard = _apply_best_quote_entry_level_guard(
+            plan,
+            buy_levels=getattr(effective_args, "buy_levels", 0),
+            sell_levels=getattr(effective_args, "sell_levels", 0),
+        )
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),
@@ -17424,6 +17475,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "profitable_exit_offset_cap": dict(best_quote_profitable_exit_offset_cap),
             "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
             "inventory_cap_guard": dict(best_quote_inventory_cap_guard),
+            "entry_level_guard": dict(best_quote_entry_level_guard),
             "reduce_freeze": dict(best_quote_reduce_freeze),
             "frozen_manual_reduce": dict(best_quote_frozen_manual_reduce),
             "frozen_manual_limit": dict(best_quote_frozen_manual_limit),

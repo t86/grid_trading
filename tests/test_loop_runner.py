@@ -125,6 +125,7 @@ from grid_optimizer.loop_runner import (
     _isolated_frozen_actions_tolerate_position_drift,
     _hedge_best_quote_position_diff_effectively_dust,
     _apply_best_quote_entry_inventory_cap_guard,
+    _apply_best_quote_entry_level_guard,
 )
 from grid_optimizer.submit_plan import (
     apply_loss_inventory_no_cross_entry_guard_to_actions,
@@ -179,6 +180,26 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertFalse(guard["short_over_cap"])
         self.assertEqual(guard["blocked_buy_orders"], 1)
         self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_reduce_short"])
+        self.assertEqual([order["role"] for order in plan["sell_orders"]], ["best_quote_reduce_long"])
+
+    def test_best_quote_entry_level_guard_honors_disabled_levels(self) -> None:
+        plan = {
+            "buy_orders": [
+                {"role": "best_quote_entry_long", "side": "BUY", "qty": 10, "notional": 6.0},
+                {"role": "best_quote_reduce_short", "side": "BUY", "qty": 8, "notional": 5.0},
+            ],
+            "sell_orders": [
+                {"role": "best_quote_entry_short", "side": "SELL", "qty": 12, "notional": 7.0},
+                {"role": "best_quote_reduce_long", "side": "SELL", "qty": 9, "notional": 5.5},
+            ],
+        }
+
+        guard = _apply_best_quote_entry_level_guard(plan, buy_levels=1, sell_levels=0)
+
+        self.assertEqual(guard["blocked_buy_orders"], 0)
+        self.assertEqual(guard["blocked_sell_orders"], 1)
+        self.assertEqual(guard["blocked_sell_order_details"][0]["block_reason"], "sell_levels_disabled")
+        self.assertEqual([order["role"] for order in plan["buy_orders"]], ["best_quote_entry_long", "best_quote_reduce_short"])
         self.assertEqual([order["role"] for order in plan["sell_orders"]], ["best_quote_reduce_long"])
 
     def test_hedge_best_quote_position_diff_treats_min_notional_residue_as_dust(self) -> None:
