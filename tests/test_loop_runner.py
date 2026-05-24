@@ -1188,6 +1188,57 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(ledger["short_qty"], 300.0)
         self.assertEqual(ledger["short_lots"][0]["reason"], "reduce_hard_loss_threshold")
 
+    def test_best_quote_reduce_freeze_confirmation_survives_managed_qty_change(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_reduce_freeze_confirmation": {
+                "short": {
+                    "side": "SHORT",
+                    "count": 4,
+                    "required_count": 5,
+                    "qty": 100.0,
+                    "notional": 66.0,
+                    "loss_ratio": 0.02,
+                    "freeze_threshold_loss_ratio": 0.01,
+                    "hard_freeze_enabled": False,
+                    "stress_active": False,
+                    "first_seen_at": "2026-05-24T08:00:00+00:00",
+                }
+            },
+            "best_quote_volume_ledger": {
+                "short_lots": [{"qty": 120.0, "price": 0.6500}],
+                "short_qty": 120.0,
+                "short_avg_price": 0.6500,
+                "initialized": True,
+            },
+        }
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=120.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6500,
+            mid_price=0.6600,
+        )
+
+        result = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=5,
+            current_long_qty=0.0,
+            current_short_qty=120.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6500,
+            mid_price=0.6600,
+        )
+
+        self.assertTrue(result["applied"])
+        self.assertEqual(result["frozen_short_qty"], 120.0)
+        self.assertNotIn("best_quote_reduce_freeze_confirmation", state)
+
     def test_best_quote_reduce_freeze_can_add_opposite_side_lot(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {

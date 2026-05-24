@@ -3267,15 +3267,13 @@ def _apply_best_quote_reduce_freeze(
             return True
         now_iso = _utc_now().isoformat()
         previous = confirmations.get(side_key) if isinstance(confirmations.get(side_key), dict) else {}
-        previous_qty = _safe_float(previous.get("qty")) if isinstance(previous, dict) else 0.0
         previous_threshold = (
             _safe_float(previous.get("freeze_threshold_loss_ratio", previous.get("effective_threshold_loss_ratio")))
             if isinstance(previous, dict)
             else 0.0
         )
         same_candidate = (
-            abs(previous_qty - qty) <= 1e-9
-            and abs(previous_threshold - freeze_threshold) <= 1e-12
+            abs(previous_threshold - freeze_threshold) <= 1e-12
             and bool(previous.get("stress_active")) == bool(stress_active)
             and bool(previous.get("hard_freeze_enabled")) == bool(hard_freeze_enabled)
         )
