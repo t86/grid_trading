@@ -170,10 +170,23 @@ class LoopRunnerTests(unittest.TestCase):
                 "requested_at": "2026-05-22T06:05:00+00:00",
                 "source": "running_status_ui",
             }
+            volume_ledger = {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [],
+                "applied_trade_fill_keys": ["41974646:SELL:SHORT:2000:100:0.1"],
+            }
+            order_refs = {
+                "41974646": {"book": "normal_bq", "role": "best_quote_entry_short"},
+                "41974647": {"book": "frozen_bq", "role": "frozen_inventory_manual_reduce_long"},
+            }
             state_path.write_text(
                 json.dumps(
                     {
                         "version": "old",
+                        "best_quote_volume_ledger": volume_ledger,
+                        "best_quote_volume_order_refs": order_refs,
                         "best_quote_frozen_inventory": frozen_ledger,
                         "best_quote_frozen_inventory_manual_reduce": manual_reduce,
                         "best_quote_frozen_inventory_manual_limit": manual_limit,
@@ -210,6 +223,8 @@ class LoopRunnerTests(unittest.TestCase):
                 reset_state=True,
             )
 
+        self.assertEqual(state["best_quote_volume_ledger"], volume_ledger)
+        self.assertEqual(state["best_quote_volume_order_refs"], order_refs)
         self.assertEqual(state["best_quote_frozen_inventory"], frozen_ledger)
         self.assertEqual(state["best_quote_frozen_inventory_manual_reduce"], manual_reduce)
         self.assertEqual(state["best_quote_frozen_inventory_manual_limit"], manual_limit)
