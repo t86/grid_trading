@@ -18725,9 +18725,12 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         live_bid_price=live_bid_price,
         live_ask_price=live_ask_price,
     )
+    inventory_priority_net_qty = current_actual_net_qty
+    if isolated_best_quote_reduce_freeze:
+        inventory_priority_net_qty = expected_actual_net_qty
     validation["actions"] = prioritize_inventory_reducing_place_orders(
         actions=validation["actions"],
-        current_actual_net_qty=current_actual_net_qty,
+        current_actual_net_qty=inventory_priority_net_qty,
         current_long_avg_price=_safe_float(plan_report.get("current_long_avg_price")),
         current_short_avg_price=_safe_float(plan_report.get("current_short_avg_price")),
         step_price=_safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))

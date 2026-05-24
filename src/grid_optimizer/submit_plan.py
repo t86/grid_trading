@@ -1147,6 +1147,24 @@ def _entry_side_from_order(order: dict[str, Any], *, strategy_mode: str) -> str 
     return None
 
 
+def _is_best_quote_volume_entry_order(order: dict[str, Any]) -> bool:
+    role = str(order.get("role", "") or "").strip().lower()
+    return role in {"best_quote_entry_long", "best_quote_entry_short"}
+
+
+def _best_quote_volume_entries_are_isolated(plan_report: dict[str, Any], *, strategy_mode: str) -> bool:
+    normalized_mode = str(strategy_mode or "").strip()
+    if normalized_mode != "hedge_best_quote_maker_volume_v1":
+        return False
+    best_quote_metrics = plan_report.get("best_quote_maker_volume")
+    if isinstance(best_quote_metrics, dict):
+        reduce_freeze = best_quote_metrics.get("reduce_freeze")
+        if isinstance(reduce_freeze, dict) and reduce_freeze.get("isolates_risk_metrics"):
+            return True
+    loss_scope = plan_report.get("runtime_guard_loss_scope")
+    return isinstance(loss_scope, dict) and bool(loss_scope.get("enabled"))
+
+
 def apply_hard_loss_rescue_entry_guard_to_actions(
     *,
     actions: dict[str, Any],
@@ -1164,7 +1182,17 @@ def apply_hard_loss_rescue_entry_guard_to_actions(
 
     kept_place_orders: list[dict[str, Any]] = []
     dropped_orders: list[dict[str, Any]] = []
+    isolated_best_quote_entries = _best_quote_volume_entries_are_isolated(
+        plan_report, strategy_mode=strategy_mode
+    )
+    isolated_orders: list[dict[str, Any]] = []
     for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        if isolated_best_quote_entries and _is_best_quote_volume_entry_order(order):
+            isolated = dict(order)
+            isolated["hard_loss_rescue_isolated_reason"] = "best_quote_volume_entry_uses_managed_ledger"
+            isolated_orders.append(isolated)
+            kept_place_orders.append(order)
+            continue
         entry_side = _entry_side_from_order(order, strategy_mode=strategy_mode)
         should_drop = (entry_side == "long" and block_long_entries) or (
             entry_side == "short" and block_short_entries
@@ -1188,6 +1216,8 @@ def apply_hard_loss_rescue_entry_guard_to_actions(
         "reason": guard.get("reason"),
         "dropped_order_count": len(dropped_orders),
         "dropped_orders": dropped_orders,
+        "isolated_best_quote_entry_count": len(isolated_orders),
+        "isolated_best_quote_entries": isolated_orders,
     }
     return result
 
@@ -1209,7 +1239,17 @@ def apply_loss_reduce_reentry_guard_to_actions(
 
     kept_place_orders: list[dict[str, Any]] = []
     dropped_orders: list[dict[str, Any]] = []
+    isolated_best_quote_entries = _best_quote_volume_entries_are_isolated(
+        plan_report, strategy_mode=strategy_mode
+    )
+    isolated_orders: list[dict[str, Any]] = []
     for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        if isolated_best_quote_entries and _is_best_quote_volume_entry_order(order):
+            isolated = dict(order)
+            isolated["loss_reduce_reentry_isolated_reason"] = "best_quote_volume_entry_uses_managed_ledger"
+            isolated_orders.append(isolated)
+            kept_place_orders.append(order)
+            continue
         entry_side = _entry_side_from_order(order, strategy_mode=strategy_mode)
         should_drop = (entry_side == "long" and block_long_entries) or (
             entry_side == "short" and block_short_entries
@@ -1233,6 +1273,8 @@ def apply_loss_reduce_reentry_guard_to_actions(
         "reason": guard.get("reason"),
         "dropped_order_count": len(dropped_orders),
         "dropped_orders": dropped_orders,
+        "isolated_best_quote_entry_count": len(isolated_orders),
+        "isolated_best_quote_entries": isolated_orders,
     }
     return result
 

@@ -8,6 +8,7 @@ from grid_optimizer.submit_plan import (
     apply_anti_chase_entry_guard_to_actions,
     apply_hard_loss_rescue_entry_guard_to_actions,
     apply_loss_inventory_no_cross_entry_guard_to_actions,
+    apply_loss_reduce_reentry_guard_to_actions,
     apply_reduce_only_no_loss_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
@@ -1322,6 +1323,74 @@ class SubmitPlanTests(unittest.TestCase):
         guard = guarded["hard_loss_rescue_entry_guard"]
         self.assertEqual(guard["dropped_order_count"], 1)
         self.assertEqual(guard["dropped_orders"][0]["role"], "entry_short")
+
+    def test_hard_loss_rescue_guard_keeps_isolated_best_quote_volume_entries(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.6545, "qty": 24.0, "notional": 15.708, "role": "best_quote_entry_short"},
+                {"side": "BUY", "price": 0.6540, "qty": 12.0, "notional": 7.848, "role": "best_quote_entry_long"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        plan_report = {
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume": {
+                "reduce_freeze": {
+                    "isolates_risk_metrics": True,
+                    "frozen_short_qty": 329.0,
+                    "managed_short_qty": 337.0,
+                }
+            },
+            "hard_loss_rescue_entry_guard": {
+                "active": True,
+                "block_short_entries": True,
+                "block_long_entries": False,
+                "reason": "frozen_short_loss",
+            },
+        }
+
+        guarded = apply_hard_loss_rescue_entry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual([item["role"] for item in guarded["place_orders"]], ["best_quote_entry_short", "best_quote_entry_long"])
+        self.assertEqual(guarded["hard_loss_rescue_entry_guard"]["dropped_order_count"], 0)
+        self.assertEqual(guarded["hard_loss_rescue_entry_guard"]["isolated_best_quote_entry_count"], 2)
+
+    def test_loss_reduce_reentry_guard_keeps_isolated_best_quote_volume_entries(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.6545, "qty": 24.0, "notional": 15.708, "role": "best_quote_entry_short"},
+                {"side": "SELL", "price": 0.6550, "qty": 24.0, "notional": 15.72, "role": "entry_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        plan_report = {
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume": {"reduce_freeze": {"isolates_risk_metrics": True}},
+            "loss_reduce_reentry_guard": {
+                "active": True,
+                "block_short_entries": True,
+                "block_long_entries": False,
+                "reason": "price_not_recovered",
+            },
+        }
+
+        guarded = apply_loss_reduce_reentry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual([item["role"] for item in guarded["place_orders"]], ["best_quote_entry_short"])
+        self.assertEqual(guarded["loss_reduce_reentry_guard"]["dropped_order_count"], 1)
+        self.assertEqual(guarded["loss_reduce_reentry_guard"]["isolated_best_quote_entry_count"], 1)
 
     def test_deferred_action_limits_allow_capped_reduce_only_orders(self) -> None:
         now = datetime(2026, 5, 5, 0, 20, tzinfo=timezone.utc)
