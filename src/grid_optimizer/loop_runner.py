@@ -2348,6 +2348,64 @@ def _best_quote_order_book_from_role(role: Any) -> str:
     return BQ_BOOK_UNKNOWN
 
 
+def _apply_best_quote_entry_inventory_cap_guard(
+    plan: dict[str, Any],
+    *,
+    current_long_notional: float,
+    current_short_notional: float,
+    max_long_notional: float,
+    max_short_notional: float,
+) -> dict[str, Any]:
+    guard = {
+        "enabled": True,
+        "long_over_cap": False,
+        "short_over_cap": False,
+        "current_long_notional": max(_safe_float(current_long_notional), 0.0),
+        "current_short_notional": max(_safe_float(current_short_notional), 0.0),
+        "max_long_notional": max(_safe_float(max_long_notional), 0.0),
+        "max_short_notional": max(_safe_float(max_short_notional), 0.0),
+        "blocked_buy_orders": 0,
+        "blocked_sell_orders": 0,
+        "blocked_buy_order_details": [],
+        "blocked_sell_order_details": [],
+    }
+    long_cap = _safe_float(guard["max_long_notional"])
+    short_cap = _safe_float(guard["max_short_notional"])
+    long_over_cap = long_cap > 0 and _safe_float(guard["current_long_notional"]) >= long_cap - 1e-12
+    short_over_cap = short_cap > 0 and _safe_float(guard["current_short_notional"]) >= short_cap - 1e-12
+    guard["long_over_cap"] = bool(long_over_cap)
+    guard["short_over_cap"] = bool(short_over_cap)
+    if not isinstance(plan, dict):
+        return guard
+    if long_over_cap:
+        kept_buy_orders: list[dict[str, Any]] = []
+        blocked_buy_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("buy_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_long":
+                blocked = dict(item)
+                blocked["block_reason"] = "long_inventory_at_or_above_cap"
+                blocked_buy_orders.append(blocked)
+            else:
+                kept_buy_orders.append(item)
+        plan["buy_orders"] = kept_buy_orders
+        guard["blocked_buy_orders"] = len(blocked_buy_orders)
+        guard["blocked_buy_order_details"] = blocked_buy_orders
+    if short_over_cap:
+        kept_sell_orders: list[dict[str, Any]] = []
+        blocked_sell_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("sell_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_short":
+                blocked = dict(item)
+                blocked["block_reason"] = "short_inventory_at_or_above_cap"
+                blocked_sell_orders.append(blocked)
+            else:
+                kept_sell_orders.append(item)
+        plan["sell_orders"] = kept_sell_orders
+        guard["blocked_sell_orders"] = len(blocked_sell_orders)
+        guard["blocked_sell_order_details"] = blocked_sell_orders
+    return guard
+
+
 def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
     explicit_role = str((row or {}).get("role") or "").lower().strip()
     if explicit_role in {
@@ -17350,6 +17408,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             best_quote_inventory_cost_gate["blocked_sell_order_details"] = blocked_sell_orders
             best_quote_inventory_cost_gate["would_block_sell_orders"] = len(blocked_sell_orders)
         best_quote_inventory_cost_gate["reduce_fallback"] = best_quote_cost_gate_reduce_fallback
+        best_quote_inventory_cap_guard = _apply_best_quote_entry_inventory_cap_guard(
+            plan,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            max_long_notional=getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0),
+            max_short_notional=getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0),
+        )
         best_quote_maker_volume = {
             "enabled": bool(plan.get("enabled")),
             "regime": str(plan.get("regime") or ""),
@@ -17358,6 +17423,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "dynamic_offsets": dict(best_quote_dynamic_offsets),
             "profitable_exit_offset_cap": dict(best_quote_profitable_exit_offset_cap),
             "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
+            "inventory_cap_guard": dict(best_quote_inventory_cap_guard),
             "reduce_freeze": dict(best_quote_reduce_freeze),
             "frozen_manual_reduce": dict(best_quote_frozen_manual_reduce),
             "frozen_manual_limit": dict(best_quote_frozen_manual_limit),
