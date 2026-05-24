@@ -1037,6 +1037,7 @@ def apply_reduce_only_no_loss_guard_to_actions(
     min_qty: float | None,
     min_notional: float | None,
     step_size: float | None = None,
+    enabled: bool = True,
 ) -> dict[str, Any]:
     """Drop reduce-only places that would submit beyond the no-loss floor/ceiling."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
@@ -1045,6 +1046,17 @@ def apply_reduce_only_no_loss_guard_to_actions(
         result["place_orders"] = place_orders
         result["place_count"] = 0
         result["place_notional"] = 0.0
+        return result
+    if not enabled:
+        result = dict(actions)
+        result["place_orders"] = place_orders
+        result["place_count"] = len(place_orders)
+        result["place_notional"] = sum(_safe_float(item.get("notional")) for item in place_orders)
+        result["reduce_only_no_loss_guard"] = {
+            "enabled": False,
+            "dropped_order_count": 0,
+            "dropped_orders": [],
+        }
         return result
 
     guard = plan_report.get("take_profit_guard") if isinstance(plan_report.get("take_profit_guard"), dict) else {}

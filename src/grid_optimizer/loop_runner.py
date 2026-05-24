@@ -18402,6 +18402,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        enabled=not bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)),
     )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [
@@ -18793,6 +18794,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        enabled=not bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)),
     )
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [
@@ -19172,6 +19174,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-enabled", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-min-notional", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-allow-loss-reduce-only", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-loss", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)

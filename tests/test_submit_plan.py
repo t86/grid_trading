@@ -267,6 +267,45 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(dropped["reduce_only_no_loss_drop_reason"], "short_reduce_above_no_loss_ceiling")
         self.assertAlmostEqual(dropped["reduce_only_no_loss_guard_price"], 2051.20772)
 
+    def test_reduce_only_no_loss_guard_can_be_disabled_for_volume_mode(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.6502,
+                    "qty": 63.0,
+                    "notional": 40.9626,
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {"enabled": True, "long_floor_price": 0.6506},
+                "current_long_avg_price": 0.6506,
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=0.6501,
+            live_ask_price=0.6502,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+            enabled=False,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertFalse(guarded["reduce_only_no_loss_guard"]["enabled"])
+        self.assertEqual(guarded["place_orders"][0]["role"], "best_quote_reduce_long")
+
     def test_suppress_same_side_nearby_place_orders_preserves_existing_queue(self) -> None:
         actions = {
             "place_orders": [

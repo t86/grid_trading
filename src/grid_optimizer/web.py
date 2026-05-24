@@ -4028,6 +4028,7 @@ RUNNER_DEFAULT_CONFIG: dict[str, Any] = {
     "best_quote_maker_volume_net_loss_reduce_ratio": 0.0,
     "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
     "best_quote_maker_volume_net_loss_reduce_min_inventory_notional": 0.0,
+    "best_quote_maker_volume_allow_loss_reduce_only": False,
     "best_quote_maker_volume_reduce_freeze_enabled": False,
     "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
     "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
@@ -10445,6 +10446,9 @@ def _build_runner_command(config: dict[str, Any]) -> list[str]:
         "--best-quote-maker-volume-net-loss-reduce-enabled"
         if config.get("best_quote_maker_volume_net_loss_reduce_enabled", False)
         else "--no-best-quote-maker-volume-net-loss-reduce-enabled",
+        "--best-quote-maker-volume-allow-loss-reduce-only"
+        if config.get("best_quote_maker_volume_allow_loss_reduce_only", False)
+        else "--no-best-quote-maker-volume-allow-loss-reduce-only",
         "--best-quote-maker-volume-net-loss-reduce-min-loss",
         str(config.get("best_quote_maker_volume_net_loss_reduce_min_loss", 0.0)),
         "--best-quote-maker-volume-net-loss-reduce-ratio",
