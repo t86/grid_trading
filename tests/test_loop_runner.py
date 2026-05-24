@@ -6771,6 +6771,123 @@ class LoopRunnerTests(unittest.TestCase):
         mock_update_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 
+    @patch("grid_optimizer.loop_runner.update_synthetic_order_refs")
+    @patch("grid_optimizer.loop_runner._update_inventory_grid_order_refs")
+    @patch("grid_optimizer.loop_runner.post_futures_order")
+    @patch("grid_optimizer.loop_runner.post_futures_change_initial_leverage")
+    @patch("grid_optimizer.loop_runner.fetch_futures_open_orders")
+    @patch("grid_optimizer.loop_runner.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.loop_runner.fetch_futures_position_mode")
+    @patch("grid_optimizer.loop_runner.load_binance_api_credentials")
+    @patch("grid_optimizer.loop_runner.fetch_futures_book_tickers")
+    @patch("grid_optimizer.loop_runner.validate_plan_report")
+    def test_execute_plan_report_clears_hedge_best_quote_ledger_when_exchange_is_flat(
+        self,
+        mock_validate_plan_report,
+        mock_book_tickers,
+        mock_load_credentials,
+        mock_position_mode,
+        mock_account_info,
+        mock_open_orders,
+        mock_change_leverage,
+        mock_post_order,
+        mock_update_inventory_grid_refs,
+        mock_update_refs,
+    ) -> None:
+        mock_validate_plan_report.return_value = {
+            "ok": True,
+            "errors": [],
+            "actions": {
+                "place_count": 1,
+                "cancel_count": 0,
+                "cancel_orders": [],
+                "place_orders": [
+                    {
+                        "role": "best_quote_entry_short",
+                        "side": "SELL",
+                        "qty": 87.0,
+                        "price": 0.6109,
+                        "position_side": "SHORT",
+                    },
+                ],
+            },
+        }
+        mock_book_tickers.return_value = [{"bid_price": "0.6102", "ask_price": "0.6104"}]
+        mock_load_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": True}
+        mock_account_info.return_value = {
+            "multiAssetsMargin": False,
+            "positions": [
+                {"symbol": "PHAROSUSDT", "positionSide": "LONG", "positionAmt": "0", "entryPrice": "0"},
+                {"symbol": "PHAROSUSDT", "positionSide": "SHORT", "positionAmt": "0", "entryPrice": "0"},
+            ],
+        }
+        mock_open_orders.return_value = []
+
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "pharos_state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_volume_ledger": {
+                            "initialized": True,
+                            "sync_ok": True,
+                            "long_lots": [{"qty": 1.0, "price": 0.61}],
+                            "short_lots": [{"qty": 946.0, "price": 0.62}],
+                            "realized_pnl": 3.5,
+                        },
+                        "best_quote_frozen_inventory": {"short_qty": 10.0},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            args = Namespace(
+                symbol="PHAROSUSDT",
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                max_new_orders=20,
+                max_total_notional=1450.0,
+                cancel_stale=False,
+                max_plan_age_seconds=30,
+                max_mid_drift_steps=20.0,
+                plan_json="output/pharosusdt_hedge_bq_latest_plan.json",
+                apply=True,
+                margin_type="KEEP",
+                leverage=10,
+                maker_retries=0,
+                recv_window=5000,
+                state_path=str(state_path),
+            )
+            plan_report = {
+                "symbol": "PHAROSUSDT",
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "effective_strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                "mid_price": 0.6103,
+                "step_price": 0.00025,
+                "open_order_count": 0,
+                "current_long_qty": 1.0,
+                "current_short_qty": 946.0,
+                "actual_net_qty": 1.0,
+                "dual_side_position": True,
+                "state_path": str(state_path),
+                "best_quote_maker_volume": {"volume_ledger": {"initialized": True}},
+                "symbol_info": {"tick_size": 0.0001, "step_size": 1.0, "min_qty": 1.0, "min_notional": 5.0},
+            }
+
+            report = execute_plan_report(args, plan_report)
+
+            self.assertTrue(report["blocked"])
+            self.assertTrue(report["idle"])
+            self.assertEqual(report["error"]["reason"], "hedge_best_quote_exchange_flat_resynced")
+            self.assertTrue(report["position_reconcile"]["exchange_flat_resync"]["applied"])
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            self.assertEqual(state["best_quote_volume_ledger"]["long_lots"], [])
+            self.assertEqual(state["best_quote_volume_ledger"]["short_lots"], [])
+            self.assertNotIn("best_quote_frozen_inventory", state)
+        mock_post_order.assert_not_called()
+        mock_change_leverage.assert_not_called()
+        mock_update_refs.assert_not_called()
+        mock_update_inventory_grid_refs.assert_not_called()
+
     def test_apply_synthetic_inventory_exit_priority_prunes_pure_short_inventory_after_pause_threshold(self) -> None:
         plan = {
             "bootstrap_orders": [],

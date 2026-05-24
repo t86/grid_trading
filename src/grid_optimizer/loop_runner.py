@@ -2509,6 +2509,74 @@ def _best_quote_volume_ledger_snapshot(
     }
 
 
+def reset_best_quote_hedge_ledgers_after_exchange_flat(
+    *,
+    state: dict[str, Any],
+    mid_price: float,
+    reason: str,
+) -> dict[str, Any]:
+    now = _utc_now()
+    previous_volume_ledger = dict(state.get("best_quote_volume_ledger") or {})
+    previous_frozen_inventory = dict(state.get("best_quote_frozen_inventory") or {})
+    previous_snapshot = _best_quote_volume_ledger_snapshot(previous_volume_ledger, mid_price=mid_price)
+    reset_report = {
+        "applied": False,
+        "reason": reason,
+        "previous_volume_ledger": previous_snapshot,
+        "previous_frozen_inventory": previous_frozen_inventory,
+    }
+    had_volume_qty = (
+        _safe_float(previous_snapshot.get("long_qty")) > 1e-12
+        or _safe_float(previous_snapshot.get("short_qty")) > 1e-12
+    )
+    had_frozen_qty = any(
+        _safe_float(previous_frozen_inventory.get(key)) > 1e-12
+        for key in ("long_qty", "short_qty", "frozen_long_qty", "frozen_short_qty")
+    )
+    had_directive = any(
+        key in state
+        for key in (
+            "best_quote_frozen_inventory",
+            "best_quote_frozen_inventory_manual_reduce",
+            "best_quote_frozen_inventory_manual_limit",
+            "best_quote_frozen_inventory_pair_release",
+            "runtime_guard_manual_frozen_inventory_override",
+        )
+    )
+    if not had_volume_qty and not had_frozen_qty and not had_directive:
+        return reset_report
+
+    state["best_quote_volume_ledger"] = {
+        "initialized": True,
+        "schema": "best_quote_volume_ledger_v1",
+        "long_lots": [],
+        "short_lots": [],
+        "realized_pnl": _safe_float(previous_volume_ledger.get("realized_pnl")),
+        "commission": _safe_float(previous_volume_ledger.get("commission")),
+        "gross_notional": _safe_float(previous_volume_ledger.get("gross_notional")),
+        "applied_trade_count_total": int(previous_volume_ledger.get("applied_trade_count_total") or 0),
+        "last_trade_time_ms": int(now.timestamp() * 1000),
+        "last_trade_keys_at_time": [],
+        "applied_trade_fill_keys": list(previous_volume_ledger.get("applied_trade_fill_keys") or [])[-10000:],
+        "sync_ok": True,
+        "exchange_flat_resync_at": now.isoformat(),
+        "exchange_flat_resync_reason": reason,
+        "updated_at": now.isoformat(),
+    }
+    for key in (
+        "best_quote_frozen_inventory",
+        "best_quote_frozen_inventory_manual_reduce",
+        "best_quote_frozen_inventory_manual_limit",
+        "best_quote_frozen_inventory_pair_release",
+        "runtime_guard_manual_frozen_inventory_override",
+        "manual_frozen_inventory_override",
+        "manual_frozen_inventory_override_reason",
+    ):
+        state.pop(key, None)
+    reset_report["applied"] = True
+    return reset_report
+
+
 def reconcile_best_quote_volume_ledger_surplus(
     *,
     state: dict[str, Any],
@@ -14012,6 +14080,18 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     exchange_short_avg_price = current_short_avg_price
 
     if _is_best_quote_maker_volume_mode(requested_strategy_mode):
+        strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
+        if (
+            _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
+            and current_long_qty <= 1e-12
+            and current_short_qty <= 1e-12
+            and not strategy_open_orders
+        ):
+            best_quote_maker_volume["exchange_flat_resync"] = reset_best_quote_hedge_ledgers_after_exchange_flat(
+                state=state,
+                mid_price=mid_price,
+                reason="generate_plan_exchange_flat_no_strategy_orders",
+            )
         frozen_bootstrap_long_qty, frozen_bootstrap_short_qty = _best_quote_frozen_inventory_qtys(state)
         best_quote_reduce_freeze_bootstrap_isolated = bool(
             getattr(effective_args, "best_quote_maker_volume_reduce_freeze_enabled", False)
@@ -18648,6 +18728,36 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         "reduce_only_position_surplus_allowed": allow_reduce_only_position_surplus,
         "isolated_frozen_position_mismatch_allowed": allow_isolated_frozen_position_mismatch,
     }
+    if (
+        _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        and current_long_qty <= 1e-12
+        and current_short_qty <= 1e-12
+        and not current_strategy_open_orders
+        and (
+            expected_exchange_long_qty > 1e-12
+            or expected_exchange_short_qty > 1e-12
+            or expected_open_order_count > 0
+        )
+    ):
+        state_path = Path(str(plan_report.get("state_path", args.state_path)))
+        state = read_json(state_path) or {}
+        if not isinstance(state, dict):
+            state = {}
+        exchange_flat_resync = reset_best_quote_hedge_ledgers_after_exchange_flat(
+            state=state,
+            mid_price=_safe_float(plan_report.get("mid_price")),
+            reason="submit_exchange_flat_no_strategy_orders",
+        )
+        _write_json(state_path, state)
+        validation["actions"]["place_count"] = 0
+        validation["actions"]["cancel_count"] = 0
+        validation["actions"]["place_orders"] = []
+        validation["actions"]["cancel_orders"] = []
+        validation["errors"].append("hedge best quote exchange is flat; cleared stale local BQ ledgers")
+        validation["ok"] = False
+        report["validation"] = validation
+        report["position_reconcile"]["exchange_flat_resync"] = exchange_flat_resync
+        return _mark_submit_report_blocked(report, reason="hedge_best_quote_exchange_flat_resynced")
     if len(current_strategy_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
     if _is_synthetic_neutral_mode(strategy_mode):
