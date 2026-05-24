@@ -1243,6 +1243,42 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(result["close_target_reached"])
         self.assertTrue(any("仍高于 150.0000U" in warning for warning in result["warnings"]))
 
+    @patch("grid_optimizer.web._load_runner_control_config")
+    @patch("grid_optimizer.web._read_json_dict")
+    @patch("grid_optimizer.web.load_live_flatten_snapshot")
+    @patch("grid_optimizer.web._cancel_symbol_open_orders")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_execute_stop_actions_blocks_flatten_when_best_quote_frozen_isolation_is_active(
+        self,
+        mock_creds,
+        mock_cancel_orders,
+        mock_flatten_snapshot,
+        mock_read_state,
+        mock_load_config,
+    ) -> None:
+        mock_creds.return_value = ("key", "secret")
+        mock_cancel_orders.return_value = {"attempted": 2, "success": 2, "errors": []}
+        mock_load_config.return_value = {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "state_path": "output/pharosusdt_loop_state.json",
+        }
+        mock_read_state.return_value = {"best_quote_frozen_inventory": {"short_qty": 1500.0}}
+
+        result = _execute_stop_actions(
+            symbol="PHAROSUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+        )
+
+        self.assertTrue(result["cancel_open_orders_executed"])
+        self.assertFalse(result["close_all_positions_executed"])
+        self.assertEqual(result["close_attempted_count"], 0)
+        self.assertTrue(any("冻结账本隔离" in warning for warning in result["warnings"]))
+        mock_flatten_snapshot.assert_not_called()
+
     def test_normalize_runner_control_payload_supports_adaptive_step_fields(self) -> None:
         payload = _normalize_runner_control_payload(
             {
