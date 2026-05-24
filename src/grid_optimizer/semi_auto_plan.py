@@ -2331,14 +2331,38 @@ def load_or_initialize_state(
     reset_state: bool,
 ) -> dict[str, Any]:
     config = _config_payload(args, symbol_info)
+    preserved_best_quote_volume_ledger: dict[str, Any] = {}
+    preserved_best_quote_volume_order_refs: dict[str, Any] = {}
     preserved_frozen_inventory: dict[str, Any] = {}
     preserved_frozen_manual_reduce: dict[str, Any] = {}
     preserved_frozen_manual_limit: dict[str, Any] = {}
     preserved_frozen_pair_release: dict[str, Any] = {}
+
+    def _preserve_best_quote_ledgers(existing_state: dict[str, Any]) -> None:
+        nonlocal preserved_best_quote_volume_ledger
+        nonlocal preserved_best_quote_volume_order_refs
+        nonlocal preserved_frozen_inventory
+        nonlocal preserved_frozen_manual_reduce
+        nonlocal preserved_frozen_manual_limit
+        nonlocal preserved_frozen_pair_release
+        if isinstance(existing_state.get("best_quote_volume_ledger"), dict):
+            preserved_best_quote_volume_ledger = dict(existing_state["best_quote_volume_ledger"])
+        if isinstance(existing_state.get("best_quote_volume_order_refs"), dict):
+            preserved_best_quote_volume_order_refs = dict(existing_state["best_quote_volume_order_refs"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory"), dict):
+            preserved_frozen_inventory = dict(existing_state["best_quote_frozen_inventory"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory_manual_reduce"), dict):
+            preserved_frozen_manual_reduce = dict(existing_state["best_quote_frozen_inventory_manual_reduce"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory_manual_limit"), dict):
+            preserved_frozen_manual_limit = dict(existing_state["best_quote_frozen_inventory_manual_limit"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory_pair_release"), dict):
+            preserved_frozen_pair_release = dict(existing_state["best_quote_frozen_inventory_pair_release"])
+
     if state_path.exists() and not reset_state:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if str(state.get("config_signature", "")).strip() != _config_signature(config):
             if os.environ.get("GRID_AUTO_RESET_ON_CONFIG_CHANGE") == "1":
+                _preserve_best_quote_ledgers(state if isinstance(state, dict) else {})
                 print(
                     "State config does not match current CLI arguments; "
                     "auto-resetting state because GRID_AUTO_RESET_ON_CONFIG_CHANGE=1."
@@ -2352,14 +2376,7 @@ def load_or_initialize_state(
             existing_state = json.loads(state_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             existing_state = {}
-        if isinstance(existing_state.get("best_quote_frozen_inventory"), dict):
-            preserved_frozen_inventory = dict(existing_state["best_quote_frozen_inventory"])
-        if isinstance(existing_state.get("best_quote_frozen_inventory_manual_reduce"), dict):
-            preserved_frozen_manual_reduce = dict(existing_state["best_quote_frozen_inventory_manual_reduce"])
-        if isinstance(existing_state.get("best_quote_frozen_inventory_manual_limit"), dict):
-            preserved_frozen_manual_limit = dict(existing_state["best_quote_frozen_inventory_manual_limit"])
-        if isinstance(existing_state.get("best_quote_frozen_inventory_pair_release"), dict):
-            preserved_frozen_pair_release = dict(existing_state["best_quote_frozen_inventory_pair_release"])
+        _preserve_best_quote_ledgers(existing_state if isinstance(existing_state, dict) else {})
 
     center_price = args.center_price if args.center_price is not None else mid_price
     center_price = _round_to_nearest_step(center_price, symbol_info.get("tick_size"))
@@ -2374,6 +2391,10 @@ def load_or_initialize_state(
         "center_price": center_price,
         "last_mid_price": mid_price,
     }
+    if preserved_best_quote_volume_ledger:
+        state["best_quote_volume_ledger"] = preserved_best_quote_volume_ledger
+    if preserved_best_quote_volume_order_refs:
+        state["best_quote_volume_order_refs"] = preserved_best_quote_volume_order_refs
     if preserved_frozen_inventory:
         state["best_quote_frozen_inventory"] = preserved_frozen_inventory
     if preserved_frozen_manual_reduce:

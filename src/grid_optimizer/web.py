@@ -10246,6 +10246,15 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
     ledger = _normalize_runner_frozen_inventory_ledger(state.get("best_quote_frozen_inventory"))
     now_iso = datetime.now(timezone.utc).isoformat()
 
+    def _new_frozen_directive(extra: dict[str, Any]) -> dict[str, Any]:
+        now = datetime.now(timezone.utc)
+        return {
+            **extra,
+            "request_id": uuid.uuid4().hex,
+            "requested_at": now.isoformat(),
+            "expires_at": (now + timedelta(minutes=10)).isoformat(),
+        }
+
     if action == "reset":
         state.pop("best_quote_frozen_inventory", None)
         state.pop("best_quote_frozen_inventory_manual_reduce", None)
@@ -10282,12 +10291,13 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             requested_qty = min(requested_qty, side_qty)
             if requested_qty <= 1e-12:
                 raise ValueError(f"frozen {side_key} qty is empty")
-            directive[side_key] = {
-                "requested": True,
-                "requested_qty": requested_qty,
-                "requested_at": now_iso,
-                "source": "running_status_ui",
-            }
+            directive[side_key] = _new_frozen_directive(
+                {
+                    "requested": True,
+                    "requested_qty": requested_qty,
+                    "source": "running_status_ui",
+                }
+            )
             state["best_quote_frozen_inventory_manual_reduce"] = directive
         elif action in {"limit_long", "limit_short"}:
             directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
@@ -10306,13 +10316,14 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
                 raise ValueError(f"frozen {side_key} qty has no unisolated balance")
             isolated_qty = existing_isolated + requested_qty
             ledger[f"{side_key}_manual_limit_isolated_qty"] = isolated_qty
-            directive[side_key] = {
-                "requested": True,
-                "requested_qty": isolated_qty,
-                "price": price,
-                "requested_at": now_iso,
-                "source": "running_status_ui",
-            }
+            directive[side_key] = _new_frozen_directive(
+                {
+                    "requested": True,
+                    "requested_qty": isolated_qty,
+                    "price": price,
+                    "source": "running_status_ui",
+                }
+            )
             state["best_quote_frozen_inventory_manual_limit"] = directive
         elif action in {"cancel_limit_long", "cancel_limit_short"}:
             directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
@@ -10329,12 +10340,13 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             requested_qty = max(_safe_float(payload.get("requested_qty"), "requested_qty"), 0.0)
             if requested_qty <= 1e-12:
                 raise ValueError("requested_qty must be > 0")
-            state["best_quote_frozen_inventory_pair_release"] = {
-                "requested": True,
-                "requested_qty": min(requested_qty, ledger["offset_qty"]),
-                "requested_at": now_iso,
-                "source": "running_status_ui",
-            }
+            state["best_quote_frozen_inventory_pair_release"] = _new_frozen_directive(
+                {
+                    "requested": True,
+                    "requested_qty": min(requested_qty, ledger["offset_qty"]),
+                    "source": "running_status_ui",
+                }
+            )
         long_qty = max(_safe_float(ledger.get("long_qty"), "long_qty"), 0.0)
         short_qty = max(_safe_float(ledger.get("short_qty"), "short_qty"), 0.0)
         long_isolated = min(max(_safe_float(ledger.get("long_manual_limit_isolated_qty"), "long_manual_limit_isolated_qty"), 0.0), long_qty)
@@ -12232,6 +12244,45 @@ def _strategy_client_order_prefix(symbol: str) -> str:
     return f"gx-{str(symbol or '').lower().replace('usdt', 'u')}-"
 
 
+def _best_quote_frozen_isolation_active(symbol: str) -> bool:
+    normalized_symbol = str(symbol or "").upper().strip()
+    if not normalized_symbol:
+        return False
+    try:
+        config = _load_runner_control_config(normalized_symbol)
+    except Exception:
+        return False
+    strategy_mode = str(config.get("strategy_mode") or "").strip()
+    if strategy_mode != "hedge_best_quote_maker_volume_v1":
+        return False
+    if not _truthy(config.get("best_quote_maker_volume_enabled", True)):
+        return False
+    if _truthy(config.get("best_quote_maker_volume_reduce_freeze_enabled", False)):
+        return True
+
+    state_path_text = str(config.get("state_path") or "").strip()
+    if not state_path_text:
+        return False
+    try:
+        state = _read_json_dict(Path(state_path_text)) or {}
+    except Exception:
+        return False
+    frozen_inventory = state.get("best_quote_frozen_inventory")
+    volume_ledger = state.get("best_quote_volume_ledger")
+    return isinstance(frozen_inventory, dict) or isinstance(volume_ledger, dict)
+
+
+def _raise_if_manual_trade_touches_best_quote_isolation(symbol: str, market_type: str) -> None:
+    if _manual_trade_market_type(market_type) != "futures":
+        return
+    if not _best_quote_frozen_isolation_active(symbol):
+        return
+    raise ValueError(
+        f"{str(symbol or '').upper().strip()} 已启用 BQ 冻结账本隔离，禁止使用通用手动交易下 futures 单；"
+        "正常刷量由 runner 管理，冻结仓位平仓请使用冻结仓位面板生成授权指令"
+    )
+
+
 def _is_strategy_order(order: dict[str, Any], symbol: str) -> bool:
     client_order_id = str(order.get("clientOrderId", "") or "")
     return client_order_id.startswith(_strategy_client_order_prefix(symbol))
@@ -12907,6 +12958,7 @@ def _manual_trade_prepare_plan(
     normalized_side = str(side or "").upper().strip()
     if normalized_side not in {"BUY", "SELL"}:
         raise ValueError("side must be BUY or SELL")
+    _raise_if_manual_trade_touches_best_quote_isolation(normalized_symbol, normalized_market)
     creds = load_binance_api_credentials()
     if creds is None:
         raise RuntimeError("Binance API credentials are not configured")
@@ -13061,6 +13113,7 @@ def _manual_trade_place_book_limit(payload: dict[str, Any]) -> dict[str, Any]:
         raise ValueError("symbol is required")
     if normalized_side not in {"BUY", "SELL"}:
         raise ValueError("side must be BUY or SELL")
+    _raise_if_manual_trade_touches_best_quote_isolation(normalized_symbol, market_type)
     try:
         safe_notional = float(payload.get("notional", 0) or 0)
         if safe_notional <= 0:
@@ -13761,6 +13814,11 @@ def _execute_stop_actions(
         summary["cancel_success_count"] = cancel_result["success"]
         summary["cancel_errors"] = cancel_result["errors"]
     if close_all_positions:
+        if _best_quote_frozen_isolation_active(symbol):
+            summary["warnings"].append(
+                f"{symbol} 已启用 BQ 冻结账本隔离，已跳过通用清仓；冻结仓位只能通过冻结仓位面板生成授权平仓指令"
+            )
+            return summary
         summary["close_all_positions_executed"] = True
         live_snapshot = load_live_flatten_snapshot(
             symbol,

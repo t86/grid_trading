@@ -618,6 +618,40 @@ class ManualTradeTests(unittest.TestCase):
 
         mock_change_margin.assert_not_called()
 
+    @patch("grid_optimizer.web._load_runner_control_config")
+    @patch("grid_optimizer.web._read_json_dict")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    @patch("grid_optimizer.web.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_prepare_plan_blocks_futures_manual_trade_for_best_quote_frozen_isolation(
+        self,
+        mock_credentials,
+        mock_position_mode,
+        mock_book,
+        mock_account_info,
+        mock_symbol_config,
+        mock_read_state,
+        mock_load_config,
+    ) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_book.return_value = [{"bid_price": "1.0", "ask_price": "1.01"}]
+        mock_account_info.return_value = {"positions": [{"symbol": "PHAROSUSDT", "positionAmt": "20"}]}
+        mock_symbol_config.return_value = self._symbol_info()
+        mock_load_config.return_value = {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "state_path": "output/pharosusdt_loop_state.json",
+        }
+        mock_read_state.return_value = {"best_quote_volume_ledger": {"long_lots": [{"qty": 20.0}]}}
+
+        with self.assertRaisesRegex(ValueError, "冻结账本隔离"):
+            _manual_trade_prepare_plan("PHAROSUSDT", "SELL", 100.0)
+
     @patch("grid_optimizer.web._manual_trade_set_task")
     @patch("grid_optimizer.web.fetch_futures_order")
     @patch("grid_optimizer.web.post_futures_order")

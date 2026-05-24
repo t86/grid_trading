@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -166,6 +167,8 @@ def summarize_futures_runtime_guard_inputs(
     runtime_guard_stats_start_time: Any = None,
     symbol: str | None = None,
     now: datetime | None = None,
+    bq_order_refs_path: Path | None = None,
+    bq_book_scope: str | None = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     audit_paths = build_audit_paths(summary_path)
     trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
@@ -180,6 +183,19 @@ def summarize_futures_runtime_guard_inputs(
     pnl_events: list[dict[str, Any]] = []
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
     seen_order_notional_keys: set[str] = set()
+    normalized_bq_book_scope = str(bq_book_scope or "").lower().strip()
+    bq_order_books: dict[str, str] = {}
+    if normalized_bq_book_scope and bq_order_refs_path is not None:
+        try:
+            raw_state = json.loads(bq_order_refs_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_state = {}
+        raw_refs = raw_state.get("best_quote_volume_order_refs") if isinstance(raw_state, dict) else {}
+        if isinstance(raw_refs, dict):
+            for order_id, ref in raw_refs.items():
+                if not isinstance(ref, dict):
+                    continue
+                bq_order_books[str(order_id)] = str(ref.get("book") or "unknown").lower().strip() or "unknown"
 
     def _as_float(value: Any) -> float:
         try:
@@ -194,6 +210,10 @@ def summarize_futures_runtime_guard_inputs(
             trade_ts = datetime.fromtimestamp(trade_time_ms / 1000.0, tz=timezone.utc)
         if metrics_start_time is not None:
             if trade_ts is None or trade_ts < metrics_start_time:
+                continue
+        if normalized_bq_book_scope:
+            order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
+            if bq_order_books.get(order_id, "unknown") != normalized_bq_book_scope:
                 continue
         price = _as_float(row.get("price"))
         qty = abs(_as_float(row.get("qty")))
