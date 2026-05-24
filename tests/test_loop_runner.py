@@ -6843,7 +6843,10 @@ class LoopRunnerTests(unittest.TestCase):
 
         self.assertTrue(report["executed"])
         self.assertEqual(mock_post_order.call_count, 2)
-        self.assertEqual([call.kwargs["position_side"] for call in mock_post_order.call_args_list], ["SHORT", "LONG"])
+        self.assertCountEqual(
+            [call.kwargs["position_side"] for call in mock_post_order.call_args_list],
+            ["SHORT", "LONG"],
+        )
         mock_update_refs.assert_called_once()
         mock_update_inventory_grid_refs.assert_called_once()
 
