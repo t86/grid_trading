@@ -2577,6 +2577,23 @@ def reset_best_quote_hedge_ledgers_after_exchange_flat(
     return reset_report
 
 
+def _hedge_best_quote_exchange_effectively_flat(
+    *,
+    current_long_qty: float,
+    current_short_qty: float,
+    mid_price: float,
+    min_notional: Any,
+) -> bool:
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    flat_notional = max(_safe_float(min_notional), 0.0)
+    if flat_notional <= 0:
+        flat_notional = 5.0
+    return (
+        max(_safe_float(current_long_qty), 0.0) * safe_mid <= flat_notional + 1e-12
+        and max(_safe_float(current_short_qty), 0.0) * safe_mid <= flat_notional + 1e-12
+    )
+
+
 def reconcile_best_quote_volume_ledger_surplus(
     *,
     state: dict[str, Any],
@@ -14083,8 +14100,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
         if (
             _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
-            and current_long_qty <= 1e-12
-            and current_short_qty <= 1e-12
+            and _hedge_best_quote_exchange_effectively_flat(
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                mid_price=mid_price,
+                min_notional=symbol_info.get("min_notional"),
+            )
             and not strategy_open_orders
         ):
             best_quote_maker_volume["exchange_flat_resync"] = reset_best_quote_hedge_ledgers_after_exchange_flat(
@@ -18730,8 +18751,12 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     }
     if (
         _is_hedge_best_quote_maker_volume_mode(strategy_mode)
-        and current_long_qty <= 1e-12
-        and current_short_qty <= 1e-12
+        and _hedge_best_quote_exchange_effectively_flat(
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            mid_price=_safe_float(plan_report.get("mid_price")),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        )
         and not current_strategy_open_orders
         and (
             expected_exchange_long_qty > 1e-12
