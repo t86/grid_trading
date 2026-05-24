@@ -18752,8 +18752,6 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             mid_price=_safe_float(plan_report.get("mid_price")),
             min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         )
-        and not current_strategy_open_orders
-        and expected_open_order_count == 0
     )
     report["position_reconcile"] = {
         "expected_long_qty": expected_long_qty,
