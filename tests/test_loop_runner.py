@@ -63,6 +63,7 @@ from grid_optimizer.loop_runner import (
     apply_execution_request_budget_to_actions,
     StartupProtectionError,
     _update_inventory_grid_order_refs,
+    update_best_quote_volume_order_refs,
     apply_excess_inventory_reduce_only,
     apply_active_delever_short,
     apply_active_delever_long,
@@ -215,6 +216,67 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(state["best_quote_frozen_inventory_pair_release"], pair_release)
         self.assertNotIn("runtime_guard_loss_recovery", state)
         self.assertTrue(state["startup_pending"])
+
+    def test_update_best_quote_volume_order_refs_marks_normal_book(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+            update_best_quote_volume_order_refs(
+                state_path=state_path,
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "best_quote_entry_short",
+                                "side": "SELL",
+                                "position_side": "SHORT",
+                            },
+                            "response": {
+                                "orderId": 41974646,
+                                "clientOrderId": "gx-pharosu-bestquot-1-87716360",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        ref = state["best_quote_volume_order_refs"]["41974646"]
+        self.assertEqual(ref["book"], "normal_bq")
+        self.assertEqual(ref["role"], "best_quote_entry_short")
+        self.assertEqual(ref["position_side"], "SHORT")
+
+    def test_update_best_quote_volume_order_refs_marks_frozen_book(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+            update_best_quote_volume_order_refs(
+                state_path=state_path,
+                strategy_mode="hedge_best_quote_maker_volume_v1",
+                submit_report={
+                    "placed_orders": [
+                        {
+                            "request": {
+                                "role": "frozen_inventory_manual_reduce_long",
+                                "side": "SELL",
+                                "position_side": "LONG",
+                            },
+                            "response": {
+                                "orderId": 41974647,
+                                "clientOrderId": "gx-pharosu-frozen-1-87716361",
+                            },
+                        }
+                    ]
+                },
+            )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        ref = state["best_quote_volume_order_refs"]["41974647"]
+        self.assertEqual(ref["book"], "frozen_bq")
+        self.assertEqual(ref["role"], "frozen_inventory_manual_reduce_long")
 
     def test_resolve_volatility_entry_pause_holds_for_min_observation_window(self) -> None:
         trigger_now = datetime(2026, 5, 16, 4, 7, tzinfo=timezone.utc)

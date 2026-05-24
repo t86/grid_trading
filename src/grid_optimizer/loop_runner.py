@@ -2325,6 +2325,29 @@ def _order_role(order: dict[str, Any]) -> str:
     return str(order.get("role", "")).lower().strip()
 
 
+BQ_BOOK_NORMAL = "normal_bq"
+BQ_BOOK_FROZEN = "frozen_bq"
+BQ_BOOK_UNKNOWN = "unknown"
+
+
+def _best_quote_order_book_from_role(role: Any) -> str:
+    normalized = str(role or "").lower().strip()
+    if normalized in {
+        "best_quote_entry_long",
+        "best_quote_reduce_long",
+        "best_quote_entry_short",
+        "best_quote_reduce_short",
+    }:
+        return BQ_BOOK_NORMAL
+    if (
+        normalized.startswith("frozen_inventory_manual_reduce_")
+        or normalized.startswith("frozen_inventory_manual_limit_")
+        or normalized.startswith("frozen_inventory_pair_release_")
+    ):
+        return BQ_BOOK_FROZEN
+    return BQ_BOOK_UNKNOWN
+
+
 def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
     explicit_role = str((row or {}).get("role") or "").lower().strip()
     if explicit_role in {
@@ -5892,6 +5915,7 @@ def update_best_quote_volume_order_refs(
         if order_id <= 0:
             continue
         refs[str(order_id)] = {
+            "book": _best_quote_order_book_from_role(request.get("role")),
             "role": str(request.get("role", "")).strip(),
             "side": str(request.get("side", "")).upper().strip(),
             "position_side": str(
