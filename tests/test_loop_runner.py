@@ -1604,6 +1604,110 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(len(ledger["long_lots"]), 1)
         self.assertEqual(len(ledger["applied_trade_fill_keys"]), 1)
 
+    def test_best_quote_volume_ledger_ignores_frozen_book_fill(self) -> None:
+        state = {
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [],
+                "gross_notional": 0.0,
+                "last_trade_time_ms": 1,
+                "last_trade_keys_at_time": [],
+            },
+            "best_quote_volume_order_refs": {
+                "41974647": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_reduce_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                }
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            sync_best_quote_volume_ledger(
+                state=state,
+                symbol="PHAROSUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=0.0,
+                current_short_qty=0.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=0.0,
+                mid_price=0.1,
+                observed_trade_rows=[
+                    {
+                        "orderId": 41974647,
+                        "side": "SELL",
+                        "positionSide": "LONG",
+                        "qty": "100",
+                        "price": "0.1",
+                        "quoteQty": "10",
+                        "time": 2000,
+                    }
+                ],
+                allow_exchange_position_bootstrap=False,
+            )
+
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["gross_notional"], 0.0)
+        self.assertEqual(ledger["applied_trade_count_total"], 0)
+        self.assertEqual(ledger["last_skipped_frozen_trade_count"], 1)
+
+    def test_best_quote_volume_ledger_ignores_unknown_book_fill(self) -> None:
+        state = {
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [],
+                "short_lots": [],
+                "gross_notional": 0.0,
+                "last_trade_time_ms": 1,
+                "last_trade_keys_at_time": [],
+            },
+            "best_quote_volume_order_refs": {
+                "41974648": {
+                    "book": "unknown",
+                    "role": "",
+                    "side": "BUY",
+                    "position_side": "LONG",
+                }
+            },
+        }
+
+        with patch("grid_optimizer.loop_runner._fetch_trade_rows_since", return_value=[]):
+            snapshot = sync_best_quote_volume_ledger(
+                state=state,
+                symbol="PHAROSUSDT",
+                api_key="",
+                api_secret="",
+                recv_window=5000,
+                current_long_qty=0.0,
+                current_short_qty=0.0,
+                current_long_avg_price=0.0,
+                current_short_avg_price=0.0,
+                mid_price=0.1,
+                observed_trade_rows=[
+                    {
+                        "orderId": 41974648,
+                        "side": "BUY",
+                        "positionSide": "LONG",
+                        "qty": "100",
+                        "price": "0.1",
+                        "quoteQty": "10",
+                        "time": 2000,
+                    }
+                ],
+                allow_exchange_position_bootstrap=False,
+            )
+
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["gross_notional"], 0.0)
+        self.assertEqual(snapshot["long_qty"], 0.0)
+        self.assertEqual(ledger["last_unknown_trade_count"], 1)
+
     def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},

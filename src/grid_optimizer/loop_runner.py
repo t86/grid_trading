@@ -2387,14 +2387,8 @@ def _best_quote_trade_role_from_order_ref(
     row: Mapping[str, Any] | dict[str, Any],
     state: Mapping[str, Any] | dict[str, Any],
 ) -> str:
-    refs = state.get("best_quote_volume_order_refs") if isinstance(state, Mapping) else None
-    if not isinstance(refs, Mapping):
-        return ""
-    order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
-    if not order_id:
-        return ""
-    ref = refs.get(order_id)
-    if not isinstance(ref, Mapping):
+    ref = _best_quote_order_ref_for_trade(row, state)
+    if ref is None:
         return ""
     role = str(ref.get("role") or "").lower().strip()
     if role in {
@@ -2417,6 +2411,33 @@ def _best_quote_trade_role_from_order_ref(
     if side == "BUY" and position_side == "SHORT":
         return "best_quote_reduce_short"
     return ""
+
+
+def _best_quote_order_ref_for_trade(
+    row: Mapping[str, Any] | dict[str, Any],
+    state: Mapping[str, Any] | dict[str, Any],
+) -> Mapping[str, Any] | None:
+    refs = state.get("best_quote_volume_order_refs") if isinstance(state, Mapping) else None
+    if not isinstance(refs, Mapping):
+        return None
+    order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
+    if not order_id:
+        return None
+    ref = refs.get(order_id)
+    return ref if isinstance(ref, Mapping) else None
+
+
+def _best_quote_trade_book_from_order_ref(
+    row: Mapping[str, Any] | dict[str, Any],
+    state: Mapping[str, Any] | dict[str, Any],
+) -> str:
+    ref = _best_quote_order_ref_for_trade(row, state)
+    if ref is None:
+        return BQ_BOOK_UNKNOWN
+    book = str(ref.get("book") or "").lower().strip()
+    if book in {BQ_BOOK_NORMAL, BQ_BOOK_FROZEN, BQ_BOOK_UNKNOWN}:
+        return book
+    return _best_quote_order_book_from_role(ref.get("role"))
 
 
 def _best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:
@@ -2696,6 +2717,8 @@ def sync_best_quote_volume_ledger(
     applied_fill_key_set = set(applied_fill_keys)
     applied = 0
     unmatched = 0
+    skipped_frozen = 0
+    unknown_book = 0
     realized_delta = 0.0
     commission_delta = 0.0
     gross_delta = 0.0
@@ -2703,9 +2726,18 @@ def sync_best_quote_volume_ledger(
         fill_key = _best_quote_trade_fill_key(row)
         if fill_key and fill_key in applied_fill_key_set:
             continue
-        role = _best_quote_trade_role_from_row(row)
-        if not role:
+        order_ref = _best_quote_order_ref_for_trade(row, state)
+        if order_ref is not None:
+            book = _best_quote_trade_book_from_order_ref(row, state)
+            if book == BQ_BOOK_FROZEN:
+                skipped_frozen += 1
+                continue
+            if book != BQ_BOOK_NORMAL:
+                unknown_book += 1
+                continue
             role = _best_quote_trade_role_from_order_ref(row, state)
+        else:
+            role = _best_quote_trade_role_from_row(row)
         if not role:
             compact = str(row.get("clientOrderId") or row.get("client_order_id") or "").lower().split("-")
             if len(compact) >= 3 and compact[2] == "bestquot":
@@ -2751,6 +2783,8 @@ def sync_best_quote_volume_ledger(
     ledger["applied_trade_count_total"] = int(ledger.get("applied_trade_count_total") or 0) + applied
     ledger["last_applied_trade_count"] = applied
     ledger["last_unmatched_trade_count"] = unmatched
+    ledger["last_skipped_frozen_trade_count"] = skipped_frozen
+    ledger["last_unknown_trade_count"] = unknown_book
     ledger["last_trade_time_ms"] = int(trade_last_time_ms or last_time_ms or 0)
     ledger["last_trade_keys_at_time"] = list(trade_keys_at_time)
     ledger["applied_trade_fill_keys"] = applied_fill_keys[-10000:]
