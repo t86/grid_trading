@@ -2561,6 +2561,8 @@ def reconcile_best_quote_volume_ledger_surplus(
     current_long_avg_price: float,
     current_short_avg_price: float,
     mid_price: float,
+    normal_open_order_count: int = 0,
+    position_reconcile_confirm_cycles: int = 2,
 ) -> dict[str, Any]:
     ledger = dict(state.get("best_quote_volume_ledger") or {})
     if not bool(ledger.get("initialized")) or not bool(ledger.get("sync_ok", True)):
@@ -2586,15 +2588,122 @@ def reconcile_best_quote_volume_ledger_surplus(
 
     long_lots, removed_long_qty = _remove_exchange_surplus_lots(long_lots)
     short_lots, removed_short_qty = _remove_exchange_surplus_lots(short_lots)
-    if removed_long_qty <= 1e-12 and removed_short_qty <= 1e-12:
+    if removed_long_qty > 1e-12 or removed_short_qty > 1e-12:
+        ledger["long_lots"] = long_lots
+        ledger["short_lots"] = short_lots
+        ledger["surplus_reconcile_disabled_reason"] = "best_quote_volume_ledger_ignores_exchange_total_position"
+        ledger["surplus_reconcile_removed_long_qty"] = removed_long_qty
+        ledger["surplus_reconcile_removed_short_qty"] = removed_short_qty
+        ledger["surplus_reconcile_at"] = now_iso
+        ledger["updated_at"] = now_iso
+        state["best_quote_volume_ledger"] = ledger
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
+    target_long_qty = max(_safe_float(current_long_qty) - max(frozen_long_qty, 0.0), 0.0)
+    target_short_qty = max(_safe_float(current_short_qty) - max(frozen_short_qty, 0.0), 0.0)
+    current_ledger_long_qty, current_ledger_long_avg = _best_quote_volume_book_from_lots(long_lots)
+    current_ledger_short_qty, current_ledger_short_avg = _best_quote_volume_book_from_lots(short_lots)
+    long_drift = target_long_qty - current_ledger_long_qty
+    short_drift = target_short_qty - current_ledger_short_qty
+    has_position_drift = abs(long_drift) > 1e-9 or abs(short_drift) > 1e-9
+    if has_position_drift and int(normal_open_order_count or 0) > 0:
+        ledger["long_lots"] = long_lots
+        ledger["short_lots"] = short_lots
+        ledger["position_reconcile_deferred_reason"] = "normal_open_orders_active"
+        ledger["position_reconcile_pending_count"] = 0
+        ledger["position_reconcile_target_long_qty"] = target_long_qty
+        ledger["position_reconcile_target_short_qty"] = target_short_qty
+        ledger["position_reconcile_ledger_long_qty"] = current_ledger_long_qty
+        ledger["position_reconcile_ledger_short_qty"] = current_ledger_short_qty
+        ledger["position_reconcile_at"] = now_iso
+        ledger["updated_at"] = now_iso
+        state["best_quote_volume_ledger"] = ledger
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    if has_position_drift:
+        pending_key = "position_reconcile_pending_count"
+        pending_count = int(ledger.get(pending_key) or 0) + 1
+        confirm_cycles = max(int(position_reconcile_confirm_cycles or 1), 1)
+        ledger[pending_key] = pending_count
+        ledger["position_reconcile_deferred_reason"] = "confirming_position_drift"
+        ledger["position_reconcile_target_long_qty"] = target_long_qty
+        ledger["position_reconcile_target_short_qty"] = target_short_qty
+        ledger["position_reconcile_ledger_long_qty"] = current_ledger_long_qty
+        ledger["position_reconcile_ledger_short_qty"] = current_ledger_short_qty
+        ledger["position_reconcile_long_drift_qty"] = long_drift
+        ledger["position_reconcile_short_drift_qty"] = short_drift
+        ledger["position_reconcile_at"] = now_iso
+        if pending_count < confirm_cycles:
+            ledger["long_lots"] = long_lots
+            ledger["short_lots"] = short_lots
+            ledger["updated_at"] = now_iso
+            state["best_quote_volume_ledger"] = ledger
+            return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+        def _reconcile_lots_to_target(
+            lots: list[dict[str, Any]],
+            *,
+            target_qty: float,
+            current_qty: float,
+            current_avg: float,
+            exchange_avg: float,
+            side: str,
+        ) -> tuple[list[dict[str, Any]], float, float]:
+            drift = target_qty - current_qty
+            added_qty = 0.0
+            removed_qty = 0.0
+            if drift > 1e-9:
+                price = max(current_avg, _safe_float(exchange_avg), _safe_float(mid_price), 0.0)
+                if price > 0:
+                    lots = list(lots) + [
+                        {
+                            "qty": drift,
+                            "price": price,
+                            "source": "exchange_minus_frozen_position_reconcile",
+                            "side": side,
+                            "opened_at": now_iso,
+                        }
+                    ]
+                    added_qty = drift
+            elif drift < -1e-9:
+                lots, _, _ = _best_quote_volume_consume_fifo(lots, -drift)
+                removed_qty = -drift
+            return lots, added_qty, removed_qty
+
+        long_lots, added_long_qty, reconciled_removed_long_qty = _reconcile_lots_to_target(
+            long_lots,
+            target_qty=target_long_qty,
+            current_qty=current_ledger_long_qty,
+            current_avg=current_ledger_long_avg,
+            exchange_avg=current_long_avg_price,
+            side="LONG",
+        )
+        short_lots, added_short_qty, reconciled_removed_short_qty = _reconcile_lots_to_target(
+            short_lots,
+            target_qty=target_short_qty,
+            current_qty=current_ledger_short_qty,
+            current_avg=current_ledger_short_avg,
+            exchange_avg=current_short_avg_price,
+            side="SHORT",
+        )
+        ledger["position_reconcile_pending_count"] = 0
+        ledger["position_reconcile_deferred_reason"] = ""
+        ledger["position_reconcile_added_long_qty"] = added_long_qty
+        ledger["position_reconcile_added_short_qty"] = added_short_qty
+        ledger["position_reconcile_removed_long_qty"] = reconciled_removed_long_qty
+        ledger["position_reconcile_removed_short_qty"] = reconciled_removed_short_qty
+    else:
+        ledger["position_reconcile_pending_count"] = 0
+        ledger["position_reconcile_deferred_reason"] = ""
+
+    if not has_position_drift:
         return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
 
     ledger["long_lots"] = long_lots
     ledger["short_lots"] = short_lots
-    ledger["surplus_reconcile_disabled_reason"] = "best_quote_volume_ledger_ignores_exchange_total_position"
-    ledger["surplus_reconcile_removed_long_qty"] = removed_long_qty
-    ledger["surplus_reconcile_removed_short_qty"] = removed_short_qty
-    ledger["surplus_reconcile_at"] = now_iso
+    ledger["position_reconcile_source"] = "exchange_minus_frozen_position"
+    ledger["position_reconcile_completed_at"] = now_iso
     ledger["updated_at"] = now_iso
     state["best_quote_volume_ledger"] = ledger
     return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
@@ -14133,6 +14242,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_long_avg_price=current_long_avg_price,
             current_short_avg_price=current_short_avg_price,
             mid_price=mid_price,
+            normal_open_order_count=sum(
+                1
+                for order in _filter_futures_strategy_orders(open_orders, symbol)
+                if "bestquot" in str(order.get("clientOrderId") or "").lower()
+            ),
         )
         best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
 

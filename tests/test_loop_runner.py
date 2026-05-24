@@ -1777,6 +1777,86 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(snapshot["long_qty"], 0.0)
         self.assertEqual(ledger["last_unknown_trade_count"], 1)
 
+    def test_best_quote_volume_ledger_reconciles_exchange_minus_frozen_drift(self) -> None:
+        state = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 3729.0,
+            },
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [{"qty": 907.0, "price": 0.6515, "source": "trade_fill"}],
+                "short_lots": [{"qty": 875.0, "price": 0.6517, "source": "trade_fill"}],
+                "realized_pnl": 3.5,
+                "commission": 0.001,
+                "gross_notional": 5000.0,
+                "last_trade_time_ms": 1779590679870,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        first = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=556.0,
+            current_short_qty=5035.0,
+            current_long_avg_price=0.65167,
+            current_short_avg_price=0.63808,
+            mid_price=0.6530,
+            normal_open_order_count=0,
+            position_reconcile_confirm_cycles=2,
+        )
+        self.assertEqual(first["long_qty"], 907.0)
+        self.assertEqual(first["short_qty"], 875.0)
+        self.assertEqual(state["best_quote_volume_ledger"]["position_reconcile_pending_count"], 1)
+
+        second = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=556.0,
+            current_short_qty=5035.0,
+            current_long_avg_price=0.65167,
+            current_short_avg_price=0.63808,
+            mid_price=0.6530,
+            normal_open_order_count=0,
+            position_reconcile_confirm_cycles=2,
+        )
+
+        self.assertEqual(second["long_qty"], 556.0)
+        self.assertEqual(second["short_qty"], 1306.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["position_reconcile_pending_count"], 0)
+        self.assertEqual(ledger["position_reconcile_target_long_qty"], 556.0)
+        self.assertEqual(ledger["position_reconcile_target_short_qty"], 1306.0)
+        self.assertEqual(ledger["position_reconcile_removed_long_qty"], 351.0)
+        self.assertEqual(ledger["position_reconcile_added_short_qty"], 431.0)
+
+    def test_best_quote_volume_ledger_defers_position_reconcile_with_normal_open_orders(self) -> None:
+        state = {
+            "best_quote_frozen_inventory": {"short_qty": 100.0},
+            "best_quote_volume_ledger": {
+                "initialized": True,
+                "sync_ok": True,
+                "long_lots": [{"qty": 10.0, "price": 1.0, "source": "trade_fill"}],
+                "short_lots": [],
+                "last_trade_time_ms": 1,
+                "last_trade_keys_at_time": [],
+            },
+        }
+
+        snapshot = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=20.0,
+            current_short_qty=100.0,
+            current_long_avg_price=1.0,
+            current_short_avg_price=1.0,
+            mid_price=1.0,
+            normal_open_order_count=1,
+            position_reconcile_confirm_cycles=1,
+        )
+
+        self.assertEqual(snapshot["long_qty"], 10.0)
+        ledger = state["best_quote_volume_ledger"]
+        self.assertEqual(ledger["position_reconcile_deferred_reason"], "normal_open_orders_active")
+
     def test_best_quote_frozen_inventory_manual_reduce_places_reduce_only_ioc_order(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0},
