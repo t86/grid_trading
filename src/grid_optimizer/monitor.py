@@ -2531,6 +2531,42 @@ def _build_live_account_snapshot(
     return snapshot
 
 
+def _merge_live_account_position_with_local_runtime(
+    local_position: dict[str, Any],
+    live_position: dict[str, Any],
+) -> dict[str, Any]:
+    active_long_qty = max(
+        _safe_float(local_position.get("active_long_qty", local_position.get("long_qty"))),
+        0.0,
+    )
+    active_short_qty = max(
+        _safe_float(local_position.get("active_short_qty", local_position.get("short_qty"))),
+        0.0,
+    )
+    live_long_qty = max(_safe_float(live_position.get("long_qty")), 0.0)
+    live_short_qty = max(_safe_float(live_position.get("short_qty")), 0.0)
+    inventory_frozen_long_qty = max(live_long_qty - active_long_qty, 0.0)
+    inventory_frozen_short_qty = max(live_short_qty - active_short_qty, 0.0)
+    reduce_order_frozen_long_qty = max(_safe_float(live_position.get("frozen_long_qty")), 0.0)
+    reduce_order_frozen_short_qty = max(_safe_float(live_position.get("frozen_short_qty")), 0.0)
+
+    merged = dict(live_position)
+    merged.update(
+        {
+            "source": "local_runtime_with_live_account_position",
+            "active_long_qty": active_long_qty,
+            "active_short_qty": active_short_qty,
+            "inventory_frozen_long_qty": inventory_frozen_long_qty,
+            "inventory_frozen_short_qty": inventory_frozen_short_qty,
+            "reduce_order_frozen_long_qty": reduce_order_frozen_long_qty,
+            "reduce_order_frozen_short_qty": reduce_order_frozen_short_qty,
+            "frozen_long_qty": inventory_frozen_long_qty + reduce_order_frozen_long_qty,
+            "frozen_short_qty": inventory_frozen_short_qty + reduce_order_frozen_short_qty,
+        }
+    )
+    return merged
+
+
 def build_monitor_snapshot(
     *,
     symbol: str,
@@ -2748,7 +2784,15 @@ def _build_monitor_snapshot_uncached(
                 api_secret=api_secret,
             )
             snapshot["live_account"] = live_account
-            if local_runtime_snapshot is None or not bool(runner.get("is_running")):
+            if local_runtime_snapshot is not None and bool(runner.get("is_running")):
+                local_position = snapshot.get("position") if isinstance(snapshot.get("position"), dict) else {}
+                live_position = live_account.get("position") if isinstance(live_account.get("position"), dict) else {}
+                if local_position and live_position:
+                    snapshot["position"] = _merge_live_account_position_with_local_runtime(local_position, live_position)
+                snapshot["account_assets"] = live_account["account_assets"]
+                snapshot["open_orders"] = live_account["open_orders"]
+                unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
+            else:
                 snapshot["position"] = live_account["position"]
                 snapshot["account_assets"] = live_account["account_assets"]
                 snapshot["open_orders"] = live_account["open_orders"]
