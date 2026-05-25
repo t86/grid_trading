@@ -1177,6 +1177,40 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(report["effective_threshold_loss_ratio"], 0.015)
         self.assertNotIn("best_quote_frozen_inventory", state)
 
+    def test_best_quote_reduce_freeze_dynamic_threshold_raises_short_barrier(self) -> None:
+        state: dict[str, object] = {}
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+
+        report = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan={"sell_orders": [], "buy_orders": [{"role": "best_quote_reduce_short"}]},
+            report=report,
+            enabled=True,
+            threshold_loss_ratio=0.01,
+            min_notional=10.0,
+            confirm_cycles=1,
+            dynamic_threshold_enabled=True,
+            dynamic_threshold_loss_ratio_scale=0.5,
+            current_long_qty=0.0,
+            current_short_qty=300.0,
+            current_long_avg_price=0.0,
+            current_short_avg_price=0.6600,
+            mid_price=0.6680,
+        )
+
+        self.assertFalse(report["applied"])
+        self.assertAlmostEqual(report["dynamic_threshold"]["short_loss_ratio"], 0.01212121212121215)
+        self.assertAlmostEqual(report["short_freeze_threshold_loss_ratio"], 0.016060606060606075)
+        self.assertNotIn("best_quote_frozen_inventory", state)
+        self.assertNotIn("best_quote_reduce_freeze_confirmation", state)
+
     def test_best_quote_reduce_freeze_hard_threshold_keeps_soft_loss_managed(self) -> None:
         state: dict[str, object] = {}
         report = _best_quote_reduce_freeze_report(

@@ -3363,6 +3363,9 @@ def _apply_best_quote_reduce_freeze(
     hard_confirm_cycles: int = 0,
     stress_loss_ratio: float = 0.0,
     stress_active: bool = False,
+    dynamic_threshold_enabled: bool = False,
+    dynamic_threshold_loss_ratio_scale: float = 0.0,
+    dynamic_threshold_max_extra_ratio: float = 0.0,
     current_long_qty: float,
     current_short_qty: float,
     current_long_avg_price: float,
@@ -3380,6 +3383,17 @@ def _apply_best_quote_reduce_freeze(
     report["hard_confirm_cycles"] = max(int(hard_confirm_cycles), 0)
     report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
     report["stress_active"] = bool(stress_active)
+    dynamic_threshold_scale = max(_safe_float(dynamic_threshold_loss_ratio_scale), 0.0)
+    dynamic_threshold_max_extra = max(_safe_float(dynamic_threshold_max_extra_ratio), 0.0)
+    dynamic_threshold_active = bool(dynamic_threshold_enabled) and dynamic_threshold_scale > 0
+    report["dynamic_threshold"] = {
+        "enabled": bool(dynamic_threshold_enabled),
+        "active": dynamic_threshold_active,
+        "loss_ratio_scale": dynamic_threshold_scale,
+        "max_extra_ratio": dynamic_threshold_max_extra,
+        "long_extra_ratio": 0.0,
+        "short_extra_ratio": 0.0,
+    }
     if (
         not enabled
         or (report["threshold_loss_ratio"] <= 0 and report["hard_loss_ratio"] <= 0)
@@ -3417,17 +3431,38 @@ def _apply_best_quote_reduce_freeze(
         effective_threshold = max(threshold, _safe_float(stress_loss_ratio))
     report["effective_threshold_loss_ratio"] = effective_threshold
     hard_freeze_enabled = _safe_float(report["hard_loss_ratio"]) > 0
-    freeze_threshold = effective_threshold
+    def _dynamic_freeze_threshold(side_loss_ratio: float) -> tuple[float, float]:
+        extra = 0.0
+        if dynamic_threshold_active and side_loss_ratio > 0:
+            extra = max(side_loss_ratio, 0.0) * dynamic_threshold_scale
+            if dynamic_threshold_max_extra > 0:
+                extra = min(extra, dynamic_threshold_max_extra)
+        return effective_threshold + extra, extra
+
+    long_freeze_threshold, long_dynamic_extra = _dynamic_freeze_threshold(long_loss_ratio)
+    short_freeze_threshold, short_dynamic_extra = _dynamic_freeze_threshold(short_loss_ratio)
+    report["dynamic_threshold"].update(
+        {
+            "long_loss_ratio": long_loss_ratio,
+            "short_loss_ratio": short_loss_ratio,
+            "long_extra_ratio": long_dynamic_extra,
+            "short_extra_ratio": short_dynamic_extra,
+        }
+    )
     freeze_min_notional = min_notional_value
     freeze_confirm_cycles = max(int(confirm_cycles), 1)
     freeze_reason = "reduce_loss_ratio_threshold"
     if hard_freeze_enabled:
-        freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), effective_threshold)
+        long_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), long_freeze_threshold)
+        short_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), short_freeze_threshold)
         freeze_min_notional = _safe_float(report["hard_min_notional"]) or min_notional_value
         freeze_confirm_cycles = max(int(report["hard_confirm_cycles"] or confirm_cycles), 1)
         freeze_reason = "reduce_hard_loss_threshold"
+    freeze_threshold = max(long_freeze_threshold, short_freeze_threshold)
     report["hard_freeze_enabled"] = bool(hard_freeze_enabled)
     report["freeze_threshold_loss_ratio"] = freeze_threshold
+    report["long_freeze_threshold_loss_ratio"] = long_freeze_threshold
+    report["short_freeze_threshold_loss_ratio"] = short_freeze_threshold
     report["freeze_min_notional"] = freeze_min_notional
     report["freeze_confirm_cycles"] = freeze_confirm_cycles
     frozen_long_qty = _safe_float(report.get("frozen_long_qty"))
@@ -3444,12 +3479,16 @@ def _apply_best_quote_reduce_freeze(
     managed_short_notional = managed_short_qty * _safe_float(mid_price)
     protected_candidates: list[dict[str, Any]] = []
 
+    def _side_freeze_threshold(side: str) -> float:
+        return long_freeze_threshold if str(side).upper() == "LONG" else short_freeze_threshold
+
     def _record_protected(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> None:
         if not hard_freeze_enabled:
             return
+        side_threshold = _side_freeze_threshold(side)
         if not reduce_planned or qty <= 1e-12 or notional < min_notional_value or loss_ratio < effective_threshold:
             return
-        if notional >= freeze_min_notional and loss_ratio >= freeze_threshold:
+        if notional >= freeze_min_notional and loss_ratio >= side_threshold:
             return
         protected_candidates.append(
             {
@@ -3458,14 +3497,15 @@ def _apply_best_quote_reduce_freeze(
                 "notional": notional,
                 "loss_ratio": loss_ratio,
                 "protective_threshold_loss_ratio": effective_threshold,
-                "freeze_threshold_loss_ratio": freeze_threshold,
+                "freeze_threshold_loss_ratio": side_threshold,
                 "freeze_min_notional": freeze_min_notional,
             }
         )
 
     def _confirmed(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> bool:
         side_key = side.lower()
-        if not reduce_planned or notional < freeze_min_notional or qty <= 1e-12 or loss_ratio < freeze_threshold:
+        side_threshold = _side_freeze_threshold(side)
+        if not reduce_planned or notional < freeze_min_notional or qty <= 1e-12 or loss_ratio < side_threshold:
             confirmations.pop(side_key, None)
             return False
         needed = max(int(freeze_confirm_cycles), 1)
@@ -3480,7 +3520,7 @@ def _apply_best_quote_reduce_freeze(
             else 0.0
         )
         same_candidate = (
-            abs(previous_threshold - freeze_threshold) <= 1e-12
+            abs(previous_threshold - side_threshold) <= 1e-12
             and bool(previous.get("stress_active")) == bool(stress_active)
             and bool(previous.get("hard_freeze_enabled")) == bool(hard_freeze_enabled)
         )
@@ -3494,7 +3534,7 @@ def _apply_best_quote_reduce_freeze(
             "loss_ratio": loss_ratio,
             "base_threshold_loss_ratio": threshold,
             "effective_threshold_loss_ratio": effective_threshold,
-            "freeze_threshold_loss_ratio": freeze_threshold,
+            "freeze_threshold_loss_ratio": side_threshold,
             "hard_freeze_enabled": bool(hard_freeze_enabled),
             "stress_active": bool(stress_active),
             "first_seen_at": previous.get("first_seen_at") if same_candidate else now_iso,
@@ -3520,7 +3560,7 @@ def _apply_best_quote_reduce_freeze(
                 "reason": freeze_reason,
                 "loss_ratio": long_loss_ratio,
                 "effective_threshold_loss_ratio": effective_threshold,
-                "freeze_threshold_loss_ratio": freeze_threshold,
+                "freeze_threshold_loss_ratio": long_freeze_threshold,
                 "confirm_cycles": freeze_confirm_cycles,
                 "hard_freeze_enabled": bool(hard_freeze_enabled),
                 "stress_active": bool(stress_active),
@@ -3548,7 +3588,7 @@ def _apply_best_quote_reduce_freeze(
                 "reason": freeze_reason,
                 "loss_ratio": short_loss_ratio,
                 "effective_threshold_loss_ratio": effective_threshold,
-                "freeze_threshold_loss_ratio": freeze_threshold,
+                "freeze_threshold_loss_ratio": short_freeze_threshold,
                 "confirm_cycles": freeze_confirm_cycles,
                 "hard_freeze_enabled": bool(hard_freeze_enabled),
                 "stress_active": bool(stress_active),
@@ -3592,10 +3632,22 @@ def _apply_best_quote_reduce_freeze(
         report["hard_confirm_cycles"] = max(int(hard_confirm_cycles), 0)
         report["hard_freeze_enabled"] = bool(hard_freeze_enabled)
         report["freeze_threshold_loss_ratio"] = freeze_threshold
+        report["long_freeze_threshold_loss_ratio"] = long_freeze_threshold
+        report["short_freeze_threshold_loss_ratio"] = short_freeze_threshold
         report["freeze_min_notional"] = freeze_min_notional
         report["freeze_confirm_cycles"] = freeze_confirm_cycles
         report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
         report["stress_active"] = bool(stress_active)
+        report["dynamic_threshold"] = {
+            "enabled": bool(dynamic_threshold_enabled),
+            "active": dynamic_threshold_active,
+            "loss_ratio_scale": dynamic_threshold_scale,
+            "max_extra_ratio": dynamic_threshold_max_extra,
+            "long_loss_ratio": long_loss_ratio,
+            "short_loss_ratio": short_loss_ratio,
+            "long_extra_ratio": long_dynamic_extra,
+            "short_extra_ratio": short_dynamic_extra,
+        }
         report["confirmations"] = dict(confirmations)
         report["min_notional"] = min_notional_value
         report["protected_candidates"] = protected_candidates
@@ -16488,6 +16540,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             ),
             0.0,
         )
+        best_quote_reduce_freeze_dynamic_threshold_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled", False)
+        )
+        best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
         best_quote_frozen_pair_release_enabled = bool(
             getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_enabled", False)
         )
@@ -16560,6 +16635,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "stress_loss_ratio": best_quote_reduce_freeze_stress_loss_ratio,
                 "stress_1m_abs_return_ratio": best_quote_reduce_freeze_stress_1m_abs_return_ratio,
                 "stress_1m_amplitude_ratio": best_quote_reduce_freeze_stress_1m_amplitude_ratio,
+                "dynamic_threshold_enabled": best_quote_reduce_freeze_dynamic_threshold_enabled,
+                "dynamic_threshold_loss_ratio_scale": best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale,
+                "dynamic_threshold_max_extra_ratio": best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio,
                 "min_notional": best_quote_reduce_freeze_min_notional,
                 "soft_ratio_scale": best_quote_reduce_freeze_soft_scale,
                 "base_inventory_soft_ratio": float(
@@ -16606,6 +16684,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             hard_confirm_cycles=best_quote_reduce_freeze_hard_confirm_cycles,
             stress_loss_ratio=best_quote_reduce_freeze_stress_loss_ratio,
             stress_active=best_quote_reduce_freeze_stress_active,
+            dynamic_threshold_enabled=best_quote_reduce_freeze_dynamic_threshold_enabled,
+            dynamic_threshold_loss_ratio_scale=best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale,
+            dynamic_threshold_max_extra_ratio=best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio,
             current_long_qty=current_long_qty,
             current_short_qty=current_short_qty,
             current_long_avg_price=current_long_avg_price,
@@ -19768,6 +19849,21 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-loss-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-loss-ratio-scale",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-max-extra-ratio",
+        type=float,
+        default=0.0,
+    )
     parser.add_argument("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale", type=float, default=0.70)
     parser.add_argument("--best-quote-maker-volume-frozen-total-cap-notional", type=float, default=0.0)
     parser.add_argument(
@@ -20972,6 +21068,8 @@ def main() -> None:
         or args.best_quote_maker_volume_reduce_freeze_stress_loss_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio < 0
         or args.best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio < 0
         or args.best_quote_maker_volume_frozen_total_cap_notional < 0
     ):
         raise SystemExit("--best-quote-maker-volume-reduce-freeze values must be >= 0")
