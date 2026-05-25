@@ -54,6 +54,7 @@ from grid_optimizer.loop_runner import (
     sync_best_quote_frozen_pair_release,
     apply_best_quote_frozen_inventory_manual_reduce,
     apply_best_quote_frozen_inventory_manual_limit,
+    _build_best_quote_frozen_pair_release_auto_directive,
     apply_best_quote_frozen_inventory_pair_release,
     _position_unrealized_or_estimate,
     _is_long_exit_order,
@@ -2393,6 +2394,36 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(release["active"])
         self.assertEqual(report["frozen_pair_eligible_long_qty"], 70.0)
         self.assertEqual(release["release_qty"], 70.0)
+
+    def test_best_quote_frozen_pair_release_auto_directive_uses_pair_eligible_qty(self) -> None:
+        directive = _build_best_quote_frozen_pair_release_auto_directive(
+            report={
+                "frozen_pair_eligible_long_qty": 160.0,
+                "frozen_pair_eligible_short_qty": 100.0,
+            },
+            mid_price=0.62,
+            max_notional=120.0,
+            now=datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertTrue(directive["requested"])
+        self.assertEqual(directive["source"], "auto_frozen_pair_release")
+        self.assertEqual(directive["requested_qty"], 100.0)
+        self.assertTrue(directive["request_id"].startswith("auto-pair-"))
+        self.assertIn("expires_at", directive)
+
+    def test_best_quote_frozen_pair_release_auto_directive_caps_by_notional(self) -> None:
+        directive = _build_best_quote_frozen_pair_release_auto_directive(
+            report={
+                "frozen_pair_eligible_long_qty": 300.0,
+                "frozen_pair_eligible_short_qty": 300.0,
+            },
+            mid_price=0.6,
+            max_notional=60.0,
+            now=datetime(2026, 5, 25, 12, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertEqual(directive["requested_qty"], 100.0)
 
     def test_best_quote_frozen_pair_release_places_paired_ioc_when_stable_and_profitable(self) -> None:
         state: dict[str, object] = {

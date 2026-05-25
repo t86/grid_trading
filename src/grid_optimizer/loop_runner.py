@@ -4243,6 +4243,42 @@ def apply_best_quote_frozen_inventory_manual_limit(
     return limit_report
 
 
+def _build_best_quote_frozen_pair_release_auto_directive(
+    *,
+    report: Mapping[str, Any] | dict[str, Any],
+    mid_price: float,
+    max_notional: float,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    frozen_long_qty = max(
+        _safe_float((report or {}).get("frozen_pair_eligible_long_qty", (report or {}).get("frozen_long_qty"))),
+        0.0,
+    )
+    frozen_short_qty = max(
+        _safe_float((report or {}).get("frozen_pair_eligible_short_qty", (report or {}).get("frozen_short_qty"))),
+        0.0,
+    )
+    offset_qty = min(frozen_long_qty, frozen_short_qty)
+    if offset_qty <= 1e-12 or safe_mid <= 0:
+        return {}
+    safe_max_notional = max(_safe_float(max_notional), 0.0)
+    requested_qty = offset_qty
+    if safe_max_notional > 0:
+        requested_qty = min(requested_qty, safe_max_notional / safe_mid)
+    if requested_qty <= 1e-12:
+        return {}
+    checked_at = (now or _utc_now()).astimezone(timezone.utc)
+    return {
+        "requested": True,
+        "request_id": f"auto-pair-{int(checked_at.timestamp() * 1000)}",
+        "requested_at": checked_at.isoformat(),
+        "expires_at": (checked_at + timedelta(minutes=10)).isoformat(),
+        "requested_qty": requested_qty,
+        "source": "auto_frozen_pair_release",
+    }
+
+
 def apply_best_quote_frozen_inventory_pair_release(
     *,
     plan: dict[str, Any],
@@ -17676,16 +17712,46 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         best_quote_frozen_pair_release_directive = dict(
             state.get("best_quote_frozen_inventory_pair_release") or {}
         )
-        best_quote_frozen_pair_release_requested = bool(
+        best_quote_frozen_pair_release_directive_requested = bool(
             best_quote_frozen_pair_release_directive.get("requested")
+        )
+        best_quote_frozen_pair_release_auto_requested = (
+            best_quote_frozen_pair_release_directive_requested
+            and str(best_quote_frozen_pair_release_directive.get("source") or "") == "auto_frozen_pair_release"
+        )
+        best_quote_frozen_pair_release_manual_requested = (
+            best_quote_frozen_pair_release_directive_requested
+            and not best_quote_frozen_pair_release_auto_requested
         )
         best_quote_frozen_pair_release_authorized, best_quote_frozen_pair_release_auth_reason = (
             _frozen_inventory_directive_authorized(best_quote_frozen_pair_release_directive)
-            if best_quote_frozen_pair_release_requested
+            if best_quote_frozen_pair_release_directive_requested
             else (False, "not_requested")
         )
-        if best_quote_frozen_pair_release_requested and not best_quote_frozen_pair_release_authorized:
+        if best_quote_frozen_pair_release_directive_requested and not best_quote_frozen_pair_release_authorized:
             state.pop("best_quote_frozen_inventory_pair_release", None)
+            best_quote_frozen_pair_release_directive = {}
+            best_quote_frozen_pair_release_manual_requested = False
+            best_quote_frozen_pair_release_auto_requested = False
+            best_quote_frozen_pair_release_directive_requested = False
+        if (
+            not best_quote_frozen_pair_release_directive_requested
+            and best_quote_frozen_pair_release_enabled
+            and not bool(state.get("best_quote_frozen_inventory_manual_reduce"))
+        ):
+            auto_directive = _build_best_quote_frozen_pair_release_auto_directive(
+                report=best_quote_reduce_freeze,
+                mid_price=mid_price,
+                max_notional=best_quote_frozen_pair_release_max_notional,
+            )
+            if auto_directive:
+                best_quote_frozen_pair_release_directive = auto_directive
+                best_quote_frozen_pair_release_auto_requested = True
+                best_quote_frozen_pair_release_authorized = True
+                best_quote_frozen_pair_release_auth_reason = "auto_authorized"
+        best_quote_frozen_pair_release_requested = bool(
+            best_quote_frozen_pair_release_manual_requested or best_quote_frozen_pair_release_auto_requested
+        )
         best_quote_frozen_pair_release = apply_best_quote_frozen_inventory_pair_release(
             plan=plan,
             report=best_quote_reduce_freeze,
@@ -17720,15 +17786,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
         best_quote_frozen_pair_release.update(
             {
-                "auto_enabled_ignored": bool(best_quote_frozen_pair_release_enabled),
+                "auto_enabled": bool(best_quote_frozen_pair_release_enabled),
+                "auto_requested": bool(best_quote_frozen_pair_release_auto_requested),
                 "authorization_reason": best_quote_frozen_pair_release_auth_reason,
-                "one_shot_requested": best_quote_frozen_pair_release_requested,
+                "one_shot_requested": best_quote_frozen_pair_release_manual_requested,
                 "one_shot_requested_at": str(best_quote_frozen_pair_release_directive.get("requested_at") or ""),
                 "one_shot_requested_qty": max(
                     _safe_float(best_quote_frozen_pair_release_directive.get("requested_qty")),
                     0.0,
                 )
-                if best_quote_frozen_pair_release_requested
+                if best_quote_frozen_pair_release_manual_requested
                 else 0.0,
                 "max_notional": best_quote_frozen_pair_release_max_notional,
                 "min_side_notional": best_quote_frozen_pair_release_min_side_notional,
