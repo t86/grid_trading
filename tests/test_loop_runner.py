@@ -49,6 +49,7 @@ from grid_optimizer.loop_runner import (
     _cap_best_quote_reduce_orders_to_managed_inventory,
     reconcile_best_quote_volume_ledger_surplus,
     sync_best_quote_volume_ledger,
+    sync_best_quote_frozen_pair_release,
     apply_best_quote_frozen_inventory_manual_reduce,
     apply_best_quote_frozen_inventory_manual_limit,
     apply_best_quote_frozen_inventory_pair_release,
@@ -122,6 +123,7 @@ from grid_optimizer.loop_runner import (
     sync_synthetic_ledger,
     update_synthetic_order_refs,
     _suppress_place_orders_during_runtime_guard_loss_cooldown,
+    isolate_frozen_pair_release_place_orders,
     _isolated_frozen_actions_tolerate_position_drift,
     _hedge_best_quote_position_diff_effectively_dust,
     _apply_best_quote_entry_inventory_cap_guard,
@@ -2365,6 +2367,103 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["qty"], 7.0)
         self.assertEqual(plan["buy_orders"][0]["qty"], 7.0)
 
+    def test_best_quote_frozen_pair_release_repairs_missing_short_leg(self) -> None:
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report={
+                "frozen_long_qty": 100.0,
+                "frozen_short_qty": 100.0,
+                "ledger": {"long_entry_price": 1.0, "short_entry_price": 1.05},
+            },
+            bid_price=1.009,
+            ask_price=1.011,
+            tick_size=0.001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            hedge_mode=True,
+            enabled=True,
+            stable_allowed=True,
+            max_notional=100.0,
+            min_side_notional=0.0,
+            min_profit_ratio=0.0,
+            max_slippage_ticks=2,
+            requested_qty=100.0,
+            request_id="req-pair",
+            filled_long_qty=100.0,
+            filled_short_qty=40.0,
+            paired_released_qty=40.0,
+        )
+
+        self.assertTrue(release["active"])
+        self.assertEqual(release["release_qty"], 60.0)
+        self.assertEqual(release["repair_side"], "short")
+        self.assertEqual(plan["sell_orders"], [])
+        self.assertEqual(plan["buy_orders"][0]["role"], "frozen_inventory_pair_release_short")
+        self.assertEqual(plan["buy_orders"][0]["qty"], 60.0)
+
+    def test_sync_best_quote_frozen_pair_release_deducts_only_confirmed_pair_qty(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "long_lots": [{"qty": 100.0, "entry_price": 1.0}],
+                "short_lots": [{"qty": 100.0, "entry_price": 1.05}],
+            },
+            "best_quote_frozen_inventory_pair_release": {
+                "requested": True,
+                "request_id": "req-pair",
+                "requested_qty": 100.0,
+            },
+            "best_quote_volume_order_refs": {
+                "11": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_pair_release_long",
+                    "side": "SELL",
+                    "position_side": "LONG",
+                    "frozen_inventory_request_id": "req-pair",
+                },
+                "12": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_pair_release_short",
+                    "side": "BUY",
+                    "position_side": "SHORT",
+                    "frozen_inventory_request_id": "req-pair",
+                },
+            },
+        }
+
+        first = sync_best_quote_frozen_pair_release(
+            state=state,
+            observed_trade_rows=[
+                {"orderId": 11, "side": "SELL", "positionSide": "LONG", "qty": "100", "price": "1.009", "time": 1000},
+                {"orderId": 12, "side": "BUY", "positionSide": "SHORT", "qty": "40", "price": "1.011", "time": 1001},
+            ],
+        )
+
+        frozen = state["best_quote_frozen_inventory"]
+        directive = state["best_quote_frozen_inventory_pair_release"]
+        self.assertEqual(first["new_paired_release_qty"], 40.0)
+        self.assertEqual(first["repair_side"], "short")
+        self.assertEqual(frozen["long_qty"], 60.0)
+        self.assertEqual(frozen["short_qty"], 60.0)
+        self.assertEqual(directive["filled_long_qty"], 100.0)
+        self.assertEqual(directive["filled_short_qty"], 40.0)
+        self.assertEqual(directive["paired_released_qty"], 40.0)
+
+        second = sync_best_quote_frozen_pair_release(
+            state=state,
+            observed_trade_rows=[
+                {"orderId": 12, "side": "BUY", "positionSide": "SHORT", "qty": "60", "price": "1.011", "time": 1002},
+            ],
+        )
+
+        frozen = state["best_quote_frozen_inventory"]
+        self.assertEqual(second["new_paired_release_qty"], 60.0)
+        self.assertEqual(frozen["long_qty"], 0.0)
+        self.assertEqual(frozen["short_qty"], 0.0)
+        self.assertNotIn("best_quote_frozen_inventory_pair_release", state)
+
     def test_best_quote_frozen_pair_release_requires_both_sides_above_min_notional(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
 
@@ -4138,6 +4237,28 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertAlmostEqual(actions["place_notional"], 260.0, places=8)
         self.assertEqual(report["execution_request_budget"]["deferred_cancel_count"], 0)
         self.assertEqual(report["execution_request_budget"]["deferred_place_count"], 2)
+
+    def test_isolate_frozen_pair_release_place_orders_defers_normal_places(self) -> None:
+        actions = {
+            "place_orders": [
+                {"role": "best_quote_entry_long", "side": "BUY", "qty": 10.0, "price": 0.99, "notional": 9.9},
+                {"role": "frozen_inventory_pair_release_long", "side": "SELL", "qty": 10.0, "price": 1.01, "notional": 10.1},
+                {"role": "best_quote_entry_short", "side": "SELL", "qty": 10.0, "price": 1.02, "notional": 10.2},
+                {"role": "frozen_inventory_pair_release_short", "side": "BUY", "qty": 10.0, "price": 1.0, "notional": 10.0},
+            ],
+            "cancel_orders": [],
+            "place_count": 4,
+            "cancel_count": 0,
+        }
+
+        isolated = isolate_frozen_pair_release_place_orders(actions)
+
+        self.assertEqual(
+            [item["role"] for item in isolated["place_orders"]],
+            ["frozen_inventory_pair_release_long", "frozen_inventory_pair_release_short"],
+        )
+        self.assertEqual(isolated["place_count"], 2)
+        self.assertEqual(isolated["frozen_pair_release_exclusive"]["deferred_place_count"], 2)
 
     def test_inventory_reducing_place_priority_keeps_long_exits_before_new_buys(self) -> None:
         actions = {

@@ -3111,6 +3111,160 @@ def sync_best_quote_volume_ledger(
     return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
 
 
+def _refresh_best_quote_frozen_inventory_quantities(frozen: dict[str, Any]) -> dict[str, Any]:
+    long_lots = _normalize_best_quote_volume_lots(frozen.get("long_lots"))
+    short_lots = _normalize_best_quote_volume_lots(frozen.get("short_lots"))
+
+    def _entry_lots(lots: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        normalized: list[dict[str, Any]] = []
+        for item in lots:
+            lot = dict(item)
+            price = max(_safe_float(lot.get("entry_price", lot.get("price"))), _safe_float(lot.get("price")), 0.0)
+            lot["entry_price"] = price
+            lot["price"] = price
+            normalized.append(lot)
+        return normalized
+
+    long_lots = _entry_lots(long_lots)
+    short_lots = _entry_lots(short_lots)
+    long_qty, long_entry = _best_quote_volume_book_from_lots(long_lots)
+    short_qty, short_entry = _best_quote_volume_book_from_lots(short_lots)
+    long_manual_limit_isolated_qty = min(max(_safe_float(frozen.get("long_manual_limit_isolated_qty")), 0.0), long_qty)
+    short_manual_limit_isolated_qty = min(max(_safe_float(frozen.get("short_manual_limit_isolated_qty")), 0.0), short_qty)
+    pair_eligible_long_qty = max(long_qty - long_manual_limit_isolated_qty, 0.0)
+    pair_eligible_short_qty = max(short_qty - short_manual_limit_isolated_qty, 0.0)
+    frozen.update(
+        {
+            "long_lots": long_lots,
+            "short_lots": short_lots,
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+            "long_entry_price": long_entry,
+            "short_entry_price": short_entry,
+            "long_manual_limit_isolated_qty": long_manual_limit_isolated_qty,
+            "short_manual_limit_isolated_qty": short_manual_limit_isolated_qty,
+            "pair_eligible_long_qty": pair_eligible_long_qty,
+            "pair_eligible_short_qty": pair_eligible_short_qty,
+            "offset_qty": min(pair_eligible_long_qty, pair_eligible_short_qty),
+            "updated_at": _utc_now().isoformat(),
+        }
+    )
+    return frozen
+
+
+def sync_best_quote_frozen_pair_release(
+    *,
+    state: dict[str, Any],
+    observed_trade_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    directive = dict(state.get("best_quote_frozen_inventory_pair_release") or {})
+    request_id = str(directive.get("request_id") or "").strip()
+    report = {
+        "enabled": bool(request_id),
+        "request_id": request_id,
+        "new_long_fill_qty": 0.0,
+        "new_short_fill_qty": 0.0,
+        "filled_long_qty": max(_safe_float(directive.get("filled_long_qty")), 0.0),
+        "filled_short_qty": max(_safe_float(directive.get("filled_short_qty")), 0.0),
+        "paired_released_qty": max(_safe_float(directive.get("paired_released_qty")), 0.0),
+        "new_paired_release_qty": 0.0,
+        "repair_side": "",
+        "completed": False,
+    }
+    if not request_id:
+        return report
+
+    refs = state.get("best_quote_volume_order_refs")
+    order_refs = refs if isinstance(refs, Mapping) else {}
+    applied_fill_keys = [
+        str(item).strip()
+        for item in list(directive.get("applied_trade_fill_keys") or [])
+        if str(item).strip()
+    ]
+    applied_fill_key_set = set(applied_fill_keys)
+    long_delta = 0.0
+    short_delta = 0.0
+    for row in [dict(item) for item in list(observed_trade_rows or []) if isinstance(item, dict)]:
+        fill_key = _best_quote_trade_fill_key(row)
+        if fill_key and fill_key in applied_fill_key_set:
+            continue
+        order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
+        ref = order_refs.get(order_id) if order_id else None
+        ref = ref if isinstance(ref, Mapping) else {}
+        row_request_id = str(
+            row.get("frozen_inventory_request_id")
+            or row.get("request_id")
+            or ref.get("frozen_inventory_request_id")
+            or ""
+        ).strip()
+        if row_request_id != request_id:
+            continue
+        role = str(row.get("role") or ref.get("role") or "").lower().strip()
+        qty = max(_safe_float(row.get("qty")), 0.0)
+        if qty <= 1e-12:
+            continue
+        if role == "frozen_inventory_pair_release_long":
+            long_delta += qty
+        elif role == "frozen_inventory_pair_release_short":
+            short_delta += qty
+        else:
+            continue
+        if fill_key:
+            applied_fill_keys.append(fill_key)
+            applied_fill_key_set.add(fill_key)
+
+    filled_long_qty = report["filled_long_qty"] + long_delta
+    filled_short_qty = report["filled_short_qty"] + short_delta
+    requested_qty = max(_safe_float(directive.get("requested_qty")), 0.0)
+    paired_total = min(filled_long_qty, filled_short_qty)
+    if requested_qty > 0:
+        paired_total = min(paired_total, requested_qty)
+    previous_paired = report["paired_released_qty"]
+    new_paired = max(paired_total - previous_paired, 0.0)
+    if new_paired > 1e-12:
+        frozen = dict(state.get("best_quote_frozen_inventory") or {})
+        long_lots = _normalize_best_quote_volume_lots(frozen.get("long_lots"))
+        short_lots = _normalize_best_quote_volume_lots(frozen.get("short_lots"))
+        long_lots, _, _ = _best_quote_volume_consume_fifo(long_lots, new_paired)
+        short_lots, _, _ = _best_quote_volume_consume_fifo(short_lots, new_paired)
+        frozen["long_lots"] = long_lots
+        frozen["short_lots"] = short_lots
+        state["best_quote_frozen_inventory"] = _refresh_best_quote_frozen_inventory_quantities(frozen)
+
+    report.update(
+        {
+            "new_long_fill_qty": long_delta,
+            "new_short_fill_qty": short_delta,
+            "filled_long_qty": filled_long_qty,
+            "filled_short_qty": filled_short_qty,
+            "paired_released_qty": paired_total,
+            "new_paired_release_qty": new_paired,
+        }
+    )
+    if filled_long_qty > filled_short_qty + 1e-12:
+        report["repair_side"] = "short"
+    elif filled_short_qty > filled_long_qty + 1e-12:
+        report["repair_side"] = "long"
+    completed = requested_qty > 0 and paired_total + 1e-12 >= requested_qty
+    report["completed"] = completed
+    if completed:
+        state.pop("best_quote_frozen_inventory_pair_release", None)
+    else:
+        directive.update(
+            {
+                "requested": True,
+                "filled_long_qty": filled_long_qty,
+                "filled_short_qty": filled_short_qty,
+                "paired_released_qty": paired_total,
+                "repair_side": report["repair_side"],
+                "applied_trade_fill_keys": applied_fill_keys[-10000:],
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+        state["best_quote_frozen_inventory_pair_release"] = directive
+    return report
+
+
 def _transfer_best_quote_volume_to_frozen(
     *,
     state: dict[str, Any],
@@ -3969,6 +4123,9 @@ def apply_best_quote_frozen_inventory_pair_release(
     allow_loss: bool = False,
     requested_qty: float | None = None,
     request_id: str | None = None,
+    filled_long_qty: float = 0.0,
+    filled_short_qty: float = 0.0,
+    paired_released_qty: float = 0.0,
 ) -> dict[str, Any]:
     ledger = dict(report.get("ledger") or {})
     release_report = {
@@ -3988,6 +4145,7 @@ def apply_best_quote_frozen_inventory_pair_release(
         "required_profit": 0.0,
         "allow_loss": bool(allow_loss),
         "profit_buffer_bypassed": False,
+        "repair_side": "",
     }
     if not enabled:
         release_report["blocked_reasons"].append("disabled")
@@ -4002,6 +4160,12 @@ def apply_best_quote_frozen_inventory_pair_release(
 
     frozen_long_qty = max(_safe_float(report.get("frozen_pair_eligible_long_qty", report.get("frozen_long_qty"))), 0.0)
     frozen_short_qty = max(_safe_float(report.get("frozen_pair_eligible_short_qty", report.get("frozen_short_qty"))), 0.0)
+    filled_long = max(_safe_float(filled_long_qty), 0.0)
+    filled_short = max(_safe_float(filled_short_qty), 0.0)
+    paired_released = max(_safe_float(paired_released_qty), 0.0)
+    missing_long_qty = max(filled_short - filled_long, 0.0)
+    missing_short_qty = max(filled_long - filled_short, 0.0)
+    repair_side = "long" if missing_long_qty > 1e-12 else "short" if missing_short_qty > 1e-12 else ""
     offset_qty = min(frozen_long_qty, frozen_short_qty)
     safe_bid = max(_safe_float(bid_price), 0.0)
     safe_ask = max(_safe_float(ask_price), 0.0)
@@ -4026,11 +4190,15 @@ def apply_best_quote_frozen_inventory_pair_release(
 
     max_qty = offset_qty
     safe_max_notional = max(_safe_float(max_notional), 0.0)
-    if safe_max_notional > 0:
+    if repair_side == "long":
+        max_qty = min(frozen_long_qty, missing_long_qty)
+    elif repair_side == "short":
+        max_qty = min(frozen_short_qty, missing_short_qty)
+    if safe_max_notional > 0 and not repair_side:
         max_qty = min(max_qty, safe_max_notional / mid_price)
     safe_requested_qty = max(_safe_float(requested_qty), 0.0) if requested_qty is not None else 0.0
-    if safe_requested_qty > 0:
-        max_qty = min(max_qty, safe_requested_qty)
+    if safe_requested_qty > 0 and not repair_side:
+        max_qty = min(max_qty, max(safe_requested_qty - paired_released, 0.0))
     qty = _round_order_qty(max_qty, step_size)
     safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
     if qty <= 0 or (safe_min_qty > 0 and qty + 1e-12 < safe_min_qty):
@@ -4080,6 +4248,7 @@ def apply_best_quote_frozen_inventory_pair_release(
     release_report["required_profit"] = required_profit
     release_report["release_qty"] = qty
     release_report["release_notional"] = release_notional
+    release_report["repair_side"] = repair_side
     if estimated_pair_pnl + 1e-12 < required_profit and not allow_loss:
         release_report["blocked_reasons"].append("pair_pnl_below_buffer")
         return release_report
@@ -4112,12 +4281,17 @@ def apply_best_quote_frozen_inventory_pair_release(
         "frozen_inventory_pair_release": True,
         "frozen_inventory_request_id": safe_request_id,
     }
-    plan["sell_orders"] = [sell_order, *list(plan.get("sell_orders") or [])]
-    plan["buy_orders"] = [buy_order, *list(plan.get("buy_orders") or [])]
-    release_report["placed_long"] = True
-    release_report["placed_short"] = True
+    placed_orders: list[dict[str, Any]] = []
+    if repair_side in {"", "long"}:
+        plan["sell_orders"] = [sell_order, *list(plan.get("sell_orders") or [])]
+        release_report["placed_long"] = True
+        placed_orders.append(dict(sell_order))
+    if repair_side in {"", "short"}:
+        plan["buy_orders"] = [buy_order, *list(plan.get("buy_orders") or [])]
+        release_report["placed_short"] = True
+        placed_orders.append(dict(buy_order))
     release_report["active"] = True
-    release_report["orders"] = [dict(sell_order), dict(buy_order)]
+    release_report["orders"] = placed_orders
     return release_report
 
 
@@ -6474,6 +6648,7 @@ def update_best_quote_volume_order_refs(
             ).upper().strip()
             or "BOTH",
             "client_order_id": str(response.get("clientOrderId", "")).strip(),
+            "frozen_inventory_request_id": str(request.get("frozen_inventory_request_id") or "").strip(),
             "updated_at": _isoformat(_utc_now()),
         }
 
@@ -8352,6 +8527,30 @@ def _is_authorized_frozen_inventory_order(order: Mapping[str, Any] | dict[str, A
     if not _is_frozen_inventory_manual_order(order):
         return True
     return bool(str((order or {}).get("frozen_inventory_request_id") or "").strip())
+
+
+def _is_frozen_inventory_pair_release_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
+    role = str((order or {}).get("role") or "").lower().strip()
+    return bool(role.startswith("frozen_inventory_pair_release_") or (order or {}).get("frozen_inventory_pair_release"))
+
+
+def isolate_frozen_pair_release_place_orders(actions: dict[str, Any]) -> dict[str, Any]:
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    pair_orders = [item for item in place_orders if _is_frozen_inventory_pair_release_order(item)]
+    if not pair_orders:
+        return actions
+    deferred_orders = [item for item in place_orders if not _is_frozen_inventory_pair_release_order(item)]
+    result = dict(actions)
+    result["place_orders"] = pair_orders
+    result["place_count"] = len(pair_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in pair_orders)
+    result["frozen_pair_release_exclusive"] = {
+        "enabled": True,
+        "kept_place_count": len(pair_orders),
+        "deferred_place_count": len(deferred_orders),
+        "deferred_place_orders": deferred_orders,
+    }
+    return result
 
 
 def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | dict[str, Any]) -> bool:
@@ -14657,7 +14856,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if "bestquot" in str(order.get("clientOrderId") or "").lower()
             ),
         )
+        best_quote_frozen_pair_release_sync = sync_best_quote_frozen_pair_release(
+            state=state,
+            observed_trade_rows=observed_trade_rows,
+        )
         best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
+        best_quote_maker_volume["frozen_pair_release_sync"] = dict(best_quote_frozen_pair_release_sync)
 
     elastic_volume_config = _elastic_volume_config(effective_args)
     competition_start_time = None
@@ -17295,6 +17499,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 else None
             ),
             request_id=str(best_quote_frozen_pair_release_directive.get("request_id") or ""),
+            filled_long_qty=_safe_float(best_quote_frozen_pair_release_directive.get("filled_long_qty")),
+            filled_short_qty=_safe_float(best_quote_frozen_pair_release_directive.get("filled_short_qty")),
+            paired_released_qty=_safe_float(best_quote_frozen_pair_release_directive.get("paired_released_qty")),
         )
         best_quote_frozen_pair_release.update(
             {
@@ -17322,7 +17529,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             }
         )
         if best_quote_frozen_pair_release_requested and bool(best_quote_frozen_pair_release.get("active")):
-            state.pop("best_quote_frozen_inventory_pair_release", None)
+            kept_directive = dict(state.get("best_quote_frozen_inventory_pair_release") or best_quote_frozen_pair_release_directive)
+            kept_directive.update(
+                {
+                    "requested": True,
+                    "last_submitted_at": _utc_now().isoformat(),
+                    "last_submitted_orders": list(best_quote_frozen_pair_release.get("orders") or []),
+                    "last_submitted_release_qty": _safe_float(best_quote_frozen_pair_release.get("release_qty")),
+                    "last_repair_side": str(best_quote_frozen_pair_release.get("repair_side") or ""),
+                }
+            )
+            state["best_quote_frozen_inventory_pair_release"] = kept_directive
         best_quote_frozen_total_cap = {
             "enabled": best_quote_frozen_total_cap_notional > 0,
             "active": False,
@@ -19109,6 +19326,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
         enabled=not bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)),
     )
+    validation["actions"] = isolate_frozen_pair_release_place_orders(validation["actions"])
     if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
         validation["errors"] = [
             item for item in validation["errors"] if "plan contains no actions to execute" not in item
