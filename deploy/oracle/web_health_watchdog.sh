@@ -86,7 +86,7 @@ write_state "${fail_count}"
 log_line "probe failed (${fail_count}/${FAILURE_THRESHOLD}) health=${HEALTHCHECK_URL} status=${STATUS_URL:-disabled}"
 
 if [ "${fail_count}" -lt "${FAILURE_THRESHOLD}" ]; then
-  exit 1
+  exit 0
 fi
 
 log_line "threshold reached; restarting ${SERVICE_NAME}.service"

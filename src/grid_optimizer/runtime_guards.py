@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -9,13 +10,37 @@ from .audit import build_audit_paths, income_row_time_ms, read_jsonl, trade_row_
 from .competition_board import resolve_active_competition_board
 
 
-def _parse_datetime(value: Any, field_name: str) -> datetime | None:
+_BEIJING_TZ = timezone(timedelta(hours=8))
+_BEIJING_DAILY_8_STATS_TOKENS = {
+    "beijing_08_daily",
+    "beijing_8_daily",
+    "beijing_daily_08",
+    "beijing_daily_8",
+    "asia_shanghai_08_daily",
+}
+
+
+def _beijing_daily_8_start(now: datetime | None = None) -> datetime:
+    current = now or datetime.now(timezone.utc)
+    if current.tzinfo is None:
+        raise ValueError("now must include timezone information")
+    local = current.astimezone(_BEIJING_TZ)
+    start = local.replace(hour=8, minute=0, second=0, microsecond=0)
+    if local < start:
+        start -= timedelta(days=1)
+    return start.astimezone(timezone.utc)
+
+
+def _parse_datetime(value: Any, field_name: str, *, now: datetime | None = None) -> datetime | None:
     if value in {"", None}:
         return None
     if isinstance(value, datetime):
         dt = value
     else:
-        dt = datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        text = str(value).strip()
+        if field_name == "runtime_guard_stats_start_time" and text.lower() in _BEIJING_DAILY_8_STATS_TOKENS:
+            return _beijing_daily_8_start(now=now)
+        dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
     if dt.tzinfo is None:
         raise ValueError(f"{field_name} must include timezone information")
     return dt.astimezone(timezone.utc)
@@ -40,14 +65,45 @@ def _event_net_pnl(item: dict[str, Any]) -> float:
     return realized + funding - commission - recycle_loss
 
 
+def _trade_order_identity(row: dict[str, Any]) -> str:
+    for key in ("orderId", "order_id", "i"):
+        value = row.get(key)
+        if value not in {"", None}:
+            return str(value)
+    client_id = row.get("clientOrderId") or row.get("client_order_id") or row.get("origClientOrderId")
+    if client_id not in {"", None}:
+        return f"client:{client_id}"
+    trade_id = row.get("tradeId") or row.get("trade_id") or row.get("t")
+    if trade_id not in {"", None}:
+        return f"trade:{trade_id}"
+    return ""
+
+
+def _trade_notional(row: dict[str, Any]) -> float:
+    def _as_float(value: Any) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return 0.0
+
+    for key in ("quoteQty", "quote_qty", "quote_asset_qty"):
+        quote_qty = abs(_as_float(row.get(key)))
+        if quote_qty > 0:
+            return quote_qty
+    return abs(_as_float(row.get("price")) * _as_float(row.get("qty")))
+
+
 @dataclass(frozen=True)
 class RuntimeGuardConfig:
     run_start_time: datetime | None
     run_end_time: datetime | None
     rolling_hourly_loss_limit: float | None
+    rolling_hourly_loss_per_10k_limit: float | None
+    rolling_hourly_loss_per_10k_min_notional: float
     max_cumulative_notional: float | None
     max_actual_net_notional: float | None
     max_synthetic_drift_notional: float | None
+    max_unrealized_loss: float | None = None
     runtime_guard_stats_start_time: datetime | None = None
 
 
@@ -60,9 +116,13 @@ class RuntimeGuardResult:
     matched_reasons: list[str]
     triggered_at: str | None
     rolling_hourly_loss: float
+    rolling_hourly_gross_notional: float
+    rolling_hourly_loss_per_10k: float
+    rolling_hourly_loss_per_10k_active: bool
     cumulative_gross_notional: float
     actual_net_notional_abs: float
     synthetic_drift_notional: float
+    unrealized_loss: float = 0.0
 
 
 def resolve_runtime_guard_stats_start_time(
@@ -73,7 +133,11 @@ def resolve_runtime_guard_stats_start_time(
     now: datetime | None = None,
 ) -> datetime | None:
     try:
-        explicit_start = _parse_datetime(runtime_guard_stats_start_time, "runtime_guard_stats_start_time")
+        explicit_start = _parse_datetime(
+            runtime_guard_stats_start_time,
+            "runtime_guard_stats_start_time",
+            now=now,
+        )
     except ValueError:
         explicit_start = None
     normalized_symbol = str(symbol or "").upper().strip()
@@ -87,7 +151,7 @@ def resolve_runtime_guard_stats_start_time(
     if not isinstance(board, dict):
         return explicit_start
     try:
-        board_start = _parse_datetime(board.get("activity_start_at"), "activity_start_at")
+        board_start = _parse_datetime(board.get("activity_start_at"), "activity_start_at", now=now)
     except ValueError:
         return explicit_start
     if explicit_start is None:
@@ -103,6 +167,8 @@ def summarize_futures_runtime_guard_inputs(
     runtime_guard_stats_start_time: Any = None,
     symbol: str | None = None,
     now: datetime | None = None,
+    bq_order_refs_path: Path | None = None,
+    bq_book_scope: str | None = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     audit_paths = build_audit_paths(summary_path)
     trade_rows = read_jsonl(audit_paths["trade_audit"], limit=0)
@@ -116,6 +182,20 @@ def summarize_futures_runtime_guard_inputs(
     cumulative_gross_notional = 0.0
     pnl_events: list[dict[str, Any]] = []
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    seen_order_notional_keys: set[str] = set()
+    normalized_bq_book_scope = str(bq_book_scope or "").lower().strip()
+    bq_order_books: dict[str, str] = {}
+    if normalized_bq_book_scope and bq_order_refs_path is not None:
+        try:
+            raw_state = json.loads(bq_order_refs_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            raw_state = {}
+        raw_refs = raw_state.get("best_quote_volume_order_refs") if isinstance(raw_state, dict) else {}
+        if isinstance(raw_refs, dict):
+            for order_id, ref in raw_refs.items():
+                if not isinstance(ref, dict):
+                    continue
+                bq_order_books[str(order_id)] = str(ref.get("book") or "unknown").lower().strip() or "unknown"
 
     def _as_float(value: Any) -> float:
         try:
@@ -131,9 +211,20 @@ def summarize_futures_runtime_guard_inputs(
         if metrics_start_time is not None:
             if trade_ts is None or trade_ts < metrics_start_time:
                 continue
+        if normalized_bq_book_scope:
+            order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
+            if bq_order_books.get(order_id, "unknown") != normalized_bq_book_scope:
+                continue
         price = _as_float(row.get("price"))
         qty = abs(_as_float(row.get("qty")))
-        cumulative_gross_notional += price * qty
+        notional = _trade_notional(row)
+        order_identity = _trade_order_identity(row)
+        if order_identity:
+            if order_identity not in seen_order_notional_keys:
+                cumulative_gross_notional += notional
+                seen_order_notional_keys.add(order_identity)
+        else:
+            cumulative_gross_notional += notional
         if trade_ts is None:
             continue
         realized_pnl = _as_float(row.get("realizedPnl"))
@@ -144,6 +235,16 @@ def summarize_futures_runtime_guard_inputs(
             {
                 "ts": trade_ts.isoformat(),
                 "net_pnl": net_pnl,
+                "gross_notional": notional,
+                "client_order_id": str(
+                    row.get("clientOrderId")
+                    or row.get("client_order_id")
+                    or row.get("origClientOrderId")
+                    or ""
+                ),
+                "order_id": row.get("orderId") or row.get("order_id"),
+                "side": str(row.get("side") or ""),
+                "position_side": str(row.get("positionSide") or row.get("position_side") or ""),
             }
         )
 
@@ -158,19 +259,31 @@ def summarize_futures_runtime_guard_inputs(
             {
                 "ts": income_ts.isoformat(),
                 "net_pnl": _as_float(row.get("income")),
+                "gross_notional": 0.0,
             }
         )
 
     return cumulative_gross_notional, pnl_events, metrics_start_time
 
 
-def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
+def normalize_runtime_guard_config(raw: dict[str, Any], *, now: datetime | None = None) -> RuntimeGuardConfig:
     config = RuntimeGuardConfig(
         run_start_time=_parse_datetime(raw.get("run_start_time"), "run_start_time"),
         run_end_time=_parse_datetime(raw.get("run_end_time"), "run_end_time"),
         rolling_hourly_loss_limit=_parse_positive_float(
             raw.get("rolling_hourly_loss_limit"),
             "rolling_hourly_loss_limit",
+        ),
+        rolling_hourly_loss_per_10k_limit=_parse_positive_float(
+            raw.get("rolling_hourly_loss_per_10k_limit"),
+            "rolling_hourly_loss_per_10k_limit",
+        ),
+        rolling_hourly_loss_per_10k_min_notional=(
+            _parse_positive_float(
+                raw.get("rolling_hourly_loss_per_10k_min_notional"),
+                "rolling_hourly_loss_per_10k_min_notional",
+            )
+            or 10000.0
         ),
         max_cumulative_notional=_parse_positive_float(
             raw.get("max_cumulative_notional"),
@@ -184,9 +297,14 @@ def normalize_runtime_guard_config(raw: dict[str, Any]) -> RuntimeGuardConfig:
             raw.get("max_synthetic_drift_notional"),
             "max_synthetic_drift_notional",
         ),
+        max_unrealized_loss=_parse_positive_float(
+            raw.get("max_unrealized_loss"),
+            "max_unrealized_loss",
+        ),
         runtime_guard_stats_start_time=_parse_datetime(
             raw.get("runtime_guard_stats_start_time"),
             "runtime_guard_stats_start_time",
+            now=now,
         ),
     )
     if config.run_start_time and config.run_end_time and config.run_start_time >= config.run_end_time:
@@ -201,7 +319,7 @@ def normalize_runtime_guard_payload(
     market: str = "futures",
     now: datetime | None = None,
 ) -> dict[str, Any]:
-    config = normalize_runtime_guard_config(raw)
+    config = normalize_runtime_guard_config(raw, now=now)
     normalized_symbol = str(symbol or raw.get("symbol") or "").upper().strip() or None
     resolved_stats_start_time = resolve_runtime_guard_stats_start_time(
         runtime_guard_stats_start_time=config.runtime_guard_stats_start_time,
@@ -213,9 +331,12 @@ def normalize_runtime_guard_payload(
         "run_start_time": config.run_start_time.isoformat() if config.run_start_time else None,
         "run_end_time": config.run_end_time.isoformat() if config.run_end_time else None,
         "rolling_hourly_loss_limit": config.rolling_hourly_loss_limit,
+        "rolling_hourly_loss_per_10k_limit": config.rolling_hourly_loss_per_10k_limit,
+        "rolling_hourly_loss_per_10k_min_notional": config.rolling_hourly_loss_per_10k_min_notional,
         "max_cumulative_notional": config.max_cumulative_notional,
         "max_actual_net_notional": config.max_actual_net_notional,
         "max_synthetic_drift_notional": config.max_synthetic_drift_notional,
+        "max_unrealized_loss": config.max_unrealized_loss,
         "runtime_guard_stats_start_time": resolved_stats_start_time.isoformat() if resolved_stats_start_time else None,
     }
 
@@ -228,14 +349,17 @@ def evaluate_runtime_guards(
     pnl_events: list[dict[str, Any]],
     actual_net_notional: float | None = None,
     synthetic_drift_notional: float | None = None,
+    unrealized_pnl: float | None = None,
 ) -> RuntimeGuardResult:
     current = now.astimezone(timezone.utc)
     reasons: list[str] = []
     actual_net_notional_abs = abs(float(actual_net_notional or 0.0))
     safe_synthetic_drift_notional = max(float(synthetic_drift_notional or 0.0), 0.0)
+    unrealized_loss = max(0.0, -float(unrealized_pnl or 0.0))
 
     window_start = current - timedelta(minutes=60)
     window_net_pnl = 0.0
+    window_gross_notional = 0.0
     for event in pnl_events:
         event_ts = _parse_datetime(event.get("ts"), "ts")
         if event_ts is None or event_ts < window_start or event_ts > current:
@@ -243,7 +367,13 @@ def evaluate_runtime_guards(
         if config.runtime_guard_stats_start_time and event_ts < config.runtime_guard_stats_start_time:
             continue
         window_net_pnl += _event_net_pnl(event)
+        try:
+            window_gross_notional += max(float(event.get("gross_notional") or 0.0), 0.0)
+        except (TypeError, ValueError):
+            pass
     rolling_loss = max(0.0, -window_net_pnl)
+    rolling_loss_per_10k = rolling_loss / (window_gross_notional / 10000.0) if window_gross_notional > 0 else 0.0
+    rolling_loss_per_10k_active = window_gross_notional >= config.rolling_hourly_loss_per_10k_min_notional
 
     if config.run_start_time and current < config.run_start_time:
         return RuntimeGuardResult(
@@ -254,15 +384,25 @@ def evaluate_runtime_guards(
             matched_reasons=["before_start_window"],
             triggered_at=None,
             rolling_hourly_loss=rolling_loss,
+            rolling_hourly_gross_notional=window_gross_notional,
+            rolling_hourly_loss_per_10k=rolling_loss_per_10k,
+            rolling_hourly_loss_per_10k_active=rolling_loss_per_10k_active,
             cumulative_gross_notional=float(cumulative_gross_notional),
             actual_net_notional_abs=actual_net_notional_abs,
             synthetic_drift_notional=safe_synthetic_drift_notional,
+            unrealized_loss=unrealized_loss,
         )
 
     if config.run_end_time and current >= config.run_end_time:
         reasons.append("after_end_window")
     if config.rolling_hourly_loss_limit is not None and rolling_loss >= config.rolling_hourly_loss_limit:
         reasons.append("rolling_hourly_loss_limit_hit")
+    if (
+        config.rolling_hourly_loss_per_10k_limit is not None
+        and rolling_loss_per_10k_active
+        and rolling_loss_per_10k >= config.rolling_hourly_loss_per_10k_limit
+    ):
+        reasons.append("rolling_hourly_loss_per_10k_limit_hit")
     if config.max_cumulative_notional is not None and float(cumulative_gross_notional) >= config.max_cumulative_notional:
         reasons.append("max_cumulative_notional_hit")
     if config.max_actual_net_notional is not None and actual_net_notional_abs >= config.max_actual_net_notional:
@@ -272,6 +412,8 @@ def evaluate_runtime_guards(
         and safe_synthetic_drift_notional >= config.max_synthetic_drift_notional
     ):
         reasons.append("max_synthetic_drift_notional_hit")
+    if config.max_unrealized_loss is not None and unrealized_loss >= config.max_unrealized_loss:
+        reasons.append("max_unrealized_loss_hit")
 
     return RuntimeGuardResult(
         tradable=not reasons,
@@ -281,7 +423,11 @@ def evaluate_runtime_guards(
         matched_reasons=reasons,
         triggered_at=current.isoformat() if reasons else None,
         rolling_hourly_loss=rolling_loss,
+        rolling_hourly_gross_notional=window_gross_notional,
+        rolling_hourly_loss_per_10k=rolling_loss_per_10k,
+        rolling_hourly_loss_per_10k_active=rolling_loss_per_10k_active,
         cumulative_gross_notional=float(cumulative_gross_notional),
         actual_net_notional_abs=actual_net_notional_abs,
         synthetic_drift_notional=safe_synthetic_drift_notional,
+        unrealized_loss=unrealized_loss,
     )

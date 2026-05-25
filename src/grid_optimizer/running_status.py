@@ -32,6 +32,10 @@ STABLE_FEE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 FEE_ASSET_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 FEE_ASSET_PRICE_CACHE_TTL_SECONDS = 60.0
 FUTURES_COMPETITION_VOLUME_WINDOWS: dict[str, tuple[datetime, datetime]] = {
+    "BILLUSDT": (
+        datetime(2026, 5, 8, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
+        datetime(2026, 5, 19, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),
+    ),
     "CHIPUSDT": (
         datetime(2026, 4, 22, 18, 0, 0, tzinfo=timezone(timedelta(hours=8))),
         datetime(2026, 5, 13, 7, 59, 0, tzinfo=timezone(timedelta(hours=8))),
@@ -309,10 +313,44 @@ def _format_current_position(strategy_mode: str, position_amt: float, long_qty: 
     return f"净 {position_amt:g} · 多 {long_qty:g} / 空 {short_qty:g}"
 
 
+def _normalize_frozen_inventory_ledger(raw: Any, *, mid_price: float = 0.0) -> dict[str, Any]:
+    ledger = raw if isinstance(raw, dict) else {}
+    long_qty = max(_safe_float(ledger.get("long_qty")), 0.0)
+    short_qty = max(_safe_float(ledger.get("short_qty")), 0.0)
+    reference_price = max(_safe_float(mid_price), 0.0)
+    long_notional = (_safe_float(ledger.get("long_notional")) or long_qty * reference_price) if long_qty > 0 else 0.0
+    short_notional = (_safe_float(ledger.get("short_notional")) or short_qty * reference_price) if short_qty > 0 else 0.0
+    long_isolated = min(max(_safe_float(ledger.get("long_manual_limit_isolated_qty")), 0.0), long_qty)
+    short_isolated = min(max(_safe_float(ledger.get("short_manual_limit_isolated_qty")), 0.0), short_qty)
+    pair_eligible_long_qty = max(long_qty - long_isolated, 0.0)
+    pair_eligible_short_qty = max(short_qty - short_isolated, 0.0)
+    offset_qty = min(pair_eligible_long_qty, pair_eligible_short_qty)
+    offset_notional = _safe_float(ledger.get("offset_notional")) or offset_qty * reference_price
+    return {
+        "long_qty": long_qty,
+        "short_qty": short_qty,
+        "long_notional": max(long_notional, 0.0),
+        "short_notional": max(short_notional, 0.0),
+        "long_entry_price": _safe_float(ledger.get("long_entry_price")) if long_qty > 0 else 0.0,
+        "short_entry_price": _safe_float(ledger.get("short_entry_price")) if short_qty > 0 else 0.0,
+        "long_frozen_at": str(ledger.get("long_frozen_at") or "") if long_qty > 0 else "",
+        "short_frozen_at": str(ledger.get("short_frozen_at") or "") if short_qty > 0 else "",
+        "long_manual_limit_isolated_qty": long_isolated,
+        "short_manual_limit_isolated_qty": short_isolated,
+        "pair_eligible_long_qty": pair_eligible_long_qty,
+        "pair_eligible_short_qty": pair_eligible_short_qty,
+        "offset_qty": offset_qty,
+        "offset_notional": max(offset_notional, 0.0),
+        "updated_at": str(ledger.get("updated_at") or ""),
+        "active": bool(long_qty > 0 or short_qty > 0),
+    }
+
+
 def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict[str, Any]) -> dict[str, Any]:
     runtime_paths = _runner_status_runtime_paths(symbol, runner)
     plan_report = _read_json_dict(Path(runtime_paths["plan_path"])) or {}
     submit_report = _read_json_dict(Path(runtime_paths["submit_report_path"])) or {}
+    state_report = _read_json_dict(Path(str(config.get("state_path") or _default_runtime_paths_for_symbol(symbol)["state_path"]))) or {}
     submit_plan_snapshot = (
         submit_report.get("plan_snapshot") if isinstance(submit_report.get("plan_snapshot"), dict) else {}
     )
@@ -382,9 +420,13 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         else:
             position_amt = long_qty - short_qty
     unrealized_pnl = _safe_float(
-        plan_report.get("unrealized_pnl")
-        if plan_report.get("unrealized_pnl") is not None
-        else submit_plan_snapshot.get("unrealized_pnl")
+        plan_report.get("exchange_unrealized_pnl")
+        if plan_report.get("exchange_unrealized_pnl") is not None
+        else (
+            plan_report.get("unrealized_pnl")
+            if plan_report.get("unrealized_pnl") is not None
+            else submit_plan_snapshot.get("unrealized_pnl")
+        )
     )
     total_fees = _commission_usdt(trade_summary)
     total_pnl = (
@@ -409,6 +451,27 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
     updated_at = updated_at_dt.isoformat() if updated_at_dt is not None else None
     has_last_run = bool(plan_report or submit_report or trade_rows or income_rows or events)
     adaptive_step = plan_report.get("adaptive_step") if isinstance(plan_report.get("adaptive_step"), dict) else {}
+    mid_price = _safe_float(plan_report.get("mid_price"))
+    if mid_price <= 0:
+        bid_price = _safe_float(plan_report.get("bid_price"))
+        ask_price = _safe_float(plan_report.get("ask_price"))
+        if bid_price > 0 and ask_price > 0:
+            mid_price = (bid_price + ask_price) / 2.0
+    reduce_freeze = plan_report.get("reduce_freeze") if isinstance(plan_report.get("reduce_freeze"), dict) else {}
+    best_quote = (
+        plan_report.get("best_quote_maker_volume")
+        if isinstance(plan_report.get("best_quote_maker_volume"), dict)
+        else {}
+    )
+    frozen_pair_release = (
+        best_quote.get("frozen_pair_release")
+        if isinstance(best_quote.get("frozen_pair_release"), dict)
+        else {}
+    )
+    frozen_inventory = _normalize_frozen_inventory_ledger(
+        state_report.get("best_quote_frozen_inventory") or reduce_freeze.get("ledger") or {},
+        mid_price=mid_price,
+    )
 
     return {
         "has_last_run": has_last_run,
@@ -444,6 +507,8 @@ def _build_local_stat_snapshot(symbol: str, config: dict[str, Any], runner: dict
         "trade_pnl": _safe_float(trade_summary.get("realized_pnl")) if has_last_run else None,
         "fees": total_fees if has_last_run else None,
         "funding_fee": _safe_float(income_summary.get("funding_fee")) if has_last_run else None,
+        "frozen_inventory": frozen_inventory,
+        "frozen_pair_release": dict(frozen_pair_release) if has_last_run else {},
     }
 
 
@@ -576,6 +641,8 @@ def build_running_status_card(
         "trade_pnl": stats.get("trade_pnl"),
         "fees": stats.get("fees"),
         "funding_fee": stats.get("funding_fee"),
+        "frozen_inventory": stats.get("frozen_inventory"),
+        "frozen_pair_release": stats.get("frozen_pair_release"),
         "config": merged_config,
         "snapshot": None,
     }

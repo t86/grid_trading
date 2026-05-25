@@ -260,6 +260,20 @@ def _spot_long_entry_reference_price(
     return reference_price
 
 
+def _spot_maker_buy_price(*, price: float, bid_price: float, tick_size: float | None) -> float:
+    best_bid = max(_safe_float(bid_price), 0.0)
+    if best_bid <= EPSILON:
+        return _round_order_price(price, tick_size, "BUY")
+    return min(_round_order_price(price, tick_size, "BUY"), _round_order_price(best_bid, tick_size, "BUY"))
+
+
+def _spot_maker_sell_price(*, price: float, ask_price: float, tick_size: float | None) -> float:
+    best_ask = max(_safe_float(ask_price), 0.0)
+    if best_ask <= EPSILON:
+        return _round_order_price(price, tick_size, "SELL")
+    return max(_round_order_price(price, tick_size, "SELL"), _round_order_price(best_ask, tick_size, "SELL"))
+
+
 def _bootstrap_orders(
     *,
     market_type: str,
@@ -307,6 +321,8 @@ def _build_buy_ladder_orders(
 ) -> list[dict[str, Any]]:
     if max_total_notional is not None and max_total_notional <= EPSILON:
         return []
+    if levels <= 0:
+        return []
 
     orders: list[dict[str, Any]] = []
     used_prices: set[float] = set()
@@ -351,6 +367,8 @@ def _build_sell_ladder_orders(
     levels: int,
     per_order_notional: float,
     role: str,
+    first_role: str | None = None,
+    next_role: str | None = None,
     start_level: int,
     max_total_qty: float | None,
     tick_size: float | None,
@@ -359,6 +377,8 @@ def _build_sell_ladder_orders(
     min_notional: float | None,
 ) -> list[dict[str, Any]]:
     if max_total_qty is not None and max_total_qty <= EPSILON:
+        return []
+    if levels <= 0:
         return []
 
     orders: list[dict[str, Any]] = []
@@ -385,7 +405,10 @@ def _build_sell_ladder_orders(
             qty = min(qty, remaining_qty_rounded)
         if not _order_meets_mins(qty=qty, price=price, min_qty=min_qty, min_notional=min_notional):
             continue
-        orders.append(_build_order(side="SELL", price=price, qty=qty, role=role))
+        order_role = role
+        if first_role is not None or next_role is not None:
+            order_role = str(first_role if offset == 0 else (next_role or role))
+        orders.append(_build_order(side="SELL", price=price, qty=qty, role=order_role))
         used_prices.add(price)
         if remaining_qty is not None:
             remaining_qty = max(remaining_qty - qty, 0.0)
@@ -409,6 +432,8 @@ def build_inventory_grid_orders(
     require_non_loss_exit: bool = False,
     max_order_position_notional: float,
     max_position_notional: float,
+    max_short_order_position_notional: float | None = None,
+    max_short_position_notional: float | None = None,
     buy_levels: int = 1,
     tick_size: float | None,
     step_size: float | None,
@@ -424,6 +449,13 @@ def build_inventory_grid_orders(
     bootstrap_notional = max(_safe_float(per_order_notional), 0.0) * max(_safe_float(first_order_multiplier), 0.0)
     warmup_notional = max(_safe_float(warmup_position_notional), 0.0)
     mid_price = (max(_safe_float(bid_price), 0.0) + max(_safe_float(ask_price), 0.0)) / 2.0
+    synthetic_neutral = bool(runtime.get("synthetic_neutral"))
+    short_order_limit_notional = max(_safe_float(max_short_order_position_notional), 0.0)
+    if short_order_limit_notional <= EPSILON:
+        short_order_limit_notional = max(_safe_float(max_order_position_notional), 0.0)
+    short_position_limit_notional = max(_safe_float(max_short_position_notional), 0.0)
+    if short_position_limit_notional <= EPSILON:
+        short_position_limit_notional = max(_safe_float(max_position_notional), 0.0)
 
     bootstrap_orders: list[dict[str, Any]] = []
     buy_orders: list[dict[str, Any]] = []
@@ -442,7 +474,7 @@ def build_inventory_grid_orders(
                 min_qty=min_qty,
                 min_notional=min_notional,
             )
-        if market_type == "spot":
+        if market_type == "spot" and not synthetic_neutral:
             bootstrap_levels = 1 if warmup_notional > EPSILON else buy_levels
             bootstrap_orders = _build_buy_ladder_orders(
                 reference_price=bid_price,
@@ -458,6 +490,42 @@ def build_inventory_grid_orders(
                 step_size=step_size,
                 min_qty=min_qty,
                 min_notional=min_notional,
+            )
+        elif synthetic_neutral:
+            bootstrap_orders = _build_buy_ladder_orders(
+                reference_price=bid_price,
+                step_price=step_price,
+                levels=buy_levels,
+                first_order_notional=bootstrap_notional,
+                per_order_notional=per_order_notional,
+                first_role="bootstrap_entry",
+                next_role="grid_entry",
+                start_level=0,
+                max_total_notional=max_order_position_notional if max_order_position_notional > 0 else None,
+                tick_size=tick_size,
+                step_size=step_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
+            )
+            max_short_qty = None
+            if short_order_limit_notional > EPSILON:
+                max_short_qty = short_order_limit_notional / max(mid_price, EPSILON)
+            bootstrap_orders.extend(
+                _build_sell_ladder_orders(
+                    reference_price=ask_price,
+                    step_price=step_price,
+                    levels=sell_levels,
+                    per_order_notional=per_order_notional,
+                    role="grid_entry",
+                    first_role="bootstrap_entry",
+                    next_role="grid_entry",
+                    start_level=0,
+                    max_total_qty=max_short_qty,
+                    tick_size=tick_size,
+                    step_size=step_size,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
             )
         else:
             bootstrap_orders = _bootstrap_orders(
@@ -487,7 +555,8 @@ def build_inventory_grid_orders(
     if recovery_mode != "live":
         risk_state = runtime_risk_state
     else:
-        if max_position_notional > 0 and inventory_notional >= max_position_notional:
+        position_limit_notional = short_position_limit_notional if direction_state == "short_active" else max_position_notional
+        if position_limit_notional > 0 and inventory_notional >= position_limit_notional:
             risk_state = "hard_reduce_only"
         elif threshold_position_notional > 0 and inventory_notional >= threshold_position_notional:
             risk_state = "threshold_reduce_only"
@@ -534,21 +603,23 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-            return _finalize_inventory_grid_plan(
-                risk_state=risk_state,
-                bootstrap_orders=bootstrap_orders,
-                buy_orders=buy_orders,
-                sell_orders=sell_orders,
-                forced_reduce_orders=forced_reduce_orders,
-                tail_cleanup_active=True,
-                min_qty=min_qty,
-                min_notional=min_notional,
-            )
+                return _finalize_inventory_grid_plan(
+                    risk_state=risk_state,
+                    bootstrap_orders=bootstrap_orders,
+                    buy_orders=buy_orders,
+                    sell_orders=sell_orders,
+                    forced_reduce_orders=forced_reduce_orders,
+                    tail_cleanup_active=True,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
 
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         planned_closing_qty = 0.0
         sell_reference_price = anchor_price
-        if market_type == "spot":
+        if synthetic_neutral:
+            sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
+        elif market_type == "spot":
             sell_reference_price = max(sell_reference_price, max(_safe_float(ask_price), 0.0) - max(float(step_price), 0.0))
         raw_sell_orders: list[dict[str, Any]]
         if warmup_top_of_book_active:
@@ -698,18 +769,20 @@ def build_inventory_grid_orders(
                         role="tail_cleanup",
                     )
                 )
-            return _finalize_inventory_grid_plan(
-                risk_state=risk_state,
-                bootstrap_orders=bootstrap_orders,
-                buy_orders=buy_orders,
-                sell_orders=sell_orders,
-                forced_reduce_orders=forced_reduce_orders,
-                tail_cleanup_active=True,
-                min_qty=min_qty,
-                min_notional=min_notional,
-            )
+                return _finalize_inventory_grid_plan(
+                    risk_state=risk_state,
+                    bootstrap_orders=bootstrap_orders,
+                    buy_orders=buy_orders,
+                    sell_orders=sell_orders,
+                    forced_reduce_orders=forced_reduce_orders,
+                    tail_cleanup_active=True,
+                    min_qty=min_qty,
+                    min_notional=min_notional,
+                )
 
         exit_price = _round_order_price(anchor_price - step_price, tick_size, "BUY")
+        if synthetic_neutral:
+            exit_price = _spot_maker_buy_price(price=exit_price, bid_price=bid_price, tick_size=tick_size)
         exit_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(exit_price, EPSILON), step_size)
         closeable_qty = _round_order_qty(max(held_qty, 0.0), step_size)
         exit_qty = min(exit_qty, closeable_qty)
@@ -719,10 +792,13 @@ def build_inventory_grid_orders(
             planned_closing_qty = exit_qty
 
         entry_allowed = risk_state == "normal" and (
-            max_order_position_notional <= 0 or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= max_order_position_notional
+            short_order_limit_notional <= 0
+            or inventory_notional + max(_safe_float(per_order_notional), 0.0) <= short_order_limit_notional
         )
         if entry_allowed:
             entry_price = _round_order_price(anchor_price + step_price, tick_size, "SELL")
+            if synthetic_neutral:
+                entry_price = _spot_maker_sell_price(price=entry_price, ask_price=ask_price, tick_size=tick_size)
             entry_qty = _round_order_qty(max(_safe_float(per_order_notional), 0.0) / max(entry_price, EPSILON), step_size)
             if entry_qty > 0 and (min_qty is None or entry_qty >= min_qty) and (
                 min_notional is None or entry_qty * entry_price >= min_notional

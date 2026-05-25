@@ -14,6 +14,8 @@ class DataHelpersTests(unittest.TestCase):
         self.assertEqual(_format_request_number(78078.6), "78078.6")
         self.assertEqual(_format_request_number(78078.7), "78078.7")
         self.assertEqual(_format_request_number(78000.1), "78000.1")
+        self.assertEqual(_format_request_number(100), "100")
+        self.assertEqual(_format_request_number(200.0), "200")
 
     def test_filter_futures_symbols_perpetual_usdt_trading(self) -> None:
         exchange_info = {

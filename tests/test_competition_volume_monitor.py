@@ -91,6 +91,51 @@ class CompetitionVolumeMonitorTests(unittest.TestCase):
         self.assertEqual(result["elastic_regime"], "defensive")
         self.assertAlmostEqual(result["maker_ratio"], 1.0)
 
+    def test_bill_summary_can_start_at_competition_open(self) -> None:
+        with TemporaryDirectory() as tmp:
+            output = Path(tmp)
+            summary_path = output / "billusdt_loop_events.jsonl"
+            trade_path = output / "billusdt_loop_trade_audit.jsonl"
+            summary_path.write_text("", encoding="utf-8")
+            trade_path.write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "symbol": "BILLUSDT",
+                                "time": 1778234399000,
+                                "price": "10",
+                                "qty": "10",
+                                "realizedPnl": "0",
+                                "commission": "0",
+                                "commissionAsset": "USDT",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "symbol": "BILLUSDT",
+                                "time": 1778234400000,
+                                "price": "20",
+                                "qty": "10",
+                                "realizedPnl": "0",
+                                "commission": "0",
+                                "commissionAsset": "USDT",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            result = _build_competition_volume_summary(
+                symbol="BILLUSDT",
+                summary_path=summary_path,
+                competition_start_at="2026-05-08T18:00:00+08:00",
+            )
+
+        self.assertAlmostEqual(result["competition_gross_notional"], 200.0)
+
     def test_fills_returns_recent_trade_rows(self) -> None:
         with TemporaryDirectory() as tmp:
             output = Path(tmp)

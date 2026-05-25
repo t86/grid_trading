@@ -17,6 +17,7 @@ from .backtest import build_grid_levels
 from .data import (
     delete_spot_order,
     fetch_spot_account_info,
+    fetch_spot_agg_trades,
     fetch_spot_book_tickers,
     fetch_spot_klines,
     fetch_spot_latest_price,
@@ -33,12 +34,18 @@ from .inventory_grid_recovery import rebuild_inventory_grid_runtime
 from .inventory_grid_state import apply_inventory_grid_fill, new_inventory_grid_runtime
 from .semi_auto_plan import diff_open_orders
 from .spot_flatten_runner import load_live_spot_flatten_snapshot, spot_flatten_client_order_prefix
+from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
 
 STATE_VERSION = 2
 EPSILON = 1e-12
 PRICE_CACHE_TTL_SECONDS = 30.0
 _LATEST_PRICE_CACHE: dict[str, tuple[float, float]] = {}
 SPOT_COMPETITION_RUNTIME_CACHE_KEY = "spot_competition_inventory_grid_runtime_cache"
+SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY = "spot_competition_synthetic_neutral_grid_runtime_cache"
+SPOT_COMPETITION_MODES = {
+    "spot_competition_inventory_grid",
+    "spot_competition_synthetic_neutral_grid",
+}
 
 
 def _utc_now() -> datetime:
@@ -105,7 +112,7 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
     loaded_strategy_mode = str(state.get("strategy_mode") or "").strip()
     loaded_symbol = str(state.get("symbol") or "").upper().strip()
     requested_symbol = str(symbol or "").upper().strip()
-    if strategy_mode == "spot_competition_inventory_grid" and (
+    if strategy_mode in SPOT_COMPETITION_MODES and (
         (loaded_strategy_mode and loaded_strategy_mode != strategy_mode)
         or (loaded_symbol and loaded_symbol != requested_symbol)
     ):
@@ -115,8 +122,10 @@ def _load_state(path: Path, symbol: str, strategy_mode: str, cell_count: int) ->
         state["last_trade_time_ms"] = 0
         state["metrics"] = _new_metrics()
         state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
-    elif strategy_mode != "spot_competition_inventory_grid":
+        state.pop(SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY, None)
+    elif strategy_mode not in SPOT_COMPETITION_MODES:
         state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+        state.pop(SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY, None)
     state["version"] = STATE_VERSION
     state["symbol"] = symbol
     state["strategy_mode"] = strategy_mode
@@ -233,20 +242,35 @@ def _competition_runtime_trade_key(trade: dict[str, Any]) -> str:
     )
 
 
-def _load_cached_spot_competition_runtime(state: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
-    payload = state.get(SPOT_COMPETITION_RUNTIME_CACHE_KEY)
+def _spot_competition_runtime_cache_key(*, synthetic_neutral: bool) -> str:
+    return SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY if synthetic_neutral else SPOT_COMPETITION_RUNTIME_CACHE_KEY
+
+
+def _load_cached_spot_competition_runtime(
+    state: dict[str, Any],
+    *,
+    synthetic_neutral: bool = False,
+) -> tuple[dict[str, Any] | None, list[str]]:
+    cache_key = _spot_competition_runtime_cache_key(synthetic_neutral=synthetic_neutral)
+    expected_market_type = "futures" if synthetic_neutral else "spot"
+    expected_strategy_mode = (
+        "spot_competition_synthetic_neutral_grid"
+        if synthetic_neutral
+        else "spot_competition_inventory_grid"
+    )
+    payload = state.get(cache_key)
     if not isinstance(payload, dict):
         return None, []
-    if str(payload.get("strategy_mode", "")).strip() != "spot_competition_inventory_grid":
-        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    if str(payload.get("strategy_mode", "")).strip() != expected_strategy_mode:
+        state.pop(cache_key, None)
         return None, []
-    if str(payload.get("market_type", "")).strip().lower() != "spot":
-        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    if str(payload.get("market_type", "")).strip().lower() != expected_market_type:
+        state.pop(cache_key, None)
         return None, []
 
     runtime = payload.get("runtime")
-    if not isinstance(runtime, dict) or str(runtime.get("market_type", "")).strip().lower() != "spot":
-        state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    if not isinstance(runtime, dict) or str(runtime.get("market_type", "")).strip().lower() != expected_market_type:
+        state.pop(cache_key, None)
         return None, []
 
     applied_trade_keys = [str(item).strip() for item in list(payload.get("applied_trade_keys") or []) if str(item).strip()]
@@ -258,14 +282,20 @@ def _store_cached_spot_competition_runtime(
     state: dict[str, Any],
     runtime: dict[str, Any],
     applied_trade_keys: list[str],
+    synthetic_neutral: bool = False,
 ) -> None:
     cached_runtime = copy.deepcopy(runtime)
     cached_runtime["pair_credit_steps"] = 0
     cached_runtime["recovery_mode"] = "live"
     cached_runtime["recovery_errors"] = []
-    state[SPOT_COMPETITION_RUNTIME_CACHE_KEY] = {
-        "strategy_mode": "spot_competition_inventory_grid",
-        "market_type": "spot",
+    cache_key = _spot_competition_runtime_cache_key(synthetic_neutral=synthetic_neutral)
+    state[cache_key] = {
+        "strategy_mode": (
+            "spot_competition_synthetic_neutral_grid"
+            if synthetic_neutral
+            else "spot_competition_inventory_grid"
+        ),
+        "market_type": "futures" if synthetic_neutral else "spot",
         "runtime": cached_runtime,
         "applied_trade_keys": list(applied_trade_keys),
     }
@@ -310,8 +340,10 @@ def _resolve_spot_competition_runtime(
     order_refs: dict[str, dict[str, Any]],
     step_price: float,
     current_position_qty: float,
+    synthetic_neutral: bool = False,
 ) -> dict[str, Any]:
     expected_position_qty = max(float(current_position_qty), 0.0)
+    runtime_market_type = "futures" if synthetic_neutral else "spot"
     strategy_trades = sorted(
         [
             trade
@@ -324,7 +356,10 @@ def _resolve_spot_competition_runtime(
         ),
     )
 
-    cached_runtime, applied_trade_keys = _load_cached_spot_competition_runtime(state)
+    cached_runtime, applied_trade_keys = _load_cached_spot_competition_runtime(
+        state,
+        synthetic_neutral=synthetic_neutral,
+    )
     if cached_runtime is not None:
         applied_trade_key_set = set(applied_trade_keys)
         cache_valid = True
@@ -351,11 +386,12 @@ def _resolve_spot_competition_runtime(
                 state=state,
                 runtime=cached_runtime,
                 applied_trade_keys=applied_trade_keys,
+                synthetic_neutral=synthetic_neutral,
             )
             return cached_runtime
 
     runtime = rebuild_inventory_grid_runtime(
-        market_type="spot",
+        market_type=runtime_market_type,
         trades=strategy_trades,
         order_refs=order_refs,
         step_price=step_price,
@@ -366,14 +402,18 @@ def _resolve_spot_competition_runtime(
             state=state,
             runtime=runtime,
             applied_trade_keys=[_competition_runtime_trade_key(trade) for trade in strategy_trades],
+            synthetic_neutral=synthetic_neutral,
         )
     elif expected_position_qty <= EPSILON:
-        flat_runtime = new_inventory_grid_runtime(market_type="spot")
+        flat_runtime = new_inventory_grid_runtime(market_type=runtime_market_type)
+        replayed_trade_keys = [_competition_runtime_trade_key(trade) for trade in strategy_trades]
         _store_cached_spot_competition_runtime(
             state=state,
             runtime=flat_runtime,
-            applied_trade_keys=[],
+            applied_trade_keys=replayed_trade_keys,
+            synthetic_neutral=synthetic_neutral,
         )
+        return flat_runtime
     return runtime
 
 
@@ -689,6 +729,96 @@ def _record_trade_metrics(
     )
 
 
+def _spot_trade_audit_rows_from_metrics(metrics: dict[str, Any], *, symbol: str) -> list[dict[str, Any]]:
+    recent = metrics.get("recent_trades")
+    if not isinstance(recent, list):
+        return []
+    rows: list[dict[str, Any]] = []
+    for row in recent:
+        if not isinstance(row, dict):
+            continue
+        trade_id = _safe_int(row.get("id"))
+        rows.append(
+            {
+                "id": trade_id,
+                "orderId": row.get("orderId") or row.get("order_id") or trade_id,
+                "time": row.get("time"),
+                "symbol": symbol,
+                "side": row.get("side"),
+                "price": row.get("price"),
+                "qty": row.get("qty"),
+                "quoteQty": row.get("notional"),
+                "commission": row.get("commission"),
+                "commissionAsset": row.get("commission_asset"),
+                "commission_quote": row.get("commission_quote"),
+                "realizedPnl": row.get("realized_pnl"),
+                "maker": row.get("maker"),
+                "role": row.get("role"),
+                "source": "spot_runner_metrics",
+            }
+        )
+    return rows
+
+
+def _persist_spot_trade_database(
+    *,
+    symbol: str,
+    strategy_mode: str,
+    args: argparse.Namespace,
+    metrics: dict[str, Any],
+) -> dict[str, Any]:
+    status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
+    if not trade_database_enabled():
+        return status
+    rows = _spot_trade_audit_rows_from_metrics(metrics, symbol=symbol)
+    if not rows:
+        return status
+    try:
+        ensure_trade_database_schema()
+        return persist_trade_rows(
+            symbol=symbol,
+            market_type="spot",
+            strategy_mode=strategy_mode,
+            config=vars(args),
+            trade_rows=rows,
+            income_rows=[],
+        )
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "trade_inserted": 0,
+            "income_inserted": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _persist_spot_cycle_database(
+    *,
+    symbol: str,
+    strategy_mode: str,
+    args: argparse.Namespace,
+    summary: dict[str, Any],
+) -> dict[str, Any]:
+    status: dict[str, Any] = {"enabled": trade_database_enabled(), "cycle_inserted": 0}
+    if not trade_database_enabled():
+        return status
+    try:
+        ensure_trade_database_schema()
+        return persist_cycle_snapshot(
+            symbol=symbol,
+            market_type="spot",
+            strategy_mode=strategy_mode,
+            config=vars(args),
+            summary=summary,
+        )
+    except Exception as exc:
+        return {
+            "enabled": True,
+            "cycle_inserted": 0,
+            "error": f"{type(exc).__name__}: {exc}",
+        }
+
+
 def _sync_static_trades(
     *,
     state: dict[str, Any],
@@ -864,7 +994,7 @@ def _sync_volume_shift_trades(
     state["inventory_lots"] = lots
     state["seen_trade_ids"] = sorted(seen_ids)[-5000:]
     state["last_trade_time_ms"] = last_trade_time_ms
-    if str(state.get("strategy_mode") or "").strip() == "spot_competition_inventory_grid":
+    if str(state.get("strategy_mode") or "").strip() in SPOT_COMPETITION_MODES:
         state["known_orders"] = known_orders
     else:
         now_ms = int(time.time() * 1000)
@@ -874,6 +1004,69 @@ def _sync_volume_shift_trades(
             for key, value in known_orders.items()
             if int((value or {}).get("created_at_ms", now_ms) or now_ms) >= cutoff_ms
         }
+    return applied
+
+
+def _sync_synthetic_neutral_trades(
+    *,
+    state: dict[str, Any],
+    trades: list[dict[str, Any]],
+    base_asset: str,
+    quote_asset: str,
+) -> int:
+    seen_ids = {int(x) for x in state.get("seen_trade_ids", []) if str(x).strip().isdigit()}
+    known_orders = state.get("known_orders", {})
+    if not isinstance(known_orders, dict):
+        known_orders = {}
+        state["known_orders"] = known_orders
+    metrics = state.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = _new_metrics()
+        state["metrics"] = metrics
+    last_trade_time_ms = int(state.get("last_trade_time_ms") or 0)
+    applied = 0
+    for trade in sorted(trades, key=lambda row: (int(row.get("time", 0) or 0), int(row.get("id", 0) or 0))):
+        trade_id = int(trade.get("id", 0) or 0)
+        if trade_id <= 0 or trade_id in seen_ids:
+            continue
+        order_id = str(int(trade.get("orderId", 0) or 0))
+        meta = known_orders.get(order_id)
+        if not isinstance(meta, dict):
+            continue
+        side = str(meta.get("side", trade.get("isBuyer") and "BUY" or "SELL")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            continue
+        trade_qty = max(_safe_float(trade.get("qty")), 0.0)
+        price = max(_safe_float(trade.get("price")), 0.0)
+        commission = max(_safe_float(trade.get("commission")), 0.0)
+        commission_asset = str(trade.get("commissionAsset", "")).upper().strip()
+        commission_quote = _normalize_commission_quote(
+            commission=commission,
+            commission_asset=commission_asset,
+            price=price,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        _record_trade_metrics(
+            metrics=metrics,
+            trade=trade,
+            side=side,
+            price=price,
+            qty=trade_qty,
+            commission_quote=commission_quote,
+            commission_asset=commission_asset,
+            commission_raw=commission,
+            realized_pnl=-commission_quote,
+            role=str(meta.get("role", "") or ""),
+        )
+        seen_ids.add(trade_id)
+        trade_time_ms = int(trade.get("time", 0) or 0)
+        if trade_time_ms > last_trade_time_ms:
+            last_trade_time_ms = trade_time_ms
+        applied += 1
+    state["seen_trade_ids"] = sorted(seen_ids)[-5000:]
+    state["last_trade_time_ms"] = last_trade_time_ms
+    state["known_orders"] = known_orders
     return applied
 
 
@@ -1004,6 +1197,126 @@ def _assess_spot_market_guard(
         }
     )
     return guard
+
+
+def _spot_trade_window_move(symbol: str, *, seconds: int, now: datetime | None = None) -> dict[str, Any]:
+    window_seconds = max(int(seconds), 1)
+    current_time = now or _utc_now()
+    end_ms = int(current_time.timestamp() * 1000)
+    start_ms = end_ms - window_seconds * 1000
+    result: dict[str, Any] = {
+        "seconds": window_seconds,
+        "available": False,
+        "warning": None,
+        "open": 0.0,
+        "high": 0.0,
+        "low": 0.0,
+        "close": 0.0,
+        "return_ratio": 0.0,
+        "amplitude_ratio": 0.0,
+        "trade_count": 0,
+    }
+    try:
+        trades = fetch_spot_agg_trades(symbol=symbol, start_ms=start_ms, end_ms=end_ms, limit=1000)
+    except Exception as exc:
+        result["warning"] = f"{exc.__class__.__name__}: {exc}"
+        return result
+    prices: list[float] = []
+    for trade in trades:
+        price = _safe_float(trade.get("p"))
+        if price > 0:
+            prices.append(price)
+    if len(prices) < 2:
+        result["warning"] = "insufficient_trades"
+        result["trade_count"] = len(prices)
+        return result
+    open_price = prices[0]
+    close_price = prices[-1]
+    high_price = max(prices)
+    low_price = min(prices)
+    result.update(
+        {
+            "available": True,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "return_ratio": (close_price / open_price - 1.0) if open_price > 0 else 0.0,
+            "amplitude_ratio": (high_price / low_price - 1.0) if low_price > 0 else 0.0,
+            "trade_count": len(prices),
+        }
+    )
+    return result
+
+
+def _assess_spot_fast_stop_guard(
+    *,
+    symbol: str,
+    current_long_notional: float,
+    freeze_position_notional: float,
+    exit_position_notional: float,
+    trigger_10s_abs_return_ratio: float,
+    trigger_10s_amplitude_ratio: float,
+    trigger_30s_abs_return_ratio: float,
+    trigger_30s_amplitude_ratio: float,
+    down_only: bool = True,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    enabled = any(
+        threshold > 0
+        for threshold in (
+            freeze_position_notional,
+            exit_position_notional,
+            trigger_10s_abs_return_ratio,
+            trigger_10s_amplitude_ratio,
+            trigger_30s_abs_return_ratio,
+            trigger_30s_amplitude_ratio,
+        )
+    )
+    result: dict[str, Any] = {
+        "enabled": enabled,
+        "available": False,
+        "freeze_buy": False,
+        "force_exit": False,
+        "reasons": [],
+        "windows": {},
+        "current_long_notional": max(_safe_float(current_long_notional), 0.0),
+        "freeze_position_notional": max(_safe_float(freeze_position_notional), 0.0),
+        "exit_position_notional": max(_safe_float(exit_position_notional), 0.0),
+    }
+    if not enabled:
+        return result
+    windows = {
+        "10s": _spot_trade_window_move(symbol, seconds=10, now=now),
+        "30s": _spot_trade_window_move(symbol, seconds=30, now=now),
+    }
+    result["windows"] = windows
+    result["available"] = any(bool(item.get("available")) for item in windows.values())
+    move_reasons: list[str] = []
+    for label, window in windows.items():
+        if not window.get("available"):
+            continue
+        ret = _safe_float(window.get("return_ratio"))
+        amp = _safe_float(window.get("amplitude_ratio"))
+        if down_only and ret >= 0:
+            continue
+        abs_ret_threshold = trigger_10s_abs_return_ratio if label == "10s" else trigger_30s_abs_return_ratio
+        amp_threshold = trigger_10s_amplitude_ratio if label == "10s" else trigger_30s_amplitude_ratio
+        if abs_ret_threshold > 0 and abs(ret) >= abs_ret_threshold:
+            move_reasons.append(f"{label}_fast_return ret={ret * 100:.3f}%")
+        if amp_threshold > 0 and amp >= amp_threshold:
+            move_reasons.append(f"{label}_fast_amplitude amp={amp * 100:.3f}%")
+    if not move_reasons:
+        return result
+    current_notional = max(_safe_float(current_long_notional), 0.0)
+    freeze_notional = max(_safe_float(freeze_position_notional), 0.0)
+    exit_notional = max(_safe_float(exit_position_notional), 0.0)
+    if freeze_notional <= 0 or current_notional >= freeze_notional:
+        result["freeze_buy"] = True
+    if exit_notional > 0 and current_notional >= exit_notional:
+        result["force_exit"] = True
+    result["reasons"] = move_reasons
+    return result
 
 
 def _band_prices(*, center_price: float, levels: int, band_ratio: float, tick_size: float | None, side: str) -> list[float]:
@@ -1300,26 +1613,99 @@ def _build_spot_competition_inventory_grid_orders(
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    synthetic_neutral: bool = False,
+    neutral_base_qty: float = 0.0,
+    max_short_position_notional: float = 0.0,
+    actual_base_qty: float | None = None,
+    symbol: str = "",
+    slow_trend_step_enabled: bool = False,
+    slow_trend_step_5m_return_ratio: float = 0.0,
+    slow_trend_step_15m_return_ratio: float = 0.0,
+    slow_trend_step_5m_amplitude_ratio: float = 0.0,
+    slow_trend_step_15m_amplitude_ratio: float = 0.0,
+    slow_trend_step_scale: float = 1.0,
+    now: datetime | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     known_orders = state.get("known_orders")
     order_refs = known_orders if isinstance(known_orders, dict) else {}
     inventory_lots = state.get("inventory_lots")
-    current_position_qty = _sum_inventory_qty(inventory_lots if isinstance(inventory_lots, list) else [])
+    tracked_base_qty = _sum_inventory_qty(inventory_lots if isinstance(inventory_lots, list) else [])
+    resolved_actual_base_qty = (
+        max(_safe_float(actual_base_qty), 0.0)
+        if actual_base_qty is not None
+        else tracked_base_qty
+    )
+    neutral_qty = max(_safe_float(neutral_base_qty), 0.0) if synthetic_neutral else 0.0
+    synthetic_net_qty = resolved_actual_base_qty - neutral_qty if synthetic_neutral else resolved_actual_base_qty
+    mid_price = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+    synthetic_dust_qty = 0.0
+    synthetic_dust_notional = 0.0
+    if synthetic_neutral and _synthetic_residual_is_dust(
+        qty=abs(synthetic_net_qty),
+        price=mid_price,
+        min_qty=min_qty,
+        min_notional=min_notional,
+    ):
+        synthetic_dust_qty = synthetic_net_qty
+        synthetic_dust_notional = abs(synthetic_net_qty) * mid_price
+        synthetic_net_qty = 0.0
+    current_position_qty = abs(synthetic_net_qty) if synthetic_neutral else resolved_actual_base_qty
     runtime = _resolve_spot_competition_runtime(
         state=state,
         trades=trades,
         order_refs=order_refs,
         step_price=step_price,
         current_position_qty=current_position_qty,
+        synthetic_neutral=synthetic_neutral,
     )
+    if synthetic_neutral:
+        runtime["synthetic_neutral"] = True
+        runtime["neutral_base_qty"] = neutral_qty
+        expected_direction_state = "long_active" if synthetic_net_qty > EPSILON else "short_active" if synthetic_net_qty < -EPSILON else "flat"
+        runtime_direction_state = str(runtime.get("direction_state", "flat") or "flat").strip().lower()
+        if current_position_qty <= EPSILON and runtime_direction_state != "flat":
+            runtime = new_inventory_grid_runtime(market_type="futures")
+            runtime["synthetic_neutral"] = True
+            runtime["neutral_base_qty"] = neutral_qty
+        elif expected_direction_state != "flat" and (
+            runtime_direction_state != expected_direction_state
+            or str(runtime.get("recovery_mode", "live") or "live").strip().lower() != "live"
+        ):
+            runtime = new_inventory_grid_runtime(market_type="futures")
+            runtime["synthetic_neutral"] = True
+            runtime["neutral_base_qty"] = neutral_qty
+            runtime["direction_state"] = expected_direction_state
+            runtime["position_lots"] = [
+                {
+                    "lot_id": "synthetic_recovered",
+                    "side": "long" if expected_direction_state == "long_active" else "short",
+                    "qty": current_position_qty,
+                    "entry_price": (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0,
+                    "opened_at_ms": 0,
+                    "source_role": "synthetic_recovery",
+                }
+            ]
     if _safe_float(runtime.get("grid_anchor_price")) <= 0:
         runtime["grid_anchor_price"] = (max(float(bid_price), 0.0) + max(float(ask_price), 0.0)) / 2.0
+    slow_trend_step = _resolve_spot_slow_trend_step(
+        symbol=str(symbol or state.get("symbol") or "").upper().strip(),
+        base_step_price=step_price,
+        enabled=bool(slow_trend_step_enabled),
+        trigger_5m_return_ratio=slow_trend_step_5m_return_ratio,
+        trigger_15m_return_ratio=slow_trend_step_15m_return_ratio,
+        trigger_5m_amplitude_ratio=slow_trend_step_5m_amplitude_ratio,
+        trigger_15m_amplitude_ratio=slow_trend_step_15m_amplitude_ratio,
+        scale=slow_trend_step_scale,
+        tick_size=tick_size,
+        now=now,
+    )
+    effective_step_price = max(_safe_float(slow_trend_step.get("effective_step_price")), _safe_float(step_price))
 
     plan = build_inventory_grid_orders(
         runtime=runtime,
         bid_price=bid_price,
         ask_price=ask_price,
-        step_price=step_price,
+        step_price=effective_step_price,
         per_order_notional=per_order_notional,
         first_order_multiplier=first_order_multiplier,
         threshold_position_notional=threshold_position_notional,
@@ -1328,6 +1714,8 @@ def _build_spot_competition_inventory_grid_orders(
         require_non_loss_exit=require_non_loss_exit,
         max_order_position_notional=max_order_position_notional,
         max_position_notional=max_position_notional,
+        max_short_order_position_notional=max_short_position_notional,
+        max_short_position_notional=max_short_position_notional,
         buy_levels=buy_levels,
         sell_levels=sell_levels,
         tick_size=tick_size,
@@ -1338,8 +1726,10 @@ def _build_spot_competition_inventory_grid_orders(
     desired_orders = list(plan.get("bootstrap_orders") or []) + list(plan.get("buy_orders") or []) + list(plan.get("sell_orders") or [])
     reduce_target_notional = max(_safe_float(threshold_reduce_target_notional), 0.0)
     display_soft_limit = reduce_target_notional if reduce_target_notional > 0 else _safe_float(threshold_position_notional)
+    current_long_notional = max(synthetic_net_qty, 0.0) * mid_price
+    current_short_notional = max(-synthetic_net_qty, 0.0) * mid_price
     controls = {
-        "mode": "competition_inventory_grid",
+        "mode": "competition_synthetic_neutral_grid" if synthetic_neutral else "competition_inventory_grid",
         "buy_paused": False,
         "pause_reasons": [],
         "shift_frozen": False,
@@ -1352,6 +1742,9 @@ def _build_spot_competition_inventory_grid_orders(
         "effective_buy_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "BUY"),
         "effective_sell_levels": sum(1 for order in desired_orders if str(order.get("side", "")).upper() == "SELL"),
         "effective_per_order_notional": _safe_float(per_order_notional),
+        "base_step_price": _safe_float(step_price),
+        "effective_step_price": effective_step_price,
+        "slow_trend_step": slow_trend_step,
         "direction_state": str(runtime.get("direction_state", "flat") or "flat"),
         "risk_state": str(plan.get("risk_state", "normal") or "normal"),
         "grid_anchor_price": _safe_float(runtime.get("grid_anchor_price")),
@@ -1360,6 +1753,15 @@ def _build_spot_competition_inventory_grid_orders(
         "threshold_reduce_target_notional": reduce_target_notional,
         "warmup_position_notional": max(_safe_float(warmup_position_notional), 0.0),
         "require_non_loss_exit": bool(require_non_loss_exit),
+        "neutral_base_qty": neutral_qty,
+        "actual_base_qty": resolved_actual_base_qty,
+        "tracked_base_qty": tracked_base_qty,
+        "synthetic_net_qty": synthetic_net_qty,
+        "synthetic_dust_qty": synthetic_dust_qty,
+        "synthetic_dust_notional": synthetic_dust_notional,
+        "current_long_notional": current_long_notional,
+        "current_short_notional": current_short_notional,
+        "max_short_position_notional": max(_safe_float(max_short_position_notional), 0.0),
     }
     return desired_orders, controls
 
@@ -1378,8 +1780,13 @@ def _available_new_funds(
     return quote_free, base_free
 
 
+def _total_base_balance(account_info: dict[str, Any], base_asset: str) -> float:
+    base_free, base_locked = _extract_balance(account_info, base_asset)
+    return max(base_free, 0.0) + max(base_locked, 0.0)
+
+
 def _auto_flatten_on_runtime_guard(strategy_mode: str) -> bool:
-    return str(strategy_mode or "").strip() != "spot_competition_inventory_grid"
+    return str(strategy_mode or "").strip() not in SPOT_COMPETITION_MODES
 
 
 def _spot_order_meets_exchange_mins(
@@ -1396,6 +1803,160 @@ def _spot_order_meets_exchange_mins(
     if min_notional is not None and qty * price + EPSILON < float(min_notional):
         return False
     return True
+
+
+def _synthetic_residual_is_dust(
+    *,
+    qty: float,
+    price: float,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> bool:
+    residual_qty = max(_safe_float(qty), 0.0)
+    if residual_qty <= EPSILON:
+        return False
+    if min_qty is not None and residual_qty + EPSILON < float(min_qty):
+        return True
+    if min_notional is not None and residual_qty * max(_safe_float(price), 0.0) + EPSILON < float(min_notional):
+        return True
+    return False
+
+
+def _round_up_to_step(value: float, step: float | None) -> float:
+    if step is None or step <= 0:
+        return float(value)
+    units = max(int(math.ceil(max(float(value), 0.0) / float(step))), 0)
+    return units * float(step)
+
+
+def _empty_spot_slow_trend_step(
+    *,
+    enabled: bool,
+    base_step_price: float,
+    warning: str | None = None,
+) -> dict[str, Any]:
+    safe_base_step = max(_safe_float(base_step_price), 0.0)
+    return {
+        "enabled": bool(enabled),
+        "active": False,
+        "warning": warning,
+        "base_step_price": safe_base_step,
+        "effective_step_price": safe_base_step,
+        "scale": 1.0,
+        "configured_scale": 1.0,
+        "reasons": [],
+        "window_5m": {
+            "available": False,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        },
+        "window_15m": {
+            "available": False,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        },
+    }
+
+
+def _spot_slow_trend_window_stats(candles: list[Any], minutes: int) -> dict[str, Any]:
+    safe_minutes = max(_safe_int(minutes), 1)
+    window = list(candles[-safe_minutes:])
+    if len(window) < safe_minutes:
+        return {
+            "available": False,
+            "minutes": safe_minutes,
+            "return_ratio": 0.0,
+            "amplitude_ratio": 0.0,
+        }
+    open_price = max(_safe_float(getattr(window[0], "open", 0.0)), 0.0)
+    close_price = max(_safe_float(getattr(window[-1], "close", 0.0)), 0.0)
+    high_price = max((_safe_float(getattr(item, "high", 0.0)) for item in window), default=0.0)
+    low_price = min((_safe_float(getattr(item, "low", 0.0)) for item in window), default=0.0)
+    return_ratio = ((close_price / open_price) - 1.0) if open_price > EPSILON and close_price > EPSILON else 0.0
+    amplitude_ratio = ((high_price / low_price) - 1.0) if low_price > EPSILON and high_price > EPSILON else 0.0
+    return {
+        "available": open_price > EPSILON and close_price > EPSILON,
+        "minutes": safe_minutes,
+        "return_ratio": return_ratio,
+        "amplitude_ratio": amplitude_ratio,
+        "open": open_price,
+        "close": close_price,
+        "high": high_price,
+        "low": low_price,
+    }
+
+
+def _resolve_spot_slow_trend_step(
+    *,
+    symbol: str,
+    base_step_price: float,
+    enabled: bool,
+    trigger_5m_return_ratio: float,
+    trigger_15m_return_ratio: float,
+    trigger_5m_amplitude_ratio: float,
+    trigger_15m_amplitude_ratio: float,
+    scale: float,
+    tick_size: float | None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    safe_base_step = max(_safe_float(base_step_price), 0.0)
+    configured_scale = max(_safe_float(scale), 1.0)
+    result = _empty_spot_slow_trend_step(enabled=enabled, base_step_price=safe_base_step)
+    result["configured_scale"] = configured_scale
+    if not enabled:
+        return result
+    if safe_base_step <= EPSILON:
+        result["warning"] = "base_step_price_not_positive"
+        return result
+    if configured_scale <= 1.0 + EPSILON:
+        result["warning"] = "scale_not_above_one"
+        return result
+    current_time = now or _utc_now()
+    end_ms = int(current_time.timestamp() * 1000)
+    start_ms = end_ms - int(timedelta(minutes=16).total_seconds() * 1000)
+    try:
+        candles = fetch_spot_klines(symbol=symbol, interval="1m", start_ms=start_ms, end_ms=end_ms, limit=20)
+    except Exception as exc:
+        result["warning"] = f"{type(exc).__name__}: {exc}"
+        return result
+    closed_candles = [item for item in candles if getattr(item, "close_time", current_time) <= current_time]
+    if len(closed_candles) < 5:
+        result["warning"] = "insufficient_closed_1m_candles"
+        return result
+    window_5m = _spot_slow_trend_window_stats(closed_candles, 5)
+    window_15m = _spot_slow_trend_window_stats(closed_candles, 15)
+    result["window_5m"] = window_5m
+    result["window_15m"] = window_15m
+
+    reasons: list[str] = []
+    for name, stats, metric, threshold in (
+        ("5m_return", window_5m, "return_ratio", trigger_5m_return_ratio),
+        ("15m_return", window_15m, "return_ratio", trigger_15m_return_ratio),
+        ("5m_amplitude", window_5m, "amplitude_ratio", trigger_5m_amplitude_ratio),
+        ("15m_amplitude", window_15m, "amplitude_ratio", trigger_15m_amplitude_ratio),
+    ):
+        safe_threshold = max(_safe_float(threshold), 0.0)
+        if safe_threshold <= EPSILON or not bool(stats.get("available")):
+            continue
+        value = abs(_safe_float(stats.get(metric))) if metric == "return_ratio" else _safe_float(stats.get(metric))
+        if value >= safe_threshold:
+            reasons.append(f"{name}={value * 100:.3f}%>=threshold={safe_threshold * 100:.3f}%")
+    if not reasons:
+        return result
+    desired_step = safe_base_step * configured_scale
+    safe_tick = _safe_float(tick_size)
+    effective_step = _round_up_to_step(desired_step, safe_tick if safe_tick > 0 else None)
+    if effective_step <= safe_base_step + EPSILON:
+        return result
+    result.update(
+        {
+            "active": True,
+            "effective_step_price": effective_step,
+            "scale": effective_step / safe_base_step,
+            "reasons": reasons,
+        }
+    )
+    return result
 
 
 def _cancel_orders(
@@ -1595,6 +2156,168 @@ def _maybe_execute_spot_taker_exit(
     return result
 
 
+def _apply_synthetic_fast_stop_sell_to_state(
+    *,
+    state: dict[str, Any],
+    response: dict[str, Any],
+    base_asset: str,
+    quote_asset: str,
+    role: str,
+) -> dict[str, Any]:
+    metrics = state.get("metrics")
+    if not isinstance(metrics, dict):
+        metrics = _new_metrics()
+        state["metrics"] = metrics
+    transact_time_ms = _safe_int(response.get("transactTime")) or int(time.time() * 1000)
+    order_id = _safe_int(response.get("orderId"))
+    applied_qty = 0.0
+    applied_notional = 0.0
+    applied_commission_quote = 0.0
+    fills = response.get("fills")
+    if not isinstance(fills, list):
+        fills = []
+    for idx, fill in enumerate(fills):
+        if not isinstance(fill, dict):
+            continue
+        price = max(_safe_float(fill.get("price")), 0.0)
+        qty = max(_safe_float(fill.get("qty")), 0.0)
+        if price <= 0 or qty <= 0:
+            continue
+        commission = max(_safe_float(fill.get("commission")), 0.0)
+        commission_asset = str(fill.get("commissionAsset", "")).upper().strip()
+        commission_quote = _normalize_commission_quote(
+            commission=commission,
+            commission_asset=commission_asset,
+            price=price,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        trade = {
+            "id": _safe_int(fill.get("tradeId")) or order_id * 1000 + idx,
+            "orderId": order_id,
+            "time": transact_time_ms,
+            "isMaker": False,
+        }
+        _record_trade_metrics(
+            metrics=metrics,
+            trade=trade,
+            side="SELL",
+            price=price,
+            qty=qty,
+            commission_quote=commission_quote,
+            commission_asset=commission_asset,
+            commission_raw=commission,
+            realized_pnl=-commission_quote,
+            role=role,
+        )
+        applied_qty += qty
+        applied_notional += price * qty
+        applied_commission_quote += commission_quote
+    state["last_trade_time_ms"] = max(_safe_int(state.get("last_trade_time_ms")), transact_time_ms)
+    state.pop(SPOT_COMPETITION_RUNTIME_CACHE_KEY, None)
+    state.pop(SPOT_SYNTHETIC_NEUTRAL_RUNTIME_CACHE_KEY, None)
+    return {
+        "executed_qty": applied_qty,
+        "executed_notional": applied_notional,
+        "realized_pnl": -applied_commission_quote,
+        "commission_quote": applied_commission_quote,
+        "order_id": order_id,
+    }
+
+
+def _maybe_execute_spot_fast_stop_exit(
+    *,
+    args: argparse.Namespace,
+    state: dict[str, Any],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    strategy_open_orders: list[dict[str, Any]],
+    bid_price: float,
+    base_asset: str,
+    quote_asset: str,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    fast_stop_guard: dict[str, Any],
+    controls: dict[str, Any],
+) -> dict[str, Any]:
+    result = {
+        "enabled": bool(getattr(args, "spot_fast_stop_enabled", False)),
+        "executed": False,
+        "reason": "",
+        "canceled_count": 0,
+        "order": None,
+        "execution": None,
+        "guard": fast_stop_guard,
+    }
+    if not result["enabled"]:
+        return result
+    if not fast_stop_guard.get("force_exit"):
+        result["reason"] = "not_triggered"
+        return result
+    neutral_qty = max(_safe_float(getattr(args, "neutral_base_qty", 0.0)), 0.0)
+    actual_base_qty = max(_safe_float(controls.get("actual_base_qty")), 0.0)
+    mid_price = (max(_safe_float(bid_price), 0.0) + max(_safe_float(controls.get("center_price")), 0.0)) / 2.0
+    if mid_price <= 0:
+        mid_price = max(_safe_float(bid_price), 0.0)
+    reduce_target_notional = max(_safe_float(getattr(args, "spot_fast_stop_reduce_target_notional", 0.0)), 0.0)
+    target_excess_qty = (reduce_target_notional / mid_price) if mid_price > 0 else 0.0
+    excess_qty = max(actual_base_qty - neutral_qty, 0.0)
+    desired_sell_qty = max(excess_qty - target_excess_qty, 0.0)
+    if desired_sell_qty <= EPSILON:
+        result["reason"] = "at_or_below_target"
+        return result
+    account_info = fetch_spot_account_info(api_key, api_secret)
+    base_free, _ = _extract_balance(account_info, base_asset)
+    protected_base_qty = neutral_qty + max(_safe_float(getattr(args, "spot_fast_stop_min_base_buffer_qty", 0.0)), 0.0)
+    free_excess_qty = max(base_free - protected_base_qty, 0.0)
+    sell_qty = _round_order_qty(min(desired_sell_qty, free_excess_qty), step_size)
+    if sell_qty <= EPSILON:
+        result["reason"] = "no_free_excess_base"
+        return result
+    if min_qty is not None and sell_qty < min_qty:
+        result["reason"] = "below_min_qty"
+        return result
+    if min_notional is not None and sell_qty * max(bid_price, 0.0) < min_notional:
+        result["reason"] = "below_min_notional"
+        return result
+    if strategy_open_orders:
+        result["canceled_count"] = _cancel_orders(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            orders=strategy_open_orders,
+        )
+    if not _truthy(args.apply):
+        result["executed"] = True
+        result["reason"] = "dry_run"
+        result["execution"] = {"executed_qty": sell_qty, "executed_notional": sell_qty * max(bid_price, 0.0)}
+        return result
+    client_order_id = _build_client_order_id(str(args.client_order_prefix), "faststop", "SELL")
+    placed = post_spot_order(
+        symbol=symbol,
+        side="SELL",
+        quantity=sell_qty,
+        price=bid_price,
+        api_key=api_key,
+        api_secret=api_secret,
+        order_type="MARKET",
+        new_client_order_id=client_order_id,
+    )
+    result["order"] = placed
+    result["execution"] = _apply_synthetic_fast_stop_sell_to_state(
+        state=state,
+        response=placed,
+        base_asset=base_asset,
+        quote_asset=quote_asset,
+        role="fast_stop_exit",
+    )
+    result["executed"] = True
+    result["reason"] = "executed"
+    return result
+
+
 def _build_runtime_guard_summary(
     *,
     args: argparse.Namespace,
@@ -1679,6 +2402,11 @@ def _build_runtime_guard_summary(
         "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
         "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
         "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+        "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,
+        "rolling_hourly_loss_per_10k": runtime_guard_result.rolling_hourly_loss_per_10k,
+        "rolling_hourly_loss_per_10k_active": runtime_guard_result.rolling_hourly_loss_per_10k_active,
+        "rolling_hourly_loss_per_10k_limit": runtime_guard_config.rolling_hourly_loss_per_10k_limit,
+        "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
         "flatten_started": bool(flatten_result.get("started")),
@@ -1770,6 +2498,14 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             freeze_shift_abs_return_trigger_ratio=args.freeze_shift_abs_return_trigger_ratio,
         )
         controls = {}
+    elif strategy_mode == "spot_competition_synthetic_neutral_grid":
+        applied_trades = _sync_synthetic_neutral_trades(
+            state=state,
+            trades=trades,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+        )
+        controls = {}
     else:
         applied_trades = _sync_volume_shift_trades(
             state=state,
@@ -1783,6 +2519,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
     strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
     metrics = state.get("metrics") if isinstance(state.get("metrics"), dict) else _new_metrics()
+    trade_database_status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
     runtime_guard_config = normalize_runtime_guard_config(vars(args))
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
@@ -1823,6 +2560,18 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             canceled_count=canceled_count,
             flatten_result=flatten_result,
         )
+        summary["trade_database"] = _persist_spot_trade_database(
+            symbol=symbol,
+            strategy_mode=strategy_mode,
+            args=args,
+            metrics=metrics,
+        )
+        summary["cycle_database"] = _persist_spot_cycle_database(
+            symbol=symbol,
+            strategy_mode=strategy_mode,
+            args=args,
+            summary=summary,
+        )
         _save_state(state_path, state)
         _append_jsonl(Path(args.summary_jsonl), summary)
         return summary
@@ -1845,6 +2594,15 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         account_info = fetch_spot_account_info(api_key, api_secret)
         open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
         strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+    fast_stop_exit_result = {
+        "enabled": bool(getattr(args, "spot_fast_stop_enabled", False)),
+        "executed": False,
+        "reason": "not_evaluated",
+        "canceled_count": 0,
+        "order": None,
+        "execution": None,
+        "guard": {},
+    }
 
     if strategy_mode == "spot_one_way_long":
         desired_orders = _build_static_desired_orders(
@@ -1864,6 +2622,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             market_guard=market_guard,
         )
     else:
+        synthetic_neutral_mode = strategy_mode == "spot_competition_synthetic_neutral_grid"
         desired_orders, controls = _build_spot_competition_inventory_grid_orders(
             state=state,
             trades=trades,
@@ -1884,7 +2643,60 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+            synthetic_neutral=synthetic_neutral_mode,
+            neutral_base_qty=float(getattr(args, "neutral_base_qty", 0.0)),
+            max_short_position_notional=float(getattr(args, "max_short_position_notional", 0.0)),
+            actual_base_qty=_total_base_balance(account_info, base_asset) if synthetic_neutral_mode else None,
+            symbol=symbol,
+            slow_trend_step_enabled=bool(getattr(args, "spot_slow_trend_step_enabled", False)),
+            slow_trend_step_5m_return_ratio=float(getattr(args, "spot_slow_trend_step_5m_return_ratio", 0.0)),
+            slow_trend_step_15m_return_ratio=float(getattr(args, "spot_slow_trend_step_15m_return_ratio", 0.0)),
+            slow_trend_step_5m_amplitude_ratio=float(getattr(args, "spot_slow_trend_step_5m_amplitude_ratio", 0.0)),
+            slow_trend_step_15m_amplitude_ratio=float(getattr(args, "spot_slow_trend_step_15m_amplitude_ratio", 0.0)),
+            slow_trend_step_scale=float(getattr(args, "spot_slow_trend_step_scale", 1.0)),
         )
+        current_long_notional_for_guard = _safe_float(controls.get("current_long_notional"))
+        fast_stop_guard = _assess_spot_fast_stop_guard(
+            symbol=symbol,
+            current_long_notional=current_long_notional_for_guard,
+            freeze_position_notional=float(getattr(args, "spot_fast_stop_freeze_position_notional", 0.0)),
+            exit_position_notional=float(getattr(args, "spot_fast_stop_exit_position_notional", 0.0)),
+            trigger_10s_abs_return_ratio=float(getattr(args, "spot_fast_stop_10s_abs_return_ratio", 0.0)),
+            trigger_10s_amplitude_ratio=float(getattr(args, "spot_fast_stop_10s_amplitude_ratio", 0.0)),
+            trigger_30s_abs_return_ratio=float(getattr(args, "spot_fast_stop_30s_abs_return_ratio", 0.0)),
+            trigger_30s_amplitude_ratio=float(getattr(args, "spot_fast_stop_30s_amplitude_ratio", 0.0)),
+            down_only=bool(getattr(args, "spot_fast_stop_down_only", True)),
+        )
+        fast_stop_exit_result = _maybe_execute_spot_fast_stop_exit(
+            args=args,
+            state=state,
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            strategy_open_orders=strategy_open_orders,
+            bid_price=bid_price,
+            base_asset=base_asset,
+            quote_asset=quote_asset,
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            fast_stop_guard=fast_stop_guard,
+            controls=controls,
+        )
+        if fast_stop_exit_result.get("executed"):
+            account_info = fetch_spot_account_info(api_key, api_secret)
+            open_orders = fetch_spot_open_orders(symbol, api_key, api_secret)
+            strategy_open_orders = _strategy_open_orders(open_orders, str(args.client_order_prefix))
+            desired_orders = []
+            controls["buy_paused"] = True
+            controls["pause_reasons"] = list(controls.get("pause_reasons") or []) + list(fast_stop_guard.get("reasons") or [])
+            controls["risk_state"] = "fast_stop_exit"
+        elif fast_stop_guard.get("freeze_buy"):
+            desired_orders = [order for order in desired_orders if str(order.get("side", "")).upper() != "BUY"]
+            controls["buy_paused"] = True
+            controls["pause_reasons"] = list(controls.get("pause_reasons") or []) + list(fast_stop_guard.get("reasons") or [])
+            controls["risk_state"] = "fast_stop_freeze"
+        controls["fast_stop_guard"] = fast_stop_guard
     diff = diff_open_orders(existing_orders=strategy_open_orders, desired_orders=desired_orders)
 
     canceled_count = 0
@@ -1961,13 +2773,20 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
     inventory_qty = _sum_inventory_qty(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
     inventory_cost_quote = _sum_inventory_cost(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else [])
     inventory_avg_cost = (inventory_cost_quote / inventory_qty) if inventory_qty > EPSILON else 0.0
+    synthetic_net_qty = _safe_float(controls.get("synthetic_net_qty")) if isinstance(controls, dict) else 0.0
     managed_base_qty = (
         sum(max(_safe_float((state["cells"].get(str(cell["idx"])) or {}).get("position_qty")), 0.0) for cell in cells)
         if strategy_mode == "spot_one_way_long"
-        else inventory_qty
+        else abs(synthetic_net_qty) if strategy_mode == "spot_competition_synthetic_neutral_grid" else inventory_qty
     )
     unrealized_pnl = (mid_price - inventory_avg_cost) * inventory_qty if inventory_qty > EPSILON else 0.0
     net_pnl_estimate = _safe_float(metrics.get("realized_pnl")) + unrealized_pnl
+    trade_database_status = _persist_spot_trade_database(
+        symbol=symbol,
+        strategy_mode=strategy_mode,
+        args=args,
+        metrics=metrics,
+    )
 
     summary = {
         "ts": _utc_now().isoformat(),
@@ -1986,6 +2805,7 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "quote_asset": quote_asset,
         "base_asset": base_asset,
         "applied_trades": applied_trades,
+        "trade_database": trade_database_status,
         "placed_count": placed_count,
         "canceled_count": canceled_count,
         "open_strategy_orders": len(strategy_open_orders),
@@ -2006,6 +2826,14 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "sell_count": _safe_int(metrics.get("sell_count")),
         "inventory_qty": inventory_qty,
         "inventory_notional": inventory_qty * mid_price,
+        "neutral_base_qty": _safe_float(controls.get("neutral_base_qty")),
+        "actual_base_qty": _safe_float(controls.get("actual_base_qty")),
+        "synthetic_net_qty": _safe_float(controls.get("synthetic_net_qty")),
+        "synthetic_dust_qty": _safe_float(controls.get("synthetic_dust_qty")),
+        "synthetic_dust_notional": _safe_float(controls.get("synthetic_dust_notional")),
+        "current_long_notional": _safe_float(controls.get("current_long_notional")),
+        "current_short_notional": _safe_float(controls.get("current_short_notional")),
+        "max_short_position_notional": _safe_float(controls.get("max_short_position_notional")),
         "inventory_avg_cost": inventory_avg_cost,
         "oldest_inventory_age_minutes": _oldest_inventory_age_minutes(state.get("inventory_lots") if isinstance(state.get("inventory_lots"), list) else []),
         "mode": controls.get("mode", "static"),
@@ -2021,6 +2849,9 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "effective_buy_levels": _safe_int(controls.get("effective_buy_levels")),
         "effective_sell_levels": _safe_int(controls.get("effective_sell_levels")),
         "effective_per_order_notional": _safe_float(controls.get("effective_per_order_notional")),
+        "base_step_price": _safe_float(controls.get("base_step_price")),
+        "effective_step_price": _safe_float(controls.get("effective_step_price")),
+        "slow_trend_step": controls.get("slow_trend_step", {}),
         "direction_state": str(controls.get("direction_state", "") or ""),
         "risk_state": str(controls.get("risk_state", "") or ""),
         "grid_anchor_price": _safe_float(controls.get("grid_anchor_price")),
@@ -2030,6 +2861,8 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "warmup_position_notional": _safe_float(controls.get("warmup_position_notional")),
         "require_non_loss_exit": bool(controls.get("require_non_loss_exit")),
         "spot_taker_exit": taker_exit_result,
+        "spot_fast_stop_exit": fast_stop_exit_result,
+        "spot_fast_stop_guard": controls.get("fast_stop_guard", {}),
         "shift_moves": controls.get("shift_moves", []),
         "runtime_status": runtime_guard_result.runtime_status,
         "stop_triggered": runtime_guard_result.stop_triggered,
@@ -2040,9 +2873,20 @@ def _run_cycle(args: argparse.Namespace, symbol_info: dict[str, Any], api_key: s
         "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
         "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
         "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+        "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,
+        "rolling_hourly_loss_per_10k": runtime_guard_result.rolling_hourly_loss_per_10k,
+        "rolling_hourly_loss_per_10k_active": runtime_guard_result.rolling_hourly_loss_per_10k_active,
+        "rolling_hourly_loss_per_10k_limit": runtime_guard_config.rolling_hourly_loss_per_10k_limit,
+        "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
     }
+    summary["cycle_database"] = _persist_spot_cycle_database(
+        symbol=symbol,
+        strategy_mode=strategy_mode,
+        args=args,
+        summary=summary,
+    )
     _save_state(state_path, state)
     _append_jsonl(Path(args.summary_jsonl), summary)
     return summary
@@ -2070,6 +2914,11 @@ def run_once(args: argparse.Namespace) -> dict[str, Any]:
             raise RuntimeError("spot competition inventory grid requires per_order_notional > 0")
         if args.max_position_notional <= 0:
             raise RuntimeError("max_position_notional must be > 0")
+        if strategy_mode == "spot_competition_synthetic_neutral_grid":
+            if args.neutral_base_qty <= 0:
+                raise RuntimeError("spot synthetic-neutral grid requires neutral_base_qty > 0")
+            if args.max_short_position_notional <= 0:
+                raise RuntimeError("spot synthetic-neutral grid requires max_short_position_notional > 0")
     api_key, api_secret = creds
     symbol_info = fetch_spot_symbol_config(args.symbol)
     return _run_cycle(args, symbol_info, api_key, api_secret)
@@ -2082,7 +2931,12 @@ def _build_parser() -> argparse.ArgumentParser:
         "--strategy-mode",
         type=str,
         default="spot_one_way_long",
-        choices=("spot_one_way_long", "spot_volume_shift_long", "spot_competition_inventory_grid"),
+        choices=(
+            "spot_one_way_long",
+            "spot_volume_shift_long",
+            "spot_competition_inventory_grid",
+            "spot_competition_synthetic_neutral_grid",
+        ),
     )
     parser.add_argument("--min-price", type=float, default=0.0)
     parser.add_argument("--max-price", type=float, default=0.0)
@@ -2128,8 +2982,31 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--spot-taker-exit-enabled", action="store_true")
     parser.add_argument("--spot-taker-exit-fee-ratio", type=float, default=0.001)
     parser.add_argument("--spot-taker-exit-min-profit-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-enabled", action="store_true")
+    parser.add_argument("--spot-fast-stop-down-only", dest="spot_fast_stop_down_only", action="store_true")
+    parser.add_argument("--spot-fast-stop-any-direction", dest="spot_fast_stop_down_only", action="store_false")
+    parser.set_defaults(spot_fast_stop_down_only=True)
+    parser.add_argument("--spot-fast-stop-10s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-10s-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-30s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-30s-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-freeze-position-notional", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-exit-position-notional", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-reduce-target-notional", type=float, default=0.0)
+    parser.add_argument("--spot-fast-stop-min-base-buffer-qty", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-enabled", action="store_true")
+    parser.add_argument("--spot-slow-trend-step-5m-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-15m-return-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-15m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--spot-slow-trend-step-scale", type=float, default=1.0)
     parser.add_argument("--max-order-position-notional", type=float, default=0.0)
     parser.add_argument("--max-position-notional", type=float, default=0.0)
+    parser.add_argument("--neutral-base-qty", type=float, default=0.0)
+    parser.add_argument("--max-short-position-notional", type=float, default=0.0)
+    parser.add_argument("--elastic-volume-enabled", dest="elastic_volume_enabled", action="store_true")
+    parser.add_argument("--no-elastic-volume-enabled", dest="elastic_volume_enabled", action="store_false")
+    parser.set_defaults(elastic_volume_enabled=False)
     parser.add_argument("--max-single-cycle-new-orders", type=int, default=8)
     parser.add_argument("--run-start-time", type=str, default=None)
     parser.add_argument("--run-end-time", type=str, default=None)

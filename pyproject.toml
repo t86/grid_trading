@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Arithmetic long-grid optimizer for BTC/ETH perpetual strategies."
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["requests>=2.31", "websocket-client>=1.8,<2"]
+dependencies = ["requests>=2.31", "websocket-client>=1.8,<2", "psycopg[binary]>=3.1,<4"]
 
 [project.optional-dependencies]
 platform-db = [
@@ -20,12 +20,17 @@ platform-db = [
 [project.scripts]
 grid-opt = "grid_optimizer.cli:main"
 grid-competition-report = "grid_optimizer.competition_report:main"
+grid-competition-board-refresh = "grid_optimizer.competition_board_refresh:main"
 grid-web = "grid_optimizer.web:main"
 grid-dry-run = "grid_optimizer.dry_run:main"
 grid-live-check = "grid_optimizer.live_check:main"
 grid-semi-auto-plan = "grid_optimizer.semi_auto_plan:main"
 grid-submit-plan = "grid_optimizer.submit_plan:main"
 grid-loop-runner = "grid_optimizer.loop_runner:main"
+grid-alpha-airdrop-monitor = "grid_optimizer.alpha_airdrop_monitor:main"
+grid-trade-db-backfill = "grid_optimizer.trade_database_backfill:main"
+grid-recovery-stall-monitor = "grid_optimizer.recovery_stall_monitor:main"
+grid-low-volume-monitor = "grid_optimizer.low_volume_monitor:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

@@ -6,6 +6,10 @@ from datetime import datetime, timedelta, timezone
 from grid_optimizer.submit_plan import (
     adjust_post_only_price,
     apply_anti_chase_entry_guard_to_actions,
+    apply_hard_loss_rescue_entry_guard_to_actions,
+    apply_loss_inventory_no_cross_entry_guard_to_actions,
+    apply_loss_reduce_reentry_guard_to_actions,
+    apply_reduce_only_no_loss_guard_to_actions,
     build_execution_actions,
     cap_reduce_only_place_orders_to_position,
     enforce_execution_action_limits,
@@ -13,6 +17,9 @@ from grid_optimizer.submit_plan import (
     filter_strategy_open_orders,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
+    sort_cancel_orders_farthest_from_market_first,
+    suppress_same_side_nearby_place_orders,
+    suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
 )
 
@@ -51,6 +58,69 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(actions["cancel_count"], 1)
         self.assertAlmostEqual(actions["place_notional"], 202.32531, places=8)
 
+    def test_build_execution_actions_prioritizes_forced_reduce_orders(self) -> None:
+        report = {
+            "symbol": "BILLUSDT",
+            "forced_reduce_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                }
+            ],
+            "bootstrap_orders": [
+                {"side": "BUY", "price": 0.1512, "qty": 100.0, "notional": 15.12, "role": "entry"}
+            ],
+            "missing_orders": [
+                {"side": "SELL", "price": 0.1520, "qty": 100.0, "notional": 15.2, "role": "take_profit_long"}
+            ],
+            "stale_orders": [],
+        }
+
+        actions = build_execution_actions(report)
+
+        self.assertEqual(actions["place_count"], 3)
+        self.assertEqual(actions["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(actions["place_orders"][0]["time_in_force"], "IOC")
+        self.assertTrue(actions["place_orders"][0]["force_reduce_only"])
+        self.assertAlmostEqual(actions["place_notional"], 110.19836, places=8)
+
+    def test_build_execution_actions_deduplicates_forced_reduce_already_missing(self) -> None:
+        forced_reduce = {
+            "side": "SELL",
+            "price": 0.14464,
+            "qty": 900.0,
+            "notional": 130.176,
+            "role": "best_quote_adverse_reduce_long",
+            "force_reduce_only": True,
+            "execution_type": "post_only",
+            "time_in_force": "GTX",
+        }
+        report = {
+            "symbol": "BILLUSDT",
+            "forced_reduce_orders": [forced_reduce],
+            "bootstrap_orders": [],
+            "missing_orders": [
+                dict(forced_reduce),
+                {"side": "BUY", "price": 0.14289, "qty": 909.0, "notional": 129.88701, "role": "best_quote_entry_long"},
+            ],
+            "stale_orders": [],
+        }
+
+        actions = build_execution_actions(report)
+
+        self.assertEqual(actions["place_count"], 2)
+        self.assertEqual([item["role"] for item in actions["place_orders"]], [
+            "best_quote_adverse_reduce_long",
+            "best_quote_entry_long",
+        ])
+        self.assertAlmostEqual(actions["place_notional"], 260.06301, places=8)
+
     def test_build_execution_actions_excludes_manual_stale_orders(self) -> None:
         report = {
             "symbol": "BTCUSDC",
@@ -65,7 +135,223 @@ class SubmitPlanTests(unittest.TestCase):
         actions = build_execution_actions(report)
 
         self.assertEqual(actions["cancel_orders"], [report["stale_orders"][0]])
-        self.assertEqual(actions["cancel_count"], 1)
+
+    def test_sort_cancel_orders_farthest_from_market_first_for_buy_and_sell(self) -> None:
+        actions = {
+            "place_orders": [],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.15390"},
+                {"orderId": 2, "side": "BUY", "price": "0.15370"},
+                {"orderId": 3, "side": "SELL", "price": "0.15420"},
+                {"orderId": 4, "side": "SELL", "price": "0.15440"},
+            ],
+            "place_count": 0,
+            "cancel_count": 4,
+        }
+
+        adjusted = sort_cancel_orders_farthest_from_market_first(
+            actions=actions,
+            live_bid_price=0.15400,
+            live_ask_price=0.15410,
+        )
+
+        self.assertEqual([item["orderId"] for item in adjusted["cancel_orders"]], [4, 2, 3, 1])
+
+    def test_sort_cancel_orders_keeps_urgent_cancel_reason_first(self) -> None:
+        actions = {
+            "place_orders": [],
+            "cancel_orders": [
+                {"orderId": 1, "side": "BUY", "price": "0.15370"},
+                {"orderId": 2, "side": "SELL", "price": "0.15420", "cancel_reason": "urgent_reduce_only_displaces_take_profit"},
+                {"orderId": 3, "side": "SELL", "price": "0.15440"},
+            ],
+            "place_count": 0,
+            "cancel_count": 3,
+        }
+
+        adjusted = sort_cancel_orders_farthest_from_market_first(
+            actions=actions,
+            live_bid_price=0.15400,
+            live_ask_price=0.15410,
+        )
+
+        self.assertEqual([item["orderId"] for item in adjusted["cancel_orders"]], [2, 3, 1])
+        self.assertEqual(adjusted["cancel_count"], 3)
+
+    def test_suppress_same_side_nearby_place_orders_keeps_one_per_spacing_band(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.15900, "qty": 720.0, "notional": 114.48, "role": "best_quote_entry_long"},
+                {"side": "BUY", "price": 0.15900, "qty": 720.0, "notional": 114.48, "role": "best_quote_entry_long"},
+                {"side": "BUY", "price": 0.15900, "qty": 100.0, "notional": 15.9, "role": "best_quote_reduce_short", "force_reduce_only": True},
+                {"side": "SELL", "price": 0.16087, "qty": 714.0, "notional": 114.86118, "role": "best_quote_entry_short"},
+                {"side": "SELL", "price": 0.16106, "qty": 714.0, "notional": 114.99684, "role": "best_quote_entry_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 4,
+            "cancel_count": 0,
+        }
+
+        guarded = suppress_same_side_nearby_place_orders(
+            actions=actions,
+            min_price_spacing=0.00019,
+            live_bid_price=0.16090,
+            live_ask_price=0.16091,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 3)
+        self.assertEqual([(item["side"], item["price"]) for item in guarded["place_orders"]], [
+            ("BUY", 0.15900),
+            ("BUY", 0.15900),
+            ("SELL", 0.16091),
+        ])
+        self.assertEqual(guarded["same_side_spacing_guard"]["suppressed_place_count"], 2)
+
+    def test_reduce_only_no_loss_guard_drops_cost_gate_short_cover_above_ceiling(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 2052.60,
+                    "qty": 0.01,
+                    "notional": 20.526,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                    "cost_gate_fallback_from_role": "best_quote_entry_long",
+                },
+                {
+                    "side": "BUY",
+                    "price": 2051.00,
+                    "qty": 0.01,
+                    "notional": 20.51,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {
+                    "enabled": True,
+                    "effective_min_profit_ratio": 0.0,
+                    "short_ceiling_price": 2051.20772,
+                },
+                "current_short_avg_price": 2051.20772,
+                "symbol_info": {"tick_size": 0.01, "min_qty": 0.001, "min_notional": 5.0, "step_size": 0.001},
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=2052.50,
+            live_ask_price=2052.61,
+            tick_size=0.01,
+            min_qty=0.001,
+            min_notional=5.0,
+            step_size=0.001,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["price"], 2051.00)
+        dropped = guarded["reduce_only_no_loss_guard"]["dropped_orders"][0]
+        self.assertEqual(dropped["role"], "best_quote_reduce_short")
+        self.assertEqual(dropped["reduce_only_no_loss_drop_reason"], "short_reduce_above_no_loss_ceiling")
+        self.assertAlmostEqual(dropped["reduce_only_no_loss_guard_price"], 2051.20772)
+
+    def test_reduce_only_no_loss_guard_can_be_disabled_for_volume_mode(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.6502,
+                    "qty": 63.0,
+                    "notional": 40.9626,
+                    "role": "best_quote_reduce_long",
+                    "position_side": "LONG",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+
+        guarded = apply_reduce_only_no_loss_guard_to_actions(
+            actions=actions,
+            plan_report={
+                "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                "take_profit_guard": {"enabled": True, "long_floor_price": 0.6506},
+                "current_long_avg_price": 0.6506,
+            },
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+            live_bid_price=0.6501,
+            live_ask_price=0.6502,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+            enabled=False,
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertFalse(guarded["reduce_only_no_loss_guard"]["enabled"])
+        self.assertEqual(guarded["place_orders"][0]["role"], "best_quote_reduce_long")
+
+    def test_suppress_same_side_nearby_place_orders_preserves_existing_queue(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.16006, "qty": 718.0, "notional": 114.92308, "role": "best_quote_entry_short"}
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 419310803,
+                    "clientOrderId": "gx-billu-bestquot-2-12628113",
+                    "side": "SELL",
+                    "price": "0.16014",
+                    "origQty": "717.0",
+                    "positionSide": "BOTH",
+                }
+            ],
+            "place_count": 1,
+            "cancel_count": 1,
+        }
+        current_open_orders = [
+            {
+                "orderId": 419310803,
+                "clientOrderId": "gx-billu-bestquot-2-12628113",
+                "side": "SELL",
+                "price": "0.16014",
+                "origQty": "717.0",
+                "positionSide": "BOTH",
+            }
+        ]
+
+        guarded = suppress_same_side_nearby_place_orders(
+            actions=actions,
+            current_open_orders=current_open_orders,
+            min_price_spacing=0.00019,
+            live_bid_price=0.15993,
+            live_ask_price=0.15994,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(guarded["place_count"], 0)
+        self.assertEqual(guarded["cancel_count"], 0)
+        guard = guarded["same_side_spacing_guard"]
+        self.assertEqual(guard["suppressed_place_orders"][0]["defer_reason"], "existing_same_side_nearby_open_order")
+        self.assertEqual(guard["protected_cancel_count"], 1)
 
     def test_reduce_only_cap_counts_orders_pending_cancel_until_exchange_releases_qty(self) -> None:
         actions = {
@@ -126,6 +412,751 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["place_orders"][1]["qty"], 50.0)
         self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
 
+    def test_loss_inventory_guard_drops_losing_short_buy_above_recovery_ceiling(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.1450, "qty": 1000.0, "notional": 145.0, "role": "entry_long"}
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -900.0,
+            "unrealized_pnl": -10.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.0002,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_orders"], [])
+        self.assertEqual(guarded["loss_inventory_no_cross_entry_guard"]["dropped_order_count"], 1)
+
+    def test_loss_inventory_guard_drops_loss_entry_cross_and_allows_reduce_only_brush(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.1400, "qty": 100.0, "notional": 14.0, "role": "entry_short"},
+                {"side": "SELL", "price": 0.1400, "qty": 200.0, "notional": 28.0, "role": "entry_short"},
+                {
+                    "side": "SELL",
+                    "price": 0.1400,
+                    "qty": 100.0,
+                    "notional": 14.0,
+                    "role": "active_delever_long",
+                    "force_reduce_only": True,
+                    "execution_type": "maker_timeout_release",
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 3,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "active_delever_long")
+        self.assertEqual(
+            guarded["place_orders"][0]["loss_inventory_no_cross_guard"],
+            "long_small_loss_reduce_allowed",
+        )
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["resized_small_loss_reduce_count"], 0)
+        self.assertEqual(guard_report["dropped_order_count"], 2)
+
+    def test_loss_inventory_guard_converts_profitable_short_cover_and_cap_prevents_cross(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "BUY", "price": 0.1429, "qty": 1000.0, "notional": 142.9, "role": "entry_long"}
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -700.0,
+            "unrealized_pnl": -1.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.0002,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+        capped = cap_reduce_only_place_orders_to_position(
+            actions=guarded,
+            strategy_mode="synthetic_neutral",
+            current_actual_net_qty=-700.0,
+            current_open_orders=[],
+        )
+
+        self.assertEqual(capped["place_count"], 1)
+        self.assertEqual(capped["place_orders"][0]["qty"], 700.0)
+        self.assertIs(capped["place_orders"][0]["force_reduce_only"], True)
+        self.assertEqual(capped["reduce_only_position_cap"]["resized_order_count"], 1)
+
+    def test_loss_inventory_guard_drops_non_urgent_reduce_only_long_below_recovery_floor(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 200.0,
+                    "notional": 28.1,
+                    "role": "adverse_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "maker_timeout_release",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_orders"], [])
+        self.assertEqual(guarded["loss_inventory_no_cross_entry_guard"]["dropped_order_count"], 1)
+        self.assertEqual(
+            guarded["loss_inventory_no_cross_entry_guard"]["dropped_orders"][0][
+                "loss_inventory_no_cross_drop_reason"
+            ],
+            "losing_long_sell_below_recovery_floor",
+        )
+
+    def test_loss_inventory_guard_allows_small_reduce_only_long_brush_below_recovery_floor(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 100.0,
+                    "notional": 14.05,
+                    "role": "best_quote_reduce_long",
+                    "force_reduce_only": True,
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "best_quote_reduce_long")
+        self.assertEqual(
+            guarded["place_orders"][0]["loss_inventory_no_cross_guard"],
+            "long_small_loss_reduce_allowed",
+        )
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_shrinks_large_reduce_only_long_brush_below_recovery_floor(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 200.0,
+                    "quantity": 200.0,
+                    "notional": 28.1,
+                    "role": "best_quote_reduce_long",
+                    "force_reduce_only": True,
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "long_small_loss_reduce_resized")
+        self.assertEqual(order["qty"], 106.0)
+        self.assertEqual(order["quantity"], 106.0)
+        self.assertLessEqual(order["notional"], 15.0)
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["resized_small_loss_reduce_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_drops_entry_short_that_would_loss_reduce_losing_long(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 200.0,
+                    "quantity": 200.0,
+                    "notional": 28.1,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 0)
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["resized_small_loss_reduce_count"], 0)
+        self.assertEqual(guard_report["dropped_order_count"], 1)
+        self.assertEqual(
+            guard_report["dropped_orders"][0]["loss_inventory_no_cross_drop_reason"],
+            "losing_long_sell_below_recovery_floor",
+        )
+
+    def test_loss_inventory_guard_allows_small_best_quote_short_entry_to_reduce_losing_long(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 100.0,
+                    "quantity": 100.0,
+                    "notional": 14.05,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -5.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["role"], "best_quote_entry_short")
+        self.assertIs(order["force_reduce_only"], True)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "long_small_loss_reduce_allowed")
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_allows_best_quote_short_entry_when_losing_long_is_dust(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.5783,
+                    "qty": 48.0,
+                    "quantity": 48.0,
+                    "notional": 27.7584,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1.0,
+            "unrealized_pnl": -0.0081,
+            "current_long_avg_price": 0.5861,
+            "take_profit_min_profit_ratio": 0.00008,
+            "loss_inventory_no_cross_small_entry_notional": 30.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["role"], "best_quote_entry_short")
+        self.assertNotIn("force_reduce_only", order)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "long_dust_cross_allowed")
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_does_not_force_reduce_losing_long_dust_inside_recovery(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.5759,
+                    "qty": 48.0,
+                    "quantity": 48.0,
+                    "notional": 27.6432,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1.0,
+            "unrealized_pnl": -0.0001,
+            "current_long_avg_price": 0.5757,
+            "take_profit_min_profit_ratio": 0.00008,
+            "loss_inventory_no_cross_small_entry_notional": 30.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertNotIn("force_reduce_only", order)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "long_dust_cross_allowed")
+        self.assertLess(order["loss_inventory_target_notional"], 5.0)
+
+    def test_loss_inventory_guard_allows_small_reduce_only_short_brush_above_recovery_ceiling(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.1450,
+                    "qty": 100.0,
+                    "notional": 14.5,
+                    "role": "best_quote_reduce_short",
+                    "force_reduce_only": True,
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -1000.0,
+            "unrealized_pnl": -5.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "best_quote_reduce_short")
+        self.assertEqual(
+            guarded["place_orders"][0]["loss_inventory_no_cross_guard"],
+            "short_small_loss_reduce_allowed",
+        )
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_shrinks_large_reduce_only_short_brush_above_recovery_ceiling(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.1450,
+                    "qty": 200.0,
+                    "quantity": 200.0,
+                    "notional": 29.0,
+                    "role": "best_quote_reduce_short",
+                    "force_reduce_only": True,
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -1000.0,
+            "unrealized_pnl": -5.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "short_small_loss_reduce_resized")
+        self.assertEqual(order["qty"], 103.0)
+        self.assertEqual(order["quantity"], 103.0)
+        self.assertLessEqual(order["notional"], 15.0)
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["resized_small_loss_reduce_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_drops_entry_long_that_would_loss_reduce_losing_short(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.1450,
+                    "qty": 200.0,
+                    "quantity": 200.0,
+                    "notional": 29.0,
+                    "role": "best_quote_entry_long",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -1000.0,
+            "unrealized_pnl": -5.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 0)
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["resized_small_loss_reduce_count"], 0)
+        self.assertEqual(guard_report["dropped_order_count"], 1)
+        self.assertEqual(
+            guard_report["dropped_orders"][0]["loss_inventory_no_cross_drop_reason"],
+            "losing_short_buy_above_recovery_ceiling",
+        )
+
+    def test_loss_inventory_guard_allows_small_best_quote_long_entry_to_reduce_losing_short(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.1450,
+                    "qty": 100.0,
+                    "quantity": 100.0,
+                    "notional": 14.5,
+                    "role": "best_quote_entry_long",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -1000.0,
+            "unrealized_pnl": -5.0,
+            "current_short_avg_price": 0.1430,
+            "take_profit_min_profit_ratio": 0.001,
+            "loss_inventory_no_cross_small_entry_notional": 15.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["role"], "best_quote_entry_long")
+        self.assertIs(order["force_reduce_only"], True)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "short_small_loss_reduce_allowed")
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_allows_best_quote_long_entry_when_losing_short_is_dust(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.5780,
+                    "qty": 48.0,
+                    "quantity": 48.0,
+                    "notional": 27.744,
+                    "role": "best_quote_entry_long",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -1.0,
+            "unrealized_pnl": -0.0081,
+            "current_short_avg_price": 0.5700,
+            "take_profit_min_profit_ratio": 0.00008,
+            "loss_inventory_no_cross_small_entry_notional": 30.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertEqual(order["role"], "best_quote_entry_long")
+        self.assertNotIn("force_reduce_only", order)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "short_dust_cross_allowed")
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_small_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 0)
+
+    def test_loss_inventory_guard_does_not_force_reduce_losing_short_dust_inside_recovery(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.5759,
+                    "qty": 62.0,
+                    "quantity": 62.0,
+                    "notional": 35.7058,
+                    "role": "best_quote_entry_long",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -1.0,
+            "unrealized_pnl": -0.0001,
+            "current_short_avg_price": 0.5761,
+            "take_profit_min_profit_ratio": 0.00008,
+            "loss_inventory_no_cross_small_entry_notional": 38.0,
+            "symbol_info": {"min_notional": 5.0},
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        order = guarded["place_orders"][0]
+        self.assertNotIn("force_reduce_only", order)
+        self.assertEqual(order["loss_inventory_no_cross_guard"], "short_dust_cross_allowed")
+        self.assertLess(order["loss_inventory_target_notional"], 5.0)
+
+    def test_loss_inventory_guard_drops_best_quote_short_entry_during_losing_short_uptrend(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.16053,
+                    "qty": 716.0,
+                    "quantity": 716.0,
+                    "notional": 114.9,
+                    "role": "best_quote_entry_short",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -26909.0,
+            "unrealized_pnl": -17.0,
+            "current_short_avg_price": 0.1598576369652,
+            "step_price": 0.00019,
+            "mid_price": 0.160515,
+            "market_guard": {"return_ratio": 0.00337},
+            "take_profit_min_profit_ratio": 0.0003,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual(guarded["place_count"], 0)
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["dropped_order_count"], 1)
+        self.assertEqual(
+            guard_report["dropped_orders"][0]["loss_inventory_no_cross_drop_reason"],
+            "losing_short_adverse_uptrend",
+        )
+
+    def test_loss_inventory_guard_allows_best_quote_short_entry_only_after_cost_gap(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.16004,
+                    "qty": 718.0,
+                    "quantity": 718.0,
+                    "notional": 114.9,
+                    "role": "best_quote_entry_short",
+                },
+                {
+                    "side": "SELL",
+                    "price": 0.16020,
+                    "qty": 717.0,
+                    "quantity": 717.0,
+                    "notional": 114.9,
+                    "role": "best_quote_entry_short",
+                },
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": -26909.0,
+            "unrealized_pnl": -17.0,
+            "current_short_avg_price": 0.1598576369652,
+            "step_price": 0.00019,
+            "mid_price": 0.16010,
+            "market_guard": {"return_ratio": 0.0},
+            "take_profit_min_profit_ratio": 0.0003,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertAlmostEqual(guarded["place_orders"][0]["price"], 0.16020)
+        self.assertEqual(
+            guarded["place_orders"][0]["loss_inventory_no_cross_guard"],
+            "short_same_side_entry_allowed",
+        )
+        guard_report = guarded["loss_inventory_no_cross_entry_guard"]
+        self.assertEqual(guard_report["allowed_same_side_entry_count"], 1)
+        self.assertEqual(guard_report["dropped_order_count"], 1)
+        self.assertEqual(
+            guard_report["dropped_orders"][0]["loss_inventory_no_cross_drop_reason"],
+            "losing_short_sell_below_entry_floor",
+        )
+
+    def test_loss_inventory_guard_keeps_hard_loss_forced_reduce_below_recovery_floor(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.1405,
+                    "qty": 200.0,
+                    "notional": 28.1,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                }
+            ],
+            "cancel_orders": [],
+            "place_count": 1,
+            "cancel_count": 0,
+        }
+        report = {
+            "actual_net_qty": 1000.0,
+            "unrealized_pnl": -80.0,
+            "current_long_avg_price": 0.1420,
+            "take_profit_min_profit_ratio": 0.001,
+        }
+
+        guarded = apply_loss_inventory_no_cross_entry_guard_to_actions(
+            actions=actions,
+            plan_report=report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(guarded["place_count"], 1)
+        self.assertEqual(guarded["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(guarded["loss_inventory_no_cross_entry_guard"]["dropped_order_count"], 0)
+
     def test_urgent_reduce_only_displaces_existing_take_profit_capacity(self) -> None:
         actions = {
             "place_orders": [
@@ -169,6 +1200,55 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(capped["cancel_orders"][0]["cancel_reason"], "urgent_reduce_only_displaces_take_profit")
         self.assertEqual(capped["reduce_only_position_cap"]["dropped_order_count"], 0)
         self.assertEqual(capped["reduce_only_position_cap"]["displaced_order_count"], 1)
+
+    def test_queue_priority_preserves_urgent_forced_reduce_order(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "hard_loss_forced_reduce_long",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                },
+                {
+                    "side": "SELL",
+                    "price": 0.15186,
+                    "qty": 526.0,
+                    "notional": 79.87836,
+                    "role": "take_profit_long",
+                },
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "SELL",
+                    "price": "0.15186",
+                    "origQty": "526",
+                    "positionSide": "BOTH",
+                }
+            ],
+            "place_count": 2,
+            "cancel_count": 1,
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.15186,
+            live_ask_price=0.15187,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["place_orders"][0]["role"], "hard_loss_forced_reduce_long")
+        self.assertEqual(adjusted["place_orders"][0]["execution_type"], "aggressive")
+        self.assertEqual(adjusted["place_orders"][0]["time_in_force"], "IOC")
+        self.assertTrue(adjusted["place_orders"][0]["force_reduce_only"])
 
     def test_anti_chase_guard_drops_long_entries_but_keeps_reduce_only_sells(self) -> None:
         actions = {
@@ -236,6 +1316,120 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(guarded["place_count"], 1)
         self.assertEqual(guarded["place_orders"][0]["role"], "take_profit_short")
         self.assertEqual(guarded["anti_chase_entry_guard"]["dropped_order_count"], 1)
+
+    def test_hard_loss_rescue_guard_blocks_same_direction_entries_only(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.1565,
+                    "qty": 766.0,
+                    "notional": 119.879,
+                    "role": "hard_loss_forced_reduce_short",
+                    "force_reduce_only": True,
+                    "execution_type": "aggressive",
+                    "time_in_force": "IOC",
+                },
+                {"side": "BUY", "price": 0.1540, "qty": 843.0, "notional": 129.822, "role": "take_profit_short"},
+                {"side": "SELL", "price": 0.1600, "qty": 812.0, "notional": 129.92, "role": "entry_short"},
+                {"side": "BUY", "price": 0.1545, "qty": 841.0, "notional": 129.9345, "role": "entry_long"},
+            ],
+            "cancel_orders": [],
+            "place_count": 4,
+            "cancel_count": 0,
+            "place_notional": 509.5555,
+        }
+        plan_report = {
+            "hard_loss_rescue_entry_guard": {
+                "active": True,
+                "block_short_entries": True,
+                "block_long_entries": False,
+                "reason": "protect_window_remaining=120s",
+            }
+        }
+
+        guarded = apply_hard_loss_rescue_entry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="synthetic_neutral",
+        )
+
+        self.assertEqual(
+            [item["role"] for item in guarded["place_orders"]],
+            ["hard_loss_forced_reduce_short", "take_profit_short", "entry_long"],
+        )
+        self.assertEqual(guarded["place_count"], 3)
+        guard = guarded["hard_loss_rescue_entry_guard"]
+        self.assertEqual(guard["dropped_order_count"], 1)
+        self.assertEqual(guard["dropped_orders"][0]["role"], "entry_short")
+
+    def test_hard_loss_rescue_guard_keeps_isolated_best_quote_volume_entries(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.6545, "qty": 24.0, "notional": 15.708, "role": "best_quote_entry_short"},
+                {"side": "BUY", "price": 0.6540, "qty": 12.0, "notional": 7.848, "role": "best_quote_entry_long"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        plan_report = {
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume": {
+                "reduce_freeze": {
+                    "isolates_risk_metrics": True,
+                    "frozen_short_qty": 329.0,
+                    "managed_short_qty": 337.0,
+                }
+            },
+            "hard_loss_rescue_entry_guard": {
+                "active": True,
+                "block_short_entries": True,
+                "block_long_entries": False,
+                "reason": "frozen_short_loss",
+            },
+        }
+
+        guarded = apply_hard_loss_rescue_entry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual([item["role"] for item in guarded["place_orders"]], ["best_quote_entry_short", "best_quote_entry_long"])
+        self.assertEqual(guarded["hard_loss_rescue_entry_guard"]["dropped_order_count"], 0)
+        self.assertEqual(guarded["hard_loss_rescue_entry_guard"]["isolated_best_quote_entry_count"], 2)
+
+    def test_loss_reduce_reentry_guard_keeps_isolated_best_quote_volume_entries(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.6545, "qty": 24.0, "notional": 15.708, "role": "best_quote_entry_short"},
+                {"side": "SELL", "price": 0.6550, "qty": 24.0, "notional": 15.72, "role": "entry_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+        }
+        plan_report = {
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume": {"reduce_freeze": {"isolates_risk_metrics": True}},
+            "loss_reduce_reentry_guard": {
+                "active": True,
+                "block_short_entries": True,
+                "block_long_entries": False,
+                "reason": "price_not_recovered",
+            },
+        }
+
+        guarded = apply_loss_reduce_reentry_guard_to_actions(
+            actions=actions,
+            plan_report=plan_report,
+            strategy_mode="hedge_best_quote_maker_volume_v1",
+        )
+
+        self.assertEqual([item["role"] for item in guarded["place_orders"]], ["best_quote_entry_short"])
+        self.assertEqual(guarded["loss_reduce_reentry_guard"]["dropped_order_count"], 1)
+        self.assertEqual(guarded["loss_reduce_reentry_guard"]["isolated_best_quote_entry_count"], 1)
 
     def test_deferred_action_limits_allow_capped_reduce_only_orders(self) -> None:
         now = datetime(2026, 5, 5, 0, 20, tzinfo=timezone.utc)
@@ -333,9 +1527,7 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 0)
-        self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
+        self.assertEqual(adjusted["place_count"], 0)
 
     def test_preserve_queue_priority_keeps_replace_when_projected_bucket_needs_smaller_qty(self) -> None:
         actions = {
@@ -357,9 +1549,8 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 1)
-        self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 350.0, places=8)
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_count"], 1)
 
     def test_preserve_queue_priority_keeps_exact_same_bucket_subset_when_qty_shrinks(self) -> None:
         actions = {
@@ -385,7 +1576,7 @@ class SubmitPlanTests(unittest.TestCase):
         self.assertEqual(adjusted["cancel_count"], 1)
         self.assertEqual(adjusted["cancel_orders"][0]["orderId"], 1)
 
-    def test_preserve_queue_priority_keeps_subset_and_places_delta_when_qty_shrinks(self) -> None:
+    def test_preserve_queue_priority_keeps_subset_without_same_bucket_delta(self) -> None:
         actions = {
             "place_orders": [
                 {"side": "BUY", "price": 0.05064, "qty": 650.0, "notional": 32.916, "role": "entry"}
@@ -406,9 +1597,148 @@ class SubmitPlanTests(unittest.TestCase):
         )
 
         self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["place_count"], 0)
+
+    def test_preserve_queue_priority_defers_same_bucket_place_while_cancel_pending(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.14379, "qty": 20.0, "notional": 2.8758, "role": "entry_short"},
+                {"side": "BUY", "price": 0.14200, "qty": 35.0, "notional": 4.97, "role": "entry_long"},
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "SELL",
+                    "price": "0.14379",
+                    "origQty": "35",
+                    "positionSide": "BOTH",
+                    "clientOrderId": "gx-billu-entrysho-1-11111111",
+                },
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.14250,
+            live_ask_price=0.14378,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=0.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 1)
         self.assertEqual(adjusted["place_count"], 1)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.05062, places=8)
-        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 150.0, places=8)
+        self.assertEqual(adjusted["place_orders"][0]["side"], "BUY")
+        guard = adjusted["same_bucket_cancel_place_guard"]
+        self.assertEqual(guard["deferred_place_count"], 1)
+        self.assertEqual(guard["deferred_place_orders"][0]["role"], "entry_short")
+
+    def test_preserve_queue_priority_cancels_smaller_best_quote_reduce_before_replace(self) -> None:
+        actions = {
+            "place_orders": [
+                {
+                    "side": "BUY",
+                    "price": 0.6054,
+                    "qty": 52.0,
+                    "notional": 31.4808,
+                    "role": "best_quote_reduce_short",
+                    "position_side": "SHORT",
+                    "force_reduce_only": True,
+                },
+            ],
+            "cancel_orders": [
+                {
+                    "orderId": 1,
+                    "side": "BUY",
+                    "price": "0.6054000",
+                    "origQty": "13",
+                    "positionSide": "SHORT",
+                    "reduceOnly": True,
+                },
+            ],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.6069,
+            live_ask_price=0.6070,
+            tick_size=0.0001,
+            min_qty=1.0,
+            min_notional=5.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["cancel_count"], 1)
+        self.assertEqual(adjusted["place_count"], 0)
+        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_count"], 1)
+        self.assertEqual(adjusted["same_bucket_cancel_place_guard"]["deferred_place_orders"][0]["qty"], 52.0)
+
+    def test_preserve_queue_priority_merges_duplicate_take_profit_place_buckets(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.14362, "qty": 74.0, "notional": 10.62788, "role": "take_profit_long"},
+                {"side": "SELL", "price": 0.14362, "qty": 974.0, "notional": 139.912, "role": "take_profit_long"},
+            ],
+            "cancel_orders": [],
+        }
+
+        adjusted = preserve_queue_priority_in_execution_actions(
+            actions=actions,
+            live_bid_price=0.14200,
+            live_ask_price=0.14210,
+            tick_size=0.00001,
+            min_qty=0.1,
+            min_notional=0.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertEqual(adjusted["place_orders"][0]["side"], "SELL")
+        self.assertAlmostEqual(adjusted["place_orders"][0]["price"], 0.14362, places=8)
+        self.assertAlmostEqual(adjusted["place_orders"][0]["qty"], 1048.0, places=8)
+        guard = adjusted["duplicate_place_bucket_guard"]
+        self.assertEqual(guard["merged_order_count"], 1)
+        self.assertEqual(guard["merged_orders"][0]["role"], "take_profit_long")
+
+    def test_suppress_place_orders_when_submitted_bucket_already_open(self) -> None:
+        actions = {
+            "place_orders": [
+                {"side": "SELL", "price": 0.14567, "qty": 1029.0, "notional": 149.9, "role": "entry_short"},
+                {"side": "SELL", "price": 0.14629, "qty": 1025.0, "notional": 149.9, "role": "entry_short"},
+            ],
+            "cancel_orders": [],
+            "place_count": 2,
+            "cancel_count": 0,
+            "place_notional": 299.8,
+        }
+        current_open_orders = [
+            {
+                "orderId": 1,
+                "clientOrderId": "gx-billu-entrysho-1-11111111",
+                "side": "SELL",
+                "price": "0.1456700",
+                "origQty": "1029",
+                "positionSide": "BOTH",
+            }
+        ]
+
+        adjusted = suppress_place_orders_with_existing_submitted_buckets(
+            actions=actions,
+            current_open_orders=current_open_orders,
+            live_bid_price=0.14200,
+            live_ask_price=0.14210,
+            tick_size=0.00001,
+            min_qty=1.0,
+            min_notional=0.0,
+            step_size=1.0,
+        )
+
+        self.assertEqual(adjusted["place_count"], 1)
+        self.assertEqual(adjusted["place_orders"][0]["price"], 0.14629)
+        guard = adjusted["existing_submitted_bucket_guard"]
+        self.assertEqual(guard["suppressed_place_count"], 1)
+        self.assertEqual(guard["suppressed_place_orders"][0]["role"], "entry_short")
 
     def test_validate_plan_report_rejects_old_plan_and_stale_orders_without_flag(self) -> None:
         now = datetime(2026, 3, 16, 10, 0, tzinfo=timezone.utc)

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import io
+import json
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from grid_optimizer.web import (
+    FUTURES_USDM_FALLBACK_SYMBOLS,
+    _Handler,
     MANUAL_TRADE_PAGE,
     _build_manual_trade_plan,
     _is_manual_trade_order,
@@ -18,13 +22,30 @@ from grid_optimizer.web import (
     _manual_trade_delete_history,
     _manual_trade_history_for_symbol,
     _manual_trade_public_history_for_symbol,
+    _manual_trade_refresh_book_limit_task,
     _manual_trade_maker_worker,
     _manual_trade_place_book_limit,
+    _manual_trade_snapshot,
     MANUAL_TRADE_PREPARE_TIMEOUT_SECONDS,
     MANUAL_TRADE_SLEEP_SECONDS,
     _manual_trade_set_task,
     _manual_trade_prepare_plan,
 )
+
+
+class _JsonCaptureHandler(_Handler):
+    def __init__(self) -> None:
+        self.headers = {"Content-Length": "0"}
+        self.path = "/"
+        self.status = None
+        self.payload = None
+
+    def _authorize_request(self) -> bool:
+        return True
+
+    def _send_json(self, payload, status=200):  # type: ignore[no-untyped-def]
+        self.status = status
+        self.payload = payload
 
 
 class ManualTradeTests(unittest.TestCase):
@@ -175,7 +196,7 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("/api/manual_trade/book_limit", MANUAL_TRADE_PAGE)
         self.assertIn('id="book_buy_btn"', MANUAL_TRADE_PAGE)
         self.assertIn('id="book_sell_btn"', MANUAL_TRADE_PAGE)
-        self.assertIn('const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["CHIPUSDT"]', MANUAL_TRADE_PAGE)
+        self.assertIn('const MANUAL_TRADE_EXTRA_FUTURES_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "CHIPUSDT"]', MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/take", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/cancel", MANUAL_TRADE_PAGE)
         self.assertIn("/api/manual_trade/history/delete", MANUAL_TRADE_PAGE)
@@ -192,12 +213,31 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("renderHistory(snapshot.history || [])", MANUAL_TRADE_PAGE)
         self.assertIn("history-delete-btn", MANUAL_TRADE_PAGE)
         self.assertIn("deleteHistory", MANUAL_TRADE_PAGE)
+        self.assertIn('id="history_type_filter"', MANUAL_TRADE_PAGE)
+
+        self.assertIn('<option value="maker">Maker 追盘</option>', MANUAL_TRADE_PAGE)
+        self.assertIn('<option value="take">Take 市价</option>', MANUAL_TRADE_PAGE)
+        self.assertIn('<option value="book_limit">买一/卖一挂单</option>', MANUAL_TRADE_PAGE)
+        self.assertIn('id="history_side_filter"', MANUAL_TRADE_PAGE)
+        self.assertIn('id="history_role_filter"', MANUAL_TRADE_PAGE)
+        self.assertIn('let currentHistory = [];', MANUAL_TRADE_PAGE)
+        self.assertIn("function historyItemMatchesFilters(item)", MANUAL_TRADE_PAGE)
+        self.assertIn("renderHistory(currentHistory)", MANUAL_TRADE_PAGE)
+        self.assertIn('id="history_select_all"', MANUAL_TRADE_PAGE)
+        self.assertIn('id="history_delete_selected_btn"', MANUAL_TRADE_PAGE)
+        self.assertIn("selectedHistoryIds", MANUAL_TRADE_PAGE)
+        self.assertIn("syncHistorySelectionControls", MANUAL_TRADE_PAGE)
+        self.assertIn("deleteSelectedHistory", MANUAL_TRADE_PAGE)
         self.assertIn('data-market-tab="futures"', MANUAL_TRADE_PAGE)
         self.assertIn('data-market-tab="spot"', MANUAL_TRADE_PAGE)
         self.assertIn('market_type: activeMarketType', MANUAL_TRADE_PAGE)
         self.assertIn("现货不使用借贷卖出", MANUAL_TRADE_PAGE)
 
+    def test_manual_trade_futures_fallback_symbols_include_pharos(self) -> None:
+        self.assertIn("PHAROSUSDT", FUTURES_USDM_FALLBACK_SYMBOLS)
+
     @patch("grid_optimizer.web._manual_trade_snapshot")
+    @patch("grid_optimizer.web.print")
     @patch("grid_optimizer.web.post_futures_order")
     @patch("grid_optimizer.web.fetch_futures_symbol_config")
     @patch("grid_optimizer.web.fetch_futures_book_tickers")
@@ -210,6 +250,7 @@ class ManualTradeTests(unittest.TestCase):
         mock_book,
         mock_symbol_config,
         mock_post_order,
+        mock_print,
         mock_snapshot,
     ) -> None:
         mock_credentials.return_value = ("key", "secret")
@@ -233,6 +274,95 @@ class ManualTradeTests(unittest.TestCase):
         self.assertEqual(result["order"]["orderId"], 123)
         self.assertEqual(result["limit_order"]["price"], 2.0)
         self.assertEqual(result["snapshot"], {"symbol": "BARDUSDT"})
+        task = _manual_trade_current_task("BARDUSDT")
+        self.assertEqual(task["source"], "book_limit")
+        self.assertEqual(task["status"], "submitted")
+        self.assertEqual(task["client_order_id"], "mt_bardusdt_bookbuy_b_1")
+        self.assertEqual(task["limit_order"]["price"], 2.0)
+        mock_print.assert_called_once()
+        log_line = mock_print.call_args.args[0]
+        self.assertIn("[manual-trade] book_limit symbol=BARDUSDT side=BUY", log_line)
+        self.assertIn("status=ok", log_line)
+        self.assertIn("stage_position_mode=", log_line)
+        self.assertIn("stage_book_ticker=", log_line)
+        self.assertIn("stage_symbol_config=", log_line)
+        self.assertIn("stage_post_order=", log_line)
+        self.assertIn("stage_snapshot=", log_line)
+
+    @patch("grid_optimizer.web.MANUAL_TRADE_RECEIVE_ONLY", True)
+    @patch("grid_optimizer.web.print")
+    @patch("grid_optimizer.web.post_futures_order")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_book_limit_receive_only_records_without_live_order(
+        self,
+        mock_credentials,
+        mock_position_mode,
+        mock_post_order,
+        mock_print,
+    ) -> None:
+        result = _manual_trade_place_book_limit({"symbol": "BARDUSDT", "side": "BUY", "notional": 80.0})
+
+        mock_credentials.assert_not_called()
+        mock_position_mode.assert_not_called()
+        mock_post_order.assert_not_called()
+        self.assertEqual(result["order"]["status"], "RECEIVED")
+        self.assertTrue(result["receive_only"])
+        task = _manual_trade_current_task("BARDUSDT")
+        self.assertEqual(task["status"], "received")
+        self.assertEqual(task["message"], "book limit request received; live order disabled")
+        self.assertIn("status=received", mock_print.call_args.args[0])
+
+    @patch("grid_optimizer.web.MANUAL_TRADE_RECEIVE_ONLY", True)
+    @patch("grid_optimizer.web._manual_trade_execute_take")
+    def test_receive_only_blocks_take_endpoint_before_live_execution(self, mock_take) -> None:
+        payload = {"symbol": "BARDUSDT", "market_type": "futures", "side": "BUY", "notional": 80.0}
+        raw = json.dumps(payload).encode("utf-8")
+        handler = _JsonCaptureHandler()
+        handler.path = "/api/manual_trade/take"
+        handler.headers = {"Content-Length": str(len(raw))}
+        handler.rfile = io.BytesIO(raw)
+
+        handler.do_POST()
+
+        mock_take.assert_not_called()
+        self.assertEqual(handler.status, 200)
+        self.assertTrue(handler.payload["receive_only"])
+        self.assertEqual(handler.payload["message"], "manual trade request received; live action disabled")
+
+    @patch("grid_optimizer.web.MANUAL_TRADE_RECEIVE_ONLY", True)
+    @patch("grid_optimizer.web.fetch_futures_open_orders")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.web._manual_trade_book_prices")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_receive_only_snapshot_is_local_and_fast(
+        self,
+        mock_credentials,
+        mock_book_prices,
+        mock_account_info,
+        mock_position_mode,
+        mock_open_orders,
+    ) -> None:
+        _manual_trade_set_task(
+            "BARDUSDT",
+            {"market_type": "futures", "status": "received", "message": "book limit request received"},
+        )
+
+        snapshot = _manual_trade_snapshot("BARDUSDT", "futures")
+
+        mock_credentials.assert_not_called()
+        mock_book_prices.assert_not_called()
+        mock_account_info.assert_not_called()
+        mock_position_mode.assert_not_called()
+        mock_open_orders.assert_not_called()
+        self.assertTrue(snapshot["receive_only"])
+        self.assertEqual(snapshot["symbol"], "BARDUSDT")
+        self.assertEqual(snapshot["bid_price"], 0.0)
+        self.assertEqual(snapshot["ask_price"], 0.0)
+        self.assertEqual(snapshot["open_order_count"], 0)
+        self.assertEqual(snapshot["manual_open_order_count"], 0)
+        self.assertEqual(snapshot["task"]["status"], "received")
 
     @patch("grid_optimizer.web._manual_trade_snapshot")
     @patch("grid_optimizer.web.post_futures_order")
@@ -327,6 +457,52 @@ class ManualTradeTests(unittest.TestCase):
         self.assertIn("mts_bardusdt", kwargs["new_client_order_id"])
         self.assertEqual(result["market_type"], "spot")
         self.assertEqual(result["limit_order"]["time_in_force"], "LIMIT_MAKER")
+
+    @patch("grid_optimizer.web.fetch_futures_order")
+    def test_book_limit_refresh_records_filled_order_history_once(self, mock_fetch_order) -> None:
+        _manual_trade_set_task(
+            "BARDUSDT",
+            {
+                "source": "book_limit",
+                "market_type": "futures",
+                "status": "submitted",
+                "side": "SELL",
+                "notional": 80.0,
+                "quantity": 39.6,
+                "limit_order": {
+                    "side": "SELL",
+                    "quantity": 39.6,
+                    "price": 2.02,
+                    "notional": 79.992,
+                    "time_in_force": "GTX",
+                    "client_order_id": "mt_bardusdt_booksell_s_1",
+                },
+                "order_id": 456,
+                "client_order_id": "mt_bardusdt_booksell_s_1",
+                "history_recorded": False,
+            },
+        )
+        mock_fetch_order.return_value = {
+            "orderId": 456,
+            "clientOrderId": "mt_bardusdt_booksell_s_1",
+            "status": "FILLED",
+            "executedQty": "39.6",
+            "avgPrice": "2.02",
+            "price": "2.02",
+        }
+
+        task = _manual_trade_refresh_book_limit_task("BARDUSDT", "key", "secret")
+        task_again = _manual_trade_refresh_book_limit_task("BARDUSDT", "key", "secret")
+
+        history = _manual_trade_history_for_symbol("BARDUSDT")
+        self.assertEqual(task["status"], "filled")
+        self.assertEqual(task_again["history_recorded"], True)
+        self.assertEqual(len(history), 1)
+        self.assertEqual(history[0]["source"], "book_limit")
+        self.assertEqual(history[0]["side"], "SELL")
+        self.assertAlmostEqual(history[0]["executed_qty"], 39.6)
+        self.assertAlmostEqual(history[0]["avg_fill_price"], 2.02)
+        self.assertAlmostEqual(history[0]["fill_notional"], 79.992)
 
     def test_manual_trade_history_is_symbol_scoped(self) -> None:
         _manual_trade_append_history(
@@ -441,6 +617,40 @@ class ManualTradeTests(unittest.TestCase):
         _manual_trade_prepare_plan("BARDUSDT", "BUY", 100.0)
 
         mock_change_margin.assert_not_called()
+
+    @patch("grid_optimizer.web._load_runner_control_config")
+    @patch("grid_optimizer.web._read_json_dict")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    @patch("grid_optimizer.web.fetch_futures_account_info_v3")
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_position_mode")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_prepare_plan_blocks_futures_manual_trade_for_best_quote_frozen_isolation(
+        self,
+        mock_credentials,
+        mock_position_mode,
+        mock_book,
+        mock_account_info,
+        mock_symbol_config,
+        mock_read_state,
+        mock_load_config,
+    ) -> None:
+        mock_credentials.return_value = ("key", "secret")
+        mock_position_mode.return_value = {"dualSidePosition": False}
+        mock_book.return_value = [{"bid_price": "1.0", "ask_price": "1.01"}]
+        mock_account_info.return_value = {"positions": [{"symbol": "PHAROSUSDT", "positionAmt": "20"}]}
+        mock_symbol_config.return_value = self._symbol_info()
+        mock_load_config.return_value = {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "state_path": "output/pharosusdt_loop_state.json",
+        }
+        mock_read_state.return_value = {"best_quote_volume_ledger": {"long_lots": [{"qty": 20.0}]}}
+
+        with self.assertRaisesRegex(ValueError, "冻结账本隔离"):
+            _manual_trade_prepare_plan("PHAROSUSDT", "SELL", 100.0)
 
     @patch("grid_optimizer.web._manual_trade_set_task")
     @patch("grid_optimizer.web.fetch_futures_order")

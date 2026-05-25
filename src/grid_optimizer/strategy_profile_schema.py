@@ -239,6 +239,27 @@ PARAMETER_NEUTRAL_DEFAULTS: dict[str, Any] = {
     "neutral_hourly_scale_defensive": 0.65,
 }
 
+KNOWN_PARAMETER_PREFIXES = frozenset(
+    {
+        "adaptive_regime_router_",
+        "best_quote_maker_volume_",
+        "elastic_",
+        "leverage_change_",
+        "loss_recovery_brush_",
+        "loss_reentry_",
+        "regime_entry_budget_",
+        "rolling_hourly_",
+        "runtime_guard_",
+        "sticky_entry_",
+        "volatility_entry_pause_",
+    }
+)
+KNOWN_PARAMETER_NAMES = frozenset(
+    {
+        "leverage",
+    }
+)
+
 COMMON_RUNNER_PARAMS = frozenset(
     {
         "symbol",
@@ -1112,6 +1133,13 @@ def _is_active_unknown_value(value: Any) -> bool:
     return True
 
 
+def _is_known_runner_parameter_name(key: str) -> bool:
+    normalized = str(key or "")
+    return normalized in KNOWN_PARAMETER_NAMES or any(
+        normalized.startswith(prefix) for prefix in KNOWN_PARAMETER_PREFIXES
+    )
+
+
 def _profile_key(strategy_profile: str) -> str:
     return str(strategy_profile or "").strip().lower()
 
@@ -1363,7 +1391,12 @@ def apply_strategy_profile_schema(
         )
         known_params = schema.allowed_params | frozenset(PARAMETER_NEUTRAL_DEFAULTS) | overlay_known_params
         for key, value in vars(args).items():
-            if key.startswith("_") or key in known_params or _is_pharos_hedge_bq_known_param(strategy_profile, key):
+            if (
+                key.startswith("_")
+                or key in known_params
+                or _is_known_runner_parameter_name(key)
+                or _is_pharos_hedge_bq_known_param(strategy_profile, key)
+            ):
                 continue
             if _is_active_unknown_value(value):
                 unknown_params.append(key)

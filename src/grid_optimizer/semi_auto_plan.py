@@ -1960,6 +1960,17 @@ def diff_open_orders(
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
 ) -> dict[str, list[dict[str, Any]]]:
+    def _merged_desired_order(orders: list[dict[str, Any]]) -> dict[str, Any]:
+        total_qty = sum(
+            (_quantity_decimal(order.get("qty", order.get("quantity"))) for order in orders),
+            Decimal("0"),
+        )
+        return _clone_order_with_qty(orders[0], total_qty)
+
+    def _desired_replaces_smaller_existing(orders: list[dict[str, Any]]) -> bool:
+        roles = {str(order.get("role", "")).strip() for order in orders}
+        return bool(roles & {"best_quote_reduce_long", "best_quote_reduce_short"})
+
     desired_by_bucket: dict[str, list[dict[str, Any]]] = {}
     for order in desired_orders:
         key = _order_bucket_key(
@@ -1994,7 +2005,7 @@ def diff_open_orders(
             stale_orders.extend(existing_group)
             continue
         if not existing_group:
-            missing_orders.extend(desired_group)
+            missing_orders.append(_merged_desired_order(desired_group))
             continue
 
         existing_total = sum(
@@ -2006,15 +2017,21 @@ def diff_open_orders(
             Decimal("0"),
         )
 
+        if len(existing_group) > 1:
+            stale_orders.extend(existing_group)
+            continue
         if existing_total > desired_total:
             stale_orders.extend(existing_group)
-            missing_orders.extend(desired_group)
+            continue
+        if existing_total < desired_total:
+            if _desired_replaces_smaller_existing(desired_group):
+                stale_orders.extend(existing_group)
+                missing_orders.append(_merged_desired_order(desired_group))
+                continue
+            kept_orders.extend(existing_group)
             continue
 
         kept_orders.extend(existing_group)
-        delta = desired_total - existing_total
-        if delta > Decimal("0"):
-            missing_orders.append(_clone_order_with_qty(desired_group[0], delta))
 
     return {
         "missing_orders": missing_orders,
@@ -2029,6 +2046,7 @@ def preserve_sticky_entry_orders(
     desired_orders: list[dict[str, Any]],
     price_tolerance: float,
     max_levels_per_group: int | None = None,
+    preserve_less_aggressive: bool = False,
 ) -> list[dict[str, Any]]:
     tolerance = max(_safe_float(price_tolerance), 0.0)
     safe_max_levels = None if max_levels_per_group is None else max(int(max_levels_per_group), 0)
@@ -2036,7 +2054,7 @@ def preserve_sticky_entry_orders(
         return [dict(order) for order in desired_orders]
 
     adjusted_orders = [dict(order) for order in desired_orders]
-    entry_roles = {"entry_long", "entry_short"}
+    entry_roles = {"entry_long", "entry_short", "best_quote_entry_long", "best_quote_entry_short"}
     take_profit_roles = {"take_profit_long", "take_profit_short"}
     sticky_roles = entry_roles | take_profit_roles
 
@@ -2114,7 +2132,7 @@ def preserve_sticky_entry_orders(
             role = str(desired_order.get("role", "")).strip()
             if role in entry_roles and abs(existing_price - desired_price) > tolerance + 1e-12:
                 continue
-            if not _existing_is_closer(existing_order, desired_order):
+            if not preserve_less_aggressive and not _existing_is_closer(existing_order, desired_order):
                 continue
             bucket = _order_bucket_key(
                 str(desired_order.get("side", "")),
@@ -2139,6 +2157,7 @@ def preserve_sticky_exit_orders(
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
     sticky_roles: set[str] | None = None,
+    price_tolerance: float | None = None,
 ) -> list[dict[str, Any]]:
     normalized_roles = {
         str(role).strip()
@@ -2147,6 +2166,7 @@ def preserve_sticky_exit_orders(
     }
     if not normalized_roles:
         return [dict(order) for order in desired_orders]
+    tolerance = None if price_tolerance is None else max(_safe_float(price_tolerance), 0.0)
 
     adjusted_orders = [dict(order) for order in desired_orders]
 
@@ -2167,9 +2187,26 @@ def preserve_sticky_exit_orders(
             return (-price, price)
         return (price, price)
 
+    def _role(order: dict[str, Any]) -> str:
+        role = str(order.get("role", "")).strip()
+        if role:
+            return role
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _position_side(order)
+        if side == "BUY" and position_side == "SHORT":
+            return "best_quote_reduce_short"
+        if side == "SELL" and position_side == "LONG":
+            return "best_quote_reduce_long"
+        if _truthy(order.get("reduceOnly", order.get("reduce_only", order.get("force_reduce_only")))):
+            if side == "BUY" and position_side == "SHORT":
+                return "best_quote_reduce_short"
+            if side == "SELL" and position_side == "LONG":
+                return "best_quote_reduce_long"
+        return ""
+
     desired_groups: dict[tuple[str, str, str], list[tuple[int, dict[str, Any]]]] = {}
     for index, order in enumerate(adjusted_orders):
-        role = str(order.get("role", "")).strip()
+        role = _role(order)
         if role not in normalized_roles:
             continue
         side = str(order.get("side", "")).upper().strip()
@@ -2180,7 +2217,7 @@ def preserve_sticky_exit_orders(
 
     existing_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for order in existing_orders:
-        role = str(order.get("role", "")).strip()
+        role = _role(order)
         if role not in normalized_roles:
             continue
         side = str(order.get("side", "")).upper().strip()
@@ -2197,9 +2234,12 @@ def preserve_sticky_exit_orders(
             continue
         desired_sorted = sorted(desired_group, key=lambda item: _sort_key(item[1]))
         existing_sorted = sorted(existing_group, key=_sort_key)
-        for (index, _desired_order), existing_order in zip(desired_sorted, existing_sorted):
+        for (index, desired_order), existing_order in zip(desired_sorted, existing_sorted):
             existing_price = _price(existing_order)
             if existing_price <= 0:
+                continue
+            desired_price = _price(desired_order)
+            if tolerance is not None and abs(existing_price - desired_price) > tolerance + 1e-12:
                 continue
             adjusted_order = dict(adjusted_orders[index])
             qty = _qty(adjusted_order)
@@ -2291,10 +2331,38 @@ def load_or_initialize_state(
     reset_state: bool,
 ) -> dict[str, Any]:
     config = _config_payload(args, symbol_info)
+    preserved_best_quote_volume_ledger: dict[str, Any] = {}
+    preserved_best_quote_volume_order_refs: dict[str, Any] = {}
+    preserved_frozen_inventory: dict[str, Any] = {}
+    preserved_frozen_manual_reduce: dict[str, Any] = {}
+    preserved_frozen_manual_limit: dict[str, Any] = {}
+    preserved_frozen_pair_release: dict[str, Any] = {}
+
+    def _preserve_best_quote_ledgers(existing_state: dict[str, Any]) -> None:
+        nonlocal preserved_best_quote_volume_ledger
+        nonlocal preserved_best_quote_volume_order_refs
+        nonlocal preserved_frozen_inventory
+        nonlocal preserved_frozen_manual_reduce
+        nonlocal preserved_frozen_manual_limit
+        nonlocal preserved_frozen_pair_release
+        if isinstance(existing_state.get("best_quote_volume_ledger"), dict):
+            preserved_best_quote_volume_ledger = dict(existing_state["best_quote_volume_ledger"])
+        if isinstance(existing_state.get("best_quote_volume_order_refs"), dict):
+            preserved_best_quote_volume_order_refs = dict(existing_state["best_quote_volume_order_refs"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory"), dict):
+            preserved_frozen_inventory = dict(existing_state["best_quote_frozen_inventory"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory_manual_reduce"), dict):
+            preserved_frozen_manual_reduce = dict(existing_state["best_quote_frozen_inventory_manual_reduce"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory_manual_limit"), dict):
+            preserved_frozen_manual_limit = dict(existing_state["best_quote_frozen_inventory_manual_limit"])
+        if isinstance(existing_state.get("best_quote_frozen_inventory_pair_release"), dict):
+            preserved_frozen_pair_release = dict(existing_state["best_quote_frozen_inventory_pair_release"])
+
     if state_path.exists() and not reset_state:
         state = json.loads(state_path.read_text(encoding="utf-8"))
         if str(state.get("config_signature", "")).strip() != _config_signature(config):
             if os.environ.get("GRID_AUTO_RESET_ON_CONFIG_CHANGE") == "1":
+                _preserve_best_quote_ledgers(state if isinstance(state, dict) else {})
                 print(
                     "State config does not match current CLI arguments; "
                     "auto-resetting state because GRID_AUTO_RESET_ON_CONFIG_CHANGE=1."
@@ -2303,6 +2371,12 @@ def load_or_initialize_state(
                 raise SystemExit("State config does not match current CLI arguments. Use --reset-state to restart.")
         else:
             return state
+    elif state_path.exists() and reset_state:
+        try:
+            existing_state = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            existing_state = {}
+        _preserve_best_quote_ledgers(existing_state if isinstance(existing_state, dict) else {})
 
     center_price = args.center_price if args.center_price is not None else mid_price
     center_price = _round_to_nearest_step(center_price, symbol_info.get("tick_size"))
@@ -2317,6 +2391,18 @@ def load_or_initialize_state(
         "center_price": center_price,
         "last_mid_price": mid_price,
     }
+    if preserved_best_quote_volume_ledger:
+        state["best_quote_volume_ledger"] = preserved_best_quote_volume_ledger
+    if preserved_best_quote_volume_order_refs:
+        state["best_quote_volume_order_refs"] = preserved_best_quote_volume_order_refs
+    if preserved_frozen_inventory:
+        state["best_quote_frozen_inventory"] = preserved_frozen_inventory
+    if preserved_frozen_manual_reduce:
+        state["best_quote_frozen_inventory_manual_reduce"] = preserved_frozen_manual_reduce
+    if preserved_frozen_manual_limit:
+        state["best_quote_frozen_inventory_manual_limit"] = preserved_frozen_manual_limit
+    if preserved_frozen_pair_release:
+        state["best_quote_frozen_inventory_pair_release"] = preserved_frozen_pair_release
     if getattr(args, "custom_grid_enabled", False):
         state.update(
             {

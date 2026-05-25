@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import shlex
@@ -14,6 +15,7 @@ from typing import Any
 
 from .audit import (
     DEFAULT_AUDIT_LOOKBACK_DAYS,
+    append_jsonl,
     build_audit_paths,
     count_jsonl_lines,
     fetch_time_paged,
@@ -26,6 +28,7 @@ from .audit import (
     read_trade_audit_rows,
     trade_row_key,
     trade_row_time_ms,
+    write_json,
 )
 from .data import (
     fetch_futures_account_info_v3,
@@ -40,8 +43,12 @@ from .data import (
     load_binance_api_credentials,
 )
 from .live_check import extract_symbol_position
-from .competition_board import build_reward_volume_targets, resolve_active_competition_board
-
+from .competition_board import (
+    build_competition_displacement_volume,
+    build_competition_entry_volume_targets,
+    build_reward_volume_targets,
+    resolve_active_competition_board,
+)
 
 def _safe_float(value: Any) -> float:
     try:
@@ -50,10 +57,69 @@ def _safe_float(value: Any) -> float:
         return 0.0
 
 
+def _trade_sort_key(value: Any) -> tuple[int, int | str]:
+    text = str(value or "").strip()
+    if not text:
+        return (0, 0)
+    try:
+        return (0, int(text))
+    except (TypeError, ValueError):
+        return (1, text)
+
+
 def _truthy(value: Any) -> bool:
     if isinstance(value, bool):
         return value
     return str(value).strip().lower() in {"true", "1", "yes"}
+
+
+def _truncate_two_decimals(value: float) -> float:
+    return math.floor(max(float(value), 0.0) * 100.0) / 100.0
+
+
+def _competition_uses_daily_sqrt_score(board: dict[str, Any] | None) -> bool:
+    if not isinstance(board, dict):
+        return False
+    source_slug = str(board.get("source_slug", "")).strip().lower()
+    symbol = str(board.get("symbol", "")).strip().upper()
+    metric_field = str(board.get("metric_field", "")).strip().lower()
+    return source_slug == "futures_pharos" or (symbol == "PHAROS" and metric_field == "grade")
+
+
+def _competition_daily_sqrt_score(trade_summary: dict[str, Any] | None) -> float:
+    if not isinstance(trade_summary, dict):
+        return 0.0
+    score = 0.0
+    rows = trade_summary.get("daily_volume_rows")
+    if isinstance(rows, list) and rows:
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            gross = max(_safe_float(row.get("gross_notional")), 0.0)
+            if gross <= 0:
+                continue
+            score += _truncate_two_decimals(math.sqrt(gross))
+        return float(score)
+    gross = max(_safe_float(trade_summary.get("gross_notional")), 0.0)
+    return _truncate_two_decimals(math.sqrt(gross)) if gross > 0 else 0.0
+
+
+def _competition_current_metric_value(
+    board: dict[str, Any] | None,
+    trade_summary: dict[str, Any] | None,
+) -> float:
+    if _competition_uses_daily_sqrt_score(board):
+        return _competition_daily_sqrt_score(trade_summary)
+    if not isinstance(trade_summary, dict):
+        return 0.0
+    return _safe_float(trade_summary.get("gross_notional"))
+
+
+def _sort_int(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
 
 
 RUNNER_PID_PATH = Path("output/night_loop_runner.pid")
@@ -62,9 +128,11 @@ RUNNER_LOG_PATH = Path("output/night_loop_runner.log")
 STABLE_QUOTE_ASSETS = {"USDT", "USDC", "FDUSD", "BUSD"}
 MONITOR_CACHE_TTL_SECONDS = 2.0
 LOCAL_RUNTIME_SNAPSHOT_MAX_AGE_SECONDS = 180.0
+LIVE_ACCOUNT_SNAPSHOT_TTL_SECONDS = float(os.environ.get("GRID_MONITOR_LIVE_ACCOUNT_TTL_SECONDS", "60.0"))
 _MONITOR_CACHE_LOCK = threading.Lock()
 _MONITOR_CACHE: dict[tuple[str, str, str, str, int], tuple[float, dict[str, Any]]] = {}
 _MONITOR_INFLIGHT: dict[tuple[str, str, str, str, int], "_InflightMonitorSnapshot"] = {}
+_LIVE_ACCOUNT_CACHE: dict[tuple[str, str], tuple[float, dict[str, Any]]] = {}
 
 
 class _InflightMonitorSnapshot:
@@ -459,6 +527,75 @@ def _filter_events_since(events: list[dict[str, Any]], since: datetime | None) -
     return filtered
 
 
+def _monitor_anchor_path(audit_paths: dict[str, Path]) -> Path:
+    audit_state_path = audit_paths["audit_state"]
+    return audit_state_path.with_name(audit_state_path.name.replace("_audit_state.json", "_monitor_anchor.json"))
+
+
+def _jsonl_time_bounds(path: Path, row_time_ms: Any) -> tuple[datetime | None, datetime | None]:
+    first_ts: datetime | None = None
+    last_ts: datetime | None = None
+    for item in iter_jsonl(path):
+        ts_ms = int(row_time_ms(item) or 0)
+        if ts_ms <= 0:
+            continue
+        ts = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc)
+        if first_ts is None or ts < first_ts:
+            first_ts = ts
+        if last_ts is None or ts > last_ts:
+            last_ts = ts
+    return first_ts, last_ts
+
+
+def _resolve_monitor_stats_anchor(
+    *,
+    anchor_path: Path,
+    symbol: str,
+    candidates: list[tuple[str, datetime | None]],
+) -> tuple[datetime | None, dict[str, Any]]:
+    normalized_symbol = str(symbol).upper().strip()
+    persisted_payload = _read_json(anchor_path)
+    persisted_start = _parse_iso_ts((persisted_payload or {}).get("stats_start_at"))
+    selected_start = persisted_start
+    selected_source = "persisted" if persisted_start is not None else None
+    for source, value in candidates:
+        if value is None:
+            continue
+        candidate = value.astimezone(timezone.utc)
+        if selected_start is None or candidate < selected_start:
+            selected_start = candidate
+            selected_source = source
+    if selected_start is None:
+        return None, {
+            "path": str(anchor_path),
+            "source": None,
+            "persisted": False,
+            "updated": False,
+        }
+    updated = (
+        persisted_start is None
+        or selected_start != persisted_start
+        or str((persisted_payload or {}).get("symbol", "")).upper().strip() != normalized_symbol
+    )
+    if updated:
+        write_json(
+            anchor_path,
+            {
+                "symbol": normalized_symbol,
+                "stats_start_at": selected_start.isoformat(),
+                "source": selected_source,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+    return selected_start, {
+        "path": str(anchor_path),
+        "source": selected_source,
+        "persisted": persisted_start is not None,
+        "updated": updated,
+        "stats_start_at": selected_start.isoformat(),
+    }
+
+
 def _read_event_window(
     path: Path,
     *,
@@ -497,33 +634,83 @@ def _load_or_fetch_trade_rows(
         limit=0,
         predicate=lambda item: int(trade_row_time_ms(item) or 0) >= floor_ms,
     )
-    if audit_rows:
-        return audit_rows, {
-            "source": "audit",
-            "path": str(audit_path),
-            "row_count": len(audit_rows),
-            "start_time": effective_start.isoformat(),
-        }
-
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    rows = fetch_time_paged(
-        fetch_page=lambda **params: fetch_futures_user_trades(
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            **params,
-        ),
-        start_time_ms=start_time_ms,
-        end_time_ms=end_time_ms,
-        limit=1000,
-        row_time_ms=trade_row_time_ms,
-        row_key=trade_row_key,
-    )
+    try:
+        api_rows = fetch_time_paged(
+            fetch_page=lambda **params: fetch_futures_user_trades(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                **params,
+            ),
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=1000,
+            row_time_ms=trade_row_time_ms,
+            row_key=trade_row_key,
+        )
+    except Exception as exc:
+        if audit_rows:
+            return audit_rows, {
+                "source": "audit",
+                "path": str(audit_path),
+                "row_count": len(audit_rows),
+                "start_time": effective_start.isoformat(),
+                "api_error": f"{type(exc).__name__}: {exc}",
+            }
+        raise
+    def _trade_merge_key(row: dict[str, Any]) -> tuple[Any, ...]:
+        order_id = row.get("orderId")
+        if order_id is not None:
+            return (
+                "order_fill",
+                str(order_id).strip(),
+                str(row.get("side", "")).upper().strip(),
+                round(_safe_float(row.get("price")), 12),
+                round(_safe_float(row.get("qty")), 12),
+            )
+        return (
+            "trade_id",
+            int(trade_row_time_ms(row) or 0),
+            trade_row_key(row),
+        )
+
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    audit_keys: set[tuple[Any, ...]] = set()
+    duplicate_count = 0
+    for row in audit_rows:
+        key = _trade_merge_key(row)
+        audit_keys.add(key)
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+        merged.append(row)
+    missing_api_rows: list[dict[str, Any]] = []
+    for row in api_rows:
+        key = _trade_merge_key(row)
+        if key in seen:
+            duplicate_count += 1
+            continue
+        if key not in audit_keys:
+            missing_api_rows.append(row)
+        seen.add(key)
+        merged.append(row)
+    rows = sorted(merged, key=lambda item: (int(trade_row_time_ms(item) or 0), trade_row_key(item)))
+    for row in missing_api_rows:
+        append_jsonl(audit_path, row)
+    source = "audit+api" if audit_rows and api_rows else ("audit" if audit_rows else "api")
     return rows, {
-        "source": "api",
-        "path": None,
+        "source": source,
+        "path": str(audit_path) if audit_rows or missing_api_rows else None,
         "row_count": len(rows),
+        "audit_row_count": len(audit_rows),
+        "api_row_count": len(api_rows),
+        "merged_row_count": len(rows),
+        "deduped_row_count": duplicate_count,
+        "missing_api_row_count": len(missing_api_rows),
         "start_time": effective_start.isoformat(),
     }
 
@@ -543,40 +730,112 @@ def _load_or_fetch_income_rows(
         limit=0,
         predicate=lambda item: int(income_row_time_ms(item) or 0) >= floor_ms,
     )
-    if audit_rows:
-        return audit_rows, {
-            "source": "audit",
-            "path": str(audit_path),
-            "row_count": len(audit_rows),
-            "start_time": effective_start.isoformat(),
-        }
-
     start_time_ms = int(effective_start.timestamp() * 1000)
     end_time_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
-    rows = fetch_time_paged(
-        fetch_page=lambda **params: fetch_futures_income_history(
-            symbol=symbol,
-            income_type="FUNDING_FEE",
-            api_key=api_key,
-            api_secret=api_secret,
-            **params,
-        ),
-        start_time_ms=start_time_ms,
-        end_time_ms=end_time_ms,
-        limit=1000,
-        row_time_ms=income_row_time_ms,
-        row_key=income_row_key,
-    )
+    try:
+        api_rows = fetch_time_paged(
+            fetch_page=lambda **params: fetch_futures_income_history(
+                symbol=symbol,
+                income_type="FUNDING_FEE",
+                api_key=api_key,
+                api_secret=api_secret,
+                **params,
+            ),
+            start_time_ms=start_time_ms,
+            end_time_ms=end_time_ms,
+            limit=1000,
+            row_time_ms=income_row_time_ms,
+            row_key=income_row_key,
+        )
+    except Exception as exc:
+        if audit_rows:
+            return audit_rows, {
+                "source": "audit",
+                "path": str(audit_path),
+                "row_count": len(audit_rows),
+                "start_time": effective_start.isoformat(),
+                "api_error": f"{type(exc).__name__}: {exc}",
+            }
+        raise
+    merged: list[dict[str, Any]] = []
+    seen: set[tuple[int, str]] = set()
+    audit_keys: set[tuple[int, str]] = set()
+    duplicate_count = 0
+    for row in audit_rows:
+        key = (int(income_row_time_ms(row) or 0), income_row_key(row))
+        audit_keys.add(key)
+        if key in seen:
+            duplicate_count += 1
+            continue
+        seen.add(key)
+        merged.append(row)
+    missing_api_rows: list[dict[str, Any]] = []
+    for row in api_rows:
+        key = (int(income_row_time_ms(row) or 0), income_row_key(row))
+        if key in seen:
+            duplicate_count += 1
+            continue
+        if key not in audit_keys:
+            missing_api_rows.append(row)
+        seen.add(key)
+        merged.append(row)
+    rows = sorted(merged, key=lambda item: (int(income_row_time_ms(item) or 0), income_row_key(item)))
+    for row in missing_api_rows:
+        append_jsonl(audit_path, row)
+    source = "audit+api" if audit_rows and api_rows else ("audit" if audit_rows else "api")
     return rows, {
-        "source": "api",
-        "path": None,
+        "source": source,
+        "path": str(audit_path) if audit_rows or missing_api_rows else None,
         "row_count": len(rows),
+        "audit_row_count": len(audit_rows),
+        "api_row_count": len(api_rows),
+        "merged_row_count": len(rows),
+        "deduped_row_count": duplicate_count,
+        "missing_api_row_count": len(missing_api_rows),
         "start_time": effective_start.isoformat(),
     }
 
 
+def _merge_time_keyed_rows(
+    *,
+    audit_rows: list[dict[str, Any]],
+    api_rows: list[dict[str, Any]],
+    row_time_ms: Any,
+    row_key: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    rows_by_identity: dict[tuple[int, str], dict[str, Any]] = {}
+    audit_identities: set[tuple[int, str]] = set()
+    for item in audit_rows:
+        ts_ms = int(row_time_ms(item) or 0)
+        key = str(row_key(item) or "").strip()
+        if ts_ms <= 0 or not key:
+            continue
+        identity = (ts_ms, key)
+        audit_identities.add(identity)
+        rows_by_identity[identity] = item
+
+    missing_api_rows: list[dict[str, Any]] = []
+    for item in api_rows:
+        ts_ms = int(row_time_ms(item) or 0)
+        key = str(row_key(item) or "").strip()
+        if ts_ms <= 0 or not key:
+            continue
+        identity = (ts_ms, key)
+        if identity not in audit_identities:
+            missing_api_rows.append(item)
+        rows_by_identity.setdefault(identity, item)
+
+    rows = list(rows_by_identity.items())
+    rows.sort(key=lambda pair: (pair[0][0], pair[0][1]))
+    missing_api_rows.sort(key=lambda item: (int(row_time_ms(item) or 0), str(row_key(item) or "")))
+    return [item for _, item in rows], missing_api_rows
+
+
 def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: Any | None = None) -> dict[str, Any]:
-    sorted_trades = sorted(trades, key=lambda item: (int(item.get("time", 0) or 0), int(item.get("id", 0) or 0)))
+    sorted_trades = sorted(
+        trades,
+        key=lambda item: (int(item.get("time", 0) or 0), _trade_sort_key(item.get("id"))),
+    )
     gross_notional = 0.0
     buy_notional = 0.0
     sell_notional = 0.0
@@ -590,6 +849,7 @@ def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: An
     cumulative_notional = 0.0
     cumulative_realized = 0.0
     cumulative_net = 0.0
+    daily_rows: dict[str, dict[str, Any]] = {}
 
     for item in sorted_trades:
         price = _safe_float(item.get("price"))
@@ -621,6 +881,39 @@ def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: An
         if _truthy(item.get("maker")):
             maker_count += 1
         ts_ms = int(item.get("time", 0) or 0)
+        trade_day = (
+            datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d")
+            if ts_ms
+            else ""
+        )
+        if trade_day:
+            daily = daily_rows.setdefault(
+                trade_day,
+                {
+                    "date": trade_day,
+                    "timezone": "UTC+0",
+                    "trade_count": 0,
+                    "buy_count": 0,
+                    "sell_count": 0,
+                    "gross_notional": 0.0,
+                    "buy_notional": 0.0,
+                    "sell_notional": 0.0,
+                    "realized_pnl": 0.0,
+                    "commission": 0.0,
+                    "net_realized": 0.0,
+                },
+            )
+            daily["trade_count"] += 1
+            daily["gross_notional"] += trade_notional
+            daily["realized_pnl"] += trade_realized
+            daily["commission"] += trade_commission
+            daily["net_realized"] += trade_realized - trade_commission
+            if side == "BUY":
+                daily["buy_count"] += 1
+                daily["buy_notional"] += trade_notional
+            elif side == "SELL":
+                daily["sell_count"] += 1
+                daily["sell_notional"] += trade_notional
         series.append(
             {
                 "ts": datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).isoformat() if ts_ms else None,
@@ -641,6 +934,7 @@ def summarize_user_trades(trades: list[dict[str, Any]], commission_converter: An
         "realized_pnl": realized_pnl,
         "commission": commission,
         "commission_raw_by_asset": commission_raw_by_asset,
+        "daily_volume_rows": [daily_rows[key] for key in sorted(daily_rows, reverse=True)],
         "series": series[-240:],
         "recent_trades": [
             {
@@ -684,12 +978,165 @@ def _floor_hour(dt: datetime) -> datetime:
     return normalized.replace(minute=0, second=0, microsecond=0)
 
 
+TRADE_QUALITY_BUCKETS = (
+    "normal_grid",
+    "take_profit_recycle",
+    "active_delever",
+    "adverse_reduce",
+    "hard_loss_forced_reduce",
+    "protective_flatten",
+    "manual_unknown",
+)
+
+
+def _empty_trade_quality_bucket() -> dict[str, Any]:
+    return {
+        "count": 0,
+        "gross_notional": 0.0,
+        "realized_pnl": 0.0,
+        "commission": 0.0,
+    }
+
+
+def _empty_trade_quality_buckets() -> dict[str, dict[str, Any]]:
+    return {key: _empty_trade_quality_bucket() for key in TRADE_QUALITY_BUCKETS}
+
+
+def _normalize_trade_role_text(value: Any) -> str:
+    return str(value or "").strip().lower().replace("-", "_")
+
+
+def _trade_role_from_client_order_id(value: Any) -> str:
+    text = _normalize_trade_role_text(value)
+    if not text:
+        return ""
+    if "takeprof" in text or "take_profit" in text:
+        return "take_profit"
+    if "entrylon" in text or "entry_long" in text or "grid_long" in text:
+        return "entry_long"
+    if "entrysho" in text or "entry_short" in text or "grid_short" in text:
+        return "entry_short"
+    if "activede" in text or "active_delever" in text:
+        return "active_delever"
+    if "adverser" in text or "adverse_reduce" in text:
+        return "adverse_reduce"
+    if "harddele" in text or "hard_loss" in text or "forced_reduce" in text:
+        return "hard_loss_forced_reduce"
+    if "softdele" in text or "protect" in text or "flatten" in text or "flowslee" in text:
+        return "protective_flatten"
+    return ""
+
+
+def _trade_quality_bucket_for_role(role: Any) -> str:
+    normalized = _normalize_trade_role_text(role)
+    if not normalized:
+        return "manual_unknown"
+    if normalized in {
+        "entry",
+        "bootstrap",
+        "bootstrap_entry",
+        "grid_entry",
+        "entry_long",
+        "entry_short",
+        "bootstrap_long",
+        "bootstrap_short",
+    }:
+        return "normal_grid"
+    if normalized in {"take_profit", "take_profit_long", "take_profit_short", "grid_exit"}:
+        return "take_profit_recycle"
+    if "active_delever" in normalized or "activede" in normalized:
+        return "active_delever"
+    if "adverse_reduce" in normalized or "adverser" in normalized:
+        return "adverse_reduce"
+    if "hard_loss_forced_reduce" in normalized or "hard_delever" in normalized or "harddele" in normalized:
+        return "hard_loss_forced_reduce"
+    if (
+        "protect" in normalized
+        or "flatten" in normalized
+        or "soft_delever" in normalized
+        or "softdele" in normalized
+        or "flow_sleeve" in normalized
+        or "flowslee" in normalized
+        or normalized == "forced_reduce"
+        or normalized == "tail_cleanup"
+    ):
+        return "protective_flatten"
+    return "manual_unknown"
+
+
+def _trade_role_from_lookup(item: dict[str, Any], order_role_lookup: dict[str, dict[str, Any]] | None) -> str:
+    for key in ("role", "order_role", "strategy_role", "source_role"):
+        role = _normalize_trade_role_text(item.get(key))
+        if role:
+            return role
+    role = _trade_role_from_client_order_id(
+        item.get("clientOrderId")
+        or item.get("client_order_id")
+        or item.get("origClientOrderId")
+        or item.get("orig_client_order_id")
+    )
+    if role:
+        return role
+    if not order_role_lookup:
+        return ""
+    order_id = str(item.get("orderId") or item.get("order_id") or "").strip()
+    if not order_id:
+        return ""
+    ref = order_role_lookup.get(order_id)
+    if not isinstance(ref, dict):
+        return ""
+    return _normalize_trade_role_text(ref.get("role")) or _trade_role_from_client_order_id(ref.get("client_order_id"))
+
+
+def _finalize_trade_quality(bucket: dict[str, Any]) -> dict[str, Any]:
+    gross = float(bucket.get("gross_notional") or 0.0)
+    buy = float(bucket.get("buy_notional") or 0.0)
+    sell = float(bucket.get("sell_notional") or 0.0)
+    imbalance_ratio = abs(buy - sell) / gross if gross > 0 else 0.0
+    buckets = bucket.get("quality_buckets") if isinstance(bucket.get("quality_buckets"), dict) else {}
+    healthy_gross = sum(
+        float((buckets.get(key) or {}).get("gross_notional") or 0.0)
+        for key in ("normal_grid", "take_profit_recycle")
+    )
+    protective_gross = sum(
+        float((buckets.get(key) or {}).get("gross_notional") or 0.0)
+        for key in ("active_delever", "adverse_reduce", "hard_loss_forced_reduce", "protective_flatten")
+    )
+    unknown_gross = float((buckets.get("manual_unknown") or {}).get("gross_notional") or 0.0)
+    protective_share = protective_gross / gross if gross > 0 else 0.0
+    unknown_share = unknown_gross / gross if gross > 0 else 0.0
+    reasons: list[str] = []
+    if gross > 0 and protective_share >= 0.30:
+        reasons.append(f"保护/减仓成交占比 {protective_share:.1%}")
+    if gross > 0 and unknown_share >= 0.25:
+        reasons.append(f"未知成交占比 {unknown_share:.1%}")
+    if gross >= 1000.0 and imbalance_ratio >= 0.35:
+        reasons.append(f"买卖失衡 {imbalance_ratio:.1%}")
+    verdict = "abnormal" if reasons else ("healthy" if gross > 0 else "empty")
+    return {
+        "buy_count": int(bucket.get("buy_count") or 0),
+        "buy_notional": buy,
+        "sell_count": int(bucket.get("sell_count") or 0),
+        "sell_notional": sell,
+        "imbalance_ratio": imbalance_ratio,
+        "buckets": buckets,
+        "healthy_gross_notional": healthy_gross,
+        "protective_gross_notional": protective_gross,
+        "unknown_gross_notional": unknown_gross,
+        "protective_share": protective_share,
+        "unknown_share": unknown_share,
+        "verdict": verdict,
+        "reasons": reasons,
+    }
+
+
 def summarize_hourly_metrics(
     trades: list[dict[str, Any]],
     income_rows: list[dict[str, Any]],
     candles: list[Any],
     *,
     commission_converter: Any | None = None,
+    order_role_lookup: dict[str, dict[str, Any]] | None = None,
     limit: int = 24,
 ) -> dict[str, Any]:
     buckets: dict[datetime, dict[str, Any]] = {}
@@ -716,6 +1163,9 @@ def summarize_hourly_metrics(
                 "low_price": 0.0,
                 "return_ratio": 0.0,
                 "amplitude_ratio": 0.0,
+                "buy_sell_imbalance_ratio": 0.0,
+                "quality_buckets": _empty_trade_quality_buckets(),
+                "trade_quality": None,
             }
             buckets[hour_start] = bucket
         return bucket
@@ -758,6 +1208,13 @@ def summarize_hourly_metrics(
         elif side == "SELL":
             bucket["sell_notional"] += trade_notional
             bucket["sell_count"] += 1
+        role = _trade_role_from_lookup(item, order_role_lookup)
+        bucket_key = _trade_quality_bucket_for_role(role)
+        quality_bucket = bucket["quality_buckets"].setdefault(bucket_key, _empty_trade_quality_bucket())
+        quality_bucket["count"] += 1
+        quality_bucket["gross_notional"] += trade_notional
+        quality_bucket["realized_pnl"] += trade_realized
+        quality_bucket["commission"] += trade_commission
 
     for item in income_rows:
         ts_ms = int(item.get("time", 0) or 0)
@@ -787,6 +1244,12 @@ def summarize_hourly_metrics(
             if gross_notional > 0
             else 0.0
         )
+        bucket["buy_sell_imbalance_ratio"] = (
+            abs(float(bucket["buy_notional"]) - float(bucket["sell_notional"])) / gross_notional
+            if gross_notional > 0
+            else 0.0
+        )
+        bucket["trade_quality"] = _finalize_trade_quality(bucket)
         rows.append(bucket)
 
     limited_rows = rows[: max(int(limit), 1)]
@@ -1683,6 +2146,75 @@ def _normalize_runtime_open_order(payload: dict[str, Any]) -> dict[str, Any] | N
     }
 
 
+def _summarize_frozen_position_qty(open_orders: list[dict[str, Any]]) -> dict[str, float]:
+    frozen_long_qty = 0.0
+    frozen_short_qty = 0.0
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        position_side = str(order.get("position_side", order.get("positionSide", "")) or "").upper().strip() or "BOTH"
+        remaining_qty = max(
+            _safe_float(order.get("orig_qty", order.get("origQty")))
+            - _safe_float(order.get("executed_qty", order.get("executedQty"))),
+            0.0,
+        )
+        if remaining_qty <= 0:
+            continue
+        reduce_only = _truthy(order.get("reduce_only", order.get("reduceOnly")))
+        if position_side == "LONG" and side == "SELL":
+            frozen_long_qty += remaining_qty
+        elif position_side == "SHORT" and side == "BUY":
+            frozen_short_qty += remaining_qty
+        elif reduce_only and position_side == "BOTH" and side == "SELL":
+            frozen_long_qty += remaining_qty
+        elif reduce_only and position_side == "BOTH" and side == "BUY":
+            frozen_short_qty += remaining_qty
+    return {"frozen_long_qty": frozen_long_qty, "frozen_short_qty": frozen_short_qty}
+
+
+def _derive_inventory_frozen_position_qty(
+    plan_report: dict[str, Any],
+    *,
+    active_long_qty: float,
+    active_short_qty: float,
+) -> dict[str, float]:
+    frozen_long_qty = 0.0
+    frozen_short_qty = 0.0
+
+    raw_inventory = plan_report.get("frozen_inventory")
+    if isinstance(raw_inventory, dict):
+        frozen_long_qty = max(
+            _safe_float(
+                raw_inventory.get("long_qty")
+                or raw_inventory.get("frozen_long_qty")
+                or raw_inventory.get("long")
+            ),
+            0.0,
+        )
+        frozen_short_qty = max(
+            _safe_float(
+                raw_inventory.get("short_qty")
+                or raw_inventory.get("frozen_short_qty")
+                or raw_inventory.get("short")
+            ),
+            0.0,
+        )
+        if frozen_long_qty > 0 or frozen_short_qty > 0:
+            return {"frozen_long_qty": frozen_long_qty, "frozen_short_qty": frozen_short_qty}
+
+    actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
+    strategy_net_qty = _safe_float(plan_report.get("strategy_actual_net_qty"))
+    if abs(strategy_net_qty) <= 1e-12:
+        strategy_net_qty = active_long_qty - active_short_qty
+    frozen_net_qty = actual_net_qty - strategy_net_qty
+    if frozen_net_qty > 1e-12:
+        frozen_long_qty = frozen_net_qty
+    elif frozen_net_qty < -1e-12:
+        frozen_short_qty = abs(frozen_net_qty)
+    return {"frozen_long_qty": frozen_long_qty, "frozen_short_qty": frozen_short_qty}
+
+
 def _build_local_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -1718,8 +2250,10 @@ def _build_local_runtime_snapshot(
 
     dual_side_position = _truthy(plan_report.get("dual_side_position"))
     actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
-    long_qty = max(_safe_float(plan_report.get("current_long_qty")), 0.0)
-    short_qty = max(_safe_float(plan_report.get("current_short_qty")), 0.0)
+    active_long_qty = max(_safe_float(plan_report.get("current_long_qty")), 0.0)
+    active_short_qty = max(_safe_float(plan_report.get("current_short_qty")), 0.0)
+    long_qty = active_long_qty
+    short_qty = active_short_qty
     if not dual_side_position:
         long_qty = max(actual_net_qty, 0.0)
         short_qty = max(-actual_net_qty, 0.0)
@@ -1751,6 +2285,25 @@ def _build_local_runtime_snapshot(
             continue
         seen_keys.add(dedupe_key)
         open_orders.append(normalized)
+    reduce_order_frozen_position = _summarize_frozen_position_qty(open_orders)
+    inventory_frozen_position = (
+        _derive_inventory_frozen_position_qty(
+            plan_report,
+            active_long_qty=active_long_qty,
+            active_short_qty=active_short_qty,
+        )
+        if dual_side_position
+        else {"frozen_long_qty": 0.0, "frozen_short_qty": 0.0}
+    )
+    if inventory_frozen_position["frozen_long_qty"] > 0 or inventory_frozen_position["frozen_short_qty"] > 0:
+        long_qty = active_long_qty + inventory_frozen_position["frozen_long_qty"]
+        short_qty = active_short_qty + inventory_frozen_position["frozen_short_qty"]
+    frozen_position = {
+        "frozen_long_qty": reduce_order_frozen_position["frozen_long_qty"]
+        + inventory_frozen_position["frozen_long_qty"],
+        "frozen_short_qty": reduce_order_frozen_position["frozen_short_qty"]
+        + inventory_frozen_position["frozen_short_qty"],
+    }
 
     leverage_raw = runner_config.get("leverage")
     try:
@@ -1771,8 +2324,22 @@ def _build_local_runtime_snapshot(
             "position_amt": actual_net_qty,
             "long_qty": long_qty,
             "short_qty": short_qty,
+            "active_long_qty": active_long_qty,
+            "active_short_qty": active_short_qty,
             "entry_price": entry_price,
             "break_even_price": break_even_price,
+            "long_entry_price": long_avg_price,
+            "short_entry_price": short_avg_price,
+            "long_break_even_price": long_avg_price,
+            "short_break_even_price": short_avg_price,
+            "long_unrealized_pnl": 0.0,
+            "short_unrealized_pnl": 0.0,
+            "frozen_long_qty": frozen_position["frozen_long_qty"],
+            "frozen_short_qty": frozen_position["frozen_short_qty"],
+            "inventory_frozen_long_qty": inventory_frozen_position["frozen_long_qty"],
+            "inventory_frozen_short_qty": inventory_frozen_position["frozen_short_qty"],
+            "reduce_order_frozen_long_qty": reduce_order_frozen_position["frozen_long_qty"],
+            "reduce_order_frozen_short_qty": reduce_order_frozen_position["frozen_short_qty"],
             "unrealized_pnl": _safe_float(plan_report.get("unrealized_pnl")),
             "isolated": str(runner_config.get("margin_type", "")).upper().strip() == "ISOLATED",
             "leverage": leverage,
@@ -1783,6 +2350,221 @@ def _build_local_runtime_snapshot(
         },
         "open_orders": open_orders,
     }
+
+
+def _infer_state_path_from_events_path(events_path: str | Path) -> Path | None:
+    path = Path(events_path)
+    name = path.name
+    if name.endswith("_loop_events.jsonl"):
+        return path.with_name(f"{name.removesuffix('_loop_events.jsonl')}_loop_state.json")
+    if name == "night_loop_events.jsonl":
+        return path.with_name("night_loop_state.json")
+    return None
+
+
+def _build_order_role_lookup(
+    *,
+    state_path: Path | None,
+    plan_report: dict[str, Any] | None,
+    submit_report: dict[str, Any] | None,
+) -> dict[str, dict[str, Any]]:
+    lookup: dict[str, dict[str, Any]] = {}
+    state = _read_json(state_path) if state_path is not None else None
+    if isinstance(state, dict):
+        for refs_key in ("synthetic_order_refs", "inventory_grid_order_refs"):
+            refs = state.get(refs_key)
+            if not isinstance(refs, dict):
+                continue
+            for order_id, ref in refs.items():
+                if isinstance(ref, dict) and str(order_id).strip():
+                    lookup[str(order_id).strip()] = dict(ref)
+
+    for container in (plan_report if isinstance(plan_report, dict) else {}, submit_report if isinstance(submit_report, dict) else {}):
+        for key in ("kept_orders", "placed_orders", "open_orders"):
+            rows = container.get(key)
+            if not isinstance(rows, list):
+                continue
+            for item in rows:
+                if not isinstance(item, dict):
+                    continue
+                request = item.get("request") if isinstance(item.get("request"), dict) else {}
+                response = item.get("response") if isinstance(item.get("response"), dict) else item
+                order_id = response.get("orderId") or response.get("order_id") or item.get("orderId") or item.get("order_id")
+                if order_id in {"", None}:
+                    continue
+                role = (
+                    request.get("role")
+                    or response.get("role")
+                    or item.get("role")
+                    or _trade_role_from_client_order_id(
+                        response.get("clientOrderId")
+                        or response.get("client_order_id")
+                        or request.get("client_order_id")
+                        or item.get("client_order_id")
+                    )
+                )
+                lookup[str(order_id).strip()] = {
+                    "role": str(role or "").strip(),
+                    "side": str(request.get("side") or response.get("side") or item.get("side") or "").upper().strip(),
+                    "position_side": str(
+                        request.get("position_side")
+                        or response.get("positionSide")
+                        or item.get("position_side")
+                        or "BOTH"
+                    ).upper().strip()
+                    or "BOTH",
+                    "client_order_id": str(
+                        response.get("clientOrderId")
+                        or response.get("client_order_id")
+                        or request.get("client_order_id")
+                        or item.get("client_order_id")
+                        or ""
+                    ).strip(),
+                }
+    return lookup
+
+
+def _build_live_account_snapshot(
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+) -> dict[str, Any]:
+    normalized_symbol = str(symbol).upper().strip()
+    cache_key = (api_key.strip(), normalized_symbol)
+    now = time.time()
+    ttl = max(float(LIVE_ACCOUNT_SNAPSHOT_TTL_SECONDS), 0.0)
+    with _MONITOR_CACHE_LOCK:
+        cached = _LIVE_ACCOUNT_CACHE.get(cache_key)
+        if cached is not None and (now - cached[0]) <= ttl:
+            snapshot = dict(cached[1])
+            snapshot["cache_hit"] = True
+            return snapshot
+
+    account_info = fetch_futures_account_info_v3(api_key, api_secret)
+    position_mode = fetch_futures_position_mode(api_key, api_secret)
+    open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
+    dual_side_position = _truthy(position_mode.get("dualSidePosition"))
+    if dual_side_position:
+        long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
+        short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
+        long_qty = abs(_safe_float(long_position.get("positionAmt")))
+        short_qty = abs(_safe_float(short_position.get("positionAmt")))
+        long_entry_price = _safe_float(long_position.get("entryPrice"))
+        short_entry_price = _safe_float(short_position.get("entryPrice"))
+        long_break_even_price = _safe_float(long_position.get("breakEvenPrice"))
+        short_break_even_price = _safe_float(short_position.get("breakEvenPrice"))
+        long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
+        short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
+        unrealized_pnl = long_unrealized + short_unrealized
+        position_amt = long_qty - short_qty
+        position = long_position if long_qty >= short_qty else short_position
+        entry_price = long_entry_price if long_qty >= short_qty else short_entry_price
+        break_even_price = long_break_even_price if long_qty >= short_qty else short_break_even_price
+    else:
+        position = extract_symbol_position(account_info, normalized_symbol)
+        position_amt = _safe_float(position.get("positionAmt"))
+        long_qty = max(position_amt, 0.0)
+        short_qty = max(-position_amt, 0.0)
+        unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
+        entry_price = _safe_float(position.get("entryPrice"))
+        break_even_price = _safe_float(position.get("breakEvenPrice"))
+        long_entry_price = entry_price if position_amt > 0 else 0.0
+        short_entry_price = entry_price if position_amt < 0 else 0.0
+        long_break_even_price = break_even_price if position_amt > 0 else 0.0
+        short_break_even_price = break_even_price if position_amt < 0 else 0.0
+        long_unrealized = unrealized_pnl if position_amt > 0 else 0.0
+        short_unrealized = unrealized_pnl if position_amt < 0 else 0.0
+
+    normalized_open_orders = [
+        {
+            "order_id": item.get("orderId"),
+            "client_order_id": item.get("clientOrderId"),
+            "side": str(item.get("side", "")).upper().strip(),
+            "price": _safe_float(item.get("price")),
+            "orig_qty": _safe_float(item.get("origQty")),
+            "executed_qty": _safe_float(item.get("executedQty")),
+            "reduce_only": _truthy(item.get("reduceOnly")),
+            "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
+            "time": int(item.get("time", 0) or 0),
+        }
+        for item in open_orders
+    ]
+    frozen_position = _summarize_frozen_position_qty(normalized_open_orders)
+
+    snapshot = {
+        "source": "binance_futures_account",
+        "cache_hit": False,
+        "ttl_seconds": ttl,
+        "fetched_at": datetime.now(timezone.utc).isoformat(),
+        "position": {
+            "source": "binance_futures_account",
+            "position_amt": position_amt,
+            "long_qty": long_qty,
+            "short_qty": short_qty,
+            "entry_price": entry_price,
+            "break_even_price": break_even_price,
+            "long_entry_price": long_entry_price,
+            "short_entry_price": short_entry_price,
+            "long_break_even_price": long_break_even_price,
+            "short_break_even_price": short_break_even_price,
+            "long_unrealized_pnl": long_unrealized,
+            "short_unrealized_pnl": short_unrealized,
+            "frozen_long_qty": frozen_position["frozen_long_qty"],
+            "frozen_short_qty": frozen_position["frozen_short_qty"],
+            "unrealized_pnl": unrealized_pnl,
+            "isolated": _truthy(position.get("isolated")),
+            "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
+            "one_way_mode": not dual_side_position,
+            "available_balance": _safe_float(account_info.get("availableBalance")),
+            "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
+            "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
+        },
+        "account_assets": {
+            "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
+            "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
+        },
+        "open_orders": normalized_open_orders,
+    }
+    with _MONITOR_CACHE_LOCK:
+        _LIVE_ACCOUNT_CACHE[cache_key] = (time.time(), snapshot)
+    return snapshot
+
+
+def _merge_live_account_position_with_local_runtime(
+    local_position: dict[str, Any],
+    live_position: dict[str, Any],
+) -> dict[str, Any]:
+    active_long_qty = max(
+        _safe_float(local_position.get("active_long_qty", local_position.get("long_qty"))),
+        0.0,
+    )
+    active_short_qty = max(
+        _safe_float(local_position.get("active_short_qty", local_position.get("short_qty"))),
+        0.0,
+    )
+    live_long_qty = max(_safe_float(live_position.get("long_qty")), 0.0)
+    live_short_qty = max(_safe_float(live_position.get("short_qty")), 0.0)
+    inventory_frozen_long_qty = max(live_long_qty - active_long_qty, 0.0)
+    inventory_frozen_short_qty = max(live_short_qty - active_short_qty, 0.0)
+    reduce_order_frozen_long_qty = max(_safe_float(live_position.get("frozen_long_qty")), 0.0)
+    reduce_order_frozen_short_qty = max(_safe_float(live_position.get("frozen_short_qty")), 0.0)
+
+    merged = dict(live_position)
+    merged.update(
+        {
+            "source": "local_runtime_with_live_account_position",
+            "active_long_qty": active_long_qty,
+            "active_short_qty": active_short_qty,
+            "inventory_frozen_long_qty": inventory_frozen_long_qty,
+            "inventory_frozen_short_qty": inventory_frozen_short_qty,
+            "reduce_order_frozen_long_qty": reduce_order_frozen_long_qty,
+            "reduce_order_frozen_short_qty": reduce_order_frozen_short_qty,
+            "frozen_long_qty": inventory_frozen_long_qty + reduce_order_frozen_long_qty,
+            "frozen_short_qty": inventory_frozen_short_qty + reduce_order_frozen_short_qty,
+        }
+    )
+    return merged
 
 
 def build_monitor_snapshot(
@@ -1882,9 +2664,26 @@ def _build_monitor_snapshot_uncached(
     )
     plan_report = _read_json(Path(plan_path))
     submit_report = _read_json(Path(submit_report_path))
+    order_role_lookup = _build_order_role_lookup(
+        state_path=_infer_state_path_from_events_path(event_path),
+        plan_report=plan_report if isinstance(plan_report, dict) else {},
+        submit_report=submit_report if isinstance(submit_report, dict) else {},
+    )
     session_start, session_last = _build_session_window(events, submit_report)
     session_start = _min_dt(session_start, event_start)
-    stats_start = competition_start or session_start
+    audit_trade_start, _audit_trade_last = _jsonl_time_bounds(audit_paths["trade_audit"], trade_row_time_ms)
+    audit_income_start, _audit_income_last = _jsonl_time_bounds(audit_paths["income_audit"], income_row_time_ms)
+    stats_start, stats_anchor = _resolve_monitor_stats_anchor(
+        anchor_path=_monitor_anchor_path(audit_paths),
+        symbol=normalized_symbol,
+        candidates=[
+            ("competition_start", competition_start),
+            ("audit_trade_start", audit_trade_start),
+            ("audit_income_start", audit_income_start),
+            ("session_start", session_start),
+        ],
+    )
+    stats_start = stats_start or competition_start or session_start
     session_last = _max_dt(session_last, event_last)
     loop_summary = summarize_loop_events(events)
     runner = runner_process or read_symbol_runner_process(normalized_symbol)
@@ -1909,11 +2708,14 @@ def _build_monitor_snapshot_uncached(
             "submit_report": submit_report,
         },
         "competition_reward_targets": build_reward_volume_targets(competition_board),
+        "competition_displacement_volume": None,
+        "competition_entry_volume_targets": None,
         "runner": runner,
         "audit": {
             "paths": {key: str(path) for key, path in audit_paths.items()},
             "trade_source": None,
             "income_source": None,
+            "stats_anchor": stats_anchor,
             "trade_row_count": 0,
             "income_row_count": 0,
             "order_event_count": _count_monitor_audit_lines(audit_paths["order_audit"]),
@@ -1925,6 +2727,7 @@ def _build_monitor_snapshot_uncached(
         "position": None,
         "account_assets": {},
         "open_orders": [],
+        "live_account": None,
         "trade_summary": None,
         "income_summary": None,
         "hourly_summary": None,
@@ -1973,63 +2776,30 @@ def _build_monitor_snapshot_uncached(
     else:
         api_key, api_secret = credentials
         snapshot["account_connected"] = True
+        unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
         try:
-            unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
-            if local_runtime_snapshot is None:
-                account_info = fetch_futures_account_info_v3(api_key, api_secret)
-                position_mode = fetch_futures_position_mode(api_key, api_secret)
-                open_orders = fetch_futures_open_orders(normalized_symbol, api_key, api_secret)
-                dual_side_position = _truthy(position_mode.get("dualSidePosition"))
-                if dual_side_position:
-                    long_position = extract_symbol_position(account_info, normalized_symbol, "LONG")
-                    short_position = extract_symbol_position(account_info, normalized_symbol, "SHORT")
-                    long_qty = abs(_safe_float(long_position.get("positionAmt")))
-                    short_qty = abs(_safe_float(short_position.get("positionAmt")))
-                    long_unrealized = _safe_float(long_position.get("unRealizedProfit", long_position.get("unrealizedProfit")))
-                    short_unrealized = _safe_float(short_position.get("unRealizedProfit", short_position.get("unrealizedProfit")))
-                    unrealized_pnl = long_unrealized + short_unrealized
-                    position_amt = long_qty - short_qty
-                    position = long_position if long_qty >= short_qty else short_position
-                    entry_price = _safe_float(position.get("entryPrice"))
-                    break_even_price = _safe_float(position.get("breakEvenPrice"))
-                else:
-                    position = extract_symbol_position(account_info, normalized_symbol)
-                    unrealized_pnl = _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
-                    entry_price = _safe_float(position.get("entryPrice"))
-                    break_even_price = _safe_float(position.get("breakEvenPrice"))
-                    position_amt = _safe_float(position.get("positionAmt"))
-                snapshot["position"] = {
-                    "position_amt": position_amt,
-                    "long_qty": long_qty if dual_side_position else max(position_amt, 0.0),
-                    "short_qty": short_qty if dual_side_position else 0.0,
-                    "entry_price": entry_price,
-                    "break_even_price": break_even_price,
-                    "unrealized_pnl": unrealized_pnl,
-                    "isolated": _truthy(position.get("isolated")),
-                    "leverage": int(float(position.get("leverage", 0) or 0)) if str(position.get("leverage", "")).strip() else None,
-                    "one_way_mode": not dual_side_position,
-                    "available_balance": _safe_float(account_info.get("availableBalance")),
-                    "wallet_balance": _safe_float(account_info.get("totalWalletBalance")),
-                    "multi_assets_margin": _truthy(account_info.get("multiAssetsMargin")),
-                }
-                snapshot["account_assets"] = {
-                    "USDT": _extract_futures_asset_snapshot(account_info, "USDT"),
-                    "BNB": _extract_futures_asset_snapshot(account_info, "BNB"),
-                }
-                snapshot["open_orders"] = [
-                    {
-                        "order_id": item.get("orderId"),
-                        "client_order_id": item.get("clientOrderId"),
-                        "side": str(item.get("side", "")).upper().strip(),
-                        "price": _safe_float(item.get("price")),
-                        "orig_qty": _safe_float(item.get("origQty")),
-                        "executed_qty": _safe_float(item.get("executedQty")),
-                        "reduce_only": _truthy(item.get("reduceOnly")),
-                        "position_side": str(item.get("positionSide", "BOTH")).upper().strip() or "BOTH",
-                        "time": int(item.get("time", 0) or 0),
-                    }
-                    for item in open_orders
-                ]
+            live_account = _build_live_account_snapshot(
+                symbol=normalized_symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+            )
+            snapshot["live_account"] = live_account
+            if local_runtime_snapshot is not None and bool(runner.get("is_running")):
+                local_position = snapshot.get("position") if isinstance(snapshot.get("position"), dict) else {}
+                live_position = live_account.get("position") if isinstance(live_account.get("position"), dict) else {}
+                if local_position and live_position:
+                    snapshot["position"] = _merge_live_account_position_with_local_runtime(local_position, live_position)
+                snapshot["account_assets"] = live_account["account_assets"]
+                snapshot["open_orders"] = live_account["open_orders"]
+                unrealized_pnl = _safe_float((snapshot.get("position") or {}).get("unrealized_pnl"))
+            else:
+                snapshot["position"] = live_account["position"]
+                snapshot["account_assets"] = live_account["account_assets"]
+                snapshot["open_orders"] = live_account["open_orders"]
+                unrealized_pnl = _safe_float(live_account["position"].get("unrealized_pnl"))
+        except Exception as exc:
+            snapshot["warnings"].append(f"account_read_failed: {type(exc).__name__}: {exc}")
+        try:
             user_trades, trade_meta = _load_or_fetch_trade_rows(
                 audit_path=audit_paths["trade_audit"],
                 symbol=normalized_symbol,
@@ -2037,6 +2807,11 @@ def _build_monitor_snapshot_uncached(
                 api_secret=api_secret,
                 session_start=stats_start,
             )
+        except Exception as exc:
+            user_trades = []
+            trade_meta = {"source": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
+            snapshot["warnings"].append(f"trade_audit_refresh_failed: {type(exc).__name__}: {exc}")
+        try:
             income_rows, income_meta = _load_or_fetch_income_rows(
                 audit_path=audit_paths["income_audit"],
                 symbol=normalized_symbol,
@@ -2044,59 +2819,88 @@ def _build_monitor_snapshot_uncached(
                 api_secret=api_secret,
                 session_start=stats_start,
             )
-            trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
-            income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
-            session_start = _min_dt(stats_start, trade_start, income_start)
-            stats_start = competition_start or session_start
-            session_last = _max_dt(session_last, trade_last, income_last)
-            snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
-            snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
-            snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
-            commission_converter = _build_commission_converter(user_trades)
-            trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
-            income_summary = summarize_income(income_rows)
-            hourly_summary = None
-            try:
-                hourly_window_start = max(
-                    stats_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
-                    datetime.now(timezone.utc) - timedelta(hours=48),
-                )
-                hourly_window_start = _floor_hour(hourly_window_start)
-                hourly_window_end = datetime.now(timezone.utc) + timedelta(minutes=1)
-                hourly_candles = fetch_futures_klines(
-                    symbol=normalized_symbol,
-                    interval="1h",
-                    start_ms=int(hourly_window_start.timestamp() * 1000),
-                    end_ms=int(hourly_window_end.timestamp() * 1000),
-                )
-                hourly_summary = summarize_hourly_metrics(
-                    user_trades,
-                    income_rows,
-                    hourly_candles,
-                    commission_converter=commission_converter,
-                    limit=24,
-                )
-            except Exception as exc:
-                snapshot["warnings"].append(f"hourly_summary_failed: {type(exc).__name__}: {exc}")
-            net_pnl_est = (
-                trade_summary["realized_pnl"]
-                + unrealized_pnl
-                + income_summary["funding_fee"]
-                - trade_summary["commission"]
-            )
-            trade_summary["net_pnl_estimate"] = net_pnl_est
-            snapshot["trade_summary"] = trade_summary
-            snapshot["income_summary"] = income_summary
-            snapshot["hourly_summary"] = hourly_summary
-            snapshot["diagnostics"] = {
-                "hourly": build_hourly_diagnostics(events, hourly_summary, limit=24),
-            }
-            snapshot["audit"]["trade_source"] = trade_meta
-            snapshot["audit"]["income_source"] = income_meta
-            snapshot["audit"]["trade_row_count"] = len(user_trades)
-            snapshot["audit"]["income_row_count"] = len(income_rows)
         except Exception as exc:
-            snapshot["warnings"].append(f"account_read_failed: {type(exc).__name__}: {exc}")
+            income_rows = []
+            income_meta = {"source": "unavailable", "error": f"{type(exc).__name__}: {exc}"}
+            snapshot["warnings"].append(f"income_refresh_failed: {type(exc).__name__}: {exc}")
+        trade_start, trade_last = _epoch_bounds(user_trades, trade_row_time_ms)
+        income_start, income_last = _epoch_bounds(income_rows, income_row_time_ms)
+        stats_start, stats_anchor = _resolve_monitor_stats_anchor(
+            anchor_path=_monitor_anchor_path(audit_paths),
+            symbol=normalized_symbol,
+            candidates=[
+                ("competition_start", competition_start),
+                ("trade_start", trade_start),
+                ("income_start", income_start),
+                ("session_start", session_start),
+            ],
+        )
+        session_start = _min_dt(stats_start, trade_start, income_start)
+        session_last = _max_dt(session_last, trade_last, income_last)
+        snapshot["session"]["start"] = stats_start.isoformat() if stats_start else None
+        snapshot["session"]["last_event"] = session_last.isoformat() if session_last else None
+        snapshot["competition_window"]["stats_start_at"] = stats_start.isoformat() if stats_start else None
+        snapshot["audit"]["stats_anchor"] = stats_anchor
+        commission_converter = _build_commission_converter(user_trades)
+        trade_summary = summarize_user_trades(user_trades, commission_converter=commission_converter)
+        income_summary = summarize_income(income_rows)
+        hourly_summary = None
+        try:
+            hourly_window_start = max(
+                stats_start or (datetime.now(timezone.utc) - timedelta(hours=48)),
+                datetime.now(timezone.utc) - timedelta(hours=48),
+            )
+            hourly_window_start = _floor_hour(hourly_window_start)
+            hourly_window_end = datetime.now(timezone.utc) + timedelta(minutes=1)
+            hourly_candles = fetch_futures_klines(
+                symbol=normalized_symbol,
+                interval="1h",
+                start_ms=int(hourly_window_start.timestamp() * 1000),
+                end_ms=int(hourly_window_end.timestamp() * 1000),
+            )
+            hourly_summary = summarize_hourly_metrics(
+                user_trades,
+                income_rows,
+                hourly_candles,
+                commission_converter=commission_converter,
+                order_role_lookup=order_role_lookup,
+                limit=24,
+            )
+        except Exception as exc:
+            snapshot["warnings"].append(f"hourly_summary_failed: {type(exc).__name__}: {exc}")
+        net_pnl_est = (
+            trade_summary["realized_pnl"]
+            + unrealized_pnl
+            + income_summary["funding_fee"]
+            - trade_summary["commission"]
+        )
+        trade_summary["net_pnl_estimate"] = net_pnl_est
+        competition_current_metric = _competition_current_metric_value(competition_board, trade_summary)
+        trade_summary["competition_current_metric"] = competition_current_metric
+        if _competition_uses_daily_sqrt_score(competition_board):
+            trade_summary["competition_current_metric_label"] = "每日成交量开根号积分"
+        snapshot["trade_summary"] = trade_summary
+        snapshot["competition_reward_targets"] = build_reward_volume_targets(
+            competition_board,
+            current_volume=competition_current_metric,
+        )
+        snapshot["competition_displacement_volume"] = build_competition_displacement_volume(
+            competition_board,
+            current_volume=competition_current_metric,
+        )
+        snapshot["competition_entry_volume_targets"] = build_competition_entry_volume_targets(
+            competition_board,
+            current_volume=competition_current_metric,
+        )
+        snapshot["income_summary"] = income_summary
+        snapshot["hourly_summary"] = hourly_summary
+        snapshot["diagnostics"] = {
+            "hourly": build_hourly_diagnostics(events, hourly_summary, limit=24),
+        }
+        snapshot["audit"]["trade_source"] = trade_meta
+        snapshot["audit"]["income_source"] = income_meta
+        snapshot["audit"]["trade_row_count"] = len(user_trades)
+        snapshot["audit"]["income_row_count"] = len(income_rows)
 
     runner_config = runner.get("config", {})
     latest_loop = (loop_summary.get("latest") or {}) if isinstance(loop_summary, dict) else {}
@@ -2167,11 +2971,11 @@ def _build_monitor_snapshot_uncached(
             current_short_notional = _safe_float(latest_loop.get("current_short_notional"))
     else:
         current_long_notional = (
-            max(_safe_float(position.get("long_qty", position.get("position_amt"))), 0.0)
+            max(_safe_float(position.get("active_long_qty", position.get("long_qty", position.get("position_amt")))), 0.0)
             * max(_safe_float(market.get("mid_price")), 0.0)
         )
         current_short_notional = (
-            max(_safe_float(position.get("short_qty")), 0.0)
+            max(_safe_float(position.get("active_short_qty", position.get("short_qty"))), 0.0)
             * max(_safe_float(market.get("mid_price")), 0.0)
         )
     if current_long_notional <= 0 and not use_live_synthetic_position:
@@ -2436,6 +3240,18 @@ def _build_monitor_snapshot_uncached(
     hard_loss_forced_reduce = (plan_report or {}).get("hard_loss_forced_reduce")
     if not isinstance(hard_loss_forced_reduce, dict):
         hard_loss_forced_reduce = {}
+    adaptive_step = (plan_report or {}).get("adaptive_step")
+    if not isinstance(adaptive_step, dict):
+        adaptive_step = {}
+    elastic_volume = (plan_report or {}).get("elastic_volume")
+    if not isinstance(elastic_volume, dict):
+        elastic_volume = {}
+    regime_entry_budget = (plan_report or {}).get("regime_entry_budget")
+    if not isinstance(regime_entry_budget, dict):
+        regime_entry_budget = {}
+    entry_permission_gate = (plan_report or {}).get("entry_permission_gate")
+    if not isinstance(entry_permission_gate, dict):
+        entry_permission_gate = {}
     execution_regime = _execution_regime_from_sources(
         plan_report=plan_report if isinstance(plan_report, dict) else {},
         latest_loop=latest_loop,
@@ -2505,6 +3321,68 @@ def _build_monitor_snapshot_uncached(
         "auto_regime_confirm_cycles": auto_regime_confirm_cycles,
         "effective_strategy_profile": effective_strategy_profile,
         "effective_strategy_label": effective_strategy_label,
+        "base_step_price": _safe_float(adaptive_step.get("base_step_price") or runner_config.get("step_price")),
+        "plan_step_price": _safe_float((plan_report or {}).get("step_price")),
+        "effective_step_price": _safe_float(
+            regime_entry_budget.get("effective_step_price")
+            or adaptive_step.get("effective_step_price")
+            or (plan_report or {}).get("step_price")
+        ),
+        "base_per_order_notional": _safe_float(
+            regime_entry_budget.get("base_per_order_notional")
+            or runner_config.get("regime_entry_budget_base_per_order_notional")
+            or runner_config.get("per_order_notional")
+        ),
+        "regime_entry_budget": dict(regime_entry_budget),
+        "regime_entry_budget_enabled": bool(regime_entry_budget.get("enabled")),
+        "regime_entry_budget_report_only": bool(regime_entry_budget.get("report_only")),
+        "regime_entry_budget_state": str(regime_entry_budget.get("state") or "").strip(),
+        "regime_entry_budget_candidate_regime": str(regime_entry_budget.get("candidate_regime") or "").strip(),
+        "regime_entry_budget_target_regime": str(regime_entry_budget.get("target_regime") or "").strip(),
+        "regime_entry_budget_switching": bool(regime_entry_budget.get("switching")),
+        "regime_entry_budget_shock_guard_active": bool(regime_entry_budget.get("shock_guard_active")),
+        "regime_entry_budget_cancel_entry_required": bool(regime_entry_budget.get("cancel_entry_required")),
+        "regime_entry_budget_allow_entry_long": bool(regime_entry_budget.get("allow_entry_long", True)),
+        "regime_entry_budget_allow_entry_short": bool(regime_entry_budget.get("allow_entry_short", True)),
+        "regime_entry_budget_long_side_budget": _safe_float(regime_entry_budget.get("long_side_budget")),
+        "regime_entry_budget_short_side_budget": _safe_float(regime_entry_budget.get("short_side_budget")),
+        "regime_entry_budget_long_capacity": int(_safe_float(regime_entry_budget.get("long_entry_capacity"))),
+        "regime_entry_budget_short_capacity": int(_safe_float(regime_entry_budget.get("short_entry_capacity"))),
+        "regime_entry_budget_effective_step_ratio": _safe_float(regime_entry_budget.get("effective_step_ratio")),
+        "regime_entry_budget_effective_step_price": _safe_float(regime_entry_budget.get("effective_step_price")),
+        "regime_entry_budget_effective_per_order_notional": _safe_float(
+            regime_entry_budget.get("effective_per_order_notional")
+        ),
+        "regime_entry_budget_base_step_ratio": _safe_float(runner_config.get("regime_entry_budget_base_step_ratio")),
+        "regime_entry_budget_base_per_order_notional": _safe_float(
+            runner_config.get("regime_entry_budget_base_per_order_notional")
+        ),
+        "regime_entry_budget_entry_reuse_tolerance": _safe_float(regime_entry_budget.get("entry_reuse_tolerance")),
+        "regime_entry_budget_entry_reuse_reason": regime_entry_budget.get("entry_reuse_reason"),
+        "regime_entry_budget_reasons": list(regime_entry_budget.get("reasons") or []),
+        "regime_entry_budget_metrics": dict(regime_entry_budget.get("metrics") or {}),
+        "entry_permission_gate": dict(entry_permission_gate),
+        "elastic_volume": dict(elastic_volume),
+        "elastic_volume_enabled": bool(elastic_volume.get("enabled")),
+        "elastic_volume_regime": str(elastic_volume.get("regime") or "").strip(),
+        "elastic_volume_step_scale": _safe_float(elastic_volume.get("step_scale")),
+        "elastic_volume_per_order_scale": _safe_float(elastic_volume.get("per_order_scale")),
+        "elastic_volume_levels_scale": _safe_float(elastic_volume.get("levels_scale")),
+        "elastic_volume_reasons": list(elastic_volume.get("reasons") or []),
+        "elastic_volume_metrics": dict(elastic_volume.get("metrics") or {}),
+        "adaptive_step": dict(adaptive_step),
+        "adaptive_step_enabled": bool(adaptive_step.get("enabled")),
+        "adaptive_step_active": bool(adaptive_step.get("active")),
+        "adaptive_step_controls_active": bool(adaptive_step.get("controls_active")),
+        "adaptive_step_base_step_price": _safe_float(adaptive_step.get("base_step_price")),
+        "adaptive_step_effective_step_price": _safe_float(adaptive_step.get("effective_step_price")),
+        "adaptive_step_scale": _safe_float(adaptive_step.get("scale")),
+        "adaptive_step_raw_scale": _safe_float(adaptive_step.get("raw_scale")),
+        "adaptive_step_per_order_scale": _safe_float(adaptive_step.get("per_order_scale")),
+        "adaptive_step_dominant_window": adaptive_step.get("dominant_window"),
+        "adaptive_step_dominant_metric": adaptive_step.get("dominant_metric"),
+        "adaptive_step_dominant_value": _safe_float(adaptive_step.get("dominant_value")),
+        "adaptive_step_dominant_threshold": _safe_float(adaptive_step.get("dominant_threshold")),
         "xaut_adaptive_enabled": xaut_adaptive_enabled,
         "xaut_adaptive_state": xaut_adaptive_state,
         "xaut_adaptive_candidate_state": xaut_adaptive_candidate_state,
@@ -2610,7 +3488,11 @@ def _build_monitor_snapshot_uncached(
         "runtime_guard_stats_start_time": latest_loop.get("runtime_guard_stats_start_time"),
         "rolling_hourly_loss": _safe_float(latest_loop.get("rolling_hourly_loss")),
         "rolling_hourly_loss_limit": _safe_float(runner_config.get("rolling_hourly_loss_limit")),
-        "cumulative_gross_notional": _safe_float(latest_loop.get("cumulative_gross_notional")),
+        "cumulative_gross_notional": _safe_float(
+            (snapshot.get("trade_summary") or {}).get("gross_notional")
+            if isinstance(snapshot.get("trade_summary"), dict)
+            else latest_loop.get("cumulative_gross_notional")
+        ),
         "max_cumulative_notional": _safe_float(runner_config.get("max_cumulative_notional")),
         "custom_grid_runtime_min_price": custom_grid_runtime_min_price,
         "custom_grid_runtime_max_price": custom_grid_runtime_max_price,

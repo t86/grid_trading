@@ -20,7 +20,10 @@ from grid_optimizer.competition_board import (
     _parse_segments,
     _per_user_reward_from_segment,
     CompetitionSource,
+    build_competition_displacement_volume,
+    build_competition_entry_volume_targets,
     build_reward_volume_targets,
+    competition_board_daily_refresh_due,
     resolve_active_competition_board,
     upsert_competition_entry,
     build_competition_board_snapshot,
@@ -28,6 +31,155 @@ from grid_optimizer.competition_board import (
 
 
 class CompetitionBoardTests(unittest.TestCase):
+    def test_build_competition_displacement_volume_sums_users_needed_to_push_current_out(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [{"rank": rank, "value": 1_000.0 - rank * 10.0} for rank in range(1, 201)],
+            "segments": [
+                {"start_rank": 1, "end_rank": 1, "rank_label": "第 1 名"},
+                {"start_rank": 2, "end_rank": 2, "rank_label": "第 2 名"},
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名"},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名"},
+            ],
+        }
+
+        result = build_competition_displacement_volume(board, current_volume=0.0, target_rank=200)
+
+        self.assertIsNotNone(result)
+        self.assertEqual(result["current_rank"], 100)
+        self.assertEqual(result["current"]["from_rank"], 100)
+        self.assertEqual(result["current"]["target_rank"], 201)
+        self.assertEqual(result["current"]["last_included_rank"], 200)
+        self.assertEqual(result["current"]["users_count"], 100)
+        self.assertAlmostEqual(result["current"]["cumulative_gap"], 50_500.0, places=8)
+
+    def test_build_competition_entry_volume_targets_reports_gap_to_each_rank(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [
+                {"rank": 1, "value": 1_000.0},
+                {"rank": 2, "value": 900.0},
+                {"rank": 3, "value": 800.0},
+                {"rank": 4, "value": 700.0},
+                {"rank": 5, "value": 600.0},
+                {"rank": 20, "value": 500.0},
+                {"rank": 50, "value": 300.0},
+                {"rank": 200, "value": 100.0},
+            ],
+        }
+
+        result = build_competition_entry_volume_targets(board, current_volume=650.0)
+
+        self.assertEqual(result["current_volume"], 650.0)
+        self.assertEqual([item["rank"] for item in result["targets"]], [1, 2, 3, 4, 5, 20, 50, 200])
+        rank_5 = next(item for item in result["targets"] if item["rank"] == 5)
+        self.assertEqual(rank_5["status"], "reached")
+        self.assertEqual(rank_5["additional_volume"], 0.0)
+        rank_4 = next(item for item in result["targets"] if item["rank"] == 4)
+        self.assertEqual(rank_4["status"], "needed")
+        self.assertAlmostEqual(rank_4["additional_volume"], 50.0, places=8)
+
+    def test_chip_futures_hint_uses_live_leaderboard_resource_id(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_chip")
+        _meta, boards = _hinted_boards_for_source(source)
+
+        self.assertEqual(boards[0]["resourceId"], 51202)
+
+    def test_competition_board_daily_refresh_due_allows_final_15_cst_after_end(self) -> None:
+        board = {"activity_end_at": "2026-05-10T08:00:00+08:00"}
+
+        self.assertTrue(
+            competition_board_daily_refresh_due(
+                board,
+                now=datetime(2026, 5, 10, 15, 0, tzinfo=competition_board.UTC_PLUS_8),
+            )
+        )
+        self.assertFalse(
+            competition_board_daily_refresh_due(
+                board,
+                now=datetime(2026, 5, 11, 15, 0, tzinfo=competition_board.UTC_PLUS_8),
+            )
+        )
+
+    def test_bill_futures_hint_uses_live_leaderboard_resource_id(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_bill")
+        _meta, boards = _hinted_boards_for_source(source)
+
+        self.assertEqual(boards[0]["resourceId"], 54211)
+
+    def test_build_competition_displacement_volume_reports_adjacent_and_reward_floor_steps(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [
+                {"rank": 1, "value": 1_000.0},
+                {"rank": 2, "value": 900.0},
+                {"rank": 3, "value": 700.0},
+                {"rank": 21, "value": 500.0},
+                {"rank": 22, "value": 450.0},
+                {"rank": 50, "value": 300.0},
+                {"rank": 51, "value": 280.0},
+                {"rank": 200, "value": 100.0},
+            ],
+            "segments": [
+                {"start_rank": 1, "end_rank": 1, "rank_label": "第 1 名"},
+                {"start_rank": 2, "end_rank": 2, "rank_label": "第 2 名"},
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名"},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名"},
+            ],
+        }
+
+        result = build_competition_displacement_volume(board, current_volume=950.0, target_rank=200)
+
+        self.assertEqual(result["rank_steps"][0]["label"], "第 1 名 -> 第 2 名")
+        self.assertAlmostEqual(result["rank_steps"][0]["cumulative_gap"], 100.0, places=8)
+        floor_21 = next(item for item in result["reward_floor_steps"] if item["from_rank"] == 21)
+        self.assertEqual(floor_21["label"], "第 21 名 -> 第 200 名")
+        self.assertEqual(floor_21["users_count"], 4)
+        self.assertAlmostEqual(floor_21["cumulative_gap"], 870.0, places=8)
+        bands = result["displacement_bands"]
+        self.assertEqual([item["label"] for item in bands], ["第 1 名 -> 第 2 名", "第 2 名 -> 第 3 名", "第 21 名 -> 第 51 名", "第 51 名 -> 第 201 名"])
+        self.assertAlmostEqual(bands[0]["cumulative_gap"], 100.0, places=8)
+        band_21 = next(item for item in bands if item["from_rank"] == 21)
+        self.assertEqual(band_21["target_rank"], 51)
+        self.assertEqual(band_21["last_included_rank"], 51)
+        self.assertAlmostEqual(band_21["cumulative_gap"], 470.0, places=8)
+
+    def test_build_competition_displacement_volume_reports_current_reward_floor(self) -> None:
+        board = {
+            "leaderboard_unit": "USDT",
+            "rows": [
+                *[{"rank": rank, "value": 5_000.0 - rank * 10.0} for rank in range(1, 39)],
+                {"rank": 39, "value": 3_900.0},
+                {"rank": 40, "value": 3_700.0},
+                {"rank": 41, "value": 3_650.0},
+                {"rank": 42, "value": 3_600.0},
+                {"rank": 43, "value": 3_575.0},
+                {"rank": 44, "value": 3_550.0},
+                {"rank": 45, "value": 3_525.0},
+                {"rank": 46, "value": 3_500.0},
+                {"rank": 47, "value": 3_475.0},
+                {"rank": 48, "value": 3_450.0},
+                {"rank": 49, "value": 3_425.0},
+                {"rank": 50, "value": 3_400.0},
+                {"rank": 51, "value": 3_300.0},
+                {"rank": 200, "value": 300.0},
+            ],
+            "segments": [
+                {"start_rank": 21, "end_rank": 50, "rank_label": "第 21 - 50 名"},
+                {"start_rank": 51, "end_rank": 200, "rank_label": "第 51 - 200 名"},
+            ],
+        }
+
+        result = build_competition_displacement_volume(board, current_volume=3_763.0, target_rank=200)
+
+        floor = result["current_reward_floor"]
+        self.assertEqual(floor["label"], "当前第 40 名 -> 第 51 名")
+        self.assertEqual(floor["from_rank"], 40)
+        self.assertEqual(floor["target_rank"], 51)
+        self.assertEqual(floor["last_included_rank"], 50)
+        self.assertEqual(floor["users_count"], 10)
+        self.assertAlmostEqual(floor["cumulative_gap"], 2_480.0, places=8)
+
     def test_build_reward_volume_targets_maps_20_50_200_loss_targets(self) -> None:
         board = {
             "label": "KAT 合约交易挑战赛",
@@ -202,6 +354,8 @@ class CompetitionBoardTests(unittest.TestCase):
                 "spot_vana",
                 "futures_soon",
                 "futures_chip",
+                "futures_bill",
+                "futures_aigensyn",
                 "futures_tradfi_week1",
                 "futures_altcoins_week1",
                 "futures_um_week1",
@@ -209,12 +363,30 @@ class CompetitionBoardTests(unittest.TestCase):
             }.issubset(slugs)
         )
 
+    def test_aigensyn_futures_hint_uses_user_provided_activity_terms(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_aigensyn")
+        hinted = _hinted_boards_for_source(source)
+        self.assertIsNotNone(hinted)
+        _, boards = hinted or ({}, [])
+
+        self.assertEqual(len(boards), 1)
+        board = boards[0]
+        self.assertIn("www.binance.com", source.url)
+        self.assertEqual(board.get("resourceId"), 54596)
+        self.assertEqual(board["rewardUnit"], "AIGENSYN")
+        self.assertEqual(board["activityPeriodText"], "2026/05/12 18:00 - 2026/05/19 07:59")
+        self.assertEqual(board["activityEndAt"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(board["maxRows"], 200)
+        self.assertIn("累计AIGENSYN U本位合约交易量不低于500 USDT", board["bodyExcerpt"])
+        self.assertIn("总奖池 3,200,000 AIGENSYN", board["bodyExcerpt"])
+
     def test_hinted_current_live_boards_include_real_resource_ids(self) -> None:
         expected = {
             "spot_plume": (50208, "PLUME", "2026-04-30T19:00:00+08:00"),
             "spot_ton": (49996, "USDC", "2026-04-29T20:00:00+08:00"),
             "spot_vana": (51242, "BNB", "2026-05-07T19:00:00+08:00"),
-            "futures_chip": (51201, "CHIP", "2026-05-13T07:59:00+08:00"),
+            "futures_chip": (51202, "CHIP", "2026-05-13T07:59:00+08:00"),
+            "futures_bill": (54211, "BILL", "2026-05-19T07:59:00+08:00"),
         }
         for slug, (resource_id, reward_unit, end_at) in expected.items():
             source = next(item for item in COMPETITION_SOURCES if item.slug == slug)
@@ -225,6 +397,36 @@ class CompetitionBoardTests(unittest.TestCase):
             self.assertEqual(boards[0].get("resourceId"), resource_id)
             self.assertEqual(boards[0]["rewardUnit"], reward_unit)
             self.assertEqual(boards[0]["activityEndAt"], end_at)
+
+    def test_bill_reward_volume_targets_use_live_rank_segments(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_bill")
+        hinted = _hinted_boards_for_source(source)
+        self.assertIsNotNone(hinted)
+        meta, boards = hinted or ({}, [])
+        board = competition_board._compose_board(
+            source,
+            boards[0],
+            {
+                "eligible_user_count": 0,
+                "eligible_metric_total": 0.0,
+                "updated_time_ms": 0,
+                "rows_truncated": False,
+                "last_rank_fetched": 0,
+                "rows": [],
+            },
+            meta,
+        )
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.004):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 5, 10, tzinfo=timezone.utc))
+        self.assertIsNotNone(targets)
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        rank_200, rank_50, rank_20 = targets["tiers"]
+        self.assertAlmostEqual(rank_200["reward_value_usdt"], 32.0, places=8)
+        self.assertAlmostEqual(rank_50["reward_value_usdt"], 80.0, places=8)
+        self.assertAlmostEqual(rank_20["reward_value_usdt"], 160.0, places=8)
+        self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["3"], 106666.66666666667, places=8)
+        self.assertAlmostEqual(rank_50["volumes_by_loss_rate"]["4"], 200000.0, places=8)
+        self.assertAlmostEqual(rank_20["volumes_by_loss_rate"]["5"], 320000.0, places=8)
 
     def test_hinted_soon_two_stage_boards_include_real_resource_ids(self) -> None:
         source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_soon")
@@ -353,6 +555,97 @@ class CompetitionBoardTests(unittest.TestCase):
         self.assertEqual(board["market"], "futures")
         self.assertIn("第一阶段", board["label"])
         self.assertEqual(board["resource_id"], 50568)
+
+    def test_resolve_active_competition_board_falls_back_to_hinted_aigensyn_board_when_snapshot_missing(self) -> None:
+        board = resolve_active_competition_board(
+            "AIGENSYNUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 13, 0, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "AIGENSYN")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["reward_unit"], "AIGENSYN")
+        self.assertEqual(board["activity_start_at"], "2026-05-12T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(board["threshold_value"], 500.0)
+        self.assertEqual(board["threshold_unit"], "USDT")
+        self.assertEqual([segment["end_rank"] for segment in board.get("segments", [])], [1, 2, 3, 4, 5, 20, 50, 200])
+
+    def test_resolve_active_competition_board_falls_back_to_hinted_bill_board(self) -> None:
+        board = resolve_active_competition_board(
+            "BILLUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 15, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "BILL")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["resource_id"], 54211)
+        self.assertEqual(board["activity_start_at"], "2026-05-08T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-05-19T07:59:00+08:00")
+        self.assertEqual(len(board.get("segments", [])), 8)
+
+    def test_resolve_active_competition_board_falls_back_to_hinted_pharos_board(self) -> None:
+        board = resolve_active_competition_board(
+            "PHAROSUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 22, 2, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+        self.assertEqual(board["symbol"], "PHAROS")
+        self.assertEqual(board["market"], "futures")
+        self.assertEqual(board["resource_id"], 56722)
+        self.assertEqual(board["activity_start_at"], "2026-05-19T18:00:00+08:00")
+        self.assertEqual(board["activity_end_at"], "2026-06-09T07:59:00+08:00")
+
+    def test_hinted_pharos_board_parses_reward_segments(self) -> None:
+        board = resolve_active_competition_board(
+            "PHAROSUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 22, 2, 0, tzinfo=timezone.utc),
+        )
+
+        self.assertIsNotNone(board)
+        by_end_rank = {segment["end_rank"]: segment for segment in board.get("segments", [])}
+        self.assertEqual(by_end_rank[20]["per_user_reward"], 4000.0)
+        self.assertEqual(by_end_rank[50]["per_user_reward"], 2000.0)
+        self.assertEqual(by_end_rank[200]["per_user_reward"], 800.0)
+
+    def test_pharos_source_uses_official_binance_activity_page(self) -> None:
+        source = next(item for item in COMPETITION_SOURCES if item.slug == "futures_pharos")
+        self.assertEqual(
+            source.url,
+            "https://www.binance.com/zh-CN/activity/trading-competition/futures-pharos-challenge?ref=YEK2JZJT",
+        )
+
+    def test_build_reward_volume_targets_works_for_hinted_aigensyn_board(self) -> None:
+        board = resolve_active_competition_board(
+            "AIGENSYNUSDT",
+            "futures",
+            snapshot={"boards": []},
+            now=datetime(2026, 5, 13, 0, 0, tzinfo=timezone.utc),
+        )
+        self.assertIsNotNone(board)
+
+        with patch.object(competition_board, "_fetch_symbol_close_price_usdt", return_value=0.01):
+            targets = build_reward_volume_targets(board, now=datetime(2026, 5, 13, 0, 0, tzinfo=timezone.utc))
+
+        self.assertIsNotNone(targets)
+        self.assertEqual(targets["reward_unit"], "AIGENSYN")
+        self.assertEqual([item["rank"] for item in targets["tiers"]], [200, 50, 20])
+        rank_200, rank_50, rank_20 = targets["tiers"]
+        self.assertAlmostEqual(rank_200["reward_value_usdt"], 64.0, places=8)
+        self.assertAlmostEqual(rank_50["reward_value_usdt"], 160.0, places=8)
+        self.assertAlmostEqual(rank_20["reward_value_usdt"], 320.0, places=8)
+        self.assertAlmostEqual(rank_200["volumes_by_loss_rate"]["3"], 213333.33333333334, places=8)
+        self.assertAlmostEqual(rank_50["volumes_by_loss_rate"]["4"], 400000.0, places=8)
+        self.assertAlmostEqual(rank_20["volumes_by_loss_rate"]["5"], 640000.0, places=8)
 
     def test_load_history_index_merges_disk_files_with_stale_index(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

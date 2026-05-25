@@ -6,6 +6,7 @@ import copy
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import time
@@ -13,7 +14,7 @@ import traceback
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
 from .audit import (
     DEFAULT_AUDIT_LOOKBACK_DAYS,
@@ -33,6 +34,17 @@ from .audit import (
     write_json as _write_json,
 )
 from .backtest import build_grid_levels
+from .best_quote_maker_volume import (
+    BestQuoteMakerVolumeConfig,
+    BestQuoteMakerVolumeInputs,
+    build_best_quote_maker_volume_plan,
+)
+from .adaptive_regime_router import (
+    AdaptiveRegimeRouterConfig,
+    AdaptiveRegimeRouterInputs,
+    adaptive_regime_router_state_snapshot,
+    resolve_adaptive_regime_router_control,
+)
 from .competition_elastic_volume import ElasticVolumeConfig, ElasticVolumeInputs, resolve_elastic_volume_control
 from .data import (
     FuturesMarketStream,
@@ -52,6 +64,12 @@ from .data import (
     post_futures_order,
     resolve_futures_market_snapshot,
 )
+from .regime_entry_budget import (
+    RegimeEntryBudgetConfig,
+    RegimeEntryBudgetInputs,
+    regime_entry_budget_state_snapshot,
+    resolve_regime_entry_budget_control,
+)
 from .live_check import extract_symbol_position
 from .maker_flatten_runner import (
     flatten_client_order_prefix,
@@ -59,6 +77,7 @@ from .maker_flatten_runner import (
     load_live_flatten_snapshot,
 )
 from .runtime_guards import evaluate_runtime_guards, normalize_runtime_guard_config, summarize_futures_runtime_guard_inputs
+from .trade_database import ensure_trade_database_schema, persist_cycle_snapshot, persist_trade_rows, trade_database_enabled
 from .semi_auto_plan import (
     STATE_VERSION,
     _isoformat,
@@ -91,14 +110,22 @@ from .submit_plan import (
     _ignore_noop_error,
     _is_reduce_only_reject,
     apply_anti_chase_entry_guard_to_actions,
+    apply_hard_loss_rescue_entry_guard_to_actions,
+    apply_loss_inventory_no_cross_entry_guard_to_actions,
+    apply_loss_reduce_reentry_guard_to_actions,
+    apply_reduce_only_no_loss_guard_to_actions,
     cap_reduce_only_place_orders_to_position,
     estimate_mid_drift_steps,
     preserve_queue_priority_in_execution_actions,
     prepare_post_only_order_request,
+    sort_cancel_orders_farthest_from_market_first,
+    suppress_same_side_nearby_place_orders,
+    suppress_place_orders_with_existing_submitted_buckets,
     validate_plan_report,
     enforce_execution_action_limits,
 )
 from .dry_run import _round_order_price, _round_order_qty
+from .execution_events import FuturesUserDataStream
 from .execution_regime import (
     ExecutionRegimeConfig,
     ExecutionRegimeFeatures,
@@ -130,8 +157,20 @@ XAUT_ADAPTIVE_STATE_NORMAL = "normal"
 XAUT_ADAPTIVE_STATE_DEFENSIVE = "defensive"
 XAUT_ADAPTIVE_STATE_REDUCE_ONLY = "reduce_only"
 AUDIT_SYNC_MIN_INTERVAL_SECONDS = 60.0
+AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS = float(os.getenv("GRID_AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS", "300.0"))
+TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
+OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS = 5 * 60.0
+EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS = 10 * 60.0
+ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS = 30.0
+OPEN_ORDER_STREAM_MAX_AGE_SECONDS = 30.0
+PROTECTIVE_SYNTHETIC_DRIFT_MIN_NOTIONAL = 100.0
+PROTECTIVE_OPEN_ORDER_DIFF_LIMIT = 10
+PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS = 2
+POSITION_MODE_CACHE_TTL_SECONDS = 10 * 60.0
 EXECUTION_MARKET_SNAPSHOT_CACHE_TTL_SECONDS = 0.25
-RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 3.0
+RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS = 15.0
+RUNNER_MARKET_STREAM_WARMUP_SECONDS = 8.0
+RUNNER_RATE_LIMIT_BACKOFF_SECONDS = 30.0
 AUTO_REGIME_PROFILE_OVERRIDES: dict[str, dict[str, Any]] = {
     AUTO_REGIME_STABLE_PROFILE: {
         "buy_levels": 8,
@@ -220,6 +259,10 @@ SYNTHETIC_TP_ONLY_WATCHDOG_MIN_DURATION_SECONDS = 180.0
 
 class StartupProtectionError(RuntimeError):
     """Raised when startup preconditions fail and the runner should stop."""
+
+
+class ProtectiveEntryStopError(RuntimeError):
+    """Raised after canceling entry orders because live state is not trustworthy."""
 
 
 XAUT_ADAPTIVE_STATE_CONFIGS: dict[str, dict[str, dict[str, Any]]] = {
@@ -551,6 +594,7 @@ def resolve_adaptive_step_price(
         "reason": None,
         "history_count": len(history),
         "metrics": {
+            "window_10s": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=10),
             "window_30s": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=30),
             "window_1m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=60),
             "window_3m": _resolve_adaptive_step_window_stats(history, now=now, window_seconds=180),
@@ -670,10 +714,202 @@ def resolve_adaptive_step_price(
     return report
 
 
+def _resolve_best_quote_dynamic_offsets(
+    *,
+    adaptive_step: dict[str, Any],
+    quote_offset_ticks: int,
+    defensive_offset_ticks: int,
+) -> dict[str, Any]:
+    configured_quote = max(int(quote_offset_ticks or 0), 0)
+    configured_defensive = max(int(defensive_offset_ticks or 0), 0)
+    report = {
+        "configured_quote_offset_ticks": configured_quote,
+        "configured_defensive_offset_ticks": configured_defensive,
+        "quote_offset_ticks": configured_quote,
+        "defensive_offset_ticks": configured_defensive,
+        "dynamic_quote_offset_applied": False,
+        "dynamic_quote_offset_scale": 1.0,
+        "reason": None,
+    }
+    if configured_quote <= 1 or not isinstance(adaptive_step, dict) or not bool(adaptive_step.get("enabled")):
+        return report
+    raw_scale = max(_safe_float(adaptive_step.get("raw_scale")), 0.0)
+    if raw_scale <= 0.0 or raw_scale >= 1.0:
+        return report
+    dynamic_quote = max(int(math.ceil(configured_quote / raw_scale)), configured_quote)
+    report.update(
+        {
+            "quote_offset_ticks": dynamic_quote,
+            "dynamic_quote_offset_applied": dynamic_quote > configured_quote,
+            "dynamic_quote_offset_scale": raw_scale,
+            "reason": (
+                "low_volatility_quote_widen"
+                f": raw_scale={raw_scale:.3f} "
+                f"{configured_quote}->{dynamic_quote}"
+            )
+            if dynamic_quote > configured_quote
+            else None,
+        }
+    )
+    return report
+
+
+def _cap_best_quote_profitable_inventory_exit_offset(
+    *,
+    plan: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    configured_quote_offset_ticks: int,
+    min_profit_ratio: float | None,
+) -> dict[str, Any]:
+    configured_ticks = max(int(configured_quote_offset_ticks or 0), 0)
+    tick = _safe_float(tick_size)
+    safe_min_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    report = {
+        "enabled": configured_ticks > 0 and tick > 0,
+        "configured_quote_offset_ticks": configured_ticks,
+        "adjusted_sell_orders": 0,
+        "adjusted_buy_orders": 0,
+        "reason": None,
+    }
+    if configured_ticks <= 0 or tick <= 0:
+        report["reason"] = "disabled"
+        return report
+
+    max_sell_price = _round_order_price(_safe_float(ask_price) + tick * configured_ticks, tick_size, "SELL")
+    min_buy_price = _round_order_price(max(_safe_float(bid_price) - tick * configured_ticks, 0.0), tick_size, "BUY")
+    long_floor = (
+        _round_order_price(current_long_avg_price * (1.0 + safe_min_profit_ratio), tick_size, "SELL")
+        if current_long_qty > 1e-12 and current_long_avg_price > 0
+        else 0.0
+    )
+    short_ceiling = (
+        _round_order_price(max(current_short_avg_price * (1.0 - safe_min_profit_ratio), 0.0), tick_size, "BUY")
+        if current_short_qty > 1e-12 and current_short_avg_price > 0
+        else 0.0
+    )
+
+    adjusted_sell_orders = 0
+    sell_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in plan.get("sell_orders", []) if isinstance(item, dict)]:
+        role = _order_role(order)
+        price = _safe_float(order.get("price"))
+        profitable_long_exit = (
+            current_long_qty > 1e-12
+            and role in {"best_quote_entry_short", "best_quote_reduce_long"}
+            and long_floor > 0
+            and max_sell_price >= long_floor
+        )
+        if profitable_long_exit and price > max_sell_price + 1e-12:
+            order["price"] = max_sell_price
+            order["notional"] = _safe_float(order.get("qty")) * max_sell_price
+            order["profitable_inventory_exit_offset_cap"] = {
+                "side": "SELL",
+                "max_price": max_sell_price,
+                "profit_floor_price": long_floor,
+            }
+            adjusted_sell_orders += 1
+        sell_orders.append(order)
+    plan["sell_orders"] = sell_orders
+
+    adjusted_buy_orders = 0
+    buy_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)]:
+        role = _order_role(order)
+        price = _safe_float(order.get("price"))
+        profitable_short_exit = (
+            current_short_qty > 1e-12
+            and not bool(order.get("paired_entry_reduce"))
+            and role in {"best_quote_entry_long", "best_quote_reduce_short"}
+            and short_ceiling > 0
+            and min_buy_price <= short_ceiling
+        )
+        if profitable_short_exit and price + 1e-12 < min_buy_price:
+            order["price"] = min_buy_price
+            order["notional"] = _safe_float(order.get("qty")) * min_buy_price
+            order["profitable_inventory_exit_offset_cap"] = {
+                "side": "BUY",
+                "min_price": min_buy_price,
+                "profit_ceiling_price": short_ceiling,
+            }
+            adjusted_buy_orders += 1
+        buy_orders.append(order)
+    plan["buy_orders"] = buy_orders
+
+    report["adjusted_sell_orders"] = adjusted_sell_orders
+    report["adjusted_buy_orders"] = adjusted_buy_orders
+    if adjusted_sell_orders or adjusted_buy_orders:
+        report["reason"] = "profitable_inventory_exit_uses_configured_quote_offset"
+    return report
+
+
+def _separate_paired_best_quote_reduce_orders(
+    *,
+    plan: dict[str, Any],
+    tick_size: float | None,
+) -> dict[str, Any]:
+    tick = _safe_float(tick_size)
+    report = {"adjusted_buy_orders": 0, "adjusted_sell_orders": 0}
+    if tick <= 0:
+        return report
+
+    def _position_side(order: dict[str, Any]) -> str:
+        return str(order.get("position_side", order.get("positionSide", "BOTH"))).upper().strip() or "BOTH"
+
+    def _separate(bucket_name: str, side: str, direction: int) -> int:
+        orders = [dict(item) for item in plan.get(bucket_name, []) if isinstance(item, dict)]
+        if not orders:
+            return 0
+        occupied = {
+            (
+                _order_role(order),
+                str(order.get("side", "")).upper().strip(),
+                _position_side(order),
+                _safe_float(order.get("price")),
+            )
+            for order in orders
+            if not bool(order.get("paired_entry_reduce")) and _safe_float(order.get("price")) > 0
+        }
+        adjusted = 0
+        separated: list[dict[str, Any]] = []
+        for order in orders:
+            if not bool(order.get("paired_entry_reduce")):
+                separated.append(order)
+                continue
+            role = _order_role(order)
+            order_side = str(order.get("side", "")).upper().strip()
+            position_side = _position_side(order)
+            price = _safe_float(order.get("price"))
+            original_price = price
+            while (role, order_side, position_side, price) in occupied and price > 0:
+                price = _round_order_price(max(price + tick * direction, 0.0), tick_size, side)
+            if price > 0 and abs(price - original_price) > 1e-12:
+                order["price"] = price
+                order["notional"] = _safe_float(order.get("qty")) * price
+                order["paired_reduce_price_separated"] = True
+                adjusted += 1
+            occupied.add((role, order_side, position_side, price))
+            separated.append(order)
+        plan[bucket_name] = separated
+        return adjusted
+
+    report["adjusted_buy_orders"] = _separate("buy_orders", "BUY", -1)
+    report["adjusted_sell_orders"] = _separate("sell_orders", "SELL", 1)
+    return report
+
+
 def resolve_volatility_entry_pause(
     *,
     adaptive_step: dict[str, Any],
+    state: dict[str, Any] | None = None,
     enabled: bool,
+    window_10s_abs_return_ratio: float | None,
+    window_10s_amplitude_ratio: float | None,
     window_30s_abs_return_ratio: float | None,
     window_30s_amplitude_ratio: float | None,
     window_1m_abs_return_ratio: float | None,
@@ -682,11 +918,24 @@ def resolve_volatility_entry_pause(
     window_3m_amplitude_ratio: float | None,
     window_5m_abs_return_ratio: float | None,
     window_5m_amplitude_ratio: float | None,
+    recover_confirm_cycles: int = 1,
+    now: datetime | None = None,
+    min_observation_seconds: float = 0.0,
+    current_long_notional: float | None = None,
+    current_short_notional: float | None = None,
+    inventory_recover_ratio: float = 1.0,
+    tiny_inventory_ignore_notional: float = 0.0,
 ) -> dict[str, Any]:
     metrics = dict(adaptive_step.get("metrics") or {}) if isinstance(adaptive_step, dict) else {}
+    memory = dict((state or {}).get("volatility_entry_pause_state") or {}) if isinstance(state, dict) else {}
+    current_time = now or _utc_now()
     report: dict[str, Any] = {
         "enabled": bool(enabled),
         "active": False,
+        "trigger_active": False,
+        "recovering": False,
+        "recover_confirm_cycles": max(int(recover_confirm_cycles or 1), 1),
+        "recover_count": 0,
         "dominant_window": None,
         "dominant_metric": None,
         "dominant_value": 0.0,
@@ -694,11 +943,20 @@ def resolve_volatility_entry_pause(
         "matched_reasons": [],
         "reason": None,
         "metrics": metrics,
+        "observation_remaining_seconds": 0.0,
+        "inventory_gate_active": False,
+        "tiny_inventory_ignore_notional": max(_safe_float(tiny_inventory_ignore_notional), 0.0),
+        "tiny_inventory_ignored": False,
+        "state": {},
     }
     if not enabled:
         return report
 
     thresholds = {
+        "window_10s": {
+            "abs_return_ratio": _safe_float(window_10s_abs_return_ratio),
+            "amplitude_ratio": _safe_float(window_10s_amplitude_ratio),
+        },
         "window_30s": {
             "abs_return_ratio": _safe_float(window_30s_abs_return_ratio),
             "amplitude_ratio": _safe_float(window_30s_amplitude_ratio),
@@ -730,26 +988,640 @@ def resolve_volatility_entry_pause(
             if threshold <= 0 or value < threshold:
                 continue
             candidates.append((value / threshold, window_key, metric, value, threshold))
-    if not candidates:
-        return report
-
-    _, dominant_window, dominant_metric, dominant_value, dominant_threshold = max(
-        candidates,
-        key=lambda item: item[0],
-    )
+    dominant_window = dominant_metric = None
+    dominant_value = dominant_threshold = 0.0
+    if candidates:
+        _, dominant_window, dominant_metric, dominant_value, dominant_threshold = max(
+            candidates,
+            key=lambda item: item[0],
+        )
     matched_reasons = [
         f"{window_key} {metric}={value * 100:.2f}% >= {threshold * 100:.2f}%"
         for _, window_key, metric, value, threshold in sorted(candidates, key=lambda item: item[0], reverse=True)
     ]
+    required_recover = max(int(recover_confirm_cycles or 1), 1)
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    short_notional = max(_safe_float(current_short_notional), 0.0)
+    current_inventory_notional = max(long_notional, short_notional)
+    inventory_ratio_required = min(max(float(inventory_recover_ratio or 1.0), 0.0), 1.0)
+    tiny_inventory_limit = max(_safe_float(tiny_inventory_ignore_notional), 0.0)
+    tiny_inventory_ignored = False
+    if candidates:
+        recover_count = 0
+        active = True
+        recovering = False
+        reason = matched_reasons[0] if matched_reasons else None
+        trigger_inventory_notional = current_inventory_notional
+        last_trigger_at = _isoformat(current_time)
+        observation_remaining_seconds = max(float(min_observation_seconds or 0.0), 0.0)
+        inventory_gate_active = False
+    else:
+        was_active = bool(memory.get("active") or memory.get("recovering"))
+        previous_recover = int(_safe_float(memory.get("recover_count")))
+        trigger_inventory_notional = max(_safe_float(memory.get("trigger_inventory_notional")), 0.0)
+        last_trigger_at_raw = str(memory.get("last_trigger_at") or "").strip()
+        try:
+            last_trigger_at = datetime.fromisoformat(last_trigger_at_raw) if last_trigger_at_raw else None
+        except ValueError:
+            last_trigger_at = None
+        elapsed_seconds = (
+            max((current_time - last_trigger_at).total_seconds(), 0.0)
+            if isinstance(last_trigger_at, datetime)
+            else float("inf")
+        )
+        observation_remaining_seconds = max(float(min_observation_seconds or 0.0) - elapsed_seconds, 0.0)
+        inventory_recover_limit = trigger_inventory_notional * inventory_ratio_required if trigger_inventory_notional > 0 else 0.0
+        tiny_inventory_ignored = bool(tiny_inventory_limit > 0 and 0 < current_inventory_notional <= tiny_inventory_limit)
+        inventory_gate_active = (
+            trigger_inventory_notional > 0
+            and current_inventory_notional > inventory_recover_limit
+            and not tiny_inventory_ignored
+        )
+        recover_gate_open = observation_remaining_seconds <= 0 and not inventory_gate_active
+        recover_count = previous_recover + 1 if was_active and recover_gate_open else 0 if was_active else required_recover
+        active = was_active and (not recover_gate_open or recover_count < required_recover)
+        recovering = bool(was_active and active)
+        reason_parts: list[str] = []
+        if observation_remaining_seconds > 0:
+            reason_parts.append(f"observing {math.ceil(observation_remaining_seconds)}s")
+        if inventory_gate_active:
+            reason_parts.append(
+                f"inventory {current_inventory_notional:.4f} > recover_limit {inventory_recover_limit:.4f}"
+            )
+        if recover_gate_open and recovering:
+            reason_parts.append(f"recovering {recover_count}/{required_recover}")
+        reason = (
+            f"{' ; '.join(reason_parts)} after {memory.get('last_trigger_reason') or 'volatility_entry_pause'}"
+            if recovering and reason_parts
+            else None
+        )
+    report.update(
+        {
+            "active": active,
+            "trigger_active": bool(candidates),
+            "recovering": recovering,
+            "recover_confirm_cycles": required_recover,
+            "recover_count": recover_count,
+            "dominant_window": dominant_window if candidates else memory.get("dominant_window"),
+            "dominant_metric": dominant_metric if candidates else memory.get("dominant_metric"),
+            "dominant_value": dominant_value if candidates else _safe_float(memory.get("dominant_value")),
+            "dominant_threshold": dominant_threshold if candidates else _safe_float(memory.get("dominant_threshold")),
+            "matched_reasons": matched_reasons,
+            "reason": reason,
+            "observation_remaining_seconds": observation_remaining_seconds,
+            "inventory_gate_active": inventory_gate_active,
+            "tiny_inventory_ignore_notional": tiny_inventory_limit,
+            "tiny_inventory_ignored": tiny_inventory_ignored,
+        }
+    )
+    report["state"] = {
+        "active": active,
+        "recovering": recovering,
+        "recover_count": recover_count,
+        "recover_confirm_cycles": required_recover,
+        "last_trigger_reason": matched_reasons[0]
+        if matched_reasons
+        else (memory.get("last_trigger_reason") if active else None),
+        "last_trigger_at": last_trigger_at if candidates else memory.get("last_trigger_at"),
+        "trigger_inventory_notional": trigger_inventory_notional if active or recovering else 0.0,
+        "dominant_window": report.get("dominant_window"),
+        "dominant_metric": report.get("dominant_metric"),
+        "dominant_value": report.get("dominant_value"),
+        "dominant_threshold": report.get("dominant_threshold"),
+    }
+    return report
+
+
+def apply_volatility_entry_pause_controls(
+    *,
+    controls: dict[str, Any],
+    volatility_entry_pause: dict[str, Any],
+    loss_recovery_brush: dict[str, Any],
+    elastic_volume: dict[str, Any],
+) -> None:
+    if not volatility_entry_pause.get("active"):
+        return
+    if bool(elastic_volume.get("enabled") and elastic_volume.get("applied")):
+        volatility_entry_pause["entry_pause_absorbed_by_elastic"] = True
+        return
+
+    entry_pause_reason = volatility_entry_pause.get("reason") or "active"
+    recovery_active = bool(loss_recovery_brush.get("active"))
+    recovery_side = str(loss_recovery_brush.get("side") or "").lower()
+    bypass_buy_pause = recovery_active and recovery_side == "short"
+    bypass_short_pause = recovery_active and recovery_side == "long"
+    if bypass_buy_pause or bypass_short_pause:
+        volatility_entry_pause["loss_recovery_brush_bypass_side"] = "BUY" if bypass_buy_pause else "SELL"
+
+    if not bypass_buy_pause:
+        controls["buy_paused"] = True
+        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+        controls["pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+    if not bypass_short_pause:
+        controls["short_paused"] = True
+        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
+        controls["short_pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+
+
+def _parse_rescue_guard_time(value: Any) -> datetime | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    try:
+        parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed.astimezone(timezone.utc) if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _volatility_window_is_calm(
+    *,
+    metrics: dict[str, Any],
+    thresholds: dict[str, dict[str, float]],
+    window_key: str,
+) -> tuple[bool, str | None]:
+    window = metrics.get(window_key)
+    if not isinstance(window, dict):
+        return False, f"{window_key}_missing"
+    window_thresholds = thresholds.get(window_key) or {}
+    abs_threshold = _safe_float(window_thresholds.get("abs_return_ratio"))
+    amp_threshold = _safe_float(window_thresholds.get("amplitude_ratio"))
+    abs_return = abs(_safe_float(window.get("return_ratio")))
+    amplitude = _safe_float(window.get("amplitude_ratio"))
+    if abs_threshold > 0 and abs_return >= abs_threshold:
+        return False, f"{window_key}_abs_return={abs_return:.6f}>={abs_threshold:.6f}"
+    if amp_threshold > 0 and amplitude >= amp_threshold:
+        return False, f"{window_key}_amplitude={amplitude:.6f}>={amp_threshold:.6f}"
+    return True, None
+
+
+def resolve_hard_loss_rescue_entry_guard(
+    *,
+    state: dict[str, Any],
+    hard_loss_forced_reduce: dict[str, Any],
+    volatility_entry_pause: dict[str, Any],
+    current_long_notional: float,
+    current_short_notional: float,
+    now: datetime,
+    protect_seconds: float = 180.0,
+    hard_unrealized_loss_limit: float | None = None,
+    loss_recover_ratio: float = 0.75,
+) -> dict[str, Any]:
+    safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    memory = dict(state.get("hard_loss_rescue_entry_guard") or {})
+    hard_active = bool(hard_loss_forced_reduce.get("active"))
+    side = str(hard_loss_forced_reduce.get("side") or memory.get("side") or "").upper().strip()
+    if hard_active and side in {"BUY", "SELL"}:
+        memory = {
+            "side": side,
+            "started_at": _isoformat(safe_now),
+            "updated_at": _isoformat(safe_now),
+        }
+        state["hard_loss_rescue_entry_guard"] = memory
+
+    started_at = _parse_rescue_guard_time(memory.get("started_at"))
+    if side not in {"BUY", "SELL"} or started_at is None:
+        state.pop("hard_loss_rescue_entry_guard", None)
+        return {"enabled": True, "active": False, "reason": "no_recent_hard_loss"}
+
+    target_notional = max(_safe_float(hard_loss_forced_reduce.get("target_notional")), 0.0)
+    hard_loss_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    loss_recover_threshold = hard_loss_limit * max(_safe_float(loss_recover_ratio), 0.0)
+    hard_unrealized_pnl = _safe_float(hard_loss_forced_reduce.get("unrealized_pnl"))
+    hard_loss_still_elevated = (
+        hard_loss_limit > 0
+        and loss_recover_threshold > 0
+        and hard_unrealized_pnl < -loss_recover_threshold
+    )
+    current_rescue_notional = (
+        max(_safe_float(current_short_notional), 0.0)
+        if side == "BUY"
+        else max(_safe_float(current_long_notional), 0.0)
+    )
+    elapsed_seconds = max((safe_now - started_at).total_seconds(), 0.0)
+    min_remaining_seconds = max(_safe_float(protect_seconds) - elapsed_seconds, 0.0)
+    volatility_metrics = dict(volatility_entry_pause.get("metrics") or {})
+    thresholds: dict[str, dict[str, float]] = {}
+    for key in ("window_1m", "window_3m"):
+        threshold_key = f"{key}_thresholds"
+        if isinstance(volatility_entry_pause.get(threshold_key), dict):
+            thresholds[key] = dict(volatility_entry_pause[threshold_key])
+    if not thresholds:
+        state_snapshot = volatility_entry_pause.get("state")
+        dominant_threshold = _safe_float(state_snapshot.get("dominant_threshold")) if isinstance(state_snapshot, dict) else 0.0
+        if dominant_threshold > 0:
+            thresholds = {
+                "window_1m": {"abs_return_ratio": dominant_threshold, "amplitude_ratio": dominant_threshold},
+                "window_3m": {"abs_return_ratio": dominant_threshold, "amplitude_ratio": dominant_threshold},
+            }
+
+    one_min_calm, one_min_reason = _volatility_window_is_calm(
+        metrics=volatility_metrics,
+        thresholds=thresholds,
+        window_key="window_1m",
+    )
+    three_min_calm, three_min_reason = _volatility_window_is_calm(
+        metrics=volatility_metrics,
+        thresholds=thresholds,
+        window_key="window_3m",
+    )
+    over_target = target_notional > 0 and current_rescue_notional > target_notional + 1e-12
+    should_protect = (
+        hard_active
+        or min_remaining_seconds > 0
+        or over_target
+        or hard_loss_still_elevated
+        or not (one_min_calm and three_min_calm)
+    )
+    if not should_protect:
+        state.pop("hard_loss_rescue_entry_guard", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "reason": "recovered",
+            "elapsed_seconds": elapsed_seconds,
+            "target_notional": target_notional,
+            "current_rescue_notional": current_rescue_notional,
+            "hard_unrealized_pnl": hard_unrealized_pnl,
+            "loss_recover_threshold": loss_recover_threshold,
+        }
+
+    reasons: list[str] = []
+    if hard_active:
+        reasons.append("hard_loss_active")
+    if min_remaining_seconds > 0:
+        reasons.append(f"protect_window_remaining={math.ceil(min_remaining_seconds)}s")
+    if over_target:
+        reasons.append("inventory_above_target")
+    if hard_loss_still_elevated:
+        reasons.append("hard_loss_still_elevated")
+    if not one_min_calm:
+        reasons.append(one_min_reason or "window_1m_not_calm")
+    if not three_min_calm:
+        reasons.append(three_min_reason or "window_3m_not_calm")
+    memory["updated_at"] = _isoformat(safe_now)
+    state["hard_loss_rescue_entry_guard"] = memory
+    return {
+        "enabled": True,
+        "active": True,
+        "side": side,
+        "block_long_entries": side == "SELL",
+        "block_short_entries": side == "BUY",
+        "started_at": _isoformat(started_at),
+        "elapsed_seconds": elapsed_seconds,
+        "min_remaining_seconds": min_remaining_seconds,
+        "target_notional": target_notional,
+        "current_rescue_notional": current_rescue_notional,
+        "hard_unrealized_pnl": hard_unrealized_pnl,
+        "loss_recover_threshold": loss_recover_threshold,
+        "one_min_calm": one_min_calm,
+        "three_min_calm": three_min_calm,
+        "reason": ";".join(item for item in reasons if item),
+    }
+
+
+def _loss_reduce_side_from_reports(
+    *,
+    adverse_inventory_reduce: dict[str, Any],
+    hard_loss_forced_reduce: dict[str, Any],
+) -> tuple[str | None, str | None, float | None]:
+    hard_side = str(hard_loss_forced_reduce.get("side") or "").upper().strip()
+    if bool(hard_loss_forced_reduce.get("active")) and hard_side in {"BUY", "SELL"}:
+        return hard_side, "hard_loss", None
+
+    adverse_orders = [
+        item
+        for item in adverse_inventory_reduce.get("forced_reduce_orders", [])
+        if isinstance(item, dict)
+    ]
+    if bool(adverse_inventory_reduce.get("enabled")) and int(adverse_inventory_reduce.get("placed_reduce_orders") or 0) > 0:
+        if bool(adverse_inventory_reduce.get("long_active")):
+            order_price = _safe_float(adverse_orders[0].get("price")) if adverse_orders else 0.0
+            return "SELL", "adverse_reduce", order_price or None
+        if bool(adverse_inventory_reduce.get("short_active")):
+            order_price = _safe_float(adverse_orders[0].get("price")) if adverse_orders else 0.0
+            return "BUY", "adverse_reduce", order_price or None
+        if adverse_orders:
+            order_side = str(adverse_orders[0].get("side") or "").upper().strip()
+            if order_side in {"BUY", "SELL"}:
+                order_price = _safe_float(adverse_orders[0].get("price"))
+                return order_side, "adverse_reduce", order_price or None
+    return None, None, None
+
+
+def resolve_loss_reduce_reentry_guard(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    adverse_inventory_reduce: dict[str, Any],
+    hard_loss_forced_reduce: dict[str, Any],
+    current_long_notional: float,
+    current_short_notional: float,
+    mid_price: float,
+    effective_step_price: float | None,
+    now: datetime,
+    cooldown_seconds: float = 300.0,
+    recover_buffer_steps: float = 1.0,
+) -> dict[str, Any]:
+    if not enabled:
+        state.pop("loss_reduce_reentry_guard", None)
+        return {"enabled": False, "active": False, "reason": "disabled"}
+
+    safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    memory = dict(state.get("loss_reduce_reentry_guard") or {})
+    trigger_side, trigger_source, trigger_price = _loss_reduce_side_from_reports(
+        adverse_inventory_reduce=adverse_inventory_reduce,
+        hard_loss_forced_reduce=hard_loss_forced_reduce,
+    )
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    if trigger_side in {"BUY", "SELL"}:
+        reference_price = max(_safe_float(trigger_price), safe_mid, 0.0)
+        memory = {
+            "side": trigger_side,
+            "source": trigger_source or "loss_reduce",
+            "started_at": _isoformat(safe_now),
+            "updated_at": _isoformat(safe_now),
+            "reference_price": reference_price,
+        }
+        state["loss_reduce_reentry_guard"] = memory
+
+    side = str(memory.get("side") or "").upper().strip()
+    started_at = _parse_rescue_guard_time(memory.get("started_at"))
+    if side not in {"BUY", "SELL"} or started_at is None:
+        state.pop("loss_reduce_reentry_guard", None)
+        return {"enabled": True, "active": False, "reason": "no_recent_loss_reduce"}
+
+    elapsed_seconds = max((safe_now - started_at).total_seconds(), 0.0)
+    min_remaining_seconds = max(_safe_float(cooldown_seconds) - elapsed_seconds, 0.0)
+    step_price = max(_safe_float(effective_step_price), 0.0)
+    buffer_price = step_price * max(_safe_float(recover_buffer_steps), 0.0)
+    reference_price = max(_safe_float(memory.get("reference_price")), 0.0)
+    if reference_price <= 0:
+        reference_price = safe_mid
+        memory["reference_price"] = reference_price
+
+    gate_price: float | None = None
+    price_recovered = True
+    if reference_price > 0 and buffer_price > 0 and safe_mid > 0:
+        if side == "SELL":
+            gate_price = reference_price + buffer_price
+            price_recovered = safe_mid >= gate_price - 1e-12
+        else:
+            gate_price = max(reference_price - buffer_price, 0.0)
+            price_recovered = safe_mid <= gate_price + 1e-12
+
+    current_rescue_notional = (
+        max(_safe_float(current_short_notional), 0.0)
+        if side == "BUY"
+        else max(_safe_float(current_long_notional), 0.0)
+    )
+    should_protect = min_remaining_seconds > 0 or not price_recovered
+    if not should_protect:
+        state.pop("loss_reduce_reentry_guard", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "reason": "recovered",
+            "side": side,
+            "source": memory.get("source"),
+            "elapsed_seconds": elapsed_seconds,
+            "reference_price": reference_price,
+            "gate_price": gate_price,
+            "mid_price": safe_mid,
+            "current_rescue_notional": current_rescue_notional,
+        }
+
+    reasons: list[str] = []
+    if min_remaining_seconds > 0:
+        reasons.append(f"cooldown_remaining={math.ceil(min_remaining_seconds)}s")
+    if not price_recovered:
+        reasons.append("price_not_recovered")
+    memory["updated_at"] = _isoformat(safe_now)
+    state["loss_reduce_reentry_guard"] = memory
+    return {
+        "enabled": True,
+        "active": True,
+        "side": side,
+        "source": memory.get("source"),
+        "block_long_entries": side == "SELL",
+        "block_short_entries": side == "BUY",
+        "started_at": _isoformat(started_at),
+        "elapsed_seconds": elapsed_seconds,
+        "min_remaining_seconds": min_remaining_seconds,
+        "reference_price": reference_price,
+        "gate_price": gate_price,
+        "mid_price": safe_mid,
+        "current_rescue_notional": current_rescue_notional,
+        "reason": ";".join(reasons) or "loss_reduce_reentry_guard_active",
+    }
+
+
+def resolve_hard_loss_forced_reduce_episode(
+    *,
+    state: dict[str, Any],
+    enabled: bool,
+    triggered: bool,
+    side: str | None,
+    current_notional: float,
+    target_notional: float | None,
+    unrealized_pnl: float,
+    hard_unrealized_loss_limit: float | None,
+    now: datetime,
+    loss_recover_ratio: float = 0.75,
+) -> dict[str, Any]:
+    normalized_side = str(side or "").upper().strip()
+    current_time = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
+    hard_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    recover_threshold = hard_limit * max(_safe_float(loss_recover_ratio), 0.0)
+    current_loss = -_safe_float(unrealized_pnl)
+    current_notional_safe = max(_safe_float(current_notional), 0.0)
+    target_notional_safe = max(_safe_float(target_notional), 0.0)
+    memory = dict(state.get("hard_loss_forced_reduce_episode") or {})
+    memory_side = str(memory.get("side") or "").upper().strip()
+    same_side = normalized_side in {"BUY", "SELL"} and memory_side == normalized_side
+    recovered = hard_limit > 0 and recover_threshold > 0 and current_loss <= recover_threshold
+    if not enabled:
+        state.pop("hard_loss_forced_reduce_episode", None)
+        return {
+            "enabled": False,
+            "active": False,
+            "disarmed": False,
+            "reason": "disabled",
+            "loss_recover_threshold": recover_threshold,
+        }
+    if recovered:
+        state.pop("hard_loss_forced_reduce_episode", None)
+        return {
+            "enabled": True,
+            "active": False,
+            "disarmed": False,
+            "reason": "recovered",
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+        }
+    if same_side and memory.get("disarmed_until_recovery"):
+        memory["updated_at"] = _isoformat(current_time)
+        memory["current_loss"] = current_loss
+        memory["current_notional"] = current_notional_safe
+        memory["target_notional"] = target_notional_safe
+        memory["loss_recover_threshold"] = recover_threshold
+        state["hard_loss_forced_reduce_episode"] = memory
+        return {
+            "enabled": True,
+            "active": True,
+            "disarmed": True,
+            "side": normalized_side,
+            "reason": "waiting_loss_recovery",
+            "started_at": memory.get("started_at"),
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+        }
+    if triggered and normalized_side in {"BUY", "SELL"}:
+        disarmed = target_notional_safe <= 0 or current_notional_safe <= target_notional_safe + 1e-12
+        if disarmed:
+            memory = {
+                "side": normalized_side,
+                "started_at": str(memory.get("started_at") or _isoformat(current_time)),
+                "updated_at": _isoformat(current_time),
+                "disarmed_until_recovery": True,
+                "current_loss": current_loss,
+                "current_notional": current_notional_safe,
+                "target_notional": target_notional_safe,
+                "loss_recover_threshold": recover_threshold,
+            }
+            state["hard_loss_forced_reduce_episode"] = memory
+            return {
+                "enabled": True,
+                "active": True,
+                "disarmed": True,
+                "side": normalized_side,
+                "reason": "target_reached_waiting_loss_recovery",
+                "started_at": memory["started_at"],
+                "current_loss": current_loss,
+                "loss_recover_threshold": recover_threshold,
+                "current_notional": current_notional_safe,
+                "target_notional": target_notional_safe,
+            }
+        memory = {
+            "side": normalized_side,
+            "started_at": str(memory.get("started_at") or _isoformat(current_time)),
+            "updated_at": _isoformat(current_time),
+            "disarmed_until_recovery": False,
+            "current_loss": current_loss,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+            "loss_recover_threshold": recover_threshold,
+        }
+        state["hard_loss_forced_reduce_episode"] = memory
+        return {
+            "enabled": True,
+            "active": True,
+            "disarmed": False,
+            "side": normalized_side,
+            "reason": "reducing_to_target",
+            "started_at": memory["started_at"],
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+            "current_notional": current_notional_safe,
+            "target_notional": target_notional_safe,
+        }
+    if not triggered and not memory:
+        return {
+            "enabled": True,
+            "active": False,
+            "disarmed": False,
+            "reason": "not_triggered",
+            "current_loss": current_loss,
+            "loss_recover_threshold": recover_threshold,
+        }
+    return {
+        "enabled": True,
+        "active": bool(memory),
+        "disarmed": bool(memory.get("disarmed_until_recovery")),
+        "side": memory_side or normalized_side,
+        "reason": "memory",
+        "current_loss": current_loss,
+        "loss_recover_threshold": recover_threshold,
+    }
+
+
+def resolve_loss_recovery_brush(
+    *,
+    enabled: bool,
+    strategy_mode: str,
+    current_long_notional: float,
+    current_short_notional: float,
+    unrealized_pnl: float,
+    hard_loss_forced_reduce: dict[str, Any] | None,
+    hard_unrealized_loss_limit: float | None,
+    per_order_notional: float,
+    entry_notional: float | None,
+    min_unrealized_loss: float | None,
+    max_entry_orders_per_side: int | None,
+) -> dict[str, Any]:
+    safe_entry_notional = max(_safe_float(entry_notional), 0.0)
+    safe_per_order = max(_safe_float(per_order_notional), 0.0)
+    safe_min_loss = max(_safe_float(min_unrealized_loss), 0.0)
+    hard_limit = max(_safe_float(hard_unrealized_loss_limit), 0.0)
+    hard_active = bool((hard_loss_forced_reduce or {}).get("active")) or (
+        hard_limit > 0 and _safe_float(unrealized_pnl) <= -hard_limit
+    )
+    long_notional = max(_safe_float(current_long_notional), 0.0)
+    short_notional = max(_safe_float(current_short_notional), 0.0)
+    dominant_side = "long" if long_notional >= short_notional and long_notional > 0 else (
+        "short" if short_notional > 0 else None
+    )
+    report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "side": dominant_side,
+        "reason": None,
+        "entry_notional": safe_entry_notional,
+        "same_side_probe_scale": 0.0,
+        "max_entry_long_orders": None,
+        "max_entry_short_orders": None,
+        "allow_opposite_entry_with_single_side_inventory": False,
+        "hard_loss_active": hard_active,
+        "unrealized_pnl": _safe_float(unrealized_pnl),
+        "min_unrealized_loss": safe_min_loss,
+    }
+    if not enabled:
+        report["reason"] = "disabled"
+        return report
+    if not _is_synthetic_neutral_mode(strategy_mode):
+        report["reason"] = "unsupported_strategy_mode"
+        return report
+    if hard_active:
+        report["reason"] = "hard_loss_active"
+        return report
+    if dominant_side is None:
+        report["reason"] = "no_inventory"
+        return report
+    if _safe_float(unrealized_pnl) >= -safe_min_loss:
+        report["reason"] = "loss_below_threshold"
+        return report
+    if safe_entry_notional <= 0 or safe_per_order <= 0:
+        report["reason"] = "entry_notional_disabled"
+        return report
+
+    max_orders = max(int(max_entry_orders_per_side or 1), 0)
+    if max_orders <= 0:
+        report["reason"] = "max_entry_orders_zero"
+        return report
+    scale = min(safe_entry_notional / safe_per_order, 1.0)
+    if scale <= 0:
+        report["reason"] = "probe_scale_zero"
+        return report
     report.update(
         {
             "active": True,
-            "dominant_window": dominant_window,
-            "dominant_metric": dominant_metric,
-            "dominant_value": dominant_value,
-            "dominant_threshold": dominant_threshold,
-            "matched_reasons": matched_reasons,
-            "reason": matched_reasons[0] if matched_reasons else None,
+            "reason": "losing_inventory_brush",
+            "same_side_probe_scale": scale,
+            "max_entry_long_orders": max_orders,
+            "max_entry_short_orders": max_orders,
+            "allow_opposite_entry_with_single_side_inventory": True,
         }
     )
     return report
@@ -975,6 +1847,7 @@ def _normalize_live_book_snapshot(book_row: dict[str, Any] | None, *, symbol: st
     return {
         "bid_price": bid_price,
         "ask_price": ask_price,
+        "source": str(row.get("source") or "unknown"),
     }
 
 
@@ -1039,6 +1912,33 @@ def _resolve_runner_market_snapshot(args: argparse.Namespace, *, symbol: str) ->
         "mark_time": premium.get("time"),
         "source": "rest",
     }
+
+
+def _wait_for_runner_market_stream_snapshot(
+    market_stream: FuturesMarketStream | None,
+    *,
+    max_wait_seconds: float = RUNNER_MARKET_STREAM_WARMUP_SECONDS,
+) -> dict[str, Any] | None:
+    if market_stream is None:
+        return None
+    deadline = time.monotonic() + max(float(max_wait_seconds), 0.0)
+    while True:
+        snapshot = market_stream.snapshot(max_age_seconds=RUNNER_MARKET_SNAPSHOT_MAX_AGE_SECONDS)
+        if snapshot is not None:
+            return snapshot
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
+
+
+def _is_binance_rate_limit_error(exc: BaseException) -> bool:
+    message = str(exc)
+    return (
+        "-1003" in message
+        or "Too many requests" in message
+        or "current limit of IP" in message
+        or "Please use the websocket" in message
+    )
 
 
 def _resolve_custom_grid_roll(
@@ -1205,6 +2105,7 @@ def _run_periodic_reconcile(
     recv_window: int,
     expected_open_order_count: int,
     expected_actual_net_qty: float,
+    args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
     safe_interval_cycles = max(int(interval_cycles), 0)
     snapshot = dict(state.get("last_reconcile") or {})
@@ -1215,14 +2116,57 @@ def _run_periodic_reconcile(
     if safe_interval_cycles <= 0 or cycle % safe_interval_cycles != 0:
         return snapshot
 
-    current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
-    current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
-    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window)
+    observed_open_order_state = (
+        _summarize_runner_strategy_open_order_state(args, symbol, max_events=500)
+        if args is not None
+        else {"active_order_count": 0, "active_client_order_ids": [], "active_order_ids": []}
+    )
+    open_orders_rest_backfill_performed = _should_backfill_open_orders_rest(
+        snapshot,
+        now_utc=_utc_now(),
+        observed_active_order_count=int(observed_open_order_state.get("active_order_count", 0) or 0),
+        expected_open_order_count=int(expected_open_order_count or 0),
+        observed_source=str(observed_open_order_state.get("source") or ""),
+    )
+    if open_orders_rest_backfill_performed:
+        current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window, use_cache=False)
+        current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
+        stream = getattr(args, "user_data_stream", None) if args is not None else None
+        if stream is not None and hasattr(stream, "replace_open_orders_from_rest"):
+            try:
+                stream.replace_open_orders_from_rest(current_strategy_open_orders)
+            except Exception:
+                pass
+        actual_open_order_count = len(current_strategy_open_orders)
+        total_open_order_count: int | None = len(current_open_orders)
+        open_orders_source = "rest"
+    else:
+        actual_open_order_count = int(observed_open_order_state.get("active_order_count", 0) or 0)
+        total_open_order_count = None
+        open_orders_source = str(observed_open_order_state.get("source") or "observed_events")
+    stream_position = _snapshot_runner_account_position(args, symbol)
+    stale_stream_position = (
+        stream_position
+        if stream_position is not None
+        else _snapshot_runner_account_position(args, symbol, max_age_seconds=-1.0)
+    )
+    account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
     current_position = extract_symbol_position(account_info, symbol)
+    stream_position = stale_stream_position
+    account_position_source = "rest"
     actual_net_qty = _safe_float(current_position.get("positionAmt"))
-    open_order_diff = len(current_strategy_open_orders) - int(expected_open_order_count or 0)
+    open_order_diff = actual_open_order_count - int(expected_open_order_count or 0)
     actual_net_qty_diff = actual_net_qty - float(expected_actual_net_qty or 0.0)
-    ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9
+    previous_over_10 = int(snapshot.get("open_order_diff_over_10_count", 0) or 0)
+    open_order_diff_over_10_count = previous_over_10 + 1 if abs(open_order_diff) > PROTECTIVE_OPEN_ORDER_DIFF_LIMIT else 0
+    protective_stop_reasons: list[str] = []
+    protective_warning_reasons: list[str] = []
+    stream_age_seconds = stream_position.get("stream_age_seconds") if stream_position is not None else None
+    if stream_age_seconds is not None and _safe_float(stream_age_seconds) > ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS:
+        protective_warning_reasons.append("account_position_stream_stale")
+    if open_order_diff_over_10_count >= PROTECTIVE_OPEN_ORDER_DIFF_CONFIRM_CHECKS:
+        protective_stop_reasons.append("open_order_diff_persistent")
+    ok = abs(open_order_diff) == 0 and abs(actual_net_qty_diff) <= 1e-9 and not protective_stop_reasons
     message_parts: list[str] = []
     if open_order_diff:
         message_parts.append(f"open_orders diff={open_order_diff:+d}")
@@ -1237,15 +2181,43 @@ def _run_periodic_reconcile(
         "cycle": cycle,
         "strategy_mode": strategy_mode,
         "expected_open_order_count": int(expected_open_order_count or 0),
-        "actual_open_order_count": len(current_strategy_open_orders),
-        "total_open_order_count": len(current_open_orders),
+        "actual_open_order_count": actual_open_order_count,
+        "total_open_order_count": total_open_order_count,
+        "open_orders_source": open_orders_source,
+        "open_orders_rest_backfill_performed": open_orders_rest_backfill_performed,
+        "open_orders_rest_last_sync_at": (
+            _isoformat(_utc_now())
+            if open_orders_rest_backfill_performed
+            else snapshot.get("open_orders_rest_last_sync_at")
+        ),
+        "observed_active_open_order_count": int(observed_open_order_state.get("active_order_count", 0) or 0),
+        "observed_active_client_order_ids": list(observed_open_order_state.get("active_client_order_ids", [])),
         "expected_actual_net_qty": float(expected_actual_net_qty or 0.0),
         "actual_actual_net_qty": actual_net_qty,
+        "account_position_source": account_position_source,
+        "account_position_stream_age_seconds": (
+            stream_position.get("stream_age_seconds") if stream_position is not None else None
+        ),
         "open_order_diff": open_order_diff,
+        "open_order_diff_over_10_count": open_order_diff_over_10_count,
         "actual_net_qty_diff": actual_net_qty_diff,
+        "protective_stop_required": bool(protective_stop_reasons),
+        "protective_stop_reasons": protective_stop_reasons,
+        "protective_warning_reasons": protective_warning_reasons,
         "ok": ok,
         "message": "OK" if ok else "; ".join(message_parts),
     }
+    if protective_stop_reasons:
+        if message_parts:
+            snapshot["message"] = f"{snapshot['message']}; protective_stop={','.join(protective_stop_reasons)}"
+        else:
+            snapshot["message"] = f"protective_stop={','.join(protective_stop_reasons)}"
+    elif protective_warning_reasons:
+        snapshot["message"] = (
+            "OK; protective_warning=" + ",".join(protective_warning_reasons)
+            if snapshot["message"] == "OK"
+            else f"{snapshot['message']}; protective_warning={','.join(protective_warning_reasons)}"
+        )
     state["last_reconcile"] = snapshot
     return snapshot
 
@@ -1271,7 +2243,12 @@ def _uses_entry_price_cost_basis(strategy_profile: str | None) -> bool:
         "clusdt_competition_maker_neutral_v1",
         "clusdt_competition_maker_neutral_conservative_v1",
         "ethusdc_um_volume_long_v1",
-    } or normalized_profile.endswith("_competition_neutral_ping_pong_v1")
+        "billusdt_best_quote_maker_volume_reset_v1",
+        "pharosusdt_adaptive_regime_router_v1",
+        "pharosusdt_best_quote_maker_volume_v1",
+    } or normalized_profile.endswith("_competition_neutral_ping_pong_v1") or normalized_profile.endswith(
+        "_neutral_regime_budget_ping_pong_v2"
+    )
 
 
 def _uses_volume_long_v4_staged_delever(strategy_profile: str | None) -> bool:
@@ -1304,6 +2281,10 @@ def _position_cost_basis_price(position: dict[str, Any], *, prefer_entry_price: 
     return 0.0
 
 
+def _position_unrealized_pnl(position: dict[str, Any]) -> float:
+    return _safe_float(position.get("unRealizedProfit", position.get("unrealizedProfit")))
+
+
 def _resolve_adverse_reduce_cost_basis(
     *,
     side: str,
@@ -1318,7 +2299,7 @@ def _resolve_adverse_reduce_cost_basis(
     synthetic_snapshot = synthetic_ledger_snapshot or {}
     normalized_mode = str(requested_strategy_mode or "").strip()
     if normalized_side == "long":
-        if normalized_mode == "hedge_neutral":
+        if _uses_exchange_hedge_position_sides(normalized_mode):
             actual_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
             actual_long_price = _position_cost_basis_price(long_position)
             if actual_long_qty > 1e-12 and actual_long_price > 0:
@@ -1330,7 +2311,7 @@ def _resolve_adverse_reduce_cost_basis(
             return synthetic_long_price, "synthetic_ledger"
         return 0.0, None
 
-    if normalized_mode == "hedge_neutral":
+    if _uses_exchange_hedge_position_sides(normalized_mode):
         actual_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
         actual_short_price = _position_cost_basis_price(short_position)
         if actual_short_qty > 1e-12 and actual_short_price > 0:
@@ -1349,6 +2330,1927 @@ def _order_position_side(order: dict[str, Any]) -> str:
 
 def _order_role(order: dict[str, Any]) -> str:
     return str(order.get("role", "")).lower().strip()
+
+
+BQ_BOOK_NORMAL = "normal_bq"
+BQ_BOOK_FROZEN = "frozen_bq"
+BQ_BOOK_UNKNOWN = "unknown"
+
+
+def _best_quote_order_book_from_role(role: Any) -> str:
+    normalized = str(role or "").lower().strip()
+    if normalized in {
+        "best_quote_entry_long",
+        "best_quote_reduce_long",
+        "best_quote_entry_short",
+        "best_quote_reduce_short",
+    }:
+        return BQ_BOOK_NORMAL
+    if (
+        normalized.startswith("frozen_inventory_manual_reduce_")
+        or normalized.startswith("frozen_inventory_manual_limit_")
+        or normalized.startswith("frozen_inventory_pair_release_")
+    ):
+        return BQ_BOOK_FROZEN
+    return BQ_BOOK_UNKNOWN
+
+
+def _apply_best_quote_entry_inventory_cap_guard(
+    plan: dict[str, Any],
+    *,
+    current_long_notional: float,
+    current_short_notional: float,
+    max_long_notional: float,
+    max_short_notional: float,
+) -> dict[str, Any]:
+    guard = {
+        "enabled": True,
+        "long_over_cap": False,
+        "short_over_cap": False,
+        "current_long_notional": max(_safe_float(current_long_notional), 0.0),
+        "current_short_notional": max(_safe_float(current_short_notional), 0.0),
+        "max_long_notional": max(_safe_float(max_long_notional), 0.0),
+        "max_short_notional": max(_safe_float(max_short_notional), 0.0),
+        "blocked_buy_orders": 0,
+        "blocked_sell_orders": 0,
+        "blocked_buy_order_details": [],
+        "blocked_sell_order_details": [],
+    }
+    long_cap = _safe_float(guard["max_long_notional"])
+    short_cap = _safe_float(guard["max_short_notional"])
+    long_over_cap = long_cap > 0 and _safe_float(guard["current_long_notional"]) >= long_cap - 1e-12
+    short_over_cap = short_cap > 0 and _safe_float(guard["current_short_notional"]) >= short_cap - 1e-12
+    guard["long_over_cap"] = bool(long_over_cap)
+    guard["short_over_cap"] = bool(short_over_cap)
+    if not isinstance(plan, dict):
+        return guard
+    if long_over_cap:
+        kept_buy_orders: list[dict[str, Any]] = []
+        blocked_buy_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("buy_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_long":
+                blocked = dict(item)
+                blocked["block_reason"] = "long_inventory_at_or_above_cap"
+                blocked_buy_orders.append(blocked)
+            else:
+                kept_buy_orders.append(item)
+        plan["buy_orders"] = kept_buy_orders
+        guard["blocked_buy_orders"] = len(blocked_buy_orders)
+        guard["blocked_buy_order_details"] = blocked_buy_orders
+    if short_over_cap:
+        kept_sell_orders: list[dict[str, Any]] = []
+        blocked_sell_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("sell_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_short":
+                blocked = dict(item)
+                blocked["block_reason"] = "short_inventory_at_or_above_cap"
+                blocked_sell_orders.append(blocked)
+            else:
+                kept_sell_orders.append(item)
+        plan["sell_orders"] = kept_sell_orders
+        guard["blocked_sell_orders"] = len(blocked_sell_orders)
+        guard["blocked_sell_order_details"] = blocked_sell_orders
+    return guard
+
+
+def _apply_best_quote_entry_level_guard(
+    plan: dict[str, Any],
+    *,
+    buy_levels: int,
+    sell_levels: int,
+) -> dict[str, Any]:
+    guard = {
+        "enabled": True,
+        "buy_levels": max(int(_safe_float(buy_levels)), 0),
+        "sell_levels": max(int(_safe_float(sell_levels)), 0),
+        "blocked_buy_orders": 0,
+        "blocked_sell_orders": 0,
+        "blocked_buy_order_details": [],
+        "blocked_sell_order_details": [],
+    }
+    if not isinstance(plan, dict):
+        return guard
+    if guard["buy_levels"] <= 0:
+        kept_buy_orders: list[dict[str, Any]] = []
+        blocked_buy_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("buy_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_long":
+                blocked = dict(item)
+                blocked["block_reason"] = "buy_levels_disabled"
+                blocked_buy_orders.append(blocked)
+            else:
+                kept_buy_orders.append(item)
+        plan["buy_orders"] = kept_buy_orders
+        guard["blocked_buy_orders"] = len(blocked_buy_orders)
+        guard["blocked_buy_order_details"] = blocked_buy_orders
+    if guard["sell_levels"] <= 0:
+        kept_sell_orders: list[dict[str, Any]] = []
+        blocked_sell_orders: list[dict[str, Any]] = []
+        for item in list(plan.get("sell_orders") or []):
+            if isinstance(item, dict) and _order_role(item) == "best_quote_entry_short":
+                blocked = dict(item)
+                blocked["block_reason"] = "sell_levels_disabled"
+                blocked_sell_orders.append(blocked)
+            else:
+                kept_sell_orders.append(item)
+        plan["sell_orders"] = kept_sell_orders
+        guard["blocked_sell_orders"] = len(blocked_sell_orders)
+        guard["blocked_sell_order_details"] = blocked_sell_orders
+    return guard
+
+
+def _best_quote_trade_role_from_row(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    explicit_role = str((row or {}).get("role") or "").lower().strip()
+    if explicit_role in {
+        "best_quote_entry_long",
+        "best_quote_reduce_long",
+        "best_quote_entry_short",
+        "best_quote_reduce_short",
+    }:
+        return explicit_role
+    client_order_id = str((row or {}).get("clientOrderId") or (row or {}).get("client_order_id") or "").strip()
+    parts = client_order_id.lower().split("-")
+    if len(parts) < 3 or parts[0] != "gx":
+        return ""
+    compact_role = parts[2].strip()
+    if compact_role not in {"bestquot", "hardloss"}:
+        return ""
+    side = str((row or {}).get("side") or "").upper().strip()
+    position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
+    if compact_role == "hardloss":
+        if side == "SELL" and position_side == "LONG":
+            return "best_quote_reduce_long"
+        if side == "BUY" and position_side == "SHORT":
+            return "best_quote_reduce_short"
+        return ""
+    if side == "BUY" and position_side == "LONG":
+        return "best_quote_entry_long"
+    if side == "SELL" and position_side == "LONG":
+        return "best_quote_reduce_long"
+    if side == "SELL" and position_side == "SHORT":
+        return "best_quote_entry_short"
+    if side == "BUY" and position_side == "SHORT":
+        return "best_quote_reduce_short"
+    return ""
+
+
+def _best_quote_trade_role_from_order_ref(
+    row: Mapping[str, Any] | dict[str, Any],
+    state: Mapping[str, Any] | dict[str, Any],
+) -> str:
+    ref = _best_quote_order_ref_for_trade(row, state)
+    if ref is None:
+        return ""
+    role = str(ref.get("role") or "").lower().strip()
+    if role in {
+        "best_quote_entry_long",
+        "best_quote_reduce_long",
+        "best_quote_entry_short",
+        "best_quote_reduce_short",
+    }:
+        return role
+    side = str((row or {}).get("side") or ref.get("side") or "").upper().strip()
+    position_side = str(
+        (row or {}).get("positionSide") or (row or {}).get("position_side") or ref.get("position_side") or ""
+    ).upper().strip()
+    if side == "BUY" and position_side == "LONG":
+        return "best_quote_entry_long"
+    if side == "SELL" and position_side == "LONG":
+        return "best_quote_reduce_long"
+    if side == "SELL" and position_side == "SHORT":
+        return "best_quote_entry_short"
+    if side == "BUY" and position_side == "SHORT":
+        return "best_quote_reduce_short"
+    return ""
+
+
+def _best_quote_order_ref_for_trade(
+    row: Mapping[str, Any] | dict[str, Any],
+    state: Mapping[str, Any] | dict[str, Any],
+) -> Mapping[str, Any] | None:
+    refs = state.get("best_quote_volume_order_refs") if isinstance(state, Mapping) else None
+    if not isinstance(refs, Mapping):
+        return None
+    order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
+    if not order_id:
+        return None
+    ref = refs.get(order_id)
+    return ref if isinstance(ref, Mapping) else None
+
+
+def _best_quote_trade_book_from_order_ref(
+    row: Mapping[str, Any] | dict[str, Any],
+    state: Mapping[str, Any] | dict[str, Any],
+) -> str:
+    ref = _best_quote_order_ref_for_trade(row, state)
+    if ref is None:
+        return BQ_BOOK_UNKNOWN
+    book = str(ref.get("book") or "").lower().strip()
+    if book in {BQ_BOOK_NORMAL, BQ_BOOK_FROZEN, BQ_BOOK_UNKNOWN}:
+        return book
+    return _best_quote_order_book_from_role(ref.get("role"))
+
+
+def _best_quote_trade_fill_key(row: Mapping[str, Any] | dict[str, Any]) -> str:
+    order_id = str((row or {}).get("orderId") or (row or {}).get("order_id") or "").strip()
+    side = str((row or {}).get("side") or "").upper().strip()
+    position_side = str((row or {}).get("positionSide") or (row or {}).get("position_side") or "").upper().strip()
+    time_ms = trade_row_time_ms(dict(row or {}))
+    qty = _safe_float((row or {}).get("qty"))
+    price = _safe_float((row or {}).get("price"))
+    if order_id and side and position_side and time_ms > 0 and qty > 0 and price > 0:
+        return ":".join(
+            [
+                order_id,
+                side,
+                position_side,
+                str(time_ms),
+                format(Decimal(str(qty)), "f").rstrip("0").rstrip("."),
+                format(Decimal(str(price)), "f").rstrip("0").rstrip("."),
+            ]
+        )
+    return trade_row_key(dict(row or {}))
+
+
+def _normalize_best_quote_volume_lots(raw_lots: Any) -> list[dict[str, Any]]:
+    lots: list[dict[str, Any]] = []
+    if not isinstance(raw_lots, list):
+        return lots
+    for item in raw_lots:
+        if not isinstance(item, dict):
+            continue
+        qty = max(_safe_float(item.get("qty")), 0.0)
+        price = max(_safe_float(item.get("price", item.get("entry_price"))), 0.0)
+        if qty <= 1e-12 or price <= 0:
+            continue
+        lot = dict(item)
+        lot["qty"] = qty
+        lot["price"] = price
+        lots.append(lot)
+    return lots
+
+
+def _best_quote_volume_book_from_lots(lots: list[dict[str, Any]]) -> tuple[float, float]:
+    qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in lots)
+    if qty <= 1e-12:
+        return 0.0, 0.0
+    cost = sum(max(_safe_float(item.get("qty")), 0.0) * max(_safe_float(item.get("price")), 0.0) for item in lots)
+    return qty, cost / qty if qty > 0 else 0.0
+
+
+def _best_quote_volume_consume_fifo(
+    lots: list[dict[str, Any]],
+    qty: float,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], float]:
+    remaining = max(_safe_float(qty), 0.0)
+    updated = [dict(item) for item in lots]
+    consumed: list[dict[str, Any]] = []
+    realized_cost = 0.0
+    while updated and remaining > 1e-12:
+        head = dict(updated[0])
+        head_qty = max(_safe_float(head.get("qty")), 0.0)
+        head_price = max(_safe_float(head.get("price")), 0.0)
+        take_qty = min(head_qty, remaining)
+        if take_qty <= 1e-12 or head_price <= 0:
+            updated.pop(0)
+            continue
+        consumed_lot = dict(head)
+        consumed_lot["qty"] = take_qty
+        consumed_lot["price"] = head_price
+        consumed.append(consumed_lot)
+        realized_cost += take_qty * head_price
+        if head_qty <= remaining + 1e-12:
+            remaining = max(remaining - head_qty, 0.0)
+            updated.pop(0)
+            continue
+        updated[0]["qty"] = head_qty - remaining
+        remaining = 0.0
+    return updated, consumed, realized_cost
+
+
+def _best_quote_volume_ledger_snapshot(
+    ledger: Mapping[str, Any] | dict[str, Any],
+    *,
+    mid_price: float,
+) -> dict[str, Any]:
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    long_lots = _normalize_best_quote_volume_lots((ledger or {}).get("long_lots"))
+    short_lots = _normalize_best_quote_volume_lots((ledger or {}).get("short_lots"))
+    long_qty, long_avg = _best_quote_volume_book_from_lots(long_lots)
+    short_qty, short_avg = _best_quote_volume_book_from_lots(short_lots)
+    long_unrealized = (safe_mid - long_avg) * long_qty if safe_mid > 0 and long_avg > 0 else 0.0
+    short_unrealized = (short_avg - safe_mid) * short_qty if safe_mid > 0 and short_avg > 0 else 0.0
+    return {
+        "initialized": bool((ledger or {}).get("initialized")),
+        "sync_ok": bool((ledger or {}).get("sync_ok", True)),
+        "sync_error": str((ledger or {}).get("sync_error") or ""),
+        "long_qty": long_qty,
+        "long_avg_price": long_avg,
+        "long_notional": long_qty * safe_mid,
+        "long_unrealized_pnl": long_unrealized,
+        "short_qty": short_qty,
+        "short_avg_price": short_avg,
+        "short_notional": short_qty * safe_mid,
+        "short_unrealized_pnl": short_unrealized,
+        "unrealized_pnl": long_unrealized + short_unrealized,
+        "realized_pnl": _safe_float((ledger or {}).get("realized_pnl")),
+        "commission": _safe_float((ledger or {}).get("commission")),
+        "gross_notional": _safe_float((ledger or {}).get("gross_notional")),
+        "applied_trade_count_total": int((ledger or {}).get("applied_trade_count_total") or 0),
+        "last_trade_time_ms": int((ledger or {}).get("last_trade_time_ms") or 0),
+        "last_trade_keys_at_time": list((ledger or {}).get("last_trade_keys_at_time") or []),
+        "last_transfer_at": str((ledger or {}).get("last_transfer_at") or ""),
+        "transfer_shortfall_qty": _safe_float((ledger or {}).get("transfer_shortfall_qty")),
+    }
+
+
+def reset_best_quote_hedge_ledgers_after_exchange_flat(
+    *,
+    state: dict[str, Any],
+    mid_price: float,
+    reason: str,
+) -> dict[str, Any]:
+    now = _utc_now()
+    previous_volume_ledger = dict(state.get("best_quote_volume_ledger") or {})
+    previous_frozen_inventory = dict(state.get("best_quote_frozen_inventory") or {})
+    previous_snapshot = _best_quote_volume_ledger_snapshot(previous_volume_ledger, mid_price=mid_price)
+    reset_report = {
+        "applied": False,
+        "reason": reason,
+        "previous_volume_ledger": previous_snapshot,
+        "previous_frozen_inventory": previous_frozen_inventory,
+    }
+    had_volume_qty = (
+        _safe_float(previous_snapshot.get("long_qty")) > 1e-12
+        or _safe_float(previous_snapshot.get("short_qty")) > 1e-12
+    )
+    had_frozen_qty = any(
+        _safe_float(previous_frozen_inventory.get(key)) > 1e-12
+        for key in ("long_qty", "short_qty", "frozen_long_qty", "frozen_short_qty")
+    )
+    had_directive = any(
+        key in state
+        for key in (
+            "best_quote_frozen_inventory",
+            "best_quote_frozen_inventory_manual_reduce",
+            "best_quote_frozen_inventory_manual_limit",
+            "best_quote_frozen_inventory_pair_release",
+            "runtime_guard_manual_frozen_inventory_override",
+        )
+    )
+    if not had_volume_qty and not had_frozen_qty and not had_directive:
+        return reset_report
+
+    state["best_quote_volume_ledger"] = {
+        "initialized": True,
+        "schema": "best_quote_volume_ledger_v1",
+        "long_lots": [],
+        "short_lots": [],
+        "realized_pnl": _safe_float(previous_volume_ledger.get("realized_pnl")),
+        "commission": _safe_float(previous_volume_ledger.get("commission")),
+        "gross_notional": _safe_float(previous_volume_ledger.get("gross_notional")),
+        "applied_trade_count_total": int(previous_volume_ledger.get("applied_trade_count_total") or 0),
+        "last_trade_time_ms": int(now.timestamp() * 1000),
+        "last_trade_keys_at_time": [],
+        "applied_trade_fill_keys": list(previous_volume_ledger.get("applied_trade_fill_keys") or [])[-10000:],
+        "sync_ok": True,
+        "exchange_flat_resync_at": now.isoformat(),
+        "exchange_flat_resync_reason": reason,
+        "updated_at": now.isoformat(),
+    }
+    for key in (
+        "best_quote_frozen_inventory",
+        "best_quote_frozen_inventory_manual_reduce",
+        "best_quote_frozen_inventory_manual_limit",
+        "best_quote_frozen_inventory_pair_release",
+        "runtime_guard_manual_frozen_inventory_override",
+        "manual_frozen_inventory_override",
+        "manual_frozen_inventory_override_reason",
+    ):
+        state.pop(key, None)
+    reset_report["applied"] = True
+    return reset_report
+
+
+def _hedge_best_quote_exchange_effectively_flat(
+    *,
+    current_long_qty: float,
+    current_short_qty: float,
+    mid_price: float,
+    min_notional: Any,
+) -> bool:
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    flat_notional = max(_safe_float(min_notional), 0.0)
+    if flat_notional <= 0:
+        flat_notional = 5.0
+    return (
+        max(_safe_float(current_long_qty), 0.0) * safe_mid <= flat_notional + 1e-12
+        and max(_safe_float(current_short_qty), 0.0) * safe_mid <= flat_notional + 1e-12
+    )
+
+
+def _hedge_best_quote_position_diff_effectively_dust(
+    *,
+    current_long_qty: float,
+    current_short_qty: float,
+    expected_long_qty: float,
+    expected_short_qty: float,
+    mid_price: float,
+    min_notional: Any,
+) -> bool:
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    dust_notional = max(_safe_float(min_notional), 0.0)
+    if dust_notional <= 0:
+        dust_notional = 5.0
+    long_diff_notional = abs(_safe_float(current_long_qty) - _safe_float(expected_long_qty)) * safe_mid
+    short_diff_notional = abs(_safe_float(current_short_qty) - _safe_float(expected_short_qty)) * safe_mid
+    return long_diff_notional <= dust_notional + 1e-12 and short_diff_notional <= dust_notional + 1e-12
+
+
+def reconcile_best_quote_volume_ledger_surplus(
+    *,
+    state: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+    normal_open_order_count: int = 0,
+    position_reconcile_confirm_cycles: int = 2,
+) -> dict[str, Any]:
+    ledger = dict(state.get("best_quote_volume_ledger") or {})
+    if not bool(ledger.get("initialized")) or not bool(ledger.get("sync_ok", True)):
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    frozen = dict(state.get("best_quote_frozen_inventory") or {})
+    if not frozen:
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    now_iso = _utc_now().isoformat()
+    long_lots = _normalize_best_quote_volume_lots(ledger.get("long_lots"))
+    short_lots = _normalize_best_quote_volume_lots(ledger.get("short_lots"))
+
+    def _remove_exchange_surplus_lots(lots: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], float]:
+        kept: list[dict[str, Any]] = []
+        removed_qty = 0.0
+        for lot in lots:
+            if str(lot.get("source") or "") == "exchange_surplus_reconcile":
+                removed_qty += max(_safe_float(lot.get("qty")), 0.0)
+                continue
+            kept.append(lot)
+        return kept, removed_qty
+
+    long_lots, removed_long_qty = _remove_exchange_surplus_lots(long_lots)
+    short_lots, removed_short_qty = _remove_exchange_surplus_lots(short_lots)
+    if removed_long_qty > 1e-12 or removed_short_qty > 1e-12:
+        ledger["long_lots"] = long_lots
+        ledger["short_lots"] = short_lots
+        ledger["surplus_reconcile_disabled_reason"] = "best_quote_volume_ledger_ignores_exchange_total_position"
+        ledger["surplus_reconcile_removed_long_qty"] = removed_long_qty
+        ledger["surplus_reconcile_removed_short_qty"] = removed_short_qty
+        ledger["surplus_reconcile_at"] = now_iso
+        ledger["updated_at"] = now_iso
+        state["best_quote_volume_ledger"] = ledger
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
+    target_long_qty = max(_safe_float(current_long_qty) - max(frozen_long_qty, 0.0), 0.0)
+    target_short_qty = max(_safe_float(current_short_qty) - max(frozen_short_qty, 0.0), 0.0)
+    current_ledger_long_qty, current_ledger_long_avg = _best_quote_volume_book_from_lots(long_lots)
+    current_ledger_short_qty, current_ledger_short_avg = _best_quote_volume_book_from_lots(short_lots)
+    long_drift = target_long_qty - current_ledger_long_qty
+    short_drift = target_short_qty - current_ledger_short_qty
+    has_position_drift = abs(long_drift) > 1e-9 or abs(short_drift) > 1e-9
+    if has_position_drift and int(normal_open_order_count or 0) > 0:
+        ledger["long_lots"] = long_lots
+        ledger["short_lots"] = short_lots
+        ledger["position_reconcile_deferred_reason"] = "normal_open_orders_active"
+        ledger["position_reconcile_pending_count"] = 0
+        ledger["position_reconcile_target_long_qty"] = target_long_qty
+        ledger["position_reconcile_target_short_qty"] = target_short_qty
+        ledger["position_reconcile_ledger_long_qty"] = current_ledger_long_qty
+        ledger["position_reconcile_ledger_short_qty"] = current_ledger_short_qty
+        ledger["position_reconcile_at"] = now_iso
+        ledger["updated_at"] = now_iso
+        state["best_quote_volume_ledger"] = ledger
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    if has_position_drift:
+        pending_key = "position_reconcile_pending_count"
+        pending_count = int(ledger.get(pending_key) or 0) + 1
+        confirm_cycles = max(int(position_reconcile_confirm_cycles or 1), 1)
+        ledger[pending_key] = pending_count
+        ledger["position_reconcile_deferred_reason"] = "confirming_position_drift"
+        ledger["position_reconcile_target_long_qty"] = target_long_qty
+        ledger["position_reconcile_target_short_qty"] = target_short_qty
+        ledger["position_reconcile_ledger_long_qty"] = current_ledger_long_qty
+        ledger["position_reconcile_ledger_short_qty"] = current_ledger_short_qty
+        ledger["position_reconcile_long_drift_qty"] = long_drift
+        ledger["position_reconcile_short_drift_qty"] = short_drift
+        ledger["position_reconcile_at"] = now_iso
+        if pending_count < confirm_cycles:
+            ledger["long_lots"] = long_lots
+            ledger["short_lots"] = short_lots
+            ledger["updated_at"] = now_iso
+            state["best_quote_volume_ledger"] = ledger
+            return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+        def _reconcile_lots_to_target(
+            lots: list[dict[str, Any]],
+            *,
+            target_qty: float,
+            current_qty: float,
+            current_avg: float,
+            exchange_avg: float,
+            side: str,
+        ) -> tuple[list[dict[str, Any]], float, float]:
+            drift = target_qty - current_qty
+            added_qty = 0.0
+            removed_qty = 0.0
+            if drift > 1e-9:
+                price = max(current_avg, _safe_float(exchange_avg), _safe_float(mid_price), 0.0)
+                if price > 0:
+                    lots = list(lots) + [
+                        {
+                            "qty": drift,
+                            "price": price,
+                            "source": "exchange_minus_frozen_position_reconcile",
+                            "side": side,
+                            "opened_at": now_iso,
+                        }
+                    ]
+                    added_qty = drift
+            elif drift < -1e-9:
+                lots, _, _ = _best_quote_volume_consume_fifo(lots, -drift)
+                removed_qty = -drift
+            return lots, added_qty, removed_qty
+
+        long_lots, added_long_qty, reconciled_removed_long_qty = _reconcile_lots_to_target(
+            long_lots,
+            target_qty=target_long_qty,
+            current_qty=current_ledger_long_qty,
+            current_avg=current_ledger_long_avg,
+            exchange_avg=current_long_avg_price,
+            side="LONG",
+        )
+        short_lots, added_short_qty, reconciled_removed_short_qty = _reconcile_lots_to_target(
+            short_lots,
+            target_qty=target_short_qty,
+            current_qty=current_ledger_short_qty,
+            current_avg=current_ledger_short_avg,
+            exchange_avg=current_short_avg_price,
+            side="SHORT",
+        )
+        ledger["position_reconcile_pending_count"] = 0
+        ledger["position_reconcile_deferred_reason"] = ""
+        ledger["position_reconcile_added_long_qty"] = added_long_qty
+        ledger["position_reconcile_added_short_qty"] = added_short_qty
+        ledger["position_reconcile_removed_long_qty"] = reconciled_removed_long_qty
+        ledger["position_reconcile_removed_short_qty"] = reconciled_removed_short_qty
+    else:
+        ledger["position_reconcile_pending_count"] = 0
+        ledger["position_reconcile_deferred_reason"] = ""
+
+    if not has_position_drift:
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    ledger["long_lots"] = long_lots
+    ledger["short_lots"] = short_lots
+    ledger["position_reconcile_source"] = "exchange_minus_frozen_position"
+    ledger["position_reconcile_completed_at"] = now_iso
+    ledger["updated_at"] = now_iso
+    state["best_quote_volume_ledger"] = ledger
+    return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+
+def sync_best_quote_volume_ledger(
+    *,
+    state: dict[str, Any],
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+    observed_trade_rows: list[dict[str, Any]] | None = None,
+    allow_exchange_position_bootstrap: bool = True,
+) -> dict[str, Any]:
+    ledger = dict(state.get("best_quote_volume_ledger") or {})
+    now = _utc_now()
+    if not bool(ledger.get("initialized")):
+        long_lots = []
+        short_lots = []
+        if (
+            allow_exchange_position_bootstrap
+            and _safe_float(current_long_qty) > 1e-12
+            and _safe_float(current_long_avg_price) > 0
+        ):
+            long_lots.append(
+                {
+                    "qty": max(_safe_float(current_long_qty), 0.0),
+                    "price": max(_safe_float(current_long_avg_price), 0.0),
+                    "source": "bootstrap_from_exchange_managed_position",
+                    "opened_at": now.isoformat(),
+                }
+            )
+        if (
+            allow_exchange_position_bootstrap
+            and _safe_float(current_short_qty) > 1e-12
+            and _safe_float(current_short_avg_price) > 0
+        ):
+            short_lots.append(
+                {
+                    "qty": max(_safe_float(current_short_qty), 0.0),
+                    "price": max(_safe_float(current_short_avg_price), 0.0),
+                    "source": "bootstrap_from_exchange_managed_position",
+                    "opened_at": now.isoformat(),
+                }
+            )
+        ledger.update(
+            {
+                "initialized": True,
+                "schema": "best_quote_volume_ledger_v1",
+                "long_lots": long_lots,
+                "short_lots": short_lots,
+                "realized_pnl": _safe_float(ledger.get("realized_pnl")),
+                "commission": _safe_float(ledger.get("commission")),
+                "gross_notional": _safe_float(ledger.get("gross_notional")),
+                "applied_trade_count_total": int(ledger.get("applied_trade_count_total") or 0),
+                "last_trade_time_ms": int(now.timestamp() * 1000),
+                "last_trade_keys_at_time": [],
+                "sync_ok": True,
+                "bootstrap_at": now.isoformat(),
+                "bootstrap_source": (
+                    "exchange_managed_position"
+                    if allow_exchange_position_bootstrap
+                    else "empty_due_to_reduce_freeze_isolation"
+                ),
+                "exchange_position_bootstrap_allowed": bool(allow_exchange_position_bootstrap),
+                "exchange_position_bootstrap_blocked_long_qty": (
+                    0.0 if allow_exchange_position_bootstrap else max(_safe_float(current_long_qty), 0.0)
+                ),
+                "exchange_position_bootstrap_blocked_short_qty": (
+                    0.0 if allow_exchange_position_bootstrap else max(_safe_float(current_short_qty), 0.0)
+                ),
+            }
+        )
+        state["best_quote_volume_ledger"] = ledger
+        return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    long_lots = _normalize_best_quote_volume_lots(ledger.get("long_lots"))
+    short_lots = _normalize_best_quote_volume_lots(ledger.get("short_lots"))
+    last_time_ms = int(ledger.get("last_trade_time_ms") or 0)
+    rows = [dict(row) for row in list(observed_trade_rows or []) if isinstance(row, dict)]
+    now_ms = int(now.timestamp() * 1000)
+    rest_last_sync_ms = int(ledger.get("rest_last_sync_at_ms") or 0)
+    should_rest_sync = rest_last_sync_ms <= 0 or now_ms - rest_last_sync_ms >= 30_000 or not rows
+    if should_rest_sync:
+        try:
+            rows.extend(
+                _fetch_trade_rows_since(
+                    symbol=symbol,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    start_time_ms=last_time_ms,
+                    recv_window=recv_window,
+                )
+            )
+            ledger["rest_last_sync_at_ms"] = now_ms
+        except Exception as exc:
+            ledger["sync_ok"] = False
+            ledger["sync_error"] = f"{type(exc).__name__}: {exc}"
+            state["best_quote_volume_ledger"] = ledger
+            return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+    fresh_rows, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
+        rows=rows,
+        last_time_ms=last_time_ms or None,
+        last_keys_at_time=list(ledger.get("last_trade_keys_at_time", [])),
+        row_time_ms=trade_row_time_ms,
+        row_key=trade_row_key,
+    )
+    applied_fill_keys = [
+        str(item).strip()
+        for item in list(ledger.get("applied_trade_fill_keys") or [])
+        if str(item).strip()
+    ]
+    applied_fill_key_set = set(applied_fill_keys)
+    applied = 0
+    unmatched = 0
+    skipped_frozen = 0
+    unknown_book = 0
+    realized_delta = 0.0
+    commission_delta = 0.0
+    gross_delta = 0.0
+    for row in fresh_rows:
+        fill_key = _best_quote_trade_fill_key(row)
+        if fill_key and fill_key in applied_fill_key_set:
+            continue
+        order_ref = _best_quote_order_ref_for_trade(row, state)
+        if order_ref is not None:
+            book = _best_quote_trade_book_from_order_ref(row, state)
+            if book == BQ_BOOK_FROZEN:
+                skipped_frozen += 1
+                continue
+            if book != BQ_BOOK_NORMAL:
+                unknown_book += 1
+                continue
+            role = _best_quote_trade_role_from_order_ref(row, state)
+        else:
+            role = _best_quote_trade_role_from_row(row)
+        if not role:
+            compact = str(row.get("clientOrderId") or row.get("client_order_id") or "").lower().split("-")
+            if len(compact) >= 3 and compact[2] == "bestquot":
+                unmatched += 1
+            continue
+        qty = max(_safe_float(row.get("qty")), 0.0)
+        price = max(_safe_float(row.get("price")), 0.0)
+        if qty <= 1e-12 or price <= 0:
+            unmatched += 1
+            continue
+        gross_delta += max(_safe_float(row.get("quoteQty")), qty * price)
+        commission_delta += _safe_float(row.get("commission"))
+        opened_at = datetime.fromtimestamp(max(trade_row_time_ms(row), 0) / 1000, tz=timezone.utc).isoformat()
+        lot = {
+            "qty": qty,
+            "price": price,
+            "source": "trade_fill",
+            "role": role,
+            "order_id": row.get("orderId"),
+            "client_order_id": row.get("clientOrderId") or row.get("client_order_id"),
+            "opened_at": opened_at,
+        }
+        if role == "best_quote_entry_long":
+            long_lots.append(lot)
+        elif role == "best_quote_entry_short":
+            short_lots.append(lot)
+        elif role == "best_quote_reduce_long":
+            long_lots, _, realized_cost = _best_quote_volume_consume_fifo(long_lots, qty)
+            realized_delta += qty * price - realized_cost
+        elif role == "best_quote_reduce_short":
+            short_lots, _, realized_cost = _best_quote_volume_consume_fifo(short_lots, qty)
+            realized_delta += realized_cost - qty * price
+        applied += 1
+        if fill_key:
+            applied_fill_keys.append(fill_key)
+            applied_fill_key_set.add(fill_key)
+
+    ledger["long_lots"] = long_lots
+    ledger["short_lots"] = short_lots
+    ledger["realized_pnl"] = _safe_float(ledger.get("realized_pnl")) + realized_delta
+    ledger["commission"] = _safe_float(ledger.get("commission")) + commission_delta
+    ledger["gross_notional"] = _safe_float(ledger.get("gross_notional")) + gross_delta
+    ledger["applied_trade_count_total"] = int(ledger.get("applied_trade_count_total") or 0) + applied
+    ledger["last_applied_trade_count"] = applied
+    ledger["last_unmatched_trade_count"] = unmatched
+    ledger["last_skipped_frozen_trade_count"] = skipped_frozen
+    ledger["last_unknown_trade_count"] = unknown_book
+    ledger["last_trade_time_ms"] = int(trade_last_time_ms or last_time_ms or 0)
+    ledger["last_trade_keys_at_time"] = list(trade_keys_at_time)
+    ledger["applied_trade_fill_keys"] = applied_fill_keys[-10000:]
+    ledger["updated_at"] = now.isoformat()
+    ledger["sync_ok"] = True
+    ledger.pop("sync_error", None)
+    state["best_quote_volume_ledger"] = ledger
+    return _best_quote_volume_ledger_snapshot(ledger, mid_price=mid_price)
+
+
+def _transfer_best_quote_volume_to_frozen(
+    *,
+    state: dict[str, Any],
+    side: str,
+    qty: float,
+    reason: str,
+    loss_ratio: float,
+) -> dict[str, Any]:
+    normalized_side = str(side or "").lower().strip()
+    ledger = dict(state.get("best_quote_volume_ledger") or {})
+    frozen = dict(state.get("best_quote_frozen_inventory") or {})
+    source_key = "long_lots" if normalized_side == "long" else "short_lots"
+    source_lots = _normalize_best_quote_volume_lots(ledger.get(source_key))
+    remaining_lots, consumed_lots, _ = _best_quote_volume_consume_fifo(source_lots, qty)
+    transfer_qty = sum(_safe_float(item.get("qty")) for item in consumed_lots)
+    now_iso = _utc_now().isoformat()
+    frozen_lots = list(frozen.get(source_key) or [])
+    for item in consumed_lots:
+        frozen_lot = {
+            "qty": _safe_float(item.get("qty")),
+            "entry_price": _safe_float(item.get("price")),
+            "frozen_at": now_iso,
+            "reason": reason,
+            "loss_ratio": max(_safe_float(loss_ratio), 0.0),
+            "source": "bq_volume_ledger_transfer",
+            "source_order_id": item.get("order_id"),
+            "source_client_order_id": item.get("client_order_id"),
+            "source_opened_at": item.get("opened_at"),
+        }
+        frozen_lots.append(frozen_lot)
+    ledger[source_key] = remaining_lots
+    ledger["last_transfer_at"] = now_iso
+    ledger["last_transfer_side"] = normalized_side
+    ledger["last_transfer_qty"] = transfer_qty
+    ledger["transfer_shortfall_qty"] = max(_safe_float(qty) - transfer_qty, 0.0)
+    ledger["sync_ok"] = ledger.get("sync_ok", True) and ledger["transfer_shortfall_qty"] <= 1e-12
+    if ledger["transfer_shortfall_qty"] > 1e-12:
+        ledger["sync_error"] = "bq_volume_ledger_transfer_shortfall"
+    frozen[source_key] = frozen_lots
+    frozen["updated_at"] = now_iso
+    state["best_quote_volume_ledger"] = ledger
+    state["best_quote_frozen_inventory"] = frozen
+    return {
+        "side": normalized_side.upper(),
+        "requested_qty": max(_safe_float(qty), 0.0),
+        "transferred_qty": transfer_qty,
+        "shortfall_qty": max(_safe_float(qty) - transfer_qty, 0.0),
+        "lot_count": len(consumed_lots),
+    }
+
+
+def _best_quote_reduce_freeze_report(
+    *,
+    state: dict[str, Any],
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+    bq_ledger_report: dict[str, Any] | None = None,
+    position_long_qty: float | None = None,
+    position_short_qty: float | None = None,
+) -> dict[str, Any]:
+    ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    effective_position_long_qty = max(
+        _safe_float(current_long_qty if position_long_qty is None else position_long_qty),
+        0.0,
+    )
+    effective_position_short_qty = max(
+        _safe_float(current_short_qty if position_short_qty is None else position_short_qty),
+        0.0,
+    )
+
+    def _normalized_lots(side: str, current_qty: float, fallback_entry: float) -> list[dict[str, Any]]:
+        raw_lots = ledger.get(f"{side}_lots")
+        source_lots = list(raw_lots) if isinstance(raw_lots, list) else []
+        if not source_lots and _safe_float(ledger.get(f"{side}_qty")) > 0:
+            source_lots = [
+                {
+                    "qty": _safe_float(ledger.get(f"{side}_qty")),
+                    "entry_price": _safe_float(ledger.get(f"{side}_entry_price")) or _safe_float(fallback_entry),
+                    "frozen_at": str(ledger.get(f"{side}_frozen_at") or ""),
+                    "source": "legacy_aggregate",
+                }
+            ]
+        remaining = max(_safe_float(current_qty), 0.0)
+        normalized: list[dict[str, Any]] = []
+        for raw_lot in source_lots:
+            if not isinstance(raw_lot, dict) or remaining <= 1e-12:
+                break
+            qty = min(max(_safe_float(raw_lot.get("qty")), 0.0), remaining)
+            if qty <= 1e-12:
+                continue
+            entry_price = _safe_float(raw_lot.get("entry_price")) or _safe_float(fallback_entry)
+            lot = dict(raw_lot)
+            lot["qty"] = qty
+            lot["entry_price"] = max(entry_price, 0.0)
+            lot["notional"] = qty * safe_mid
+            normalized.append(lot)
+            remaining -= qty
+        return normalized
+
+    long_lots = _normalized_lots("long", effective_position_long_qty, current_long_avg_price)
+    short_lots = _normalized_lots("short", effective_position_short_qty, current_short_avg_price)
+    long_qty = sum(_safe_float(lot.get("qty")) for lot in long_lots)
+    short_qty = sum(_safe_float(lot.get("qty")) for lot in short_lots)
+    long_manual_limit_isolated_qty = min(
+        max(_safe_float(ledger.get("long_manual_limit_isolated_qty")), 0.0),
+        long_qty,
+    )
+    short_manual_limit_isolated_qty = min(
+        max(_safe_float(ledger.get("short_manual_limit_isolated_qty")), 0.0),
+        short_qty,
+    )
+    long_notional = long_qty * max(_safe_float(mid_price), 0.0)
+    short_notional = short_qty * max(_safe_float(mid_price), 0.0)
+    pair_eligible_long_qty = max(long_qty - long_manual_limit_isolated_qty, 0.0)
+    pair_eligible_short_qty = max(short_qty - short_manual_limit_isolated_qty, 0.0)
+    offset_qty = min(pair_eligible_long_qty, pair_eligible_short_qty)
+    offset_notional = offset_qty * max(_safe_float(mid_price), 0.0)
+    if long_qty > 0 or short_qty > 0 or ledger:
+        ledger.update(
+            {
+                "long_qty": long_qty,
+                "short_qty": short_qty,
+                "long_notional": long_notional,
+                "short_notional": short_notional,
+                "long_manual_limit_isolated_qty": long_manual_limit_isolated_qty,
+                "short_manual_limit_isolated_qty": short_manual_limit_isolated_qty,
+                "pair_eligible_long_qty": pair_eligible_long_qty,
+                "pair_eligible_short_qty": pair_eligible_short_qty,
+                "long_lots": long_lots,
+                "short_lots": short_lots,
+                "offset_qty": offset_qty,
+                "offset_notional": offset_notional,
+                "updated_at": _utc_now().isoformat(),
+            }
+        )
+        state["best_quote_frozen_inventory"] = ledger
+    else:
+        state.pop("best_quote_frozen_inventory", None)
+    actual_long_unrealized = (
+        (safe_mid - _safe_float(current_long_avg_price)) * effective_position_long_qty
+        if safe_mid > 0 and _safe_float(current_long_avg_price) > 0
+        else 0.0
+    )
+    actual_short_unrealized = (
+        (_safe_float(current_short_avg_price) - safe_mid) * effective_position_short_qty
+        if safe_mid > 0 and _safe_float(current_short_avg_price) > 0
+        else 0.0
+    )
+    frozen_long_unrealized = sum(
+        (safe_mid - _safe_float(lot.get("entry_price"))) * _safe_float(lot.get("qty"))
+        for lot in long_lots
+        if safe_mid > 0 and _safe_float(lot.get("entry_price")) > 0
+    )
+    frozen_short_unrealized = sum(
+        (_safe_float(lot.get("entry_price")) - safe_mid) * _safe_float(lot.get("qty"))
+        for lot in short_lots
+        if safe_mid > 0 and _safe_float(lot.get("entry_price")) > 0
+    )
+    managed_long_unrealized = actual_long_unrealized - frozen_long_unrealized
+    managed_short_unrealized = actual_short_unrealized - frozen_short_unrealized
+    actual_unrealized = actual_long_unrealized + actual_short_unrealized
+    frozen_unrealized = frozen_long_unrealized + frozen_short_unrealized
+    managed_unrealized = managed_long_unrealized + managed_short_unrealized
+    managed_long_qty = max(effective_position_long_qty - long_qty, 0.0)
+    managed_short_qty = max(effective_position_short_qty - short_qty, 0.0)
+    managed_long_avg_price = (
+        max(safe_mid - (managed_long_unrealized / managed_long_qty), 0.0)
+        if safe_mid > 0 and managed_long_qty > 1e-12
+        else 0.0
+    )
+    managed_short_avg_price = (
+        max(safe_mid + (managed_short_unrealized / managed_short_qty), 0.0)
+        if safe_mid > 0 and managed_short_qty > 1e-12
+        else 0.0
+    )
+    managed_source = "exchange_minus_frozen_inventory"
+    if isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized")):
+        managed_source = "best_quote_volume_ledger"
+        managed_long_qty = max(_safe_float(bq_ledger_report.get("long_qty")), 0.0)
+        managed_short_qty = max(_safe_float(bq_ledger_report.get("short_qty")), 0.0)
+        managed_long_avg_price = max(_safe_float(bq_ledger_report.get("long_avg_price")), 0.0)
+        managed_short_avg_price = max(_safe_float(bq_ledger_report.get("short_avg_price")), 0.0)
+        managed_long_unrealized = _safe_float(bq_ledger_report.get("long_unrealized_pnl"))
+        managed_short_unrealized = _safe_float(bq_ledger_report.get("short_unrealized_pnl"))
+        managed_unrealized = _safe_float(bq_ledger_report.get("unrealized_pnl"))
+    return {
+        "enabled": False,
+        "applied": False,
+        "events": [],
+        "threshold_loss_ratio": 0.0,
+        "min_notional": 0.0,
+        "current_long_unrealized_ratio": (
+            (_safe_float(mid_price) - _safe_float(current_long_avg_price)) / _safe_float(current_long_avg_price)
+            if _safe_float(mid_price) > 0 and _safe_float(current_long_avg_price) > 0
+            else None
+        ),
+        "current_short_unrealized_ratio": (
+            (_safe_float(current_short_avg_price) - _safe_float(mid_price)) / _safe_float(current_short_avg_price)
+            if _safe_float(mid_price) > 0 and _safe_float(current_short_avg_price) > 0
+            else None
+        ),
+        "frozen_long_qty": long_qty,
+        "frozen_short_qty": short_qty,
+        "frozen_long_notional": long_notional,
+        "frozen_short_notional": short_notional,
+        "frozen_long_manual_limit_isolated_qty": long_manual_limit_isolated_qty,
+        "frozen_short_manual_limit_isolated_qty": short_manual_limit_isolated_qty,
+        "frozen_pair_eligible_long_qty": pair_eligible_long_qty,
+        "frozen_pair_eligible_short_qty": pair_eligible_short_qty,
+        "frozen_long_unrealized_pnl": frozen_long_unrealized,
+        "frozen_short_unrealized_pnl": frozen_short_unrealized,
+        "frozen_unrealized_pnl": frozen_unrealized,
+        "offset_qty": offset_qty,
+        "offset_notional": offset_notional,
+        "managed_long_qty": managed_long_qty,
+        "managed_short_qty": managed_short_qty,
+        "managed_long_notional": managed_long_qty * safe_mid,
+        "managed_short_notional": managed_short_qty * safe_mid,
+        "managed_long_avg_price": managed_long_avg_price,
+        "managed_short_avg_price": managed_short_avg_price,
+        "managed_long_unrealized_pnl": managed_long_unrealized,
+        "managed_short_unrealized_pnl": managed_short_unrealized,
+        "managed_unrealized_pnl": managed_unrealized,
+        "managed_source": managed_source,
+        "volume_ledger": dict(bq_ledger_report or {}),
+        "position_long_qty": effective_position_long_qty,
+        "position_short_qty": effective_position_short_qty,
+        "actual_unrealized_pnl": actual_unrealized,
+        "strategy_unrealized_pnl": managed_unrealized,
+        "isolates_risk_metrics": bool(long_qty > 0 or short_qty > 0),
+        "ledger": dict(ledger) if ledger else {},
+    }
+
+
+def _apply_best_quote_reduce_freeze(
+    *,
+    state: dict[str, Any],
+    plan: dict[str, Any],
+    report: dict[str, Any],
+    enabled: bool,
+    threshold_loss_ratio: float,
+    min_notional: float,
+    confirm_cycles: int = 1,
+    hard_loss_ratio: float = 0.0,
+    hard_min_notional: float = 0.0,
+    hard_confirm_cycles: int = 0,
+    stress_loss_ratio: float = 0.0,
+    stress_active: bool = False,
+    dynamic_threshold_enabled: bool = False,
+    dynamic_threshold_loss_ratio_scale: float = 0.0,
+    dynamic_threshold_max_extra_ratio: float = 0.0,
+    dynamic_threshold_frozen_notional_start: float = 0.0,
+    dynamic_threshold_frozen_notional_full: float = 0.0,
+    current_long_qty: float,
+    current_short_qty: float,
+    current_long_avg_price: float,
+    current_short_avg_price: float,
+    mid_price: float,
+    bq_ledger_report: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    report = dict(report)
+    report["enabled"] = bool(enabled)
+    report["threshold_loss_ratio"] = max(_safe_float(threshold_loss_ratio), 0.0)
+    report["min_notional"] = max(_safe_float(min_notional), 0.0)
+    report["confirm_cycles"] = max(int(confirm_cycles), 1)
+    report["hard_loss_ratio"] = max(_safe_float(hard_loss_ratio), 0.0)
+    report["hard_min_notional"] = max(_safe_float(hard_min_notional), 0.0)
+    report["hard_confirm_cycles"] = max(int(hard_confirm_cycles), 0)
+    report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
+    report["stress_active"] = bool(stress_active)
+    dynamic_threshold_scale = max(_safe_float(dynamic_threshold_loss_ratio_scale), 0.0)
+    dynamic_threshold_max_extra = max(_safe_float(dynamic_threshold_max_extra_ratio), 0.0)
+    dynamic_threshold_frozen_start = max(_safe_float(dynamic_threshold_frozen_notional_start), 0.0)
+    dynamic_threshold_frozen_full = max(_safe_float(dynamic_threshold_frozen_notional_full), 0.0)
+    dynamic_threshold_active = bool(dynamic_threshold_enabled) and dynamic_threshold_scale > 0
+    report["dynamic_threshold"] = {
+        "enabled": bool(dynamic_threshold_enabled),
+        "active": dynamic_threshold_active,
+        "loss_ratio_scale": dynamic_threshold_scale,
+        "max_extra_ratio": dynamic_threshold_max_extra,
+        "frozen_notional_start": dynamic_threshold_frozen_start,
+        "frozen_notional_full": dynamic_threshold_frozen_full,
+        "long_frozen_pressure": 0.0,
+        "short_frozen_pressure": 0.0,
+        "long_extra_ratio": 0.0,
+        "short_extra_ratio": 0.0,
+    }
+    if (
+        not enabled
+        or (report["threshold_loss_ratio"] <= 0 and report["hard_loss_ratio"] <= 0)
+        or _safe_float(mid_price) <= 0
+    ):
+        state.pop("best_quote_reduce_freeze_confirmation", None)
+        report["managed_long_qty"] = max(_safe_float(current_long_qty), 0.0)
+        report["managed_short_qty"] = max(_safe_float(current_short_qty), 0.0)
+        return report
+
+    reduce_long_planned = any(
+        isinstance(item, dict) and _order_role(item) == "best_quote_reduce_long"
+        for item in list(plan.get("sell_orders") or [])
+    )
+    reduce_short_planned = any(
+        isinstance(item, dict) and _order_role(item) == "best_quote_reduce_short"
+        for item in list(plan.get("buy_orders") or [])
+    )
+    events = list(report.get("events") or [])
+    confirmations = dict(state.get("best_quote_reduce_freeze_confirmation") or {})
+    min_notional_value = _safe_float(report["min_notional"])
+
+    long_loss_ratio = 0.0
+    if _safe_float(current_long_avg_price) > 0:
+        long_loss_ratio = max((_safe_float(current_long_avg_price) - _safe_float(mid_price)) / _safe_float(current_long_avg_price), 0.0)
+    short_loss_ratio = 0.0
+    if _safe_float(current_short_avg_price) > 0:
+        short_loss_ratio = max((_safe_float(mid_price) - _safe_float(current_short_avg_price)) / _safe_float(current_short_avg_price), 0.0)
+
+    long_notional = max(_safe_float(current_long_qty), 0.0) * _safe_float(mid_price)
+    short_notional = max(_safe_float(current_short_qty), 0.0) * _safe_float(mid_price)
+    threshold = _safe_float(report["threshold_loss_ratio"])
+    effective_threshold = threshold
+    if bool(stress_active):
+        effective_threshold = max(threshold, _safe_float(stress_loss_ratio))
+    report["effective_threshold_loss_ratio"] = effective_threshold
+    hard_freeze_enabled = _safe_float(report["hard_loss_ratio"]) > 0
+    def _frozen_pressure(side: str) -> float:
+        frozen_notional = (
+            _safe_float(report.get("frozen_long_notional"))
+            if str(side).upper() == "LONG"
+            else _safe_float(report.get("frozen_short_notional"))
+        )
+        if dynamic_threshold_frozen_full <= dynamic_threshold_frozen_start:
+            return 1.0 if frozen_notional > 0 else 0.0
+        raw_pressure = (
+            (frozen_notional - dynamic_threshold_frozen_start)
+            / (dynamic_threshold_frozen_full - dynamic_threshold_frozen_start)
+        )
+        return min(max(raw_pressure, 0.0), 1.0)
+
+    def _dynamic_freeze_threshold(side: str, side_loss_ratio: float) -> tuple[float, float, float]:
+        extra = 0.0
+        pressure = _frozen_pressure(side)
+        if dynamic_threshold_active and pressure > 0:
+            if dynamic_threshold_max_extra > 0:
+                extra = dynamic_threshold_max_extra * dynamic_threshold_scale * pressure
+            elif side_loss_ratio > 0:
+                extra = max(side_loss_ratio, 0.0) * dynamic_threshold_scale * pressure
+            if dynamic_threshold_max_extra > 0:
+                extra = min(extra, dynamic_threshold_max_extra)
+        return effective_threshold + extra, extra, pressure
+
+    long_freeze_threshold, long_dynamic_extra, long_frozen_pressure = _dynamic_freeze_threshold("LONG", long_loss_ratio)
+    short_freeze_threshold, short_dynamic_extra, short_frozen_pressure = _dynamic_freeze_threshold(
+        "SHORT", short_loss_ratio
+    )
+    report["dynamic_threshold"].update(
+        {
+            "long_loss_ratio": long_loss_ratio,
+            "short_loss_ratio": short_loss_ratio,
+            "long_frozen_pressure": long_frozen_pressure,
+            "short_frozen_pressure": short_frozen_pressure,
+            "long_extra_ratio": long_dynamic_extra,
+            "short_extra_ratio": short_dynamic_extra,
+        }
+    )
+    freeze_min_notional = min_notional_value
+    freeze_confirm_cycles = max(int(confirm_cycles), 1)
+    freeze_reason = "reduce_loss_ratio_threshold"
+    if hard_freeze_enabled:
+        long_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), long_freeze_threshold)
+        short_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), short_freeze_threshold)
+        freeze_min_notional = _safe_float(report["hard_min_notional"]) or min_notional_value
+        freeze_confirm_cycles = max(int(report["hard_confirm_cycles"] or confirm_cycles), 1)
+        freeze_reason = "reduce_hard_loss_threshold"
+    freeze_threshold = max(long_freeze_threshold, short_freeze_threshold)
+    report["hard_freeze_enabled"] = bool(hard_freeze_enabled)
+    report["freeze_threshold_loss_ratio"] = freeze_threshold
+    report["long_freeze_threshold_loss_ratio"] = long_freeze_threshold
+    report["short_freeze_threshold_loss_ratio"] = short_freeze_threshold
+    report["freeze_min_notional"] = freeze_min_notional
+    report["freeze_confirm_cycles"] = freeze_confirm_cycles
+    actual_long_loss_ratio = long_loss_ratio
+    actual_short_loss_ratio = short_loss_ratio
+    frozen_long_qty = _safe_float(report.get("frozen_long_qty"))
+    frozen_short_qty = _safe_float(report.get("frozen_short_qty"))
+    if isinstance(bq_ledger_report, dict) and bool(bq_ledger_report.get("initialized")):
+        managed_long_qty = max(_safe_float(bq_ledger_report.get("long_qty")), 0.0)
+        managed_short_qty = max(_safe_float(bq_ledger_report.get("short_qty")), 0.0)
+        current_long_avg_price = max(_safe_float(bq_ledger_report.get("long_avg_price")), 0.0)
+        current_short_avg_price = max(_safe_float(bq_ledger_report.get("short_avg_price")), 0.0)
+    else:
+        managed_long_qty = max(_safe_float(current_long_qty) - frozen_long_qty, 0.0)
+        managed_short_qty = max(_safe_float(current_short_qty) - frozen_short_qty, 0.0)
+    managed_long_notional = managed_long_qty * _safe_float(mid_price)
+    managed_short_notional = managed_short_qty * _safe_float(mid_price)
+    long_loss_ratio = 0.0
+    if _safe_float(current_long_avg_price) > 0:
+        long_loss_ratio = max(
+            (_safe_float(current_long_avg_price) - _safe_float(mid_price)) / _safe_float(current_long_avg_price),
+            0.0,
+        )
+    short_loss_ratio = 0.0
+    if _safe_float(current_short_avg_price) > 0:
+        short_loss_ratio = max(
+            (_safe_float(mid_price) - _safe_float(current_short_avg_price)) / _safe_float(current_short_avg_price),
+            0.0,
+        )
+    long_freeze_threshold, long_dynamic_extra, long_frozen_pressure = _dynamic_freeze_threshold("LONG", long_loss_ratio)
+    short_freeze_threshold, short_dynamic_extra, short_frozen_pressure = _dynamic_freeze_threshold(
+        "SHORT", short_loss_ratio
+    )
+    if hard_freeze_enabled:
+        long_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), long_freeze_threshold)
+        short_freeze_threshold = max(_safe_float(report["hard_loss_ratio"]), short_freeze_threshold)
+    freeze_threshold = max(long_freeze_threshold, short_freeze_threshold)
+    report["freeze_threshold_loss_ratio"] = freeze_threshold
+    report["long_freeze_threshold_loss_ratio"] = long_freeze_threshold
+    report["short_freeze_threshold_loss_ratio"] = short_freeze_threshold
+    report["actual_long_loss_ratio"] = actual_long_loss_ratio
+    report["actual_short_loss_ratio"] = actual_short_loss_ratio
+    report["managed_long_loss_ratio"] = long_loss_ratio
+    report["managed_short_loss_ratio"] = short_loss_ratio
+    report["dynamic_threshold"].update(
+        {
+            "long_loss_ratio": long_loss_ratio,
+            "short_loss_ratio": short_loss_ratio,
+            "actual_long_loss_ratio": actual_long_loss_ratio,
+            "actual_short_loss_ratio": actual_short_loss_ratio,
+            "long_frozen_pressure": long_frozen_pressure,
+            "short_frozen_pressure": short_frozen_pressure,
+            "long_extra_ratio": long_dynamic_extra,
+            "short_extra_ratio": short_dynamic_extra,
+        }
+    )
+    protected_candidates: list[dict[str, Any]] = []
+
+    def _side_freeze_threshold(side: str) -> float:
+        return long_freeze_threshold if str(side).upper() == "LONG" else short_freeze_threshold
+
+    def _record_protected(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> None:
+        if not hard_freeze_enabled:
+            return
+        side_threshold = _side_freeze_threshold(side)
+        if not reduce_planned or qty <= 1e-12 or notional < min_notional_value or loss_ratio < effective_threshold:
+            return
+        if notional >= freeze_min_notional and loss_ratio >= side_threshold:
+            return
+        protected_candidates.append(
+            {
+                "side": side.upper(),
+                "qty": qty,
+                "notional": notional,
+                "loss_ratio": loss_ratio,
+                "protective_threshold_loss_ratio": effective_threshold,
+                "freeze_threshold_loss_ratio": side_threshold,
+                "freeze_min_notional": freeze_min_notional,
+            }
+        )
+
+    def _confirmed(side: str, qty: float, loss_ratio: float, notional: float, reduce_planned: bool) -> bool:
+        side_key = side.lower()
+        side_threshold = _side_freeze_threshold(side)
+        if not reduce_planned or notional < freeze_min_notional or qty <= 1e-12 or loss_ratio < side_threshold:
+            confirmations.pop(side_key, None)
+            return False
+        needed = max(int(freeze_confirm_cycles), 1)
+        if needed <= 1:
+            confirmations.pop(side_key, None)
+            return True
+        now_iso = _utc_now().isoformat()
+        previous = confirmations.get(side_key) if isinstance(confirmations.get(side_key), dict) else {}
+        previous_threshold = (
+            _safe_float(previous.get("freeze_threshold_loss_ratio", previous.get("effective_threshold_loss_ratio")))
+            if isinstance(previous, dict)
+            else 0.0
+        )
+        same_candidate = (
+            abs(previous_threshold - side_threshold) <= 1e-12
+            and bool(previous.get("stress_active")) == bool(stress_active)
+            and bool(previous.get("hard_freeze_enabled")) == bool(hard_freeze_enabled)
+        )
+        count = int(previous.get("count", 0) if same_candidate else 0) + 1
+        confirmations[side_key] = {
+            "side": side.upper(),
+            "count": count,
+            "required_count": needed,
+            "qty": qty,
+            "notional": notional,
+            "loss_ratio": loss_ratio,
+            "base_threshold_loss_ratio": threshold,
+            "effective_threshold_loss_ratio": effective_threshold,
+            "freeze_threshold_loss_ratio": side_threshold,
+            "hard_freeze_enabled": bool(hard_freeze_enabled),
+            "stress_active": bool(stress_active),
+            "first_seen_at": previous.get("first_seen_at") if same_candidate else now_iso,
+            "last_seen_at": now_iso,
+        }
+        return count >= needed
+
+    _record_protected("LONG", managed_long_qty, long_loss_ratio, managed_long_notional, reduce_long_planned)
+    _record_protected("SHORT", managed_short_qty, short_loss_ratio, managed_short_notional, reduce_short_planned)
+    if (
+        _confirmed("LONG", managed_long_qty, long_loss_ratio, managed_long_notional, reduce_long_planned)
+    ):
+        transfer = _transfer_best_quote_volume_to_frozen(
+            state=state,
+            side="long",
+            qty=managed_long_qty,
+            reason=freeze_reason,
+            loss_ratio=long_loss_ratio,
+        )
+        events.append(
+            {
+                "side": "LONG",
+                "reason": freeze_reason,
+                "loss_ratio": long_loss_ratio,
+                "effective_threshold_loss_ratio": effective_threshold,
+                "freeze_threshold_loss_ratio": long_freeze_threshold,
+                "confirm_cycles": freeze_confirm_cycles,
+                "hard_freeze_enabled": bool(hard_freeze_enabled),
+                "stress_active": bool(stress_active),
+                "qty": _safe_float(transfer.get("transferred_qty")),
+                "requested_qty": managed_long_qty,
+                "shortfall_qty": _safe_float(transfer.get("shortfall_qty")),
+                "notional": _safe_float(transfer.get("transferred_qty")) * _safe_float(mid_price),
+                "transfer": transfer,
+            }
+        )
+        confirmations.pop("long", None)
+    if (
+        _confirmed("SHORT", managed_short_qty, short_loss_ratio, managed_short_notional, reduce_short_planned)
+    ):
+        transfer = _transfer_best_quote_volume_to_frozen(
+            state=state,
+            side="short",
+            qty=managed_short_qty,
+            reason=freeze_reason,
+            loss_ratio=short_loss_ratio,
+        )
+        events.append(
+            {
+                "side": "SHORT",
+                "reason": freeze_reason,
+                "loss_ratio": short_loss_ratio,
+                "effective_threshold_loss_ratio": effective_threshold,
+                "freeze_threshold_loss_ratio": short_freeze_threshold,
+                "confirm_cycles": freeze_confirm_cycles,
+                "hard_freeze_enabled": bool(hard_freeze_enabled),
+                "stress_active": bool(stress_active),
+                "qty": _safe_float(transfer.get("transferred_qty")),
+                "requested_qty": managed_short_qty,
+                "shortfall_qty": _safe_float(transfer.get("shortfall_qty")),
+                "notional": _safe_float(transfer.get("transferred_qty")) * _safe_float(mid_price),
+                "transfer": transfer,
+            }
+        )
+        confirmations.pop("short", None)
+
+    if confirmations:
+        state["best_quote_reduce_freeze_confirmation"] = confirmations
+        report["confirmations"] = dict(confirmations)
+    else:
+        state.pop("best_quote_reduce_freeze_confirmation", None)
+        report["confirmations"] = {}
+    report["protected_candidates"] = protected_candidates
+    if events:
+        bq_ledger_report = _best_quote_volume_ledger_snapshot(
+            dict(state.get("best_quote_volume_ledger") or {}),
+            mid_price=mid_price,
+        )
+        report = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+            bq_ledger_report=bq_ledger_report,
+        )
+        report["enabled"] = True
+        report["applied"] = True
+        report["threshold_loss_ratio"] = threshold
+        report["effective_threshold_loss_ratio"] = effective_threshold
+        report["confirm_cycles"] = max(int(confirm_cycles), 1)
+        report["hard_loss_ratio"] = max(_safe_float(hard_loss_ratio), 0.0)
+        report["hard_min_notional"] = max(_safe_float(hard_min_notional), 0.0)
+        report["hard_confirm_cycles"] = max(int(hard_confirm_cycles), 0)
+        report["hard_freeze_enabled"] = bool(hard_freeze_enabled)
+        report["freeze_threshold_loss_ratio"] = freeze_threshold
+        report["long_freeze_threshold_loss_ratio"] = long_freeze_threshold
+        report["short_freeze_threshold_loss_ratio"] = short_freeze_threshold
+        report["freeze_min_notional"] = freeze_min_notional
+        report["freeze_confirm_cycles"] = freeze_confirm_cycles
+        report["stress_loss_ratio"] = max(_safe_float(stress_loss_ratio), 0.0)
+        report["stress_active"] = bool(stress_active)
+        report["dynamic_threshold"] = {
+            "enabled": bool(dynamic_threshold_enabled),
+            "active": dynamic_threshold_active,
+            "loss_ratio_scale": dynamic_threshold_scale,
+            "max_extra_ratio": dynamic_threshold_max_extra,
+            "frozen_notional_start": dynamic_threshold_frozen_start,
+            "frozen_notional_full": dynamic_threshold_frozen_full,
+            "long_loss_ratio": long_loss_ratio,
+            "short_loss_ratio": short_loss_ratio,
+            "actual_long_loss_ratio": actual_long_loss_ratio,
+            "actual_short_loss_ratio": actual_short_loss_ratio,
+            "long_frozen_pressure": long_frozen_pressure,
+            "short_frozen_pressure": short_frozen_pressure,
+            "long_extra_ratio": long_dynamic_extra,
+            "short_extra_ratio": short_dynamic_extra,
+        }
+        report["confirmations"] = dict(confirmations)
+        report["min_notional"] = min_notional_value
+        report["protected_candidates"] = protected_candidates
+        report["events"] = events
+    return report
+
+
+def _frozen_inventory_directive_authorized(
+    directive: Mapping[str, Any] | dict[str, Any],
+    *,
+    now: datetime | None = None,
+) -> tuple[bool, str]:
+    if not isinstance(directive, Mapping):
+        return False, "missing_authorization"
+    request_id = str(directive.get("request_id") or "").strip()
+    if not request_id:
+        return False, "missing_authorization"
+    if bool(directive.get("consumed")):
+        return False, "authorization_consumed"
+    expires_at = _parse_state_datetime(directive.get("expires_at"))
+    if expires_at is None:
+        return False, "authorization_missing_expiry"
+    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    if expires_at <= checked_at:
+        return False, "authorization_expired"
+    return True, "authorized"
+
+
+def apply_best_quote_frozen_inventory_manual_reduce(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    report: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    hedge_mode: bool,
+) -> dict[str, Any]:
+    directive = dict(state.get("best_quote_frozen_inventory_manual_reduce") or {})
+    ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    reduce_report = {
+        "enabled": bool(directive),
+        "requested_long": bool((directive.get("long") or {}).get("requested")),
+        "requested_short": bool((directive.get("short") or {}).get("requested")),
+        "placed_long": False,
+        "placed_short": False,
+        "orders": [],
+        "blocked_reasons": [],
+    }
+    safe_min_notional = max(_safe_float(min_notional), 0.0)
+
+    def _authorized(side_directive: dict[str, Any], *, side_key: str) -> bool:
+        ok, reason = _frozen_inventory_directive_authorized(side_directive)
+        if not ok:
+            directive.pop(side_key, None)
+            reduce_report["blocked_reasons"].append(f"{side_key}_{reason}")
+        return ok
+
+    def _build_order(*, side_key: str) -> dict[str, Any] | None:
+        is_long = side_key == "long"
+        side_directive = dict(directive.get(side_key) or {})
+        requested = bool(side_directive.get("requested"))
+        frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
+        if not requested:
+            return None
+        if not _authorized(side_directive, side_key=side_key):
+            return None
+        requested_qty = max(_safe_float(side_directive.get("requested_qty")), 0.0)
+        if frozen_qty <= 1e-12:
+            directive.pop(side_key, None)
+            reduce_report["blocked_reasons"].append(f"{side_key}_frozen_qty_empty")
+            return None
+        side = "SELL" if is_long else "BUY"
+        raw_price = bid_price if is_long else ask_price
+        price = _round_order_price(max(_safe_float(raw_price), 0.0), tick_size, side)
+        if price <= 0:
+            reduce_report["blocked_reasons"].append(f"{side_key}_missing_price")
+            return None
+        qty = _round_order_qty(min(frozen_qty, requested_qty) if requested_qty > 0 else frozen_qty, step_size)
+        if qty <= 0 or (min_qty is not None and qty < _safe_float(min_qty)):
+            reduce_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
+            return None
+        notional = qty * price
+        if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
+            reduce_report["blocked_reasons"].append(f"{side_key}_below_min_notional")
+            return None
+        return {
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "notional": notional,
+            "role": f"frozen_inventory_manual_reduce_{side_key}",
+            "position_side": ("LONG" if is_long else "SHORT") if hedge_mode else "BOTH",
+            "force_reduce_only": True,
+            "execution_type": "aggressive",
+            "time_in_force": "IOC",
+            "manual_frozen_inventory_reduce": True,
+            "frozen_inventory_request_id": str(side_directive.get("request_id") or "").strip(),
+        }
+
+    long_order = _build_order(side_key="long")
+    if long_order is not None:
+        plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
+        reduce_report["placed_long"] = True
+        reduce_report["orders"].append(dict(long_order))
+        directive.pop("long", None)
+    short_order = _build_order(side_key="short")
+    if short_order is not None:
+        plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
+        reduce_report["placed_short"] = True
+        reduce_report["orders"].append(dict(short_order))
+        directive.pop("short", None)
+
+    if directive:
+        state["best_quote_frozen_inventory_manual_reduce"] = directive
+    else:
+        state.pop("best_quote_frozen_inventory_manual_reduce", None)
+    reduce_report["active"] = bool(reduce_report["placed_long"] or reduce_report["placed_short"])
+    return reduce_report
+
+
+def apply_best_quote_frozen_inventory_manual_limit(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    hedge_mode: bool,
+) -> dict[str, Any]:
+    directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
+    ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    limit_report = {
+        "enabled": bool(directive),
+        "placed_long": False,
+        "placed_short": False,
+        "orders": [],
+        "blocked_reasons": [],
+    }
+    safe_min_notional = max(_safe_float(min_notional), 0.0)
+
+    def _authorized(side_directive: dict[str, Any], *, side_key: str) -> bool:
+        ok, reason = _frozen_inventory_directive_authorized(side_directive)
+        if not ok:
+            directive.pop(side_key, None)
+            ledger[f"{side_key}_manual_limit_isolated_qty"] = 0.0
+            limit_report["blocked_reasons"].append(f"{side_key}_{reason}")
+        return ok
+
+    def _build_order(*, side_key: str) -> dict[str, Any] | None:
+        side_directive = dict(directive.get(side_key) or {})
+        if not bool(side_directive.get("requested")):
+            return None
+        if not _authorized(side_directive, side_key=side_key):
+            return None
+        is_long = side_key == "long"
+        frozen_qty = max(_safe_float(ledger.get(f"{side_key}_qty")), 0.0)
+        isolated_key = f"{side_key}_manual_limit_isolated_qty"
+        requested_qty = max(_safe_float(side_directive.get("requested_qty")), 0.0)
+        isolated_qty = min(max(_safe_float(ledger.get(isolated_key)), requested_qty), frozen_qty)
+        if isolated_qty <= 1e-12:
+            directive.pop(side_key, None)
+            ledger[isolated_key] = 0.0
+            limit_report["blocked_reasons"].append(f"{side_key}_isolated_qty_empty")
+            return None
+        side = "SELL" if is_long else "BUY"
+        fallback_price = bid_price if is_long else ask_price
+        raw_price = _safe_float(side_directive.get("price")) or _safe_float(fallback_price)
+        price = _round_order_price(max(raw_price, 0.0), tick_size, side)
+        if price <= 0:
+            limit_report["blocked_reasons"].append(f"{side_key}_missing_price")
+            return None
+        qty = _round_order_qty(isolated_qty, step_size)
+        if qty <= 0 or (min_qty is not None and qty + 1e-12 < _safe_float(min_qty)):
+            limit_report["blocked_reasons"].append(f"{side_key}_below_min_qty")
+            return None
+        notional = qty * price
+        if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
+            limit_report["blocked_reasons"].append(f"{side_key}_below_min_notional")
+            return None
+        ledger[isolated_key] = qty
+        return {
+            "side": side,
+            "price": price,
+            "qty": qty,
+            "notional": notional,
+            "role": f"frozen_inventory_manual_limit_{side_key}",
+            "position_side": ("LONG" if is_long else "SHORT") if hedge_mode else "BOTH",
+            "force_reduce_only": True,
+            "execution_type": "maker",
+            "time_in_force": "GTX",
+            "manual_frozen_inventory_limit": True,
+            "frozen_inventory_request_id": str(side_directive.get("request_id") or "").strip(),
+        }
+
+    long_order = _build_order(side_key="long")
+    if long_order is not None:
+        plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
+        limit_report["placed_long"] = True
+        limit_report["orders"].append(dict(long_order))
+        directive.pop("long", None)
+    short_order = _build_order(side_key="short")
+    if short_order is not None:
+        plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
+        limit_report["placed_short"] = True
+        limit_report["orders"].append(dict(short_order))
+        directive.pop("short", None)
+
+    if directive:
+        state["best_quote_frozen_inventory_manual_limit"] = directive
+    else:
+        state.pop("best_quote_frozen_inventory_manual_limit", None)
+    if ledger:
+        state["best_quote_frozen_inventory"] = ledger
+    limit_report["active"] = bool(limit_report["placed_long"] or limit_report["placed_short"])
+    return limit_report
+
+
+def apply_best_quote_frozen_inventory_pair_release(
+    *,
+    plan: dict[str, Any],
+    report: dict[str, Any],
+    bid_price: float,
+    ask_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    hedge_mode: bool,
+    enabled: bool,
+    stable_allowed: bool,
+    max_notional: float,
+    min_side_notional: float,
+    min_profit_ratio: float,
+    max_slippage_ticks: int,
+    allow_loss: bool = False,
+    requested_qty: float | None = None,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    ledger = dict(report.get("ledger") or {})
+    release_report = {
+        "enabled": bool(enabled),
+        "active": False,
+        "stable_allowed": bool(stable_allowed),
+        "placed_long": False,
+        "placed_short": False,
+        "orders": [],
+        "blocked_reasons": [],
+        "release_qty": 0.0,
+        "release_notional": 0.0,
+        "min_side_notional": max(_safe_float(min_side_notional), 0.0),
+        "frozen_long_notional": 0.0,
+        "frozen_short_notional": 0.0,
+        "estimated_pair_pnl": 0.0,
+        "required_profit": 0.0,
+        "allow_loss": bool(allow_loss),
+        "profit_buffer_bypassed": False,
+    }
+    if not enabled:
+        release_report["blocked_reasons"].append("disabled")
+        return release_report
+    safe_request_id = str(request_id or "").strip()
+    if not safe_request_id:
+        release_report["blocked_reasons"].append("missing_authorization")
+        return release_report
+    if not stable_allowed:
+        release_report["blocked_reasons"].append("market_not_stable")
+        return release_report
+
+    frozen_long_qty = max(_safe_float(report.get("frozen_pair_eligible_long_qty", report.get("frozen_long_qty"))), 0.0)
+    frozen_short_qty = max(_safe_float(report.get("frozen_pair_eligible_short_qty", report.get("frozen_short_qty"))), 0.0)
+    offset_qty = min(frozen_long_qty, frozen_short_qty)
+    safe_bid = max(_safe_float(bid_price), 0.0)
+    safe_ask = max(_safe_float(ask_price), 0.0)
+    mid_price = (safe_bid + safe_ask) / 2.0 if safe_bid > 0 and safe_ask > 0 else 0.0
+    if offset_qty <= 1e-12:
+        release_report["blocked_reasons"].append("no_frozen_offset_qty")
+        return release_report
+    if mid_price <= 0:
+        release_report["blocked_reasons"].append("missing_book_price")
+        return release_report
+    frozen_long_notional = frozen_long_qty * mid_price
+    frozen_short_notional = frozen_short_qty * mid_price
+    release_report["frozen_long_notional"] = frozen_long_notional
+    release_report["frozen_short_notional"] = frozen_short_notional
+    safe_min_side_notional = max(_safe_float(min_side_notional), 0.0)
+    if safe_min_side_notional > 0 and (
+        frozen_long_notional + 1e-12 < safe_min_side_notional
+        or frozen_short_notional + 1e-12 < safe_min_side_notional
+    ):
+        release_report["blocked_reasons"].append("below_min_side_notional")
+        return release_report
+
+    max_qty = offset_qty
+    safe_max_notional = max(_safe_float(max_notional), 0.0)
+    if safe_max_notional > 0:
+        max_qty = min(max_qty, safe_max_notional / mid_price)
+    safe_requested_qty = max(_safe_float(requested_qty), 0.0) if requested_qty is not None else 0.0
+    if safe_requested_qty > 0:
+        max_qty = min(max_qty, safe_requested_qty)
+    qty = _round_order_qty(max_qty, step_size)
+    safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
+    if qty <= 0 or (safe_min_qty > 0 and qty + 1e-12 < safe_min_qty):
+        release_report["blocked_reasons"].append("below_min_qty")
+        return release_report
+
+    slippage = max(int(max_slippage_ticks), 0) * max(_safe_float(tick_size), 0.0)
+    sell_price = _round_order_price(max(safe_bid - slippage, 0.0), tick_size, "SELL")
+    buy_price = _round_order_price(max(safe_ask + slippage, 0.0), tick_size, "BUY")
+    if sell_price <= 0 or buy_price <= 0:
+        release_report["blocked_reasons"].append("missing_release_price")
+        return release_report
+    release_notional = qty * mid_price
+    safe_min_notional = max(_safe_float(min_notional), 0.0) if min_notional is not None else 0.0
+    if safe_min_notional > 0 and release_notional + 1e-12 < safe_min_notional:
+        release_report["blocked_reasons"].append("below_min_notional")
+        return release_report
+
+    def _weighted_entry(side: str) -> float:
+        lots = ledger.get(f"{side}_lots")
+        raw_lots = lots if isinstance(lots, list) else []
+        remaining = qty
+        total_cost = 0.0
+        total_qty = 0.0
+        for raw_lot in raw_lots:
+            if not isinstance(raw_lot, dict) or remaining <= 1e-12:
+                break
+            lot_qty = min(max(_safe_float(raw_lot.get("qty")), 0.0), remaining)
+            entry = max(_safe_float(raw_lot.get("entry_price")), 0.0)
+            if lot_qty <= 1e-12 or entry <= 0:
+                continue
+            total_cost += lot_qty * entry
+            total_qty += lot_qty
+            remaining -= lot_qty
+        if total_qty > 1e-12:
+            return total_cost / total_qty
+        return max(_safe_float(ledger.get(f"{side}_entry_price")), 0.0)
+
+    long_entry = _weighted_entry("long")
+    short_entry = _weighted_entry("short")
+    if long_entry <= 0 or short_entry <= 0:
+        release_report["blocked_reasons"].append("missing_entry_price")
+        return release_report
+    estimated_pair_pnl = (sell_price - long_entry) * qty + (short_entry - buy_price) * qty
+    required_profit = release_notional * max(_safe_float(min_profit_ratio), 0.0)
+    release_report["estimated_pair_pnl"] = estimated_pair_pnl
+    release_report["required_profit"] = required_profit
+    release_report["release_qty"] = qty
+    release_report["release_notional"] = release_notional
+    if estimated_pair_pnl + 1e-12 < required_profit and not allow_loss:
+        release_report["blocked_reasons"].append("pair_pnl_below_buffer")
+        return release_report
+    if estimated_pair_pnl + 1e-12 < required_profit:
+        release_report["profit_buffer_bypassed"] = True
+
+    sell_order = {
+        "side": "SELL",
+        "price": sell_price,
+        "qty": qty,
+        "notional": qty * sell_price,
+        "role": "frozen_inventory_pair_release_long",
+        "position_side": "LONG" if hedge_mode else "BOTH",
+        "force_reduce_only": True,
+        "execution_type": "aggressive",
+        "time_in_force": "IOC",
+        "frozen_inventory_pair_release": True,
+        "frozen_inventory_request_id": safe_request_id,
+    }
+    buy_order = {
+        "side": "BUY",
+        "price": buy_price,
+        "qty": qty,
+        "notional": qty * buy_price,
+        "role": "frozen_inventory_pair_release_short",
+        "position_side": "SHORT" if hedge_mode else "BOTH",
+        "force_reduce_only": True,
+        "execution_type": "aggressive",
+        "time_in_force": "IOC",
+        "frozen_inventory_pair_release": True,
+        "frozen_inventory_request_id": safe_request_id,
+    }
+    plan["sell_orders"] = [sell_order, *list(plan.get("sell_orders") or [])]
+    plan["buy_orders"] = [buy_order, *list(plan.get("buy_orders") or [])]
+    release_report["placed_long"] = True
+    release_report["placed_short"] = True
+    release_report["active"] = True
+    release_report["orders"] = [dict(sell_order), dict(buy_order)]
+    return release_report
+
+
+def _cap_best_quote_reduce_orders_to_managed_inventory(
+    *,
+    plan: dict[str, Any],
+    report: dict[str, Any],
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+) -> dict[str, Any]:
+    managed_long_qty = max(_safe_float(report.get("managed_long_qty")), 0.0)
+    managed_short_qty = max(_safe_float(report.get("managed_short_qty")), 0.0)
+    frozen_long_qty = max(_safe_float(report.get("frozen_long_qty")), 0.0)
+    frozen_short_qty = max(_safe_float(report.get("frozen_short_qty")), 0.0)
+    cap_report = {
+        "enabled": bool(frozen_long_qty > 1e-12 or frozen_short_qty > 1e-12),
+        "managed_long_qty": managed_long_qty,
+        "managed_short_qty": managed_short_qty,
+        "frozen_long_qty": frozen_long_qty,
+        "frozen_short_qty": frozen_short_qty,
+        "trimmed_long_orders": 0,
+        "trimmed_short_orders": 0,
+        "dropped_long_orders": 0,
+        "dropped_short_orders": 0,
+        "skipped_manual_reduce_orders": 0,
+    }
+    if not cap_report["enabled"]:
+        return cap_report
+
+    safe_min_qty = max(_safe_float(min_qty), 0.0) if min_qty is not None else 0.0
+    safe_min_notional = max(_safe_float(min_notional), 0.0) if min_notional is not None else 0.0
+
+    def _is_manual_frozen_reduce(order: dict[str, Any]) -> bool:
+        role = _order_role(order)
+        return (
+            role.startswith("frozen_inventory_manual_reduce_")
+            or role.startswith("frozen_inventory_manual_limit_")
+            or role.startswith("frozen_inventory_pair_release_")
+            or bool(order.get("manual_frozen_inventory_reduce"))
+            or bool(order.get("manual_frozen_inventory_limit"))
+            or bool(order.get("frozen_inventory_pair_release"))
+        )
+
+    def _is_reduce_long_order(order: dict[str, Any]) -> bool:
+        role = _order_role(order)
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _order_position_side(order)
+        return (
+            side == "SELL"
+            and position_side in {"LONG", "BOTH"}
+            and (role in {"best_quote_reduce_long"} or bool(order.get("force_reduce_only")))
+        )
+
+    def _is_reduce_short_order(order: dict[str, Any]) -> bool:
+        role = _order_role(order)
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _order_position_side(order)
+        return (
+            side == "BUY"
+            and position_side in {"SHORT", "BOTH"}
+            and (role in {"best_quote_reduce_short"} or bool(order.get("force_reduce_only")))
+        )
+
+    def _trim_order(order: dict[str, Any], available_qty: float) -> tuple[dict[str, Any] | None, float, bool]:
+        original_qty = max(_safe_float(order.get("qty")), 0.0)
+        if original_qty <= 1e-12 or available_qty <= 1e-12:
+            return None, available_qty, False
+        qty = min(original_qty, available_qty)
+        if qty + 1e-12 < original_qty:
+            qty = _round_order_qty(qty, step_size)
+        if qty <= 1e-12 or (safe_min_qty > 0 and qty + 1e-12 < safe_min_qty):
+            return None, available_qty, False
+        price = max(_safe_float(order.get("price")), 0.0)
+        notional = qty * price if price > 0 else _safe_float(order.get("notional"))
+        if safe_min_notional > 0 and notional + 1e-12 < safe_min_notional:
+            return None, available_qty, False
+        trimmed = dict(order)
+        trimmed["qty"] = qty
+        trimmed["notional"] = notional
+        if qty + 1e-12 < original_qty:
+            trimmed["frozen_inventory_managed_qty_capped"] = True
+        return trimmed, max(available_qty - qty, 0.0), bool(qty + 1e-12 < original_qty)
+
+    long_available = managed_long_qty
+    sell_orders: list[dict[str, Any]] = []
+    for raw_order in [item for item in plan.get("sell_orders", []) if isinstance(item, dict)]:
+        order = dict(raw_order)
+        if _is_manual_frozen_reduce(order):
+            cap_report["skipped_manual_reduce_orders"] += 1
+            sell_orders.append(order)
+            continue
+        if not _is_reduce_long_order(order):
+            sell_orders.append(order)
+            continue
+        trimmed, long_available, was_trimmed = _trim_order(order, long_available)
+        if trimmed is None:
+            cap_report["dropped_long_orders"] += 1
+            continue
+        if was_trimmed:
+            cap_report["trimmed_long_orders"] += 1
+        sell_orders.append(trimmed)
+    plan["sell_orders"] = sell_orders
+
+    short_available = managed_short_qty
+    buy_orders: list[dict[str, Any]] = []
+    for raw_order in [item for item in plan.get("buy_orders", []) if isinstance(item, dict)]:
+        order = dict(raw_order)
+        if _is_manual_frozen_reduce(order):
+            cap_report["skipped_manual_reduce_orders"] += 1
+            buy_orders.append(order)
+            continue
+        if not _is_reduce_short_order(order):
+            buy_orders.append(order)
+            continue
+        trimmed, short_available, was_trimmed = _trim_order(order, short_available)
+        if trimmed is None:
+            cap_report["dropped_short_orders"] += 1
+            continue
+        if was_trimmed:
+            cap_report["trimmed_short_orders"] += 1
+        buy_orders.append(trimmed)
+    plan["buy_orders"] = buy_orders
+    cap_report["remaining_managed_long_qty"] = long_available
+    cap_report["remaining_managed_short_qty"] = short_available
+    return cap_report
 
 
 TAKE_PROFIT_EXIT_ROLES = {"take_profit", "take_profit_long", "take_profit_short"}
@@ -1897,8 +4799,14 @@ def apply_hard_loss_forced_reduce(
     min_qty: float | None,
     min_notional: float | None,
     reason: str | None = None,
+    strategy_mode: str = "one_way_long",
 ) -> dict[str, Any]:
     normalized_side = str(side or "").upper().strip()
+    position_side = (
+        ("LONG" if normalized_side == "SELL" else "SHORT")
+        if _uses_exchange_hedge_position_sides(strategy_mode)
+        else "BOTH"
+    )
     report = {
         "enabled": bool(enabled),
         "active": False,
@@ -1923,12 +4831,15 @@ def apply_hard_loss_forced_reduce(
     safe_current_qty = max(_safe_float(current_qty), 0.0)
     safe_current_notional = max(_safe_float(current_notional), 0.0)
     safe_target_notional = max(_safe_float(target_notional), 0.0)
-    if safe_current_qty <= 1e-12 or safe_current_notional <= safe_target_notional + 1e-12:
+    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
+    if safe_current_qty <= 1e-12:
+        report["blocked_reason"] = "at_or_below_target"
+        return report
+    if safe_current_notional <= safe_target_notional + 1e-12:
         report["blocked_reason"] = "at_or_below_target"
         return report
 
     raw_reduce_notional = safe_current_notional - safe_target_notional
-    safe_max_order_notional = max(_safe_float(max_order_notional), 0.0)
     reduce_notional = min(raw_reduce_notional, safe_max_order_notional) if safe_max_order_notional > 0 else raw_reduce_notional
     price_source = bid_price if normalized_side == "SELL" else ask_price
     price = _round_order_price(max(_safe_float(price_source), 0.0), tick_size, normalized_side)
@@ -1953,7 +4864,7 @@ def apply_hard_loss_forced_reduce(
         "qty": qty,
         "notional": notional,
         "role": "hard_loss_forced_reduce_long" if normalized_side == "SELL" else "hard_loss_forced_reduce_short",
-        "position_side": "BOTH",
+        "position_side": position_side,
         "force_reduce_only": True,
         "execution_type": "aggressive",
         "time_in_force": "IOC",
@@ -1975,17 +4886,49 @@ def apply_hard_loss_forced_reduce(
     return report
 
 
+def _resolve_hard_loss_reduce_target_notional(
+    *,
+    configured_target_notional: float | None,
+    pause_position_notional: float | None,
+) -> float:
+    safe_target = max(_safe_float(configured_target_notional), 0.0)
+    if safe_target > 0:
+        return safe_target
+    safe_pause = max(_safe_float(pause_position_notional), 0.0)
+    return safe_pause
+
+
+def _position_unrealized_or_estimate(
+    *,
+    position: dict[str, Any],
+    qty: float,
+    cost_basis_price: float,
+    mid_price: float,
+    side: str,
+) -> float:
+    if "unRealizedProfit" in position or "unrealizedProfit" in position:
+        return _position_unrealized_pnl(position)
+    safe_qty = max(_safe_float(qty), 0.0)
+    safe_cost = max(_safe_float(cost_basis_price), 0.0)
+    safe_mid = max(_safe_float(mid_price), 0.0)
+    if safe_qty <= 1e-12 or safe_cost <= 0 or safe_mid <= 0:
+        return 0.0
+    if str(side or "").upper().strip() == "SELL":
+        return (safe_mid - safe_cost) * safe_qty
+    return (safe_cost - safe_mid) * safe_qty
+
+
 def _is_long_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
     position_side = _order_position_side(order)
-    return role in {"bootstrap", "entry", "bootstrap_long", "entry_long"} or (
+    return role in {"bootstrap", "entry", "bootstrap_long", "entry_long", "best_quote_entry_long"} or (
         position_side in {"BOTH", "LONG"} and role in {"bootstrap", "entry"}
     )
 
 
 def _is_short_entry_order(order: dict[str, Any]) -> bool:
     role = _order_role(order)
-    return role in {"bootstrap_short", "entry_short"}
+    return role in {"bootstrap_short", "entry_short", "best_quote_entry_short"}
 
 
 def _is_long_exit_order(order: dict[str, Any]) -> bool:
@@ -1995,11 +4938,162 @@ def _is_long_exit_order(order: dict[str, Any]) -> bool:
         "soft_delever_long",
         "hard_delever_long",
         "flow_sleeve_long",
+        "inventory_unlock_reduce_long",
+        "best_quote_reduce_long",
     }
 
 
 def _is_short_exit_order(order: dict[str, Any]) -> bool:
-    return _order_role(order) in {"take_profit_short", "active_delever_short", "flow_sleeve_short"}
+    return _order_role(order) in {
+        "take_profit_short",
+        "active_delever_short",
+        "flow_sleeve_short",
+        "inventory_unlock_reduce_short",
+        "best_quote_reduce_short",
+    }
+
+
+def apply_entry_permission_gate(
+    plan: dict[str, Any],
+    *,
+    allow_entry_long: bool = True,
+    allow_entry_short: bool = True,
+    max_entry_long_orders: int | None = None,
+    max_entry_short_orders: int | None = None,
+) -> dict[str, Any]:
+    """Prune entry orders after late sticky/preservation passes."""
+    long_limit = None if max_entry_long_orders is None else max(int(max_entry_long_orders), 0)
+    short_limit = None if max_entry_short_orders is None else max(int(max_entry_short_orders), 0)
+    report = {
+        "enabled": not allow_entry_long or not allow_entry_short or long_limit is not None or short_limit is not None,
+        "allow_entry_long": bool(allow_entry_long),
+        "allow_entry_short": bool(allow_entry_short),
+        "max_entry_long_orders": long_limit,
+        "max_entry_short_orders": short_limit,
+        "pruned_bootstrap_orders": 0,
+        "pruned_buy_orders": 0,
+        "pruned_sell_orders": 0,
+        "applied": False,
+    }
+    if not report["enabled"]:
+        return report
+
+    bootstrap_before = len(plan.get("bootstrap_orders", []))
+    buy_before = len(plan.get("buy_orders", []))
+    sell_before = len(plan.get("sell_orders", []))
+
+    if not allow_entry_long:
+        plan["bootstrap_orders"] = [
+            item
+            for item in plan.get("bootstrap_orders", [])
+            if not (isinstance(item, dict) and _is_long_entry_order(item))
+        ]
+        plan["buy_orders"] = [
+            item
+            for item in plan.get("buy_orders", [])
+            if not (isinstance(item, dict) and _is_long_entry_order(item))
+        ]
+    if not allow_entry_short:
+        plan["bootstrap_orders"] = [
+            item
+            for item in plan.get("bootstrap_orders", [])
+            if not (isinstance(item, dict) and _is_short_entry_order(item))
+        ]
+        plan["sell_orders"] = [
+            item
+            for item in plan.get("sell_orders", [])
+            if not (isinstance(item, dict) and _is_short_entry_order(item))
+        ]
+    if long_limit is not None:
+        kept_long_entries = 0
+        limited_buy_orders = []
+        for item in plan.get("buy_orders", []):
+            if isinstance(item, dict) and _is_long_entry_order(item):
+                if kept_long_entries >= long_limit:
+                    continue
+                kept_long_entries += 1
+            limited_buy_orders.append(item)
+        plan["buy_orders"] = limited_buy_orders
+    if short_limit is not None:
+        kept_short_entries = 0
+        limited_sell_orders = []
+        for item in plan.get("sell_orders", []):
+            if isinstance(item, dict) and _is_short_entry_order(item):
+                if kept_short_entries >= short_limit:
+                    continue
+                kept_short_entries += 1
+            limited_sell_orders.append(item)
+        plan["sell_orders"] = limited_sell_orders
+
+    report["pruned_bootstrap_orders"] = bootstrap_before - len(plan.get("bootstrap_orders", []))
+    report["pruned_buy_orders"] = buy_before - len(plan.get("buy_orders", []))
+    report["pruned_sell_orders"] = sell_before - len(plan.get("sell_orders", []))
+    report["applied"] = any(
+        int(report[key] or 0) > 0
+        for key in ("pruned_bootstrap_orders", "pruned_buy_orders", "pruned_sell_orders")
+    )
+    return report
+
+
+def _sync_plan_orders_from_desired_orders(plan: dict[str, Any], desired_orders: list[dict[str, Any]]) -> None:
+    plan["buy_orders"] = [
+        dict(item)
+        for item in desired_orders
+        if isinstance(item, dict) and str(item.get("side", "")).upper().strip() == "BUY"
+    ]
+    plan["sell_orders"] = [
+        dict(item)
+        for item in desired_orders
+        if isinstance(item, dict) and str(item.get("side", "")).upper().strip() == "SELL"
+    ]
+
+
+def _regime_budget_entry_reuse_tolerance(
+    *,
+    strategy_profile: str,
+    regime_entry_budget: dict[str, Any],
+    step_price: float,
+) -> tuple[float, str]:
+    if not isinstance(regime_entry_budget, dict) or not regime_entry_budget.get("enabled"):
+        return max(float(step_price), 0.0), "default_step"
+    if bool(regime_entry_budget.get("report_only", True)):
+        return max(float(step_price), 0.0), "report_only_default_step"
+    if bool(regime_entry_budget.get("cancel_entry_required")):
+        return 0.0, "cancel_confirm_required"
+    if bool(regime_entry_budget.get("shock_guard_active")) or str(regime_entry_budget.get("state") or "") in {
+        "defensive",
+        "shock-guard",
+    }:
+        return 0.0, "defensive_or_shock"
+    return max(float(step_price), 0.0) * 2.25, "regime_budget_small_drift_reuse"
+
+
+def _summarize_open_entry_exposure(open_orders: Iterable[Any]) -> dict[str, Any]:
+    long_notional = 0.0
+    short_notional = 0.0
+    long_count = 0
+    short_count = 0
+    for item in open_orders:
+        if not isinstance(item, dict):
+            continue
+        qty = abs(_safe_float(item.get("origQty") or item.get("quantity") or item.get("qty")))
+        price = _safe_float(item.get("price"))
+        if price <= 0:
+            price = _safe_float(item.get("stopPrice"))
+        notional = max(qty * price, _safe_float(item.get("notional")))
+        if _is_long_entry_order(item):
+            long_count += 1
+            long_notional += max(notional, 0.0)
+        elif _is_short_entry_order(item):
+            short_count += 1
+            short_notional += max(notional, 0.0)
+    return {
+        "open_entry_long_notional": long_notional,
+        "open_entry_short_notional": short_notional,
+        "open_entry_long_count": long_count,
+        "open_entry_short_count": short_count,
+        "open_non_reduce_entry_orders": long_count + short_count,
+    }
 
 
 
@@ -2012,7 +5106,7 @@ def _resolve_reduce_only_flag(
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
     normalized_side = str(side or "").upper().strip()
     normalized_role = str(role or "").lower().strip()
-    if normalized_mode == "hedge_neutral":
+    if _uses_exchange_hedge_position_sides(normalized_mode):
         return None
     if normalized_role in {"grid_exit", "forced_reduce", "tail_cleanup"}:
         return True
@@ -2023,6 +5117,7 @@ def _resolve_reduce_only_flag(
         "soft_delever_long",
         "hard_delever_long",
         "flow_sleeve_long",
+        "inventory_unlock_reduce_long",
         "hard_loss_forced_reduce_long",
     }:
         return True
@@ -2030,6 +5125,7 @@ def _resolve_reduce_only_flag(
         "take_profit_short",
         "active_delever_short",
         "flow_sleeve_short",
+        "inventory_unlock_reduce_short",
         "hard_loss_forced_reduce_short",
     }:
         return True
@@ -2178,6 +5274,69 @@ def apply_best_quote_repair_ladder(
     report["placed_repair_notional"] = sum(_safe_float(item.get("notional")) for item in repaired_orders)
     report["blocked_reason"] = None if repaired_orders else "all_repair_orders_below_min"
     return report
+
+
+def _is_hedge_side_reduce_order(order: dict[str, Any]) -> bool:
+    side = str(order.get("side", "")).upper().strip()
+    position_side = _order_position_side(order)
+    if position_side == "LONG" and side == "SELL":
+        return True
+    if position_side == "SHORT" and side == "BUY":
+        return True
+    return False
+
+
+def _all_place_orders_are_forced_hedge_reduces(actions: dict[str, Any]) -> bool:
+    place_orders = [item for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders:
+        return False
+    return all(bool(order.get("force_reduce_only")) and _is_hedge_side_reduce_order(order) for order in place_orders)
+
+
+def _isolated_frozen_actions_tolerate_position_drift(
+    actions: dict[str, Any],
+    *,
+    expected_long_qty: float,
+    expected_short_qty: float,
+    current_long_qty: float,
+    current_short_qty: float,
+    frozen_long_qty: float = 0.0,
+    frozen_short_qty: float = 0.0,
+) -> bool:
+    long_deficit = current_long_qty + 1e-9 < expected_long_qty
+    short_deficit = current_short_qty + 1e-9 < expected_short_qty
+    if not long_deficit and not short_deficit:
+        return True
+    reduce_long_qty = 0.0
+    reduce_short_qty = 0.0
+    for order in [item for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        side = str(order.get("side", "")).upper().strip()
+        position_side = _order_position_side(order)
+        if (long_deficit or short_deficit) and position_side == "BOTH":
+            return False
+        if position_side == "LONG" and side == "SELL" and bool(order.get("force_reduce_only")):
+            reduce_long_qty += max(_safe_float(order.get("qty", order.get("quantity"))), 0.0)
+        if position_side == "SHORT" and side == "BUY" and bool(order.get("force_reduce_only")):
+            reduce_short_qty += max(_safe_float(order.get("qty", order.get("quantity"))), 0.0)
+        if long_deficit and position_side == "LONG":
+            if side == "BUY":
+                continue
+            if side == "SELL" and bool(order.get("force_reduce_only")):
+                continue
+            return False
+        if short_deficit and position_side == "SHORT":
+            if side == "SELL":
+                continue
+            if side == "BUY" and bool(order.get("force_reduce_only")):
+                continue
+            return False
+    normal_long_available = max(_safe_float(current_long_qty) - max(_safe_float(frozen_long_qty), 0.0), 0.0)
+    normal_short_available = max(_safe_float(current_short_qty) - max(_safe_float(frozen_short_qty), 0.0), 0.0)
+    if reduce_long_qty > normal_long_available + 1e-9:
+        return False
+    if reduce_short_qty > normal_short_available + 1e-9:
+        return False
+    return True
 
 
 
@@ -2450,6 +5609,19 @@ def _is_maker_volatility_inventory_mode(strategy_mode: str) -> bool:
     return str(strategy_mode).strip() == "maker_volatility_inventory_v1"
 
 
+def _is_best_quote_maker_volume_mode(strategy_mode: str) -> bool:
+    return str(strategy_mode).strip() in {"best_quote_maker_volume_v1", "hedge_best_quote_maker_volume_v1"}
+
+
+def _is_hedge_best_quote_maker_volume_mode(strategy_mode: str) -> bool:
+    return str(strategy_mode).strip() == "hedge_best_quote_maker_volume_v1"
+
+
+def _uses_exchange_hedge_position_sides(strategy_mode: str) -> bool:
+    normalized = str(strategy_mode or "").strip()
+    return normalized == "hedge_neutral" or _is_hedge_best_quote_maker_volume_mode(normalized)
+
+
 def _is_custom_grid_mode(args: argparse.Namespace) -> bool:
     return bool(getattr(args, "custom_grid_enabled", False))
 
@@ -2460,8 +5632,6 @@ def _is_one_way_short_mode(strategy_mode: str) -> bool:
 
 def _normalize_strategy_mode(strategy_mode: str) -> str:
     normalized = str(strategy_mode or "").strip() or "one_way_long"
-    if normalized == BEST_QUOTE_MAKER_VOLUME_MODE:
-        return "one_way_long"
     return normalized
 
 
@@ -2495,7 +5665,10 @@ def _is_best_quote_long_profile(strategy_profile: str) -> bool:
 
 
 def _is_best_quote_neutral_profile(strategy_profile: str) -> bool:
-    return str(strategy_profile).strip().endswith("_competition_neutral_ping_pong_v1")
+    normalized_profile = str(strategy_profile).strip()
+    return normalized_profile.endswith("_competition_neutral_ping_pong_v1") or normalized_profile.endswith(
+        "_neutral_regime_budget_ping_pong_v2"
+    )
 
 
 def _is_strict_neutral_ping_pong_profile(strategy_profile: str) -> bool:
@@ -2768,6 +5941,51 @@ def _synthetic_order_ref_from_state(state: dict[str, Any], order_id: int | None)
     return dict(item) if isinstance(item, dict) else None
 
 
+def _infer_synthetic_order_ref_from_trade(trade: dict[str, Any]) -> dict[str, Any] | None:
+    client_order_id = str(trade.get("clientOrderId", "") or "").strip()
+    if not client_order_id:
+        return None
+    parts = client_order_id.lower().split("-")
+    if len(parts) < 3 or parts[0] != "gx":
+        return None
+
+    compact_role = parts[2].strip()
+    side = str(trade.get("side", "") or "").upper().strip()
+    if side not in {"BUY", "SELL"}:
+        return None
+
+    role = ""
+    if compact_role == "entrylon":
+        role = "entry_long"
+    elif compact_role == "entrysho":
+        role = "entry_short"
+    elif compact_role == "bootstra":
+        role = "bootstrap_long" if side == "BUY" else "bootstrap_short"
+    elif compact_role == "takeprof":
+        role = "take_profit_short" if side == "BUY" else "take_profit_long"
+    elif compact_role == "activede":
+        role = "active_delever_short" if side == "BUY" else "active_delever_long"
+    elif compact_role == "adverser":
+        role = "adverse_reduce_short" if side == "BUY" else "adverse_reduce_long"
+    elif compact_role == "flowslee":
+        role = "flow_sleeve_short" if side == "BUY" else "flow_sleeve_long"
+    elif compact_role == "softdele":
+        role = "soft_delever_short" if side == "BUY" else "soft_delever_long"
+    elif compact_role == "harddele":
+        role = "hard_delever_short" if side == "BUY" else "hard_delever_long"
+
+    if not role:
+        return None
+    return {
+        "role": role,
+        "side": side,
+        "position_side": str(trade.get("positionSide", trade.get("position_side", "BOTH")) or "BOTH").upper().strip()
+        or "BOTH",
+        "client_order_id": client_order_id,
+        "inferred_from_client_order_id": True,
+    }
+
+
 def _decorate_synthetic_open_orders(
     *,
     state: dict[str, Any],
@@ -2793,6 +6011,8 @@ def _decorate_synthetic_open_orders(
         if ref is None:
             client_order_id = str(order.get("clientOrderId", "")).strip()
             ref = client_refs.get(client_order_id)
+        if ref is None:
+            ref = _infer_synthetic_order_ref_from_trade(order)
         if isinstance(ref, dict):
             role = str(ref.get("role", "")).strip()
             if role:
@@ -3229,6 +6449,7 @@ def sync_synthetic_ledger(
     entry_price: float,
     qty_tolerance: float | None = None,
     fallback_price: float = 0.0,
+    observed_trade_rows: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     ledger = _load_synthetic_ledger(
         state=state,
@@ -3239,6 +6460,11 @@ def sync_synthetic_ledger(
     if trade_start_time_ms <= 0:
         trade_start_time_ms = max(int((_utc_now().timestamp() * 1000) - 48 * 3600 * 1000), 0)
 
+    observed_rows = [
+        dict(row)
+        for row in list(observed_trade_rows or [])
+        if isinstance(row, dict)
+    ]
     trade_rows = _fetch_trade_rows_since(
         symbol=symbol,
         api_key=api_key,
@@ -3247,7 +6473,7 @@ def sync_synthetic_ledger(
         recv_window=recv_window,
     )
     fresh_rows, last_time_ms, keys_at_time = collect_new_rows(
-        rows=trade_rows,
+        rows=[*observed_rows, *trade_rows],
         last_time_ms=int(ledger.get("last_trade_time_ms") or 0) or None,
         last_keys_at_time=list(ledger.get("last_trade_keys_at_time", [])),
         row_time_ms=trade_row_time_ms,
@@ -3258,6 +6484,8 @@ def sync_synthetic_ledger(
     unmatched = 0
     for row in fresh_rows:
         order_ref = _synthetic_order_ref_from_state(state, epoch_ms(row.get("orderId")))
+        if order_ref is None:
+            order_ref = _infer_synthetic_order_ref_from_trade(row)
         if _apply_synthetic_trade_fill(ledger=ledger, trade=row, order_ref=order_ref):
             applied += 1
         else:
@@ -3383,6 +6611,53 @@ def _update_inventory_grid_order_refs(
         }
 
     state["inventory_grid_order_refs"] = refs
+    try:
+        state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        return
+
+
+def update_best_quote_volume_order_refs(
+    *,
+    state_path: Path,
+    strategy_mode: str,
+    submit_report: dict[str, Any],
+) -> None:
+    if not _is_best_quote_maker_volume_mode(strategy_mode) or not state_path.exists():
+        return
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+
+    refs = state.get("best_quote_volume_order_refs")
+    if not isinstance(refs, dict):
+        refs = {}
+
+    for item in submit_report.get("placed_orders", []):
+        if not isinstance(item, dict):
+            continue
+        request = item.get("request", {}) if isinstance(item.get("request"), dict) else {}
+        response = item.get("response", {}) if isinstance(item.get("response"), dict) else {}
+        order_id = epoch_ms(response.get("orderId"))
+        if order_id <= 0:
+            continue
+        refs[str(order_id)] = {
+            "book": _best_quote_order_book_from_role(request.get("role")),
+            "role": str(request.get("role", "")).strip(),
+            "side": str(request.get("side", "")).upper().strip(),
+            "position_side": str(
+                request.get("position_side") or request.get("positionSide") or "BOTH"
+            ).upper().strip()
+            or "BOTH",
+            "client_order_id": str(response.get("clientOrderId", "")).strip(),
+            "updated_at": _isoformat(_utc_now()),
+        }
+
+    if len(refs) > 10000:
+        refs = dict(list(refs.items())[-10000:])
+
+    state["best_quote_volume_order_refs"] = refs
     try:
         state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError:
@@ -3752,6 +7027,17 @@ def _load_audit_state(path: Path) -> dict[str, Any]:
 
 
 def _should_sync_account_audit(audit_state: dict[str, Any], *, now: datetime) -> bool:
+    cooldown_until_raw = str((audit_state or {}).get("rate_limit_cooldown_until") or "").strip()
+    if cooldown_until_raw:
+        try:
+            cooldown_until = datetime.fromisoformat(cooldown_until_raw.replace("Z", "+00:00"))
+        except ValueError:
+            cooldown_until = None
+        if cooldown_until is not None:
+            if cooldown_until.tzinfo is None:
+                cooldown_until = cooldown_until.replace(tzinfo=timezone.utc)
+            if now.astimezone(timezone.utc) < cooldown_until.astimezone(timezone.utc):
+                return False
     updated_at_raw = str((audit_state or {}).get("updated_at") or "").strip()
     if not updated_at_raw:
         return True
@@ -3822,6 +7108,7 @@ def _sync_account_audit(
     cycle: int,
     summary_path: Path,
     recv_window: int,
+    args: argparse.Namespace | None = None,
 ) -> dict[str, Any]:
     credentials = load_binance_api_credentials()
     if credentials is None:
@@ -3833,10 +7120,14 @@ def _sync_account_audit(
     audit_state = _load_audit_state(audit_state_path)
     now = datetime.now(timezone.utc)
     if not _should_sync_account_audit(audit_state, now=now):
+        cooldown_until = str(audit_state.get("rate_limit_cooldown_until") or "").strip()
+        skipped = f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s"
+        if cooldown_until:
+            skipped = f"rate_limit_cooldown_until={cooldown_until}"
         return {
             "trade_appended": 0,
             "income_appended": 0,
-            "skipped": f"throttled<{int(AUDIT_SYNC_MIN_INTERVAL_SECONDS)}s",
+            "skipped": skipped,
             "trade_audit_path": str(audit_paths["trade_audit"]),
             "income_audit_path": str(audit_paths["income_audit"]),
             "audit_state_path": str(audit_state_path),
@@ -3852,28 +7143,81 @@ def _sync_account_audit(
     if income_start_time_ms <= 0:
         income_start_time_ms = int(audit_state.get("session_start_time_ms") or 0) or default_start_time_ms
 
-    trade_rows = _fetch_trade_rows_since(
-        symbol=symbol,
-        api_key=api_key,
-        api_secret=api_secret,
-        start_time_ms=trade_start_time_ms,
-        recv_window=recv_window,
-    )
-    fresh_trades, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
-        rows=trade_rows,
+    observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
+
+    observed_fresh_trades, observed_trade_last_time_ms, observed_trade_keys_at_time = collect_new_rows(
+        rows=observed_trade_rows,
         last_time_ms=int(audit_state.get("trade_last_time_ms") or 0) or None,
         last_keys_at_time=list(audit_state.get("trade_last_keys_at_time", [])),
         row_time_ms=trade_row_time_ms,
         row_key=trade_row_key,
     )
 
-    income_rows = _fetch_income_rows_since(
-        symbol=symbol,
-        api_key=api_key,
-        api_secret=api_secret,
-        start_time_ms=income_start_time_ms,
-        recv_window=recv_window,
+    trade_rows: list[dict[str, Any]] = []
+    trade_rest_backfill_performed = False
+    if _should_backfill_trade_rest(
+        audit_state,
+        now_utc=now,
+        observed_trade_appended=len(observed_fresh_trades),
+    ):
+        try:
+            trade_rows = _fetch_trade_rows_since(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                start_time_ms=trade_start_time_ms,
+                recv_window=recv_window,
+            )
+        except RuntimeError as exc:
+            message = str(exc)
+            if "-1003" in message or "Too many requests" in message or "local cooldown active" in message:
+                cooldown_until = now.astimezone(timezone.utc) + timedelta(
+                    seconds=max(AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS, AUDIT_SYNC_MIN_INTERVAL_SECONDS)
+                )
+                audit_state.update(
+                    {
+                        "symbol": symbol.upper().strip(),
+                        "updated_at": now.isoformat(),
+                        "rate_limit_cooldown_until": cooldown_until.isoformat(),
+                        "rate_limit_error": message,
+                    }
+                )
+                _write_json(audit_state_path, audit_state)
+            raise
+        trade_rest_backfill_performed = True
+    fresh_trades, trade_last_time_ms, trade_keys_at_time = collect_new_rows(
+        rows=trade_rows,
+        last_time_ms=observed_trade_last_time_ms,
+        last_keys_at_time=observed_trade_keys_at_time,
+        row_time_ms=trade_row_time_ms,
+        row_key=trade_row_key,
     )
+    fresh_trades = [*observed_fresh_trades, *fresh_trades]
+
+    try:
+        income_rows = _fetch_income_rows_since(
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            start_time_ms=income_start_time_ms,
+            recv_window=recv_window,
+        )
+    except RuntimeError as exc:
+        message = str(exc)
+        if "-1003" in message or "Too many requests" in message or "local cooldown active" in message:
+            cooldown_until = now.astimezone(timezone.utc) + timedelta(
+                seconds=max(AUDIT_SYNC_RATE_LIMIT_COOLDOWN_SECONDS, AUDIT_SYNC_MIN_INTERVAL_SECONDS)
+            )
+            audit_state.update(
+                {
+                    "symbol": symbol.upper().strip(),
+                    "updated_at": now.isoformat(),
+                    "rate_limit_cooldown_until": cooldown_until.isoformat(),
+                    "rate_limit_error": message,
+                }
+            )
+            _write_json(audit_state_path, audit_state)
+        raise
     fresh_income, income_last_time_ms, income_keys_at_time = collect_new_rows(
         rows=income_rows,
         last_time_ms=int(audit_state.get("income_last_time_ms") or 0) or None,
@@ -3883,16 +7227,44 @@ def _sync_account_audit(
     )
 
     synced_at = datetime.now(timezone.utc).isoformat()
+    trade_payloads: list[dict[str, Any]] = []
+    income_payloads: list[dict[str, Any]] = []
     for row in fresh_trades:
         payload = dict(row)
         payload["audit_cycle"] = cycle
         payload["audit_synced_at"] = synced_at
+        trade_payloads.append(payload)
         _append_jsonl(audit_paths["trade_audit"], payload)
     for row in fresh_income:
         payload = dict(row)
         payload["audit_cycle"] = cycle
         payload["audit_synced_at"] = synced_at
+        income_payloads.append(payload)
         _append_jsonl(audit_paths["income_audit"], payload)
+
+    db_status: dict[str, Any] = {"enabled": trade_database_enabled(), "trade_inserted": 0, "income_inserted": 0}
+    if trade_database_enabled() and (trade_payloads or income_payloads):
+        try:
+            ensure_trade_database_schema()
+            db_status = persist_trade_rows(
+                symbol=symbol,
+                market_type="futures",
+                strategy_mode=(
+                    str(getattr(args, "strategy_profile", "") or getattr(args, "strategy_mode", "") or "unknown")
+                    if args is not None
+                    else "unknown"
+                ),
+                config=vars(args) if args is not None else {},
+                trade_rows=trade_payloads,
+                income_rows=income_payloads,
+            )
+        except Exception as exc:
+            db_status = {
+                "enabled": True,
+                "trade_inserted": 0,
+                "income_inserted": 0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
     session_start_time_ms = int(audit_state.get("session_start_time_ms") or 0)
     earliest_appended_trade_time = min((trade_row_time_ms(item) for item in fresh_trades), default=0)
@@ -3914,8 +7286,11 @@ def _sync_account_audit(
             "trade_last_keys_at_time": trade_keys_at_time,
             "income_last_time_ms": income_last_time_ms,
             "income_last_keys_at_time": income_keys_at_time,
+            "trade_rest_last_sync_at": synced_at if trade_rest_backfill_performed else audit_state.get("trade_rest_last_sync_at"),
         }
     )
+    audit_state.pop("rate_limit_cooldown_until", None)
+    audit_state.pop("rate_limit_error", None)
     _write_json(audit_state_path, audit_state)
     return {
         "trade_appended": len(fresh_trades),
@@ -3923,6 +7298,8 @@ def _sync_account_audit(
         "trade_audit_path": str(audit_paths["trade_audit"]),
         "income_audit_path": str(audit_paths["income_audit"]),
         "audit_state_path": str(audit_state_path),
+        "trade_rest_backfill_performed": trade_rest_backfill_performed,
+        "database": db_status,
     }
 
 
@@ -3941,6 +7318,703 @@ def _filter_futures_strategy_orders(open_orders: Iterable[Any], symbol: str) -> 
         for order in open_orders
         if isinstance(order, dict) and _is_futures_strategy_order(order, symbol)
     ]
+
+
+def _maybe_start_runner_user_data_stream(args: argparse.Namespace) -> FuturesUserDataStream | None:
+    credentials = load_binance_api_credentials()
+    if credentials is None:
+        setattr(args, "user_data_stream", None)
+        return None
+    api_key, _api_secret = credentials
+    try:
+        stream = FuturesUserDataStream(api_key=api_key)
+        stream.start()
+        setattr(args, "user_data_stream", stream)
+        return stream
+    except Exception as exc:
+        setattr(args, "user_data_stream", None)
+        print(f"[user-data-stream] disabled for {getattr(args, 'symbol', '')}: {exc}")
+        return None
+
+
+def _snapshot_runner_execution_events(args: argparse.Namespace, *, max_events: int = 5) -> list[dict[str, Any]]:
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_events"):
+        return []
+    try:
+        events = list(stream.snapshot_events())
+    except Exception:
+        return []
+    payloads: list[dict[str, Any]] = []
+    for event in events[-max_events:]:
+        payloads.append(
+            {
+                "kind": str(getattr(event, "kind", "") or ""),
+                "symbol": str(getattr(event, "symbol", "") or ""),
+                "event_time": getattr(event, "event_time", None),
+                "transaction_time": getattr(event, "transaction_time", None),
+                "order_id": getattr(event, "order_id", None),
+                "client_order_id": str(getattr(event, "client_order_id", "") or ""),
+                "side": str(getattr(event, "side", "") or ""),
+                "execution_type": str(getattr(event, "execution_type", "") or ""),
+                "order_status": str(getattr(event, "order_status", "") or ""),
+                "last_filled_qty": _safe_float(getattr(event, "last_filled_qty", 0.0)),
+                "cumulative_filled_qty": _safe_float(getattr(event, "cumulative_filled_qty", 0.0)),
+                "last_filled_price": _safe_float(getattr(event, "last_filled_price", 0.0)),
+                "realized_pnl": _safe_float(getattr(event, "realized_pnl", 0.0)),
+            }
+        )
+    return payloads
+
+
+def _runner_user_data_stream_status(args: argparse.Namespace) -> dict[str, Any]:
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None:
+        return {"enabled": False, "connection_state": "disabled"}
+    if not hasattr(stream, "status"):
+        return {"enabled": True, "connection_state": "unknown"}
+    try:
+        status = dict(stream.status())
+    except Exception as exc:
+        return {"enabled": True, "connection_state": "status_error", "last_error": str(exc)}
+    status["enabled"] = True
+    return status
+
+
+def _drain_new_runner_execution_events(args: argparse.Namespace, *, max_events: int = 50) -> list[dict[str, Any]]:
+    events = _snapshot_runner_execution_events(args, max_events=max_events)
+    seen = getattr(args, "_seen_execution_event_keys", None)
+    if not isinstance(seen, set):
+        seen = set()
+        setattr(args, "_seen_execution_event_keys", seen)
+    fresh: list[dict[str, Any]] = []
+    for item in events:
+        key = (
+            item.get("kind"),
+            item.get("symbol"),
+            item.get("order_id"),
+            item.get("client_order_id"),
+            item.get("transaction_time"),
+            item.get("last_filled_qty"),
+            item.get("last_filled_price"),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        fresh.append(item)
+    return fresh
+
+
+def _summarize_runner_strategy_execution_events(
+    args: argparse.Namespace,
+    symbol: str,
+    *,
+    max_events: int = 200,
+) -> dict[str, Any]:
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    events = [
+        item
+        for item in _snapshot_runner_execution_events(args, max_events=max_events)
+        if str(item.get("symbol") or "").upper().strip() == symbol.upper().strip()
+        and str(item.get("client_order_id") or "").startswith(strategy_prefix)
+    ]
+    counts: dict[str, int] = {}
+    filled_client_order_ids: list[str] = []
+    canceled_client_order_ids: list[str] = []
+    for item in events:
+        kind = str(item.get("kind") or "")
+        counts[kind] = counts.get(kind, 0) + 1
+        client_order_id = str(item.get("client_order_id") or "")
+        if kind == "ORDER_FILLED" and client_order_id:
+            filled_client_order_ids.append(client_order_id)
+        if kind in {"ORDER_CANCELED", "ORDER_EXPIRED"} and client_order_id:
+            canceled_client_order_ids.append(client_order_id)
+    return {
+        "observed_event_count": len(events),
+        "counts": counts,
+        "filled_client_order_ids": filled_client_order_ids,
+        "canceled_client_order_ids": canceled_client_order_ids,
+        "latest_events": events[-5:],
+    }
+
+
+def _summarize_runner_strategy_open_order_state(
+    args: argparse.Namespace,
+    symbol: str,
+    *,
+    max_events: int = 500,
+) -> dict[str, Any]:
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    stream = getattr(args, "user_data_stream", None)
+    if stream is not None and hasattr(stream, "snapshot_open_orders"):
+        stream_age = None
+        if hasattr(stream, "open_order_state_age_seconds"):
+            try:
+                stream_age = stream.open_order_state_age_seconds()
+            except Exception:
+                stream_age = None
+        try:
+            open_orders = [
+                dict(item)
+                for item in list(stream.snapshot_open_orders())
+                if isinstance(item, dict)
+                and str(item.get("symbol") or "").upper().strip() == symbol.upper().strip()
+                and str(item.get("clientOrderId") or "").startswith(strategy_prefix)
+            ]
+        except Exception:
+            open_orders = []
+        if (
+            stream_age is not None
+            and stream_age <= OPEN_ORDER_STREAM_MAX_AGE_SECONDS
+        ):
+            return {
+                "active_order_count": len(open_orders),
+                "active_client_order_ids": [str(item.get("clientOrderId") or "") for item in open_orders],
+                "active_order_ids": [item.get("orderId") for item in open_orders],
+                "latest_events": [],
+                "source": "stream_open_orders",
+                "stream_age_seconds": stream_age,
+            }
+    events = [
+        item
+        for item in _snapshot_runner_execution_events(args, max_events=max_events)
+        if str(item.get("symbol") or "").upper().strip() == symbol.upper().strip()
+        and str(item.get("client_order_id") or "").startswith(strategy_prefix)
+    ]
+    active_by_client_order_id: dict[str, dict[str, Any]] = {}
+    terminal_statuses = {"ORDER_FILLED", "ORDER_CANCELED", "ORDER_EXPIRED"}
+    for item in events:
+        client_order_id = str(item.get("client_order_id") or "")
+        if not client_order_id:
+            continue
+        kind = str(item.get("kind") or "")
+        if kind in terminal_statuses:
+            active_by_client_order_id.pop(client_order_id, None)
+        else:
+            active_by_client_order_id[client_order_id] = item
+    active_items = list(active_by_client_order_id.values())
+    return {
+        "active_order_count": len(active_items),
+        "active_client_order_ids": [str(item.get("client_order_id") or "") for item in active_items],
+        "active_order_ids": [item.get("order_id") for item in active_items],
+        "latest_events": events[-5:],
+        "source": "observed_events",
+    }
+
+
+def _snapshot_runner_account_position(
+    args: argparse.Namespace | None,
+    symbol: str,
+    *,
+    position_side: str | None = None,
+    max_age_seconds: float = ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+) -> dict[str, Any] | None:
+    if args is None:
+        return None
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_account_positions"):
+        return None
+    wanted_symbol = symbol.upper().strip()
+    wanted_side = str(position_side or "BOTH").upper().strip() or "BOTH"
+    try:
+        positions = list(stream.snapshot_account_positions())
+    except Exception:
+        return None
+    best: dict[str, Any] | None = None
+    best_observed_at = -1.0
+    now = time.monotonic()
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol") or "").upper().strip() != wanted_symbol:
+            continue
+        item_side = str(item.get("positionSide") or "BOTH").upper().strip() or "BOTH"
+        if item_side != wanted_side:
+            continue
+        observed_at = _safe_float(item.get("observed_at"))
+        if max_age_seconds >= 0 and (observed_at <= 0 or now - observed_at > max_age_seconds):
+            continue
+        if observed_at >= best_observed_at:
+            best = item
+            best_observed_at = observed_at
+    if best is None:
+        return None
+    result = dict(best)
+    result["stream_age_seconds"] = max(now - best_observed_at, 0.0) if best_observed_at > 0 else None
+    return result
+
+
+def _runner_account_position_stream_age_seconds(args: argparse.Namespace | None) -> float | None:
+    if args is None:
+        return None
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None:
+        return None
+    if hasattr(stream, "status"):
+        try:
+            status = dict(stream.status())
+            value = status.get("last_account_update_age_seconds")
+            if value is not None:
+                return max(_safe_float(value), 0.0)
+        except Exception:
+            pass
+    store = getattr(stream, "account_position_store", None)
+    if store is not None and hasattr(store, "last_update_age_seconds"):
+        try:
+            value = store.last_update_age_seconds()
+            if value is not None:
+                return max(_safe_float(value), 0.0)
+        except Exception:
+            pass
+    return None
+
+
+def _snapshot_runner_account_positions(
+    args: argparse.Namespace | None,
+    symbol: str,
+    *,
+    max_age_seconds: float = ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+) -> list[dict[str, Any]]:
+    if args is None:
+        return []
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_account_positions"):
+        return []
+    wanted_symbol = symbol.upper().strip()
+    now = time.monotonic()
+    try:
+        positions = list(stream.snapshot_account_positions())
+    except Exception:
+        return []
+    fresh: list[dict[str, Any]] = []
+    for item in positions:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("symbol") or "").upper().strip() != wanted_symbol:
+            continue
+        observed_at = _safe_float(item.get("observed_at"))
+        if max_age_seconds >= 0 and (observed_at <= 0 or now - observed_at > max_age_seconds):
+            continue
+        cloned = dict(item)
+        cloned["stream_age_seconds"] = max(now - observed_at, 0.0) if observed_at > 0 else None
+        fresh.append(cloned)
+    return fresh
+
+
+def _stream_account_info_snapshot(args: argparse.Namespace | None, symbol: str) -> dict[str, Any] | None:
+    positions = _snapshot_runner_account_positions(args, symbol)
+    if not positions:
+        return None
+    return {
+        "multiAssetsMargin": bool(getattr(args, "_cached_multi_assets_margin", False)),
+        "positions": positions,
+        "source": "user_data_stream",
+    }
+
+
+def _fetch_runner_account_info_rest(
+    api_key: str,
+    api_secret: str,
+    *,
+    recv_window: int,
+) -> dict[str, Any]:
+    return fetch_futures_account_info_v3(api_key, api_secret, recv_window=recv_window, use_cache=False)
+
+
+def _stream_open_orders_snapshot(
+    args: argparse.Namespace | None,
+    symbol: str,
+    *,
+    max_account_position_stream_age_seconds: float | None = ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+) -> list[dict[str, Any]] | None:
+    if args is None:
+        return None
+    if max_account_position_stream_age_seconds is not None and max_account_position_stream_age_seconds >= 0:
+        account_position_age = _runner_account_position_stream_age_seconds(args)
+        if account_position_age is None or account_position_age > max_account_position_stream_age_seconds:
+            return None
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_open_orders"):
+        return None
+    stream_age = None
+    if hasattr(stream, "open_order_state_age_seconds"):
+        try:
+            stream_age = stream.open_order_state_age_seconds()
+        except Exception:
+            stream_age = None
+    if stream_age is None or stream_age > OPEN_ORDER_STREAM_MAX_AGE_SECONDS:
+        return None
+    wanted_symbol = symbol.upper().strip()
+    try:
+        return [
+            dict(item)
+            for item in list(stream.snapshot_open_orders())
+            if isinstance(item, dict)
+            and str(item.get("symbol") or "").upper().strip() == wanted_symbol
+        ]
+    except Exception:
+        return None
+
+
+def _fetch_runner_position_mode_cached(
+    args: argparse.Namespace,
+    api_key: str,
+    api_secret: str,
+    *,
+    recv_window: int,
+) -> dict[str, Any]:
+    cached = getattr(args, "_cached_position_mode", None)
+    cached_at = _safe_float(getattr(args, "_cached_position_mode_at", 0.0))
+    now = time.monotonic()
+    if isinstance(cached, dict) and cached_at > 0 and now - cached_at <= POSITION_MODE_CACHE_TTL_SECONDS:
+        result = dict(cached)
+        result["source"] = "cache"
+        return result
+    result = dict(fetch_futures_position_mode(api_key, api_secret, recv_window=recv_window))
+    setattr(args, "_cached_position_mode", dict(result))
+    setattr(args, "_cached_position_mode_at", now)
+    return result
+
+
+def _resolve_runner_account_snapshot(
+    args: argparse.Namespace,
+    *,
+    symbol: str,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+    require_account_mode: bool = False,
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, str]]:
+    sources: dict[str, str] = {}
+    stream_account_position_age = _runner_account_position_stream_age_seconds(args)
+    account_info = _fetch_runner_account_info_rest(api_key, api_secret, recv_window=recv_window)
+    sources["account_info"] = "rest"
+    if stream_account_position_age is not None:
+        sources["account_position_stream_age_seconds"] = f"{stream_account_position_age:.6f}"
+    setattr(args, "_cached_multi_assets_margin", _truthy(account_info.get("multiAssetsMargin")))
+    open_orders = _stream_open_orders_snapshot(
+        args,
+        symbol,
+        max_account_position_stream_age_seconds=ACCOUNT_POSITION_STREAM_MAX_AGE_SECONDS,
+    )
+    if open_orders is None:
+        open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window)
+        sources["open_orders"] = "rest"
+        stream = getattr(args, "user_data_stream", None)
+        if stream is not None and hasattr(stream, "replace_open_orders_from_rest"):
+            try:
+                stream.replace_open_orders_from_rest(_filter_futures_strategy_orders(open_orders, symbol))
+            except Exception:
+                pass
+    else:
+        sources["open_orders"] = "user_data_stream"
+    return account_info, list(open_orders), sources
+
+
+def _trade_event_to_audit_row(event: Any) -> dict[str, Any]:
+    event_time = int(getattr(event, "event_time", 0) or 0)
+    transaction_time = int(getattr(event, "transaction_time", 0) or 0) or event_time
+    last_filled_qty = _safe_float(getattr(event, "last_filled_qty", 0.0))
+    last_filled_price = _safe_float(getattr(event, "last_filled_price", 0.0))
+    order_id = getattr(event, "order_id", None)
+    client_order_id = str(getattr(event, "client_order_id", "") or "")
+    return {
+        "id": f"{order_id}:{client_order_id}:{transaction_time}:{last_filled_qty}:{last_filled_price}",
+        "orderId": order_id,
+        "clientOrderId": client_order_id,
+        "symbol": str(getattr(event, "symbol", "") or "").upper().strip(),
+        "side": str(getattr(event, "side", "") or "").upper().strip(),
+        "positionSide": str(getattr(event, "position_side", "") or "").upper().strip(),
+        "time": transaction_time,
+        "price": last_filled_price,
+        "qty": last_filled_qty,
+        "quoteQty": last_filled_qty * last_filled_price,
+        "realizedPnl": _safe_float(getattr(event, "realized_pnl", 0.0)),
+        "commission": _safe_float(getattr(event, "commission", 0.0)),
+        "commissionAsset": str(getattr(event, "commission_asset", "") or "").upper().strip(),
+        "executionType": str(getattr(event, "execution_type", "") or "").upper().strip(),
+        "orderStatus": str(getattr(event, "order_status", "") or "").upper().strip(),
+        "source": "user_data_stream",
+    }
+
+
+def _collect_runner_observed_trade_rows(
+    args: argparse.Namespace | None,
+    *,
+    symbol: str,
+) -> list[dict[str, Any]]:
+    if args is None:
+        return []
+    stream = getattr(args, "user_data_stream", None)
+    if stream is None or not hasattr(stream, "snapshot_events"):
+        return []
+    observed_trade_rows: list[dict[str, Any]] = []
+    try:
+        for event in list(stream.snapshot_events()):
+            kind = str(getattr(event, "kind", "") or "").strip().upper()
+            if kind not in {"ORDER_FILLED", "ORDER_PARTIALLY_FILLED"}:
+                continue
+            if str(getattr(event, "symbol", "") or "").upper().strip() != symbol.upper().strip():
+                continue
+            if _safe_float(getattr(event, "last_filled_qty", 0.0)) <= 0:
+                continue
+            observed_trade_rows.append(_trade_event_to_audit_row(event))
+    except Exception:
+        return []
+    return observed_trade_rows
+
+
+def _should_backfill_trade_rest(
+    audit_state: dict[str, Any],
+    *,
+    now_utc: datetime | str,
+    observed_trade_appended: int,
+) -> bool:
+    if int(observed_trade_appended or 0) <= 0:
+        return True
+    current = now_utc
+    if isinstance(current, str):
+        current = datetime.fromisoformat(current.replace("Z", "+00:00"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    last_sync_raw = str(audit_state.get("trade_rest_last_sync_at") or "")
+    if not last_sync_raw:
+        return True
+    try:
+        last_sync = datetime.fromisoformat(last_sync_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    elapsed = (current.astimezone(timezone.utc) - last_sync.astimezone(timezone.utc)).total_seconds()
+    return elapsed >= TRADE_REST_BACKFILL_MIN_INTERVAL_SECONDS
+
+
+def _should_backfill_open_orders_rest(
+    reconcile_state: dict[str, Any],
+    *,
+    now_utc: datetime | str,
+    observed_active_order_count: int,
+    expected_open_order_count: int,
+    observed_source: str = "",
+) -> bool:
+    observed_diff = int(observed_active_order_count or 0) - int(expected_open_order_count or 0)
+    if (
+        abs(observed_diff) > PROTECTIVE_OPEN_ORDER_DIFF_LIMIT
+        and str(observed_source or "").strip() != "stream_open_orders"
+    ):
+        return True
+    current = now_utc
+    if isinstance(current, str):
+        current = datetime.fromisoformat(current.replace("Z", "+00:00"))
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=timezone.utc)
+    last_sync_raw = str(reconcile_state.get("open_orders_rest_last_sync_at") or "")
+    if not last_sync_raw:
+        return True
+    try:
+        last_sync = datetime.fromisoformat(last_sync_raw.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if last_sync.tzinfo is None:
+        last_sync = last_sync.replace(tzinfo=timezone.utc)
+    elapsed = (current.astimezone(timezone.utc) - last_sync.astimezone(timezone.utc)).total_seconds()
+    return elapsed >= OPEN_ORDERS_REST_BACKFILL_MIN_INTERVAL_SECONDS
+
+
+def apply_execution_request_budget_to_actions(
+    *,
+    validation: dict[str, Any],
+    report: dict[str, Any],
+    max_mutations_per_cycle: int = 0,
+    max_cancels_per_cycle: int = 0,
+    max_places_per_cycle: int = 0,
+) -> dict[str, Any]:
+    actions = dict(validation.get("actions") or {})
+    cancel_orders = list(actions.get("cancel_orders") or [])
+    place_orders = list(actions.get("place_orders") or [])
+    safe_max_mutations = max(int(max_mutations_per_cycle or 0), 0)
+    safe_max_cancels = max(int(max_cancels_per_cycle or 0), 0)
+    safe_max_places = max(int(max_places_per_cycle or 0), 0)
+    cancel_limit = len(cancel_orders) if safe_max_cancels <= 0 else min(len(cancel_orders), safe_max_cancels)
+    place_limit = len(place_orders) if safe_max_places <= 0 else min(len(place_orders), safe_max_places)
+    if safe_max_mutations > 0:
+        cancel_limit = min(cancel_limit, safe_max_mutations)
+        place_limit = min(place_limit, max(safe_max_mutations - cancel_limit, 0))
+    kept_cancel_orders = cancel_orders[:cancel_limit]
+    kept_place_orders = place_orders[:place_limit]
+    deferred_cancel_orders = cancel_orders[cancel_limit:]
+    deferred_place_orders = place_orders[place_limit:]
+    actions["cancel_orders"] = kept_cancel_orders
+    actions["place_orders"] = kept_place_orders
+    actions["cancel_count"] = len(kept_cancel_orders)
+    actions["place_count"] = len(kept_place_orders)
+    actions["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    updated = dict(validation)
+    updated["actions"] = actions
+    report["execution_request_budget"] = {
+        "max_mutations_per_cycle": safe_max_mutations,
+        "max_cancels_per_cycle": safe_max_cancels,
+        "max_places_per_cycle": safe_max_places,
+        "applied": bool(safe_max_mutations or safe_max_cancels or safe_max_places),
+        "executed_cancel_count": len(kept_cancel_orders),
+        "executed_place_count": len(kept_place_orders),
+        "deferred_cancel_count": len(deferred_cancel_orders),
+        "deferred_place_count": len(deferred_place_orders),
+        "deferred_cancel_orders": deferred_cancel_orders,
+        "deferred_place_orders": deferred_place_orders,
+    }
+    return updated
+
+
+def prioritize_inventory_reducing_place_orders(
+    *,
+    actions: dict[str, Any],
+    current_actual_net_qty: float,
+    current_long_avg_price: float = 0.0,
+    current_short_avg_price: float = 0.0,
+    step_price: float = 0.0,
+    tick_size: float | None = None,
+    min_profit_ratio: float | None = None,
+) -> dict[str, Any]:
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders or abs(_safe_float(current_actual_net_qty)) <= 1e-12:
+        return actions
+
+    reducing_side = "SELL" if _safe_float(current_actual_net_qty) > 0 else "BUY"
+    safe_step = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
+    safe_profit_ratio = max(_safe_float(min_profit_ratio), 0.0)
+    long_cost = max(_safe_float(current_long_avg_price), 0.0)
+    short_cost = max(_safe_float(current_short_avg_price), 0.0)
+    long_profit_floor = (
+        max(
+            long_cost + safe_step if safe_step > 0 else 0.0,
+            long_cost * (1.0 + safe_profit_ratio) if safe_profit_ratio > 0 else 0.0,
+        )
+        if long_cost > 0
+        else 0.0
+    )
+    short_profit_ceiling = (
+        min(
+            value
+            for value in (
+                short_cost - safe_step if safe_step > 0 else None,
+                short_cost * (1.0 - safe_profit_ratio) if safe_profit_ratio > 0 else None,
+            )
+            if value is not None and value > 0
+        )
+        if short_cost > 0 and (safe_step > 0 or safe_profit_ratio > 0)
+        else 0.0
+    )
+    long_low_entry_ceiling = max(long_cost - safe_step, 0.0) if long_cost > 0 and safe_step > 0 else 0.0
+    short_high_entry_floor = short_cost + safe_step if short_cost > 0 and safe_step > 0 else 0.0
+
+    def priority(order: dict[str, Any]) -> tuple[int, int]:
+        side = str(order.get("side", "")).upper().strip()
+        role = str(order.get("role", "") or "").strip().lower()
+        price = _safe_float(order.get("price"))
+        reduce_like = (
+            bool(order.get("force_reduce_only"))
+            or "reduce" in role
+            or role.startswith("take_profit")
+            or role in {"best_quote_entry_short", "best_quote_entry_long"}
+        )
+        low_cost_entry = (
+            side == "BUY"
+            and role == "best_quote_entry_long"
+            and long_low_entry_ceiling > 0
+            and price <= long_low_entry_ceiling + 1e-12
+        )
+        high_cost_entry = (
+            side == "SELL"
+            and role == "best_quote_entry_short"
+            and short_high_entry_floor > 0
+            and price + 1e-12 >= short_high_entry_floor
+        )
+        profitable_reduce = (
+            side == "SELL"
+            and reducing_side == "SELL"
+            and reduce_like
+            and (long_profit_floor <= 0 or price + 1e-12 >= long_profit_floor)
+        ) or (
+            side == "BUY"
+            and reducing_side == "BUY"
+            and reduce_like
+            and (short_profit_ceiling <= 0 or price <= short_profit_ceiling + 1e-12)
+        )
+        if profitable_reduce:
+            return (0, 0)
+        if low_cost_entry or high_cost_entry:
+            return (1, 0)
+        if side == reducing_side and reduce_like:
+            return (2, 0)
+        if side == reducing_side:
+            return (3, 0)
+        return (4, 0)
+
+    prioritized = sorted(enumerate(place_orders), key=lambda item: (*priority(item[1]), item[0]))
+    result = dict(actions)
+    result["place_orders"] = [item for _, item in prioritized]
+    result["place_count"] = len(result["place_orders"])
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in result["place_orders"])
+    result["inventory_reducing_place_priority"] = {
+        "enabled": True,
+        "current_actual_net_qty": _safe_float(current_actual_net_qty),
+        "reducing_side": reducing_side,
+        "long_profit_floor": long_profit_floor or None,
+        "long_low_entry_ceiling": long_low_entry_ceiling or None,
+        "short_profit_ceiling": short_profit_ceiling or None,
+        "short_high_entry_floor": short_high_entry_floor or None,
+    }
+    return result
+
+
+def _maybe_sleep_between_execution_requests(args: argparse.Namespace) -> None:
+    interval = _safe_float(getattr(args, "execution_request_min_interval_seconds", 0.0))
+    if interval > 0:
+        time.sleep(interval)
+
+
+def _change_initial_leverage_with_cache(
+    *,
+    args: argparse.Namespace,
+    symbol: str,
+    leverage: int,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+) -> dict[str, Any]:
+    ttl = _safe_float(
+        getattr(args, "leverage_change_cache_ttl_seconds", EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS)
+    )
+    cache_key = f"{symbol.upper().strip()}:{int(leverage)}"
+    cached_key = str(getattr(args, "_cached_execution_leverage_key", "") or "")
+    cached_at = _safe_float(getattr(args, "_cached_execution_leverage_at", 0.0))
+    now = time.monotonic()
+    if ttl > 0 and cached_key == cache_key and cached_at > 0 and now - cached_at <= ttl:
+        return {
+            "skipped": True,
+            "source": "cache",
+            "symbol": symbol,
+            "leverage": int(leverage),
+            "age_seconds": now - cached_at,
+            "ttl_seconds": ttl,
+        }
+    try:
+        response = post_futures_change_initial_leverage(
+            symbol=symbol,
+            leverage=leverage,
+            api_key=api_key,
+            api_secret=api_secret,
+            recv_window=recv_window,
+        )
+    except RuntimeError as exc:
+        if not _ignore_noop_error(exc, ("no need to change leverage", "same leverage")):
+            raise
+        response = {"ignored_error": str(exc)}
+    setattr(args, "_cached_execution_leverage_key", cache_key)
+    setattr(args, "_cached_execution_leverage_at", now)
+    return response
 
 
 def _flatten_pid_path(symbol: str) -> Path:
@@ -4022,12 +8096,16 @@ def _load_futures_runtime_guard_inputs(
     runtime_guard_stats_start_time: Any = None,
     symbol: str,
     now: datetime | None = None,
+    state_path: Path | None = None,
+    bq_book_scope: str | None = None,
 ) -> tuple[float, list[dict[str, Any]], datetime | None]:
     return summarize_futures_runtime_guard_inputs(
         summary_path,
         runtime_guard_stats_start_time=runtime_guard_stats_start_time,
         symbol=symbol,
         now=now,
+        bq_order_refs_path=state_path,
+        bq_book_scope=bq_book_scope,
     )
 
 
@@ -4048,20 +8126,620 @@ def _cancel_futures_strategy_orders(
         client_order_id = str(order.get("clientOrderId", "") or "")
         if not client_order_id.startswith(strategy_prefix) or is_flatten_order(order, flatten_prefix):
             continue
-        delete_futures_order(
-            symbol=symbol,
-            api_key=api_key,
-            api_secret=api_secret,
-            order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
-            orig_client_order_id=client_order_id or None,
-            recv_window=recv_window,
-        )
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
+                orig_client_order_id=client_order_id or None,
+                recv_window=recv_window,
+            )
+        except RuntimeError as exc:
+            if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                raise
         count += 1
     return count
 
 
+def _is_reduce_only_strategy_order_like(order: dict[str, Any], *, strategy_mode: str) -> bool:
+    if _truthy(order.get("reduceOnly")):
+        return True
+    side = str(order.get("side", "")).upper().strip()
+    role = _order_role(order)
+    return _resolve_reduce_only_flag(strategy_mode=strategy_mode, side=side, role=role) is True
+
+
+def _cancel_futures_strategy_entry_orders(
+    *,
+    symbol: str,
+    strategy_mode: str,
+    api_key: str,
+    api_secret: str,
+    recv_window: int,
+    state: dict[str, Any] | None = None,
+) -> int:
+    strategy_prefix = _strategy_client_order_prefix(symbol)
+    flatten_prefix = flatten_client_order_prefix(symbol)
+    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=recv_window, use_cache=False)
+    decorated_orders = (
+        _decorate_synthetic_open_orders(state=state, open_orders=list(open_orders))
+        if isinstance(state, dict) and _is_synthetic_neutral_mode(strategy_mode)
+        else list(open_orders)
+    )
+    by_client_order_id = {
+        str(item.get("clientOrderId", "") or ""): item
+        for item in decorated_orders
+        if isinstance(item, dict)
+    }
+    count = 0
+    for order in open_orders:
+        if not isinstance(order, dict):
+            continue
+        client_order_id = str(order.get("clientOrderId", "") or "")
+        if not client_order_id.startswith(strategy_prefix) or is_flatten_order(order, flatten_prefix):
+            continue
+        decorated = by_client_order_id.get(client_order_id, order)
+        if _is_reduce_only_strategy_order_like(decorated, strategy_mode=strategy_mode):
+            continue
+        try:
+            delete_futures_order(
+                symbol=symbol,
+                api_key=api_key,
+                api_secret=api_secret,
+                order_id=int(order["orderId"]) if str(order.get("orderId", "")).strip() else None,
+                orig_client_order_id=client_order_id or None,
+                recv_window=recv_window,
+            )
+        except RuntimeError as exc:
+            if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                raise
+        count += 1
+    return count
+
+
+def _protective_synthetic_drift_threshold_notional(args: argparse.Namespace) -> float:
+    configured = _safe_float(getattr(args, "max_synthetic_drift_notional", None))
+    per_order = _safe_float(getattr(args, "per_order_notional", None))
+    candidates = [PROTECTIVE_SYNTHETIC_DRIFT_MIN_NOTIONAL]
+    if configured > 0:
+        candidates.append(configured)
+    if per_order > 0:
+        candidates.append(per_order * 2.0)
+    return max(candidates)
+
+
+def _protective_entry_stop(
+    *,
+    args: argparse.Namespace,
+    symbol: str,
+    strategy_mode: str,
+    api_key: str,
+    api_secret: str,
+    reason: str,
+    details: dict[str, Any],
+    state: dict[str, Any] | None = None,
+    state_path: Path | None = None,
+) -> None:
+    canceled_count = _cancel_futures_strategy_entry_orders(
+        symbol=symbol,
+        strategy_mode=strategy_mode,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=int(getattr(args, "recv_window", 5000)),
+        state=state,
+    )
+    if isinstance(state, dict):
+        state["protective_entry_stop"] = {
+            "triggered": True,
+            "triggered_at": _isoformat(_utc_now()),
+            "reason": reason,
+            "details": dict(details),
+            "canceled_entry_order_count": canceled_count,
+        }
+        if state_path is not None:
+            _write_json(state_path, state)
+    raise ProtectiveEntryStopError(
+        f"protective entry stop: {reason}; canceled_entry_order_count={canceled_count}; details={details}"
+    )
+
+
 def _synthetic_drift_notional(mid_price: float, synthetic_drift_qty: float) -> float:
     return abs(float(synthetic_drift_qty)) * max(float(mid_price), 0.0)
+
+
+def _runtime_guard_loss_recovery_enabled(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "runtime_guard_loss_recovery_enabled", True))
+
+
+def _runtime_guard_loss_recovery_state(state: dict[str, Any]) -> dict[str, Any]:
+    recovery = state.get("runtime_guard_loss_recovery")
+    if not isinstance(recovery, dict):
+        recovery = {}
+        state["runtime_guard_loss_recovery"] = recovery
+    return recovery
+
+
+def _runtime_guard_best_quote_volume_ledger_synced(state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    if not isinstance(state, Mapping):
+        return False
+    ledger = state.get("best_quote_volume_ledger")
+    if not isinstance(ledger, Mapping):
+        return False
+    return bool(ledger.get("initialized")) and bool(ledger.get("sync_ok", True))
+
+
+def _runtime_guard_should_use_bq_isolated_loss(args: argparse.Namespace, state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    return (
+        _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+        and _has_best_quote_frozen_inventory_position(state)
+        and _runtime_guard_best_quote_volume_ledger_synced(state)
+    )
+
+
+def _is_best_quote_volume_runtime_pnl_event(event: Mapping[str, Any] | dict[str, Any], symbol: str) -> bool:
+    if not isinstance(event, Mapping):
+        return False
+    client_order_id = str(
+        event.get("client_order_id")
+        or event.get("clientOrderId")
+        or event.get("origClientOrderId")
+        or ""
+    ).lower()
+    if not client_order_id:
+        return False
+    if not client_order_id.startswith(_strategy_client_order_prefix(symbol).lower()):
+        return False
+    if "frozen" in client_order_id or "manual" in client_order_id or "pairrel" in client_order_id:
+        return False
+    return "bestquot" in client_order_id or "bestquote" in client_order_id
+
+
+def _runtime_guard_isolated_bq_pnl_events(
+    *,
+    args: argparse.Namespace,
+    state: Mapping[str, Any] | dict[str, Any],
+    pnl_events: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    symbol = str(getattr(args, "symbol", "") or "").upper().strip()
+    if not _runtime_guard_should_use_bq_isolated_loss(args, state):
+        reason = "best_quote_volume_ledger_not_synced"
+        if not _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", ""))):
+            reason = "not_hedge_best_quote_mode"
+        elif not _has_best_quote_frozen_inventory_position(state):
+            reason = "no_frozen_inventory_position"
+        return pnl_events, {
+            "enabled": False,
+            "source": "mixed_runtime_audit",
+            "reason": reason,
+        }
+    filtered = [
+        dict(event)
+        for event in pnl_events
+        if _is_best_quote_volume_runtime_pnl_event(event, symbol)
+    ]
+    return filtered, {
+        "enabled": True,
+        "source": "best_quote_volume_ledger_orders",
+        "reason": "frozen_and_manual_inventory_pnl_isolated",
+        "mixed_event_count": len(pnl_events),
+        "bq_event_count": len(filtered),
+    }
+
+
+def _runtime_guard_bq_isolated_loss_recovery_report(
+    args: argparse.Namespace,
+    state: Mapping[str, Any] | dict[str, Any],
+    *,
+    now: datetime,
+    recovered_at: datetime | None = None,
+) -> dict[str, Any]:
+    report: dict[str, Any] = {
+        "enabled": _runtime_guard_should_use_bq_isolated_loss(args, state),
+        "clear": False,
+        "source": "mixed_runtime_audit",
+    }
+    if not report["enabled"]:
+        if not _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", ""))):
+            report["reason"] = "not_hedge_best_quote_mode"
+        elif not _has_best_quote_frozen_inventory_position(state):
+            report["reason"] = "no_frozen_inventory_position"
+        else:
+            report["reason"] = "best_quote_volume_ledger_not_synced"
+        return report
+    summary_path_text = str(getattr(args, "summary_jsonl", "") or "").strip()
+    if not summary_path_text:
+        report["reason"] = "summary_jsonl_missing"
+        return report
+    try:
+        runtime_guard_config = normalize_runtime_guard_config(vars(args))
+        cumulative_gross_notional, pnl_events, _stats_start_time = _load_futures_runtime_guard_inputs(
+            Path(summary_path_text),
+            runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
+            symbol=str(getattr(args, "symbol", "") or "").upper().strip(),
+            now=now,
+            state_path=Path(str(getattr(args, "state_path", "") or "")),
+            bq_book_scope=(
+                BQ_BOOK_NORMAL
+                if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+                else None
+            ),
+        )
+        filtered_events = _filter_pnl_events_after(pnl_events, recovered_at)
+        isolated_events, scope = _runtime_guard_isolated_bq_pnl_events(
+            args=args,
+            state=state,
+            pnl_events=filtered_events,
+        )
+        result = evaluate_runtime_guards(
+            config=runtime_guard_config,
+            now=now,
+            cumulative_gross_notional=cumulative_gross_notional,
+            pnl_events=isolated_events,
+            actual_net_notional=0.0,
+            synthetic_drift_notional=0.0,
+            unrealized_pnl=0.0,
+        )
+    except Exception as exc:
+        report.update({"reason": "bq_isolated_loss_check_error", "error": f"{type(exc).__name__}: {exc}"})
+        return report
+    loss_reasons = {
+        "rolling_hourly_loss_limit_hit",
+        "rolling_hourly_loss_per_10k_limit_hit",
+    }
+    matched_loss_reasons = [reason for reason in result.matched_reasons if reason in loss_reasons]
+    report.update(
+        {
+            **scope,
+            "clear": not matched_loss_reasons,
+            "matched_loss_reasons": matched_loss_reasons,
+            "bq_rolling_hourly_loss": result.rolling_hourly_loss,
+            "bq_rolling_hourly_gross_notional": result.rolling_hourly_gross_notional,
+            "bq_rolling_hourly_loss_per_10k": result.rolling_hourly_loss_per_10k,
+            "bq_rolling_hourly_loss_per_10k_active": result.rolling_hourly_loss_per_10k_active,
+        }
+    )
+    return report
+
+
+def _runtime_guard_mark_loss_stop(
+    recovery: dict[str, Any],
+    *,
+    stopped_at: datetime,
+    rolling_hourly_loss: float,
+) -> None:
+    stopped_iso = stopped_at.astimezone(timezone.utc).isoformat()
+    recovery.update(
+        {
+            "stopped_at": stopped_iso,
+            "last_reason": "rolling_hourly_loss_limit_hit",
+            "last_rolling_hourly_loss": rolling_hourly_loss,
+        }
+    )
+    recovery.pop("recovered_at", None)
+
+
+def _runtime_guard_loss_recovery_blocks_submit(args: argparse.Namespace, *, now: datetime | None = None) -> dict[str, Any]:
+    report = {"blocked": False, "reason": None}
+    if not _runtime_guard_loss_recovery_enabled(args):
+        return report
+    state_path_text = str(getattr(args, "state_path", "") or "").strip()
+    if not state_path_text:
+        return report
+    state = read_json(Path(state_path_text)) or {}
+    if not isinstance(state, dict):
+        return report
+    recovery = state.get("runtime_guard_loss_recovery")
+    if not isinstance(recovery, dict):
+        return report
+    stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+    if stopped_at is None:
+        return report
+    recovered_at = _parse_state_datetime(recovery.get("recovered_at"))
+    if recovered_at is not None and recovered_at >= stopped_at:
+        return report
+    checked_at = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
+    cooldown_seconds = max(
+        _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", recovery.get("cooldown_seconds", 180.0))),
+        0.0,
+    )
+    elapsed = max((checked_at - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+    bq_loss_report = _runtime_guard_bq_isolated_loss_recovery_report(
+        args,
+        state,
+        now=checked_at,
+        recovered_at=recovered_at,
+    )
+    if bq_loss_report.get("enabled") and bq_loss_report.get("clear"):
+        recovery.update(
+            {
+                "recovered_at": checked_at.isoformat(),
+                "last_reason": "bq_isolated_loss_clear_after_mixed_loss_stop",
+                "cooldown_elapsed_seconds": elapsed,
+                "cooldown_seconds": cooldown_seconds,
+                "bq_isolated_loss": bq_loss_report,
+            }
+        )
+        _clear_runtime_guard_manual_frozen_inventory_override(state)
+        _write_json(Path(state_path_text), state)
+        return report
+    if bq_loss_report.get("enabled"):
+        recovery["bq_isolated_loss"] = bq_loss_report
+    if _has_best_quote_frozen_inventory_position(state):
+        plan_path_text = str(getattr(args, "plan_json", "") or "").strip()
+        plan_report = read_json(Path(plan_path_text)) if plan_path_text else {}
+        if not isinstance(plan_report, dict):
+            plan_report = {}
+        strategy_flat = _runtime_guard_strategy_exposure_is_flat(plan_report)
+        try:
+            stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=checked_at)
+        except Exception as exc:
+            stable = bool(recovery.get("market_stable"))
+            stable_report = {
+                "available": False,
+                "warning": f"{type(exc).__name__}: {exc}",
+                **(recovery.get("market") if isinstance(recovery.get("market"), dict) else {}),
+            }
+        recovery.update(
+            {
+                "last_checked_at": checked_at.isoformat(),
+                "cooldown_elapsed_seconds": elapsed,
+                "cooldown_seconds": cooldown_seconds,
+                "flat": strategy_flat,
+                "flat_basis": "strategy_exposure_excluding_frozen_inventory",
+                "market_stable": stable,
+                "market": stable_report,
+            }
+        )
+        if elapsed >= cooldown_seconds and strategy_flat and stable:
+            recovery.update(
+                {
+                    "recovered_at": checked_at.isoformat(),
+                    "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
+                }
+            )
+            _clear_runtime_guard_manual_frozen_inventory_override(state)
+            _write_json(Path(state_path_text), state)
+            return report
+        _write_json(Path(state_path_text), state)
+    return {
+        "blocked": True,
+        "reason": "runtime_guard_loss_cooling_down",
+        "stopped_at": stopped_at.isoformat(),
+        "elapsed_seconds": elapsed,
+        "cooldown_seconds": cooldown_seconds,
+        "last_reason": recovery.get("last_reason"),
+        "last_rolling_hourly_loss": recovery.get("last_rolling_hourly_loss"),
+    }
+
+
+def _is_frozen_inventory_manual_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
+    role = str((order or {}).get("role") or "").strip()
+    return (
+        role.startswith("frozen_inventory_manual_reduce_")
+        or role.startswith("frozen_inventory_manual_limit_")
+        or role.startswith("frozen_inventory_pair_release_")
+        or bool((order or {}).get("manual_frozen_inventory_reduce"))
+        or bool((order or {}).get("manual_frozen_inventory_limit"))
+        or bool((order or {}).get("frozen_inventory_pair_release"))
+    )
+
+
+def _is_authorized_frozen_inventory_order(order: Mapping[str, Any] | dict[str, Any]) -> bool:
+    if not _is_frozen_inventory_manual_order(order):
+        return True
+    return bool(str((order or {}).get("frozen_inventory_request_id") or "").strip())
+
+
+def _has_pending_frozen_inventory_manual_directive(state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    manual_reduce = state.get("best_quote_frozen_inventory_manual_reduce") if isinstance(state, Mapping) else None
+    manual_limit = state.get("best_quote_frozen_inventory_manual_limit") if isinstance(state, Mapping) else None
+    pair_release = state.get("best_quote_frozen_inventory_pair_release") if isinstance(state, Mapping) else None
+
+    def _has_requested(raw: Any) -> bool:
+        if not isinstance(raw, dict):
+            return False
+        if bool(raw.get("requested")):
+            return True
+        return any(isinstance(item, dict) and bool(item.get("requested")) for item in raw.values())
+
+    return _has_requested(manual_reduce) or _has_requested(manual_limit) or _has_requested(pair_release)
+
+
+def _clear_runtime_guard_manual_frozen_inventory_override(state: dict[str, Any]) -> bool:
+    changed = state.pop("runtime_guard_manual_frozen_inventory_override", None) is not None
+    recovery = state.get("runtime_guard_loss_recovery")
+    if isinstance(recovery, dict):
+        for key in (
+            "manual_frozen_inventory_override",
+            "manual_frozen_inventory_override_reason",
+        ):
+            if key in recovery:
+                recovery.pop(key, None)
+                changed = True
+    return changed
+
+
+def _has_best_quote_frozen_inventory_position(state: Mapping[str, Any] | dict[str, Any]) -> bool:
+    ledger = state.get("best_quote_frozen_inventory") if isinstance(state, Mapping) else None
+    if not isinstance(ledger, Mapping):
+        return False
+    return (
+        _safe_float(ledger.get("long_qty")) > 1e-12
+        or _safe_float(ledger.get("short_qty")) > 1e-12
+        or bool(ledger.get("long_lots"))
+        or bool(ledger.get("short_lots"))
+    )
+
+
+def _best_quote_frozen_inventory_qtys(state: Mapping[str, Any] | dict[str, Any]) -> tuple[float, float]:
+    ledger = state.get("best_quote_frozen_inventory") if isinstance(state, Mapping) else None
+    if not isinstance(ledger, Mapping):
+        return 0.0, 0.0
+    return max(_safe_float(ledger.get("long_qty")), 0.0), max(_safe_float(ledger.get("short_qty")), 0.0)
+
+
+def _suppress_place_orders_during_runtime_guard_loss_cooldown(
+    *,
+    actions: dict[str, Any],
+    args: argparse.Namespace,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    cooldown = _runtime_guard_loss_recovery_blocks_submit(args, now=now)
+    manual_override: dict[str, Any] = {}
+    if not cooldown.get("blocked"):
+        state_path = Path(getattr(args, "state_path", ""))
+        state = read_json(state_path) or {}
+        if isinstance(state, dict):
+            raw_override = state.get("runtime_guard_manual_frozen_inventory_override")
+            if isinstance(raw_override, dict) and raw_override.get("active"):
+                manual_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
+                if manual_directive_pending:
+                    manual_override = {
+                        "blocked": True,
+                        "reason": "runtime_guard_manual_frozen_inventory_override",
+                        "stop_reasons": list(raw_override.get("stop_reasons") or []),
+                        "last_checked_at": raw_override.get("last_checked_at"),
+                        "manual_directive_pending": True,
+                    }
+                else:
+                    if _clear_runtime_guard_manual_frozen_inventory_override(state):
+                        _write_json(state_path, state)
+        if not manual_override.get("blocked"):
+            return actions
+    block = cooldown if cooldown.get("blocked") else manual_override
+    block_key = "runtime_guard_loss_cooldown" if cooldown.get("blocked") else "runtime_guard_manual_frozen_inventory_override"
+    updated = dict(actions)
+    place_orders = [dict(item) for item in list(updated.get("place_orders") or []) if isinstance(item, dict)]
+    allowed = [dict(item) for item in place_orders if _is_frozen_inventory_manual_order(item)]
+    dropped = [dict(item) for item in place_orders if not _is_frozen_inventory_manual_order(item)]
+    updated["place_orders"] = allowed
+    updated["place_count"] = len(allowed)
+    updated[block_key] = block
+    if dropped:
+        updated[f"place_orders_dropped_by_{block_key}"] = dropped
+        updated[f"dropped_place_count_by_{block_key}"] = len(dropped)
+        if block_key != "runtime_guard_loss_cooldown":
+            updated["place_orders_dropped_by_runtime_guard_loss_cooldown"] = dropped
+            updated["dropped_place_count_by_runtime_guard_loss_cooldown"] = len(dropped)
+    if allowed:
+        updated[f"place_orders_allowed_by_{block_key}"] = allowed
+        updated[f"allowed_place_count_by_{block_key}"] = len(allowed)
+        if block_key != "runtime_guard_loss_cooldown":
+            updated["place_orders_allowed_by_runtime_guard_loss_cooldown"] = allowed
+            updated["allowed_place_count_by_runtime_guard_loss_cooldown"] = len(allowed)
+    return updated
+
+
+def _filter_pnl_events_after(pnl_events: list[dict[str, Any]], since: datetime | None) -> list[dict[str, Any]]:
+    if since is None:
+        return pnl_events
+    filtered: list[dict[str, Any]] = []
+    for event in pnl_events:
+        event_ts = _parse_state_datetime(event.get("ts"))
+        if event_ts is None or event_ts >= since:
+            filtered.append(event)
+    return filtered
+
+
+def _runtime_guard_snapshot_is_flat(
+    flatten_snapshot: dict[str, Any],
+    *,
+    min_notional: float = 5.0,
+    state: Mapping[str, Any] | dict[str, Any] | None = None,
+) -> bool:
+    if list(flatten_snapshot.get("orders", [])):
+        return False
+    bid_price = _safe_float(flatten_snapshot.get("bid_price"))
+    ask_price = _safe_float(flatten_snapshot.get("ask_price"))
+    mid_price = (bid_price + ask_price) / 2.0 if bid_price > 0 and ask_price > 0 else max(bid_price, ask_price)
+    long_qty = abs(_safe_float(flatten_snapshot.get("long_qty")))
+    short_qty = abs(_safe_float(flatten_snapshot.get("short_qty")))
+    if state is not None:
+        frozen_long_qty, frozen_short_qty = _best_quote_frozen_inventory_qtys(state)
+        long_qty = max(long_qty - frozen_long_qty, 0.0)
+        short_qty = max(short_qty - frozen_short_qty, 0.0)
+    net_qty = abs(long_qty - short_qty)
+    if mid_price <= 0:
+        return max(net_qty, long_qty, short_qty) <= 1e-12
+    return max(net_qty, long_qty, short_qty) * mid_price <= max(_safe_float(min_notional), 0.0)
+
+
+def _runtime_guard_strategy_exposure_is_flat(
+    plan_report: Mapping[str, Any] | dict[str, Any],
+    *,
+    min_notional: float = 5.0,
+) -> bool:
+    mid_price = _safe_float(plan_report.get("mid_price"))
+    if mid_price <= 0:
+        bid_price = _safe_float(plan_report.get("bid_price"))
+        ask_price = _safe_float(plan_report.get("ask_price"))
+        mid_price = (bid_price + ask_price) / 2.0 if bid_price > 0 and ask_price > 0 else max(bid_price, ask_price)
+    current_long_qty = max(_safe_float(plan_report.get("current_long_qty")), 0.0)
+    current_short_qty = max(_safe_float(plan_report.get("current_short_qty")), 0.0)
+    strategy_actual_net_notional = plan_report.get("strategy_actual_net_notional")
+    if strategy_actual_net_notional is not None:
+        strategy_net_notional = abs(_safe_float(strategy_actual_net_notional))
+    elif mid_price > 0:
+        strategy_net_notional = abs(current_long_qty - current_short_qty) * mid_price
+    else:
+        strategy_net_notional = abs(current_long_qty - current_short_qty)
+    long_notional = (
+        abs(_safe_float(plan_report.get("current_long_notional")))
+        if plan_report.get("current_long_notional") is not None
+        else (current_long_qty * mid_price if mid_price > 0 else current_long_qty)
+    )
+    short_notional = (
+        abs(_safe_float(plan_report.get("current_short_notional")))
+        if plan_report.get("current_short_notional") is not None
+        else (current_short_qty * mid_price if mid_price > 0 else current_short_qty)
+    )
+    synthetic_drift_notional = _synthetic_drift_notional(mid_price, _safe_float(plan_report.get("synthetic_drift_qty")))
+    return max(strategy_net_notional, long_notional, short_notional, synthetic_drift_notional) <= max(
+        _safe_float(min_notional),
+        0.0,
+    )
+
+
+def _runtime_guard_market_is_stable_for_recovery(
+    args: argparse.Namespace,
+    *,
+    now: datetime,
+) -> tuple[bool, dict[str, Any]]:
+    max_amp_1m = max(_safe_float(getattr(args, "runtime_guard_loss_recovery_max_1m_amplitude_ratio", 0.012)), 0.0)
+    max_amp_3m = max(_safe_float(getattr(args, "runtime_guard_loss_recovery_max_3m_amplitude_ratio", 0.025)), 0.0)
+    guard = assess_market_guard(
+        symbol=args.symbol.upper().strip(),
+        buy_pause_amp_trigger_ratio=max_amp_1m,
+        buy_pause_down_return_trigger_ratio=-max_amp_1m,
+        short_cover_pause_amp_trigger_ratio=max_amp_1m,
+        short_cover_pause_down_return_trigger_ratio=-max_amp_1m,
+        freeze_shift_abs_return_trigger_ratio=max_amp_1m,
+        now=now,
+        force_fetch=True,
+    )
+    amp_1m = _safe_float(guard.get("amplitude_ratio"))
+    window_3m = guard.get("window_3m") if isinstance(guard.get("window_3m"), dict) else {}
+    amp_3m = _safe_float(window_3m.get("amplitude_ratio"))
+    stable = (
+        bool(guard.get("available"))
+        and (max_amp_1m <= 0 or amp_1m <= max_amp_1m)
+        and (max_amp_3m <= 0 or amp_3m <= max_amp_3m)
+        and not bool(guard.get("buy_pause_active"))
+        and not bool(guard.get("short_cover_pause_active"))
+        and not bool(guard.get("shift_frozen"))
+    )
+    return stable, {
+        "available": bool(guard.get("available")),
+        "warning": guard.get("warning"),
+        "amplitude_1m": amp_1m,
+        "amplitude_3m": amp_3m,
+        "max_amplitude_1m": max_amp_1m,
+        "max_amplitude_3m": max_amp_3m,
+        "buy_pause_active": bool(guard.get("buy_pause_active")),
+        "short_cover_pause_active": bool(guard.get("short_cover_pause_active")),
+        "shift_frozen": bool(guard.get("shift_frozen")),
+    }
 
 
 def _build_runtime_guard_stop_summary(
@@ -4099,6 +8777,7 @@ def _build_runtime_guard_stop_summary(
     synthetic_net_qty = _safe_float(metric_source.get("synthetic_net_qty"))
     synthetic_drift_qty = _safe_float(metric_source.get("synthetic_drift_qty"))
     synthetic_drift_notional = _synthetic_drift_notional(mid_price, synthetic_drift_qty)
+    unrealized_pnl = _safe_float(metric_source.get("unrealized_pnl"))
 
     return {
         "ts": cycle_started_at.isoformat(),
@@ -4117,6 +8796,7 @@ def _build_runtime_guard_stop_summary(
         "current_short_notional": current_short_notional,
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_notional,
+        "unrealized_pnl": unrealized_pnl,
         "synthetic_net_qty": synthetic_net_qty,
         "synthetic_drift_qty": synthetic_drift_qty,
         "synthetic_drift_notional": synthetic_drift_notional,
@@ -4210,10 +8890,17 @@ def _build_runtime_guard_stop_summary(
         "runtime_guard_stats_start_time": stats_start_time.isoformat() if stats_start_time else None,
         "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
         "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+        "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,
+        "rolling_hourly_loss_per_10k": runtime_guard_result.rolling_hourly_loss_per_10k,
+        "rolling_hourly_loss_per_10k_active": runtime_guard_result.rolling_hourly_loss_per_10k_active,
+        "rolling_hourly_loss_per_10k_limit": runtime_guard_config.rolling_hourly_loss_per_10k_limit,
+        "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
         "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
         "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
         "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
         "max_synthetic_drift_notional": runtime_guard_config.max_synthetic_drift_notional,
+        "max_unrealized_loss": runtime_guard_config.max_unrealized_loss,
+        "unrealized_loss": runtime_guard_result.unrealized_loss,
         "flatten_started": bool(flatten_result.get("started")),
         "flatten_already_running": bool(flatten_result.get("already_running")),
     }
@@ -4232,24 +8919,203 @@ def _maybe_handle_runtime_guard(
             runtime_guard_config.run_start_time,
             runtime_guard_config.run_end_time,
             runtime_guard_config.rolling_hourly_loss_limit,
+            runtime_guard_config.rolling_hourly_loss_per_10k_limit,
             runtime_guard_config.max_cumulative_notional,
+            runtime_guard_config.max_actual_net_notional,
+            runtime_guard_config.max_synthetic_drift_notional,
+            runtime_guard_config.max_unrealized_loss,
         )
     ):
         return None
+    state_path = Path(getattr(args, "state_path", ""))
+    state = read_json(state_path) or {}
+    if not isinstance(state, dict):
+        state = {}
+    recovery = _runtime_guard_loss_recovery_state(state)
+    recovered_at = _parse_state_datetime(recovery.get("recovered_at"))
+
     cumulative_gross_notional, pnl_events, stats_start_time = _load_futures_runtime_guard_inputs(
         summary_path,
         runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
         symbol=args.symbol.upper().strip(),
         now=cycle_started_at,
+        state_path=state_path,
+        bq_book_scope=(
+            BQ_BOOK_NORMAL
+            if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+            else None
+        ),
     )
+    pnl_events_for_guard = _filter_pnl_events_after(pnl_events, recovered_at)
+    pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
+        args=args,
+        state=state,
+        pnl_events=pnl_events_for_guard,
+    )
+    latest_plan_report = read_json(Path(getattr(args, "plan_json", ""))) or {}
+    if not isinstance(latest_plan_report, dict):
+        latest_plan_report = {}
+    latest_mid_price = _safe_float(latest_plan_report.get("mid_price"))
+    latest_synthetic_drift_notional = _synthetic_drift_notional(
+        latest_mid_price,
+        _safe_float(latest_plan_report.get("synthetic_drift_qty")),
+    )
+    guard_actual_net_notional = latest_plan_report.get("strategy_actual_net_notional")
+    if guard_actual_net_notional is None:
+        guard_actual_net_notional = latest_plan_report.get("actual_net_notional")
+    guard_unrealized_pnl = latest_plan_report.get("strategy_unrealized_pnl")
+    if guard_unrealized_pnl is None:
+        guard_unrealized_pnl = latest_plan_report.get("unrealized_pnl")
     runtime_guard_result = evaluate_runtime_guards(
         config=runtime_guard_config,
         now=cycle_started_at,
         cumulative_gross_notional=cumulative_gross_notional,
-        pnl_events=pnl_events,
+        pnl_events=pnl_events_for_guard,
+        actual_net_notional=_safe_float(guard_actual_net_notional),
+        synthetic_drift_notional=latest_synthetic_drift_notional,
+        unrealized_pnl=_safe_float(guard_unrealized_pnl),
     )
     if runtime_guard_result.tradable:
+        recovery["loss_scope"] = runtime_guard_loss_scope
+        if _clear_runtime_guard_manual_frozen_inventory_override(state):
+            _write_json(state_path, state)
         return None
+    loss_only_stop = runtime_guard_result.matched_reasons in (
+        ["rolling_hourly_loss_limit_hit"],
+        ["rolling_hourly_loss_per_10k_limit_hit"],
+    )
+    frozen_inventory_present = _has_best_quote_frozen_inventory_position(state)
+    manual_frozen_directive_pending = _has_pending_frozen_inventory_manual_directive(state)
+    if frozen_inventory_present and not manual_frozen_directive_pending:
+        if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+            stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+            if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            elif stopped_at is None:
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            cooldown_seconds = max(
+                _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
+                0.0,
+            )
+            elapsed = (
+                max((cycle_started_at.astimezone(timezone.utc) - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+                if stopped_at is not None
+                else 0.0
+            )
+            strategy_flat = _runtime_guard_strategy_exposure_is_flat(latest_plan_report)
+            try:
+                stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=cycle_started_at)
+            except Exception as exc:
+                stable = bool(recovery.get("market_stable"))
+                stable_report = {
+                    "available": False,
+                    "warning": f"{type(exc).__name__}: {exc}",
+                    **(recovery.get("market") if isinstance(recovery.get("market"), dict) else {}),
+                }
+            recovery.update(
+                {
+                    "last_checked_at": cycle_started_at.isoformat(),
+                    "cooldown_elapsed_seconds": elapsed,
+                    "cooldown_seconds": cooldown_seconds,
+                    "flat": strategy_flat,
+                    "flat_basis": "strategy_exposure_excluding_frozen_inventory",
+                    "market_stable": stable,
+                    "market": stable_report,
+                    "frozen_inventory_isolated_from_bq_volume": True,
+                    "last_reason": "rolling_hourly_loss_limit_hit_excluding_frozen_inventory",
+                    "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                    "loss_scope": runtime_guard_loss_scope,
+                }
+            )
+            if elapsed >= cooldown_seconds and strategy_flat and stable:
+                recovery.update(
+                    {
+                        "recovered_at": cycle_started_at.astimezone(timezone.utc).isoformat(),
+                        "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
+                    }
+                )
+        cleared_manual_override = _clear_runtime_guard_manual_frozen_inventory_override(state)
+        if cleared_manual_override or loss_only_stop:
+            _write_json(state_path, state)
+        return None
+    if frozen_inventory_present or manual_frozen_directive_pending:
+        if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+            stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+            if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            elif stopped_at is None:
+                _runtime_guard_mark_loss_stop(
+                    recovery,
+                    stopped_at=cycle_started_at,
+                    rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                )
+                stopped_at = cycle_started_at.astimezone(timezone.utc)
+            cooldown_seconds = max(
+                _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
+                0.0,
+            )
+            elapsed = (
+                max((cycle_started_at.astimezone(timezone.utc) - stopped_at.astimezone(timezone.utc)).total_seconds(), 0.0)
+                if stopped_at is not None
+                else 0.0
+            )
+            strategy_flat = _runtime_guard_strategy_exposure_is_flat(latest_plan_report)
+            stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=cycle_started_at)
+            recovery.update(
+                {
+                    "last_checked_at": cycle_started_at.isoformat(),
+                    "cooldown_elapsed_seconds": elapsed,
+                    "cooldown_seconds": cooldown_seconds,
+                    "flat": strategy_flat,
+                    "flat_basis": "strategy_exposure_excluding_frozen_inventory",
+                    "market_stable": stable,
+                    "market": stable_report,
+                    "manual_frozen_inventory_override": True,
+                    "manual_frozen_inventory_override_reason": "allow_reduce_only_frozen_inventory_directive",
+                }
+            )
+            if elapsed >= cooldown_seconds and strategy_flat and stable:
+                recovered_at = cycle_started_at.astimezone(timezone.utc)
+                recovery.update(
+                    {
+                        "recovered_at": recovered_at.isoformat(),
+                        "last_reason": "market_stable_after_loss_stop_excluding_frozen_inventory",
+                        "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                        "loss_scope": runtime_guard_loss_scope,
+                    }
+                )
+                _clear_runtime_guard_manual_frozen_inventory_override(state)
+                _write_json(state_path, state)
+                return None
+        state["runtime_guard_manual_frozen_inventory_override"] = {
+            "active": True,
+            "last_checked_at": cycle_started_at.isoformat(),
+            "runtime_status": runtime_guard_result.runtime_status,
+            "stop_reason": runtime_guard_result.primary_reason,
+            "stop_reasons": list(runtime_guard_result.matched_reasons or []),
+            "reason": "allow_reduce_only_frozen_inventory_directive",
+            "frozen_inventory_present": frozen_inventory_present,
+            "manual_directive_pending": manual_frozen_directive_pending,
+        }
+        _write_json(state_path, state)
+        return None
+    if _clear_runtime_guard_manual_frozen_inventory_override(state):
+        _write_json(state_path, state)
     credentials = load_binance_api_credentials()
     if credentials is None:
         raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
@@ -4267,9 +9133,56 @@ def _maybe_handle_runtime_guard(
         api_secret,
         allow_loss=True,
     )
-    if list(flatten_snapshot.get("orders", [])):
+    if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+        stopped_at = _parse_state_datetime(recovery.get("stopped_at"))
+        if recovered_at is not None and (stopped_at is None or recovered_at >= stopped_at):
+            _runtime_guard_mark_loss_stop(
+                recovery,
+                stopped_at=cycle_started_at,
+                rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+            )
+            stopped_at = cycle_started_at.astimezone(timezone.utc)
+        if stopped_at is not None:
+            cooldown_seconds = max(
+                _safe_float(getattr(args, "runtime_guard_loss_recovery_cooldown_seconds", 180.0)),
+                0.0,
+            )
+            elapsed = max((cycle_started_at.astimezone(timezone.utc) - stopped_at).total_seconds(), 0.0)
+            flat = _runtime_guard_snapshot_is_flat(flatten_snapshot, state=state)
+            stable, stable_report = _runtime_guard_market_is_stable_for_recovery(args, now=cycle_started_at)
+            recovery.update(
+                {
+                    "last_checked_at": cycle_started_at.isoformat(),
+                    "cooldown_elapsed_seconds": elapsed,
+                    "cooldown_seconds": cooldown_seconds,
+                    "flat": flat,
+                    "market_stable": stable,
+                    "market": stable_report,
+                    "loss_scope": runtime_guard_loss_scope,
+                }
+            )
+            if elapsed >= cooldown_seconds and flat and stable:
+                recovered_at = cycle_started_at.astimezone(timezone.utc)
+                recovery.update(
+                    {
+                        "recovered_at": recovered_at.isoformat(),
+                        "last_reason": "market_stable_after_loss_stop",
+                        "last_rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
+                        "loss_scope": runtime_guard_loss_scope,
+                    }
+                )
+                _write_json(state_path, state)
+                return None
+        if stopped_at is None:
+            _runtime_guard_mark_loss_stop(
+                recovery,
+                stopped_at=cycle_started_at,
+                rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+            )
+        _write_json(state_path, state)
+    if list(flatten_snapshot.get("orders", [])) and not (loss_only_stop and _runtime_guard_loss_recovery_enabled(args)):
         flatten_result = _start_futures_flatten_process(args.symbol.upper().strip(), allow_loss=True)
-    return _build_runtime_guard_stop_summary(
+    summary = _build_runtime_guard_stop_summary(
         args=args,
         cycle=cycle,
         cycle_started_at=cycle_started_at,
@@ -4280,6 +9193,13 @@ def _maybe_handle_runtime_guard(
         flatten_result=flatten_result,
         flatten_snapshot=flatten_snapshot,
     )
+    if loss_only_stop and _runtime_guard_loss_recovery_enabled(args):
+        summary["runtime_status"] = "cooldown"
+        summary["stop_triggered"] = False
+        summary["stop_reason"] = "rolling_hourly_loss_cooling_down"
+        summary["runtime_guard_loss_recovery"] = dict(recovery)
+    summary["runtime_guard_loss_scope"] = runtime_guard_loss_scope
+    return summary
 
 
 def apply_position_controls(
@@ -4291,14 +9211,16 @@ def apply_position_controls(
     min_mid_price_for_buys: float | None,
     external_buy_pause: bool = False,
     external_pause_reasons: list[str] | None = None,
+    open_entry_long_notional: float = 0.0,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
+    projected_long_notional = current_long_notional + max(_safe_float(open_entry_long_notional), 0.0)
     buy_paused = bool(external_buy_pause)
     reasons: list[str] = list(external_pause_reasons or [])
-    if pause_buy_position_notional is not None and current_long_notional >= pause_buy_position_notional:
+    if pause_buy_position_notional is not None and projected_long_notional >= pause_buy_position_notional:
         buy_paused = True
         reasons.append(
-            f"current_long_notional={_float(current_long_notional)} >= pause_buy_position_notional={_float(pause_buy_position_notional)}"
+            f"projected_long_notional={_float(projected_long_notional)} >= pause_buy_position_notional={_float(pause_buy_position_notional)}"
         )
     if min_mid_price_for_buys is not None and mid_price <= min_mid_price_for_buys:
         buy_paused = True
@@ -4312,6 +9234,7 @@ def apply_position_controls(
         "buy_paused": buy_paused,
         "pause_reasons": reasons,
         "current_long_notional": current_long_notional,
+        "projected_long_notional": projected_long_notional,
     }
 
 
@@ -4385,12 +9308,16 @@ def apply_hedge_position_controls(
     external_pause_reasons: list[str] | None = None,
     external_short_pause: bool = False,
     external_short_pause_reasons: list[str] | None = None,
+    open_entry_long_notional: float = 0.0,
+    open_entry_short_notional: float = 0.0,
     preserve_long_entry_on_inventory_pause: bool = False,
     preserve_short_entry_on_external_pause: bool = False,
     preserve_short_entry_on_inventory_pause: bool = False,
 ) -> dict[str, Any]:
     current_long_notional = max(current_long_qty, 0.0) * max(mid_price, 0.0)
     current_short_notional = max(current_short_qty, 0.0) * max(mid_price, 0.0)
+    projected_long_notional = current_long_notional + max(_safe_float(open_entry_long_notional), 0.0)
+    projected_short_notional = current_short_notional + max(_safe_float(open_entry_short_notional), 0.0)
     long_paused = bool(external_long_pause)
     short_paused = bool(external_short_pause)
     inventory_long_paused = False
@@ -4398,17 +9325,17 @@ def apply_hedge_position_controls(
     long_reasons: list[str] = list(external_pause_reasons or [])
     short_reasons: list[str] = list(external_short_pause_reasons or [])
 
-    if pause_long_position_notional is not None and current_long_notional >= pause_long_position_notional:
+    if pause_long_position_notional is not None and projected_long_notional >= pause_long_position_notional:
         long_paused = True
         inventory_long_paused = True
         long_reasons.append(
-            f"current_long_notional={_float(current_long_notional)} >= pause_long_position_notional={_float(pause_long_position_notional)}"
+            f"projected_long_notional={_float(projected_long_notional)} >= pause_long_position_notional={_float(pause_long_position_notional)}"
         )
-    if pause_short_position_notional is not None and current_short_notional >= pause_short_position_notional:
+    if pause_short_position_notional is not None and projected_short_notional >= pause_short_position_notional:
         short_paused = True
         inventory_short_paused = True
         short_reasons.append(
-            f"current_short_notional={_float(current_short_notional)} >= pause_short_position_notional={_float(pause_short_position_notional)}"
+            f"projected_short_notional={_float(projected_short_notional)} >= pause_short_position_notional={_float(pause_short_position_notional)}"
         )
     if min_mid_price_for_buys is not None and mid_price <= min_mid_price_for_buys:
         long_paused = True
@@ -4417,7 +9344,12 @@ def apply_hedge_position_controls(
         )
 
     if long_paused:
-        keep_long_probe = preserve_long_entry_on_inventory_pause if inventory_long_paused else False
+        keep_long_probe = (
+            preserve_long_entry_on_inventory_pause
+            and max(_safe_float(open_entry_long_notional), 0.0) <= 1e-12
+            if inventory_long_paused
+            else False
+        )
         if not keep_long_probe:
             plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_long_entry_order(item)]
             plan["buy_orders"] = [item for item in plan.get("buy_orders", []) if not _is_long_entry_order(item)]
@@ -4425,6 +9357,7 @@ def apply_hedge_position_controls(
         plan["bootstrap_orders"] = [item for item in plan.get("bootstrap_orders", []) if not _is_short_entry_order(item)]
         keep_short_probe = (
             preserve_short_entry_on_inventory_pause
+            and max(_safe_float(open_entry_short_notional), 0.0) <= 1e-12
             if inventory_short_paused
             else preserve_short_entry_on_external_pause
         )
@@ -4440,6 +9373,8 @@ def apply_hedge_position_controls(
         "pause_reasons": long_reasons + short_reasons,
         "current_long_notional": current_long_notional,
         "current_short_notional": current_short_notional,
+        "projected_long_notional": projected_long_notional,
+        "projected_short_notional": projected_short_notional,
     }
 
 
@@ -4477,6 +9412,8 @@ def apply_take_profit_profit_guard(
     tick_size: float | None,
     bid_price: float,
     ask_price: float,
+    extra_long_guard_roles: Iterable[str] | None = None,
+    extra_short_guard_roles: Iterable[str] | None = None,
 ) -> dict[str, Any]:
     safe_ratio = max(_safe_float(min_profit_ratio), 0.0)
     long_pause_threshold = max(_safe_float(pause_long_position_notional), 0.0)
@@ -4513,6 +9450,10 @@ def apply_take_profit_profit_guard(
     synthetic_short_avg = max(_safe_float(synthetic_short_avg_price), 0.0)
     long_guard_roles = {"take_profit", "take_profit_long", "active_delever_long"}
     short_guard_roles = {"take_profit_short", "active_delever_short"}
+    if extra_long_guard_roles is not None:
+        long_guard_roles.update(str(role) for role in extra_long_guard_roles)
+    if extra_short_guard_roles is not None:
+        short_guard_roles.update(str(role) for role in extra_short_guard_roles)
 
     long_floor_candidates: list[float] = []
     short_ceiling_candidates: list[float] = []
@@ -5178,6 +10119,7 @@ def assess_adverse_inventory_reduce(
     long_trigger_ratio: float | None,
     short_trigger_ratio: float | None,
     target_ratio: float | None = None,
+    allow_short_below_pause_probe: bool = True,
 ) -> dict[str, Any]:
     report: dict[str, Any] = {
         "enabled": bool(enabled),
@@ -5243,8 +10185,11 @@ def assess_adverse_inventory_reduce(
     if (
         max(_safe_float(current_short_qty), 0.0) > 1e-12
         and short_pause > 0
-        and max(_safe_float(current_short_notional), 0.0) > min(
-            value for value in (short_pause, short_probe_floor) if value > 0
+        and max(_safe_float(current_short_notional), 0.0)
+        > (
+            min(value for value in (short_pause, short_probe_floor) if value > 0)
+            if allow_short_below_pause_probe and any(value > 0 for value in (short_pause, short_probe_floor))
+            else short_pause
         )
     ):
         if safe_short_cost <= 0:
@@ -5332,8 +10277,14 @@ def _build_adverse_reduce_order(
     min_qty: float | None,
     min_notional: float | None,
     aggressive: bool,
+    strategy_mode: str = "one_way_long",
 ) -> dict[str, Any] | None:
     normalized_side = str(side or "").upper().strip()
+    position_side = (
+        ("LONG" if normalized_side == "SELL" else "SHORT")
+        if str(strategy_mode or "").strip() == "hedge_neutral"
+        else "BOTH"
+    )
     rounded_price = _round_order_price(max(_safe_float(price), 0.0), tick_size, normalized_side)
     if rounded_price is None or rounded_price <= 0:
         return None
@@ -5350,7 +10301,7 @@ def _build_adverse_reduce_order(
         "qty": desired_qty,
         "notional": notional,
         "role": "adverse_reduce_long" if normalized_side == "SELL" else "adverse_reduce_short",
-        "position_side": "BOTH",
+        "position_side": position_side,
         "force_reduce_only": True,
         "execution_type": "aggressive" if aggressive else "maker",
         "time_in_force": "IOC" if aggressive else "GTX",
@@ -5378,6 +10329,7 @@ def apply_adverse_inventory_reduce(
     min_qty: float | None,
     min_notional: float | None,
     maker_timeout_seconds: float = 60.0,
+    strategy_mode: str = "one_way_long",
 ) -> dict[str, Any]:
     state_key = "adverse_inventory_reduce"
     safe_now = now.astimezone(timezone.utc) if now.tzinfo else now.replace(tzinfo=timezone.utc)
@@ -5431,6 +10383,7 @@ def apply_adverse_inventory_reduce(
             min_qty=min_qty,
             min_notional=min_notional,
             aggressive=aggressive,
+            strategy_mode=strategy_mode,
         )
         adverse_report[f"{normalized_key}_elapsed_seconds"] = elapsed
         adverse_report[f"{normalized_key}_aggressive"] = aggressive
@@ -5670,6 +10623,293 @@ def _build_near_market_release_seed_orders(
     return orders
 
 
+def _inventory_unlock_default_report() -> dict[str, Any]:
+    return {
+        "enabled": True,
+        "active": False,
+        "candidate": False,
+        "side": None,
+        "stall_count": 0,
+        "confirm_cycles": 3,
+        "reason": None,
+        "current_notional": 0.0,
+        "pause_notional": None,
+        "target_notional": None,
+        "release_cap_notional": 0.0,
+        "release_order_notional": 0.0,
+        "release_price": None,
+        "release_qty": 0.0,
+        "release_order_count": 0,
+        "reentry_block_active": False,
+        "reentry_cooldown_cycles": 0,
+        "blocked_entry_order_count": 0,
+        "reentry_reference_price": None,
+        "reentry_gate_price": None,
+    }
+
+
+def _resolve_inventory_unlock_release_cap(*, args: Any, fallback_notional: float) -> float:
+    for attr in (
+        "loss_inventory_no_cross_small_entry_notional",
+        "loss_recovery_brush_entry_notional",
+        "adverse_reduce_max_order_notional",
+    ):
+        value = max(_safe_float(getattr(args, attr, None)), 0.0)
+        if value > 0:
+            return value
+    return max(_safe_float(fallback_notional), 0.0)
+
+
+def _resolve_inventory_unlock_pause_notional(
+    *,
+    args: Any,
+    strategy_mode: str,
+    side: str,
+    fallback_pause_notional: float | None,
+    open_entry_notional: float = 0.0,
+    pending_entry_buffer_notional: float = 0.0,
+) -> float | None:
+    if not _is_best_quote_maker_volume_mode(strategy_mode):
+        return fallback_pause_notional
+    soft_ratio = _clamp_ratio(_safe_float(getattr(args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)))
+    if soft_ratio <= 0:
+        return fallback_pause_notional
+    if str(side or "").strip().lower() == "short":
+        limit = max(_safe_float(getattr(args, "best_quote_maker_volume_max_short_notional", 0.0)), 0.0)
+    else:
+        limit = max(_safe_float(getattr(args, "best_quote_maker_volume_max_long_notional", 0.0)), 0.0)
+    soft_notional = limit * soft_ratio
+    if soft_notional <= 0:
+        return fallback_pause_notional
+    soft_notional = max(
+        soft_notional - max(_safe_float(open_entry_notional), 0.0) - max(_safe_float(pending_entry_buffer_notional), 0.0),
+        0.0,
+    )
+    if soft_notional <= 0:
+        return fallback_pause_notional
+    fallback = max(_safe_float(fallback_pause_notional), 0.0)
+    if fallback <= 0:
+        return soft_notional
+    return min(fallback, soft_notional)
+
+
+def apply_inventory_unlock_release(
+    *,
+    plan: dict[str, Any],
+    state: dict[str, Any],
+    side: str,
+    entry_paused: bool,
+    take_profit_guard: dict[str, Any],
+    current_qty: float,
+    current_notional: float,
+    pause_notional: float | None,
+    release_cap_notional: float,
+    per_order_notional: float,
+    step_price: float,
+    tick_size: float | None,
+    step_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    bid_price: float,
+    ask_price: float,
+    confirm_cycles: int = 3,
+) -> dict[str, Any]:
+    report = _inventory_unlock_default_report()
+    normalized_side = str(side or "").strip().lower()
+    safe_confirm_cycles = max(int(confirm_cycles or 3), 1)
+    safe_qty = max(_safe_float(current_qty), 0.0)
+    safe_current_notional = max(_safe_float(current_notional), 0.0)
+    safe_pause_notional = max(_safe_float(pause_notional), 0.0)
+    safe_cap_notional = max(_safe_float(release_cap_notional), 0.0)
+    safe_per_order_notional = max(_safe_float(per_order_notional), 0.0)
+    report.update(
+        {
+            "side": normalized_side if normalized_side in {"long", "short"} else None,
+            "confirm_cycles": safe_confirm_cycles,
+            "current_notional": safe_current_notional,
+            "pause_notional": safe_pause_notional if safe_pause_notional > 0 else pause_notional,
+            "release_cap_notional": safe_cap_notional,
+        }
+    )
+
+    existing_state = state.get("inventory_unlock_release")
+    runtime_state = dict(existing_state) if isinstance(existing_state, dict) else {}
+    guard = dict(take_profit_guard or {})
+    floor_price = max(_safe_float(guard.get("long_floor_price")), 0.0)
+    ceiling_price = max(_safe_float(guard.get("short_ceiling_price")), 0.0)
+    long_floor_blocks = normalized_side == "long" and bool(guard.get("long_active")) and floor_price > max(_safe_float(ask_price), 0.0)
+    short_ceiling_blocks = (
+        normalized_side == "short"
+        and bool(guard.get("short_active"))
+        and ceiling_price > 0
+        and ceiling_price < max(_safe_float(bid_price), 0.0)
+    )
+    candidate = (
+        normalized_side in {"long", "short"}
+        and bool(entry_paused)
+        and safe_qty > 1e-12
+        and safe_pause_notional > 0
+        and safe_current_notional > safe_pause_notional
+        and safe_cap_notional > 0
+        and (long_floor_blocks or short_ceiling_blocks)
+    )
+    previous_reentry_cooldown = int(runtime_state.get("reentry_cooldown_cycles") or 0)
+    previous_target_notional = max(_safe_float(runtime_state.get("target_notional")), 0.0)
+    previous_release_price = max(_safe_float(runtime_state.get("release_price")), 0.0)
+    reentry_gap = max(_safe_float(step_price), _safe_float(tick_size), 0.0)
+    reentry_block_active = (
+        not candidate
+        and runtime_state.get("side") == normalized_side
+        and previous_reentry_cooldown > 0
+        and previous_release_price > 0
+        and reentry_gap > 0
+    )
+    if candidate:
+        previous_count = int(runtime_state.get("stall_count") or 0) if runtime_state.get("side") == normalized_side else 0
+        stall_count = previous_count + 1
+        runtime_state = {
+            "side": normalized_side,
+            "stall_count": stall_count,
+            "reentry_cooldown_cycles": previous_reentry_cooldown,
+            "target_notional": previous_target_notional,
+            "release_price": previous_release_price,
+        }
+    elif reentry_block_active:
+        stall_count = 0
+        runtime_state = {
+            "side": normalized_side,
+            "stall_count": 0,
+            "reentry_cooldown_cycles": max(previous_reentry_cooldown - 1, 0),
+            "target_notional": previous_target_notional,
+            "release_price": previous_release_price,
+        }
+    else:
+        stall_count = 0
+        runtime_state = {}
+    report["candidate"] = bool(candidate)
+    report["stall_count"] = stall_count
+    report["reentry_block_active"] = bool(reentry_block_active)
+    report["reentry_cooldown_cycles"] = int(runtime_state.get("reentry_cooldown_cycles") or 0)
+    if previous_release_price > 0:
+        report["reentry_reference_price"] = previous_release_price
+    if previous_target_notional > 0 and report.get("target_notional") is None:
+        report["target_notional"] = previous_target_notional
+
+    if runtime_state:
+        state["inventory_unlock_release"] = runtime_state
+    else:
+        state.pop("inventory_unlock_release", None)
+
+    if reentry_block_active:
+        if normalized_side == "long":
+            gate_price = previous_release_price - reentry_gap
+            before = len(plan.get("buy_orders", []) or [])
+            plan["buy_orders"] = [
+                dict(item)
+                for item in plan.get("buy_orders", [])
+                if isinstance(item, dict)
+                and (_is_short_exit_order(item) or not _is_long_entry_order(item) or _safe_float(item.get("price")) <= gate_price)
+            ]
+            report["blocked_entry_order_count"] = before - len(plan["buy_orders"])
+            report["reentry_gate_price"] = gate_price
+        elif normalized_side == "short":
+            gate_price = previous_release_price + reentry_gap
+            before = len(plan.get("sell_orders", []) or [])
+            plan["sell_orders"] = [
+                dict(item)
+                for item in plan.get("sell_orders", [])
+                if isinstance(item, dict)
+                and (_is_long_exit_order(item) or not _is_short_entry_order(item) or _safe_float(item.get("price")) >= gate_price)
+            ]
+            report["blocked_entry_order_count"] = before - len(plan["sell_orders"])
+            report["reentry_gate_price"] = gate_price
+        report["reason"] = "reentry_price_gate"
+        return report
+    if not candidate:
+        report["reason"] = "not_stalled"
+        return report
+    if stall_count < safe_confirm_cycles:
+        report["reason"] = "waiting_for_stall_confirmation"
+        return report
+
+    price_side = "SELL" if normalized_side == "long" else "BUY"
+    order_key = "sell_orders" if normalized_side == "long" else "buy_orders"
+    role = "inventory_unlock_reduce_long" if normalized_side == "long" else "inventory_unlock_reduce_short"
+    price = _resolve_near_market_release_price(
+        side=price_side,
+        level_index=1,
+        bid_price=bid_price,
+        ask_price=ask_price,
+        step_price=step_price,
+        tick_size=tick_size,
+    )
+    if price <= 0:
+        report["reason"] = "invalid_release_price"
+        return report
+
+    buffer_notional = min(safe_cap_notional, max(safe_per_order_notional * 0.5, safe_pause_notional * 0.02))
+    target_notional = max(safe_pause_notional - buffer_notional, 0.0)
+    release_budget = min(
+        safe_cap_notional,
+        safe_current_notional,
+        max(safe_current_notional - target_notional, min(safe_per_order_notional, safe_cap_notional)),
+    )
+    qty = _round_order_qty(min(safe_qty, release_budget / price), step_size)
+    notional = qty * price
+    report["target_notional"] = target_notional
+    if qty <= 0:
+        report["reason"] = "invalid_release_qty"
+        return report
+    if min_qty is not None and qty < min_qty:
+        report["reason"] = "below_min_qty"
+        return report
+    if min_notional is not None and notional < min_notional:
+        report["reason"] = "below_min_notional"
+        return report
+
+    plan[order_key] = [
+        dict(item)
+        for item in plan.get(order_key, [])
+        if isinstance(item, dict) and _order_role(item) != role
+    ]
+    order = {
+        "side": price_side,
+        "price": price,
+        "qty": qty,
+        "notional": notional,
+        "level": 1,
+        "role": role,
+        "position_side": "BOTH",
+        "force_reduce_only": True,
+        "time_in_force": "GTX",
+        "execution_type": "inventory_unlock_release",
+    }
+    if normalized_side == "long":
+        order["take_profit_guard_release_floor"] = price
+    else:
+        order["take_profit_guard_release_ceiling"] = price
+    plan[order_key].append(order)
+    state["inventory_unlock_release"] = {
+        "side": normalized_side,
+        "stall_count": stall_count,
+        "reentry_cooldown_cycles": 6,
+        "target_notional": target_notional,
+        "release_price": price,
+    }
+    report.update(
+        {
+            "active": True,
+            "reason": "stalled_inventory_pause",
+            "release_order_notional": notional,
+            "release_price": price,
+            "release_qty": qty,
+            "release_order_count": 1,
+            "reentry_cooldown_cycles": 6,
+        }
+    )
+    return report
+
+
 def apply_active_delever_long(
     *,
     plan: dict[str, Any],
@@ -5761,8 +11001,7 @@ def apply_active_delever_long(
         if isinstance(item, dict) and _order_role(item) == "take_profit_long"
     ]
     if not take_profit_orders and (
-        pause_trigger_active
-        or inventory_pause_timeout_trigger_active
+        inventory_pause_timeout_trigger_active
         or force_release_trigger_active
     ):
         take_profit_orders = _build_near_market_release_seed_orders(
@@ -5942,14 +11181,7 @@ def apply_active_delever_long(
         shifted_take_profit_orders.append(shifted)
 
     active_orders: list[dict[str, Any]] = []
-    release_active = (
-        trigger_mode in {"threshold", "pause"}
-        and pause_notional > 0
-        and current_long_notional >= pause_notional - 1e-12
-    ) or (
-        force_release_trigger_active
-        and bool(trigger_mode)
-    )
+    release_active = force_release_trigger_active and bool(trigger_mode)
     release_floor_price: float | None = None
     release_order_count = 0
     pruned_flow_sleeve_count = 0
@@ -6129,9 +11361,7 @@ def apply_active_delever_short(
         if isinstance(item, dict) and _order_role(item) == "take_profit_short"
     ]
     if not take_profit_orders and (
-        pause_trigger_active
-        or threshold_timeout_trigger_active
-        or threshold_trigger_active
+        threshold_timeout_trigger_active
         or inventory_pause_timeout_trigger_active
         or force_release_trigger_active
     ):
@@ -6317,14 +11547,7 @@ def apply_active_delever_short(
         shifted_take_profit_orders.append(shifted)
 
     active_orders: list[dict[str, Any]] = []
-    release_active = (
-        trigger_mode in {"threshold", "pause"}
-        and pause_notional > 0
-        and current_short_notional >= pause_notional - 1e-12
-    ) or (
-        force_release_trigger_active
-        and bool(trigger_mode)
-    )
+    release_active = force_release_trigger_active and bool(trigger_mode)
     release_ceiling_price: float | None = None
     release_order_count = 0
     pruned_flow_sleeve_count = 0
@@ -8195,6 +13418,40 @@ def resolve_market_bias_entry_pause(
     }
 
 
+def assess_unrealized_loss_entry_guard(
+    *,
+    enabled: bool,
+    unrealized_pnl: float,
+    current_long_notional: float,
+    current_short_notional: float,
+    min_loss: float | None,
+    loss_ratio: float | None,
+) -> dict[str, Any]:
+    exposure_notional = max(_safe_float(current_long_notional), 0.0) + max(_safe_float(current_short_notional), 0.0)
+    unrealized_loss = max(0.0, -_safe_float(unrealized_pnl))
+    safe_min_loss = max(_safe_float(min_loss), 0.0)
+    safe_loss_ratio = max(_safe_float(loss_ratio), 0.0)
+    ratio = (unrealized_loss / exposure_notional) if exposure_notional > 0 else 0.0
+    active = bool(enabled and exposure_notional > 0 and safe_loss_ratio > 0 and unrealized_loss >= safe_min_loss and ratio >= safe_loss_ratio)
+    reason = None
+    if active:
+        reason = (
+            f"unrealized_loss_ratio loss={unrealized_loss:.4f} "
+            f"ratio={ratio:.4%} >= {safe_loss_ratio:.4%}"
+        )
+    return {
+        "enabled": bool(enabled),
+        "active": active,
+        "reason": reason,
+        "unrealized_pnl": _safe_float(unrealized_pnl),
+        "unrealized_loss": unrealized_loss,
+        "exposure_notional": exposure_notional,
+        "loss_ratio": ratio,
+        "min_loss": safe_min_loss,
+        "threshold_ratio": safe_loss_ratio,
+    }
+
+
 def resolve_market_bias_regime_switch(
     *,
     state: dict[str, Any],
@@ -8415,13 +13672,79 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         loss_per_10k_cooldown=float(getattr(args, "elastic_loss_per_10k_cooldown", 1.8)),
         inventory_soft_ratio=float(getattr(args, "elastic_inventory_soft_ratio", 0.6)),
         inventory_hard_ratio=float(getattr(args, "elastic_inventory_hard_ratio", 0.9)),
+        inventory_soft_ratio_ping_pong_fast=float(
+            getattr(args, "elastic_inventory_soft_ratio_ping_pong_fast", 0.30)
+        ),
+        inventory_hard_ratio_ping_pong_fast=float(
+            getattr(args, "elastic_inventory_hard_ratio_ping_pong_fast", 0.45)
+        ),
+        inventory_soft_ratio_ping_pong_safe=float(
+            getattr(args, "elastic_inventory_soft_ratio_ping_pong_safe", 0.45)
+        ),
+        inventory_hard_ratio_ping_pong_safe=float(
+            getattr(args, "elastic_inventory_hard_ratio_ping_pong_safe", 0.60)
+        ),
+        inventory_soft_ratio_wide_step_attack=float(
+            getattr(args, "elastic_inventory_soft_ratio_wide_step_attack", 0.45)
+        ),
+        inventory_hard_ratio_wide_step_attack=float(
+            getattr(args, "elastic_inventory_hard_ratio_wide_step_attack", 0.65)
+        ),
+        inventory_soft_ratio_wide_step=float(getattr(args, "elastic_inventory_soft_ratio_wide_step", 0.60)),
+        inventory_hard_ratio_wide_step=float(getattr(args, "elastic_inventory_hard_ratio_wide_step", 0.80)),
         step_scale_sprint=float(getattr(args, "elastic_step_scale_sprint", 0.8)),
         step_scale_defensive=float(getattr(args, "elastic_step_scale_defensive", 1.8)),
         step_scale_cooldown=float(getattr(args, "elastic_step_scale_cooldown", 3.0)),
+        base_step_multiplier_ping_pong_fast=float(
+            getattr(args, "elastic_base_step_multiplier_ping_pong_fast", 0.8)
+        ),
+        base_step_multiplier_ping_pong_safe=float(
+            getattr(args, "elastic_base_step_multiplier_ping_pong_safe", 1.2)
+        ),
+        base_step_multiplier_wide_step_attack=float(
+            getattr(args, "elastic_base_step_multiplier_wide_step_attack", 2.2)
+        ),
+        base_step_multiplier_wide_step=float(getattr(args, "elastic_base_step_multiplier_wide_step", 2.5)),
+        base_step_multiplier_defensive=float(getattr(args, "elastic_base_step_multiplier_defensive", 3.5)),
         per_order_scale_sprint=float(getattr(args, "elastic_per_order_scale_sprint", 1.25)),
         per_order_scale_defensive=float(getattr(args, "elastic_per_order_scale_defensive", 0.65)),
+        per_order_scale_ping_pong_fast=float(getattr(args, "elastic_per_order_scale_ping_pong_fast", 1.0)),
+        per_order_scale_ping_pong_safe=float(getattr(args, "elastic_per_order_scale_ping_pong_safe", 0.9)),
+        per_order_scale_wide_step_attack=float(getattr(args, "elastic_per_order_scale_wide_step_attack", 1.2)),
+        per_order_scale_wide_step=float(getattr(args, "elastic_per_order_scale_wide_step", 0.6)),
+        per_order_scale_defensive_state=float(getattr(args, "elastic_per_order_scale_defensive_state", 0.4)),
         levels_scale_sprint=float(getattr(args, "elastic_levels_scale_sprint", 1.25)),
         levels_scale_defensive=float(getattr(args, "elastic_levels_scale_defensive", 0.65)),
+        levels_scale_ping_pong_fast=float(getattr(args, "elastic_levels_scale_ping_pong_fast", 1.0)),
+        levels_scale_ping_pong_safe=float(getattr(args, "elastic_levels_scale_ping_pong_safe", 0.85)),
+        levels_scale_wide_step_attack=float(getattr(args, "elastic_levels_scale_wide_step_attack", 1.1)),
+        levels_scale_wide_step=float(getattr(args, "elastic_levels_scale_wide_step", 0.65)),
+        levels_scale_defensive_state=float(getattr(args, "elastic_levels_scale_defensive_state", 0.35)),
+        threshold_scale_ping_pong_fast=float(getattr(args, "elastic_threshold_scale_ping_pong_fast", 1.0)),
+        threshold_scale_ping_pong_safe=float(getattr(args, "elastic_threshold_scale_ping_pong_safe", 1.1)),
+        threshold_scale_wide_step_attack=float(getattr(args, "elastic_threshold_scale_wide_step_attack", 1.5)),
+        threshold_scale_wide_step=float(getattr(args, "elastic_threshold_scale_wide_step", 1.5)),
+        threshold_scale_defensive=float(getattr(args, "elastic_threshold_scale_defensive", 1.8)),
+        pause_scale_ping_pong_fast=float(getattr(args, "elastic_pause_scale_ping_pong_fast", 1.0)),
+        pause_scale_ping_pong_safe=float(getattr(args, "elastic_pause_scale_ping_pong_safe", 1.1)),
+        pause_scale_wide_step_attack=float(getattr(args, "elastic_pause_scale_wide_step_attack", 1.2)),
+        pause_scale_wide_step=float(getattr(args, "elastic_pause_scale_wide_step", 1.5)),
+        pause_scale_defensive=float(getattr(args, "elastic_pause_scale_defensive", 1.8)),
+        max_total_scale_ping_pong_fast=float(getattr(args, "elastic_max_total_scale_ping_pong_fast", 1.0)),
+        max_total_scale_ping_pong_safe=float(getattr(args, "elastic_max_total_scale_ping_pong_safe", 1.1)),
+        max_total_scale_wide_step_attack=float(getattr(args, "elastic_max_total_scale_wide_step_attack", 1.2)),
+        max_total_scale_wide_step=float(getattr(args, "elastic_max_total_scale_wide_step", 1.35)),
+        max_total_scale_defensive=float(getattr(args, "elastic_max_total_scale_defensive", 1.6)),
+        max_entry_orders_ping_pong_fast=int(getattr(args, "elastic_max_entry_orders_ping_pong_fast", 6)),
+        max_entry_orders_ping_pong_safe=int(getattr(args, "elastic_max_entry_orders_ping_pong_safe", 4)),
+        max_entry_orders_wide_step_attack=int(getattr(args, "elastic_max_entry_orders_wide_step_attack", 4)),
+        max_entry_orders_wide_step=int(getattr(args, "elastic_max_entry_orders_wide_step", 3)),
+        max_entry_orders_defensive=int(getattr(args, "elastic_max_entry_orders_defensive", 2)),
+        early_micro_abs_return_ratio=float(getattr(args, "elastic_early_micro_abs_return_ratio", 0.00025)),
+        early_micro_amplitude_ratio=float(getattr(args, "elastic_early_micro_amplitude_ratio", 0.00035)),
+        early_safe_inventory_ratio=float(getattr(args, "elastic_early_safe_inventory_ratio", 0.45)),
+        early_wide_inventory_ratio=float(getattr(args, "elastic_early_wide_inventory_ratio", 0.65)),
+        early_wide_loss_per_10k_5m=float(getattr(args, "elastic_early_wide_loss_per_10k_5m", 0.5)),
         cooldown_seconds=float(getattr(args, "elastic_cooldown_seconds", 120.0)),
         state_confirm_cycles=int(getattr(args, "elastic_state_confirm_cycles", 3)),
         inventory_recover_exit_ratio=float(getattr(args, "elastic_inventory_recover_exit_ratio", 0.45)),
@@ -8433,7 +13756,87 @@ def _elastic_volume_config(args: argparse.Namespace) -> ElasticVolumeConfig:
         repair_slice_ratio_near_cross=float(getattr(args, "elastic_repair_slice_ratio_near_cross", 0.30)),
         repair_slice_ratio_cross=float(getattr(args, "elastic_repair_slice_ratio_cross", 0.60)),
         max_repair_loss_per_10k=float(getattr(args, "elastic_max_repair_loss_per_10k", 0.0)),
+        cancel_stale_entries_on_cooldown=bool(getattr(args, "elastic_cancel_stale_entries_on_cooldown", True)),
     )
+
+
+def _adaptive_regime_router_config(args: argparse.Namespace) -> AdaptiveRegimeRouterConfig:
+    return AdaptiveRegimeRouterConfig(
+        enabled=bool(getattr(args, "adaptive_regime_router_enabled", False)),
+        mode=str(getattr(args, "adaptive_regime_router_mode", "profit_adaptive_v1") or "profit_adaptive_v1"),
+        confirm_cycles=int(getattr(args, "adaptive_regime_router_confirm_cycles", 2)),
+        min_dwell_seconds=float(getattr(args, "adaptive_regime_router_min_dwell_seconds", 120.0)),
+        max_spread_bps=float(getattr(args, "adaptive_regime_router_max_spread_bps", 22.0)),
+        min_depth_notional=float(getattr(args, "adaptive_regime_router_min_depth_notional", 0.0)),
+        shock_1m_abs_return_ratio=float(getattr(args, "adaptive_regime_router_shock_1m_abs_return_ratio", 0.018)),
+        shock_1m_amplitude_ratio=float(getattr(args, "adaptive_regime_router_shock_1m_amplitude_ratio", 0.028)),
+        shock_5m_amplitude_ratio=float(getattr(args, "adaptive_regime_router_shock_5m_amplitude_ratio", 0.055)),
+        down_1m_return_ratio=float(getattr(args, "adaptive_regime_router_down_1m_return_ratio", -0.004)),
+        down_5m_return_ratio=float(getattr(args, "adaptive_regime_router_down_5m_return_ratio", -0.010)),
+        up_1m_return_ratio=float(getattr(args, "adaptive_regime_router_up_1m_return_ratio", 0.006)),
+        up_5m_return_ratio=float(getattr(args, "adaptive_regime_router_up_5m_return_ratio", 0.014)),
+        range_5m_abs_return_ratio=float(getattr(args, "adaptive_regime_router_range_5m_abs_return_ratio", 0.006)),
+        range_5m_amplitude_ratio=float(getattr(args, "adaptive_regime_router_range_5m_amplitude_ratio", 0.018)),
+        range_step_scale=float(getattr(args, "adaptive_regime_router_range_step_scale", 1.0)),
+        range_per_order_scale=float(getattr(args, "adaptive_regime_router_range_per_order_scale", 1.0)),
+        range_levels_scale=float(getattr(args, "adaptive_regime_router_range_levels_scale", 1.0)),
+        range_position_limit_scale=float(getattr(args, "adaptive_regime_router_range_position_limit_scale", 1.0)),
+        range_max_entry_orders=int(getattr(args, "adaptive_regime_router_range_max_entry_orders", 4)),
+        down_step_scale=float(getattr(args, "adaptive_regime_router_down_step_scale", 1.8)),
+        down_per_order_scale=float(getattr(args, "adaptive_regime_router_down_per_order_scale", 0.55)),
+        down_levels_scale=float(getattr(args, "adaptive_regime_router_down_levels_scale", 0.65)),
+        down_position_limit_scale=float(getattr(args, "adaptive_regime_router_down_position_limit_scale", 0.70)),
+        down_max_entry_long_orders=int(getattr(args, "adaptive_regime_router_down_max_entry_long_orders", 0)),
+        down_max_entry_short_orders=int(getattr(args, "adaptive_regime_router_down_max_entry_short_orders", 2)),
+        up_step_scale=float(getattr(args, "adaptive_regime_router_up_step_scale", 1.5)),
+        up_per_order_scale=float(getattr(args, "adaptive_regime_router_up_per_order_scale", 0.75)),
+        up_levels_scale=float(getattr(args, "adaptive_regime_router_up_levels_scale", 0.75)),
+        up_position_limit_scale=float(getattr(args, "adaptive_regime_router_up_position_limit_scale", 0.85)),
+        up_max_entry_long_orders=int(getattr(args, "adaptive_regime_router_up_max_entry_long_orders", 2)),
+        up_max_entry_short_orders=int(getattr(args, "adaptive_regime_router_up_max_entry_short_orders", 0)),
+        no_trade_step_scale=float(getattr(args, "adaptive_regime_router_no_trade_step_scale", 2.5)),
+        no_trade_per_order_scale=float(getattr(args, "adaptive_regime_router_no_trade_per_order_scale", 0.35)),
+        no_trade_levels_scale=float(getattr(args, "adaptive_regime_router_no_trade_levels_scale", 0.50)),
+        no_trade_position_limit_scale=float(
+            getattr(args, "adaptive_regime_router_no_trade_position_limit_scale", 0.60)
+        ),
+        cancel_stale_entries_on_no_trade=bool(
+            getattr(args, "adaptive_regime_router_cancel_stale_entries_on_no_trade", True)
+        ),
+    )
+
+
+def _regime_entry_budget_config(args: argparse.Namespace) -> RegimeEntryBudgetConfig:
+    return RegimeEntryBudgetConfig(
+        enabled=bool(getattr(args, "regime_entry_budget_enabled", False)),
+        report_only=bool(getattr(args, "regime_entry_budget_report_only", True)),
+        base_per_order_notional=float(getattr(args, "regime_entry_budget_base_per_order_notional", 60.0)),
+        base_step_ratio=float(getattr(args, "regime_entry_budget_base_step_ratio", 0.0025)),
+        min_profit_or_fee_buffer_ratio=float(
+            getattr(args, "regime_entry_budget_min_profit_or_fee_buffer_ratio", 0.0008)
+        ),
+        switch_reconcile_confirm_cycles=int(getattr(args, "regime_entry_budget_switch_reconcile_confirm_cycles", 2)),
+        shock_reconcile_confirm_cycles=int(getattr(args, "regime_entry_budget_shock_reconcile_confirm_cycles", 3)),
+        shock_30s_abs_return_ratio=float(getattr(args, "regime_entry_budget_shock_30s_abs_return_ratio", 0.016)),
+        shock_30s_amplitude_ratio=float(getattr(args, "regime_entry_budget_shock_30s_amplitude_ratio", 0.024)),
+        shock_1m_abs_return_ratio=float(getattr(args, "regime_entry_budget_shock_1m_abs_return_ratio", 0.025)),
+        shock_1m_amplitude_ratio=float(getattr(args, "regime_entry_budget_shock_1m_amplitude_ratio", 0.030)),
+        defensive_loss_per_10k_15m=float(getattr(args, "regime_entry_budget_defensive_loss_per_10k_15m", 8.0)),
+        defensive_inventory_usage_ratio=float(getattr(args, "regime_entry_budget_defensive_inventory_usage_ratio", 0.80)),
+        defensive_min_gross_notional_15m=float(getattr(args, "regime_entry_budget_defensive_min_gross_notional_15m", 1000.0)),
+        tick_dominated_ratio=float(getattr(args, "regime_entry_budget_tick_dominated_ratio", 0.0035)),
+        coarse_tick_ratio=float(getattr(args, "regime_entry_budget_coarse_tick_ratio", 0.0080)),
+    )
+
+
+def _elastic_volume_state_snapshot(elastic_volume: dict[str, Any], *, updated_at: str) -> dict[str, Any]:
+    return {
+        "regime": elastic_volume.get("regime"),
+        "cooldown_until": elastic_volume.get("cooldown_until"),
+        "pending_regime": elastic_volume.get("pending_regime"),
+        "pending_count": int(_safe_float(elastic_volume.get("pending_count"))),
+        "updated_at": updated_at,
+    }
 
 
 def _summarize_elastic_volume_windows(
@@ -8448,6 +13851,9 @@ def _summarize_elastic_volume_windows(
     window_15m_start = now.astimezone(timezone.utc) - timedelta(minutes=15)
     competition_start = competition_start_time.astimezone(timezone.utc) if competition_start_time else None
     metrics = {
+        "gross_notional_5m": 0.0,
+        "net_pnl_5m": 0.0,
+        "commission_5m": 0.0,
         "gross_notional_15m": 0.0,
         "net_pnl_15m": 0.0,
         "commission_15m": 0.0,
@@ -8457,6 +13863,7 @@ def _summarize_elastic_volume_windows(
     }
 
     stable_assets = {"USDT", "USDC", "FDUSD", "BUSD"}
+    window_5m_start = now.astimezone(timezone.utc) - timedelta(minutes=5)
     for row in read_jsonl(audit_paths["trade_audit"], limit=0):
         if normalized_symbol and str(row.get("symbol", "")).upper().strip() not in {"", normalized_symbol}:
             continue
@@ -8471,6 +13878,10 @@ def _summarize_elastic_volume_windows(
             else 0.0
         )
         net = _safe_float(row.get("realizedPnl")) - commission
+        if ts >= window_5m_start:
+            metrics["gross_notional_5m"] += notional
+            metrics["net_pnl_5m"] += net
+            metrics["commission_5m"] += commission
         if ts >= window_15m_start:
             metrics["gross_notional_15m"] += notional
             metrics["net_pnl_15m"] += net
@@ -8554,6 +13965,7 @@ def apply_max_position_notional_cap(
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    open_entry_long_notional: float = 0.0,
 ) -> dict[str, Any]:
     if max_position_notional is None or max_position_notional <= 0:
         return {
@@ -8564,7 +13976,12 @@ def apply_max_position_notional_cap(
             + sum(_safe_float(x.get("notional")) for x in plan.get("buy_orders", [])),
         }
 
-    buy_budget_notional = max(max_position_notional - max(current_long_notional, 0.0), 0.0)
+    buy_budget_notional = max(
+        max_position_notional
+        - max(current_long_notional, 0.0)
+        - max(_safe_float(open_entry_long_notional), 0.0),
+        0.0,
+    )
     bootstrap_orders = [dict(item) for item in plan.get("bootstrap_orders", []) if isinstance(item, dict)]
     buy_orders = [dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)]
     planned_buy_notional = sum(_safe_float(x.get("notional")) for x in bootstrap_orders) + sum(
@@ -8662,6 +14079,8 @@ def apply_hedge_position_notional_caps(
     step_size: float | None,
     min_qty: float | None,
     min_notional: float | None,
+    open_entry_long_notional: float = 0.0,
+    open_entry_short_notional: float = 0.0,
 ) -> dict[str, Any]:
     bootstrap_orders = [dict(item) for item in plan.get("bootstrap_orders", []) if isinstance(item, dict)]
     buy_orders = [dict(item) for item in plan.get("buy_orders", []) if isinstance(item, dict)]
@@ -8670,9 +14089,19 @@ def apply_hedge_position_notional_caps(
     long_budget_notional = None
     short_budget_notional = None
     if max_long_position_notional is not None and max_long_position_notional > 0:
-        long_budget_notional = max(max_long_position_notional - max(current_long_notional, 0.0), 0.0)
+        long_budget_notional = max(
+            max_long_position_notional
+            - max(current_long_notional, 0.0)
+            - max(_safe_float(open_entry_long_notional), 0.0),
+            0.0,
+        )
     if max_short_position_notional is not None and max_short_position_notional > 0:
-        short_budget_notional = max(max_short_position_notional - max(current_short_notional, 0.0), 0.0)
+        short_budget_notional = max(
+            max_short_position_notional
+            - max(current_short_notional, 0.0)
+            - max(_safe_float(open_entry_short_notional), 0.0),
+            0.0,
+        )
 
     original_planned_long = sum(_safe_float(item.get("notional")) for item in bootstrap_orders if _is_long_entry_order(item))
     original_planned_long += sum(_safe_float(item.get("notional")) for item in buy_orders if _is_long_entry_order(item))
@@ -8754,6 +14183,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "inventory_target_neutral",
         "competition_inventory_grid",
         "maker_volatility_inventory_v1",
+        "best_quote_maker_volume_v1",
+        "hedge_best_quote_maker_volume_v1",
     }:
         raise RuntimeError(f"Unsupported strategy_mode: {requested_strategy_mode}")
     requested_strategy_profile = str(getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)).strip() or AUTO_REGIME_STABLE_PROFILE
@@ -8840,6 +14271,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "cooldown_seconds": getattr(args, "exposure_escalation_buy_pause_cooldown_seconds", 0.0),
         "remaining_seconds": 0.0,
     }
+    exposure_hard_long_pause = False
     hard_loss_forced_reduce: dict[str, Any] = {
         "enabled": bool(getattr(args, "hard_loss_forced_reduce_enabled", False)),
         "active": False,
@@ -8850,6 +14282,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "hard_unrealized_loss_limit": getattr(args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
         "placed_order_count": 0,
         "placed_notional": 0.0,
+    }
+    unrealized_loss_entry_guard: dict[str, Any] = {
+        "enabled": bool(getattr(args, "unrealized_loss_entry_guard_enabled", False)),
+        "active": False,
+        "reason": None,
+        "unrealized_pnl": 0.0,
+        "unrealized_loss": 0.0,
+        "exposure_notional": 0.0,
+        "loss_ratio": 0.0,
+        "min_loss": getattr(args, "unrealized_loss_entry_guard_min_loss", None),
+        "threshold_ratio": getattr(args, "unrealized_loss_entry_guard_ratio", None),
     }
     adverse_inventory_reduce: dict[str, Any] = {
         "enabled": bool(getattr(args, "adverse_reduce_enabled", False)),
@@ -8884,6 +14327,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     if strategy_profile_schema.get("strict_enabled") and not bool(strategy_profile_schema.get("strict_ok", True)):
         unknown_params = ", ".join(strategy_profile_schema.get("unknown_params") or [])
         raise RuntimeError(f"Strict strategy profile schema rejected unknown params: {unknown_params}")
+    best_quote_maker_volume: dict[str, Any] = {
+        "enabled": bool(getattr(args, "best_quote_maker_volume_enabled", False)),
+        "regime": (
+            "disabled"
+            if not bool(getattr(args, "best_quote_maker_volume_enabled", False))
+            else "not_evaluated"
+        ),
+        "reasons": [],
+        "metrics": {},
+    }
+    best_quote_volume_ledger: dict[str, Any] = {}
     effective_strategy_profile = requested_strategy_profile
     if is_xaut_adaptive_profile(requested_strategy_profile):
         if symbol != "XAUTUSDT":
@@ -9061,23 +14515,33 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 "warning": f"{exc.__class__.__name__}: {exc}",
             }
 
-    volatility_entry_pause = resolve_volatility_entry_pause(
-        adaptive_step=adaptive_step,
-        enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
-        window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
-        window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
-        window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
-        window_1m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
-        window_3m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
-        window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
-        window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
-        window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
-    )
     elastic_volume: dict[str, Any] = {
         "enabled": bool(getattr(effective_args, "elastic_volume_enabled", False)),
         "regime": "disabled" if not bool(getattr(effective_args, "elastic_volume_enabled", False)) else "not_evaluated",
         "applied": False,
         "reasons": [],
+    }
+    adaptive_regime_router: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "adaptive_regime_router_enabled", False)),
+        "regime": (
+            "disabled"
+            if not bool(getattr(effective_args, "adaptive_regime_router_enabled", False))
+            else "not_evaluated"
+        ),
+        "applied": False,
+        "reasons": [],
+    }
+    regime_entry_budget: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "regime_entry_budget_enabled", False)),
+        "report_only": bool(getattr(effective_args, "regime_entry_budget_report_only", True)),
+        "state": "disabled" if not bool(getattr(effective_args, "regime_entry_budget_enabled", False)) else "not_evaluated",
+        "reasons": [],
+    }
+    hard_loss_forced_reduce_episode: dict[str, Any] = {
+        "enabled": bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
+        "active": False,
+        "disarmed": False,
+        "reason": "not_evaluated",
     }
 
     effective_args = argparse.Namespace(**vars(effective_args))
@@ -9216,9 +14680,15 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
     api_key, api_secret = credentials
 
-    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=args.recv_window)
-    position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
-    open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
+    account_info, open_orders, account_snapshot_sources = _resolve_runner_account_snapshot(
+        args,
+        symbol=symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+    )
+    position_mode = _fetch_runner_position_mode_cached(args, api_key, api_secret, recv_window=args.recv_window)
+    account_snapshot_sources["position_mode"] = str(position_mode.get("source") or "rest")
     dual_side_position = _truthy(position_mode.get("dualSidePosition"))
     required_position_mode = _normalize_required_position_mode(
         strategy_profile_schema.get("required_position_mode"),
@@ -9236,12 +14706,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         prefer_entry_price=prefer_entry_price_cost_basis,
     )
     actual_break_even_price = max(_safe_float(actual_position.get("breakEvenPrice")), 0.0)
-    long_position = extract_symbol_position(account_info, symbol, "LONG" if requested_strategy_mode == "hedge_neutral" else None)
-    short_position = extract_symbol_position(account_info, symbol, "SHORT") if requested_strategy_mode == "hedge_neutral" else {}
+    uses_exchange_hedge_positions = _uses_exchange_hedge_position_sides(requested_strategy_mode)
+    long_position = extract_symbol_position(account_info, symbol, "LONG" if uses_exchange_hedge_positions else None)
+    short_position = extract_symbol_position(account_info, symbol, "SHORT") if uses_exchange_hedge_positions else {}
     if (
         _is_inventory_target_neutral_mode(requested_strategy_mode)
         or _is_competition_inventory_grid_mode(requested_strategy_mode)
         or _is_maker_volatility_inventory_mode(requested_strategy_mode)
+        or (
+            _is_best_quote_maker_volume_mode(requested_strategy_mode)
+            and not _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
+        )
     ):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
@@ -9249,10 +14724,45 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_long_qty = 0.0
         current_short_qty = max(-actual_net_qty, 0.0)
     else:
-        current_long_qty = max(_position_qty(long_position, position_side="LONG" if requested_strategy_mode == "hedge_neutral" else None), 0.0)
-        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if requested_strategy_mode == "hedge_neutral" else 0.0
+        current_long_qty = max(_position_qty(long_position, position_side="LONG" if uses_exchange_hedge_positions else None), 0.0)
+        current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0) if uses_exchange_hedge_positions else 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    if uses_exchange_hedge_positions:
+        unrealized_pnl = _position_unrealized_pnl(long_position) + _position_unrealized_pnl(short_position)
+    else:
+        unrealized_pnl = _position_unrealized_pnl(actual_position)
+    exchange_unrealized_pnl = unrealized_pnl
+    strategy_unrealized_pnl = unrealized_pnl
+    strategy_actual_net_qty = actual_net_qty
+    strategy_actual_net_notional = actual_net_qty * max(mid_price, 0.0)
+    volatility_entry_pause = resolve_volatility_entry_pause(
+        adaptive_step=adaptive_step,
+        state=state,
+        enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
+        window_10s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_10s_abs_return_ratio", None),
+        window_10s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_10s_amplitude_ratio", None),
+        window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
+        window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
+        window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+        window_1m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+        window_3m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+        window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+        window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
+        window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
+        recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
+        now=plan_now,
+        min_observation_seconds=getattr(effective_args, "volatility_entry_pause_min_observation_seconds", 180.0),
+        current_long_notional=current_long_notional,
+        current_short_notional=current_short_notional,
+        inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
+        tiny_inventory_ignore_notional=getattr(
+            effective_args,
+            "volatility_entry_pause_tiny_inventory_ignore_notional",
+            0.0,
+        ),
+    )
+    observed_trade_rows = _collect_runner_observed_trade_rows(args, symbol=symbol)
     execution_regime = build_execution_regime_report(
         args=args,
         state=state,
@@ -9293,7 +14803,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     }
     current_long_avg_price = 0.0
     current_short_avg_price = 0.0
-    if requested_strategy_mode == "hedge_neutral":
+    if uses_exchange_hedge_positions:
         current_long_avg_price = (
             _position_cost_basis_price(long_position, prefer_entry_price=prefer_entry_price_cost_basis)
             if current_long_qty > 1e-12
@@ -9312,35 +14822,134 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     exchange_long_avg_price = current_long_avg_price
     exchange_short_avg_price = current_short_avg_price
 
+    if _is_best_quote_maker_volume_mode(requested_strategy_mode):
+        strategy_open_orders = _filter_futures_strategy_orders(open_orders, symbol)
+        if (
+            _is_hedge_best_quote_maker_volume_mode(requested_strategy_mode)
+            and _hedge_best_quote_exchange_effectively_flat(
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                mid_price=mid_price,
+                min_notional=symbol_info.get("min_notional"),
+            )
+            and not strategy_open_orders
+        ):
+            best_quote_maker_volume["exchange_flat_resync"] = reset_best_quote_hedge_ledgers_after_exchange_flat(
+                state=state,
+                mid_price=mid_price,
+                reason="generate_plan_exchange_flat_no_strategy_orders",
+            )
+        frozen_bootstrap_long_qty, frozen_bootstrap_short_qty = _best_quote_frozen_inventory_qtys(state)
+        best_quote_reduce_freeze_bootstrap_isolated = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_enabled", False)
+        )
+        best_quote_volume_ledger = sync_best_quote_volume_ledger(
+            state=state,
+            symbol=symbol,
+            api_key=api_key,
+            api_secret=api_secret,
+            recv_window=args.recv_window,
+            current_long_qty=max(current_long_qty - frozen_bootstrap_long_qty, 0.0),
+            current_short_qty=max(current_short_qty - frozen_bootstrap_short_qty, 0.0),
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+            observed_trade_rows=observed_trade_rows,
+            allow_exchange_position_bootstrap=not best_quote_reduce_freeze_bootstrap_isolated,
+        )
+        best_quote_volume_ledger = reconcile_best_quote_volume_ledger_surplus(
+            state=state,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+            normal_open_order_count=sum(
+                1
+                for order in _filter_futures_strategy_orders(open_orders, symbol)
+                if "bestquot" in str(order.get("clientOrderId") or "").lower()
+            ),
+        )
+        best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
+
     elastic_volume_config = _elastic_volume_config(effective_args)
-    if elastic_volume_config.enabled:
+    competition_start_time = None
+    try:
+        competition_start_time = normalize_runtime_guard_config(vars(args)).runtime_guard_stats_start_time
+    except Exception:
         competition_start_time = None
-        try:
-            competition_start_time = normalize_runtime_guard_config(vars(args)).runtime_guard_stats_start_time
-        except Exception:
-            competition_start_time = None
+    elastic_metrics = {
+        "gross_notional_5m": 0.0,
+        "net_pnl_5m": 0.0,
+        "commission_5m": 0.0,
+        "gross_notional_15m": 0.0,
+        "net_pnl_15m": 0.0,
+        "commission_15m": 0.0,
+        "competition_gross_notional": 0.0,
+        "competition_net_pnl": 0.0,
+        "competition_commission": 0.0,
+    }
+    needs_recent_best_quote_pnl = bool(
+        _is_best_quote_maker_volume_mode(requested_strategy_mode)
+        and getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_enabled", False)
+    )
+    if elastic_volume_config.enabled or needs_recent_best_quote_pnl:
         elastic_metrics = _summarize_elastic_volume_windows(
             summary_path,
             symbol=symbol,
             now=plan_now,
             competition_start_time=competition_start_time,
         )
+    if elastic_volume_config.enabled:
+        elastic_threshold_position_notional = _safe_float(getattr(effective_args, "threshold_position_notional", None))
+        if elastic_threshold_position_notional <= 0:
+            elastic_threshold_position_notional = _safe_float(getattr(args, "threshold_position_notional", None))
+        if elastic_threshold_position_notional <= 0:
+            elastic_threshold_position_notional = max(
+                _safe_float(getattr(effective_args, "pause_buy_position_notional", None)),
+                _safe_float(getattr(effective_args, "pause_short_position_notional", None)),
+                _safe_float(getattr(args, "pause_buy_position_notional", None)),
+                _safe_float(getattr(args, "pause_short_position_notional", None)),
+            )
         elastic_volume = resolve_elastic_volume_control(
             config=elastic_volume_config,
             inputs=ElasticVolumeInputs(
                 now=plan_now,
                 last_state=state.get("elastic_volume") if isinstance(state.get("elastic_volume"), dict) else {},
-                gross_notional_15m=elastic_metrics["gross_notional_15m"],
-                net_pnl_15m=elastic_metrics["net_pnl_15m"],
-                competition_gross_notional=elastic_metrics["competition_gross_notional"],
-                competition_net_pnl=elastic_metrics["competition_net_pnl"],
-                competition_commission=elastic_metrics["competition_commission"],
+                gross_notional_5m=_safe_float(elastic_metrics.get("gross_notional_5m")),
+                net_pnl_5m=_safe_float(elastic_metrics.get("net_pnl_5m")),
+                commission_5m=_safe_float(elastic_metrics.get("commission_5m")),
+                gross_notional_15m=_safe_float(elastic_metrics.get("gross_notional_15m")),
+                net_pnl_15m=_safe_float(elastic_metrics.get("net_pnl_15m")),
+                commission_15m=_safe_float(elastic_metrics.get("commission_15m")),
+                competition_gross_notional=_safe_float(elastic_metrics.get("competition_gross_notional")),
+                competition_net_pnl=_safe_float(elastic_metrics.get("competition_net_pnl")),
+                competition_commission=_safe_float(elastic_metrics.get("competition_commission")),
                 long_notional=current_long_notional,
                 short_notional=current_short_notional,
+                threshold_position_notional=elastic_threshold_position_notional,
                 max_long_notional=_safe_float(getattr(effective_args, "max_position_notional", None)),
                 max_short_notional=_safe_float(getattr(effective_args, "max_short_position_notional", None)),
                 actual_net_notional=actual_net_qty * max(mid_price, 0.0),
                 adaptive_step_raw_scale=_safe_float(adaptive_step.get("raw_scale")),
+                volatility_entry_pause_active=bool(volatility_entry_pause.get("active")),
+                volatility_entry_pause_reason=(
+                    str(volatility_entry_pause.get("reason") or "")
+                    if volatility_entry_pause.get("reason") is not None
+                    else None
+                ),
+                volatility_10s_abs_return_ratio=abs(
+                    _safe_float(((adaptive_step.get("metrics") or {}).get("window_10s") or {}).get("return_ratio"))
+                ),
+                volatility_10s_amplitude_ratio=_safe_float(
+                    ((adaptive_step.get("metrics") or {}).get("window_10s") or {}).get("amplitude_ratio")
+                ),
+                volatility_1m_amplitude_ratio=_safe_float(
+                    ((adaptive_step.get("metrics") or {}).get("window_1m") or {}).get("amplitude_ratio")
+                ),
+                volatility_5m_amplitude_ratio=_safe_float(
+                    ((adaptive_step.get("metrics") or {}).get("window_5m") or {}).get("amplitude_ratio")
+                ),
                 multi_timeframe_bias_regime=str(multi_timeframe_bias.get("regime") or "balanced"),
                 mid_price=mid_price,
                 tick_size=_safe_float(symbol_info.get("tick_size")),
@@ -9367,6 +14976,24 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 0,
             )
             position_limit_scale = _safe_float(elastic_volume.get("position_limit_scale")) or 1.0
+            threshold_scale = _safe_float(elastic_volume.get("threshold_scale")) or 1.0
+            pause_scale = _safe_float(elastic_volume.get("pause_scale")) or 1.0
+            max_total_scale = _safe_float(elastic_volume.get("max_total_scale")) or 1.0
+            if getattr(effective_args, "threshold_position_notional", None) is not None:
+                effective_args.threshold_position_notional = max(
+                    _safe_float(effective_args.threshold_position_notional) * threshold_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_buy_position_notional", None) is not None:
+                effective_args.pause_buy_position_notional = max(
+                    _safe_float(effective_args.pause_buy_position_notional) * pause_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_short_position_notional", None) is not None:
+                effective_args.pause_short_position_notional = max(
+                    _safe_float(effective_args.pause_short_position_notional) * pause_scale,
+                    0.0,
+                )
             if getattr(effective_args, "max_position_notional", None) is not None:
                 effective_args.max_position_notional = max(_safe_float(effective_args.max_position_notional) * position_limit_scale, 0.0)
             if getattr(effective_args, "max_short_position_notional", None) is not None:
@@ -9374,6 +15001,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                     _safe_float(effective_args.max_short_position_notional) * position_limit_scale,
                     0.0,
                 )
+            if getattr(effective_args, "max_total_notional", None) is not None:
+                effective_args.max_total_notional = max(_safe_float(effective_args.max_total_notional) * max_total_scale, 0.0)
             if not bool(elastic_volume.get("entry_allowed")):
                 repair_ladder = elastic_volume.get("repair_ladder") if isinstance(elastic_volume.get("repair_ladder"), dict) else {}
                 repair_side = str(repair_ladder.get("side") or "").upper().strip()
@@ -9387,6 +15016,166 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             elif not bool(elastic_volume.get("allow_entry_long")) and current_long_notional >= current_short_notional:
                 effective_args.buy_levels = 0
             elif not bool(elastic_volume.get("allow_entry_short")) and current_short_notional > current_long_notional:
+                effective_args.sell_levels = 0
+
+    adaptive_regime_router_config = _adaptive_regime_router_config(effective_args)
+    if adaptive_regime_router_config.enabled:
+        adaptive_metrics_for_router = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
+        window_1m_for_router = (
+            adaptive_metrics_for_router.get("window_1m")
+            if isinstance(adaptive_metrics_for_router.get("window_1m"), dict)
+            else {}
+        )
+        window_5m_for_router = (
+            adaptive_metrics_for_router.get("window_5m")
+            if isinstance(adaptive_metrics_for_router.get("window_5m"), dict)
+            else {}
+        )
+        spread_bps = ((ask_price - bid_price) / mid_price * 10_000.0) if mid_price > 0 else 0.0
+        adaptive_regime_router = resolve_adaptive_regime_router_control(
+            config=adaptive_regime_router_config,
+            inputs=AdaptiveRegimeRouterInputs(
+                now=plan_now,
+                last_state=state.get("adaptive_regime_router")
+                if isinstance(state.get("adaptive_regime_router"), dict)
+                else {},
+                return_1m_ratio=_safe_float(window_1m_for_router.get("return_ratio")),
+                amplitude_1m_ratio=_safe_float(window_1m_for_router.get("amplitude_ratio")),
+                return_5m_ratio=_safe_float(window_5m_for_router.get("return_ratio")),
+                amplitude_5m_ratio=_safe_float(window_5m_for_router.get("amplitude_ratio")),
+                spread_bps=spread_bps,
+                depth_notional=getattr(effective_args, "execution_regime_depth_value", None),
+                long_notional=current_long_notional,
+                short_notional=current_short_notional,
+                actual_net_notional=actual_net_qty * max(mid_price, 0.0),
+            ),
+        )
+        adaptive_regime_router["applied"] = True
+        if adaptive_regime_router.get("enabled"):
+            effective_args = argparse.Namespace(**vars(effective_args))
+            effective_args.step_price = max(
+                _safe_float(getattr(effective_args, "step_price", 0.0))
+                * _safe_float(adaptive_regime_router.get("step_scale")),
+                0.0,
+            )
+            effective_args.per_order_notional = max(
+                _safe_float(getattr(effective_args, "per_order_notional", 0.0))
+                * _safe_float(adaptive_regime_router.get("per_order_scale")),
+                0.0,
+            )
+            effective_args.buy_levels = max(
+                int(
+                    round(
+                        int(getattr(effective_args, "buy_levels", 0))
+                        * _safe_float(adaptive_regime_router.get("levels_scale"))
+                    )
+                ),
+                0,
+            )
+            effective_args.sell_levels = max(
+                int(
+                    round(
+                        int(getattr(effective_args, "sell_levels", 0))
+                        * _safe_float(adaptive_regime_router.get("levels_scale"))
+                    )
+                ),
+                0,
+            )
+            position_limit_scale = _safe_float(adaptive_regime_router.get("position_limit_scale")) or 1.0
+            pause_scale = _safe_float(adaptive_regime_router.get("pause_scale")) or 1.0
+            max_total_scale = _safe_float(adaptive_regime_router.get("max_total_scale")) or 1.0
+            if getattr(effective_args, "threshold_position_notional", None) is not None:
+                effective_args.threshold_position_notional = max(
+                    _safe_float(effective_args.threshold_position_notional) * position_limit_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_buy_position_notional", None) is not None:
+                effective_args.pause_buy_position_notional = max(
+                    _safe_float(effective_args.pause_buy_position_notional) * pause_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "pause_short_position_notional", None) is not None:
+                effective_args.pause_short_position_notional = max(
+                    _safe_float(effective_args.pause_short_position_notional) * pause_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "max_position_notional", None) is not None:
+                effective_args.max_position_notional = max(
+                    _safe_float(effective_args.max_position_notional) * position_limit_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "max_short_position_notional", None) is not None:
+                effective_args.max_short_position_notional = max(
+                    _safe_float(effective_args.max_short_position_notional) * position_limit_scale,
+                    0.0,
+                )
+            if getattr(effective_args, "max_total_notional", None) is not None:
+                effective_args.max_total_notional = max(
+                    _safe_float(effective_args.max_total_notional) * max_total_scale,
+                    0.0,
+                )
+
+    regime_entry_budget_config = _regime_entry_budget_config(effective_args)
+    if regime_entry_budget_config.enabled:
+        budget_open_orders = _decorate_synthetic_open_orders(state=state, open_orders=open_orders) if _is_synthetic_neutral_mode(strategy_mode) else _filter_futures_strategy_orders(open_orders, symbol)
+        open_entry_exposure = _summarize_open_entry_exposure(budget_open_orders)
+        elastic_metrics_for_budget = elastic_volume.get("metrics") if isinstance(elastic_volume.get("metrics"), dict) else {}
+        adaptive_metrics_for_budget = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
+        window_30s_for_budget = (
+            adaptive_metrics_for_budget.get("window_30s")
+            if isinstance(adaptive_metrics_for_budget.get("window_30s"), dict)
+            else {}
+        )
+        window_1m_for_budget = (
+            adaptive_metrics_for_budget.get("window_1m")
+            if isinstance(adaptive_metrics_for_budget.get("window_1m"), dict)
+            else {}
+        )
+        window_5m_for_budget = (
+            adaptive_metrics_for_budget.get("window_5m")
+            if isinstance(adaptive_metrics_for_budget.get("window_5m"), dict)
+            else {}
+        )
+        regime_entry_budget = resolve_regime_entry_budget_control(
+            config=regime_entry_budget_config,
+            inputs=RegimeEntryBudgetInputs(
+                now=plan_now,
+                last_state=state.get("regime_entry_budget") if isinstance(state.get("regime_entry_budget"), dict) else {},
+                candidate_regime=str(
+                    (
+                        adaptive_regime_router.get("regime")
+                        if isinstance(adaptive_regime_router, dict) and adaptive_regime_router.get("enabled")
+                        else None
+                    )
+                    or elastic_volume.get("regime")
+                    or "ping-pong-safe"
+                ),
+                mid_price=mid_price,
+                tick_size=_safe_float(symbol_info.get("tick_size")),
+                current_long_notional=current_long_notional,
+                current_short_notional=current_short_notional,
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
+                open_non_reduce_entry_orders=int(open_entry_exposure.get("open_non_reduce_entry_orders", 0) or 0),
+                reconcile_ok=True,
+                reconcile_diff_count=0,
+                gross_notional_15m=_safe_float(elastic_metrics_for_budget.get("gross_notional_15m")),
+                loss_per_10k_15m=_safe_float(elastic_metrics_for_budget.get("loss_per_10k_15m")),
+                abs_return_30s_ratio=_safe_float(window_30s_for_budget.get("abs_return_ratio")),
+                amplitude_30s_ratio=_safe_float(window_30s_for_budget.get("amplitude_ratio")),
+                abs_return_1m_ratio=_safe_float(window_1m_for_budget.get("abs_return_ratio")),
+                amplitude_1m_ratio=_safe_float(window_1m_for_budget.get("amplitude_ratio")),
+                amplitude_5m_ratio=_safe_float(window_5m_for_budget.get("amplitude_ratio")),
+            ),
+        )
+        if not bool(regime_entry_budget.get("report_only", True)):
+            effective_args = argparse.Namespace(**vars(effective_args))
+            if _safe_float(regime_entry_budget.get("effective_step_price")) > 0:
+                effective_args.step_price = _safe_float(regime_entry_budget.get("effective_step_price"))
+            if _safe_float(regime_entry_budget.get("effective_per_order_notional")) > 0:
+                effective_args.per_order_notional = _safe_float(regime_entry_budget.get("effective_per_order_notional"))
+            if bool(regime_entry_budget.get("cancel_entry_required")):
+                effective_args.buy_levels = 0
                 effective_args.sell_levels = 0
 
     def _apply_multi_timeframe_side_scheduler(*, long_notional: float, short_notional: float) -> None:
@@ -9455,6 +15244,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "short_cover_paused": False,
         "short_cover_pause_reasons": [],
     }
+    inventory_tier = {
+        "enabled": False,
+        "active": False,
+        "ratio": 0.0,
+        "effective_buy_levels": int(getattr(effective_args, "buy_levels", 0) or 0),
+        "effective_sell_levels": int(getattr(effective_args, "sell_levels", 0) or 0),
+        "effective_per_order_notional": _safe_float(getattr(effective_args, "per_order_notional", 0.0)),
+        "effective_base_position_notional": _safe_float(getattr(effective_args, "base_position_notional", 0.0)),
+    }
+    entry_permission_gate = {
+        "enabled": False,
+        "allow_entry_long": True,
+        "allow_entry_short": True,
+        "pruned_bootstrap_orders": 0,
+        "pruned_buy_orders": 0,
+        "pruned_sell_orders": 0,
+        "applied": False,
+    }
+    loss_recovery_brush = {
+        "enabled": bool(getattr(effective_args, "loss_recovery_brush_enabled", False)),
+        "active": False,
+        "reason": "not_evaluated",
+    }
     take_profit_guard = {
         "enabled": True,
         "min_profit_ratio": getattr(effective_args, "take_profit_min_profit_ratio", None),
@@ -9503,6 +15315,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "inventory_pause_timeout_target_notional": None,
         "inventory_pause_timeout_aggressive": False,
     }
+    inventory_unlock_release = _inventory_unlock_default_report()
     long_inventory_pause_timeout = {
         "enabled": False,
         "side": "long",
@@ -9731,10 +15544,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         if requested_strategy_mode == "synthetic_neutral" and strategy_mode != "synthetic_neutral":
             state["synthetic_ledger_resync_required"] = True
 
-    if _is_inventory_target_neutral_mode(strategy_mode) or _is_maker_volatility_inventory_mode(strategy_mode):
+    if (
+        _is_inventory_target_neutral_mode(strategy_mode)
+        or _is_maker_volatility_inventory_mode(strategy_mode)
+        or (
+            _is_best_quote_maker_volume_mode(strategy_mode)
+            and not _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        )
+    ):
         current_long_qty = max(actual_net_qty, 0.0)
         current_short_qty = max(-actual_net_qty, 0.0)
-    elif strategy_mode == "hedge_neutral":
+    elif strategy_mode == "hedge_neutral" or _is_hedge_best_quote_maker_volume_mode(strategy_mode):
         current_long_qty = max(_position_qty(long_position, position_side="LONG"), 0.0)
         current_short_qty = max(_position_qty(short_position, position_side="SHORT"), 0.0)
     elif _is_one_way_short_mode(strategy_mode):
@@ -9745,6 +15565,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_qty = 0.0
     current_long_notional = current_long_qty * max(mid_price, 0.0)
     current_short_notional = current_short_qty * max(mid_price, 0.0)
+    strategy_open_orders_for_exposure = _filter_futures_strategy_orders(open_orders, symbol)
+    if _is_synthetic_neutral_mode(strategy_mode):
+        strategy_open_orders_for_exposure = _filter_futures_strategy_orders(
+            _decorate_synthetic_open_orders(state=state, open_orders=open_orders),
+            symbol,
+        )
+    open_entry_exposure = _summarize_open_entry_exposure(strategy_open_orders_for_exposure)
     synthetic_residual_long_flat_notional = max(
         _safe_float(getattr(effective_args, "synthetic_residual_long_flat_notional", None)),
         0.0,
@@ -9829,6 +15656,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 entry_price=actual_cost_basis_price,
                 qty_tolerance=max(_safe_float(symbol_info.get("step_size")), 1e-9),
                 fallback_price=mid_price,
+                observed_trade_rows=observed_trade_rows,
             )
             current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
             current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)
@@ -9888,6 +15716,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 external_pause_reasons=list(market_guard["buy_pause_reasons"]) + list(market_bias_entry_pause["buy_pause_reasons"]),
                 external_short_pause=bool(market_bias_entry_pause["short_pause_active"]),
                 external_short_pause_reasons=list(market_bias_entry_pause["short_pause_reasons"]),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             )
             cap_controls = apply_hedge_position_notional_caps(
                 plan=plan,
@@ -9895,6 +15725,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_notional=controls["current_short_notional"],
                 max_long_position_notional=effective_args.max_position_notional,
                 max_short_position_notional=effective_args.max_short_position_notional,
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
@@ -9912,6 +15744,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_mid_price_for_buys=None,
                 external_long_pause=False,
                 external_pause_reasons=[],
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             )
             cap_controls = apply_hedge_position_notional_caps(
                 plan=plan,
@@ -9919,6 +15752,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 current_short_notional=controls["current_short_notional"],
                 max_long_position_notional=None,
                 max_short_position_notional=effective_args.max_short_position_notional,
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
@@ -9943,6 +15777,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
                 external_buy_pause=bool(market_guard["buy_pause_active"]),
                 external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
             )
             cap_controls = apply_max_position_notional_cap(
                 plan=plan,
@@ -9951,6 +15786,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
             )
             target_base_qty = 0.0
             bootstrap_qty = 0.0
@@ -10103,10 +15939,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             paused_entry_long_scale=combined_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
             allow_opposite_entry_with_single_side_inventory=bool(
-                _is_best_quote_neutral_profile(effective_strategy_profile)
-                and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
-                and not inventory_long_pause_active
-                and not inventory_short_pause_active
+                (
+                    _is_best_quote_neutral_profile(effective_strategy_profile)
+                    and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
+                    and not inventory_long_pause_active
+                    and not inventory_short_pause_active
+                )
+                or bool(loss_recovery_brush.get("allow_opposite_entry_with_single_side_inventory"))
             ),
         )
         controls = apply_hedge_position_controls(
@@ -10136,6 +15975,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
@@ -10147,9 +15988,28 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+        )
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
         )
         target_base_qty = plan["target_long_base_qty"]
         bootstrap_qty = plan["bootstrap_long_qty"]
@@ -10173,13 +16033,52 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             entry_price=actual_cost_basis_price,
             qty_tolerance=max(_safe_float(symbol_info.get("step_size")), 1e-9),
             fallback_price=mid_price,
+            observed_trade_rows=observed_trade_rows,
         )
+        synthetic_net_after_sync = _safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")) - _safe_float(
+            synthetic_ledger_snapshot.get("virtual_short_qty")
+        )
+        synthetic_drift_after_sync_qty = actual_net_qty - synthetic_net_after_sync
+        synthetic_drift_after_sync_notional = _synthetic_drift_notional(mid_price, synthetic_drift_after_sync_qty)
+        synthetic_drift_threshold_notional = _protective_synthetic_drift_threshold_notional(effective_args)
+        if synthetic_drift_after_sync_notional > synthetic_drift_threshold_notional:
+            _protective_entry_stop(
+                args=effective_args,
+                symbol=symbol,
+                strategy_mode=strategy_mode,
+                api_key=api_key,
+                api_secret=api_secret,
+                reason="synthetic_rest_position_drift",
+                details={
+                    "actual_net_qty": actual_net_qty,
+                    "synthetic_net_qty": synthetic_net_after_sync,
+                    "drift_qty": synthetic_drift_after_sync_qty,
+                    "drift_notional": synthetic_drift_after_sync_notional,
+                    "threshold_notional": synthetic_drift_threshold_notional,
+                    "unmatched_trade_count": int(synthetic_ledger_snapshot.get("unmatched_trade_count", 0) or 0),
+                },
+                state=state,
+                state_path=state_path,
+            )
         current_long_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_qty")), 0.0)
         current_short_qty = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_qty")), 0.0)
         current_long_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_long_avg_price")), 0.0)
         current_short_avg_price = max(_safe_float(synthetic_ledger_snapshot.get("virtual_short_avg_price")), 0.0)
         current_long_notional = current_long_qty * max(mid_price, 0.0)
         current_short_notional = current_short_qty * max(mid_price, 0.0)
+        loss_recovery_brush = resolve_loss_recovery_brush(
+            enabled=bool(getattr(effective_args, "loss_recovery_brush_enabled", False)),
+            strategy_mode=strategy_mode,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            unrealized_pnl=unrealized_pnl,
+            hard_loss_forced_reduce=hard_loss_forced_reduce,
+            hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+            per_order_notional=effective_args.per_order_notional,
+            entry_notional=getattr(effective_args, "loss_recovery_brush_entry_notional", None),
+            min_unrealized_loss=getattr(effective_args, "loss_recovery_brush_min_unrealized_loss", None),
+            max_entry_orders_per_side=getattr(effective_args, "loss_recovery_brush_max_entry_orders_per_side", None),
+        )
         _apply_multi_timeframe_side_scheduler(
             long_notional=current_long_notional,
             short_notional=current_short_notional,
@@ -10197,6 +16096,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_long_pause_active
             else 0.0
         )
+        if loss_recovery_brush.get("active") and inventory_long_pause_active:
+            inventory_long_probe_scale = max(
+                inventory_long_probe_scale,
+                _safe_float(loss_recovery_brush.get("same_side_probe_scale")),
+            )
         combined_long_probe_scale = (
             weak_buy_probe_scale
             if bool(market_bias_entry_pause["buy_pause_active"])
@@ -10228,6 +16132,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             if inventory_short_pause_active
             else 0.0
         )
+        if loss_recovery_brush.get("active") and inventory_short_pause_active:
+            inventory_short_probe_scale = max(
+                inventory_short_probe_scale,
+                _safe_float(loss_recovery_brush.get("same_side_probe_scale")),
+            )
         combined_short_probe_scale = (
             strong_short_probe_scale
             if bool(market_bias_entry_pause["short_pause_active"])
@@ -10360,10 +16269,13 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             paused_entry_long_scale=combined_long_probe_scale,
             paused_entry_short_scale=combined_short_probe_scale,
             allow_opposite_entry_with_single_side_inventory=bool(
-                _is_best_quote_neutral_profile(effective_strategy_profile)
-                and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
-                and not inventory_long_pause_active
-                and not inventory_short_pause_active
+                (
+                    _is_best_quote_neutral_profile(effective_strategy_profile)
+                    and not _is_strict_neutral_ping_pong_profile(effective_strategy_profile)
+                    and not inventory_long_pause_active
+                    and not inventory_short_pause_active
+                )
+                or bool(loss_recovery_brush.get("allow_opposite_entry_with_single_side_inventory"))
             ),
         )
         plan = _convert_plan_orders_to_one_way(hedge_plan)
@@ -10443,6 +16355,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 list(market_bias_entry_pause["short_pause_reasons"])
                 + list(center_entry_guard["short_pause_reasons"])
             ),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             preserve_long_entry_on_inventory_pause=combined_long_probe_scale > 0,
             preserve_short_entry_on_external_pause=strong_short_probe_scale > 0
             and not center_entry_guard["short_pause_active"],
@@ -10454,6 +16368,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -10694,6 +16610,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
             external_long_pause=bool(market_guard["buy_pause_active"]),
             external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -10701,6 +16619,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=effective_args.max_position_notional,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -10840,6 +16760,1177 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             "planned_short_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("sell_orders", []))),
             "max_position_notional": getattr(effective_args, "maker_max_long_notional", 300.0),
             "max_short_position_notional": getattr(effective_args, "maker_max_short_notional", 300.0),
+        }
+        target_base_qty = 0.0
+        bootstrap_qty = 0.0
+    elif _is_best_quote_maker_volume_mode(strategy_mode):
+        hedge_best_quote = _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        if hedge_best_quote and not dual_side_position:
+            raise RuntimeError("hedge best quote maker volume 策略要求账户处于双向持仓模式")
+        if not hedge_best_quote and dual_side_position:
+            raise RuntimeError("best quote maker volume 策略要求账户处于单向持仓模式")
+        cycle_budget = _safe_float(getattr(effective_args, "best_quote_maker_volume_cycle_budget_notional", 0.0))
+        if cycle_budget <= 0:
+            cycle_budget = max(_safe_float(getattr(effective_args, "max_total_notional", 0.0)), 0.0)
+        target_remaining = max(_safe_float(getattr(effective_args, "best_quote_maker_volume_target_remaining_notional", 0.0)), 0.0)
+        if target_remaining <= 0:
+            target_remaining = max(_safe_float(getattr(effective_args, "max_total_notional", 0.0)), cycle_budget)
+        open_entry_exposure = _summarize_open_entry_exposure(
+            _filter_futures_strategy_orders(open_orders, symbol)
+        )
+        best_quote_loss_per_10k_15m = _safe_float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_15m", 0.0))
+        if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
+            best_quote_loss_per_10k_15m = _safe_float(
+                ((elastic_volume.get("metrics") or {}).get("loss_per_10k_15m"))
+            )
+        best_quote_dynamic_offsets = _resolve_best_quote_dynamic_offsets(
+            adaptive_step=adaptive_step,
+            quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
+            defensive_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_defensive_offset_ticks", 3)),
+        )
+        adaptive_metrics = adaptive_step.get("metrics") if isinstance(adaptive_step.get("metrics"), dict) else {}
+
+        def _adaptive_window_metric(window_name: str, metric_name: str) -> float:
+            window = adaptive_metrics.get(window_name)
+            if isinstance(window, dict) and metric_name in window:
+                return _safe_float(window.get(metric_name))
+            return _safe_float(adaptive_step.get(f"{window_name}_{metric_name}"))
+
+        best_quote_reduce_freeze_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_enabled", False)
+        )
+        best_quote_reduce_freeze_loss_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_loss_ratio", 0.01)),
+            0.0,
+        )
+        best_quote_reduce_freeze_min_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_min_notional", 10.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_confirm_cycles = max(
+            int(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_confirm_cycles", 1)),
+            1,
+        )
+        best_quote_reduce_freeze_hard_loss_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_hard_loss_ratio", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_hard_min_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_hard_min_notional", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_hard_confirm_cycles = max(
+            int(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_hard_confirm_cycles", 0)),
+            0,
+        )
+        best_quote_reduce_freeze_stress_loss_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_stress_loss_ratio", 0.0)),
+            0.0,
+        )
+        best_quote_reduce_freeze_stress_1m_abs_return_ratio = max(
+            _safe_float(
+                getattr(effective_args, "best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio", 0.0)
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_stress_1m_amplitude_ratio = max(
+            _safe_float(
+                getattr(effective_args, "best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio", 0.0)
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_dynamic_threshold_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled", False)
+        )
+        best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_dynamic_threshold_frozen_notional_start = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+        best_quote_reduce_freeze_dynamic_threshold_frozen_notional_full = max(
+            _safe_float(
+                getattr(
+                    effective_args,
+                    "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full",
+                    0.0,
+                )
+            ),
+            0.0,
+        )
+        best_quote_frozen_pair_release_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_enabled", False)
+        )
+        best_quote_frozen_total_cap_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_total_cap_notional", 0.0)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_max_notional = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_notional", 20.0)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_min_side_notional = max(
+            _safe_float(
+                getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_min_side_notional", 100.0)
+            ),
+            0.0,
+        )
+        best_quote_frozen_pair_release_min_profit_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_min_profit_ratio", 0.0008)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_allow_loss = bool(
+            getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_allow_loss", False)
+        )
+        best_quote_frozen_pair_release_max_slippage_ticks = max(
+            int(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks", 2)),
+            0,
+        )
+        best_quote_frozen_pair_release_max_30s_abs_return_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio", 0.0015)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_max_1m_abs_return_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio", 0.0025)),
+            0.0,
+        )
+        best_quote_frozen_pair_release_max_1m_amplitude_ratio = max(
+            _safe_float(getattr(effective_args, "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio", 0.0035)),
+            0.0,
+        )
+        best_quote_reduce_freeze_soft_scale = min(
+            max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_reduce_freeze_soft_ratio_scale", 1.0)),
+                1e-12,
+            ),
+            1.0,
+        )
+        best_quote_inventory_soft_ratio = float(
+            getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)
+        )
+        if best_quote_reduce_freeze_enabled:
+            best_quote_inventory_soft_ratio *= best_quote_reduce_freeze_soft_scale
+        best_quote_reduce_freeze = _best_quote_reduce_freeze_report(
+            state=state,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+            bq_ledger_report=best_quote_volume_ledger,
+        )
+        best_quote_reduce_freeze.update(
+            {
+                "enabled": best_quote_reduce_freeze_enabled,
+                "threshold_loss_ratio": best_quote_reduce_freeze_loss_ratio,
+                "confirm_cycles": best_quote_reduce_freeze_confirm_cycles,
+                "hard_loss_ratio": best_quote_reduce_freeze_hard_loss_ratio,
+                "hard_min_notional": best_quote_reduce_freeze_hard_min_notional,
+                "hard_confirm_cycles": best_quote_reduce_freeze_hard_confirm_cycles,
+                "stress_loss_ratio": best_quote_reduce_freeze_stress_loss_ratio,
+                "stress_1m_abs_return_ratio": best_quote_reduce_freeze_stress_1m_abs_return_ratio,
+                "stress_1m_amplitude_ratio": best_quote_reduce_freeze_stress_1m_amplitude_ratio,
+                "dynamic_threshold_enabled": best_quote_reduce_freeze_dynamic_threshold_enabled,
+                "dynamic_threshold_loss_ratio_scale": best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale,
+                "dynamic_threshold_max_extra_ratio": best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio,
+                "dynamic_threshold_frozen_notional_start": (
+                    best_quote_reduce_freeze_dynamic_threshold_frozen_notional_start
+                ),
+                "dynamic_threshold_frozen_notional_full": (
+                    best_quote_reduce_freeze_dynamic_threshold_frozen_notional_full
+                ),
+                "min_notional": best_quote_reduce_freeze_min_notional,
+                "soft_ratio_scale": best_quote_reduce_freeze_soft_scale,
+                "base_inventory_soft_ratio": float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.60)
+                ),
+                "effective_inventory_soft_ratio": best_quote_inventory_soft_ratio,
+                "actual_long_qty": current_long_qty,
+                "actual_short_qty": current_short_qty,
+                "actual_long_notional": current_long_notional,
+                "actual_short_notional": current_short_notional,
+            }
+        )
+        freeze_fake_plan = {"buy_orders": [], "sell_orders": []}
+        # The freeze experiment is meant to split off losing inventory before
+        # any reducer can keep realizing losses. Do not wait for the soft
+        # threshold here; the 30% lower soft limit is still used by the normal
+        # inventory guards, while freeze itself is gated by loss ratio.
+        if current_long_notional >= best_quote_reduce_freeze_min_notional > 0:
+            freeze_fake_plan["sell_orders"].append({"role": "best_quote_reduce_long"})
+        if current_short_notional >= best_quote_reduce_freeze_min_notional > 0:
+            freeze_fake_plan["buy_orders"].append({"role": "best_quote_reduce_short"})
+        best_quote_reduce_freeze_stress_active = (
+            (
+                best_quote_reduce_freeze_stress_1m_abs_return_ratio > 0
+                and _adaptive_window_metric("window_1m", "abs_return_ratio")
+                >= best_quote_reduce_freeze_stress_1m_abs_return_ratio
+            )
+            or (
+                best_quote_reduce_freeze_stress_1m_amplitude_ratio > 0
+                and _adaptive_window_metric("window_1m", "amplitude_ratio")
+                >= best_quote_reduce_freeze_stress_1m_amplitude_ratio
+            )
+        )
+        best_quote_reduce_freeze = _apply_best_quote_reduce_freeze(
+            state=state,
+            plan=freeze_fake_plan,
+            report=best_quote_reduce_freeze,
+            enabled=best_quote_reduce_freeze_enabled,
+            threshold_loss_ratio=best_quote_reduce_freeze_loss_ratio,
+            min_notional=best_quote_reduce_freeze_min_notional,
+            confirm_cycles=best_quote_reduce_freeze_confirm_cycles,
+            hard_loss_ratio=best_quote_reduce_freeze_hard_loss_ratio,
+            hard_min_notional=best_quote_reduce_freeze_hard_min_notional,
+            hard_confirm_cycles=best_quote_reduce_freeze_hard_confirm_cycles,
+            stress_loss_ratio=best_quote_reduce_freeze_stress_loss_ratio,
+            stress_active=best_quote_reduce_freeze_stress_active,
+            dynamic_threshold_enabled=best_quote_reduce_freeze_dynamic_threshold_enabled,
+            dynamic_threshold_loss_ratio_scale=best_quote_reduce_freeze_dynamic_threshold_loss_ratio_scale,
+            dynamic_threshold_max_extra_ratio=best_quote_reduce_freeze_dynamic_threshold_max_extra_ratio,
+            dynamic_threshold_frozen_notional_start=(
+                best_quote_reduce_freeze_dynamic_threshold_frozen_notional_start
+            ),
+            dynamic_threshold_frozen_notional_full=(
+                best_quote_reduce_freeze_dynamic_threshold_frozen_notional_full
+            ),
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            mid_price=mid_price,
+            bq_ledger_report=best_quote_volume_ledger,
+        )
+        best_quote_volume_ledger = dict(best_quote_reduce_freeze.get("volume_ledger") or best_quote_volume_ledger)
+        best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
+        managed_long_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_long_qty")), 0.0)
+        managed_short_qty = max(_safe_float(best_quote_reduce_freeze.get("managed_short_qty")), 0.0)
+        best_quote_reduce_freeze["exchange_unrealized_pnl"] = exchange_unrealized_pnl
+        isolated_risk_metrics = bool(best_quote_reduce_freeze.get("isolates_risk_metrics"))
+        reduce_freeze_pnl_sync_diff = abs(
+            _safe_float(best_quote_reduce_freeze.get("actual_unrealized_pnl")) - _safe_float(exchange_unrealized_pnl)
+        )
+        reduce_freeze_pnl_sync_tolerance = max(
+            5.0,
+            (
+                _safe_float(best_quote_reduce_freeze.get("actual_long_notional"))
+                + _safe_float(best_quote_reduce_freeze.get("actual_short_notional"))
+            )
+            * 0.02,
+        )
+        reduce_freeze_pnl_sync_ok = (
+            not isolated_risk_metrics or reduce_freeze_pnl_sync_diff <= reduce_freeze_pnl_sync_tolerance
+        )
+        best_quote_reduce_freeze["pnl_sync_ok"] = reduce_freeze_pnl_sync_ok
+        best_quote_reduce_freeze["pnl_sync_diff"] = reduce_freeze_pnl_sync_diff
+        best_quote_reduce_freeze["pnl_sync_tolerance"] = reduce_freeze_pnl_sync_tolerance
+        current_long_qty = managed_long_qty
+        current_short_qty = managed_short_qty
+        current_long_notional = current_long_qty * mid_price
+        current_short_notional = current_short_qty * mid_price
+        if isolated_risk_metrics:
+            uses_bq_volume_ledger = str(best_quote_reduce_freeze.get("managed_source") or "") == "best_quote_volume_ledger"
+            volatility_entry_pause = resolve_volatility_entry_pause(
+                adaptive_step=adaptive_step,
+                state=state,
+                enabled=bool(getattr(effective_args, "volatility_entry_pause_enabled", False)),
+                window_10s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_10s_abs_return_ratio", None),
+                window_10s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_10s_amplitude_ratio", None),
+                window_30s_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_30s_abs_return_ratio", None),
+                window_30s_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_30s_amplitude_ratio", None),
+                window_1m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+                window_1m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+                window_3m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+                window_3m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+                window_5m_abs_return_ratio=getattr(effective_args, "volatility_entry_pause_5m_abs_return_ratio", None),
+                window_5m_amplitude_ratio=getattr(effective_args, "volatility_entry_pause_5m_amplitude_ratio", None),
+                recover_confirm_cycles=getattr(effective_args, "volatility_entry_pause_recover_confirm_cycles", 1),
+                now=plan_now,
+                min_observation_seconds=getattr(effective_args, "volatility_entry_pause_min_observation_seconds", 180.0),
+                current_long_notional=current_long_notional,
+                current_short_notional=current_short_notional,
+                inventory_recover_ratio=getattr(effective_args, "volatility_entry_pause_inventory_recover_ratio", 0.75),
+                tiny_inventory_ignore_notional=getattr(
+                    effective_args,
+                    "volatility_entry_pause_tiny_inventory_ignore_notional",
+                    0.0,
+                ),
+            )
+            volatility_entry_pause["inventory_scope"] = "managed_after_reduce_freeze"
+            current_long_avg_price = (
+                _safe_float(best_quote_reduce_freeze.get("managed_long_avg_price"))
+                if (uses_bq_volume_ledger or reduce_freeze_pnl_sync_ok)
+                else 0.0
+            )
+            current_short_avg_price = (
+                _safe_float(best_quote_reduce_freeze.get("managed_short_avg_price"))
+                if (uses_bq_volume_ledger or reduce_freeze_pnl_sync_ok)
+                else 0.0
+            )
+            if uses_bq_volume_ledger:
+                best_quote_reduce_freeze["managed_cost_basis_source"] = "best_quote_volume_ledger"
+            elif reduce_freeze_pnl_sync_ok:
+                best_quote_reduce_freeze["managed_cost_basis_source"] = "derived_from_synced_reduce_freeze"
+            else:
+                best_quote_reduce_freeze["managed_cost_basis_source"] = "invalid_pnl_sync_ignored"
+            strategy_unrealized_pnl = (
+                _safe_float(best_quote_reduce_freeze.get("managed_unrealized_pnl"))
+                if (uses_bq_volume_ledger or reduce_freeze_pnl_sync_ok)
+                else 0.0
+            )
+        else:
+            strategy_unrealized_pnl = exchange_unrealized_pnl
+        best_quote_reduce_freeze["strategy_unrealized_pnl"] = strategy_unrealized_pnl
+        unrealized_pnl = strategy_unrealized_pnl
+        strategy_actual_net_qty = current_long_qty - current_short_qty
+        strategy_actual_net_notional = strategy_actual_net_qty * max(mid_price, 0.0)
+
+        plan = build_best_quote_maker_volume_plan(
+            config=BestQuoteMakerVolumeConfig(
+                enabled=bool(getattr(effective_args, "best_quote_maker_volume_enabled", False)),
+                quote_offset_ticks=int(best_quote_dynamic_offsets["quote_offset_ticks"]),
+                defensive_offset_ticks=int(best_quote_dynamic_offsets["defensive_offset_ticks"]),
+                max_entry_orders_per_side=max(
+                    min(int(getattr(effective_args, "max_new_orders", 1) or 1) // 2, 2),
+                    1,
+                ),
+                max_long_notional=float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 1_500.0)),
+                max_short_notional=float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 1_500.0)),
+                inventory_soft_ratio=best_quote_inventory_soft_ratio,
+                loss_per_10k_soft=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_soft", 0.5)),
+                loss_per_10k_hard=float(getattr(effective_args, "best_quote_maker_volume_loss_per_10k_hard", 0.8)),
+                soft_loss_budget_scale=float(getattr(effective_args, "best_quote_maker_volume_soft_loss_budget_scale", 0.50)),
+                min_cycle_budget_notional=float(getattr(effective_args, "best_quote_maker_volume_min_cycle_budget_notional", 20.0)),
+                dynamic_tick_enabled=bool(getattr(effective_args, "best_quote_maker_volume_dynamic_tick_enabled", False)),
+                dynamic_tick_tight_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_tight_offset_ticks", 2)
+                ),
+                dynamic_tick_low_loss_per_10k=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_low_loss_per_10k", 3.0)
+                ),
+                dynamic_tick_mid_loss_per_10k=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_mid_loss_per_10k", 5.0)
+                ),
+                dynamic_tick_low_inventory_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_low_inventory_ratio", 0.35)
+                ),
+                dynamic_tick_high_inventory_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_tick_high_inventory_ratio", 0.75)
+                ),
+                inventory_bias_enabled=bool(getattr(effective_args, "best_quote_maker_volume_inventory_bias_enabled", False)),
+                inventory_bias_start_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_start_ratio", 0.25)
+                ),
+                inventory_bias_min_ratio_gap=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_min_ratio_gap", 0.05)
+                ),
+                inventory_bias_min_notional_gap=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_min_notional_gap", 10.0)
+                ),
+                inventory_bias_min_notional_gap_soft_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_min_notional_gap_soft_ratio", 0.0)
+                ),
+                inventory_bias_reduce_share=float(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_reduce_share", 0.70)
+                ),
+                inventory_bias_same_side_extra_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_same_side_extra_ticks", 2)
+                ),
+                inventory_bias_reduce_extra_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_inventory_bias_reduce_extra_ticks", -1)
+                ),
+                dynamic_control_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_enabled", False)
+                ),
+                dynamic_control_low_volatility_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_ratio", 0.0015)
+                ),
+                dynamic_control_high_volatility_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_ratio", 0.0035)
+                ),
+                dynamic_control_extreme_volatility_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_ratio", 0.007)
+                ),
+                dynamic_control_low_volatility_budget_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_budget_scale", 1.15)
+                ),
+                dynamic_control_low_volatility_budget_max_inventory_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_low_volatility_budget_max_inventory_ratio",
+                        0.75,
+                    )
+                ),
+                dynamic_control_high_volatility_budget_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_budget_scale", 0.75)
+                ),
+                dynamic_control_extreme_volatility_budget_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_budget_scale", 0.45)
+                ),
+                dynamic_control_low_volatility_extra_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_extra_offset_ticks", -1)
+                ),
+                dynamic_control_high_volatility_extra_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_extra_offset_ticks", 3)
+                ),
+                dynamic_control_extreme_volatility_extra_offset_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_extra_offset_ticks", 8)
+                ),
+                dynamic_control_low_volatility_step_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_low_volatility_step_scale", 0.75)
+                ),
+                dynamic_control_high_volatility_step_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_high_volatility_step_scale", 1.5)
+                ),
+                dynamic_control_extreme_volatility_step_scale=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_extreme_volatility_step_scale", 2.5)
+                ),
+                dynamic_control_trend_return_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_return_ratio", 0.002)
+                ),
+                dynamic_control_trend_bias_max=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_bias_max", 0.35)
+                ),
+                dynamic_control_trend_entry_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_entry_guard_enabled", False)
+                ),
+                dynamic_control_trend_entry_guard_min_score=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score", 0.75)
+                ),
+                dynamic_control_trend_entry_guard_min_volatility_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_entry_guard_min_volatility_ratio",
+                        0.0,
+                    )
+                ),
+                dynamic_control_trend_entry_guard_conflict_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_entry_guard_conflict_ratio", 0.25)
+                ),
+                dynamic_control_trend_entry_guard_opposite_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_entry_guard_opposite_budget_scale",
+                        0.0,
+                    )
+                ),
+                dynamic_control_trend_inventory_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_enabled", False)
+                ),
+                dynamic_control_trend_inventory_guard_start_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_start_ratio", 0.70)
+                ),
+                dynamic_control_trend_inventory_guard_min_score=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_min_score", 0.55)
+                ),
+                dynamic_control_trend_inventory_guard_min_volatility_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_min_volatility_ratio",
+                        0.0035,
+                    )
+                ),
+                dynamic_control_trend_inventory_guard_entry_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_entry_budget_scale",
+                        0.25,
+                    )
+                ),
+                dynamic_control_trend_inventory_guard_reduce_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_budget_scale",
+                        0.50,
+                    )
+                ),
+                dynamic_control_trend_inventory_guard_reduce_extra_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_inventory_guard_reduce_extra_ticks", 4)
+                ),
+                dynamic_control_trend_loss_reduce_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_enabled", False)
+                ),
+                dynamic_control_trend_loss_reduce_guard_min_score=float(
+                    getattr(effective_args, "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_score", 0.75)
+                ),
+                dynamic_control_trend_loss_reduce_guard_min_volatility_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_min_volatility_ratio",
+                        0.0035,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_reduce_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_budget_scale",
+                        0.35,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks=int(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_reduce_extra_ticks",
+                        6,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_recent_loss_min=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_min",
+                        0.5,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale",
+                        0.20,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks=int(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks",
+                        10,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_relief_return_ratio=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_return_ratio",
+                        0.0015,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_relief_budget_scale=float(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_budget_scale",
+                        0.50,
+                    )
+                ),
+                dynamic_control_trend_loss_reduce_guard_relief_extra_ticks=int(
+                    getattr(
+                        effective_args,
+                        "best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_extra_ticks",
+                        4,
+                    )
+                ),
+                net_loss_reduce_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_enabled", False)
+                ),
+                net_loss_reduce_min_loss=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_min_loss", 0.0)
+                ),
+                net_loss_reduce_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_ratio", 0.0)
+                ),
+                net_loss_reduce_realized_credit_ratio=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio", 1.0)
+                ),
+                net_loss_reduce_min_inventory_notional=float(
+                    getattr(effective_args, "best_quote_maker_volume_net_loss_reduce_min_inventory_notional", 0.0)
+                ),
+                same_side_entry_price_guard_enabled=bool(
+                    getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_enabled", False)
+                ),
+                same_side_entry_price_guard_min_notional=float(
+                    getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_min_notional", 0.0)
+                ),
+                same_side_entry_price_guard_gap_ticks=int(
+                    getattr(effective_args, "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks", 0)
+                ),
+            ),
+            inputs=BestQuoteMakerVolumeInputs(
+                bid_price=bid_price,
+                ask_price=ask_price,
+                mid_price=mid_price,
+                current_net_qty=actual_net_qty,
+                cycle_budget_notional=cycle_budget,
+                loss_per_10k_15m=best_quote_loss_per_10k_15m,
+                target_volume_remaining=target_remaining,
+                tick_size=symbol_info.get("tick_size"),
+                step_size=symbol_info.get("step_size"),
+                min_qty=symbol_info.get("min_qty"),
+                min_notional=symbol_info.get("min_notional"),
+                open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
+                open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
+                pending_entry_buffer_notional=cycle_budget * 0.5,
+                entry_ladder_spacing=_safe_float(getattr(effective_args, "step_price", 0.0)),
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                current_long_avg_price=current_long_avg_price,
+                current_short_avg_price=current_short_avg_price,
+                position_side_mode="hedge" if hedge_best_quote else "one_way",
+                market_return_1m=_adaptive_window_metric("window_1m", "return_ratio"),
+                market_amplitude_1m=_adaptive_window_metric("window_1m", "amplitude_ratio"),
+                market_return_5m=_adaptive_window_metric("window_5m", "return_ratio"),
+                market_amplitude_5m=_adaptive_window_metric("window_5m", "amplitude_ratio"),
+                unrealized_pnl=unrealized_pnl,
+                recent_realized_pnl=_safe_float(elastic_metrics.get("net_pnl_15m")),
+            ),
+        )
+        best_quote_take_profit_guard_enabled = bool(
+            getattr(effective_args, "best_quote_maker_volume_take_profit_guard_enabled", True)
+        )
+        best_quote_long_guard_roles = {"best_quote_reduce_long"}
+        best_quote_short_guard_roles = {"best_quote_reduce_short"}
+        if not hedge_best_quote:
+            best_quote_long_guard_roles.add("best_quote_entry_short")
+            best_quote_short_guard_roles.add("best_quote_entry_long")
+        take_profit_guard = apply_take_profit_profit_guard(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            pause_long_position_notional=effective_args.pause_buy_position_notional,
+            pause_short_position_notional=effective_args.pause_short_position_notional,
+            threshold_long_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            threshold_short_position_notional=getattr(effective_args, "threshold_position_notional", None),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+            tick_size=symbol_info.get("tick_size"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+            extra_long_guard_roles=best_quote_long_guard_roles if best_quote_take_profit_guard_enabled else None,
+            extra_short_guard_roles=best_quote_short_guard_roles if best_quote_take_profit_guard_enabled else None,
+        )
+        take_profit_guard["best_quote_guard_enabled"] = best_quote_take_profit_guard_enabled
+        best_quote_profitable_exit_offset_cap = _cap_best_quote_profitable_inventory_exit_offset(
+            plan=plan,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            current_long_avg_price=current_long_avg_price,
+            current_short_avg_price=current_short_avg_price,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            configured_quote_offset_ticks=int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
+            min_profit_ratio=getattr(effective_args, "take_profit_min_profit_ratio", None),
+        )
+        best_quote_frozen_manual_reduce = apply_best_quote_frozen_inventory_manual_reduce(
+            plan=plan,
+            state=state,
+            report=best_quote_reduce_freeze,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            hedge_mode=hedge_best_quote,
+        )
+        best_quote_frozen_manual_limit = apply_best_quote_frozen_inventory_manual_limit(
+            plan=plan,
+            state=state,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            hedge_mode=hedge_best_quote,
+        )
+        if bool(best_quote_frozen_manual_limit.get("active")):
+            best_quote_reduce_freeze = _best_quote_reduce_freeze_report(
+                state=state,
+                current_long_qty=current_long_qty,
+                current_short_qty=current_short_qty,
+                current_long_avg_price=current_long_avg_price,
+                current_short_avg_price=current_short_avg_price,
+                mid_price=mid_price,
+                bq_ledger_report=best_quote_volume_ledger,
+                position_long_qty=_safe_float(best_quote_reduce_freeze.get("position_long_qty")),
+                position_short_qty=_safe_float(best_quote_reduce_freeze.get("position_short_qty")),
+            )
+        pair_release_30s_abs_return = abs(_adaptive_window_metric("window_30s", "return_ratio"))
+        pair_release_1m_abs_return = abs(_adaptive_window_metric("window_1m", "return_ratio"))
+        pair_release_1m_amplitude = abs(_adaptive_window_metric("window_1m", "amplitude_ratio"))
+        best_quote_frozen_pair_release_stable_allowed = (
+            pair_release_30s_abs_return <= best_quote_frozen_pair_release_max_30s_abs_return_ratio
+            and pair_release_1m_abs_return <= best_quote_frozen_pair_release_max_1m_abs_return_ratio
+            and pair_release_1m_amplitude <= best_quote_frozen_pair_release_max_1m_amplitude_ratio
+        )
+        best_quote_frozen_pair_release_directive = dict(
+            state.get("best_quote_frozen_inventory_pair_release") or {}
+        )
+        best_quote_frozen_pair_release_requested = bool(
+            best_quote_frozen_pair_release_directive.get("requested")
+        )
+        best_quote_frozen_pair_release_authorized, best_quote_frozen_pair_release_auth_reason = (
+            _frozen_inventory_directive_authorized(best_quote_frozen_pair_release_directive)
+            if best_quote_frozen_pair_release_requested
+            else (False, "not_requested")
+        )
+        if best_quote_frozen_pair_release_requested and not best_quote_frozen_pair_release_authorized:
+            state.pop("best_quote_frozen_inventory_pair_release", None)
+        best_quote_frozen_pair_release = apply_best_quote_frozen_inventory_pair_release(
+            plan=plan,
+            report=best_quote_reduce_freeze,
+            bid_price=bid_price,
+            ask_price=ask_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            hedge_mode=hedge_best_quote,
+            enabled=(
+                best_quote_frozen_pair_release_requested
+                and best_quote_frozen_pair_release_authorized
+                and not bool(state.get("best_quote_frozen_inventory_manual_reduce"))
+            ),
+            stable_allowed=best_quote_frozen_pair_release_stable_allowed,
+            max_notional=best_quote_frozen_pair_release_max_notional,
+            min_side_notional=best_quote_frozen_pair_release_min_side_notional,
+            min_profit_ratio=best_quote_frozen_pair_release_min_profit_ratio,
+            max_slippage_ticks=best_quote_frozen_pair_release_max_slippage_ticks,
+            allow_loss=best_quote_frozen_pair_release_allow_loss,
+            requested_qty=(
+                _safe_float(best_quote_frozen_pair_release_directive.get("requested_qty"))
+                if best_quote_frozen_pair_release_requested
+                else None
+            ),
+            request_id=str(best_quote_frozen_pair_release_directive.get("request_id") or ""),
+        )
+        best_quote_frozen_pair_release.update(
+            {
+                "auto_enabled_ignored": bool(best_quote_frozen_pair_release_enabled),
+                "authorization_reason": best_quote_frozen_pair_release_auth_reason,
+                "one_shot_requested": best_quote_frozen_pair_release_requested,
+                "one_shot_requested_at": str(best_quote_frozen_pair_release_directive.get("requested_at") or ""),
+                "one_shot_requested_qty": max(
+                    _safe_float(best_quote_frozen_pair_release_directive.get("requested_qty")),
+                    0.0,
+                )
+                if best_quote_frozen_pair_release_requested
+                else 0.0,
+                "max_notional": best_quote_frozen_pair_release_max_notional,
+                "min_side_notional": best_quote_frozen_pair_release_min_side_notional,
+                "min_profit_ratio": best_quote_frozen_pair_release_min_profit_ratio,
+                "allow_loss": best_quote_frozen_pair_release_allow_loss,
+                "max_slippage_ticks": best_quote_frozen_pair_release_max_slippage_ticks,
+                "max_30s_abs_return_ratio": best_quote_frozen_pair_release_max_30s_abs_return_ratio,
+                "max_1m_abs_return_ratio": best_quote_frozen_pair_release_max_1m_abs_return_ratio,
+                "max_1m_amplitude_ratio": best_quote_frozen_pair_release_max_1m_amplitude_ratio,
+                "window_30s_abs_return_ratio": pair_release_30s_abs_return,
+                "window_1m_abs_return_ratio": pair_release_1m_abs_return,
+                "window_1m_amplitude_ratio": pair_release_1m_amplitude,
+            }
+        )
+        if best_quote_frozen_pair_release_requested and bool(best_quote_frozen_pair_release.get("active")):
+            state.pop("best_quote_frozen_inventory_pair_release", None)
+        best_quote_frozen_total_cap = {
+            "enabled": best_quote_frozen_total_cap_notional > 0,
+            "active": False,
+            "cap_notional": best_quote_frozen_total_cap_notional,
+            "frozen_long_notional": _safe_float(best_quote_reduce_freeze.get("frozen_long_notional")),
+            "frozen_short_notional": _safe_float(best_quote_reduce_freeze.get("frozen_short_notional")),
+            "frozen_total_notional": 0.0,
+            "blocked_buy_entry_orders": 0,
+            "blocked_sell_entry_orders": 0,
+            "reason": None,
+        }
+        best_quote_frozen_total_cap["frozen_total_notional"] = (
+            best_quote_frozen_total_cap["frozen_long_notional"]
+            + best_quote_frozen_total_cap["frozen_short_notional"]
+        )
+        if (
+            best_quote_frozen_total_cap["enabled"]
+            and best_quote_frozen_total_cap["frozen_total_notional"] >= best_quote_frozen_total_cap_notional - 1e-12
+        ):
+            original_buy_orders = list(plan.get("buy_orders") or [])
+            original_sell_orders = list(plan.get("sell_orders") or [])
+            plan["buy_orders"] = [
+                item for item in original_buy_orders if not (isinstance(item, dict) and _is_long_entry_order(item))
+            ]
+            plan["sell_orders"] = [
+                item for item in original_sell_orders if not (isinstance(item, dict) and _is_short_entry_order(item))
+            ]
+            best_quote_frozen_total_cap.update(
+                {
+                    "active": True,
+                    "blocked_buy_entry_orders": len(original_buy_orders) - len(plan["buy_orders"]),
+                    "blocked_sell_entry_orders": len(original_sell_orders) - len(plan["sell_orders"]),
+                    "reason": (
+                        f"frozen_total_notional={_float(best_quote_frozen_total_cap['frozen_total_notional'])} "
+                        f">= cap_notional={_float(best_quote_frozen_total_cap_notional)}"
+                    ),
+                }
+            )
+        best_quote_inventory_cost_gate = {
+            "enabled": bool(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_enabled", True)),
+            "blocked_buy_orders": 0,
+            "blocked_sell_orders": 0,
+            "min_inventory_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_inventory_cost_gate_min_notional", 0.0)),
+                0.0,
+            ),
+            "long_cost_price": current_long_avg_price if current_long_qty > 1e-12 else None,
+            "short_cost_price": current_short_avg_price if current_short_qty > 1e-12 else None,
+            "long_unrealized_ratio": None,
+            "short_unrealized_ratio": None,
+            "grid_profit_gap_price": max(_safe_float(effective_args.step_price), 0.0),
+            "long_entry_gate_price": None,
+            "short_entry_gate_price": None,
+            "market_return_ratio": _safe_float((market_guard or {}).get("return_ratio")),
+            "adverse_trend_threshold_ratio": None,
+            "long_soft_threshold_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0))
+                * _safe_float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.0)),
+                0.0,
+            ),
+            "short_soft_threshold_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0))
+                * _safe_float(getattr(effective_args, "best_quote_maker_volume_inventory_soft_ratio", 0.0)),
+                0.0,
+            ),
+            "long_below_soft_exempt": False,
+            "short_below_soft_exempt": False,
+            "below_soft_cost_gap_scale": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_below_soft_cost_gap_scale", 1.0)),
+                0.0,
+            ),
+            "below_soft_adverse_threshold_scale": max(
+                _safe_float(
+                    getattr(effective_args, "best_quote_maker_volume_below_soft_adverse_threshold_scale", 1.0)
+                ),
+                0.0,
+            ),
+            "long_cost_gap_price": None,
+            "short_cost_gap_price": None,
+            "long_adverse_trend_threshold_ratio": None,
+            "short_adverse_trend_threshold_ratio": None,
+            "long_tiny_inventory_exempt": False,
+            "short_tiny_inventory_exempt": False,
+        }
+        best_quote_entry_adverse_trend_threshold_ratio = (
+            _safe_float(effective_args.step_price) / mid_price
+            if _safe_float(effective_args.step_price) > 0 and mid_price > 0
+            else 0.0
+        )
+        best_quote_inventory_cost_gate["adverse_trend_threshold_ratio"] = best_quote_entry_adverse_trend_threshold_ratio
+        best_quote_cost_gate_min_notional = _safe_float(best_quote_inventory_cost_gate["min_inventory_notional"])
+        long_cost_gate_inventory_active = (
+            current_long_qty > 1e-12
+            and current_long_avg_price > 0
+            and current_long_notional >= best_quote_cost_gate_min_notional
+        )
+        short_cost_gate_inventory_active = (
+            current_short_qty > 1e-12
+            and current_short_avg_price > 0
+            and current_short_notional >= best_quote_cost_gate_min_notional
+        )
+        if (
+            best_quote_inventory_cost_gate["enabled"]
+            and current_long_qty > 1e-12
+            and current_long_avg_price > 0
+            and not long_cost_gate_inventory_active
+        ):
+            best_quote_inventory_cost_gate["long_tiny_inventory_exempt"] = True
+        if (
+            best_quote_inventory_cost_gate["enabled"]
+            and current_short_qty > 1e-12
+            and current_short_avg_price > 0
+            and not short_cost_gate_inventory_active
+        ):
+            best_quote_inventory_cost_gate["short_tiny_inventory_exempt"] = True
+        best_quote_cost_gate_reduce_fallback = {
+            "reduce_short_orders": 0,
+            "reduce_long_orders": 0,
+        }
+        best_quote_reduce_short_remaining = max(current_short_notional, 0.0)
+        best_quote_reduce_long_remaining = max(current_long_notional, 0.0)
+        best_quote_cost_gate_gap = _safe_float(symbol_info.get("tick_size")) * max(
+            int(getattr(effective_args, "best_quote_maker_volume_quote_offset_ticks", 0)),
+            0,
+        )
+
+        def _build_cost_gate_reduce_fallback(
+            *,
+            side: str,
+            role: str,
+            position_side: str,
+            anchor_price: float,
+            direction: int,
+            notional: float,
+            source_order: dict[str, Any],
+        ) -> dict[str, Any] | None:
+            price = _round_order_price(
+                max(float(Decimal(str(anchor_price)) + Decimal(direction) * Decimal(str(best_quote_cost_gate_gap))), 0.0),
+                symbol_info.get("tick_size"),
+                side,
+            )
+            if price <= 0:
+                return None
+            qty = _round_order_qty(notional / price, symbol_info.get("step_size"))
+            order_notional = qty * price
+            if qty <= 0:
+                return None
+            if symbol_info.get("min_qty") is not None and qty < _safe_float(symbol_info.get("min_qty")):
+                return None
+            if symbol_info.get("min_notional") is not None and order_notional < _safe_float(symbol_info.get("min_notional")):
+                return None
+            return {
+                "side": str(side).upper(),
+                "price": price,
+                "qty": qty,
+                "notional": order_notional,
+                "role": role,
+                "position_side": position_side,
+                "execution_type": "maker",
+                "post_only": True,
+                "force_reduce_only": True,
+                "cost_gate_fallback_from_role": _order_role(source_order),
+            }
+
+        if best_quote_inventory_cost_gate["enabled"] and long_cost_gate_inventory_active:
+            long_unrealized_ratio = (
+                (mid_price - current_long_avg_price) / current_long_avg_price
+                if mid_price > 0
+                else None
+            )
+            grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
+            long_soft_threshold = _safe_float(best_quote_inventory_cost_gate["long_soft_threshold_notional"])
+            long_below_soft_exempt = long_soft_threshold > 0 and current_long_notional < long_soft_threshold
+            below_soft_cost_gap_scale = _safe_float(best_quote_inventory_cost_gate["below_soft_cost_gap_scale"])
+            below_soft_adverse_threshold_scale = _safe_float(
+                best_quote_inventory_cost_gate["below_soft_adverse_threshold_scale"]
+            )
+            long_cost_gap = grid_profit_gap * below_soft_cost_gap_scale if long_below_soft_exempt else grid_profit_gap
+            long_adverse_threshold = (
+                best_quote_entry_adverse_trend_threshold_ratio * below_soft_adverse_threshold_scale
+                if long_below_soft_exempt
+                else best_quote_entry_adverse_trend_threshold_ratio
+            )
+            long_entry_gate_price = (
+                max(current_long_avg_price - long_cost_gap, 0.0) if long_cost_gap > 0 else current_long_avg_price
+            )
+            best_quote_inventory_cost_gate["long_unrealized_ratio"] = long_unrealized_ratio
+            best_quote_inventory_cost_gate["long_entry_gate_price"] = long_entry_gate_price
+            best_quote_inventory_cost_gate["long_below_soft_exempt"] = long_below_soft_exempt
+            best_quote_inventory_cost_gate["long_cost_gap_price"] = long_cost_gap
+            best_quote_inventory_cost_gate["long_adverse_trend_threshold_ratio"] = long_adverse_threshold
+            block_long_same_side_adverse = (
+                long_unrealized_ratio is not None
+                and long_unrealized_ratio < 0
+                and long_adverse_threshold > 0
+                and _safe_float((market_guard or {}).get("return_ratio")) < -long_adverse_threshold
+            )
+            kept_buy_orders: list[dict[str, Any]] = []
+            blocked_buy_orders: list[dict[str, Any]] = []
+            for item in plan.get("buy_orders", []):
+                if (
+                    isinstance(item, dict)
+                    and _order_role(item) == "best_quote_entry_long"
+                    and (
+                        _safe_float(item.get("price")) > long_entry_gate_price + 1e-12
+                        or block_long_same_side_adverse
+                    )
+                ):
+                    blocked = dict(item)
+                    blocked["block_reason"] = (
+                        "losing_long_adverse_downtrend"
+                        if block_long_same_side_adverse
+                        else "losing_long_entry_above_cost_gate"
+                    )
+                    blocked_buy_orders.append(blocked)
+                    if best_quote_reduce_short_remaining > 0:
+                        fallback_notional = min(
+                            _safe_float(item.get("notional")),
+                            best_quote_reduce_short_remaining,
+                        )
+                        fallback = _build_cost_gate_reduce_fallback(
+                            side="BUY",
+                            role="best_quote_reduce_short",
+                            position_side="SHORT" if hedge_best_quote else "BOTH",
+                            anchor_price=bid_price,
+                            direction=-1,
+                            notional=fallback_notional,
+                            source_order=item,
+                        )
+                        if fallback is not None:
+                            kept_buy_orders.append(fallback)
+                            best_quote_reduce_short_remaining = max(
+                                best_quote_reduce_short_remaining - _safe_float(fallback.get("notional")),
+                                0.0,
+                            )
+                            best_quote_cost_gate_reduce_fallback["reduce_short_orders"] += 1
+                else:
+                    kept_buy_orders.append(item)
+            plan["buy_orders"] = kept_buy_orders
+            best_quote_inventory_cost_gate["blocked_buy_orders"] = len(blocked_buy_orders)
+            best_quote_inventory_cost_gate["blocked_buy_order_details"] = blocked_buy_orders
+            best_quote_inventory_cost_gate["would_block_buy_orders"] = len(blocked_buy_orders)
+        if best_quote_inventory_cost_gate["enabled"] and short_cost_gate_inventory_active:
+            short_unrealized_ratio = (
+                (current_short_avg_price - mid_price) / current_short_avg_price
+                if mid_price > 0
+                else None
+            )
+            grid_profit_gap = max(_safe_float(effective_args.step_price), 0.0)
+            short_soft_threshold = _safe_float(best_quote_inventory_cost_gate["short_soft_threshold_notional"])
+            short_below_soft_exempt = short_soft_threshold > 0 and current_short_notional < short_soft_threshold
+            below_soft_cost_gap_scale = _safe_float(best_quote_inventory_cost_gate["below_soft_cost_gap_scale"])
+            below_soft_adverse_threshold_scale = _safe_float(
+                best_quote_inventory_cost_gate["below_soft_adverse_threshold_scale"]
+            )
+            short_cost_gap = grid_profit_gap * below_soft_cost_gap_scale if short_below_soft_exempt else grid_profit_gap
+            short_adverse_threshold = (
+                best_quote_entry_adverse_trend_threshold_ratio * below_soft_adverse_threshold_scale
+                if short_below_soft_exempt
+                else best_quote_entry_adverse_trend_threshold_ratio
+            )
+            short_entry_gate_price = (
+                current_short_avg_price + short_cost_gap if short_cost_gap > 0 else current_short_avg_price
+            )
+            best_quote_inventory_cost_gate["short_unrealized_ratio"] = short_unrealized_ratio
+            best_quote_inventory_cost_gate["short_entry_gate_price"] = short_entry_gate_price
+            best_quote_inventory_cost_gate["short_below_soft_exempt"] = short_below_soft_exempt
+            best_quote_inventory_cost_gate["short_cost_gap_price"] = short_cost_gap
+            best_quote_inventory_cost_gate["short_adverse_trend_threshold_ratio"] = short_adverse_threshold
+            block_short_same_side_adverse = (
+                short_unrealized_ratio is not None
+                and short_unrealized_ratio < 0
+                and short_adverse_threshold > 0
+                and _safe_float((market_guard or {}).get("return_ratio")) > short_adverse_threshold
+            )
+            kept_sell_orders: list[dict[str, Any]] = []
+            blocked_sell_orders: list[dict[str, Any]] = []
+            for item in plan.get("sell_orders", []):
+                if (
+                    isinstance(item, dict)
+                    and _order_role(item) == "best_quote_entry_short"
+                    and (
+                        _safe_float(item.get("price")) + 1e-12 < short_entry_gate_price
+                        or block_short_same_side_adverse
+                    )
+                ):
+                    blocked = dict(item)
+                    blocked["block_reason"] = (
+                        "losing_short_adverse_uptrend"
+                        if block_short_same_side_adverse
+                        else "losing_short_entry_below_cost_gate"
+                    )
+                    blocked_sell_orders.append(blocked)
+                    if best_quote_reduce_long_remaining > 0:
+                        fallback_notional = min(
+                            _safe_float(item.get("notional")),
+                            best_quote_reduce_long_remaining,
+                        )
+                        fallback = _build_cost_gate_reduce_fallback(
+                            side="SELL",
+                            role="best_quote_reduce_long",
+                            position_side="LONG" if hedge_best_quote else "BOTH",
+                            anchor_price=ask_price,
+                            direction=1,
+                            notional=fallback_notional,
+                            source_order=item,
+                        )
+                        if fallback is not None:
+                            kept_sell_orders.append(fallback)
+                            best_quote_reduce_long_remaining = max(
+                                best_quote_reduce_long_remaining - _safe_float(fallback.get("notional")),
+                                0.0,
+                            )
+                            best_quote_cost_gate_reduce_fallback["reduce_long_orders"] += 1
+                else:
+                    kept_sell_orders.append(item)
+            plan["sell_orders"] = kept_sell_orders
+            best_quote_inventory_cost_gate["blocked_sell_orders"] = len(blocked_sell_orders)
+            best_quote_inventory_cost_gate["blocked_sell_order_details"] = blocked_sell_orders
+            best_quote_inventory_cost_gate["would_block_sell_orders"] = len(blocked_sell_orders)
+        best_quote_inventory_cost_gate["reduce_fallback"] = best_quote_cost_gate_reduce_fallback
+        best_quote_inventory_cap_guard = _apply_best_quote_entry_inventory_cap_guard(
+            plan,
+            current_long_notional=current_long_notional,
+            current_short_notional=current_short_notional,
+            max_long_notional=getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0),
+            max_short_notional=getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0),
+        )
+        best_quote_entry_level_guard = _apply_best_quote_entry_level_guard(
+            plan,
+            buy_levels=getattr(effective_args, "buy_levels", 0),
+            sell_levels=getattr(effective_args, "sell_levels", 0),
+        )
+        best_quote_maker_volume = {
+            "enabled": bool(plan.get("enabled")),
+            "regime": str(plan.get("regime") or ""),
+            "reasons": list(plan.get("reasons") or []),
+            "metrics": dict(plan.get("metrics") or {}),
+            "dynamic_offsets": dict(best_quote_dynamic_offsets),
+            "profitable_exit_offset_cap": dict(best_quote_profitable_exit_offset_cap),
+            "inventory_cost_gate": dict(best_quote_inventory_cost_gate),
+            "inventory_cap_guard": dict(best_quote_inventory_cap_guard),
+            "entry_level_guard": dict(best_quote_entry_level_guard),
+            "reduce_freeze": dict(best_quote_reduce_freeze),
+            "frozen_manual_reduce": dict(best_quote_frozen_manual_reduce),
+            "frozen_manual_limit": dict(best_quote_frozen_manual_limit),
+            "frozen_pair_release": dict(best_quote_frozen_pair_release),
+            "frozen_total_cap": dict(best_quote_frozen_total_cap),
+        }
+        inventory_tier = {
+            "enabled": False,
+            "active": False,
+            "ratio": 0.0,
+            "start_notional": None,
+            "end_notional": None,
+            "effective_buy_levels": len(plan.get("buy_orders", [])),
+            "effective_sell_levels": len(plan.get("sell_orders", [])),
+            "effective_per_order_notional": cycle_budget,
+            "effective_base_position_notional": 0.0,
+        }
+        controls = {
+            "buy_paused": not bool(plan.get("buy_orders")),
+            "pause_reasons": list(best_quote_maker_volume.get("reasons") or []),
+            "short_paused": not bool(plan.get("sell_orders")),
+            "short_pause_reasons": list(best_quote_maker_volume.get("reasons") or []),
+            "current_long_notional": current_long_notional,
+            "current_short_notional": current_short_notional,
+        }
+        cap_controls = {
+            "cap_applied": False,
+            "buy_cap_applied": False,
+            "short_cap_applied": False,
+            "buy_budget_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_long_notional", 0.0))
+                - current_long_notional,
+                0.0,
+            ),
+            "short_budget_notional": max(
+                _safe_float(getattr(effective_args, "best_quote_maker_volume_max_short_notional", 0.0))
+                - current_short_notional,
+                0.0,
+            ),
+            "planned_buy_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("buy_orders", []))),
+            "planned_short_notional": sum(_safe_float(item.get("notional")) for item in list(plan.get("sell_orders", []))),
+            "max_position_notional": getattr(effective_args, "best_quote_maker_volume_max_long_notional", None),
+            "max_short_position_notional": getattr(effective_args, "best_quote_maker_volume_max_short_notional", None),
         }
         target_base_qty = 0.0
         bootstrap_qty = 0.0
@@ -11003,6 +18094,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=None,
             external_long_pause=False,
             external_pause_reasons=[],
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
         )
         cap_controls = apply_hedge_position_notional_caps(
             plan=plan,
@@ -11010,6 +18102,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             current_short_notional=controls["current_short_notional"],
             max_long_position_notional=None,
             max_short_position_notional=effective_args.max_short_position_notional,
+            open_entry_short_notional=_safe_float(open_entry_exposure.get("open_entry_short_notional")),
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
@@ -11135,6 +18228,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             min_mid_price_for_buys=effective_args.min_mid_price_for_buys,
             external_buy_pause=bool(market_guard["buy_pause_active"]),
             external_pause_reasons=list(market_guard["buy_pause_reasons"]),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
         )
         if excess_inventory_gate["active"]:
             controls["buy_paused"] = True
@@ -11150,6 +18244,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
+            open_entry_long_notional=_safe_float(open_entry_exposure.get("open_entry_long_notional")),
         )
         if _uses_volume_long_v4_staged_delever(effective_strategy_profile):
             volume_long_v4_delever = apply_volume_long_v4_staged_delever(
@@ -11263,17 +18358,40 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 ask_price=ask_price,
                 sell_offset_steps=getattr(effective_args, "static_sell_offset_steps", 0.0),
             )
+            hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
+                state=state,
+                enabled=bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
+                triggered=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
+                side="SELL",
+                current_notional=controls["current_long_notional"],
+                target_notional=_resolve_hard_loss_reduce_target_notional(
+                    configured_target_notional=(
+                        getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
+                        if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
+                        else exposure_escalation.get("target_notional")
+                    ),
+                    pause_position_notional=effective_args.pause_buy_position_notional,
+                ),
+                unrealized_pnl=_safe_float(exposure_escalation.get("unrealized_pnl")),
+                hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+                now=plan_now,
+                loss_recover_ratio=0.75,
+            )
+            hard_reduce_disarmed = bool(hard_loss_forced_reduce_episode.get("disarmed"))
             hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
                 plan=plan,
                 enabled=bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)),
-                active=exposure_escalation.get("reason") == "hard_unrealized_loss_limit",
+                active=exposure_escalation.get("reason") == "hard_unrealized_loss_limit" and not hard_reduce_disarmed,
                 side="SELL",
                 current_qty=current_long_qty,
                 current_notional=controls["current_long_notional"],
-                target_notional=(
-                    getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
-                    if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
-                    else exposure_escalation.get("target_notional")
+                target_notional=_resolve_hard_loss_reduce_target_notional(
+                    configured_target_notional=(
+                        getattr(effective_args, "hard_loss_forced_reduce_target_notional", None)
+                        if getattr(effective_args, "hard_loss_forced_reduce_target_notional", None) is not None
+                        else exposure_escalation.get("target_notional")
+                    ),
+                    pause_position_notional=effective_args.pause_buy_position_notional,
                 ),
                 max_order_notional=getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None),
                 bid_price=bid_price,
@@ -11282,8 +18400,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 step_size=symbol_info.get("step_size"),
                 min_qty=symbol_info.get("min_qty"),
                 min_notional=symbol_info.get("min_notional"),
-                reason=exposure_escalation.get("reason"),
+                reason=(
+                    "hard_loss_episode_disarmed"
+                    if hard_reduce_disarmed
+                    else exposure_escalation.get("reason")
+                ),
+                strategy_mode=strategy_mode,
             )
+            hard_loss_forced_reduce["unrealized_pnl"] = _safe_float(exposure_escalation.get("unrealized_pnl"))
         target_base_qty = plan["target_base_qty"]
         bootstrap_qty = plan["bootstrap_qty"]
 
@@ -11319,6 +18443,21 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     adverse_reduce_enabled = bool(getattr(effective_args, "adverse_reduce_enabled", False)) and not bool(
         (exposure_escalation or {}).get("active")
     )
+    adverse_long_pause_notional = effective_args.pause_buy_position_notional
+    adverse_short_pause_notional = effective_args.pause_short_position_notional
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        adverse_long_pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=effective_args,
+            strategy_mode=strategy_mode,
+            side="long",
+            fallback_pause_notional=effective_args.pause_buy_position_notional,
+        )
+        adverse_short_pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=effective_args,
+            strategy_mode=strategy_mode,
+            side="short",
+            fallback_pause_notional=effective_args.pause_short_position_notional,
+        )
     adverse_inventory_reduce = assess_adverse_inventory_reduce(
         enabled=adverse_reduce_enabled,
         mid_price=mid_price,
@@ -11330,11 +18469,12 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_short_cost_price=adverse_short_cost_price,
         current_long_cost_basis_source=adverse_long_cost_basis_source,
         current_short_cost_basis_source=adverse_short_cost_basis_source,
-        pause_long_position_notional=effective_args.pause_buy_position_notional,
-        pause_short_position_notional=effective_args.pause_short_position_notional,
+        pause_long_position_notional=adverse_long_pause_notional,
+        pause_short_position_notional=adverse_short_pause_notional,
         long_trigger_ratio=getattr(effective_args, "adverse_reduce_long_trigger_ratio", None),
         short_trigger_ratio=getattr(effective_args, "adverse_reduce_short_trigger_ratio", None),
         target_ratio=getattr(effective_args, "adverse_reduce_target_ratio", 0.75),
+        allow_short_below_pause_probe=not _is_best_quote_maker_volume_mode(strategy_mode),
     )
     adverse_inventory_reduce = apply_adverse_inventory_reduce(
         plan=plan,
@@ -11345,8 +18485,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         current_long_notional=controls.get("current_long_notional", current_long_notional),
         current_short_qty=current_short_qty,
         current_short_notional=controls.get("current_short_notional", current_short_notional),
-        pause_long_position_notional=effective_args.pause_buy_position_notional,
-        pause_short_position_notional=effective_args.pause_short_position_notional,
+        pause_long_position_notional=adverse_long_pause_notional,
+        pause_short_position_notional=adverse_short_pause_notional,
         target_ratio=getattr(effective_args, "adverse_reduce_target_ratio", 0.75),
         max_order_notional=getattr(effective_args, "adverse_reduce_max_order_notional", 0.0),
         bid_price=bid_price,
@@ -11356,35 +18496,97 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         min_qty=symbol_info.get("min_qty"),
         min_notional=symbol_info.get("min_notional"),
         maker_timeout_seconds=getattr(effective_args, "adverse_reduce_maker_timeout_seconds", 45.0),
+        strategy_mode=strategy_mode,
     )
     if not hard_loss_forced_reduce.get("active") and bool(getattr(effective_args, "hard_loss_forced_reduce_enabled", False)):
         hard_loss_limit = max(_safe_float(getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None)), 0.0)
-        hard_side = None
-        hard_qty = 0.0
-        hard_notional = 0.0
-        hard_unrealized = 0.0
-        hard_cost_basis = 0.0
+        hard_candidates: list[dict[str, Any]] = []
+        if current_long_qty > 1e-12:
+            long_notional_for_hard = controls.get("current_long_notional", current_long_notional)
+            hard_candidates.append(
+                {
+                    "side": "SELL",
+                    "qty": current_long_qty,
+                    "notional": long_notional_for_hard,
+                    "target_notional": _resolve_hard_loss_reduce_target_notional(
+                        configured_target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+                        pause_position_notional=effective_args.pause_buy_position_notional,
+                    ),
+                    "cost_basis": adverse_long_cost_price,
+                    "unrealized": _position_unrealized_or_estimate(
+                        position=long_position,
+                        qty=current_long_qty,
+                        cost_basis_price=adverse_long_cost_price,
+                        mid_price=mid_price,
+                        side="SELL",
+                    ),
+                }
+            )
         if current_short_qty > 1e-12:
-            hard_side = "BUY"
-            hard_qty = current_short_qty
-            hard_notional = controls.get("current_short_notional", current_short_notional)
-            hard_cost_basis = adverse_short_cost_price
-            hard_unrealized = (hard_cost_basis - mid_price) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
-        elif current_long_qty > 1e-12:
-            hard_side = "SELL"
-            hard_qty = current_long_qty
-            hard_notional = controls.get("current_long_notional", current_long_notional)
-            hard_cost_basis = adverse_long_cost_price
-            hard_unrealized = (mid_price - hard_cost_basis) * hard_qty if hard_cost_basis > 0 and mid_price > 0 else 0.0
-        hard_loss_active = hard_loss_limit > 0 and hard_unrealized <= -hard_loss_limit
+            short_notional_for_hard = controls.get("current_short_notional", current_short_notional)
+            hard_candidates.append(
+                {
+                    "side": "BUY",
+                    "qty": current_short_qty,
+                    "notional": short_notional_for_hard,
+                    "target_notional": _resolve_hard_loss_reduce_target_notional(
+                        configured_target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+                        pause_position_notional=effective_args.pause_short_position_notional,
+                    ),
+                    "cost_basis": adverse_short_cost_price,
+                    "unrealized": _position_unrealized_or_estimate(
+                        position=short_position,
+                        qty=current_short_qty,
+                        cost_basis_price=adverse_short_cost_price,
+                        mid_price=mid_price,
+                        side="BUY",
+                    ),
+                }
+            )
+        active_candidates = [
+            candidate
+            for candidate in hard_candidates
+            if hard_loss_limit > 0
+            and _safe_float(candidate.get("unrealized")) <= -hard_loss_limit
+            and _safe_float(candidate.get("notional")) > _safe_float(candidate.get("target_notional")) + 1e-12
+        ]
+        selected_hard_candidate = (
+            min(active_candidates, key=lambda item: _safe_float(item.get("unrealized")))
+            if active_candidates
+            else (
+                min(hard_candidates, key=lambda item: _safe_float(item.get("unrealized")))
+                if hard_candidates
+                else None
+            )
+        )
+        hard_side = str((selected_hard_candidate or {}).get("side") or "")
+        hard_qty = _safe_float((selected_hard_candidate or {}).get("qty"))
+        hard_notional = _safe_float((selected_hard_candidate or {}).get("notional"))
+        hard_target_notional = _safe_float((selected_hard_candidate or {}).get("target_notional"))
+        hard_unrealized = _safe_float((selected_hard_candidate or {}).get("unrealized"))
+        hard_cost_basis = _safe_float((selected_hard_candidate or {}).get("cost_basis"))
+        hard_loss_active = selected_hard_candidate in active_candidates
+        hard_loss_forced_reduce_episode = resolve_hard_loss_forced_reduce_episode(
+            state=state,
+            enabled=True,
+            triggered=bool(hard_side) and hard_loss_active,
+            side=hard_side,
+            current_notional=hard_notional,
+            target_notional=hard_target_notional,
+            unrealized_pnl=hard_unrealized,
+            hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+            now=plan_now,
+            loss_recover_ratio=0.75,
+        )
+        hard_reduce_disarmed = bool(hard_loss_forced_reduce_episode.get("disarmed"))
         hard_loss_forced_reduce = apply_hard_loss_forced_reduce(
             plan=plan,
             enabled=True,
-            active=bool(hard_side) and hard_loss_active,
+            active=bool(hard_side) and hard_loss_active and not hard_reduce_disarmed,
             side=hard_side or "SELL",
             current_qty=hard_qty,
             current_notional=hard_notional,
-            target_notional=getattr(effective_args, "hard_loss_forced_reduce_target_notional", None),
+            target_notional=hard_target_notional,
             max_order_notional=getattr(effective_args, "hard_loss_forced_reduce_max_order_notional", None),
             bid_price=bid_price,
             ask_price=ask_price,
@@ -11392,19 +18594,84 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             step_size=symbol_info.get("step_size"),
             min_qty=symbol_info.get("min_qty"),
             min_notional=symbol_info.get("min_notional"),
-            reason="hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered",
+            reason=(
+                "hard_loss_episode_disarmed"
+                if hard_reduce_disarmed
+                else "hard_unrealized_loss_limit" if hard_loss_active else "hard_loss_not_triggered"
+            ),
+            strategy_mode=strategy_mode,
         )
         hard_loss_forced_reduce["unrealized_pnl"] = hard_unrealized
         hard_loss_forced_reduce["cost_basis_price"] = hard_cost_basis
 
-    if volatility_entry_pause.get("active"):
-        entry_pause_reason = volatility_entry_pause.get("reason") or "active"
+    volatility_entry_pause["window_1m_thresholds"] = {
+        "abs_return_ratio": getattr(effective_args, "volatility_entry_pause_1m_abs_return_ratio", None),
+        "amplitude_ratio": getattr(effective_args, "volatility_entry_pause_1m_amplitude_ratio", None),
+    }
+    volatility_entry_pause["window_3m_thresholds"] = {
+        "abs_return_ratio": getattr(effective_args, "volatility_entry_pause_3m_abs_return_ratio", None),
+        "amplitude_ratio": getattr(effective_args, "volatility_entry_pause_3m_amplitude_ratio", None),
+    }
+    hard_loss_rescue_entry_guard = resolve_hard_loss_rescue_entry_guard(
+        state=state,
+        hard_loss_forced_reduce=hard_loss_forced_reduce,
+        volatility_entry_pause=volatility_entry_pause,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        now=plan_now,
+        protect_seconds=180.0,
+        hard_unrealized_loss_limit=getattr(effective_args, "hard_loss_forced_reduce_unrealized_loss_limit", None),
+        loss_recover_ratio=0.75,
+    )
+    loss_reduce_reentry_guard = resolve_loss_reduce_reentry_guard(
+        state=state,
+        enabled=bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),
+        adverse_inventory_reduce=adverse_inventory_reduce,
+        hard_loss_forced_reduce=hard_loss_forced_reduce,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        mid_price=mid_price,
+        effective_step_price=getattr(effective_args, "step_price", None),
+        now=plan_now,
+        cooldown_seconds=getattr(effective_args, "loss_reentry_cooldown_seconds", 300.0),
+        recover_buffer_steps=getattr(effective_args, "loss_reentry_cost_buffer_steps", 1.0),
+    )
+    if loss_reduce_reentry_guard.get("block_long_entries"):
+        controls["buy_paused"] = True
+        controls["pause_reasons"] = list(controls.get("pause_reasons", []))
+        controls["pause_reasons"].append(
+            "loss_reduce_reentry_guard: " + str(loss_reduce_reentry_guard.get("reason") or "block_long_entries")
+        )
+    if loss_reduce_reentry_guard.get("block_short_entries"):
+        controls["short_paused"] = True
+        controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
+        controls["short_pause_reasons"].append(
+            "loss_reduce_reentry_guard: " + str(loss_reduce_reentry_guard.get("reason") or "block_short_entries")
+        )
+
+    unrealized_loss_entry_guard = assess_unrealized_loss_entry_guard(
+        enabled=bool(getattr(effective_args, "unrealized_loss_entry_guard_enabled", False)),
+        unrealized_pnl=unrealized_pnl,
+        current_long_notional=controls.get("current_long_notional", current_long_notional),
+        current_short_notional=controls.get("current_short_notional", current_short_notional),
+        min_loss=getattr(effective_args, "unrealized_loss_entry_guard_min_loss", None),
+        loss_ratio=getattr(effective_args, "unrealized_loss_entry_guard_ratio", None),
+    )
+    if unrealized_loss_entry_guard.get("active"):
         controls["buy_paused"] = True
         controls["short_paused"] = True
         controls["pause_reasons"] = list(controls.get("pause_reasons", []))
         controls["short_pause_reasons"] = list(controls.get("short_pause_reasons", []))
-        controls["pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
-        controls["short_pause_reasons"].append(f"volatility_entry_pause: {entry_pause_reason}")
+        guard_reason = str(unrealized_loss_entry_guard.get("reason") or "active")
+        controls["pause_reasons"].append(f"unrealized_loss_entry_guard: {guard_reason}")
+        controls["short_pause_reasons"].append(f"unrealized_loss_entry_guard: {guard_reason}")
+
+    apply_volatility_entry_pause_controls(
+        controls=controls,
+        volatility_entry_pause=volatility_entry_pause,
+        loss_recovery_brush=loss_recovery_brush,
+        elastic_volume=elastic_volume,
+    )
     if anti_chase_entry_guard.get("block_long_entries"):
         controls["buy_paused"] = True
         controls["pause_reasons"] = list(controls.get("pause_reasons", []))
@@ -11433,6 +18700,77 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
             for item in plan.get("sell_orders", [])
             if isinstance(item, dict) and _is_long_exit_order(item)
         ]
+
+    unlock_release_cap = _resolve_inventory_unlock_release_cap(
+        args=effective_args,
+        fallback_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
+    )
+    unlock_long_side = strategy_mode == "one_way_long" or (
+        strategy_mode == "best_quote_maker_volume_v1" and current_long_qty > 1e-12
+    )
+    unlock_short_side = strategy_mode == "one_way_short" or (
+        strategy_mode == "best_quote_maker_volume_v1" and current_short_qty > 1e-12
+    )
+    if unlock_long_side:
+        best_quote_metrics = dict(best_quote_maker_volume.get("metrics") or {})
+        unlock_pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=effective_args,
+            strategy_mode=strategy_mode,
+            side="long",
+            fallback_pause_notional=effective_args.pause_buy_position_notional,
+            open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_long_notional")),
+            pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
+        )
+        inventory_unlock_release = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="long",
+            entry_paused=bool(controls.get("buy_paused")),
+            take_profit_guard=take_profit_guard,
+            current_qty=current_long_qty,
+            current_notional=controls.get("current_long_notional", current_long_notional),
+            pause_notional=unlock_pause_notional,
+            release_cap_notional=unlock_release_cap,
+            per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
+    elif unlock_short_side:
+        best_quote_metrics = dict(best_quote_maker_volume.get("metrics") or {})
+        unlock_pause_notional = _resolve_inventory_unlock_pause_notional(
+            args=effective_args,
+            strategy_mode=strategy_mode,
+            side="short",
+            fallback_pause_notional=effective_args.pause_short_position_notional,
+            open_entry_notional=_safe_float(best_quote_metrics.get("open_entry_short_notional")),
+            pending_entry_buffer_notional=_safe_float(best_quote_metrics.get("pending_entry_buffer_notional")),
+        )
+        inventory_unlock_release = apply_inventory_unlock_release(
+            plan=plan,
+            state=state,
+            side="short",
+            entry_paused=bool(controls.get("short_paused")),
+            take_profit_guard=take_profit_guard,
+            current_qty=current_short_qty,
+            current_notional=controls.get("current_short_notional", current_short_notional),
+            pause_notional=unlock_pause_notional,
+            release_cap_notional=unlock_release_cap,
+            per_order_notional=inventory_tier.get("effective_per_order_notional", getattr(effective_args, "per_order_notional", 0.0)),
+            step_price=effective_args.step_price,
+            tick_size=symbol_info.get("tick_size"),
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+            bid_price=bid_price,
+            ask_price=ask_price,
+        )
+    else:
+        state.pop("inventory_unlock_release", None)
 
     if (
         (strategy_mode == "one_way_long" and _is_best_quote_long_profile(effective_strategy_profile))
@@ -11495,12 +18833,34 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 desired_orders=desired_orders,
                 sticky_roles=set(sticky_exit_mode["roles"]),
             )
+        desired_orders = preserve_sticky_exit_orders(
+            existing_orders=open_orders_for_diff,
+            desired_orders=desired_orders,
+            sticky_roles={
+                "active_delever_long",
+                "active_delever_short",
+                "adverse_reduce_long",
+                "adverse_reduce_short",
+            },
+            price_tolerance=effective_args.step_price,
+        )
+        entry_reuse_tolerance, entry_reuse_reason = _regime_budget_entry_reuse_tolerance(
+            strategy_profile=effective_strategy_profile,
+            regime_entry_budget=regime_entry_budget,
+            step_price=effective_args.step_price,
+        )
         desired_orders = preserve_sticky_entry_orders(
             existing_orders=open_orders_for_diff,
             desired_orders=desired_orders,
-            price_tolerance=effective_args.step_price,
+            price_tolerance=entry_reuse_tolerance
+            * max(_safe_float(getattr(effective_args, "sticky_entry_price_tolerance_steps", 1.0)), 0.0),
             max_levels_per_group=getattr(effective_args, "sticky_entry_levels", None),
+            preserve_less_aggressive=bool(getattr(effective_args, "sticky_entry_preserve_less_aggressive", True)),
         )
+        _sync_plan_orders_from_desired_orders(plan, desired_orders)
+        if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled"):
+            regime_entry_budget["entry_reuse_tolerance"] = entry_reuse_tolerance
+            regime_entry_budget["entry_reuse_reason"] = entry_reuse_reason
         synthetic_tp_only_watchdog = assess_synthetic_tp_only_watchdog(
             state=state,
             strategy_mode=strategy_mode,
@@ -11525,6 +18885,118 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         )
     else:
         state.pop("synthetic_tp_only_watchdog_state", None)
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        desired_orders = preserve_sticky_exit_orders(
+            existing_orders=open_orders_for_diff,
+            desired_orders=desired_orders,
+            sticky_roles={"best_quote_reduce_long", "best_quote_reduce_short"},
+            price_tolerance=max(_safe_float(effective_args.step_price), 0.0),
+        )
+        _sync_plan_orders_from_desired_orders(plan, desired_orders)
+        best_quote_paired_reduce_separation = _separate_paired_best_quote_reduce_orders(
+            plan=plan,
+            tick_size=symbol_info.get("tick_size"),
+        )
+        best_quote_maker_volume["paired_reduce_separation"] = dict(best_quote_paired_reduce_separation)
+        desired_orders = [
+            *plan["buy_orders"],
+            *plan["sell_orders"],
+        ]
+        desired_orders = preserve_sticky_entry_orders(
+            existing_orders=open_orders_for_diff,
+            desired_orders=desired_orders,
+            price_tolerance=max(_safe_float(effective_args.step_price), 0.0)
+            * max(_safe_float(getattr(effective_args, "sticky_entry_price_tolerance_steps", 1.0)), 0.0),
+            max_levels_per_group=getattr(effective_args, "sticky_entry_levels", None),
+            preserve_less_aggressive=bool(getattr(effective_args, "sticky_entry_preserve_less_aggressive", True)),
+        )
+        _sync_plan_orders_from_desired_orders(plan, desired_orders)
+        best_quote_reduce_freeze_order_cap = _cap_best_quote_reduce_orders_to_managed_inventory(
+            plan=plan,
+            report=best_quote_reduce_freeze,
+            step_size=symbol_info.get("step_size"),
+            min_qty=symbol_info.get("min_qty"),
+            min_notional=symbol_info.get("min_notional"),
+        )
+        best_quote_maker_volume["reduce_freeze_order_cap"] = dict(best_quote_reduce_freeze_order_cap)
+        best_quote_maker_volume["reduce_freeze"] = {
+            **dict(best_quote_maker_volume.get("reduce_freeze") or {}),
+            "order_cap": dict(best_quote_reduce_freeze_order_cap),
+        }
+        desired_orders = [
+            *plan["buy_orders"],
+            *plan["sell_orders"],
+        ]
+    if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled") and not bool(
+        regime_entry_budget.get("report_only", True)
+    ):
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            allow_entry_long=bool(regime_entry_budget.get("allow_entry_long", True)),
+            allow_entry_short=bool(regime_entry_budget.get("allow_entry_short", True)),
+            max_entry_long_orders=regime_entry_budget.get("long_entry_capacity"),
+            max_entry_short_orders=regime_entry_budget.get("short_entry_capacity"),
+        )
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
+    regime_entry_budget_controls_entry = bool(
+        isinstance(regime_entry_budget, dict)
+        and regime_entry_budget.get("enabled")
+        and not bool(regime_entry_budget.get("report_only", True))
+    )
+    adaptive_regime_router_controls_entry = bool(
+        isinstance(adaptive_regime_router, dict) and adaptive_regime_router.get("enabled")
+    )
+    if adaptive_regime_router_controls_entry and not regime_entry_budget_controls_entry:
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            allow_entry_long=bool(adaptive_regime_router.get("allow_entry_long", True)),
+            allow_entry_short=bool(adaptive_regime_router.get("allow_entry_short", True)),
+            max_entry_long_orders=adaptive_regime_router.get("max_entry_long_orders"),
+            max_entry_short_orders=adaptive_regime_router.get("max_entry_short_orders"),
+        )
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
+    if (
+        loss_recovery_brush.get("active")
+        and not regime_entry_budget_controls_entry
+        and not (isinstance(elastic_volume, dict) and elastic_volume.get("enabled"))
+        and not adaptive_regime_router_controls_entry
+    ):
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            max_entry_long_orders=loss_recovery_brush.get("max_entry_long_orders"),
+            max_entry_short_orders=loss_recovery_brush.get("max_entry_short_orders"),
+        )
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
+    if (
+        isinstance(elastic_volume, dict)
+        and elastic_volume.get("enabled")
+        and not regime_entry_budget_controls_entry
+        and not adaptive_regime_router_controls_entry
+    ):
+        entry_permission_gate = apply_entry_permission_gate(
+            plan,
+            allow_entry_long=bool(elastic_volume.get("allow_entry_long", True)),
+            allow_entry_short=bool(elastic_volume.get("allow_entry_short", True)),
+            max_entry_long_orders=elastic_volume.get("max_entry_long_orders"),
+            max_entry_short_orders=elastic_volume.get("max_entry_short_orders"),
+        )
+        if entry_permission_gate.get("applied"):
+            desired_orders = [
+                *plan["buy_orders"],
+                *plan["sell_orders"],
+            ]
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 
     state_now = _isoformat(_utc_now())
@@ -11535,6 +19007,11 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state["last_mid_price"] = mid_price
     state["updated_at"] = state_now
     state["version"] = STATE_VERSION
+    if isinstance(volatility_entry_pause, dict) and volatility_entry_pause.get("enabled"):
+        state["volatility_entry_pause_state"] = dict(volatility_entry_pause.get("state") or {})
+        state["volatility_entry_pause_state"]["updated_at"] = state_now
+    else:
+        state.pop("volatility_entry_pause_state", None)
     if isinstance(elastic_volume, dict) and elastic_volume.get("enabled"):
         repair_ladder_state = elastic_volume.get("repair_ladder") if isinstance(elastic_volume.get("repair_ladder"), dict) else {}
         previous_elastic_state = state.get("elastic_volume") if isinstance(state.get("elastic_volume"), dict) else {}
@@ -11552,6 +19029,8 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         state["elastic_volume"] = {
             "regime": elastic_volume.get("regime"),
             "cooldown_until": elastic_volume.get("cooldown_until"),
+            "pending_regime": elastic_volume.get("pending_regime"),
+            "pending_count": int(_safe_float(elastic_volume.get("pending_count"))),
             "active_state": elastic_volume.get("active_state"),
             "strategy_intent": elastic_volume.get("strategy_intent"),
             "repair_ladder_level": elastic_volume.get("repair_ladder_level"),
@@ -11562,6 +19041,17 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         }
     else:
         state.pop("elastic_volume", None)
+    if isinstance(adaptive_regime_router, dict) and adaptive_regime_router.get("enabled"):
+        state["adaptive_regime_router"] = adaptive_regime_router_state_snapshot(
+            adaptive_regime_router,
+            updated_at=state_now,
+        )
+    else:
+        state.pop("adaptive_regime_router", None)
+    if isinstance(regime_entry_budget, dict) and regime_entry_budget.get("enabled"):
+        state["regime_entry_budget"] = regime_entry_budget_state_snapshot(regime_entry_budget, updated_at=state_now)
+    else:
+        state.pop("regime_entry_budget", None)
     if sticky_exit_mode["key"]:
         state["sticky_exit_mode_key"] = sticky_exit_mode["key"]
     else:
@@ -11569,6 +19059,10 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     state_path.parent.mkdir(parents=True, exist_ok=True)
     state_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
 
+    effective_loss_inventory_no_cross_small_entry_notional = max(
+        _safe_float(getattr(effective_args, "loss_inventory_no_cross_small_entry_notional", 0.0)),
+        _safe_float(loss_recovery_brush.get("entry_notional")) if loss_recovery_brush.get("active") else 0.0,
+    )
     report = {
         "generated_at": _isoformat(_utc_now()),
         "symbol": symbol,
@@ -11615,10 +19109,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "adaptive_step": adaptive_step,
         "multi_timeframe_bias": multi_timeframe_bias,
         "elastic_volume": elastic_volume,
+        "adaptive_regime_router": adaptive_regime_router,
+        "regime_entry_budget": regime_entry_budget,
         "volatility_entry_pause": volatility_entry_pause,
         "anti_chase_entry_guard": anti_chase_entry_guard,
         "best_quote_repair_ladder": best_quote_repair_ladder,
+        "entry_permission_gate": entry_permission_gate,
         "maker_volatility_inventory": maker_volatility_inventory,
+        "best_quote_maker_volume": best_quote_maker_volume,
         "synthetic_trend_follow": synthetic_trend_follow,
         "synthetic_flow_sleeve": synthetic_flow_sleeve,
         "adverse_inventory_reduce": adverse_inventory_reduce,
@@ -11629,7 +19127,14 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "exposure_escalation": exposure_escalation,
         "exposure_escalation_buy_pause": exposure_escalation_buy_pause,
         "hard_loss_forced_reduce": hard_loss_forced_reduce,
+        "hard_loss_forced_reduce_episode": hard_loss_forced_reduce_episode,
+        "hard_loss_rescue_entry_guard": hard_loss_rescue_entry_guard,
+        "loss_reduce_reentry_guard": loss_reduce_reentry_guard,
+        "unrealized_loss_entry_guard": unrealized_loss_entry_guard,
+        "loss_recovery_brush": loss_recovery_brush,
+        "loss_inventory_no_cross_small_entry_notional": effective_loss_inventory_no_cross_small_entry_notional,
         "active_delever": active_delever,
+        "inventory_unlock_release": inventory_unlock_release,
         "long_inventory_pause_timeout": long_inventory_pause_timeout,
         "short_inventory_pause_timeout": short_inventory_pause_timeout,
         "short_threshold_timeout": short_threshold_timeout,
@@ -11644,6 +19149,19 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "current_short_avg_price": current_short_avg_price,
         "actual_net_qty": actual_net_qty,
         "actual_net_notional": actual_net_qty * max(mid_price, 0.0),
+        "strategy_actual_net_qty": strategy_actual_net_qty,
+        "strategy_actual_net_notional": strategy_actual_net_notional,
+        "unrealized_pnl": unrealized_pnl,
+        "strategy_unrealized_pnl": strategy_unrealized_pnl,
+        "exchange_unrealized_pnl": exchange_unrealized_pnl,
+        "frozen_inventory_unrealized_pnl": exchange_unrealized_pnl - strategy_unrealized_pnl,
+        "unrealized_loss_entry_guard_enabled": bool(unrealized_loss_entry_guard.get("enabled")),
+        "unrealized_loss_entry_guard_active": bool(unrealized_loss_entry_guard.get("active")),
+        "unrealized_loss_entry_guard_reason": unrealized_loss_entry_guard.get("reason"),
+        "unrealized_loss_entry_guard_loss": _safe_float(unrealized_loss_entry_guard.get("unrealized_loss")),
+        "unrealized_loss_entry_guard_ratio": _safe_float(unrealized_loss_entry_guard.get("loss_ratio")),
+        "unrealized_loss_entry_guard_threshold_ratio": _safe_float(unrealized_loss_entry_guard.get("threshold_ratio")),
+        "unrealized_loss_entry_guard_min_loss": _safe_float(unrealized_loss_entry_guard.get("min_loss")),
         "synthetic_ledger": synthetic_ledger_snapshot,
         "synthetic_net_qty": current_long_qty - current_short_qty if _is_synthetic_neutral_mode(strategy_mode) else None,
         "synthetic_drift_qty": (
@@ -11668,6 +19186,9 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "effective_adverse_reduce_maker_timeout_seconds": getattr(effective_args, "adverse_reduce_maker_timeout_seconds", None),
         "effective_adverse_reduce_max_order_notional": getattr(effective_args, "adverse_reduce_max_order_notional", None),
         "effective_adverse_reduce_keep_probe_scale": getattr(effective_args, "adverse_reduce_keep_probe_scale", None),
+        "effective_loss_reentry_guard_enabled": bool(getattr(effective_args, "loss_reentry_guard_enabled", False)),
+        "effective_loss_reentry_cooldown_seconds": getattr(effective_args, "loss_reentry_cooldown_seconds", None),
+        "effective_loss_reentry_cost_buffer_steps": getattr(effective_args, "loss_reentry_cost_buffer_steps", None),
         "effective_short_threshold_timeout_seconds": getattr(effective_args, "short_threshold_timeout_seconds", None),
         "effective_synthetic_residual_long_flat_notional": getattr(
             effective_args,
@@ -11745,6 +19266,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
         "tail_cleanup_active": bool(plan.get("tail_cleanup_active")),
         "open_order_count": len(strategy_open_orders),
         "total_open_order_count": len(open_orders),
+        "account_snapshot_sources": account_snapshot_sources,
         "kept_orders": diff["kept_orders"],
         "missing_orders": diff["missing_orders"],
         "stale_orders": diff["stale_orders"],
@@ -11770,11 +19292,29 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     return report
 
 
+def _mark_submit_report_blocked(report: dict[str, Any], *, reason: str = "validation_failed") -> dict[str, Any]:
+    validation = report.get("validation") or {}
+    actions = validation.get("actions") or {}
+    report["blocked"] = True
+    report["idle"] = (
+        _safe_float(actions.get("place_count")) <= 0
+        and _safe_float(actions.get("cancel_count")) <= 0
+    )
+    report["error"] = {
+        "reason": reason,
+        "errors": list(validation.get("errors") or []),
+    }
+    return report
+
+
 def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -> dict[str, Any]:
     strategy_mode = str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")).strip() or "one_way_long"
+    default_required_position_mode = (
+        HEDGE_POSITION_MODE if _uses_exchange_hedge_position_sides(strategy_mode) else ONE_WAY_POSITION_MODE
+    )
     required_position_mode = _normalize_required_position_mode(
         plan_report.get("required_position_mode"),
-        default=getattr(args, "required_position_mode", ONE_WAY_POSITION_MODE),
+        default=getattr(args, "required_position_mode", default_required_position_mode),
         allow_unknown=True,
     )
     effective_max_total_notional = _safe_float(plan_report.get("effective_max_total_notional"))
@@ -11826,15 +19366,71 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         plan_report=plan_report,
         strategy_mode=strategy_mode,
     )
+    validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_loss_reduce_reentry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+        actions=validation["actions"],
+        args=args,
+    )
+    validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        enabled=not bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)),
+    )
+    if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        if validation["actions"].get("place_count", 0) > 0:
+            validation["errors"].append(
+                "runtime_guard_loss_cooling_down blocks normal place orders; frozen inventory manual reduce-only orders allowed"
+            )
+        else:
+            validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
+    if (validation["actions"].get("runtime_guard_manual_frozen_inventory_override") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        if validation["actions"].get("place_count", 0) > 0:
+            validation["errors"].append(
+                "runtime_guard manual frozen-inventory override blocks normal place orders; frozen reduce-only orders allowed"
+            )
+        else:
+            validation["errors"].append("runtime_guard manual frozen-inventory override blocks new normal place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
 
     report = {
         "plan_json": str(args.plan_json),
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "submit_generated_at": datetime.now(timezone.utc).isoformat(),
         "apply_requested": bool(args.apply),
         "validation": validation,
         "live_book": {
             "bid_price": live_bid_price,
             "ask_price": live_ask_price,
+            "source": str(live_book.get("source") or "unknown"),
         },
         "executed": False,
         "canceled_orders": [],
@@ -11849,6 +19445,38 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "cancel_stale": bool(args.cancel_stale),
             "maker_retries": args.maker_retries,
         },
+        "user_data_stream_status": _runner_user_data_stream_status(args),
+        "observed_execution_events": _snapshot_runner_execution_events(args, max_events=5),
+        "observed_strategy_execution_summary": _summarize_runner_strategy_execution_events(
+            args,
+            symbol,
+            max_events=200,
+        ),
+        "observed_strategy_open_order_state": _summarize_runner_strategy_open_order_state(
+            args,
+            symbol,
+            max_events=500,
+        ),
+        "plan_summary": {
+            "symbol": symbol,
+            "strategy_mode": strategy_mode,
+            "strategy_profile": str(
+                plan_report.get("effective_strategy_profile")
+                or plan_report.get("strategy_profile")
+                or getattr(args, "strategy_profile", AUTO_REGIME_STABLE_PROFILE)
+            ),
+            "mid_price": _safe_float(plan_report.get("mid_price")),
+            "center_price": _safe_float(plan_report.get("center_price")),
+            "open_order_count": int(plan_report.get("open_order_count", 0) or 0),
+            "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
+            "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
+            "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
+            "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
+            "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
+            "buy_paused": bool(plan_report.get("buy_paused")),
+            "short_paused": bool(plan_report.get("short_paused")),
+        },
+        "synthetic_ledger": dict(plan_report.get("synthetic_ledger") or {}),
         "plan_snapshot": {
             "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
             "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
@@ -11889,14 +19517,16 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         return report
 
     if not validation["ok"]:
-        raise RuntimeError("Refusing to place orders because validation failed")
+        return _mark_submit_report_blocked(report)
 
     credentials = load_binance_api_credentials()
     if credentials is None:
         raise RuntimeError("请先在本机环境变量中配置 BINANCE_API_KEY 和 BINANCE_API_SECRET")
     api_key, api_secret = credentials
 
-    position_mode = fetch_futures_position_mode(api_key, api_secret, recv_window=args.recv_window)
+    submit_account_snapshot_sources: dict[str, str] = {}
+    position_mode = _fetch_runner_position_mode_cached(args, api_key, api_secret, recv_window=args.recv_window)
+    submit_account_snapshot_sources["position_mode"] = str(position_mode.get("source") or "rest")
     dual_side_position = _truthy(position_mode.get("dualSidePosition"))
     if required_position_mode not in VALID_POSITION_MODES:
         raise RuntimeError(f"unsupported required_position_mode={required_position_mode or '<empty>'}")
@@ -11904,11 +19534,14 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         raise RuntimeError("plan requires one-way position mode, but account is in hedge mode")
     if required_position_mode == HEDGE_POSITION_MODE and not dual_side_position:
         raise RuntimeError("plan requires hedge position mode, but account is in one-way mode")
-    if required_position_mode == HEDGE_POSITION_MODE and strategy_mode != "hedge_neutral":
-        raise RuntimeError("hedge position mode requires strategy_mode=hedge_neutral")
+    if required_position_mode == HEDGE_POSITION_MODE and not _uses_exchange_hedge_position_sides(strategy_mode):
+        raise RuntimeError("hedge position mode requires hedge strategy_mode")
     if strategy_mode == "hedge_neutral":
         if not dual_side_position:
             raise RuntimeError("中性 Hedge 策略要求账户处于双向持仓模式")
+    elif _is_hedge_best_quote_maker_volume_mode(strategy_mode):
+        if not dual_side_position:
+            raise RuntimeError("Hedge Best Quote 策略要求账户处于双向持仓模式")
     elif _is_synthetic_neutral_mode(strategy_mode):
         if dual_side_position:
             raise RuntimeError("单向 synthetic neutral 策略要求账户处于单向持仓模式")
@@ -11924,7 +19557,15 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     elif dual_side_position:
         raise RuntimeError("账户当前是双向持仓模式，当前提交器只支持单向模式")
 
-    account_info = fetch_futures_account_info_v3(api_key, api_secret, recv_window=args.recv_window)
+    account_info, current_open_orders, account_sources = _resolve_runner_account_snapshot(
+        args,
+        symbol=symbol,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+        require_account_mode=str(args.margin_type).upper().strip() == "ISOLATED",
+    )
+    submit_account_snapshot_sources.update(account_sources)
     multi_assets_margin = _truthy(account_info.get("multiAssetsMargin"))
     requested_margin_type = str(args.margin_type).upper().strip()
     report["account_mode"] = {
@@ -11936,13 +19577,24 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             "账户当前启用了 Multi-Assets Mode，Binance 不允许在该模式下切到 ISOLATED。"
         )
 
-    current_open_orders = fetch_futures_open_orders(symbol, api_key, api_secret, recv_window=args.recv_window)
     current_strategy_open_orders = _filter_futures_strategy_orders(current_open_orders, symbol)
+    report["account_snapshot_sources"] = submit_account_snapshot_sources
     expected_open_order_count = int(plan_report.get("open_order_count", 0) or 0)
     expected_long_qty = _safe_float(plan_report.get("current_long_qty"))
     expected_short_qty = _safe_float(plan_report.get("current_short_qty"))
     expected_actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
-    if strategy_mode == "hedge_neutral":
+    expected_exchange_long_qty = expected_long_qty
+    expected_exchange_short_qty = expected_short_qty
+    isolated_best_quote_reduce_freeze = False
+    if _is_hedge_best_quote_maker_volume_mode(strategy_mode):
+        best_quote_metrics = plan_report.get("best_quote_maker_volume")
+        if isinstance(best_quote_metrics, dict):
+            reduce_freeze = best_quote_metrics.get("reduce_freeze")
+            if isinstance(reduce_freeze, dict) and reduce_freeze.get("isolates_risk_metrics"):
+                isolated_best_quote_reduce_freeze = True
+                expected_exchange_long_qty += max(_safe_float(reduce_freeze.get("frozen_long_qty")), 0.0)
+                expected_exchange_short_qty += max(_safe_float(reduce_freeze.get("frozen_short_qty")), 0.0)
+    if _uses_exchange_hedge_position_sides(strategy_mode):
         current_long_position = extract_symbol_position(account_info, symbol, "LONG")
         current_short_position = extract_symbol_position(account_info, symbol, "SHORT")
         current_long_qty = max(_position_qty(current_long_position, position_side="LONG"), 0.0)
@@ -11966,9 +19618,114 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         else:
             current_long_qty = max(current_actual_net_qty, 0.0)
             current_short_qty = 0.0
+    allow_reduce_only_position_surplus = (
+        isolated_best_quote_reduce_freeze
+        and _all_place_orders_are_forced_hedge_reduces(validation["actions"])
+        and current_long_qty + 1e-9 >= expected_exchange_long_qty
+        and current_short_qty + 1e-9 >= expected_exchange_short_qty
+    )
+    allow_isolated_frozen_position_mismatch = (
+        isolated_best_quote_reduce_freeze
+        and _isolated_frozen_actions_tolerate_position_drift(
+            validation["actions"],
+            expected_long_qty=expected_long_qty,
+            expected_short_qty=expected_short_qty,
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            frozen_long_qty=max(expected_exchange_long_qty - expected_long_qty, 0.0),
+            frozen_short_qty=max(expected_exchange_short_qty - expected_short_qty, 0.0),
+        )
+    )
+    allow_hedge_best_quote_flat_dust_position_mismatch = (
+        _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        and _hedge_best_quote_position_diff_effectively_dust(
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            expected_long_qty=expected_exchange_long_qty,
+            expected_short_qty=expected_exchange_short_qty,
+            mid_price=_safe_float(plan_report.get("mid_price")),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        )
+    )
+    report["position_reconcile"] = {
+        "expected_long_qty": expected_long_qty,
+        "expected_short_qty": expected_short_qty,
+        "expected_exchange_long_qty": expected_exchange_long_qty,
+        "expected_exchange_short_qty": expected_exchange_short_qty,
+        "current_long_qty": current_long_qty,
+        "current_short_qty": current_short_qty,
+        "isolated_best_quote_reduce_freeze": isolated_best_quote_reduce_freeze,
+        "reduce_only_position_surplus_allowed": allow_reduce_only_position_surplus,
+        "isolated_frozen_position_mismatch_allowed": allow_isolated_frozen_position_mismatch,
+        "hedge_best_quote_flat_dust_position_mismatch_allowed": allow_hedge_best_quote_flat_dust_position_mismatch,
+    }
+    if (
+        _is_hedge_best_quote_maker_volume_mode(strategy_mode)
+        and _hedge_best_quote_exchange_effectively_flat(
+            current_long_qty=current_long_qty,
+            current_short_qty=current_short_qty,
+            mid_price=_safe_float(plan_report.get("mid_price")),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        )
+        and not current_strategy_open_orders
+        and (
+            expected_exchange_long_qty > 1e-12
+            or expected_exchange_short_qty > 1e-12
+            or expected_open_order_count > 0
+        )
+    ):
+        state_path = Path(str(plan_report.get("state_path", args.state_path)))
+        state = read_json(state_path) or {}
+        if not isinstance(state, dict):
+            state = {}
+        exchange_flat_resync = reset_best_quote_hedge_ledgers_after_exchange_flat(
+            state=state,
+            mid_price=_safe_float(plan_report.get("mid_price")),
+            reason="submit_exchange_flat_no_strategy_orders",
+        )
+        _write_json(state_path, state)
+        validation["actions"]["place_count"] = 0
+        validation["actions"]["cancel_count"] = 0
+        validation["actions"]["place_orders"] = []
+        validation["actions"]["cancel_orders"] = []
+        validation["errors"].append("hedge best quote exchange is flat; cleared stale local BQ ledgers")
+        validation["ok"] = False
+        report["validation"] = validation
+        report["position_reconcile"]["exchange_flat_resync"] = exchange_flat_resync
+        return _mark_submit_report_blocked(report, reason="hedge_best_quote_exchange_flat_resynced")
     if len(current_strategy_open_orders) != expected_open_order_count:
         raise RuntimeError("当前未成交委托数量与计划生成时不一致，请等待下一轮刷新")
     if _is_synthetic_neutral_mode(strategy_mode):
+        synthetic_net_qty = expected_long_qty - expected_short_qty
+        synthetic_drift_qty = current_actual_net_qty - synthetic_net_qty
+        synthetic_drift_notional = _synthetic_drift_notional(
+            _safe_float(plan_report.get("mid_price")),
+            synthetic_drift_qty,
+        )
+        synthetic_drift_threshold_notional = _protective_synthetic_drift_threshold_notional(args)
+        if synthetic_drift_notional > synthetic_drift_threshold_notional:
+            state_path = Path(str(plan_report.get("state_path", args.state_path)))
+            state = read_json(state_path) or {}
+            if not isinstance(state, dict):
+                state = {}
+            _protective_entry_stop(
+                args=args,
+                symbol=symbol,
+                strategy_mode=strategy_mode,
+                api_key=api_key,
+                api_secret=api_secret,
+                reason="submit_synthetic_rest_position_drift",
+                details={
+                    "actual_net_qty": current_actual_net_qty,
+                    "synthetic_net_qty": synthetic_net_qty,
+                    "drift_qty": synthetic_drift_qty,
+                    "drift_notional": synthetic_drift_notional,
+                    "threshold_notional": synthetic_drift_threshold_notional,
+                    "account_snapshot_sources": dict(submit_account_snapshot_sources),
+                },
+                state=state,
+                state_path=state_path,
+            )
         if abs(current_actual_net_qty - expected_actual_net_qty) > 1e-9:
             raise RuntimeError("当前净持仓与计划生成时不一致，请等待下一轮刷新")
     elif _is_competition_inventory_grid_mode(strategy_mode):
@@ -11977,9 +19734,20 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     elif _is_one_way_short_mode(strategy_mode):
         if abs(current_short_qty - expected_short_qty) > 1e-9:
             raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
-    elif abs(current_long_qty - expected_long_qty) > 1e-9:
+    elif (
+        abs(current_long_qty - expected_exchange_long_qty) > 1e-9
+        and not allow_reduce_only_position_surplus
+        and not allow_isolated_frozen_position_mismatch
+        and not allow_hedge_best_quote_flat_dust_position_mismatch
+    ):
         raise RuntimeError("当前持仓与计划生成时不一致，请等待下一轮刷新")
-    if strategy_mode == "hedge_neutral" and abs(current_short_qty - expected_short_qty) > 1e-9:
+    if (
+        _uses_exchange_hedge_position_sides(strategy_mode)
+        and abs(current_short_qty - expected_exchange_short_qty) > 1e-9
+        and not allow_reduce_only_position_surplus
+        and not allow_isolated_frozen_position_mismatch
+        and not allow_hedge_best_quote_flat_dust_position_mismatch
+    ):
         raise RuntimeError("当前空头持仓与计划生成时不一致，请等待下一轮刷新")
 
     validation["actions"] = cap_reduce_only_place_orders_to_position(
@@ -11992,6 +19760,132 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         actions=validation["actions"],
         plan_report=plan_report,
         strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_hard_loss_rescue_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_loss_reduce_reentry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = apply_loss_inventory_no_cross_entry_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+    )
+    validation["actions"] = cap_reduce_only_place_orders_to_position(
+        actions=validation["actions"],
+        strategy_mode=strategy_mode,
+        current_actual_net_qty=current_actual_net_qty,
+        current_open_orders=current_strategy_open_orders,
+    )
+    validation["actions"] = suppress_place_orders_with_existing_submitted_buckets(
+        actions=validation["actions"],
+        current_open_orders=current_strategy_open_orders,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+    )
+    validation["actions"] = sort_cancel_orders_farthest_from_market_first(
+        actions=validation["actions"],
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+    )
+    inventory_priority_net_qty = current_actual_net_qty
+    if isolated_best_quote_reduce_freeze:
+        inventory_priority_net_qty = expected_actual_net_qty
+    validation["actions"] = prioritize_inventory_reducing_place_orders(
+        actions=validation["actions"],
+        current_actual_net_qty=inventory_priority_net_qty,
+        current_long_avg_price=_safe_float(plan_report.get("current_long_avg_price")),
+        current_short_avg_price=_safe_float(plan_report.get("current_short_avg_price")),
+        step_price=_safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))
+        or _safe_float(plan_report.get("effective_step_price"))
+        or _safe_float(getattr(args, "step_price", 0.0)),
+        tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
+        min_profit_ratio=(plan_report.get("take_profit_guard") or {}).get("effective_min_profit_ratio"),
+    )
+    if _is_best_quote_maker_volume_mode(strategy_mode):
+        validation["actions"] = suppress_same_side_nearby_place_orders(
+            actions=validation["actions"],
+            current_open_orders=current_strategy_open_orders,
+            min_price_spacing=(
+                _safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price"))
+                or _safe_float(plan_report.get("effective_step_price"))
+                or _safe_float(getattr(args, "step_price", 0.0))
+            ),
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=(plan_report.get("symbol_info") or {}).get("tick_size"),
+            min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+            step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        )
+    validation["actions"] = _suppress_place_orders_during_runtime_guard_loss_cooldown(
+        actions=validation["actions"],
+        args=args,
+    )
+    validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=strategy_mode,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        enabled=not bool(getattr(args, "best_quote_maker_volume_allow_loss_reduce_only", False)),
+    )
+    if (validation["actions"].get("runtime_guard_loss_cooldown") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        if "runtime_guard_loss_cooling_down blocks new place orders" not in validation["errors"]:
+            if validation["actions"].get("place_count", 0) > 0:
+                validation["errors"].append(
+                    "runtime_guard_loss_cooling_down blocks normal place orders; frozen inventory manual reduce-only orders allowed"
+                )
+            else:
+                validation["errors"].append("runtime_guard_loss_cooling_down blocks new place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
+    if (validation["actions"].get("runtime_guard_manual_frozen_inventory_override") or {}).get("blocked"):
+        validation["errors"] = [
+            item for item in validation["errors"] if "plan contains no actions to execute" not in item
+        ]
+        if "runtime_guard manual frozen-inventory override blocks new normal place orders" not in validation["errors"]:
+            if validation["actions"].get("place_count", 0) > 0:
+                validation["errors"].append(
+                    "runtime_guard manual frozen-inventory override blocks normal place orders; frozen reduce-only orders allowed"
+                )
+            else:
+                validation["errors"].append("runtime_guard manual frozen-inventory override blocks new normal place orders")
+        validation["ok"] = (
+            validation["actions"].get("cancel_count", 0) > 0
+            or validation["actions"].get("place_count", 0) > 0
+        )
+    configured_place_budget = int(getattr(args, "execution_place_budget_per_cycle", 0) or 0)
+    max_new_order_budget = int(getattr(args, "max_new_orders", 0) or 0)
+    effective_place_budget = (
+        max_new_order_budget
+        if configured_place_budget <= 0
+        else min(configured_place_budget, max_new_order_budget)
+    )
+    validation = apply_execution_request_budget_to_actions(
+        validation=validation,
+        report=report,
+        max_mutations_per_cycle=int(getattr(args, "execution_request_budget_per_cycle", 0) or 0),
+        max_cancels_per_cycle=int(getattr(args, "execution_cancel_budget_per_cycle", 0) or 0),
+        max_places_per_cycle=effective_place_budget,
     )
     validation = enforce_execution_action_limits(
         validation=validation,
@@ -12008,7 +19902,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         report["idle"] = True
         return report
     if not validation["ok"]:
-        raise RuntimeError("Refusing to place orders because validation failed")
+        return _mark_submit_report_blocked(report)
 
     if requested_margin_type != "KEEP":
         try:
@@ -12026,30 +19920,37 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
     else:
         report["margin_response"] = {"skipped": True, "reason": "KEEP"}
 
-    try:
-        report["leverage_response"] = post_futures_change_initial_leverage(
-            symbol=symbol,
-            leverage=args.leverage,
-            api_key=api_key,
-            api_secret=api_secret,
-            recv_window=args.recv_window,
-        )
-    except RuntimeError as exc:
-        if not _ignore_noop_error(exc, ("no need to change leverage", "same leverage")):
-            raise
-        report["leverage_response"] = {"ignored_error": str(exc)}
+    report["leverage_response"] = _change_initial_leverage_with_cache(
+        args=args,
+        symbol=symbol,
+        leverage=args.leverage,
+        api_key=api_key,
+        api_secret=api_secret,
+        recv_window=args.recv_window,
+    )
 
     if args.cancel_stale:
         for stale_order in validation["actions"]["cancel_orders"]:
-            cancel_response = delete_futures_order(
-                symbol=symbol,
-                order_id=int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None,
-                orig_client_order_id=str(stale_order.get("clientOrderId", "")).strip() or None,
-                api_key=api_key,
-                api_secret=api_secret,
-                recv_window=args.recv_window,
-            )
+            try:
+                cancel_response = delete_futures_order(
+                    symbol=symbol,
+                    order_id=int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None,
+                    orig_client_order_id=str(stale_order.get("clientOrderId", "")).strip() or None,
+                    api_key=api_key,
+                    api_secret=api_secret,
+                    recv_window=args.recv_window,
+                )
+            except RuntimeError as exc:
+                if not _ignore_noop_error(exc, ("-2011", "unknown order sent")):
+                    raise
+                cancel_response = {
+                    "ignored_error": str(exc),
+                    "reason": "order_not_found",
+                    "orderId": stale_order.get("orderId"),
+                    "clientOrderId": stale_order.get("clientOrderId"),
+                }
             report["canceled_orders"].append(cancel_response)
+            _maybe_sleep_between_execution_requests(args)
 
     symbol_info = plan_report.get("symbol_info") or {}
     tick_size = _safe_float(symbol_info.get("tick_size"))
@@ -12059,6 +19960,20 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         role = str(order.get("role", "entry"))
         side = str(order.get("side", "")).upper().strip()
         position_side = _order_position_side(order)
+        if _is_frozen_inventory_manual_order(order) and not _is_authorized_frozen_inventory_order(order):
+            report["skipped_orders"].append(
+                {
+                    "request": {
+                        "role": role,
+                        "side": side,
+                        "position_side": position_side,
+                        "qty": _safe_float(order.get("qty")),
+                        "desired_price": _safe_float(order.get("price")),
+                    },
+                    "reason": {"reason": "unauthorized_frozen_inventory_order"},
+                }
+            )
+            continue
         post_only = str(order.get("execution_type", "post_only")).strip().lower() != "aggressive"
         time_in_force = (
             "GTX"
@@ -12070,7 +19985,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
             side=side,
             role=role,
         )
-        if order.get("force_reduce_only") is not None:
+        if order.get("force_reduce_only") is not None and not _uses_exchange_hedge_position_sides(strategy_mode):
             reduce_only = bool(order.get("force_reduce_only"))
         last_exc: RuntimeError | None = None
         for attempt in range(args.maker_retries + 1):
@@ -12101,6 +20016,56 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                             "time_in_force": time_in_force,
                         },
                         "reason": skip_reason or {},
+                    }
+                )
+                last_exc = None
+                break
+            latest_open_orders = fetch_futures_open_orders(
+                symbol,
+                api_key,
+                api_secret,
+                recv_window=args.recv_window,
+                use_cache=False,
+            )
+            submitted_bucket = (
+                side,
+                f"{_safe_float(prepared_order.get('submitted_price')):.10f}",
+                position_side,
+            )
+            existing_same_bucket_orders = [
+                item
+                for item in _filter_futures_strategy_orders(latest_open_orders, symbol)
+                if (
+                    str(item.get("side", "")).upper().strip(),
+                    f"{_safe_float(item.get('price')):.10f}",
+                    _order_position_side(item),
+                )
+                == submitted_bucket
+            ]
+            if existing_same_bucket_orders:
+                report["skipped_orders"].append(
+                    {
+                        "request": {
+                            "role": role,
+                            "side": side,
+                            "position_side": position_side,
+                            "qty": _safe_float(prepared_order.get("qty")),
+                            "desired_price": _safe_float(prepared_order.get("desired_price")),
+                            "submitted_price": _safe_float(prepared_order.get("submitted_price")),
+                            "submitted_notional": _safe_float(prepared_order.get("submitted_notional")),
+                            "attempt": attempt + 1,
+                            "time_in_force": time_in_force,
+                            "reduce_only": reduce_only,
+                        },
+                        "reason": {
+                            "reason": "existing_same_submitted_bucket",
+                            "bucket": ":".join(submitted_bucket),
+                            "existing_order_count": len(existing_same_bucket_orders),
+                            "existing_order_ids": [item.get("orderId") for item in existing_same_bucket_orders],
+                            "existing_client_order_ids": [
+                                item.get("clientOrderId") for item in existing_same_bucket_orders
+                            ],
+                        },
                     }
                 )
                 last_exc = None
@@ -12136,6 +20101,7 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
                     }
                 )
                 last_exc = None
+                _maybe_sleep_between_execution_requests(args)
                 break
             except RuntimeError as exc:
                 last_exc = exc
@@ -12203,6 +20169,11 @@ def execute_plan_report(args: argparse.Namespace, plan_report: dict[str, Any]) -
         strategy_mode=strategy_mode,
         submit_report=report,
     )
+    update_best_quote_volume_order_refs(
+        state_path=Path(str(plan_report.get("state_path", args.state_path))),
+        strategy_mode=strategy_mode,
+        submit_report=report,
+    )
     report["executed"] = True
     return report
 
@@ -12226,6 +20197,8 @@ def _build_parser() -> argparse.ArgumentParser:
             "inventory_target_neutral",
             "competition_inventory_grid",
             "maker_volatility_inventory_v1",
+            "best_quote_maker_volume_v1",
+            "hedge_best_quote_maker_volume_v1",
         ),
     )
     parser.add_argument(
@@ -12251,7 +20224,231 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--maker-extreme-volatility-threshold", type=float, default=0.012)
     parser.add_argument("--maker-directional-move-threshold", type=float, default=0.004)
     parser.add_argument("--maker-cooldown-seconds", type=float, default=30.0)
-    parser.add_argument("--sticky-entry-levels", type=int, default=None)
+    parser.add_argument("--best-quote-maker-volume-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-cycle-budget-notional", type=float, default=400.0)
+    parser.add_argument("--best-quote-maker-volume-target-remaining-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-quote-offset-ticks", type=int, default=0)
+    parser.add_argument("--best-quote-maker-volume-defensive-offset-ticks", type=int, default=3)
+    parser.add_argument("--best-quote-maker-volume-max-long-notional", type=float, default=1_500.0)
+    parser.add_argument("--best-quote-maker-volume-max-short-notional", type=float, default=1_500.0)
+    parser.add_argument("--best-quote-maker-volume-inventory-soft-ratio", type=float, default=0.60)
+    parser.add_argument("--best-quote-maker-volume-loss-per-10k-15m", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-loss-per-10k-soft", type=float, default=0.5)
+    parser.add_argument("--best-quote-maker-volume-loss-per-10k-hard", type=float, default=0.8)
+    parser.add_argument("--best-quote-maker-volume-soft-loss-budget-scale", type=float, default=0.50)
+    parser.add_argument("--best-quote-maker-volume-min-cycle-budget-notional", type=float, default=20.0)
+    parser.add_argument("--best-quote-maker-volume-below-soft-cost-gap-scale", type=float, default=1.0)
+    parser.add_argument("--best-quote-maker-volume-below-soft-adverse-threshold-scale", type=float, default=1.0)
+    parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--best-quote-maker-volume-inventory-cost-gate-min-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-allow-loss-reduce-only", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-loss", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-realized-credit-ratio", type=float, default=1.0)
+    parser.add_argument("--best-quote-maker-volume-net-loss-reduce-min-inventory-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-loss-ratio", type=float, default=0.01)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-min-notional", type=float, default=10.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-confirm-cycles", type=int, default=1)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-hard-loss-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-hard-min-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-hard-confirm-cycles", type=int, default=0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-loss-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-stress-1m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-loss-ratio-scale",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-max-extra-ratio",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-start",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-full",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale", type=float, default=0.70)
+    parser.add_argument("--best-quote-maker-volume-frozen-total-cap-notional", type=float, default=0.0)
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-notional", type=float, default=20.0)
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-side-notional", type=float, default=100.0)
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio", type=float, default=0.0008)
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-allow-loss",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks", type=int, default=2)
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio",
+        type=float,
+        default=0.0015,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-max-1m-abs-return-ratio",
+        type=float,
+        default=0.0025,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-frozen-pair-release-max-1m-amplitude-ratio",
+        type=float,
+        default=0.0035,
+    )
+    parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-min-notional", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-same-side-entry-price-guard-gap-ticks", type=int, default=0)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-tight-offset-ticks", type=int, default=2)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-low-loss-per-10k", type=float, default=3.0)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-mid-loss-per-10k", type=float, default=5.0)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-low-inventory-ratio", type=float, default=0.35)
+    parser.add_argument("--best-quote-maker-volume-dynamic-tick-high-inventory-ratio", type=float, default=0.75)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-start-ratio", type=float, default=0.25)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-min-ratio-gap", type=float, default=0.05)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-min-notional-gap", type=float, default=10.0)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-min-notional-gap-soft-ratio", type=float, default=0.0)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-share", type=float, default=0.70)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-same-side-extra-ticks", type=int, default=2)
+    parser.add_argument("--best-quote-maker-volume-inventory-bias-reduce-extra-ticks", type=int, default=-1)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-ratio", type=float, default=0.0015)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-ratio", type=float, default=0.0035)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-ratio", type=float, default=0.007)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-budget-scale", type=float, default=1.15)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-low-volatility-budget-max-inventory-ratio",
+        type=float,
+        default=0.75,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-budget-scale", type=float, default=0.75)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-budget-scale", type=float, default=0.45)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-extra-offset-ticks", type=int, default=-1)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-extra-offset-ticks", type=int, default=3)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-extra-offset-ticks", type=int, default=8)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-low-volatility-step-scale", type=float, default=0.75)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-high-volatility-step-scale", type=float, default=1.5)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-extreme-volatility-step-scale", type=float, default=2.5)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-return-ratio", type=float, default=0.002)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-bias-max", type=float, default=0.35)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-entry-guard-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-score", type=float, default=0.75)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-volatility-ratio",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-entry-guard-conflict-ratio", type=float, default=0.25)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-entry-guard-opposite-budget-scale",
+        type=float,
+        default=0.0,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-inventory-guard-start-ratio", type=float, default=0.70)
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-inventory-guard-min-score", type=float, default=0.55)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-min-volatility-ratio",
+        type=float,
+        default=0.0035,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-entry-budget-scale",
+        type=float,
+        default=0.25,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-reduce-budget-scale",
+        type=float,
+        default=0.50,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-inventory-guard-reduce-extra-ticks",
+        type=int,
+        default=4,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-enabled",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument("--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-min-score", type=float, default=0.75)
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-min-volatility-ratio",
+        type=float,
+        default=0.0035,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-reduce-budget-scale",
+        type=float,
+        default=0.35,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-reduce-extra-ticks",
+        type=int,
+        default=6,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-min",
+        type=float,
+        default=0.5,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-budget-scale",
+        type=float,
+        default=0.20,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-extra-ticks",
+        type=int,
+        default=10,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-return-ratio",
+        type=float,
+        default=0.0015,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-budget-scale",
+        type=float,
+        default=0.50,
+    )
+    parser.add_argument(
+        "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-extra-ticks",
+        type=int,
+        default=4,
+    )
+    parser.add_argument("--best-quote-maker-volume-take-profit-guard-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sticky-entry-levels", type=int, default=4)
+    parser.add_argument("--sticky-entry-price-tolerance-steps", type=float, default=2.0)
+    parser.add_argument("--sticky-entry-preserve-less-aggressive", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--synthetic-residual-long-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-residual-short-flat-notional", type=float, default=None)
     parser.add_argument("--synthetic-tiny-long-residual-notional", type=float, default=None)
@@ -12289,6 +20486,11 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--adverse-reduce-maker-timeout-seconds", type=float, default=45.0)
     parser.add_argument("--adverse-reduce-max-order-notional", type=float, default=0.0)
     parser.add_argument("--adverse-reduce-keep-probe-scale", type=float, default=None)
+    parser.add_argument("--loss-reentry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--loss-reentry-cooldown-seconds", type=float, default=300.0)
+    parser.add_argument("--loss-reentry-cost-buffer-steps", type=float, default=1.0)
+    parser.add_argument("--loss-reentry-trend-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--loss-reentry-trend-return-ratio", type=float, default=0.0)
     parser.add_argument("--max-order-position-notional", type=float, default=80.0)
     parser.add_argument("--center-price", type=float, default=None)
     parser.add_argument("--flat-start-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -12351,13 +20553,61 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-loss-per-10k-cooldown", type=float, default=1.8)
     parser.add_argument("--elastic-inventory-soft-ratio", type=float, default=0.6)
     parser.add_argument("--elastic-inventory-hard-ratio", type=float, default=0.9)
+    parser.add_argument("--elastic-inventory-soft-ratio-ping-pong-fast", type=float, default=0.30)
+    parser.add_argument("--elastic-inventory-hard-ratio-ping-pong-fast", type=float, default=0.45)
+    parser.add_argument("--elastic-inventory-soft-ratio-ping-pong-safe", type=float, default=0.45)
+    parser.add_argument("--elastic-inventory-hard-ratio-ping-pong-safe", type=float, default=0.60)
+    parser.add_argument("--elastic-inventory-soft-ratio-wide-step-attack", type=float, default=0.45)
+    parser.add_argument("--elastic-inventory-hard-ratio-wide-step-attack", type=float, default=0.65)
+    parser.add_argument("--elastic-inventory-soft-ratio-wide-step", type=float, default=0.60)
+    parser.add_argument("--elastic-inventory-hard-ratio-wide-step", type=float, default=0.80)
     parser.add_argument("--elastic-step-scale-sprint", type=float, default=0.8)
     parser.add_argument("--elastic-step-scale-defensive", type=float, default=1.8)
     parser.add_argument("--elastic-step-scale-cooldown", type=float, default=3.0)
+    parser.add_argument("--elastic-base-step-multiplier-ping-pong-fast", type=float, default=0.8)
+    parser.add_argument("--elastic-base-step-multiplier-ping-pong-safe", type=float, default=1.2)
+    parser.add_argument("--elastic-base-step-multiplier-wide-step-attack", type=float, default=2.2)
+    parser.add_argument("--elastic-base-step-multiplier-wide-step", type=float, default=2.5)
+    parser.add_argument("--elastic-base-step-multiplier-defensive", type=float, default=3.5)
     parser.add_argument("--elastic-per-order-scale-sprint", type=float, default=1.25)
     parser.add_argument("--elastic-per-order-scale-defensive", type=float, default=0.65)
+    parser.add_argument("--elastic-per-order-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-per-order-scale-ping-pong-safe", type=float, default=0.9)
+    parser.add_argument("--elastic-per-order-scale-wide-step-attack", type=float, default=1.2)
+    parser.add_argument("--elastic-per-order-scale-wide-step", type=float, default=0.6)
+    parser.add_argument("--elastic-per-order-scale-defensive-state", type=float, default=0.4)
     parser.add_argument("--elastic-levels-scale-sprint", type=float, default=1.25)
     parser.add_argument("--elastic-levels-scale-defensive", type=float, default=0.65)
+    parser.add_argument("--elastic-levels-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-levels-scale-ping-pong-safe", type=float, default=0.85)
+    parser.add_argument("--elastic-levels-scale-wide-step-attack", type=float, default=1.1)
+    parser.add_argument("--elastic-levels-scale-wide-step", type=float, default=0.65)
+    parser.add_argument("--elastic-levels-scale-defensive-state", type=float, default=0.35)
+    parser.add_argument("--elastic-threshold-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-threshold-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-threshold-scale-wide-step-attack", type=float, default=1.5)
+    parser.add_argument("--elastic-threshold-scale-wide-step", type=float, default=1.5)
+    parser.add_argument("--elastic-threshold-scale-defensive", type=float, default=1.8)
+    parser.add_argument("--elastic-pause-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-pause-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-pause-scale-wide-step-attack", type=float, default=1.2)
+    parser.add_argument("--elastic-pause-scale-wide-step", type=float, default=1.5)
+    parser.add_argument("--elastic-pause-scale-defensive", type=float, default=1.8)
+    parser.add_argument("--elastic-max-total-scale-ping-pong-fast", type=float, default=1.0)
+    parser.add_argument("--elastic-max-total-scale-ping-pong-safe", type=float, default=1.1)
+    parser.add_argument("--elastic-max-total-scale-wide-step-attack", type=float, default=1.2)
+    parser.add_argument("--elastic-max-total-scale-wide-step", type=float, default=1.35)
+    parser.add_argument("--elastic-max-total-scale-defensive", type=float, default=1.6)
+    parser.add_argument("--elastic-max-entry-orders-ping-pong-fast", type=int, default=6)
+    parser.add_argument("--elastic-max-entry-orders-ping-pong-safe", type=int, default=4)
+    parser.add_argument("--elastic-max-entry-orders-wide-step-attack", type=int, default=4)
+    parser.add_argument("--elastic-max-entry-orders-wide-step", type=int, default=3)
+    parser.add_argument("--elastic-max-entry-orders-defensive", type=int, default=2)
+    parser.add_argument("--elastic-early-micro-abs-return-ratio", type=float, default=0.00025)
+    parser.add_argument("--elastic-early-micro-amplitude-ratio", type=float, default=0.00035)
+    parser.add_argument("--elastic-early-safe-inventory-ratio", type=float, default=0.45)
+    parser.add_argument("--elastic-early-wide-inventory-ratio", type=float, default=0.65)
+    parser.add_argument("--elastic-early-wide-loss-per-10k-5m", type=float, default=0.5)
     parser.add_argument("--elastic-cooldown-seconds", type=float, default=120.0)
     parser.add_argument("--elastic-state-confirm-cycles", type=int, default=3)
     parser.add_argument("--elastic-inventory-recover-exit-ratio", type=float, default=0.45)
@@ -12370,6 +20620,63 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--elastic-repair-slice-ratio-cross", type=float, default=0.60)
     parser.add_argument("--elastic-max-repair-loss-per-10k", type=float, default=0.0)
     parser.add_argument("--elastic-cancel-stale-entries-on-cooldown", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--adaptive-regime-router-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--adaptive-regime-router-mode", type=str, default="profit_adaptive_v1")
+    parser.add_argument("--adaptive-regime-router-confirm-cycles", type=int, default=2)
+    parser.add_argument("--adaptive-regime-router-min-dwell-seconds", type=float, default=120.0)
+    parser.add_argument("--adaptive-regime-router-max-spread-bps", type=float, default=22.0)
+    parser.add_argument("--adaptive-regime-router-min-depth-notional", type=float, default=0.0)
+    parser.add_argument("--adaptive-regime-router-shock-1m-abs-return-ratio", type=float, default=0.018)
+    parser.add_argument("--adaptive-regime-router-shock-1m-amplitude-ratio", type=float, default=0.028)
+    parser.add_argument("--adaptive-regime-router-shock-5m-amplitude-ratio", type=float, default=0.055)
+    parser.add_argument("--adaptive-regime-router-down-1m-return-ratio", type=float, default=-0.004)
+    parser.add_argument("--adaptive-regime-router-down-5m-return-ratio", type=float, default=-0.010)
+    parser.add_argument("--adaptive-regime-router-up-1m-return-ratio", type=float, default=0.006)
+    parser.add_argument("--adaptive-regime-router-up-5m-return-ratio", type=float, default=0.014)
+    parser.add_argument("--adaptive-regime-router-range-5m-abs-return-ratio", type=float, default=0.006)
+    parser.add_argument("--adaptive-regime-router-range-5m-amplitude-ratio", type=float, default=0.018)
+    parser.add_argument("--adaptive-regime-router-range-step-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-per-order-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-levels-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-position-limit-scale", type=float, default=1.0)
+    parser.add_argument("--adaptive-regime-router-range-max-entry-orders", type=int, default=4)
+    parser.add_argument("--adaptive-regime-router-down-step-scale", type=float, default=1.8)
+    parser.add_argument("--adaptive-regime-router-down-per-order-scale", type=float, default=0.55)
+    parser.add_argument("--adaptive-regime-router-down-levels-scale", type=float, default=0.65)
+    parser.add_argument("--adaptive-regime-router-down-position-limit-scale", type=float, default=0.70)
+    parser.add_argument("--adaptive-regime-router-down-max-entry-long-orders", type=int, default=0)
+    parser.add_argument("--adaptive-regime-router-down-max-entry-short-orders", type=int, default=2)
+    parser.add_argument("--adaptive-regime-router-up-step-scale", type=float, default=1.5)
+    parser.add_argument("--adaptive-regime-router-up-per-order-scale", type=float, default=0.75)
+    parser.add_argument("--adaptive-regime-router-up-levels-scale", type=float, default=0.75)
+    parser.add_argument("--adaptive-regime-router-up-position-limit-scale", type=float, default=0.85)
+    parser.add_argument("--adaptive-regime-router-up-max-entry-long-orders", type=int, default=2)
+    parser.add_argument("--adaptive-regime-router-up-max-entry-short-orders", type=int, default=0)
+    parser.add_argument("--adaptive-regime-router-no-trade-step-scale", type=float, default=2.5)
+    parser.add_argument("--adaptive-regime-router-no-trade-per-order-scale", type=float, default=0.35)
+    parser.add_argument("--adaptive-regime-router-no-trade-levels-scale", type=float, default=0.50)
+    parser.add_argument("--adaptive-regime-router-no-trade-position-limit-scale", type=float, default=0.60)
+    parser.add_argument(
+        "--adaptive-regime-router-cancel-stale-entries-on-no-trade",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--regime-entry-budget-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--regime-entry-budget-report-only", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--regime-entry-budget-base-per-order-notional", type=float, default=60.0)
+    parser.add_argument("--regime-entry-budget-base-step-ratio", type=float, default=0.0025)
+    parser.add_argument("--regime-entry-budget-min-profit-or-fee-buffer-ratio", type=float, default=0.0008)
+    parser.add_argument("--regime-entry-budget-switch-reconcile-confirm-cycles", type=int, default=2)
+    parser.add_argument("--regime-entry-budget-shock-reconcile-confirm-cycles", type=int, default=3)
+    parser.add_argument("--regime-entry-budget-shock-30s-abs-return-ratio", type=float, default=0.016)
+    parser.add_argument("--regime-entry-budget-shock-30s-amplitude-ratio", type=float, default=0.024)
+    parser.add_argument("--regime-entry-budget-shock-1m-abs-return-ratio", type=float, default=0.025)
+    parser.add_argument("--regime-entry-budget-shock-1m-amplitude-ratio", type=float, default=0.030)
+    parser.add_argument("--regime-entry-budget-defensive-loss-per-10k-15m", type=float, default=8.0)
+    parser.add_argument("--regime-entry-budget-defensive-inventory-usage-ratio", type=float, default=0.80)
+    parser.add_argument("--regime-entry-budget-defensive-min-gross-notional-15m", type=float, default=1000.0)
+    parser.add_argument("--regime-entry-budget-tick-dominated-ratio", type=float, default=0.0035)
+    parser.add_argument("--regime-entry-budget-coarse-tick-ratio", type=float, default=0.0080)
     parser.add_argument("--multi-timeframe-bias-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument(
         "--multi-timeframe-bias-mode-adapter",
@@ -12399,6 +20706,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--multi-timeframe-bias-scheduler-defensive-step-scale", type=float, default=1.35)
     parser.add_argument("--multi-timeframe-bias-scheduler-reduce-max-order-scale", type=float, default=0.65)
     parser.add_argument("--volatility-entry-pause-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--volatility-entry-pause-10s-abs-return-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-10s-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-30s-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-30s-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-1m-abs-return-ratio", type=float, default=0.0)
@@ -12407,6 +20716,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--volatility-entry-pause-3m-amplitude-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-abs-return-ratio", type=float, default=0.0)
     parser.add_argument("--volatility-entry-pause-5m-amplitude-ratio", type=float, default=0.0)
+    parser.add_argument("--volatility-entry-pause-recover-confirm-cycles", type=int, default=1)
+    parser.add_argument("--volatility-entry-pause-min-observation-seconds", type=float, default=180.0)
+    parser.add_argument("--volatility-entry-pause-inventory-recover-ratio", type=float, default=0.75)
+    parser.add_argument("--volatility-entry-pause-tiny-inventory-ignore-notional", type=float, default=0.0)
     parser.add_argument("--anti-chase-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--anti-chase-entry-guard-1m-abs-return-ratio", type=float, default=0.0025)
     parser.add_argument("--anti-chase-entry-guard-1m-amplitude-ratio", type=float, default=0.0035)
@@ -12485,6 +20798,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--hard-loss-forced-reduce-target-notional", type=float, default=None)
     parser.add_argument("--hard-loss-forced-reduce-max-order-notional", type=float, default=None)
     parser.add_argument("--hard-loss-forced-reduce-unrealized-loss-limit", type=float, default=10.0)
+    parser.add_argument("--unrealized-loss-entry-guard-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--unrealized-loss-entry-guard-min-loss", type=float, default=0.0)
+    parser.add_argument("--unrealized-loss-entry-guard-ratio", type=float, default=0.0)
+    parser.add_argument("--loss-recovery-brush-enabled", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--loss-recovery-brush-entry-notional", type=float, default=0.0)
+    parser.add_argument("--loss-recovery-brush-min-unrealized-loss", type=float, default=0.0)
+    parser.add_argument("--loss-recovery-brush-max-entry-orders-per-side", type=int, default=1)
+    parser.add_argument("--loss-inventory-no-cross-small-entry-notional", type=float, default=0.0)
     parser.add_argument("--auto-regime-enabled", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--auto-regime-confirm-cycles", type=int, default=2)
     parser.add_argument("--auto-regime-stable-15m-max-amplitude-ratio", type=float, default=0.02)
@@ -12523,9 +20844,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-total-notional", type=float, default=220.0)
     parser.add_argument("--reconcile-interval-cycles", type=int, default=5)
     parser.add_argument("--maker-retries", type=int, default=2)
+    parser.add_argument("--execution-request-budget-per-cycle", type=int, default=0)
+    parser.add_argument("--execution-cancel-budget-per-cycle", type=int, default=0)
+    parser.add_argument("--execution-place-budget-per-cycle", type=int, default=0)
+    parser.add_argument("--execution-request-min-interval-seconds", type=float, default=0.0)
+    parser.add_argument("--leverage-change-cache-ttl-seconds", type=float, default=EXECUTION_LEVERAGE_CHANGE_CACHE_TTL_SECONDS)
     parser.add_argument("--cancel-stale", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--apply", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--sleep-seconds", type=float, default=20.0)
+    parser.add_argument("--startup-jitter-seconds", type=float, default=0.0)
+    parser.add_argument("--cycle-jitter-seconds", type=float, default=0.0)
     parser.add_argument("--iterations", type=int, default=0, help="0 means run forever")
     parser.add_argument("--max-consecutive-errors", type=int, default=10)
     parser.add_argument("--state-path", type=str, default="output/night_small_semi_auto_state.json")
@@ -12536,9 +20864,16 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-end-time", type=str, default=None)
     parser.add_argument("--runtime-guard-stats-start-time", type=str, default=None)
     parser.add_argument("--rolling-hourly-loss-limit", type=float, default=None)
+    parser.add_argument("--rolling-hourly-loss-per-10k-limit", type=float, default=None)
+    parser.add_argument("--rolling-hourly-loss-per-10k-min-notional", type=float, default=10000.0)
+    parser.add_argument("--runtime-guard-loss-recovery-enabled", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--runtime-guard-loss-recovery-cooldown-seconds", type=float, default=180.0)
+    parser.add_argument("--runtime-guard-loss-recovery-max-1m-amplitude-ratio", type=float, default=0.012)
+    parser.add_argument("--runtime-guard-loss-recovery-max-3m-amplitude-ratio", type=float, default=0.025)
     parser.add_argument("--max-cumulative-notional", type=float, default=None)
     parser.add_argument("--max-actual-net-notional", type=float, default=None)
     parser.add_argument("--max-synthetic-drift-notional", type=float, default=None)
+    parser.add_argument("--max-unrealized-loss", type=float, default=None)
     parser.add_argument("--reset-state", action="store_true")
     return parser
 
@@ -12717,6 +21052,20 @@ def _print_cycle_summary(summary: dict[str, Any]) -> None:
             f"cost_missing="
             f"{'long' if take_profit_guard.get('long_cost_basis_missing') else ''}"
             f"{'short' if take_profit_guard.get('short_cost_basis_missing') else ''}"
+        )
+    inventory_unlock_release = (
+        summary.get("inventory_unlock_release") if isinstance(summary.get("inventory_unlock_release"), dict) else {}
+    )
+    if inventory_unlock_release.get("candidate") or inventory_unlock_release.get("active"):
+        print(
+            "  inventory_unlock: "
+            f"active={'yes' if inventory_unlock_release.get('active') else 'no'} "
+            f"side={inventory_unlock_release.get('side') or '-'} "
+            f"stall={int(inventory_unlock_release.get('stall_count', 0) or 0)}/"
+            f"{int(inventory_unlock_release.get('confirm_cycles', 0) or 0)} "
+            f"release={_float(inventory_unlock_release.get('release_order_notional', 0.0))} "
+            f"price={_price(_safe_float(inventory_unlock_release.get('release_price')))} "
+            f"reason={inventory_unlock_release.get('reason') or '-'}"
         )
     volume_long_v4_delever = (
         summary.get("volume_long_v4_delever") if isinstance(summary.get("volume_long_v4_delever"), dict) else {}
@@ -12897,6 +21246,8 @@ def main() -> None:
         raise SystemExit("--per-order-notional must be > 0 and --base-position-notional must be >= 0")
     if args.sticky_entry_levels is not None and args.sticky_entry_levels < 0:
         raise SystemExit("--sticky-entry-levels must be >= 0")
+    if args.sticky_entry_price_tolerance_steps < 0:
+        raise SystemExit("--sticky-entry-price-tolerance-steps must be >= 0")
     if args.synthetic_residual_long_flat_notional is not None and args.synthetic_residual_long_flat_notional < 0:
         raise SystemExit("--synthetic-residual-long-flat-notional must be >= 0")
     if args.synthetic_residual_short_flat_notional is not None and args.synthetic_residual_short_flat_notional < 0:
@@ -12963,6 +21314,12 @@ def main() -> None:
         args.adverse_reduce_keep_probe_scale < 0 or args.adverse_reduce_keep_probe_scale > 1
     ):
         raise SystemExit("--adverse-reduce-keep-probe-scale must be within [0, 1]")
+    if args.loss_reentry_cooldown_seconds < 0:
+        raise SystemExit("--loss-reentry-cooldown-seconds must be >= 0")
+    if args.loss_reentry_cost_buffer_steps < 0:
+        raise SystemExit("--loss-reentry-cost-buffer-steps must be >= 0")
+    if args.loss_reentry_trend_return_ratio < 0:
+        raise SystemExit("--loss-reentry-trend-return-ratio must be >= 0")
     if args.max_order_position_notional < 0:
         raise SystemExit("--max-order-position-notional must be >= 0")
     if args.max_position_notional is not None and args.max_position_notional <= 0:
@@ -13068,10 +21425,154 @@ def main() -> None:
     _validate_multi_timeframe_bias_args(args)
     if args.elastic_volume_enabled and str(args.elastic_volume_mode).strip() != "competition_elastic_volume_v1":
         raise SystemExit("--elastic-volume-mode must be competition_elastic_volume_v1")
+    if args.adaptive_regime_router_enabled and str(args.adaptive_regime_router_mode).strip() != "profit_adaptive_v1":
+        raise SystemExit("--adaptive-regime-router-mode must be profit_adaptive_v1")
+    if args.adaptive_regime_router_confirm_cycles < 1:
+        raise SystemExit("--adaptive-regime-router-confirm-cycles must be >= 1")
+    if args.adaptive_regime_router_min_dwell_seconds < 0:
+        raise SystemExit("--adaptive-regime-router-min-dwell-seconds must be >= 0")
+    if args.adaptive_regime_router_max_spread_bps < 0 or args.adaptive_regime_router_min_depth_notional < 0:
+        raise SystemExit("--adaptive-regime-router spread/depth guards must be >= 0")
+    if (
+        args.adaptive_regime_router_shock_1m_abs_return_ratio < 0
+        or args.adaptive_regime_router_shock_1m_amplitude_ratio < 0
+        or args.adaptive_regime_router_shock_5m_amplitude_ratio < 0
+    ):
+        raise SystemExit("--adaptive-regime-router shock thresholds must be >= 0")
+    if args.adaptive_regime_router_down_1m_return_ratio > 0 or args.adaptive_regime_router_down_5m_return_ratio > 0:
+        raise SystemExit("--adaptive-regime-router down return thresholds must be <= 0")
+    if args.adaptive_regime_router_up_1m_return_ratio < 0 or args.adaptive_regime_router_up_5m_return_ratio < 0:
+        raise SystemExit("--adaptive-regime-router up return thresholds must be >= 0")
+    if (
+        args.adaptive_regime_router_range_5m_abs_return_ratio < 0
+        or args.adaptive_regime_router_range_5m_amplitude_ratio < 0
+    ):
+        raise SystemExit("--adaptive-regime-router range thresholds must be >= 0")
+    if any(
+        value <= 0
+        for value in (
+            args.adaptive_regime_router_range_step_scale,
+            args.adaptive_regime_router_range_per_order_scale,
+            args.adaptive_regime_router_range_levels_scale,
+            args.adaptive_regime_router_range_position_limit_scale,
+            args.adaptive_regime_router_down_step_scale,
+            args.adaptive_regime_router_down_per_order_scale,
+            args.adaptive_regime_router_down_levels_scale,
+            args.adaptive_regime_router_down_position_limit_scale,
+            args.adaptive_regime_router_up_step_scale,
+            args.adaptive_regime_router_up_per_order_scale,
+            args.adaptive_regime_router_up_levels_scale,
+            args.adaptive_regime_router_up_position_limit_scale,
+            args.adaptive_regime_router_no_trade_step_scale,
+            args.adaptive_regime_router_no_trade_per_order_scale,
+            args.adaptive_regime_router_no_trade_levels_scale,
+            args.adaptive_regime_router_no_trade_position_limit_scale,
+        )
+    ):
+        raise SystemExit("--adaptive-regime-router scale values must be > 0")
+    if min(
+        args.adaptive_regime_router_range_max_entry_orders,
+        args.adaptive_regime_router_down_max_entry_long_orders,
+        args.adaptive_regime_router_down_max_entry_short_orders,
+        args.adaptive_regime_router_up_max_entry_long_orders,
+        args.adaptive_regime_router_up_max_entry_short_orders,
+    ) < 0:
+        raise SystemExit("--adaptive-regime-router max entry order values must be >= 0")
     if args.elastic_loss_per_10k_sprint < 0 or args.elastic_loss_per_10k_cruise < 0:
         raise SystemExit("--elastic-loss-per-10k sprint/cruise thresholds must be >= 0")
     if args.elastic_loss_per_10k_defensive < 0 or args.elastic_loss_per_10k_cooldown < 0:
         raise SystemExit("--elastic-loss-per-10k defensive/cooldown thresholds must be >= 0")
+    if args.regime_entry_budget_base_per_order_notional <= 0:
+        raise SystemExit("--regime-entry-budget-base-per-order-notional must be > 0")
+    if args.regime_entry_budget_base_step_ratio <= 0:
+        raise SystemExit("--regime-entry-budget-base-step-ratio must be > 0")
+    if args.regime_entry_budget_min_profit_or_fee_buffer_ratio < 0:
+        raise SystemExit("--regime-entry-budget-min-profit-or-fee-buffer-ratio must be >= 0")
+    if args.regime_entry_budget_switch_reconcile_confirm_cycles < 1:
+        raise SystemExit("--regime-entry-budget-switch-reconcile-confirm-cycles must be >= 1")
+    if args.regime_entry_budget_shock_reconcile_confirm_cycles < 1:
+        raise SystemExit("--regime-entry-budget-shock-reconcile-confirm-cycles must be >= 1")
+    if args.regime_entry_budget_defensive_inventory_usage_ratio <= 0:
+        raise SystemExit("--regime-entry-budget-defensive-inventory-usage-ratio must be > 0")
+    if args.regime_entry_budget_tick_dominated_ratio < 0 or args.regime_entry_budget_coarse_tick_ratio < 0:
+        raise SystemExit("--regime-entry-budget tick ratios must be >= 0")
+    if (
+        args.best_quote_maker_volume_below_soft_cost_gap_scale < 0
+        or args.best_quote_maker_volume_below_soft_adverse_threshold_scale < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume below-soft scales must be >= 0")
+    if args.best_quote_maker_volume_inventory_cost_gate_min_notional < 0:
+        raise SystemExit("--best-quote-maker-volume-inventory-cost-gate-min-notional must be >= 0")
+    if (
+        args.best_quote_maker_volume_net_loss_reduce_min_loss < 0
+        or args.best_quote_maker_volume_net_loss_reduce_ratio < 0
+        or args.best_quote_maker_volume_net_loss_reduce_realized_credit_ratio < 0
+        or args.best_quote_maker_volume_net_loss_reduce_min_inventory_notional < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-net-loss-reduce values must be >= 0")
+    if (
+        args.best_quote_maker_volume_reduce_freeze_loss_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_min_notional < 0
+        or args.best_quote_maker_volume_reduce_freeze_confirm_cycles < 1
+        or args.best_quote_maker_volume_reduce_freeze_hard_loss_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_hard_min_notional < 0
+        or args.best_quote_maker_volume_reduce_freeze_hard_confirm_cycles < 0
+        or args.best_quote_maker_volume_reduce_freeze_stress_loss_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_stress_1m_abs_return_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_stress_1m_amplitude_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start < 0
+        or args.best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full < 0
+        or args.best_quote_maker_volume_frozen_total_cap_notional < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-reduce-freeze values must be >= 0")
+    if not (0 < args.best_quote_maker_volume_reduce_freeze_soft_ratio_scale <= 1):
+        raise SystemExit("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale must be within (0, 1]")
+    if (
+        args.best_quote_maker_volume_frozen_pair_release_max_notional < 0
+        or args.best_quote_maker_volume_frozen_pair_release_min_side_notional < 0
+        or args.best_quote_maker_volume_frozen_pair_release_min_profit_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio < 0
+        or args.best_quote_maker_volume_frozen_pair_release_max_slippage_ticks < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-frozen-pair-release values must be >= 0")
+    if (
+        args.best_quote_maker_volume_same_side_entry_price_guard_min_notional < 0
+        or args.best_quote_maker_volume_same_side_entry_price_guard_gap_ticks < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-same-side-entry-price-guard values must be >= 0")
+    if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_score < 0:
+        raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-score must be >= 0")
+    if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_min_volatility_ratio < 0:
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-entry-guard-min-volatility-ratio must be >= 0"
+        )
+    if args.best_quote_maker_volume_dynamic_control_trend_entry_guard_conflict_ratio < 0:
+        raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-entry-guard-conflict-ratio must be >= 0")
+    if not (0 <= args.best_quote_maker_volume_dynamic_control_trend_entry_guard_opposite_budget_scale <= 1):
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-entry-guard-opposite-budget-scale must be within [0, 1]"
+        )
+    if (
+        args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_min < 0
+        or args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_extra_ticks < 0
+        or args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_return_ratio < 0
+        or args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_extra_ticks < 0
+    ):
+        raise SystemExit("--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard loss/relief values must be >= 0")
+    if not (0 <= args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_recent_loss_budget_scale <= 1):
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-recent-loss-budget-scale "
+            "must be within [0, 1]"
+        )
+    if not (0 <= args.best_quote_maker_volume_dynamic_control_trend_loss_reduce_guard_relief_budget_scale <= 1):
+        raise SystemExit(
+            "--best-quote-maker-volume-dynamic-control-trend-loss-reduce-guard-relief-budget-scale "
+            "must be within [0, 1]"
+        )
     if not (
         args.elastic_loss_per_10k_sprint
         <= args.elastic_loss_per_10k_cruise
@@ -13109,7 +21610,20 @@ def main() -> None:
             raise SystemExit(f"{label} must be within [0, 1]")
     if args.elastic_max_repair_loss_per_10k < 0:
         raise SystemExit("--elastic-max-repair-loss-per-10k must be >= 0")
+    elastic_early_thresholds = (
+        args.elastic_early_micro_abs_return_ratio,
+        args.elastic_early_micro_amplitude_ratio,
+        args.elastic_early_safe_inventory_ratio,
+        args.elastic_early_wide_inventory_ratio,
+        args.elastic_early_wide_loss_per_10k_5m,
+    )
+    if any(threshold < 0 for threshold in elastic_early_thresholds):
+        raise SystemExit("--elastic-early thresholds must be >= 0")
+    if args.elastic_early_safe_inventory_ratio > args.elastic_early_wide_inventory_ratio:
+        raise SystemExit("--elastic-early-safe-inventory-ratio must be <= wide-inventory-ratio")
     volatility_entry_pause_thresholds = (
+        args.volatility_entry_pause_10s_abs_return_ratio,
+        args.volatility_entry_pause_10s_amplitude_ratio,
         args.volatility_entry_pause_30s_abs_return_ratio,
         args.volatility_entry_pause_30s_amplitude_ratio,
         args.volatility_entry_pause_1m_abs_return_ratio,
@@ -13121,6 +21635,17 @@ def main() -> None:
     )
     if any(threshold < 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("--volatility-entry-pause thresholds must be >= 0")
+    if args.volatility_entry_pause_recover_confirm_cycles < 1:
+        raise SystemExit("--volatility-entry-pause-recover-confirm-cycles must be >= 1")
+    if args.volatility_entry_pause_min_observation_seconds < 0:
+        raise SystemExit("--volatility-entry-pause-min-observation-seconds must be >= 0")
+    if (
+        args.volatility_entry_pause_inventory_recover_ratio <= 0
+        or args.volatility_entry_pause_inventory_recover_ratio > 1
+    ):
+        raise SystemExit("--volatility-entry-pause-inventory-recover-ratio must be within (0, 1]")
+    if args.volatility_entry_pause_tiny_inventory_ignore_notional < 0:
+        raise SystemExit("--volatility-entry-pause-tiny-inventory-ignore-notional must be >= 0")
     if args.volatility_entry_pause_enabled and not any(threshold > 0 for threshold in volatility_entry_pause_thresholds):
         raise SystemExit("volatility entry pause requires at least one positive trigger threshold")
     anti_chase_entry_guard_thresholds = (
@@ -13206,9 +21731,18 @@ def main() -> None:
         (args.hard_loss_forced_reduce_target_notional, "--hard-loss-forced-reduce-target-notional"),
         (args.hard_loss_forced_reduce_max_order_notional, "--hard-loss-forced-reduce-max-order-notional"),
         (args.hard_loss_forced_reduce_unrealized_loss_limit, "--hard-loss-forced-reduce-unrealized-loss-limit"),
+        (args.unrealized_loss_entry_guard_min_loss, "--unrealized-loss-entry-guard-min-loss"),
+        (args.unrealized_loss_entry_guard_ratio, "--unrealized-loss-entry-guard-ratio"),
+        (args.loss_recovery_brush_entry_notional, "--loss-recovery-brush-entry-notional"),
+        (args.loss_recovery_brush_min_unrealized_loss, "--loss-recovery-brush-min-unrealized-loss"),
+        (args.loss_inventory_no_cross_small_entry_notional, "--loss-inventory-no-cross-small-entry-notional"),
     ):
         if value is not None and value < 0:
             raise SystemExit(f"{label} must be >= 0")
+    if args.loss_recovery_brush_max_entry_orders_per_side < 0:
+        raise SystemExit("--loss-recovery-brush-max-entry-orders-per-side must be >= 0")
+    if args.unrealized_loss_entry_guard_enabled and args.unrealized_loss_entry_guard_ratio <= 0:
+        raise SystemExit("--unrealized-loss-entry-guard-enabled requires --unrealized-loss-entry-guard-ratio > 0")
     if args.auto_regime_confirm_cycles <= 0:
         raise SystemExit("--auto-regime-confirm-cycles must be > 0")
     if args.auto_regime_stable_15m_max_amplitude_ratio <= 0 or args.auto_regime_stable_60m_max_amplitude_ratio <= 0:
@@ -13280,8 +21814,22 @@ def main() -> None:
         raise SystemExit("--max-new-orders and --max-total-notional must be > 0")
     if args.maker_retries < 0:
         raise SystemExit("--maker-retries must be >= 0")
+    if args.execution_request_budget_per_cycle < 0:
+        raise SystemExit("--execution-request-budget-per-cycle must be >= 0")
+    if args.execution_cancel_budget_per_cycle < 0:
+        raise SystemExit("--execution-cancel-budget-per-cycle must be >= 0")
+    if args.execution_place_budget_per_cycle < 0:
+        raise SystemExit("--execution-place-budget-per-cycle must be >= 0")
+    if args.execution_request_min_interval_seconds < 0:
+        raise SystemExit("--execution-request-min-interval-seconds must be >= 0")
+    if args.leverage_change_cache_ttl_seconds < 0:
+        raise SystemExit("--leverage-change-cache-ttl-seconds must be >= 0")
     if args.sleep_seconds <= 0:
         raise SystemExit("--sleep-seconds must be > 0")
+    if args.startup_jitter_seconds < 0:
+        raise SystemExit("--startup-jitter-seconds must be >= 0")
+    if args.cycle_jitter_seconds < 0:
+        raise SystemExit("--cycle-jitter-seconds must be >= 0")
     if args.iterations < 0:
         raise SystemExit("--iterations must be >= 0")
     if args.max_consecutive_errors <= 0:
@@ -13319,19 +21867,49 @@ def main() -> None:
     consecutive_errors = 0
     cycle = 0
     market_stream: FuturesMarketStream | None = None
+    user_data_stream: FuturesUserDataStream | None = None
     try:
         market_stream = FuturesMarketStream(args.symbol)
         market_stream.start()
         setattr(args, "market_stream", market_stream)
+        warm_snapshot = _wait_for_runner_market_stream_snapshot(market_stream)
+        if warm_snapshot is None:
+            print(
+                f"[market-stream] no warm snapshot for {args.symbol} after "
+                f"{RUNNER_MARKET_STREAM_WARMUP_SECONDS:.1f}s; REST fallback remains enabled"
+            )
+        else:
+            print(f"[market-stream] warm snapshot ready for {args.symbol}")
     except Exception as exc:
         setattr(args, "market_stream", None)
         print(f"[market-stream] disabled for {args.symbol}: {exc}")
+    user_data_stream = _maybe_start_runner_user_data_stream(args)
+    startup_jitter = _safe_float(getattr(args, "startup_jitter_seconds", 0.0))
+    if startup_jitter > 0:
+        delay = random.uniform(0.0, startup_jitter)
+        print(f"[startup-jitter] sleeping {delay:.3f}s before first cycle")
+        time.sleep(delay)
 
     try:
         while True:
             cycle += 1
             cycle_started_at = datetime.now(timezone.utc)
             try:
+                pre_guard_audit_sync = {
+                    "trade_appended": 0,
+                    "income_appended": 0,
+                    "error": None,
+                }
+                try:
+                    pre_guard_audit_sync = _sync_account_audit(
+                        symbol=args.symbol,
+                        cycle=cycle,
+                        summary_path=summary_path,
+                        recv_window=args.recv_window,
+                        args=args,
+                    )
+                except Exception as audit_exc:
+                    pre_guard_audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
                 runtime_guard_summary = _maybe_handle_runtime_guard(
                     args=args,
                     cycle=cycle,
@@ -13339,6 +21917,13 @@ def main() -> None:
                     summary_path=summary_path,
                 )
                 if runtime_guard_summary is not None:
+                    runtime_guard_summary["pre_guard_trade_audit_appended"] = int(
+                        pre_guard_audit_sync.get("trade_appended", 0) or 0
+                    )
+                    runtime_guard_summary["pre_guard_income_audit_appended"] = int(
+                        pre_guard_audit_sync.get("income_appended", 0) or 0
+                    )
+                    runtime_guard_summary["pre_guard_audit_error"] = pre_guard_audit_sync.get("error")
                     _append_jsonl(summary_path, runtime_guard_summary)
                     _print_cycle_summary(runtime_guard_summary)
                     consecutive_errors = 0
@@ -13395,6 +21980,17 @@ def main() -> None:
                             "payload": item,
                         },
                     )
+                for item in _drain_new_runner_execution_events(args, max_events=50):
+                    _append_jsonl(
+                        audit_paths["order_audit"],
+                        {
+                            "ts": cycle_started_at.isoformat(),
+                            "cycle": cycle,
+                            "symbol": args.symbol.upper().strip(),
+                            "event_type": "execution_observed",
+                            "payload": item,
+                        },
+                    )
                 audit_sync = {
                     "trade_appended": 0,
                     "income_appended": 0,
@@ -13406,6 +22002,7 @@ def main() -> None:
                         cycle=cycle,
                         summary_path=summary_path,
                         recv_window=args.recv_window,
+                        args=args,
                     )
                 except Exception as audit_exc:
                     audit_sync["error"] = f"{audit_exc.__class__.__name__}: {audit_exc}"
@@ -13432,22 +22029,81 @@ def main() -> None:
                         recv_window=args.recv_window,
                         expected_open_order_count=len(plan_report.get("kept_orders", [])) + len(submit_report.get("placed_orders", [])),
                         expected_actual_net_qty=_safe_float(plan_report.get("actual_net_qty")),
+                        args=args,
                     )
                 state["last_reconcile"] = reconcile_snapshot
                 _write_json(state_path, state)
+                if bool(reconcile_snapshot.get("protective_stop_required")):
+                    if reconcile_credentials is None:
+                        raise ProtectiveEntryStopError(
+                            f"protective entry stop required but credentials are missing: {reconcile_snapshot}"
+                        )
+                    _protective_entry_stop(
+                        args=args,
+                        symbol=args.symbol.upper().strip(),
+                        strategy_mode=str(plan_report.get("strategy_mode") or getattr(args, "strategy_mode", "one_way_long")),
+                        api_key=reconcile_api_key,
+                        api_secret=reconcile_api_secret,
+                        reason="reconcile_protective_stop",
+                        details=dict(reconcile_snapshot),
+                        state=state,
+                        state_path=state_path,
+                    )
                 runtime_guard_config = normalize_runtime_guard_config(vars(args))
                 runtime_cumulative_gross_notional, runtime_pnl_events, runtime_stats_start_time = _load_futures_runtime_guard_inputs(
                     summary_path,
                     runtime_guard_stats_start_time=getattr(args, "runtime_guard_stats_start_time", None),
                     symbol=args.symbol.upper().strip(),
                     now=cycle_started_at,
+                    state_path=state_path,
+                    bq_book_scope=(
+                        BQ_BOOK_NORMAL
+                        if _is_hedge_best_quote_maker_volume_mode(str(getattr(args, "strategy_mode", "")))
+                        else None
+                    ),
+                )
+                runtime_recovery = _runtime_guard_loss_recovery_state(state)
+                runtime_recovered_at = _parse_state_datetime(runtime_recovery.get("recovered_at"))
+                runtime_pnl_events_for_guard = _filter_pnl_events_after(runtime_pnl_events, runtime_recovered_at)
+                runtime_pnl_events_for_guard, runtime_guard_loss_scope = _runtime_guard_isolated_bq_pnl_events(
+                    args=args,
+                    state=state,
+                    pnl_events=runtime_pnl_events_for_guard,
                 )
                 runtime_guard_result = evaluate_runtime_guards(
                     config=runtime_guard_config,
                     now=cycle_started_at,
                     cumulative_gross_notional=runtime_cumulative_gross_notional,
-                    pnl_events=runtime_pnl_events,
+                    pnl_events=runtime_pnl_events_for_guard,
+                    actual_net_notional=_safe_float(
+                        plan_report.get("strategy_actual_net_notional")
+                        if plan_report.get("strategy_actual_net_notional") is not None
+                        else plan_report.get("actual_net_notional")
+                    ),
+                    synthetic_drift_notional=_synthetic_drift_notional(
+                        _safe_float(plan_report.get("mid_price")),
+                        _safe_float(plan_report.get("synthetic_drift_qty")),
+                    ),
+                    unrealized_pnl=_safe_float(
+                        plan_report.get("strategy_unrealized_pnl")
+                        if plan_report.get("strategy_unrealized_pnl") is not None
+                        else plan_report.get("unrealized_pnl")
+                    ),
                 )
+                runtime_loss_recovery_summary: dict[str, Any] | None = None
+                runtime_loss_only_stop = runtime_guard_result.matched_reasons in (
+                    ["rolling_hourly_loss_limit_hit"],
+                    ["rolling_hourly_loss_per_10k_limit_hit"],
+                )
+                if runtime_loss_only_stop and _runtime_guard_loss_recovery_enabled(args) and not runtime_guard_result.tradable:
+                    _runtime_guard_mark_loss_stop(
+                        runtime_recovery,
+                        stopped_at=cycle_started_at,
+                        rolling_hourly_loss=runtime_guard_result.rolling_hourly_loss,
+                    )
+                    runtime_recovery["loss_scope"] = runtime_guard_loss_scope
+                    runtime_loss_recovery_summary = dict(runtime_recovery)
+                    _write_json(state_path, state)
 
                 summary = {
                     "ts": cycle_started_at.isoformat(),
@@ -13625,12 +22281,67 @@ def main() -> None:
                         (plan_report.get("elastic_volume") or {}).get("per_order_scale")
                     ),
                     "elastic_volume_levels_scale": _safe_float((plan_report.get("elastic_volume") or {}).get("levels_scale")),
+                    "adaptive_regime_router": dict(plan_report.get("adaptive_regime_router") or {}),
+                    "adaptive_regime_router_enabled": bool(
+                        (plan_report.get("adaptive_regime_router") or {}).get("enabled")
+                    ),
+                    "adaptive_regime_router_regime": str(
+                        (plan_report.get("adaptive_regime_router") or {}).get("regime") or ""
+                    ),
+                    "adaptive_regime_router_candidate_regime": str(
+                        (plan_report.get("adaptive_regime_router") or {}).get("candidate_regime") or ""
+                    ),
+                    "adaptive_regime_router_reasons": list(
+                        (plan_report.get("adaptive_regime_router") or {}).get("reasons") or []
+                    ),
+                    "adaptive_regime_router_step_scale": _safe_float(
+                        (plan_report.get("adaptive_regime_router") or {}).get("step_scale")
+                    ),
+                    "adaptive_regime_router_per_order_scale": _safe_float(
+                        (plan_report.get("adaptive_regime_router") or {}).get("per_order_scale")
+                    ),
+                    "adaptive_regime_router_levels_scale": _safe_float(
+                        (plan_report.get("adaptive_regime_router") or {}).get("levels_scale")
+                    ),
+                    "regime_entry_budget": dict(plan_report.get("regime_entry_budget") or {}),
+                    "regime_entry_budget_enabled": bool((plan_report.get("regime_entry_budget") or {}).get("enabled")),
+                    "regime_entry_budget_state": str((plan_report.get("regime_entry_budget") or {}).get("state") or ""),
+                    "regime_entry_budget_switching": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("switching")
+                    ),
+                    "regime_entry_budget_shock_guard_active": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("shock_guard_active")
+                    ),
+                    "regime_entry_budget_long_capacity": int(
+                        _safe_float((plan_report.get("regime_entry_budget") or {}).get("long_entry_capacity"))
+                    ),
+                    "regime_entry_budget_short_capacity": int(
+                        _safe_float((plan_report.get("regime_entry_budget") or {}).get("short_entry_capacity"))
+                    ),
+                    "regime_entry_budget_cancel_entry_required": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("cancel_entry_required")
+                    ),
+                    "regime_entry_budget_tick_dominated": bool(
+                        (plan_report.get("regime_entry_budget") or {}).get("tick_dominated")
+                    ),
                     "current_long_qty": _safe_float(plan_report.get("current_long_qty")),
                     "current_long_notional": _safe_float(plan_report.get("current_long_notional")),
                     "current_short_qty": _safe_float(plan_report.get("current_short_qty")),
                     "current_short_notional": _safe_float(plan_report.get("current_short_notional")),
                     "actual_net_qty": _safe_float(plan_report.get("actual_net_qty")),
                     "actual_net_notional": _safe_float(plan_report.get("actual_net_notional")),
+                    "unrealized_pnl": _safe_float(plan_report.get("unrealized_pnl")),
+                    "unrealized_loss_entry_guard_enabled": bool(plan_report.get("unrealized_loss_entry_guard_enabled")),
+                    "unrealized_loss_entry_guard_active": bool(plan_report.get("unrealized_loss_entry_guard_active")),
+                    "unrealized_loss_entry_guard_reason": plan_report.get("unrealized_loss_entry_guard_reason"),
+                    "unrealized_loss_entry_guard_loss": _safe_float(plan_report.get("unrealized_loss_entry_guard_loss")),
+                    "unrealized_loss_entry_guard_ratio": _safe_float(plan_report.get("unrealized_loss_entry_guard_ratio")),
+                    "unrealized_loss_entry_guard_threshold_ratio": _safe_float(
+                        plan_report.get("unrealized_loss_entry_guard_threshold_ratio")
+                    ),
+                    "unrealized_loss_entry_guard_min_loss": _safe_float(
+                        plan_report.get("unrealized_loss_entry_guard_min_loss")
+                    ),
                     "synthetic_net_qty": _safe_float(plan_report.get("synthetic_net_qty")),
                     "synthetic_drift_qty": _safe_float(plan_report.get("synthetic_drift_qty")),
                     "synthetic_unmatched_trade_count": int(
@@ -13698,6 +22409,17 @@ def main() -> None:
                     ),
                     "synthetic_tp_only_watchdog_reason": (plan_report.get("synthetic_tp_only_watchdog") or {}).get("reason"),
                     "take_profit_guard": dict(plan_report.get("take_profit_guard") or {}),
+                    "inventory_unlock_release": dict(plan_report.get("inventory_unlock_release") or {}),
+                    "inventory_unlock_active": bool((plan_report.get("inventory_unlock_release") or {}).get("active")),
+                    "inventory_unlock_side": str(
+                        ((plan_report.get("inventory_unlock_release") or {}).get("side", "") or "")
+                    ),
+                    "inventory_unlock_stall_count": int(
+                        ((plan_report.get("inventory_unlock_release") or {}).get("stall_count", 0) or 0)
+                    ),
+                    "inventory_unlock_release_notional": _safe_float(
+                        (plan_report.get("inventory_unlock_release") or {}).get("release_order_notional")
+                    ),
                     "volume_long_v4_delever": dict(plan_report.get("volume_long_v4_delever") or {}),
                     "volume_long_v4_flow_sleeve": dict(plan_report.get("volume_long_v4_flow_sleeve") or {}),
                     "exposure_escalation": dict(plan_report.get("exposure_escalation") or {}),
@@ -13874,8 +22596,12 @@ def main() -> None:
                     "reconcile_expected_actual_net_qty": _safe_float(reconcile_snapshot.get("expected_actual_net_qty")),
                     "reconcile_actual_actual_net_qty": _safe_float(reconcile_snapshot.get("actual_actual_net_qty")),
                     "executed": bool(submit_report.get("executed")),
+                    "pre_guard_trade_audit_appended": int(pre_guard_audit_sync.get("trade_appended", 0) or 0),
+                    "pre_guard_income_audit_appended": int(pre_guard_audit_sync.get("income_appended", 0) or 0),
+                    "pre_guard_audit_error": pre_guard_audit_sync.get("error"),
                     "trade_audit_appended": int(audit_sync.get("trade_appended", 0) or 0),
                     "income_audit_appended": int(audit_sync.get("income_appended", 0) or 0),
+                    "trade_database": audit_sync.get("database"),
                     "audit_error": audit_sync.get("error"),
                     "error_message": None,
                     "runtime_status": runtime_guard_result.runtime_status,
@@ -13886,11 +22612,26 @@ def main() -> None:
                     "run_start_time": runtime_guard_config.run_start_time.isoformat() if runtime_guard_config.run_start_time else None,
                     "run_end_time": runtime_guard_config.run_end_time.isoformat() if runtime_guard_config.run_end_time else None,
                     "runtime_guard_stats_start_time": runtime_stats_start_time.isoformat() if runtime_stats_start_time else None,
+                    "runtime_guard_loss_scope": runtime_guard_loss_scope,
                     "rolling_hourly_loss": runtime_guard_result.rolling_hourly_loss,
                     "rolling_hourly_loss_limit": runtime_guard_config.rolling_hourly_loss_limit,
+                    "rolling_hourly_gross_notional": runtime_guard_result.rolling_hourly_gross_notional,
+                    "rolling_hourly_loss_per_10k": runtime_guard_result.rolling_hourly_loss_per_10k,
+                    "rolling_hourly_loss_per_10k_active": runtime_guard_result.rolling_hourly_loss_per_10k_active,
+                    "rolling_hourly_loss_per_10k_limit": runtime_guard_config.rolling_hourly_loss_per_10k_limit,
+                    "rolling_hourly_loss_per_10k_min_notional": runtime_guard_config.rolling_hourly_loss_per_10k_min_notional,
                     "cumulative_gross_notional": runtime_guard_result.cumulative_gross_notional,
                     "max_cumulative_notional": runtime_guard_config.max_cumulative_notional,
+                    "max_actual_net_notional": runtime_guard_config.max_actual_net_notional,
+                    "max_synthetic_drift_notional": runtime_guard_config.max_synthetic_drift_notional,
+                    "max_unrealized_loss": runtime_guard_config.max_unrealized_loss,
+                    "unrealized_loss": runtime_guard_result.unrealized_loss,
                 }
+                if runtime_loss_recovery_summary is not None:
+                    summary["runtime_status"] = "cooldown"
+                    summary["stop_triggered"] = False
+                    summary["stop_reason"] = "rolling_hourly_loss_cooling_down"
+                    summary["runtime_guard_loss_recovery"] = runtime_loss_recovery_summary
                 volatility_email_alert = maybe_send_volatility_email_alert(
                     args=args,
                     state=state,
@@ -13902,6 +22643,24 @@ def main() -> None:
                 summary["volatility_email_alert_triggered"] = bool(volatility_email_alert.get("triggered"))
                 summary["volatility_email_alert_sent"] = bool(volatility_email_alert.get("sent"))
                 summary["volatility_email_alert_reason"] = volatility_email_alert.get("reason")
+                if trade_database_enabled():
+                    try:
+                        ensure_trade_database_schema()
+                        summary["cycle_database"] = persist_cycle_snapshot(
+                            symbol=args.symbol,
+                            market_type="futures",
+                            strategy_mode=str(
+                                getattr(args, "strategy_profile", "") or getattr(args, "strategy_mode", "") or "unknown"
+                            ),
+                            config=vars(args),
+                            summary=summary,
+                        )
+                    except Exception as db_exc:
+                        summary["cycle_database"] = {
+                            "enabled": True,
+                            "cycle_inserted": 0,
+                            "error": f"{type(db_exc).__name__}: {db_exc}",
+                        }
                 _write_json(state_path, state)
                 _append_jsonl(summary_path, summary)
                 _print_cycle_summary(summary)
@@ -13934,6 +22693,10 @@ def main() -> None:
                 }
                 _append_jsonl(summary_path, error_report)
                 print(f"[{cycle}] error: {exc}")
+                if _is_binance_rate_limit_error(exc):
+                    backoff = max(RUNNER_RATE_LIMIT_BACKOFF_SECONDS, float(args.sleep_seconds))
+                    print(f"[{cycle}] Binance rate limit detected; backing off {backoff:.1f}s")
+                    time.sleep(backoff)
                 if consecutive_errors >= args.max_consecutive_errors:
                     raise SystemExit(
                         f"Stopped after {consecutive_errors} consecutive errors. Inspect {summary_path} and {submit_report_path}."
@@ -13941,8 +22704,11 @@ def main() -> None:
 
             if args.iterations and cycle >= args.iterations:
                 break
-            time.sleep(args.sleep_seconds)
+            cycle_jitter = _safe_float(getattr(args, "cycle_jitter_seconds", 0.0))
+            time.sleep(args.sleep_seconds + (random.uniform(0.0, cycle_jitter) if cycle_jitter > 0 else 0.0))
     finally:
+        if user_data_stream is not None:
+            user_data_stream.stop()
         if market_stream is not None:
             market_stream.stop()
 

@@ -282,7 +282,7 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(len(diff["missing_orders"]), 0)
         self.assertEqual(len(diff["stale_orders"]), 0)
 
-    def test_diff_open_orders_keeps_same_price_order_and_adds_delta_when_qty_increases(self) -> None:
+    def test_diff_open_orders_preserves_same_price_order_when_qty_increases(self) -> None:
         existing = [
             {"side": "BUY", "type": "LIMIT", "price": "0.02685", "origQty": "744", "orderId": 1},
         ]
@@ -294,9 +294,7 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual(len(diff["kept_orders"]), 1)
         self.assertEqual(len(diff["stale_orders"]), 0)
-        self.assertEqual(len(diff["missing_orders"]), 1)
-        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 156.0, places=8)
-        self.assertAlmostEqual(float(diff["missing_orders"][0]["price"]), 0.02685, places=8)
+        self.assertEqual(len(diff["missing_orders"]), 0)
 
     def test_diff_open_orders_replaces_same_price_order_when_qty_decreases(self) -> None:
         existing = [
@@ -310,8 +308,87 @@ class SemiAutoPlanTests(unittest.TestCase):
 
         self.assertEqual(len(diff["kept_orders"]), 0)
         self.assertEqual(len(diff["stale_orders"]), 1)
+        self.assertEqual(len(diff["missing_orders"]), 0)
+
+    def test_diff_open_orders_does_not_place_same_bucket_while_canceling_excess(self) -> None:
+        existing = [
+            {"side": "SELL", "type": "LIMIT", "price": "0.14379", "origQty": "35", "orderId": 1},
+            {"side": "SELL", "type": "LIMIT", "price": "0.14379", "origQty": "35", "orderId": 2},
+            {"side": "SELL", "type": "LIMIT", "price": "0.14379", "origQty": "833", "orderId": 3},
+        ]
+        desired = [
+            {"side": "SELL", "price": 0.14379, "qty": 35.0, "notional": 5.03265, "level": 1, "role": "entry_short"},
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 3)
+        self.assertEqual(len(diff["missing_orders"]), 0)
+
+    def test_diff_open_orders_preserves_same_bucket_take_profit_when_qty_increases(self) -> None:
+        existing = [
+            {"side": "SELL", "type": "LIMIT", "price": "0.14362", "origQty": "74", "orderId": 1},
+        ]
+        desired = [
+            {
+                "side": "SELL",
+                "price": 0.14362,
+                "qty": 974.0,
+                "notional": 139.914,
+                "level": 1,
+                "role": "take_profit_long",
+            },
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 1)
+        self.assertEqual(len(diff["stale_orders"]), 0)
+        self.assertEqual(len(diff["missing_orders"]), 0)
+
+    def test_diff_open_orders_replaces_smaller_best_quote_reduce_order(self) -> None:
+        existing = [
+            {
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.60540",
+                "origQty": "13",
+                "orderId": 1,
+                "positionSide": "SHORT",
+            },
+        ]
+        desired = [
+            {
+                "side": "BUY",
+                "price": 0.6054,
+                "qty": 52.0,
+                "notional": 31.4808,
+                "role": "best_quote_reduce_short",
+                "position_side": "SHORT",
+                "force_reduce_only": True,
+            },
+        ]
+
+        diff = diff_open_orders(existing_orders=existing, desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 1)
         self.assertEqual(len(diff["missing_orders"]), 1)
-        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 600.0, places=8)
+        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 52.0, places=8)
+
+    def test_diff_open_orders_merges_duplicate_desired_bucket_when_no_existing_order(self) -> None:
+        desired = [
+            {"side": "SELL", "price": 0.14362, "qty": 74.0, "notional": 10.62788, "level": 1, "role": "take_profit_long"},
+            {"side": "SELL", "price": 0.14362, "qty": 974.0, "notional": 139.48588, "level": 1, "role": "take_profit_long"},
+        ]
+
+        diff = diff_open_orders(existing_orders=[], desired_orders=desired)
+
+        self.assertEqual(len(diff["kept_orders"]), 0)
+        self.assertEqual(len(diff["stale_orders"]), 0)
+        self.assertEqual(len(diff["missing_orders"]), 1)
+        self.assertAlmostEqual(float(diff["missing_orders"][0]["qty"]), 1048.0, places=8)
 
     def test_preserve_sticky_entry_orders_keeps_closer_existing_entries_within_step_tolerance(self) -> None:
         existing = [
@@ -349,6 +426,78 @@ class SemiAutoPlanTests(unittest.TestCase):
         self.assertEqual(adjusted[0]["qty"], 141.0)
         self.assertEqual(adjusted[1]["price"], 0.3187)
         self.assertEqual(adjusted[1]["qty"], 141.0)
+
+    def test_preserve_sticky_entry_orders_keeps_nearby_existing_entries_even_when_less_aggressive(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.14290",
+                "origQty": "2088",
+                "positionSide": "BOTH",
+                "role": "entry_long",
+            },
+            {
+                "orderId": 2,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.14380",
+                "origQty": "2088",
+                "positionSide": "BOTH",
+                "role": "entry_short",
+            },
+        ]
+        desired = [
+            {"side": "BUY", "price": 0.14300, "qty": 2088.0, "notional": 298.584, "level": 1, "role": "entry_long"},
+            {"side": "SELL", "price": 0.14370, "qty": 2088.0, "notional": 300.0456, "level": 1, "role": "entry_short"},
+        ]
+
+        adjusted = preserve_sticky_entry_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            price_tolerance=0.00030,
+            preserve_less_aggressive=True,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.14290)
+        self.assertEqual(adjusted[1]["price"], 0.14380)
+
+    def test_preserve_sticky_entry_orders_keeps_best_quote_entries(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.6290",
+                "origQty": "57",
+                "positionSide": "BOTH",
+                "role": "best_quote_entry_long",
+            },
+            {
+                "orderId": 2,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.6296",
+                "origQty": "57",
+                "positionSide": "BOTH",
+                "role": "best_quote_entry_short",
+            },
+        ]
+        desired = [
+            {"side": "BUY", "price": 0.6289, "qty": 57.0, "notional": 35.8473, "role": "best_quote_entry_long"},
+            {"side": "SELL", "price": 0.6297, "qty": 57.0, "notional": 35.8929, "role": "best_quote_entry_short"},
+        ]
+
+        adjusted = preserve_sticky_entry_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            price_tolerance=0.0002,
+            preserve_less_aggressive=True,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.6290)
+        self.assertEqual(adjusted[1]["price"], 0.6296)
 
     def test_preserve_sticky_entry_orders_skips_prices_that_collide_with_take_profit(self) -> None:
         existing = [
@@ -531,6 +680,120 @@ class SemiAutoPlanTests(unittest.TestCase):
         )
 
         self.assertEqual([item["price"] for item in adjusted], [0.1731, 0.1733, 0.1734])
+
+    def test_preserve_sticky_exit_orders_respects_price_tolerance(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.5615",
+                "origQty": "17",
+                "positionSide": "BOTH",
+                "role": "adverse_reduce_long",
+            },
+            {
+                "orderId": 2,
+                "side": "SELL",
+                "type": "LIMIT",
+                "price": "0.5671",
+                "origQty": "17",
+                "positionSide": "BOTH",
+                "role": "adverse_reduce_long",
+            },
+        ]
+        desired = [
+            {
+                "side": "SELL",
+                "price": 0.5608,
+                "qty": 17.0,
+                "notional": 9.5336,
+                "role": "adverse_reduce_long",
+                "position_side": "BOTH",
+            },
+            {
+                "side": "SELL",
+                "price": 0.5609,
+                "qty": 17.0,
+                "notional": 9.5353,
+                "role": "adverse_reduce_long",
+                "position_side": "BOTH",
+            },
+        ]
+
+        adjusted = preserve_sticky_exit_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            sticky_roles={"adverse_reduce_long"},
+            price_tolerance=0.0016,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.5615)
+        self.assertEqual(adjusted[1]["price"], 0.5609)
+
+    def test_preserve_sticky_exit_orders_infers_best_quote_reduce_role(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.6015",
+                "origQty": "53",
+                "positionSide": "SHORT",
+            }
+        ]
+        desired = [
+            {
+                "side": "BUY",
+                "price": 0.6012,
+                "qty": 53.0,
+                "notional": 31.8636,
+                "role": "best_quote_reduce_short",
+                "position_side": "SHORT",
+                "force_reduce_only": True,
+            }
+        ]
+
+        adjusted = preserve_sticky_exit_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            sticky_roles={"best_quote_reduce_short"},
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.6015)
+        self.assertAlmostEqual(adjusted[0]["notional"], 31.8795)
+
+    def test_preserve_sticky_exit_orders_releases_best_quote_reduce_outside_tolerance(self) -> None:
+        existing = [
+            {
+                "orderId": 1,
+                "side": "BUY",
+                "type": "LIMIT",
+                "price": "0.6076",
+                "origQty": "52",
+                "positionSide": "SHORT",
+            }
+        ]
+        desired = [
+            {
+                "side": "BUY",
+                "price": 0.6080,
+                "qty": 52.0,
+                "notional": 31.616,
+                "role": "best_quote_reduce_short",
+                "position_side": "SHORT",
+                "force_reduce_only": True,
+            }
+        ]
+
+        adjusted = preserve_sticky_exit_orders(
+            existing_orders=existing,
+            desired_orders=desired,
+            sticky_roles={"best_quote_reduce_short"},
+            price_tolerance=0.00025,
+        )
+
+        self.assertEqual(adjusted[0]["price"], 0.6080)
 
     def test_build_hedge_micro_grid_plan_builds_both_sides(self) -> None:
         plan = build_hedge_micro_grid_plan(

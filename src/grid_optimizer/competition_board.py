@@ -25,6 +25,7 @@ REWARD_PRICE_CACHE_PATH = Path("output/competition_reward_price_cache.json")
 CACHE_TTL_SECONDS = 1800
 UTC_PLUS_8 = timezone(timedelta(hours=8))
 DAILY_STRATEGY_SAMPLE_CUTOFF_HOUR_CST = 14
+COMPETITION_BOARD_TARGET_REFRESH_HOUR_CST = 15
 DAILY_STRATEGY_TRACKED_RANKS = (20, 50, 100, 200, 500)
 FUTURES_MASTER_ARENA_BASE_URL = "https://www.binance.com"
 
@@ -345,6 +346,27 @@ COMPETITION_SOURCES: tuple[CompetitionSource, ...] = (
         market="futures",
         label="CHIP 合约交易挑战赛",
         url="https://www.binance.com/zh-CN/activity/trading-competition/futures-chip-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_bill",
+        symbol="BILL",
+        market="futures",
+        label="BILL 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-bill-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_aigensyn",
+        symbol="AIGENSYN",
+        market="futures",
+        label="AIGENSYN 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-aigensyn-challenge?ref=YEK2JZJT",
+    ),
+    CompetitionSource(
+        slug="futures_pharos",
+        symbol="PHAROS",
+        market="futures",
+        label="PHAROS 合约交易挑战赛",
+        url="https://www.binance.com/zh-CN/activity/trading-competition/futures-pharos-challenge?ref=YEK2JZJT",
     ),
     CompetitionSource(
         slug="futures_tradfi_week1",
@@ -1369,7 +1391,7 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
         "boards": [
             {
                 "tabLabel": "交易量挑战赛",
-                "resourceId": 51201,
+                "resourceId": 51202,
                 "metricField": "grade",
                 "metricLabel": "交易量 (USDT)",
                 "rewardUnit": "CHIP",
@@ -1400,6 +1422,123 @@ TradFi 合约冲刺赛和黄金白银合约冲刺赛合并交易量达到 70 亿
 平分 900,000 CHIP
 第 51 - 200 名
 平分 1,800,000 CHIP
+""",
+            }
+        ]
+    },
+    "futures_bill": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 54211,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "BILL",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/08 18:00 - 2026/05/19 07:59",
+                "activityEndAt": "2026-05-19T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/08 18:00 - 2026/05/19 07:59
+累计 BILL U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+总奖池 4,000,000 BILL
+第 1 名
+600,000 BILL
+第 2 名
+480,000 BILL
+第 3 名
+280,000 BILL
+第 4 名
+160,000 BILL
+第 5 名
+80,000 BILL
+第 6 - 20 名
+平分 600,000 BILL
+第 21 - 50 名
+平分 600,000 BILL
+第 51 - 200 名
+平分 1,200,000 BILL
+""",
+            }
+        ]
+    },
+    "futures_aigensyn": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 54596,
+                "metricField": "grade",
+                "metricLabel": "交易量 (USDT)",
+                "rewardUnit": "AIGENSYN",
+                "leaderboardUnit": "USDT",
+                "leaderboardUnitTitle": "交易量",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/12 18:00 - 2026/05/19 07:59",
+                "activityEndAt": "2026-05-19T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/12 18:00 - 2026/05/19 07:59
+累计AIGENSYN U本位合约交易量不低于500 USDT，方可参与排行榜奖励。
+总奖池 3,200,000 AIGENSYN
+第 1 名
+480,000 AIGENSYN
+第 2 名
+384,000 AIGENSYN
+第 3 名
+224,000 AIGENSYN
+第 4 名
+128,000 AIGENSYN
+第 5 名
+64,000 AIGENSYN
+第 6 - 20 名
+平分 480,000 AIGENSYN
+第 21 - 50 名
+平分 480,000 AIGENSYN
+第 51 - 200 名
+平分 960,000 AIGENSYN
+""",
+            }
+        ]
+    },
+    "futures_pharos": {
+        "boards": [
+            {
+                "tabLabel": "交易量挑战赛",
+                "resourceId": 56722,
+                "metricField": "grade",
+                "metricLabel": "积分",
+                "rewardUnit": "PHAROS",
+                "leaderboardUnit": "积分",
+                "leaderboardUnitTitle": "积分",
+                "rankingType": "CUSTOMIZED",
+                "competitionType": "FUTURES",
+                "activityPeriodText": "2026/05/19 18:00 - 2026/06/09 07:59",
+                "activityEndAt": "2026-06-09T07:59:00+08:00",
+                "maxRows": 200,
+                "bodyExcerpt": """
+活动时间：2026/05/19 18:00 - 2026/06/09 07:59
+累计 PHAROS U 本位合约交易量至少 500 USDT，方可参与排行榜奖励。
+
+第 1 名
+60,000 PHAROS
+第 2 名
+48,000 PHAROS
+第 3 名
+28,000 PHAROS
+第 4 名
+16,000 PHAROS
+第 5 名
+8,000 PHAROS
+第 6 - 20 名
+平分 60,000 PHAROS
+第 21 - 50 名
+平分 60,000 PHAROS
+第 51 - 200 名
+平分 120,000 PHAROS
 """,
             }
         ]
@@ -2777,6 +2916,33 @@ def _history_entry_datetime(entry: dict[str, Any]) -> datetime | None:
     return None
 
 
+def competition_board_daily_refresh_due(
+    board: dict[str, Any] | None,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    current = (now or datetime.now(UTC_PLUS_8)).astimezone(UTC_PLUS_8)
+    cutoff = current.replace(
+        hour=COMPETITION_BOARD_TARGET_REFRESH_HOUR_CST,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
+    if current < cutoff:
+        return False
+    if not isinstance(board, dict):
+        return True
+    end_at = _parse_iso_datetime(board.get("activity_end_at"))
+    if end_at is None:
+        return True
+    end_cst = end_at.astimezone(UTC_PLUS_8)
+    if current.date() < end_cst.date():
+        return True
+    if current.date() == end_cst.date():
+        return True
+    return False
+
+
 def _normalize_history_index_payload(boards: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     if not isinstance(boards, dict):
         return {}
@@ -3238,6 +3404,7 @@ def build_reward_volume_targets(
     board: dict[str, Any] | None,
     *,
     now: datetime | None = None,
+    current_volume: float | None = None,
     tracked_ranks: tuple[int, ...] = (200, 50, 20),
     loss_per_10k_options: tuple[int, ...] = (3, 4, 5),
 ) -> dict[str, Any] | None:
@@ -3251,6 +3418,7 @@ def build_reward_volume_targets(
             "reward_unit": str(board.get("reward_unit", "")).strip().upper(),
             "reward_price_usdt": None,
             "tiers": [],
+            "zone_moves": [],
             "message": "当前比赛没有可用奖励段，暂时无法估算奖励回本量。",
         }
     ref_time = now.astimezone(timezone.utc) if now is not None else datetime.now(timezone.utc)
@@ -3263,6 +3431,7 @@ def build_reward_volume_targets(
             "reward_unit": reward_unit,
             "reward_price_usdt": None,
             "tiers": [],
+            "zone_moves": [],
             "message": "当前拿不到奖励币种对 USDT 的价格，暂时无法估算奖励回本量。",
         }
 
@@ -3302,6 +3471,13 @@ def build_reward_volume_targets(
             }
         )
 
+    values_by_rank = _values_by_rank(board)
+    zone_moves = _build_reward_zone_moves(
+        segments,
+        values_by_rank,
+        current_volume=current_volume,
+    )
+
     return {
         "label": str(board.get("label", "")).strip() or str(board.get("title", "")).strip() or "-",
         "symbol": str(board.get("symbol", "")).strip(),
@@ -3309,7 +3485,289 @@ def build_reward_volume_targets(
         "reward_price_usdt": float(reward_price),
         "loss_per_10k_options": [int(item) for item in loss_per_10k_options],
         "tiers": tiers,
+        "zone_moves": zone_moves,
         "message": "" if tiers else "奖励段已识别，但没有拿到 20 / 50 / 200 名对应的有效奖励数据。",
+    }
+
+
+def _rank_after_volume(values_by_rank: dict[int, float], current_volume: float) -> int | None:
+    if not values_by_rank:
+        return None
+    ranked_values = sorted(values_by_rank.items(), key=lambda item: int(item[0]))
+    for rank, value in ranked_values:
+        if float(current_volume) >= float(value):
+            return int(rank)
+    return int(ranked_values[-1][0]) + 1
+
+
+def _build_reward_zone_moves(
+    segments: list[Any],
+    values_by_rank: dict[int, float],
+    *,
+    current_volume: float | None,
+) -> list[dict[str, Any]]:
+    current_value = _safe_float(current_volume)
+    if current_value is None or current_value <= 0 or not values_by_rank:
+        return []
+    current_rank = _rank_after_volume(values_by_rank, current_value)
+    if current_rank is None:
+        return []
+
+    valid_segments: list[dict[str, int]] = []
+    for segment in segments:
+        if not isinstance(segment, dict):
+            continue
+        start_rank = _safe_int(segment.get("start_rank"))
+        end_rank = _safe_int(segment.get("end_rank"))
+        if start_rank is None or end_rank is None:
+            continue
+        valid_segments.append({"start_rank": int(start_rank), "end_rank": int(end_rank)})
+    valid_segments.sort(key=lambda item: (item["start_rank"], item["end_rank"]))
+    if not valid_segments:
+        return []
+
+    moves: list[dict[str, Any]] = []
+    current_segment = next(
+        (
+            segment
+            for segment in valid_segments
+            if int(segment["start_rank"]) <= int(current_rank) <= int(segment["end_rank"])
+        ),
+        None,
+    )
+    if current_segment is not None:
+        target_rank = int(current_segment["end_rank"]) + 1
+        target_value = _safe_float(values_by_rank.get(target_rank))
+        if target_value is not None:
+            moves.append(
+                {
+                    "move_type": "current_segment_boundary",
+                    "from_rank": int(current_rank),
+                    "to_rank": target_rank,
+                    "target_rank": target_rank,
+                    "target_value": float(target_value),
+                    "volume_needed": max(0.0, float(target_value) - float(current_value)),
+                    "covered_users": max(0, target_rank - int(current_rank)),
+                }
+            )
+
+    max_reward_rank = max(int(segment["end_rank"]) for segment in valid_segments)
+    reward_exit_rank = max_reward_rank + 1
+    target_value = _safe_float(values_by_rank.get(reward_exit_rank))
+    if target_value is not None and not any(int(item.get("target_rank", 0)) == reward_exit_rank for item in moves):
+        moves.append(
+            {
+                "move_type": "reward_zone_boundary",
+                "from_rank": int(current_rank),
+                "to_rank": reward_exit_rank,
+                "target_rank": reward_exit_rank,
+                "target_value": float(target_value),
+                "volume_needed": max(0.0, float(target_value) - float(current_value)),
+                "covered_users": max(0, reward_exit_rank - int(current_rank)),
+            }
+        )
+    return moves
+
+
+def build_competition_displacement_volume(
+    board: dict[str, Any] | None,
+    *,
+    current_volume: float | int | None,
+    target_rank: int = 200,
+) -> dict[str, Any] | None:
+    if not isinstance(board, dict):
+        return None
+    current = _safe_float(current_volume)
+    if current is None or current < 0:
+        current = 0.0
+    rows = [
+        {"rank": int(item["rank"]), "value": float(item["value"])}
+        for item in board.get("rows", [])
+        if isinstance(item, dict)
+        and _safe_int(item.get("rank")) is not None
+        and _safe_float(item.get("value")) is not None
+    ]
+    if not rows:
+        return {
+            "leaderboard_unit": str(board.get("leaderboard_unit", "")).strip(),
+            "current_volume": float(current),
+            "current_rank": None,
+            "current": None,
+            "current_reward_floor": None,
+            "rank_steps": [],
+            "reward_floor_steps": [],
+            "displacement_bands": [],
+            "message": "当前榜单没有可用排名数据，暂时无法估算挤出排位需要的交易量。",
+        }
+    rows.sort(key=lambda item: item["rank"])
+    current_rank = sum(1 for item in rows if item["value"] > float(current)) + 1
+
+    def _label_for_rank(rank: int) -> str:
+        return f"第 {int(rank)} 名"
+
+    def _gap_summary(
+        from_rank: int,
+        to_rank: int,
+        base_value: float,
+        *,
+        label: str,
+        result_rank: int | None = None,
+    ) -> dict[str, Any]:
+        start = int(from_rank) + 1
+        end = int(to_rank)
+        selected = [item for item in rows if start <= item["rank"] <= end]
+        cumulative = sum(max(0.0, float(base_value) - item["value"]) for item in selected)
+        return {
+            "label": label,
+            "from_rank": int(from_rank),
+            "target_rank": int(result_rank if result_rank is not None else to_rank),
+            "last_included_rank": int(to_rank),
+            "base_value": float(base_value),
+            "users_count": len(selected),
+            "cumulative_gap": float(cumulative),
+            "cumulative_gap_text": f"{float(cumulative):,.2f}",
+        }
+
+    current_summary = None
+    if current_rank <= int(target_rank):
+        current_summary = _gap_summary(
+            current_rank,
+            int(target_rank),
+            float(current),
+            label=f"当前第 {int(current_rank)} 名 -> 第 {int(target_rank) + 1} 名",
+            result_rank=int(target_rank) + 1,
+        )
+
+    rank_steps: list[dict[str, Any]] = []
+    for row in rows:
+        rank = int(row["rank"])
+        if rank >= int(target_rank):
+            continue
+        next_rank = rank + 1
+        if not any(int(item["rank"]) == next_rank for item in rows):
+            continue
+        rank_steps.append(
+            _gap_summary(
+                rank,
+                next_rank,
+                float(row["value"]),
+                label=f"{_label_for_rank(rank)} -> {_label_for_rank(next_rank)}",
+            )
+        )
+
+    reward_floor_steps: list[dict[str, Any]] = []
+    displacement_bands: list[dict[str, Any]] = []
+    current_reward_floor = None
+    for segment in board.get("segments", []):
+        if not isinstance(segment, dict):
+            continue
+        start_rank = _safe_int(segment.get("start_rank"))
+        end_rank = _safe_int(segment.get("end_rank"))
+        if start_rank is None or end_rank is None:
+            continue
+        if start_rank > int(target_rank):
+            continue
+        start_row = next((item for item in rows if int(item["rank"]) == int(start_rank)), None)
+        if start_row is None:
+            continue
+        if start_rank < end_rank:
+            floor_rank = int(target_rank) if int(start_rank) <= int(target_rank) else min(int(end_rank), int(target_rank))
+            reward_floor_steps.append(
+                _gap_summary(
+                    int(start_rank),
+                    floor_rank,
+                    float(start_row["value"]),
+                    label=f"第 {int(start_rank)} 名 -> 第 {int(floor_rank)} 名",
+                )
+            )
+        if current_reward_floor is None and int(start_rank) <= int(current_rank) <= int(end_rank):
+            floor_rank = min(int(end_rank), int(target_rank))
+            if int(current_rank) < floor_rank:
+                current_reward_floor = _gap_summary(
+                    int(current_rank),
+                    floor_rank,
+                    float(current),
+                    label=f"当前第 {int(current_rank)} 名 -> 第 {int(floor_rank) + 1} 名",
+                    result_rank=int(floor_rank) + 1,
+                )
+        next_rank = min(int(end_rank) + 1, int(target_rank) + 1)
+        if int(start_rank) < next_rank:
+            included_rank = next_rank if next_rank <= int(target_rank) else next_rank - 1
+            displacement_bands.append(
+                _gap_summary(
+                    int(start_rank),
+                    included_rank,
+                    float(start_row["value"]),
+                    label=f"第 {int(start_rank)} 名 -> 第 {int(next_rank)} 名",
+                    result_rank=next_rank,
+                )
+            )
+
+    return {
+        "leaderboard_unit": str(board.get("leaderboard_unit", "")).strip(),
+        "current_volume": float(current),
+        "current_rank": int(current_rank),
+        "target_rank": int(target_rank),
+        "current": current_summary,
+        "current_reward_floor": current_reward_floor,
+        "rank_steps": rank_steps,
+        "reward_floor_steps": reward_floor_steps,
+        "displacement_bands": displacement_bands,
+        "message": "" if current_summary or rank_steps or reward_floor_steps else "榜单数据不足，暂时无法估算挤出排位需要的交易量。",
+    }
+
+
+def build_competition_entry_volume_targets(
+    board: dict[str, Any] | None,
+    *,
+    current_volume: float | int | None,
+    target_ranks: tuple[int, ...] = (1, 2, 3, 4, 5, 20, 50, 200),
+) -> dict[str, Any] | None:
+    if not isinstance(board, dict):
+        return None
+    current = _safe_float(current_volume)
+    if current is None or current < 0:
+        current = 0.0
+    rows_by_rank: dict[int, float] = {}
+    for item in board.get("rows", []):
+        if not isinstance(item, dict):
+            continue
+        rank = _safe_int(item.get("rank"))
+        value = _safe_float(item.get("value"))
+        if rank is None or value is None:
+            continue
+        rows_by_rank[int(rank)] = float(value)
+    targets: list[dict[str, Any]] = []
+    for rank in target_ranks:
+        target_value = rows_by_rank.get(int(rank))
+        if target_value is None:
+            targets.append(
+                {
+                    "rank": int(rank),
+                    "rank_label": f"第 {int(rank)} 名",
+                    "target_value": None,
+                    "additional_volume": None,
+                    "additional_volume_text": "",
+                    "status": "missing",
+                }
+            )
+            continue
+        additional = max(0.0, float(target_value) - float(current))
+        targets.append(
+            {
+                "rank": int(rank),
+                "rank_label": f"第 {int(rank)} 名",
+                "target_value": float(target_value),
+                "additional_volume": float(additional),
+                "additional_volume_text": f"{float(additional):,.2f}",
+                "status": "reached" if additional <= 0 else "needed",
+            }
+        )
+    return {
+        "leaderboard_unit": str(board.get("leaderboard_unit", "")).strip(),
+        "current_volume": float(current),
+        "targets": targets,
+        "message": "" if rows_by_rank else "当前榜单没有可用排名数据，暂时无法估算挤进各档需要的交易量。",
     }
 
 

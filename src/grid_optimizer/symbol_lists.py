@@ -7,8 +7,36 @@ from typing import Any
 
 SYMBOL_LISTS_PATH = Path("output/symbol_lists.json")
 DEFAULT_SYMBOL_LISTS: dict[str, list[str]] = {
-    "monitor": ["SOONUSDT", "CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"],
-    "competition": ["SOONUSDT", "CHIPUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"],
+    "monitor": [
+        "PHAROSUSDT",
+        "BILLUSDT",
+        "SOONUSDT",
+        "CHIPUSDT",
+        "BTCUSDC",
+        "ETHUSDC",
+        "XAUUSDT",
+        "XAGUSDT",
+        "CLUSDT",
+        "BZUSDT",
+        "ORDIUSDC",
+        "TRUMPUSDC",
+        "AIGENSYNUSDT",
+    ],
+    "competition": [
+        "PHAROSUSDT",
+        "BILLUSDT",
+        "SOONUSDT",
+        "CHIPUSDT",
+        "BTCUSDC",
+        "ETHUSDC",
+        "XAUUSDT",
+        "XAGUSDT",
+        "CLUSDT",
+        "BZUSDT",
+        "ORDIUSDC",
+        "TRUMPUSDC",
+        "AIGENSYNUSDT",
+    ],
 }
 SUPPORTED_SYMBOL_LIST_TYPES = tuple(DEFAULT_SYMBOL_LISTS.keys())
 _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9_]{3,40}$")

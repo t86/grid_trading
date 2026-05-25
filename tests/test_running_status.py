@@ -497,6 +497,68 @@ class RunningStatusTests(unittest.TestCase):
         self.assertEqual(card["competition_volume_start_at"], "2026-04-22T18:00:00+08:00")
         self.assertEqual(card["competition_volume_end_at"], "2026-05-13T07:59:00+08:00")
 
+    def test_bill_running_status_uses_full_competition_window(self) -> None:
+        from grid_optimizer.running_status import build_running_status_local_payload
+
+        window_start_ms = int(
+            datetime(2026, 5, 8, 18, 0, tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000
+        )
+        before_window_ms = int(
+            datetime(2026, 5, 8, 17, 59, tzinfo=timezone(timedelta(hours=8))).timestamp() * 1000
+        )
+
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            output_dir = root / "output"
+            output_dir.mkdir()
+            (output_dir / "billusdt_loop_runner_control.json").write_text(
+                json.dumps(
+                    {
+                        "symbol": "BILLUSDT",
+                        "strategy_profile": "bill_profile",
+                        "strategy_mode": "synthetic_neutral",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (output_dir / "billusdt_loop_trade_audit.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"symbol": "BILLUSDT", "id": 1, "time": before_window_ms, "side": "BUY", "price": "10", "qty": "10", "commission": "0", "commissionAsset": "USDT"}),
+                        json.dumps({"symbol": "BILLUSDT", "id": 2, "time": window_start_ms, "side": "BUY", "price": "20", "qty": "10", "commission": "0", "commissionAsset": "USDT"}),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            def fake_runner(symbol: str) -> dict[str, object]:
+                self.assertEqual(symbol, "BILLUSDT")
+                return {
+                    "configured": True,
+                    "is_running": False,
+                    "pid": None,
+                    "config": {
+                        "symbol": "BILLUSDT",
+                        "strategy_profile": "bill_profile",
+                        "strategy_mode": "synthetic_neutral",
+                    },
+                }
+
+            previous_cwd = os.getcwd()
+            try:
+                os.chdir(root)
+                with patch("grid_optimizer.running_status.read_symbol_runner_process", side_effect=fake_runner):
+                    payload = build_running_status_local_payload(symbol="BILLUSDT")
+            finally:
+                os.chdir(previous_cwd)
+
+        card = payload["groups"]["saved_idle"][0]
+        self.assertAlmostEqual(card["audit_lifetime_total_volume"], 300.0, places=8)
+        self.assertAlmostEqual(card["lifetime_total_volume"], 200.0, places=8)
+        self.assertEqual(card["competition_volume_start_at"], "2026-05-08T18:00:00+08:00")
+        self.assertEqual(card["competition_volume_end_at"], "2026-05-19T07:59:00+08:00")
+
     def test_build_running_status_local_payload_prefers_effective_runtime_values_for_running_cards(self) -> None:
         from grid_optimizer.running_status import build_running_status_local_payload
 

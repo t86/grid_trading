@@ -58,12 +58,14 @@ from grid_optimizer.web import (
     _start_runner_process,
     _status_commission_usdt,
     _update_custom_grid_runner_preset,
+    _update_runner_frozen_inventory,
     _uses_legacy_runner,
     _validate_runner_required_risk_guards,
     _volatility_reduce_escalation_reason,
     _volatility_trigger_orphan_recovery_action,
 )
 from grid_optimizer import web as web_module
+from grid_optimizer.running_status import _normalize_frozen_inventory_ledger
 
 
 class WebSecurityTests(unittest.TestCase):
@@ -115,10 +117,14 @@ class WebSecurityTests(unittest.TestCase):
             "buy_pause_amp_trigger_ratio": 0.003,
             "buy_pause_down_return_trigger_ratio": -0.0015,
             "volatility_entry_pause_enabled": True,
+            "volatility_entry_pause_10s_abs_return_ratio": 0.001,
+            "volatility_entry_pause_10s_amplitude_ratio": 0.0015,
             "volatility_entry_pause_30s_abs_return_ratio": 0.0015,
             "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
             "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
             "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "volatility_entry_pause_min_observation_seconds": 60.0,
+            "volatility_entry_pause_inventory_recover_ratio": 0.75,
             "anti_chase_entry_guard_enabled": True,
             "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
             "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -145,10 +151,14 @@ class WebSecurityTests(unittest.TestCase):
         return {
             "pause_short_position_notional": pause,
             "volatility_entry_pause_enabled": True,
+            "volatility_entry_pause_10s_abs_return_ratio": 0.001,
+            "volatility_entry_pause_10s_amplitude_ratio": 0.0015,
             "volatility_entry_pause_30s_abs_return_ratio": 0.0015,
             "volatility_entry_pause_30s_amplitude_ratio": 0.0025,
             "volatility_entry_pause_1m_abs_return_ratio": 0.0025,
             "volatility_entry_pause_1m_amplitude_ratio": 0.0035,
+            "volatility_entry_pause_min_observation_seconds": 60.0,
+            "volatility_entry_pause_inventory_recover_ratio": 0.75,
             "anti_chase_entry_guard_enabled": True,
             "anti_chase_entry_guard_1m_abs_return_ratio": 0.0025,
             "anti_chase_entry_guard_1m_amplitude_ratio": 0.0035,
@@ -191,6 +201,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("合约 USDT", MONITOR_PAGE)
         self.assertIn("合约 BNB", MONITOR_PAGE)
         self.assertIn("奖励回本量", MONITOR_PAGE)
+        self.assertIn("挤出奖励区量", MONITOR_PAGE)
+        self.assertIn("挤进交易量", MONITOR_PAGE)
+        self.assertIn("按后续用户逐个超过当前成交量累计", MONITOR_PAGE)
+        self.assertIn("current_reward_floor", MONITOR_PAGE)
+        self.assertIn("当前档", MONITOR_PAGE)
+        self.assertIn("按当前成交量计算进入目标名次还差多少", MONITOR_PAGE)
         self.assertIn("万3", MONITOR_PAGE)
         self.assertIn("万4", MONITOR_PAGE)
         self.assertIn("万5", MONITOR_PAGE)
@@ -359,6 +375,185 @@ class WebSecurityTests(unittest.TestCase):
         handler._send_json.assert_called_once()
         self.assertTrue(handler._send_json.call_args.args[0]["ok"])
 
+    @patch("grid_optimizer.web._update_runner_frozen_inventory")
+    def test_handler_routes_runner_frozen_inventory_updates(self, mock_update_frozen) -> None:
+        mock_update_frozen.return_value = {
+            "symbol": "PHAROSUSDT",
+            "action": "reduce_long",
+            "frozen_inventory": {},
+        }
+        payload = b'{"symbol":"PHAROSUSDT","action":"reduce_long"}'
+        handler = object.__new__(_Handler)
+        handler.path = "/api/runner/frozen_inventory"
+        handler.headers = {"Content-Length": str(len(payload))}
+        handler.rfile = io.BytesIO(payload)
+        handler._authorize_request = lambda: True
+        handler._send_json = Mock()
+
+        _Handler.do_POST(handler)
+
+        mock_update_frozen.assert_called_once_with({"symbol": "PHAROSUSDT", "action": "reduce_long"})
+        handler._send_json.assert_called_once()
+        self.assertTrue(handler._send_json.call_args.args[0]["ok"])
+
+    def test_running_status_page_contains_frozen_inventory_ledger_controls(self) -> None:
+        page = _render_running_status_page()
+
+        self.assertIn("冻结仓位账本", page)
+        self.assertIn("/api/runner/frozen_inventory", page)
+        self.assertIn("对等释放", page)
+        self.assertIn('updateFrozenInventory("pair_release", { requested_qty: qty })', page)
+        self.assertIn("限价平冻结多", page)
+        self.assertIn('updateFrozenInventory("limit_long"', page)
+        self.assertIn("撤限价平多", page)
+        self.assertIn('updateFrozenInventory("cancel_limit_long")', page)
+        self.assertIn("撤限价平空", page)
+        self.assertIn('updateFrozenInventory("cancel_limit_short")', page)
+        self.assertIn("已限价挂单接管的冻结仓位不再参与对等释放", page)
+        self.assertIn("清理冻结多仓数量", page)
+        self.assertIn("清理冻结多仓", page)
+        self.assertIn("由 runner 下 reduce-only 单处理", page)
+        self.assertIn("card.frozen_inventory = data.frozen_inventory", page)
+        self.assertIn("async function refreshOpenDrawerRuntime()", page)
+        self.assertIn("refreshOpenDrawerRuntime().catch(() => {})", page)
+
+    def test_update_frozen_inventory_pair_release_writes_one_shot_directive(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 50.0,
+                            "short_qty": 30.0,
+                            "long_entry_price": 1.0,
+                            "short_entry_price": 1.02,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                result = _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "pair_release", "requested_qty": 12.0}
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result["action"], "pair_release")
+        self.assertEqual(result["frozen_inventory"]["offset_qty"], 30.0)
+        directive = state["best_quote_frozen_inventory_pair_release"]
+        self.assertTrue(directive["requested"])
+        self.assertEqual(directive["requested_qty"], 12.0)
+        self.assertEqual(directive["source"], "running_status_ui")
+
+    def test_update_frozen_inventory_single_side_reduce_writes_requested_qty(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {"best_quote_frozen_inventory": {"long_qty": 50.0, "long_entry_price": 1.0}},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "reduce_long", "requested_qty": 8.0}
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        directive = state["best_quote_frozen_inventory_manual_reduce"]["long"]
+        self.assertTrue(directive["requested"])
+        self.assertEqual(directive["requested_qty"], 8.0)
+
+    def test_update_frozen_inventory_limit_order_isolates_qty_from_pair_release(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {"best_quote_frozen_inventory": {"long_qty": 50.0, "short_qty": 40.0, "long_entry_price": 1.0}},
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                result = _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "limit_long", "requested_qty": 8.0, "price": 1.02}
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        directive = state["best_quote_frozen_inventory_manual_limit"]["long"]
+        self.assertTrue(directive["requested"])
+        self.assertEqual(directive["requested_qty"], 8.0)
+        self.assertEqual(directive["price"], 1.02)
+        ledger = result["frozen_inventory"]
+        self.assertEqual(ledger["long_manual_limit_isolated_qty"], 8.0)
+        self.assertEqual(ledger["pair_eligible_long_qty"], 42.0)
+        self.assertEqual(ledger["offset_qty"], 40.0)
+
+    def test_update_frozen_inventory_cancel_limit_order_releases_isolated_qty(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            state_path = Path(tmpdir) / "state.json"
+            state_path.write_text(
+                json.dumps(
+                    {
+                        "best_quote_frozen_inventory": {
+                            "long_qty": 50.0,
+                            "short_qty": 40.0,
+                            "long_manual_limit_isolated_qty": 8.0,
+                            "short_manual_limit_isolated_qty": 12.0,
+                        },
+                        "best_quote_frozen_inventory_manual_limit": {
+                            "long": {"requested": True, "requested_qty": 8.0, "price": 1.02},
+                            "short": {"requested": True, "requested_qty": 12.0, "price": 0.98},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            with patch("grid_optimizer.web._runner_frozen_inventory_state_path", return_value=state_path):
+                result = _update_runner_frozen_inventory(
+                    {"symbol": "PHAROSUSDT", "action": "cancel_limit_short"}
+                )
+
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        self.assertIn("long", state["best_quote_frozen_inventory_manual_limit"])
+        self.assertNotIn("short", state["best_quote_frozen_inventory_manual_limit"])
+        ledger = result["frozen_inventory"]
+        self.assertEqual(ledger["long_manual_limit_isolated_qty"], 8.0)
+        self.assertEqual(ledger["short_manual_limit_isolated_qty"], 0.0)
+        self.assertEqual(ledger["pair_eligible_short_qty"], 40.0)
+
+    def test_frozen_inventory_normalization_hides_cleared_side_metadata(self) -> None:
+        ledger = _normalize_frozen_inventory_ledger(
+            {
+                "long_qty": 0,
+                "long_notional": 217.9,
+                "long_entry_price": 0.64425049,
+                "long_frozen_at": "2026-05-22T05:30:52.196376+00:00",
+                "short_qty": 136,
+                "short_notional": 88.46,
+                "short_entry_price": 0.6433659,
+                "short_frozen_at": "2026-05-22T06:32:41.779485+00:00",
+            }
+        )
+
+        self.assertEqual(ledger["long_qty"], 0.0)
+        self.assertEqual(ledger["long_notional"], 0.0)
+        self.assertEqual(ledger["long_entry_price"], 0.0)
+        self.assertEqual(ledger["long_frozen_at"], "")
+        self.assertEqual(ledger["short_qty"], 136.0)
+
     def test_running_status_overview_page_restores_cross_server_table(self) -> None:
         page = _render_running_status_overview_page()
 
@@ -447,6 +642,17 @@ class WebSecurityTests(unittest.TestCase):
                 symbols = _running_status_spot_symbols()
 
         self.assertEqual(symbols, ["TONUSDT"])
+
+    def test_read_running_status_trade_rows_uses_configured_limit(self) -> None:
+        from grid_optimizer.web import _read_running_status_trade_rows
+
+        with patch.dict("grid_optimizer.web.os.environ", {"GRID_RUNNING_STATUS_TRADE_LIMIT": "321"}, clear=False):
+            with patch("grid_optimizer.web.read_trade_audit_rows", return_value=[]) as trade_mock:
+                rows = _read_running_status_trade_rows(Path("/tmp/trade.jsonl"))
+
+        self.assertEqual(rows, [])
+        trade_mock.assert_called_once()
+        self.assertEqual(trade_mock.call_args.kwargs.get("limit"), 321)
 
     @patch("grid_optimizer.web._build_running_status")
     def test_run_running_status_overview_query_uses_legacy_cross_payload(self, mock_build) -> None:
@@ -1048,6 +1254,42 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(result["close_target_reached"])
         self.assertTrue(any("仍高于 150.0000U" in warning for warning in result["warnings"]))
 
+    @patch("grid_optimizer.web._load_runner_control_config")
+    @patch("grid_optimizer.web._read_json_dict")
+    @patch("grid_optimizer.web.load_live_flatten_snapshot")
+    @patch("grid_optimizer.web._cancel_symbol_open_orders")
+    @patch("grid_optimizer.web.load_binance_api_credentials")
+    def test_execute_stop_actions_blocks_flatten_when_best_quote_frozen_isolation_is_active(
+        self,
+        mock_creds,
+        mock_cancel_orders,
+        mock_flatten_snapshot,
+        mock_read_state,
+        mock_load_config,
+    ) -> None:
+        mock_creds.return_value = ("key", "secret")
+        mock_cancel_orders.return_value = {"attempted": 2, "success": 2, "errors": []}
+        mock_load_config.return_value = {
+            "symbol": "PHAROSUSDT",
+            "strategy_mode": "hedge_best_quote_maker_volume_v1",
+            "best_quote_maker_volume_enabled": True,
+            "best_quote_maker_volume_reduce_freeze_enabled": True,
+            "state_path": "output/pharosusdt_loop_state.json",
+        }
+        mock_read_state.return_value = {"best_quote_frozen_inventory": {"short_qty": 1500.0}}
+
+        result = _execute_stop_actions(
+            symbol="PHAROSUSDT",
+            cancel_open_orders=True,
+            close_all_positions=True,
+        )
+
+        self.assertTrue(result["cancel_open_orders_executed"])
+        self.assertFalse(result["close_all_positions_executed"])
+        self.assertEqual(result["close_attempted_count"], 0)
+        self.assertTrue(any("冻结账本隔离" in warning for warning in result["warnings"]))
+        mock_flatten_snapshot.assert_not_called()
+
     def test_normalize_runner_control_payload_supports_adaptive_step_fields(self) -> None:
         payload = _normalize_runner_control_payload(
             {
@@ -1112,6 +1354,12 @@ class WebSecurityTests(unittest.TestCase):
                 "elastic_max_repair_loss_per_10k": 0.6,
                 "elastic_cancel_stale_entries_on_cooldown": True,
                 "strict_strategy_profile_schema_enabled": True,
+                "elastic_early_micro_abs_return_ratio": "0.001",
+                "elastic_early_micro_amplitude_ratio": "0.0015",
+                "elastic_early_safe_inventory_ratio": "0.62",
+                "elastic_early_wide_inventory_ratio": "0.78",
+                "elastic_early_wide_loss_per_10k_5m": "4.0",
+                "regime_entry_budget_min_profit_or_fee_buffer_ratio": "0.0006",
             }
         )
 
@@ -1142,7 +1390,13 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["elastic_repair_slice_ratio_near_cross"], 0.28)
         self.assertEqual(payload["elastic_repair_slice_ratio_cross"], 0.55)
         self.assertEqual(payload["elastic_max_repair_loss_per_10k"], 0.6)
+        self.assertEqual(payload["elastic_early_micro_abs_return_ratio"], 0.001)
+        self.assertEqual(payload["elastic_early_micro_amplitude_ratio"], 0.0015)
+        self.assertEqual(payload["elastic_early_safe_inventory_ratio"], 0.62)
+        self.assertEqual(payload["elastic_early_wide_inventory_ratio"], 0.78)
+        self.assertEqual(payload["elastic_early_wide_loss_per_10k_5m"], 4.0)
         self.assertTrue(payload["elastic_cancel_stale_entries_on_cooldown"])
+        self.assertEqual(payload["regime_entry_budget_min_profit_or_fee_buffer_ratio"], 0.0006)
 
     def test_normalize_runner_control_payload_supports_synthetic_trend_follow_fields(self) -> None:
         payload = _normalize_runner_control_payload(
@@ -1983,6 +2237,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertFalse(payload["adverse_reduce_enabled"])
         self.assertFalse(payload["excess_inventory_reduce_only_enabled"])
 
+    def test_runner_preset_payload_applies_btcusdc_best_quote_maker_volume_profile(self) -> None:
+        payload = _runner_preset_payload("btcusdc_best_quote_maker_volume_v1", {"symbol": "BTCUSDC"})
+        self.assertEqual(payload["strategy_profile"], "btcusdc_best_quote_maker_volume_v1")
+        self.assertEqual(payload["symbol"], "BTCUSDC")
+        self.assertEqual(payload["strategy_mode"], "best_quote_maker_volume_v1")
+        self.assertTrue(payload["best_quote_maker_volume_enabled"])
+        self.assertAlmostEqual(payload["best_quote_maker_volume_cycle_budget_notional"], 400.0)
+        self.assertEqual(payload["best_quote_maker_volume_quote_offset_ticks"], 0)
+        self.assertEqual(payload["best_quote_maker_volume_defensive_offset_ticks"], 3)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_max_long_notional"], 1200.0)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_max_short_notional"], 1200.0)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_below_soft_cost_gap_scale"], 1.0)
+        self.assertAlmostEqual(payload["best_quote_maker_volume_below_soft_adverse_threshold_scale"], 1.0)
+        self.assertAlmostEqual(payload["max_total_notional"], 1600.0)
+        self.assertEqual(payload["max_new_orders"], 6)
+        self.assertAlmostEqual(payload["sleep_seconds"], 1.4)
+        self.assertFalse(payload["volatility_trigger_enabled"])
+        self.assertFalse(payload["volume_trigger_enabled"])
+
+    def test_runner_preset_payload_rejects_btcusdc_best_quote_maker_volume_for_other_symbols(self) -> None:
+        with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
+            _runner_preset_payload("btcusdc_best_quote_maker_volume_v1", {"symbol": "ETHUSDC"})
+
     def test_runner_preset_payload_rejects_btcusdc_best_quote_long_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=BTCUSDC"):
             _runner_preset_payload("btcusdc_best_quote_long_ping_pong_v1", {"symbol": "ETHUSDC"})
@@ -2106,6 +2383,63 @@ class WebSecurityTests(unittest.TestCase):
         self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
         self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 5.0)
         self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 12.0)
+
+    def test_runner_preset_payload_applies_billusdt_competition_neutral_ping_pong_guards(self) -> None:
+        payload = _runner_preset_payload("billusdt_competition_neutral_ping_pong_v1", {"symbol": "BILLUSDT"})
+        self.assertEqual(payload["strategy_profile"], "billusdt_competition_neutral_ping_pong_v1")
+        self.assertEqual(payload["symbol"], "BILLUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["step_price"], 0.00005)
+        self.assertEqual(payload["buy_levels"], 6)
+        self.assertEqual(payload["sell_levels"], 6)
+        self.assertAlmostEqual(payload["per_order_notional"], 35.0)
+        self.assertEqual(payload["leverage"], 20)
+        self.assertTrue(payload["flat_start_enabled"])
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertAlmostEqual(payload["adaptive_step_1m_amplitude_ratio"], 0.008)
+        self.assertTrue(payload["adverse_reduce_enabled"])
+        self.assertAlmostEqual(payload["adverse_reduce_long_trigger_ratio"], 0.008)
+        self.assertTrue(payload["hard_loss_forced_reduce_enabled"])
+        self.assertAlmostEqual(payload["hard_loss_forced_reduce_target_notional"], 70.0)
+        self.assertTrue(payload["volatility_trigger_enabled"])
+        self.assertTrue(payload["volatility_trigger_stop_close_all_positions"])
+        self.assertAlmostEqual(payload["volatility_trigger_stop_reduce_to_notional"], 10.0)
+        self.assertEqual(payload["volatility_trigger_fast_windows"][0]["window"], "1m")
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 10.0)
+
+    def test_runner_preset_payload_applies_billusdt_regime_budget_ping_pong_v2(self) -> None:
+        payload = _runner_preset_payload("billusdt_neutral_regime_budget_ping_pong_v2", {"symbol": "BILLUSDT"})
+        self.assertEqual(payload["strategy_profile"], "billusdt_neutral_regime_budget_ping_pong_v2")
+        self.assertEqual(payload["symbol"], "BILLUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["per_order_notional"], 180.0)
+        self.assertEqual(payload["buy_levels"], 12)
+        self.assertEqual(payload["sell_levels"], 12)
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertTrue(payload["regime_entry_budget_enabled"])
+        self.assertFalse(payload["regime_entry_budget_report_only"])
+        self.assertAlmostEqual(payload["regime_entry_budget_base_per_order_notional"], 180.0)
+        self.assertAlmostEqual(payload["regime_entry_budget_base_step_ratio"], 0.0025)
+        self.assertTrue(payload["anti_chase_entry_guard_enabled"])
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 55.0)
+
+    def test_runner_preset_payload_applies_btcusdt_regime_budget_ping_pong_v2(self) -> None:
+        payload = _runner_preset_payload("btcusdt_neutral_regime_budget_ping_pong_v2", {"symbol": "BTCUSDT"})
+        self.assertEqual(payload["strategy_profile"], "btcusdt_neutral_regime_budget_ping_pong_v2")
+        self.assertEqual(payload["symbol"], "BTCUSDT")
+        self.assertEqual(payload["strategy_mode"], "synthetic_neutral")
+        self.assertAlmostEqual(payload["per_order_notional"], 300.0)
+        self.assertEqual(payload["buy_levels"], 16)
+        self.assertEqual(payload["sell_levels"], 16)
+        self.assertTrue(payload["adaptive_step_enabled"])
+        self.assertTrue(payload["elastic_volume_enabled"])
+        self.assertTrue(payload["regime_entry_budget_enabled"])
+        self.assertFalse(payload["regime_entry_budget_report_only"])
+        self.assertAlmostEqual(payload["regime_entry_budget_base_per_order_notional"], 300.0)
+        self.assertAlmostEqual(payload["regime_entry_budget_base_step_ratio"], 0.00035)
+        self.assertTrue(payload["anti_chase_entry_guard_enabled"])
+        self.assertAlmostEqual(payload["rolling_hourly_loss_limit"], 80.0)
 
     def test_runner_preset_payload_rejects_competition_neutral_ping_pong_for_other_symbols(self) -> None:
         with self.assertRaisesRegex(ValueError, "requires symbol=XAUUSDT"):
@@ -2561,6 +2895,40 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--fixed-center-enabled", command)
         self.assertIn("--reset-state", command)
 
+    def test_build_runner_command_includes_execution_budget_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BILLUSDT",
+                "strategy_profile": "billusdt_competition_neutral_ping_pong_v1",
+                "strategy_mode": "synthetic_neutral",
+                "step_price": 0.00028,
+                "buy_levels": 12,
+                "sell_levels": 12,
+                "per_order_notional": 330.0,
+                "base_position_notional": 0.0,
+                "execution_request_budget_per_cycle": 4,
+                "execution_cancel_budget_per_cycle": 1,
+                "execution_place_budget_per_cycle": 3,
+                "execution_request_min_interval_seconds": 0.25,
+                "leverage_change_cache_ttl_seconds": 600.0,
+                "startup_jitter_seconds": 6.0,
+                "cycle_jitter_seconds": 0.8,
+            }
+        )
+
+        expected_pairs = {
+            "--execution-request-budget-per-cycle": "4",
+            "--execution-cancel-budget-per-cycle": "1",
+            "--execution-place-budget-per-cycle": "3",
+            "--execution-request-min-interval-seconds": "0.25",
+            "--leverage-change-cache-ttl-seconds": "600.0",
+            "--startup-jitter-seconds": "6.0",
+            "--cycle-jitter-seconds": "0.8",
+        }
+        for flag, value in expected_pairs.items():
+            index = command.index(flag)
+            self.assertEqual(command[index + 1], value)
+
     def test_build_runner_command_can_disable_take_profit(self) -> None:
         command = _build_runner_command(
             {
@@ -2610,6 +2978,38 @@ class WebSecurityTests(unittest.TestCase):
         self.assertEqual(payload["maker_extreme_volatility_threshold"], 0.014)
         self.assertEqual(payload["maker_directional_move_threshold"], 0.005)
         self.assertEqual(payload["maker_cooldown_seconds"], 45.0)
+
+    def test_normalize_runner_control_payload_keeps_best_quote_maker_volume_fields(self) -> None:
+        payload = _normalize_runner_control_payload(
+            {
+                "strategy_profile": "btcusdc_best_quote_maker_volume_v1",
+                "strategy_mode": "best_quote_maker_volume_v1",
+                "symbol": "BTCUSDC",
+                "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_cycle_budget_notional": "400",
+                "best_quote_maker_volume_quote_offset_ticks": "0",
+                "best_quote_maker_volume_defensive_offset_ticks": "3",
+                "best_quote_maker_volume_max_long_notional": "1500",
+                "best_quote_maker_volume_max_short_notional": "1500",
+                "best_quote_maker_volume_inventory_soft_ratio": "0.6",
+                "best_quote_maker_volume_loss_per_10k_15m": "0.2",
+                "best_quote_maker_volume_loss_per_10k_soft": "0.5",
+                "best_quote_maker_volume_loss_per_10k_hard": "0.8",
+                "best_quote_maker_volume_soft_loss_budget_scale": "0.5",
+                "best_quote_maker_volume_below_soft_cost_gap_scale": "0.25",
+                "best_quote_maker_volume_below_soft_adverse_threshold_scale": "5",
+            }
+        )
+
+        self.assertTrue(payload["best_quote_maker_volume_enabled"])
+        self.assertEqual(payload["best_quote_maker_volume_cycle_budget_notional"], 400.0)
+        self.assertEqual(payload["best_quote_maker_volume_quote_offset_ticks"], 0)
+        self.assertEqual(payload["best_quote_maker_volume_defensive_offset_ticks"], 3)
+        self.assertEqual(payload["best_quote_maker_volume_max_long_notional"], 1500.0)
+        self.assertEqual(payload["best_quote_maker_volume_max_short_notional"], 1500.0)
+        self.assertEqual(payload["best_quote_maker_volume_loss_per_10k_hard"], 0.8)
+        self.assertEqual(payload["best_quote_maker_volume_below_soft_cost_gap_scale"], 0.25)
+        self.assertEqual(payload["best_quote_maker_volume_below_soft_adverse_threshold_scale"], 5.0)
 
     def test_validate_runner_required_risk_guards_allows_maker_inventory_limits(self) -> None:
         _validate_runner_required_risk_guards(
@@ -2685,6 +3085,165 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--maker-cooldown-seconds", command)
         self.assertIn("--anti-chase-entry-guard-enabled", command)
         self.assertIn("--anti-chase-entry-guard-1m-abs-return-ratio", command)
+
+    def test_build_runner_command_includes_best_quote_maker_volume_arguments(self) -> None:
+        command = _build_runner_command(
+            {
+                "symbol": "BTCUSDC",
+                "strategy_profile": "btcusdc_best_quote_maker_volume_v1",
+                "strategy_mode": "best_quote_maker_volume_v1",
+                "step_price": 0.1,
+                "buy_levels": 1,
+                "sell_levels": 1,
+                "per_order_notional": 30.0,
+                "base_position_notional": 0.0,
+                "best_quote_maker_volume_enabled": True,
+                "best_quote_maker_volume_cycle_budget_notional": 400.0,
+                "best_quote_maker_volume_quote_offset_ticks": 0,
+                "best_quote_maker_volume_defensive_offset_ticks": 3,
+                "best_quote_maker_volume_max_long_notional": 1500.0,
+                "best_quote_maker_volume_max_short_notional": 1500.0,
+                "best_quote_maker_volume_inventory_soft_ratio": 0.6,
+                "best_quote_maker_volume_loss_per_10k_15m": 0.2,
+                "best_quote_maker_volume_loss_per_10k_soft": 0.5,
+                "best_quote_maker_volume_loss_per_10k_hard": 0.8,
+                "best_quote_maker_volume_soft_loss_budget_scale": 0.5,
+                "best_quote_maker_volume_below_soft_cost_gap_scale": 0.25,
+                "best_quote_maker_volume_below_soft_adverse_threshold_scale": 5.0,
+                "best_quote_maker_volume_inventory_cost_gate_min_notional": 10.0,
+                "best_quote_maker_volume_net_loss_reduce_enabled": True,
+                "best_quote_maker_volume_net_loss_reduce_min_loss": 2.0,
+                "best_quote_maker_volume_net_loss_reduce_ratio": 0.01,
+                "best_quote_maker_volume_net_loss_reduce_realized_credit_ratio": 1.0,
+                "best_quote_maker_volume_net_loss_reduce_min_inventory_notional": 40.0,
+                "best_quote_maker_volume_reduce_freeze_enabled": True,
+                "best_quote_maker_volume_reduce_freeze_loss_ratio": 0.01,
+                "best_quote_maker_volume_reduce_freeze_min_notional": 10.0,
+                "best_quote_maker_volume_reduce_freeze_hard_loss_ratio": 0.045,
+                "best_quote_maker_volume_reduce_freeze_hard_min_notional": 150.0,
+                "best_quote_maker_volume_reduce_freeze_hard_confirm_cycles": 12,
+                "best_quote_maker_volume_reduce_freeze_dynamic_threshold_enabled": True,
+                "best_quote_maker_volume_reduce_freeze_dynamic_threshold_loss_ratio_scale": 0.35,
+                "best_quote_maker_volume_reduce_freeze_dynamic_threshold_max_extra_ratio": 0.02,
+                "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_start": 500.0,
+                "best_quote_maker_volume_reduce_freeze_dynamic_threshold_frozen_notional_full": 3000.0,
+                "best_quote_maker_volume_reduce_freeze_soft_ratio_scale": 0.7,
+                "best_quote_maker_volume_frozen_pair_release_enabled": True,
+                "best_quote_maker_volume_frozen_pair_release_max_notional": 20.0,
+                "best_quote_maker_volume_frozen_pair_release_min_side_notional": 100.0,
+                "best_quote_maker_volume_frozen_pair_release_min_profit_ratio": 0.001,
+                "best_quote_maker_volume_frozen_pair_release_max_slippage_ticks": 2,
+                "best_quote_maker_volume_frozen_pair_release_max_30s_abs_return_ratio": 0.0015,
+                "best_quote_maker_volume_frozen_pair_release_max_1m_abs_return_ratio": 0.0025,
+                "best_quote_maker_volume_frozen_pair_release_max_1m_amplitude_ratio": 0.0035,
+                "best_quote_maker_volume_same_side_entry_price_guard_enabled": True,
+                "best_quote_maker_volume_same_side_entry_price_guard_min_notional": 10.0,
+                "best_quote_maker_volume_same_side_entry_price_guard_gap_ticks": 1,
+                "volatility_entry_pause_tiny_inventory_ignore_notional": 10.0,
+                "elastic_volume_enabled": True,
+                "elastic_early_micro_abs_return_ratio": 0.001,
+                "elastic_early_micro_amplitude_ratio": 0.0015,
+                "elastic_early_safe_inventory_ratio": 0.62,
+                "elastic_early_wide_inventory_ratio": 0.78,
+                "elastic_early_wide_loss_per_10k_5m": 4.0,
+                "margin_type": "KEEP",
+                "leverage": 2,
+                "max_plan_age_seconds": 30,
+                "max_mid_drift_steps": 4.0,
+                "maker_retries": 2,
+                "max_new_orders": 4,
+                "max_total_notional": 700.0,
+                "sleep_seconds": 3,
+                "state_path": "output/btcusdc_loop_state.json",
+                "plan_json": "output/btcusdc_loop_latest_plan.json",
+                "submit_report_json": "output/btcusdc_loop_latest_submit.json",
+                "summary_jsonl": "output/btcusdc_loop_events.jsonl",
+                "cancel_stale": True,
+                "apply": True,
+                "reset_state": True,
+            }
+        )
+
+        self.assertIn("--best-quote-maker-volume-enabled", command)
+        self.assertIn("--best-quote-maker-volume-cycle-budget-notional", command)
+        self.assertIn("400.0", command)
+        self.assertIn("--best-quote-maker-volume-quote-offset-ticks", command)
+        self.assertIn("--best-quote-maker-volume-defensive-offset-ticks", command)
+        self.assertIn("--best-quote-maker-volume-max-long-notional", command)
+        self.assertIn("--best-quote-maker-volume-max-short-notional", command)
+        self.assertIn("--best-quote-maker-volume-loss-per-10k-hard", command)
+        self.assertIn("--best-quote-maker-volume-below-soft-cost-gap-scale", command)
+        self.assertIn("--best-quote-maker-volume-below-soft-adverse-threshold-scale", command)
+        self.assertIn("0.25", command)
+        self.assertIn("5.0", command)
+        self.assertIn("--best-quote-maker-volume-inventory-cost-gate-min-notional", command)
+        cost_gate_min_index = command.index("--best-quote-maker-volume-inventory-cost-gate-min-notional")
+        self.assertEqual(command[cost_gate_min_index + 1], "10.0")
+        self.assertIn("--best-quote-maker-volume-net-loss-reduce-enabled", command)
+        net_loss_min_index = command.index("--best-quote-maker-volume-net-loss-reduce-min-loss")
+        self.assertEqual(command[net_loss_min_index + 1], "2.0")
+        net_loss_ratio_index = command.index("--best-quote-maker-volume-net-loss-reduce-ratio")
+        self.assertEqual(command[net_loss_ratio_index + 1], "0.01")
+        net_loss_floor_index = command.index("--best-quote-maker-volume-net-loss-reduce-min-inventory-notional")
+        self.assertEqual(command[net_loss_floor_index + 1], "40.0")
+        self.assertIn("--best-quote-maker-volume-reduce-freeze-enabled", command)
+        reduce_freeze_loss_index = command.index("--best-quote-maker-volume-reduce-freeze-loss-ratio")
+        self.assertEqual(command[reduce_freeze_loss_index + 1], "0.01")
+        reduce_freeze_min_index = command.index("--best-quote-maker-volume-reduce-freeze-min-notional")
+        self.assertEqual(command[reduce_freeze_min_index + 1], "10.0")
+        reduce_freeze_hard_loss_index = command.index("--best-quote-maker-volume-reduce-freeze-hard-loss-ratio")
+        self.assertEqual(command[reduce_freeze_hard_loss_index + 1], "0.045")
+        reduce_freeze_hard_min_index = command.index("--best-quote-maker-volume-reduce-freeze-hard-min-notional")
+        self.assertEqual(command[reduce_freeze_hard_min_index + 1], "150.0")
+        reduce_freeze_hard_confirm_index = command.index("--best-quote-maker-volume-reduce-freeze-hard-confirm-cycles")
+        self.assertEqual(command[reduce_freeze_hard_confirm_index + 1], "12")
+        self.assertIn("--best-quote-maker-volume-reduce-freeze-dynamic-threshold-enabled", command)
+        dynamic_scale_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-loss-ratio-scale"
+        )
+        self.assertEqual(command[dynamic_scale_index + 1], "0.35")
+        dynamic_max_extra_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-max-extra-ratio"
+        )
+        self.assertEqual(command[dynamic_max_extra_index + 1], "0.02")
+        dynamic_start_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-start"
+        )
+        self.assertEqual(command[dynamic_start_index + 1], "500.0")
+        dynamic_full_index = command.index(
+            "--best-quote-maker-volume-reduce-freeze-dynamic-threshold-frozen-notional-full"
+        )
+        self.assertEqual(command[dynamic_full_index + 1], "3000.0")
+        reduce_freeze_soft_index = command.index("--best-quote-maker-volume-reduce-freeze-soft-ratio-scale")
+        self.assertEqual(command[reduce_freeze_soft_index + 1], "0.7")
+        self.assertIn("--best-quote-maker-volume-frozen-pair-release-enabled", command)
+        pair_release_max_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-notional")
+        self.assertEqual(command[pair_release_max_index + 1], "20.0")
+        pair_release_min_side_index = command.index("--best-quote-maker-volume-frozen-pair-release-min-side-notional")
+        self.assertEqual(command[pair_release_min_side_index + 1], "100.0")
+        pair_release_profit_index = command.index("--best-quote-maker-volume-frozen-pair-release-min-profit-ratio")
+        self.assertEqual(command[pair_release_profit_index + 1], "0.001")
+        pair_release_slippage_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-slippage-ticks")
+        self.assertEqual(command[pair_release_slippage_index + 1], "2")
+        pair_release_30s_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-30s-abs-return-ratio")
+        self.assertEqual(command[pair_release_30s_index + 1], "0.0015")
+        pair_release_1m_return_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-1m-abs-return-ratio")
+        self.assertEqual(command[pair_release_1m_return_index + 1], "0.0025")
+        pair_release_1m_amp_index = command.index("--best-quote-maker-volume-frozen-pair-release-max-1m-amplitude-ratio")
+        self.assertEqual(command[pair_release_1m_amp_index + 1], "0.0035")
+        self.assertIn("--best-quote-maker-volume-same-side-entry-price-guard-enabled", command)
+        same_side_min_index = command.index("--best-quote-maker-volume-same-side-entry-price-guard-min-notional")
+        self.assertEqual(command[same_side_min_index + 1], "10.0")
+        same_side_gap_index = command.index("--best-quote-maker-volume-same-side-entry-price-guard-gap-ticks")
+        self.assertEqual(command[same_side_gap_index + 1], "1")
+        self.assertIn("--volatility-entry-pause-tiny-inventory-ignore-notional", command)
+        tiny_index = command.index("--volatility-entry-pause-tiny-inventory-ignore-notional")
+        self.assertEqual(command[tiny_index + 1], "10.0")
+        self.assertIn("--elastic-early-micro-abs-return-ratio", command)
+        self.assertIn("--elastic-early-micro-amplitude-ratio", command)
+        self.assertIn("--elastic-early-safe-inventory-ratio", command)
+        self.assertIn("--elastic-early-wide-inventory-ratio", command)
+        self.assertIn("--elastic-early-wide-loss-per-10k-5m", command)
 
     def test_runner_preset_payload_for_maker_volatility_inventory_v1(self) -> None:
         payload = _runner_preset_payload("maker_volatility_inventory_v1", {"symbol": "BARDUSDT"})
@@ -3069,9 +3628,11 @@ class WebSecurityTests(unittest.TestCase):
 
     def test_build_runner_command_includes_execution_regime_arguments(self) -> None:
         config = _runner_preset_payload("soon_volume_neutral_ping_pong_v1", {"symbol": "SOONUSDT"})
+        config["regime_entry_budget_min_profit_or_fee_buffer_ratio"] = 0.0006
 
         command = _build_runner_command(config)
 
+        self.assertIn("--regime-entry-budget-min-profit-or-fee-buffer-ratio", command)
         self.assertIn("--execution-regime-enabled", command)
         self.assertIn("--execution-regime-vol-p50-ratio", command)
         self.assertIn("--execution-regime-vol-p95-ratio", command)
@@ -3173,6 +3734,8 @@ class WebSecurityTests(unittest.TestCase):
                 "startup_entry_multiplier": 1.0,
                 "base_position_notional": 0.0,
                 "sticky_entry_levels": 2,
+                "sticky_entry_price_tolerance_steps": 2.5,
+                "sticky_entry_preserve_less_aggressive": True,
                 "synthetic_residual_short_flat_notional": 30.0,
                 "margin_type": "KEEP",
                 "leverage": 2,
@@ -3195,7 +3758,29 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--sticky-entry-levels", command)
         sticky_index = command.index("--sticky-entry-levels")
         self.assertEqual(command[sticky_index + 1], "2")
+        self.assertIn("--sticky-entry-price-tolerance-steps", command)
+        tolerance_index = command.index("--sticky-entry-price-tolerance-steps")
+        self.assertEqual(command[tolerance_index + 1], "2.5")
+        self.assertIn("--sticky-entry-preserve-less-aggressive", command)
         self.assertIn("--synthetic-residual-short-flat-notional", command)
+
+    @patch("grid_optimizer.web.fetch_futures_book_tickers")
+    @patch("grid_optimizer.web.fetch_futures_symbol_config")
+    def test_default_runner_command_includes_sticky_entry_churn_controls(
+        self,
+        mock_symbol_config,
+        mock_book_tickers,
+    ) -> None:
+        mock_symbol_config.return_value = self._mock_symbol_config()
+        mock_book_tickers.return_value = self._mock_book()
+        config = _resolve_runner_start_config({"symbol": "ENSOUSDT", "strategy_profile": "synthetic_neutral_v1"})
+        command = _build_runner_command(config)
+
+        sticky_index = command.index("--sticky-entry-levels")
+        self.assertEqual(command[sticky_index + 1], "4")
+        tolerance_index = command.index("--sticky-entry-price-tolerance-steps")
+        self.assertEqual(command[tolerance_index + 1], "2.0")
+        self.assertIn("--sticky-entry-preserve-less-aggressive", command)
 
     def test_build_runner_command_includes_synthetic_tiny_residual_thresholds(self) -> None:
         command = _build_runner_command(
@@ -3250,6 +3835,10 @@ class WebSecurityTests(unittest.TestCase):
                 "runtime_guard_stats_start_time": "2026-03-31T02:00:00+00:00",
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
+                "max_unrealized_loss": 25.0,
+                "unrealized_loss_entry_guard_enabled": True,
+                "unrealized_loss_entry_guard_min_loss": 3.0,
+                "unrealized_loss_entry_guard_ratio": 0.015,
             }
         )
         self.assertEqual(config["run_start_time"], "2026-03-31T01:00:00+00:00")
@@ -3714,6 +4303,10 @@ class WebSecurityTests(unittest.TestCase):
                 "runtime_guard_stats_start_time": "2026-03-31T02:00:00+00:00",
                 "rolling_hourly_loss_limit": 150.0,
                 "max_cumulative_notional": 100000.0,
+                "max_unrealized_loss": 25.0,
+                "unrealized_loss_entry_guard_enabled": True,
+                "unrealized_loss_entry_guard_min_loss": 3.0,
+                "unrealized_loss_entry_guard_ratio": 0.015,
             }
         )
         self.assertIn("--run-start-time", command)
@@ -3723,6 +4316,11 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("2026-03-31T02:00:00+00:00", command)
         self.assertIn("--rolling-hourly-loss-limit", command)
         self.assertIn("--max-cumulative-notional", command)
+        self.assertIn("--max-unrealized-loss", command)
+        self.assertIn("25.0", command)
+        self.assertIn("--unrealized-loss-entry-guard-enabled", command)
+        self.assertIn("--unrealized-loss-entry-guard-ratio", command)
+        self.assertIn("0.015", command)
 
     def test_build_runner_command_includes_strict_schema_and_elastic_repair_arguments(self) -> None:
         command = _build_runner_command(
@@ -3756,9 +4354,18 @@ class WebSecurityTests(unittest.TestCase):
                 "adverse_reduce_maker_timeout_seconds": 20.0,
                 "adverse_reduce_max_order_notional": 240.0,
                 "adverse_reduce_keep_probe_scale": 0.08,
+                "loss_recovery_brush_enabled": True,
+                "loss_recovery_brush_entry_notional": 7.0,
+                "loss_recovery_brush_min_unrealized_loss": 2.0,
+                "loss_recovery_brush_max_entry_orders_per_side": 1,
                 "inventory_pause_long_probe_scale": 0.2,
                 "inventory_pause_short_probe_scale": 0.25,
                 "inventory_pause_timeout_seconds": 75.0,
+                "loss_reentry_guard_enabled": True,
+                "loss_reentry_cooldown_seconds": 120.0,
+                "loss_reentry_cost_buffer_steps": 2.0,
+                "loss_reentry_trend_guard_enabled": True,
+                "loss_reentry_trend_return_ratio": 0.0015,
                 "margin_type": "KEEP",
                 "leverage": 2,
                 "max_plan_age_seconds": 30,
@@ -3782,11 +4389,24 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("--adverse-reduce-maker-timeout-seconds", command)
         self.assertIn("--adverse-reduce-max-order-notional", command)
         self.assertIn("--adverse-reduce-keep-probe-scale", command)
+        self.assertIn("--loss-recovery-brush-enabled", command)
+        self.assertIn("--loss-recovery-brush-entry-notional", command)
+        self.assertIn("7.0", command)
+        self.assertIn("--loss-recovery-brush-min-unrealized-loss", command)
+        self.assertIn("--loss-recovery-brush-max-entry-orders-per-side", command)
         self.assertIn("--inventory-pause-long-probe-scale", command)
         self.assertIn("0.2", command)
         self.assertIn("--inventory-pause-short-probe-scale", command)
         self.assertIn("--inventory-pause-timeout-seconds", command)
         self.assertIn("75.0", command)
+        self.assertIn("--loss-reentry-guard-enabled", command)
+        self.assertIn("--loss-reentry-cooldown-seconds", command)
+        self.assertIn("120.0", command)
+        self.assertIn("--loss-reentry-cost-buffer-steps", command)
+        self.assertIn("2.0", command)
+        self.assertIn("--loss-reentry-trend-guard-enabled", command)
+        self.assertIn("--loss-reentry-trend-return-ratio", command)
+        self.assertIn("0.0015", command)
 
     def test_build_runner_command_includes_exposure_escalation_arguments(self) -> None:
         command = _build_runner_command(
@@ -4540,6 +5160,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("async function loadRunningConfigToEditor", MONITOR_PAGE)
         self.assertIn("小时损益拆解", MONITOR_PAGE)
         self.assertIn('id="hourly_body"', MONITOR_PAGE)
+        self.assertIn("row.loss_per_10k", MONITOR_PAGE)
         self.assertIn('id="custom_grid_name"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_preview_btn"', MONITOR_PAGE)
         self.assertIn('id="custom_grid_save_btn"', MONITOR_PAGE)
@@ -4559,7 +5180,12 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("硬上限", MONITOR_PAGE)
 
     def test_monitor_page_default_monitor_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', MONITOR_PAGE)
+        self.assertIn('const DEFAULT_MONITOR_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"]', MONITOR_PAGE)
+
+    def test_monitor_page_reward_targets_render_current_segment_boundary(self) -> None:
+        self.assertIn("zone_moves", MONITOR_PAGE)
+        self.assertIn("当前档", MONITOR_PAGE)
+        self.assertIn("边界 ${targetValueText} USDT", MONITOR_PAGE)
 
     def test_monitor_page_keeps_raw_json_in_advanced_panel(self) -> None:
         self.assertIn('id="runner_params_advanced_panel"', MONITOR_PAGE)
@@ -4776,7 +5402,7 @@ class WebSecurityTests(unittest.TestCase):
         self.assertIn("/api/symbol_lists", STRATEGIES_PAGE)
 
     def test_strategies_page_default_competition_symbols_include_current_sprint_symbols(self) -> None:
-        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC"]', STRATEGIES_PAGE)
+        self.assertIn('const DEFAULT_COMPETITION_SYMBOLS = ["PHAROSUSDT", "BILLUSDT", "SOONUSDT", "BTCUSDC", "ETHUSDC", "XAUUSDT", "XAGUSDT", "CLUSDT", "BZUSDT", "ORDIUSDC", "TRUMPUSDC", "AIGENSYNUSDT"]', STRATEGIES_PAGE)
 
     def test_monitor_page_ordiusdc_ping_pong_includes_adaptive_step_amplitude_controls(self) -> None:
         self.assertIn("adaptive_step_1m_amplitude_ratio: 0.00375", MONITOR_PAGE)

@@ -5,7 +5,7 @@ import json
 import time
 import traceback
 from datetime import datetime, timezone
-from decimal import Decimal, ROUND_UP
+from decimal import Decimal, ROUND_DOWN, ROUND_UP
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -126,7 +126,7 @@ def _resolve_reduce_only_flag(
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
     normalized_side = str(side or "").upper().strip()
     normalized_role = str(role or "").lower().strip()
-    if normalized_mode == "hedge_neutral":
+    if normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"}:
         return None
     if normalized_role in {"grid_exit", "forced_reduce", "tail_cleanup"}:
         return True
@@ -162,6 +162,88 @@ def _clone_order_with_qty(order: dict[str, Any], qty: Decimal) -> dict[str, Any]
     if "notional" in cloned:
         cloned["notional"] = _safe_float(cloned.get("price")) * qty_float
     return cloned
+
+
+def _resize_order_to_notional(order: dict[str, Any], target_notional: float) -> dict[str, Any] | None:
+    price = _safe_float(order.get("price"))
+    safe_target = max(_safe_float(target_notional), 0.0)
+    if price <= 0 or safe_target <= 0:
+        return None
+    requested_qty = _quantity_decimal(order.get("qty", order.get("quantity")))
+    target_qty = Decimal(str(safe_target)) / Decimal(str(price))
+    if target_qty <= Decimal("0"):
+        return None
+    if requested_qty > Decimal("0"):
+        target_qty = min(target_qty, requested_qty)
+        if requested_qty == requested_qty.to_integral_value():
+            target_qty = target_qty.to_integral_value(rounding=ROUND_DOWN)
+        else:
+            target_qty = target_qty.quantize(requested_qty, rounding=ROUND_DOWN)
+    if target_qty <= Decimal("0"):
+        return None
+    return _clone_order_with_qty(order, target_qty)
+
+
+def _merge_place_orders_by_submitted_bucket(
+    *,
+    orders: list[dict[str, Any]],
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    merged: list[dict[str, Any]] = []
+    merged_index_by_bucket: dict[str, int] = {}
+    qty_by_bucket: dict[str, Decimal] = {}
+    dropped: list[dict[str, Any]] = []
+    for order in orders:
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            merged.append(order)
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        qty = (
+            _quantity_decimal(prepared_order.get("qty"))
+            if prepared_order is not None
+            else _quantity_decimal(order.get("qty", order.get("quantity")))
+        )
+        if price <= 0 or qty <= Decimal("0"):
+            merged.append(order)
+            continue
+        bucket = _order_bucket_key(side, price, _order_position_side(order))
+        if bucket not in merged_index_by_bucket:
+            template = dict(order)
+            template["price"] = price
+            merged_index_by_bucket[bucket] = len(merged)
+            qty_by_bucket[bucket] = qty
+            merged.append(_clone_order_with_qty(template, qty))
+            continue
+        qty_by_bucket[bucket] += qty
+        merged[merged_index_by_bucket[bucket]] = _clone_order_with_qty(
+            merged[merged_index_by_bucket[bucket]],
+            qty_by_bucket[bucket],
+        )
+        dropped_order = dict(order)
+        dropped_order["defer_reason"] = "merged_duplicate_place_bucket"
+        dropped.append(dropped_order)
+    return merged, dropped
 
 
 def _choose_preserved_cancel_indices(
@@ -381,6 +463,18 @@ def _is_urgent_reduce_only_order(order: dict[str, Any], *, strategy_mode: str) -
     return bool(order.get("force_reduce_only")) and execution_type in {"aggressive", "maker_timeout_release"}
 
 
+def _place_order_template_key(order: dict[str, Any]) -> tuple[str, str, str, str, str, str, str, str]:
+    side = str(order.get("side", "")).upper().strip()
+    price = f"{_safe_float(order.get('price')):.10f}"
+    qty = f"{_safe_float(order.get('qty', order.get('quantity'))):.10f}"
+    role = str(order.get("role", "") or "").strip().lower()
+    position_side = _order_position_side(order)
+    force_reduce_only = str(bool(order.get("force_reduce_only"))).lower()
+    execution_type = str(order.get("execution_type", "") or "").strip().lower()
+    time_in_force = str(order.get("time_in_force", "") or "").strip().upper()
+    return (side, price, qty, role, position_side, force_reduce_only, execution_type, time_in_force)
+
+
 def _is_displaceable_reduce_only_open_order(open_order: dict[str, Any]) -> bool:
     if not _truthy(open_order.get("reduceOnly")):
         return False
@@ -420,7 +514,7 @@ def cap_reduce_only_place_orders_to_position(
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
     cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
     normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
-    if normalized_mode == "hedge_neutral" or not place_orders:
+    if normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"} or not place_orders:
         result = dict(actions)
         result["place_orders"] = place_orders
         result["cancel_orders"] = cancel_orders
@@ -562,8 +656,651 @@ def apply_anti_chase_entry_guard_to_actions(
     return result
 
 
+def apply_loss_inventory_no_cross_entry_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+) -> dict[str, Any]:
+    """Prevent losing inventory recovery from turning into a fresh opposite entry."""
+    normalized_mode = str(strategy_mode or "").strip() or "one_way_long"
+    if normalized_mode in {"hedge_neutral", "hedge_best_quote_maker_volume_v1"}:
+        return actions
+
+    net_qty = _safe_float(plan_report.get("actual_net_qty"))
+    unrealized_pnl = _safe_float(plan_report.get("unrealized_pnl"))
+    min_profit_ratio = max(_safe_float(plan_report.get("take_profit_min_profit_ratio")), 0.0)
+    if min_profit_ratio <= 0:
+        guard = plan_report.get("take_profit_guard")
+        if isinstance(guard, dict):
+            min_profit_ratio = max(_safe_float(guard.get("effective_min_profit_ratio")), 0.0)
+
+    short_avg = max(_safe_float(plan_report.get("current_short_avg_price")), 0.0)
+    long_avg = max(_safe_float(plan_report.get("current_long_avg_price")), 0.0)
+    short_ceiling = short_avg * (1.0 - min_profit_ratio) if short_avg > 0 else 0.0
+    long_floor = long_avg * (1.0 + min_profit_ratio) if long_avg > 0 else 0.0
+    step_price = max(
+        _safe_float((plan_report.get("adaptive_step") or {}).get("effective_step_price")),
+        _safe_float(plan_report.get("effective_step_price")),
+        _safe_float(plan_report.get("step_price")),
+        0.0,
+    )
+    mid_price = max(_safe_float(plan_report.get("mid_price")), 0.0)
+    market_guard = plan_report.get("market_guard") if isinstance(plan_report.get("market_guard"), dict) else {}
+    market_return_ratio = _safe_float(market_guard.get("return_ratio"))
+    adverse_trend_threshold_ratio = (step_price / mid_price) if step_price > 0 and mid_price > 0 else 0.0
+    long_same_side_entry_ceiling = (
+        max(long_avg - step_price, 0.0)
+        if step_price > 0 and long_avg > 0
+        else long_avg
+    )
+    short_same_side_entry_floor = short_avg + step_price if step_price > 0 and short_avg > 0 else short_avg
+    small_entry_notional = max(
+        _safe_float(plan_report.get("loss_inventory_no_cross_small_entry_notional")),
+        0.0,
+    )
+    loss_recovery_brush = plan_report.get("loss_recovery_brush")
+    brush_allows_ordinary_recovery = bool(
+        isinstance(loss_recovery_brush, dict)
+        and _truthy(loss_recovery_brush.get("active"))
+        and _safe_float(loss_recovery_brush.get("entry_notional")) > 0
+    )
+    symbol_info = plan_report.get("symbol_info") if isinstance(plan_report.get("symbol_info"), dict) else {}
+    min_order_notional = max(_safe_float(symbol_info.get("min_notional")), 0.0)
+
+    losing_short = net_qty < -1e-12 and unrealized_pnl < -1e-9 and short_ceiling > 0
+    losing_long = net_qty > 1e-12 and unrealized_pnl < -1e-9 and long_floor > 0
+    if not losing_short and not losing_long:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    converted_orders: list[dict[str, Any]] = []
+    allowed_small_entry_orders: list[dict[str, Any]] = []
+    resized_small_loss_reduce_orders: list[dict[str, Any]] = []
+    allowed_same_side_entry_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        side = str(order.get("side", "")).upper().strip()
+        price = _safe_float(order.get("price"))
+        order_notional = abs(_safe_float(order.get("notional")))
+        entry_side = _entry_side_from_order(order, strategy_mode=normalized_mode)
+        reduce_side = _reduce_only_cap_side(order=order, strategy_mode=normalized_mode)
+        role = str(order.get("role", "") or "").strip().lower()
+        hard_loss_forced_reduce = role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}
+        implicit_loss_reduce_side = None
+        if not hard_loss_forced_reduce:
+            if losing_short and side == "BUY" and net_qty < -1e-12:
+                implicit_loss_reduce_side = "BUY"
+            elif losing_long and side == "SELL" and net_qty > 1e-12:
+                implicit_loss_reduce_side = "SELL"
+        ordinary_entry = entry_side in {"long", "short"} and reduce_side is None
+        explicit_loss_reduce = reduce_side is not None
+        implicit_loss_reduce = implicit_loss_reduce_side is not None
+        best_quote_implicit_loss_reduce = implicit_loss_reduce and ordinary_entry and role in {
+            "best_quote_entry_long",
+            "best_quote_entry_short",
+        }
+        small_loss_reduce_allowed = (
+            (
+                explicit_loss_reduce
+                or (
+                    implicit_loss_reduce
+                    and (
+                        not ordinary_entry
+                        or best_quote_implicit_loss_reduce
+                        or brush_allows_ordinary_recovery
+                    )
+                )
+            )
+            and small_entry_notional > 0
+            and order_notional <= small_entry_notional + 1e-9
+        )
+        small_loss_reduce_resize_allowed = (
+            (
+                explicit_loss_reduce
+                or (
+                    implicit_loss_reduce
+                    and (not ordinary_entry or brush_allows_ordinary_recovery)
+                )
+            )
+            and small_entry_notional > 0
+            and order_notional > small_entry_notional + 1e-9
+        )
+        short_recovery_order = entry_side == "long" or (
+            reduce_side == "BUY" and not hard_loss_forced_reduce
+        ) or implicit_loss_reduce_side == "BUY"
+        long_recovery_order = entry_side == "short" or (
+            reduce_side == "SELL" and not hard_loss_forced_reduce
+        ) or implicit_loss_reduce_side == "SELL"
+        if losing_short and entry_side == "short" and side == "SELL":
+            adverse_uptrend = (
+                adverse_trend_threshold_ratio > 0
+                and market_return_ratio > adverse_trend_threshold_ratio
+            )
+            if price <= 0 or price + 1e-12 < short_same_side_entry_floor:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_sell_below_entry_floor"
+                dropped["loss_inventory_same_side_entry_floor"] = short_same_side_entry_floor
+                dropped_orders.append(dropped)
+                continue
+            if adverse_uptrend:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_adverse_uptrend"
+                dropped["loss_inventory_market_return_ratio"] = market_return_ratio
+                dropped["loss_inventory_adverse_trend_threshold_ratio"] = adverse_trend_threshold_ratio
+                dropped_orders.append(dropped)
+                continue
+            order["loss_inventory_no_cross_guard"] = "short_same_side_entry_allowed"
+            order["loss_inventory_same_side_entry_floor"] = short_same_side_entry_floor
+            allowed_same_side_entry_orders.append(dict(order))
+            kept_place_orders.append(order)
+            continue
+        if losing_long and entry_side == "long" and side == "BUY":
+            adverse_downtrend = (
+                adverse_trend_threshold_ratio > 0
+                and market_return_ratio < -adverse_trend_threshold_ratio
+            )
+            if price <= 0 or price > long_same_side_entry_ceiling + 1e-12:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_buy_above_entry_ceiling"
+                dropped["loss_inventory_same_side_entry_ceiling"] = long_same_side_entry_ceiling
+                dropped_orders.append(dropped)
+                continue
+            if adverse_downtrend:
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_adverse_downtrend"
+                dropped["loss_inventory_market_return_ratio"] = market_return_ratio
+                dropped["loss_inventory_adverse_trend_threshold_ratio"] = adverse_trend_threshold_ratio
+                dropped_orders.append(dropped)
+                continue
+            order["loss_inventory_no_cross_guard"] = "long_same_side_entry_allowed"
+            order["loss_inventory_same_side_entry_ceiling"] = long_same_side_entry_ceiling
+            allowed_same_side_entry_orders.append(dict(order))
+            kept_place_orders.append(order)
+            continue
+        if losing_short and short_recovery_order and side == "BUY":
+            dust_target_notional = min(order_notional, abs(net_qty) * price) if price > 0 else order_notional
+            if (
+                implicit_loss_reduce
+                and ordinary_entry
+                and small_entry_notional > 0
+                and order_notional <= small_entry_notional + 1e-9
+                and min_order_notional > 0
+                and dust_target_notional + 1e-9 < min_order_notional
+            ):
+                order["loss_inventory_no_cross_guard"] = "short_dust_cross_allowed"
+                order["loss_inventory_min_notional"] = min_order_notional
+                order["loss_inventory_target_notional"] = dust_target_notional
+                order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                allowed_small_entry_orders.append(dict(order))
+                kept_place_orders.append(order)
+                continue
+            if price > 0 and price <= short_ceiling:
+                if entry_side == "long" or implicit_loss_reduce_side is not None:
+                    order["force_reduce_only"] = True
+                order["loss_inventory_no_cross_guard"] = "short_recover_no_cross"
+                converted_orders.append(dict(order))
+                kept_place_orders.append(order)
+            else:
+                if implicit_loss_reduce and ordinary_entry and small_entry_notional > 0:
+                    target_notional = min(order_notional, abs(net_qty) * price)
+                    if (
+                        order_notional <= small_entry_notional + 1e-9
+                        and min_order_notional > 0
+                        and target_notional + 1e-9 < min_order_notional
+                    ):
+                        order["loss_inventory_no_cross_guard"] = "short_dust_cross_allowed"
+                        order["loss_inventory_min_notional"] = min_order_notional
+                        order["loss_inventory_target_notional"] = target_notional
+                        order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        allowed_small_entry_orders.append(dict(order))
+                        kept_place_orders.append(order)
+                        continue
+                if small_loss_reduce_allowed:
+                    if implicit_loss_reduce:
+                        target_notional = min(order_notional, abs(net_qty) * price)
+                        if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_small_reduce_below_min_notional"
+                            dropped["loss_inventory_min_notional"] = min_order_notional
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        resized = _resize_order_to_notional(order, target_notional)
+                        if resized is None:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_small_reduce_resize_failed"
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        order = resized
+                        order["force_reduce_only"] = True
+                    order["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_allowed"
+                    order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                    allowed_small_entry_orders.append(dict(order))
+                    kept_place_orders.append(order)
+                    continue
+                if small_loss_reduce_resize_allowed:
+                    target_notional = small_entry_notional
+                    if implicit_loss_reduce:
+                        target_notional = min(target_notional, abs(net_qty) * price)
+                    if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                        dropped = dict(order)
+                        dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_small_reduce_below_min_notional"
+                        dropped["loss_inventory_min_notional"] = min_order_notional
+                        dropped["loss_inventory_target_notional"] = target_notional
+                        dropped_orders.append(dropped)
+                        continue
+                    resized = _resize_order_to_notional(order, target_notional)
+                    if resized is not None:
+                        if implicit_loss_reduce:
+                            resized["force_reduce_only"] = True
+                        resized["loss_inventory_no_cross_guard"] = "short_small_loss_reduce_resized"
+                        resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        resized["loss_inventory_original_notional"] = order_notional
+                        allowed_small_entry_orders.append(dict(resized))
+                        resized_small_loss_reduce_orders.append(dict(resized))
+                        kept_place_orders.append(resized)
+                        continue
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_short_buy_above_recovery_ceiling"
+                dropped["loss_inventory_recovery_ceiling"] = short_ceiling
+                dropped_orders.append(dropped)
+            continue
+        if losing_long and long_recovery_order and side == "SELL":
+            dust_target_notional = min(order_notional, abs(net_qty) * price) if price > 0 else order_notional
+            if (
+                implicit_loss_reduce
+                and ordinary_entry
+                and small_entry_notional > 0
+                and order_notional <= small_entry_notional + 1e-9
+                and min_order_notional > 0
+                and dust_target_notional + 1e-9 < min_order_notional
+            ):
+                order["loss_inventory_no_cross_guard"] = "long_dust_cross_allowed"
+                order["loss_inventory_min_notional"] = min_order_notional
+                order["loss_inventory_target_notional"] = dust_target_notional
+                order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                allowed_small_entry_orders.append(dict(order))
+                kept_place_orders.append(order)
+                continue
+            if price > 0 and price >= long_floor:
+                if entry_side == "short" or implicit_loss_reduce_side is not None:
+                    order["force_reduce_only"] = True
+                order["loss_inventory_no_cross_guard"] = "long_recover_no_cross"
+                converted_orders.append(dict(order))
+                kept_place_orders.append(order)
+            else:
+                if implicit_loss_reduce and ordinary_entry and small_entry_notional > 0:
+                    target_notional = min(order_notional, abs(net_qty) * price)
+                    if (
+                        order_notional <= small_entry_notional + 1e-9
+                        and min_order_notional > 0
+                        and target_notional + 1e-9 < min_order_notional
+                    ):
+                        order["loss_inventory_no_cross_guard"] = "long_dust_cross_allowed"
+                        order["loss_inventory_min_notional"] = min_order_notional
+                        order["loss_inventory_target_notional"] = target_notional
+                        order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        allowed_small_entry_orders.append(dict(order))
+                        kept_place_orders.append(order)
+                        continue
+                if small_loss_reduce_allowed:
+                    if implicit_loss_reduce:
+                        target_notional = min(order_notional, abs(net_qty) * price)
+                        if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_small_reduce_below_min_notional"
+                            dropped["loss_inventory_min_notional"] = min_order_notional
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        resized = _resize_order_to_notional(order, target_notional)
+                        if resized is None:
+                            dropped = dict(order)
+                            dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_small_reduce_resize_failed"
+                            dropped["loss_inventory_target_notional"] = target_notional
+                            dropped_orders.append(dropped)
+                            continue
+                        order = resized
+                        order["force_reduce_only"] = True
+                    order["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_allowed"
+                    order["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                    allowed_small_entry_orders.append(dict(order))
+                    kept_place_orders.append(order)
+                    continue
+                if small_loss_reduce_resize_allowed:
+                    target_notional = small_entry_notional
+                    if implicit_loss_reduce:
+                        target_notional = min(target_notional, abs(net_qty) * price)
+                    if min_order_notional > 0 and target_notional + 1e-9 < min_order_notional:
+                        dropped = dict(order)
+                        dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_small_reduce_below_min_notional"
+                        dropped["loss_inventory_min_notional"] = min_order_notional
+                        dropped["loss_inventory_target_notional"] = target_notional
+                        dropped_orders.append(dropped)
+                        continue
+                    resized = _resize_order_to_notional(order, target_notional)
+                    if resized is not None:
+                        if implicit_loss_reduce:
+                            resized["force_reduce_only"] = True
+                        resized["loss_inventory_no_cross_guard"] = "long_small_loss_reduce_resized"
+                        resized["loss_inventory_small_entry_notional_limit"] = small_entry_notional
+                        resized["loss_inventory_original_notional"] = order_notional
+                        allowed_small_entry_orders.append(dict(resized))
+                        resized_small_loss_reduce_orders.append(dict(resized))
+                        kept_place_orders.append(resized)
+                        continue
+                dropped = dict(order)
+                dropped["loss_inventory_no_cross_drop_reason"] = "losing_long_sell_below_recovery_floor"
+                dropped["loss_inventory_recovery_floor"] = long_floor
+                dropped_orders.append(dropped)
+            continue
+        kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["loss_inventory_no_cross_entry_guard"] = {
+        "enabled": True,
+        "active": bool(losing_short or losing_long),
+        "direction": "short" if losing_short else "long",
+        "actual_net_qty": net_qty,
+        "unrealized_pnl": unrealized_pnl,
+        "min_profit_ratio": min_profit_ratio,
+        "short_recovery_ceiling": short_ceiling if losing_short else None,
+        "long_recovery_floor": long_floor if losing_long else None,
+        "step_price": step_price,
+        "market_return_ratio": market_return_ratio,
+        "adverse_trend_threshold_ratio": adverse_trend_threshold_ratio,
+        "short_same_side_entry_floor": short_same_side_entry_floor if losing_short else None,
+        "long_same_side_entry_ceiling": long_same_side_entry_ceiling if losing_long else None,
+        "small_entry_notional_limit": small_entry_notional,
+        "allowed_same_side_entry_count": len(allowed_same_side_entry_orders),
+        "allowed_same_side_entry_orders": allowed_same_side_entry_orders,
+        "allowed_small_entry_count": len(allowed_small_entry_orders),
+        "allowed_small_entry_orders": allowed_small_entry_orders,
+        "resized_small_loss_reduce_count": len(resized_small_loss_reduce_orders),
+        "resized_small_loss_reduce_orders": resized_small_loss_reduce_orders,
+        "converted_order_count": len(converted_orders),
+        "dropped_order_count": len(dropped_orders),
+        "converted_orders": converted_orders,
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
+def apply_reduce_only_no_loss_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None = None,
+    enabled: bool = True,
+) -> dict[str, Any]:
+    """Drop reduce-only places that would submit beyond the no-loss floor/ceiling."""
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders:
+        result = dict(actions)
+        result["place_orders"] = place_orders
+        result["place_count"] = 0
+        result["place_notional"] = 0.0
+        return result
+    if not enabled:
+        result = dict(actions)
+        result["place_orders"] = place_orders
+        result["place_count"] = len(place_orders)
+        result["place_notional"] = sum(_safe_float(item.get("notional")) for item in place_orders)
+        result["reduce_only_no_loss_guard"] = {
+            "enabled": False,
+            "dropped_order_count": 0,
+            "dropped_orders": [],
+        }
+        return result
+
+    guard = plan_report.get("take_profit_guard") if isinstance(plan_report.get("take_profit_guard"), dict) else {}
+    min_profit_ratio = max(
+        _safe_float(guard.get("effective_min_profit_ratio")),
+        _safe_float(plan_report.get("take_profit_min_profit_ratio")),
+        0.0,
+    )
+    long_floor = max(_safe_float(guard.get("long_floor_price")), 0.0)
+    if long_floor <= 0:
+        long_avg = max(_safe_float(plan_report.get("current_long_avg_price")), 0.0)
+        if long_avg > 0:
+            long_floor = long_avg * (1.0 + min_profit_ratio)
+    short_ceiling = max(_safe_float(guard.get("short_ceiling_price")), 0.0)
+    if short_ceiling <= 0:
+        short_avg = max(_safe_float(plan_report.get("current_short_avg_price")), 0.0)
+        if short_avg > 0:
+            short_ceiling = short_avg * (1.0 - min_profit_ratio)
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    for order in place_orders:
+        side = str(order.get("side", "")).upper().strip()
+        role = str(order.get("role", "") or "").strip().lower()
+        if role in {"hard_loss_forced_reduce_long", "hard_loss_forced_reduce_short"}:
+            kept_place_orders.append(order)
+            continue
+        reduce_side = _reduce_only_cap_side(order=order, strategy_mode=strategy_mode)
+        if reduce_side not in {"BUY", "SELL"}:
+            kept_place_orders.append(order)
+            continue
+        prepared_order, skip_reason = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        submitted_price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        drop_reason = ""
+        guard_price = None
+        if reduce_side == "BUY":
+            guard_price = short_ceiling if short_ceiling > 0 else None
+            if short_ceiling > 0 and (submitted_price <= 0 or submitted_price > short_ceiling + 1e-12):
+                drop_reason = "short_reduce_above_no_loss_ceiling"
+        elif reduce_side == "SELL":
+            guard_price = long_floor if long_floor > 0 else None
+            if long_floor > 0 and (submitted_price <= 0 or submitted_price + 1e-12 < long_floor):
+                drop_reason = "long_reduce_below_no_loss_floor"
+        if drop_reason:
+            dropped = dict(order)
+            dropped["reduce_only_no_loss_drop_reason"] = drop_reason
+            dropped["reduce_only_no_loss_guard_price"] = guard_price
+            dropped["reduce_only_no_loss_submitted_price"] = submitted_price
+            if skip_reason:
+                dropped["reduce_only_no_loss_prepare_skip_reason"] = skip_reason
+            dropped_orders.append(dropped)
+            continue
+        order["reduce_only_no_loss_guard"] = "passed"
+        order["reduce_only_no_loss_guard_price"] = guard_price
+        order["reduce_only_no_loss_submitted_price"] = submitted_price
+        kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["reduce_only_no_loss_guard"] = {
+        "enabled": True,
+        "long_floor_price": long_floor if long_floor > 0 else None,
+        "short_ceiling_price": short_ceiling if short_ceiling > 0 else None,
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+    }
+    return result
+
+
+def _entry_side_from_order(order: dict[str, Any], *, strategy_mode: str) -> str | None:
+    if _reduce_only_cap_side(order=order, strategy_mode=strategy_mode) is not None:
+        return None
+    side = str(order.get("side", "")).upper().strip()
+    role = str(order.get("role", "entry")).strip().lower()
+    if role in {"entry_short", "bootstrap_short", "grid_entry_short", "best_quote_entry_short"}:
+        return "short"
+    if role in {"entry_long", "bootstrap_long", "grid_entry_long", "best_quote_entry_long"}:
+        return "long"
+    if role in {"entry", "bootstrap", "grid_entry"}:
+        if side == "SELL":
+            return "short"
+        if side == "BUY":
+            return "long"
+    return None
+
+
+def _is_best_quote_volume_entry_order(order: dict[str, Any]) -> bool:
+    role = str(order.get("role", "") or "").strip().lower()
+    return role in {"best_quote_entry_long", "best_quote_entry_short"}
+
+
+def _best_quote_volume_entries_are_isolated(plan_report: dict[str, Any], *, strategy_mode: str) -> bool:
+    normalized_mode = str(strategy_mode or "").strip()
+    if normalized_mode != "hedge_best_quote_maker_volume_v1":
+        return False
+    best_quote_metrics = plan_report.get("best_quote_maker_volume")
+    if isinstance(best_quote_metrics, dict):
+        reduce_freeze = best_quote_metrics.get("reduce_freeze")
+        if isinstance(reduce_freeze, dict) and reduce_freeze.get("isolates_risk_metrics"):
+            return True
+    loss_scope = plan_report.get("runtime_guard_loss_scope")
+    return isinstance(loss_scope, dict) and bool(loss_scope.get("enabled"))
+
+
+def apply_hard_loss_rescue_entry_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+) -> dict[str, Any]:
+    guard = plan_report.get("hard_loss_rescue_entry_guard")
+    if not isinstance(guard, dict) or not bool(guard.get("active")):
+        return actions
+
+    block_long_entries = bool(guard.get("block_long_entries"))
+    block_short_entries = bool(guard.get("block_short_entries"))
+    if not block_long_entries and not block_short_entries:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    isolated_best_quote_entries = _best_quote_volume_entries_are_isolated(
+        plan_report, strategy_mode=strategy_mode
+    )
+    isolated_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        if isolated_best_quote_entries and _is_best_quote_volume_entry_order(order):
+            isolated = dict(order)
+            isolated["hard_loss_rescue_isolated_reason"] = "best_quote_volume_entry_uses_managed_ledger"
+            isolated_orders.append(isolated)
+            kept_place_orders.append(order)
+            continue
+        entry_side = _entry_side_from_order(order, strategy_mode=strategy_mode)
+        should_drop = (entry_side == "long" and block_long_entries) or (
+            entry_side == "short" and block_short_entries
+        )
+        if should_drop:
+            dropped = dict(order)
+            dropped["hard_loss_rescue_drop_reason"] = guard.get("reason") or "hard_loss_rescue_active"
+            dropped_orders.append(dropped)
+        else:
+            kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["hard_loss_rescue_entry_guard"] = {
+        "enabled": True,
+        "active": True,
+        "block_long_entries": block_long_entries,
+        "block_short_entries": block_short_entries,
+        "reason": guard.get("reason"),
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+        "isolated_best_quote_entry_count": len(isolated_orders),
+        "isolated_best_quote_entries": isolated_orders,
+    }
+    return result
+
+
+def apply_loss_reduce_reentry_guard_to_actions(
+    *,
+    actions: dict[str, Any],
+    plan_report: dict[str, Any],
+    strategy_mode: str,
+) -> dict[str, Any]:
+    guard = plan_report.get("loss_reduce_reentry_guard")
+    if not isinstance(guard, dict) or not bool(guard.get("active")):
+        return actions
+
+    block_long_entries = bool(guard.get("block_long_entries"))
+    block_short_entries = bool(guard.get("block_short_entries"))
+    if not block_long_entries and not block_short_entries:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    dropped_orders: list[dict[str, Any]] = []
+    isolated_best_quote_entries = _best_quote_volume_entries_are_isolated(
+        plan_report, strategy_mode=strategy_mode
+    )
+    isolated_orders: list[dict[str, Any]] = []
+    for order in [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]:
+        if isolated_best_quote_entries and _is_best_quote_volume_entry_order(order):
+            isolated = dict(order)
+            isolated["loss_reduce_reentry_isolated_reason"] = "best_quote_volume_entry_uses_managed_ledger"
+            isolated_orders.append(isolated)
+            kept_place_orders.append(order)
+            continue
+        entry_side = _entry_side_from_order(order, strategy_mode=strategy_mode)
+        should_drop = (entry_side == "long" and block_long_entries) or (
+            entry_side == "short" and block_short_entries
+        )
+        if should_drop:
+            dropped = dict(order)
+            dropped["loss_reduce_reentry_drop_reason"] = guard.get("reason") or "loss_reduce_reentry_guard_active"
+            dropped_orders.append(dropped)
+        else:
+            kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["loss_reduce_reentry_guard"] = {
+        "enabled": bool(guard.get("enabled", True)),
+        "active": True,
+        "block_long_entries": block_long_entries,
+        "block_short_entries": block_short_entries,
+        "reason": guard.get("reason"),
+        "dropped_order_count": len(dropped_orders),
+        "dropped_orders": dropped_orders,
+        "isolated_best_quote_entry_count": len(isolated_orders),
+        "isolated_best_quote_entries": isolated_orders,
+    }
+    return result
+
+
 def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     symbol = str(plan_report.get("symbol", "")).upper().strip()
+    forced_reduce_orders = [
+        item for item in plan_report.get("forced_reduce_orders", []) if isinstance(item, dict)
+    ]
     bootstrap_orders = [
         item for item in plan_report.get("bootstrap_orders", []) if isinstance(item, dict)
     ]
@@ -575,7 +1312,14 @@ def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
     ]
     if symbol:
         stale_orders = [item for item in stale_orders if _is_strategy_order(item, symbol)]
-    place_orders = [*bootstrap_orders, *missing_orders]
+    place_orders: list[dict[str, Any]] = []
+    seen_place_templates: set[tuple[str, str, str, str, str, str, str, str]] = set()
+    for order in [*forced_reduce_orders, *bootstrap_orders, *missing_orders]:
+        key = _place_order_template_key(order)
+        if key in seen_place_templates:
+            continue
+        seen_place_templates.add(key)
+        place_orders.append(order)
     place_notional = sum(_safe_float(item.get("notional")) for item in place_orders)
     return {
         "place_orders": place_orders,
@@ -584,6 +1328,185 @@ def build_execution_actions(plan_report: dict[str, Any]) -> dict[str, Any]:
         "cancel_count": len(stale_orders),
         "place_notional": place_notional,
     }
+
+
+def sort_cancel_orders_farthest_from_market_first(
+    *,
+    actions: dict[str, Any],
+    live_bid_price: float,
+    live_ask_price: float,
+) -> dict[str, Any]:
+    cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
+    if len(cancel_orders) <= 1:
+        return actions
+
+    safe_bid = _safe_float(live_bid_price)
+    safe_ask = _safe_float(live_ask_price)
+
+    def _distance_key(order: dict[str, Any]) -> tuple[int, float, int]:
+        side = str(order.get("side", "")).upper().strip()
+        price = _safe_float(order.get("price"))
+        cancel_reason = str(order.get("cancel_reason", "") or "").strip().lower()
+        urgent = 0 if cancel_reason else 1
+        if side == "BUY":
+            reference = safe_bid if safe_bid > 0 else safe_ask
+            distance = max(reference - price, 0.0) if reference > 0 and price > 0 else 0.0
+        elif side == "SELL":
+            reference = safe_ask if safe_ask > 0 else safe_bid
+            distance = max(price - reference, 0.0) if reference > 0 and price > 0 else 0.0
+        else:
+            distance = 0.0
+        return (urgent, -distance, 0)
+
+    sorted_cancel_orders = sorted(enumerate(cancel_orders), key=lambda item: (_distance_key(item[1]), item[0]))
+    result = dict(actions)
+    result["cancel_orders"] = [item for _, item in sorted_cancel_orders]
+    result["cancel_count"] = len(result["cancel_orders"])
+    result["cancel_order_priority"] = {
+        "enabled": True,
+        "mode": "farthest_from_market_first",
+        "live_bid_price": safe_bid,
+        "live_ask_price": safe_ask,
+    }
+    return result
+
+
+def suppress_same_side_nearby_place_orders(
+    *,
+    actions: dict[str, Any],
+    current_open_orders: Iterable[Any] | None = None,
+    min_price_spacing: float,
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None = None,
+) -> dict[str, Any]:
+    """Keep only one non-urgent maker order per side inside the configured spacing."""
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
+    safe_spacing = max(_safe_float(min_price_spacing), 0.0)
+    if not place_orders or safe_spacing <= 0:
+        return actions
+
+    tick = max(_safe_float(tick_size), 0.0)
+    existing_spacing = safe_spacing + tick
+    existing_orders: list[tuple[dict[str, Any], str, str, float]] = []
+    for open_order in current_open_orders or []:
+        if not isinstance(open_order, dict):
+            continue
+        side = str(open_order.get("side", "")).upper().strip()
+        price = _safe_float(open_order.get("price"))
+        if side not in {"BUY", "SELL"} or price <= 0:
+            continue
+        existing_orders.append((dict(open_order), side, _order_position_side(open_order), price))
+
+    side_orders: dict[str, list[tuple[int, dict[str, Any], float]]] = {"BUY": [], "SELL": []}
+    kept_by_index: dict[int, dict[str, Any]] = {}
+    suppressed_indices: set[int] = set()
+    suppressed_orders: list[dict[str, Any]] = []
+    protected_existing_orders: list[dict[str, Any]] = []
+    for index, order in enumerate(place_orders):
+        side = str(order.get("side", "")).upper().strip()
+        if bool(order.get("force_reduce_only")) or _is_urgent_reduce_only_order(order, strategy_mode="synthetic_neutral"):
+            kept_by_index[index] = order
+            continue
+        if side not in side_orders:
+            kept_by_index[index] = order
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        if price <= 0:
+            kept_by_index[index] = order
+            continue
+        normalized = dict(order)
+        normalized["price"] = price
+        normalized["notional"] = price * _safe_float(normalized.get("qty"))
+        position_side = _order_position_side(normalized)
+        matching_existing = [
+            open_order
+            for open_order, open_side, open_position_side, open_price in existing_orders
+            if open_side == side
+            and open_position_side == position_side
+            and abs(price - open_price) <= existing_spacing + 1e-12
+        ]
+        if matching_existing:
+            suppressed = dict(normalized)
+            suppressed["defer_reason"] = "existing_same_side_nearby_open_order"
+            suppressed["min_price_spacing"] = safe_spacing
+            suppressed_orders.append(suppressed)
+            suppressed_indices.add(index)
+            protected_existing_orders.extend(matching_existing)
+            continue
+        side_orders[side].append((index, normalized, price))
+
+    for side, entries in side_orders.items():
+        if not entries:
+            continue
+        reverse = side == "BUY"
+        selected: list[tuple[int, dict[str, Any], float]] = []
+        for index, order, price in sorted(entries, key=lambda item: item[2], reverse=reverse):
+            if any(abs(price - selected_price) < safe_spacing - 1e-12 for _, _, selected_price in selected):
+                suppressed = dict(order)
+                suppressed["defer_reason"] = "same_side_nearby_place_order"
+                suppressed["min_price_spacing"] = safe_spacing
+                suppressed_orders.append(suppressed)
+                suppressed_indices.add(index)
+                continue
+            selected.append((index, order, price))
+            kept_by_index[index] = order
+
+    if not suppressed_orders:
+        return actions
+
+    protected_cancel_orders: list[dict[str, Any]] = []
+    if protected_existing_orders and cancel_orders:
+        adjusted_cancel_orders: list[dict[str, Any]] = []
+        for cancel_order in cancel_orders:
+            if any(_order_matches_cancel(open_order, cancel_order) for open_order in protected_existing_orders):
+                protected_cancel_orders.append(cancel_order)
+                continue
+            adjusted_cancel_orders.append(cancel_order)
+        cancel_orders = adjusted_cancel_orders
+
+    kept_place_orders: list[dict[str, Any]] = []
+    for index, order in enumerate(place_orders):
+        if index in kept_by_index:
+            kept_place_orders.append(kept_by_index[index])
+            continue
+        if index not in suppressed_indices:
+            kept_place_orders.append(order)
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["cancel_orders"] = cancel_orders
+    result["place_count"] = len(kept_place_orders)
+    result["cancel_count"] = len(cancel_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["same_side_spacing_guard"] = {
+        "enabled": True,
+        "min_price_spacing": safe_spacing,
+        "suppressed_place_count": len(suppressed_orders),
+        "suppressed_place_orders": suppressed_orders,
+        "protected_cancel_count": len(protected_cancel_orders),
+        "protected_cancel_orders": protected_cancel_orders,
+    }
+    return result
 
 
 def preserve_queue_priority_in_execution_actions(
@@ -599,14 +1522,39 @@ def preserve_queue_priority_in_execution_actions(
     """Prefer preserving queued orders unless the refreshed plan truly needs less size or a new bucket."""
     place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
     cancel_orders = [dict(item) for item in actions.get("cancel_orders", []) if isinstance(item, dict)]
+    urgent_place_orders: list[dict[str, Any]] = []
+    queue_place_orders: list[dict[str, Any]] = []
+    for order in place_orders:
+        if _is_urgent_reduce_only_order(order, strategy_mode="synthetic_neutral"):
+            urgent_place_orders.append(order)
+        else:
+            queue_place_orders.append(order)
+    place_orders = queue_place_orders
     if not place_orders or not cancel_orders:
-        return {
-            "place_orders": place_orders,
+        place_orders, duplicate_place_orders = _merge_place_orders_by_submitted_bucket(
+            orders=place_orders,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+        )
+        merged_place_orders = [*urgent_place_orders, *place_orders]
+        result = {
+            "place_orders": merged_place_orders,
             "cancel_orders": cancel_orders,
-            "place_count": len(place_orders),
+            "place_count": len(merged_place_orders),
             "cancel_count": len(cancel_orders),
-            "place_notional": sum(_safe_float(item.get("notional")) for item in place_orders),
+            "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
         }
+        if duplicate_place_orders:
+            result["duplicate_place_bucket_guard"] = {
+                "enabled": True,
+                "merged_order_count": len(duplicate_place_orders),
+                "merged_orders": duplicate_place_orders,
+            }
+        return result
 
     cancel_indices_by_bucket: dict[str, list[int]] = {}
     cancel_totals_by_bucket: dict[str, Decimal] = {}
@@ -653,12 +1601,13 @@ def preserve_queue_priority_in_execution_actions(
             projected_place_templates[key] = template
 
     if not projected_place_totals:
+        merged_place_orders = [*urgent_place_orders, *place_orders]
         return {
-            "place_orders": place_orders,
+            "place_orders": merged_place_orders,
             "cancel_orders": cancel_orders,
-            "place_count": len(place_orders),
+            "place_count": len(merged_place_orders),
             "cancel_count": len(cancel_orders),
-            "place_notional": sum(_safe_float(item.get("notional")) for item in place_orders),
+            "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
         }
 
     preserved_cancel_indices: set[int] = set()
@@ -666,6 +1615,11 @@ def preserve_queue_priority_in_execution_actions(
     for key, desired_total in projected_place_totals.items():
         existing_total = cancel_totals_by_bucket.get(key, Decimal("0"))
         if existing_total <= Decimal("0"):
+            continue
+        projected_template = projected_place_templates.get(key) or {}
+        projected_role = str(projected_template.get("role", "")).strip()
+        replace_smaller_reduce = projected_role in {"best_quote_reduce_long", "best_quote_reduce_short"}
+        if replace_smaller_reduce:
             continue
         bucket_indices = cancel_indices_by_bucket.get(key, [])
         bucket_quantities = [
@@ -675,7 +1629,7 @@ def preserve_queue_priority_in_execution_actions(
         if desired_total >= existing_total:
             for cancel_index in bucket_indices:
                 preserved_cancel_indices.add(cancel_index)
-            reduced_place_totals[key] = max(desired_total - existing_total, Decimal("0"))
+            reduced_place_totals[key] = Decimal("0")
             continue
 
         chosen_local_indices, preserved_qty = _choose_preserved_cancel_indices(bucket_quantities, desired_total)
@@ -724,13 +1678,155 @@ def preserve_queue_priority_in_execution_actions(
     adjusted_cancel_orders = [
         order for index, order in enumerate(cancel_orders) if index not in preserved_cancel_indices
     ]
-    return {
-        "place_orders": adjusted_place_orders,
-        "cancel_orders": adjusted_cancel_orders,
-        "place_count": len(adjusted_place_orders),
-        "cancel_count": len(adjusted_cancel_orders),
-        "place_notional": sum(_safe_float(item.get("notional")) for item in adjusted_place_orders),
+    pending_cancel_buckets = {
+        _order_bucket_key(
+            str(order.get("side", "")).upper().strip(),
+            _safe_float(order.get("price")),
+            _order_position_side(order),
+        )
+        for order in adjusted_cancel_orders
+        if str(order.get("side", "")).upper().strip() in {"BUY", "SELL"}
+        and _safe_float(order.get("price")) > 0
     }
+    if pending_cancel_buckets:
+        safe_place_orders: list[dict[str, Any]] = []
+        deferred_place_orders: list[dict[str, Any]] = []
+        for order in adjusted_place_orders:
+            side = str(order.get("side", "")).upper().strip()
+            if side not in {"BUY", "SELL"}:
+                safe_place_orders.append(order)
+                continue
+            prepared_order, _ = prepare_post_only_order_request(
+                order=order,
+                side=side,
+                live_bid_price=live_bid_price,
+                live_ask_price=live_ask_price,
+                tick_size=tick_size,
+                min_qty=min_qty,
+                min_notional=min_notional,
+                step_size=step_size,
+                post_only=_order_prefers_post_only(order),
+            )
+            price = (
+                _safe_float(prepared_order.get("submitted_price"))
+                if prepared_order is not None
+                else _safe_float(order.get("price"))
+            )
+            bucket = _order_bucket_key(side, price, _order_position_side(order))
+            if bucket in pending_cancel_buckets:
+                deferred = dict(order)
+                deferred["defer_reason"] = "pending_same_bucket_cancel"
+                deferred_place_orders.append(deferred)
+                continue
+            safe_place_orders.append(order)
+        adjusted_place_orders = safe_place_orders
+    adjusted_place_orders, duplicate_place_orders = _merge_place_orders_by_submitted_bucket(
+        orders=adjusted_place_orders,
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=tick_size,
+        min_qty=min_qty,
+        min_notional=min_notional,
+        step_size=step_size,
+    )
+    merged_place_orders = [*urgent_place_orders, *adjusted_place_orders]
+    result = {
+        "place_orders": merged_place_orders,
+        "cancel_orders": adjusted_cancel_orders,
+        "place_count": len(merged_place_orders),
+        "cancel_count": len(adjusted_cancel_orders),
+        "place_notional": sum(_safe_float(item.get("notional")) for item in merged_place_orders),
+    }
+    if pending_cancel_buckets:
+        result["same_bucket_cancel_place_guard"] = {
+            "enabled": True,
+            "pending_cancel_bucket_count": len(pending_cancel_buckets),
+            "deferred_place_count": len(deferred_place_orders),
+            "deferred_place_orders": deferred_place_orders,
+        }
+    if duplicate_place_orders:
+        result["duplicate_place_bucket_guard"] = {
+            "enabled": True,
+            "merged_order_count": len(duplicate_place_orders),
+            "merged_orders": duplicate_place_orders,
+        }
+    return result
+
+
+def suppress_place_orders_with_existing_submitted_buckets(
+    *,
+    actions: dict[str, Any],
+    current_open_orders: Iterable[Any],
+    live_bid_price: float,
+    live_ask_price: float,
+    tick_size: float | None,
+    min_qty: float | None,
+    min_notional: float | None,
+    step_size: float | None = None,
+) -> dict[str, Any]:
+    """Drop place orders whose submitted bucket already exists on exchange."""
+    place_orders = [dict(item) for item in actions.get("place_orders", []) if isinstance(item, dict)]
+    if not place_orders:
+        return actions
+
+    existing_buckets: set[str] = set()
+    for order in current_open_orders:
+        if not isinstance(order, dict):
+            continue
+        side = str(order.get("side", "")).upper().strip()
+        price = _safe_float(order.get("price"))
+        if side not in {"BUY", "SELL"} or price <= 0:
+            continue
+        existing_buckets.add(_order_bucket_key(side, price, _order_position_side(order)))
+
+    if not existing_buckets:
+        return actions
+
+    kept_place_orders: list[dict[str, Any]] = []
+    suppressed_place_orders: list[dict[str, Any]] = []
+    for order in place_orders:
+        side = str(order.get("side", "")).upper().strip()
+        if side not in {"BUY", "SELL"}:
+            kept_place_orders.append(order)
+            continue
+        prepared_order, _ = prepare_post_only_order_request(
+            order=order,
+            side=side,
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=tick_size,
+            min_qty=min_qty,
+            min_notional=min_notional,
+            step_size=step_size,
+            post_only=_order_prefers_post_only(order),
+        )
+        price = (
+            _safe_float(prepared_order.get("submitted_price"))
+            if prepared_order is not None
+            else _safe_float(order.get("price"))
+        )
+        bucket = _order_bucket_key(side, price, _order_position_side(order))
+        if bucket in existing_buckets:
+            suppressed = dict(order)
+            suppressed["defer_reason"] = "existing_same_submitted_bucket"
+            suppressed["submitted_bucket"] = bucket
+            suppressed_place_orders.append(suppressed)
+            continue
+        kept_place_orders.append(order)
+
+    if not suppressed_place_orders:
+        return actions
+
+    result = dict(actions)
+    result["place_orders"] = kept_place_orders
+    result["place_count"] = len(kept_place_orders)
+    result["place_notional"] = sum(_safe_float(item.get("notional")) for item in kept_place_orders)
+    result["existing_submitted_bucket_guard"] = {
+        "enabled": True,
+        "suppressed_place_count": len(suppressed_place_orders),
+        "suppressed_place_orders": suppressed_place_orders,
+    }
+    return result
 
 
 def estimate_mid_drift_steps(
@@ -961,6 +2057,17 @@ def main() -> None:
         min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
         step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
     )
+    validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+        actions=validation["actions"],
+        plan_report=plan_report,
+        strategy_mode=str(plan_report.get("strategy_mode", "")).strip() or "one_way_long",
+        live_bid_price=live_bid_price,
+        live_ask_price=live_ask_price,
+        tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+        min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+        min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+        step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+    )
 
     _print_preview(plan_report=plan_report, validation=validation, drift_steps=drift_steps)
 
@@ -1039,6 +2146,17 @@ def main() -> None:
             current_actual_net_qty=current_actual_net_qty,
             current_open_orders=current_strategy_open_orders,
         )
+        validation["actions"] = apply_reduce_only_no_loss_guard_to_actions(
+            actions=validation["actions"],
+            plan_report=plan_report,
+            strategy_mode=str(plan_report.get("strategy_mode", "")).strip() or "one_way_long",
+            live_bid_price=live_bid_price,
+            live_ask_price=live_ask_price,
+            tick_size=_safe_float((plan_report.get("symbol_info") or {}).get("tick_size")),
+            min_qty=(plan_report.get("symbol_info") or {}).get("min_qty"),
+            min_notional=(plan_report.get("symbol_info") or {}).get("min_notional"),
+            step_size=(plan_report.get("symbol_info") or {}).get("step_size"),
+        )
         validation = enforce_execution_action_limits(
             validation=validation,
             max_new_orders=args.max_new_orders,
@@ -1095,14 +2213,26 @@ def main() -> None:
 
         if args.cancel_stale:
             for stale_order in validation["actions"]["cancel_orders"]:
-                cancel_response = delete_futures_order(
-                    symbol=symbol,
-                    order_id=int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None,
-                    orig_client_order_id=str(stale_order.get("clientOrderId", "")).strip() or None,
-                    api_key=api_key,
-                    api_secret=api_secret,
-                    recv_window=args.recv_window,
-                )
+                order_id = int(stale_order["orderId"]) if str(stale_order.get("orderId", "")).strip() else None
+                orig_client_order_id = str(stale_order.get("clientOrderId", "")).strip() or None
+                try:
+                    cancel_response = delete_futures_order(
+                        symbol=symbol,
+                        order_id=order_id,
+                        orig_client_order_id=orig_client_order_id,
+                        api_key=api_key,
+                        api_secret=api_secret,
+                        recv_window=args.recv_window,
+                    )
+                except RuntimeError as exc:
+                    if not _ignore_noop_error(exc, ("unknown order sent", "-2011")):
+                        raise
+                    cancel_response = {
+                        "ignored_error": str(exc),
+                        "orderId": order_id,
+                        "origClientOrderId": orig_client_order_id,
+                        "status": "ALREADY_GONE",
+                    }
                 report["canceled_orders"].append(cancel_response)
 
         tick_size = _safe_float((plan_report.get("symbol_info") or {}).get("tick_size"))

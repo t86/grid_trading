@@ -14,9 +14,12 @@ from grid_optimizer.monitor import (
     _MONITOR_CACHE,
     _MONITOR_CACHE_LOCK,
     _MONITOR_INFLIGHT,
+    _competition_current_metric_value,
     _count_monitor_audit_lines,
     _filter_events_since,
     _filter_rows_since,
+    _load_or_fetch_income_rows,
+    _load_or_fetch_trade_rows,
     _extract_futures_asset_snapshot,
     _read_event_window,
     _read_runner_process,
@@ -70,6 +73,205 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(summary["commission"], 0.02, places=8)
         self.assertEqual(len(summary["series"]), 2)
 
+    def test_summarize_user_trades_accepts_string_trade_ids(self) -> None:
+        trades = [
+            {
+                "id": "23256419:gx-pharosu-bestquot-2-91789828:1779191790879:17.0:0.6348",
+                "time": 1000,
+                "side": "BUY",
+                "price": "0.6348",
+                "qty": "17",
+                "maker": True,
+                "realizedPnl": "0",
+                "commission": "0.01",
+            }
+        ]
+
+        summary = summarize_user_trades(trades)
+
+        self.assertEqual(summary["trade_count"], 1)
+        self.assertAlmostEqual(summary["gross_notional"], 10.7916, places=8)
+
+    def test_summarize_user_trades_groups_daily_volume_by_utc_day(self) -> None:
+        day0 = datetime(2026, 5, 19, 15, 30, tzinfo=timezone.utc)
+        day0_late = datetime(2026, 5, 19, 23, 30, tzinfo=timezone.utc)
+        day1 = datetime(2026, 5, 20, 0, 30, tzinfo=timezone.utc)
+        trades = [
+            {
+                "id": 1,
+                "time": int(day0.timestamp() * 1000),
+                "side": "BUY",
+                "price": "2",
+                "qty": "10",
+                "realizedPnl": "0",
+                "commission": "0",
+            },
+            {
+                "id": 2,
+                "time": int(day0_late.timestamp() * 1000),
+                "side": "SELL",
+                "price": "3",
+                "qty": "10",
+                "realizedPnl": "0",
+                "commission": "0",
+            },
+            {
+                "id": 3,
+                "time": int(day1.timestamp() * 1000),
+                "side": "SELL",
+                "price": "5",
+                "qty": "10",
+                "realizedPnl": "0",
+                "commission": "0",
+            },
+        ]
+
+        summary = summarize_user_trades(trades)
+
+        self.assertEqual(summary["daily_volume_rows"][0]["date"], "2026-05-20")
+        self.assertEqual(summary["daily_volume_rows"][0]["timezone"], "UTC+0")
+        self.assertAlmostEqual(summary["daily_volume_rows"][0]["gross_notional"], 50.0, places=8)
+        self.assertEqual(summary["daily_volume_rows"][1]["date"], "2026-05-19")
+        self.assertEqual(summary["daily_volume_rows"][1]["timezone"], "UTC+0")
+        self.assertAlmostEqual(summary["daily_volume_rows"][1]["gross_notional"], 50.0, places=8)
+
+    def test_pharos_competition_metric_uses_daily_sqrt_score(self) -> None:
+        trade_summary = {
+            "gross_notional": 1_250_000.0,
+            "daily_volume_rows": [
+                {"date": "2026-05-21", "gross_notional": 1_000_000.0},
+                {"date": "2026-05-20", "gross_notional": 250_000.9999},
+            ],
+        }
+        board = {
+            "source_slug": "futures_pharos",
+            "symbol": "PHAROS",
+            "metric_field": "grade",
+        }
+
+        current = _competition_current_metric_value(board, trade_summary)
+
+        self.assertAlmostEqual(current, 1500.0, places=8)
+
+    def test_non_pharos_competition_metric_uses_gross_notional(self) -> None:
+        trade_summary = {
+            "gross_notional": 1_250_000.0,
+            "daily_volume_rows": [{"gross_notional": 1_000_000.0}],
+        }
+        board = {
+            "source_slug": "futures_bill",
+            "symbol": "BILL",
+            "metric_field": "tradingVolume",
+        }
+
+        current = _competition_current_metric_value(board, trade_summary)
+
+        self.assertAlmostEqual(current, 1_250_000.0, places=8)
+
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_trade_rows_merges_audit_with_full_api_window(self, mock_fetch_time_paged) -> None:
+        start = datetime(2026, 5, 14, 10, 0, tzinfo=timezone.utc)
+        old_api_trade = {
+            "id": 1,
+            "time": int((start + timedelta(minutes=1)).timestamp() * 1000),
+            "symbol": "PHAROSUSDT",
+            "price": "1",
+            "qty": "10",
+        }
+        duplicate_trade = {
+            "id": 2,
+            "time": int((start + timedelta(minutes=2)).timestamp() * 1000),
+            "symbol": "PHAROSUSDT",
+            "price": "1",
+            "qty": "20",
+        }
+        audit_only_trade = {
+            "id": 3,
+            "time": int((start + timedelta(minutes=3)).timestamp() * 1000),
+            "symbol": "PHAROSUSDT",
+            "price": "1",
+            "qty": "30",
+        }
+        mock_fetch_time_paged.return_value = [old_api_trade, duplicate_trade]
+
+        with TemporaryDirectory() as tmpdir:
+            audit_path = Path(tmpdir) / "pharosusdt_loop_trade_audit.jsonl"
+            audit_path.write_text(
+                json.dumps(duplicate_trade) + "\n" + json.dumps(audit_only_trade) + "\n",
+                encoding="utf-8",
+            )
+
+            rows, meta = _load_or_fetch_trade_rows(
+                audit_path=audit_path,
+                symbol="PHAROSUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=start,
+            )
+
+        self.assertEqual([row["id"] for row in rows], [1, 2, 3])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 2)
+        self.assertEqual(meta["api_row_count"], 2)
+
+    def test_monitor_stats_anchor_persists_first_data_start(self) -> None:
+        from grid_optimizer.monitor import _resolve_monitor_stats_anchor
+
+        first_trade = datetime(2026, 5, 19, 13, 26, 56, tzinfo=timezone.utc)
+        restarted_session = datetime(2026, 5, 20, 2, 12, 46, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            anchor_path = Path(tmpdir) / "pharosusdt_loop_monitor_anchor.json"
+
+            anchor, meta = _resolve_monitor_stats_anchor(
+                anchor_path=anchor_path,
+                symbol="PHAROSUSDT",
+                candidates=[
+                    ("audit_trade_start", first_trade),
+                    ("session_start", restarted_session),
+                ],
+            )
+            self.assertEqual(anchor, first_trade)
+            self.assertEqual(meta["source"], "audit_trade_start")
+            self.assertTrue(anchor_path.exists())
+
+            anchor, meta = _resolve_monitor_stats_anchor(
+                anchor_path=anchor_path,
+                symbol="PHAROSUSDT",
+                candidates=[("session_start", restarted_session + timedelta(hours=1))],
+            )
+            self.assertEqual(anchor, first_trade)
+            self.assertEqual(meta["source"], "persisted")
+
+    def test_monitor_stats_anchor_moves_earlier_but_never_later(self) -> None:
+        from grid_optimizer.monitor import _resolve_monitor_stats_anchor
+
+        persisted = datetime(2026, 5, 19, 13, 26, 56, tzinfo=timezone.utc)
+        competition_start = datetime(2026, 5, 14, 10, 0, tzinfo=timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            anchor_path = Path(tmpdir) / "pharosusdt_loop_monitor_anchor.json"
+            anchor_path.write_text(
+                json.dumps(
+                    {
+                        "symbol": "PHAROSUSDT",
+                        "stats_start_at": persisted.isoformat(),
+                        "source": "audit_trade_start",
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            anchor, meta = _resolve_monitor_stats_anchor(
+                anchor_path=anchor_path,
+                symbol="PHAROSUSDT",
+                candidates=[
+                    ("competition_start", competition_start),
+                    ("session_start", persisted + timedelta(hours=2)),
+                ],
+            )
+
+        self.assertEqual(anchor, competition_start)
+        self.assertEqual(meta["source"], "competition_start")
+
     def test_summarize_income_sums_funding_fee(self) -> None:
         rows = [
             {"time": 1000, "income": "0.05", "incomeType": "FUNDING_FEE", "asset": "USDT", "info": ""},
@@ -101,6 +303,194 @@ class MonitorTests(unittest.TestCase):
         self.assertAlmostEqual(summary["commission"], 0.75, places=8)
         self.assertAlmostEqual(summary["commission_raw_by_asset"]["BNB"], 0.001, places=8)
         self.assertAlmostEqual(summary["recent_trades"][0]["commission_usdt"], 0.75, places=8)
+
+    def test_summarize_user_trades_accepts_non_numeric_trade_id(self) -> None:
+        trades = [
+            {
+                "id": "526323933:gx-chipu-takeprof-1-58228126:1778558235739:1447.0:0.06218",
+                "time": 1000,
+                "side": "BUY",
+                "price": "0.06218",
+                "qty": "1447",
+                "maker": True,
+                "realizedPnl": "0",
+                "commission": "0.02",
+            },
+            {
+                "id": 2,
+                "time": 1000,
+                "side": "SELL",
+                "price": "0.06220",
+                "qty": "1000",
+                "maker": False,
+                "realizedPnl": "0.05",
+                "commission": "0.01",
+            },
+        ]
+
+        summary = summarize_user_trades(trades)
+
+        self.assertEqual(summary["trade_count"], 2)
+        self.assertAlmostEqual(summary["gross_notional"], 152.17446, places=8)
+        self.assertAlmostEqual(summary["commission"], 0.03, places=8)
+        self.assertEqual(
+            summary["recent_trades"][1]["id"],
+            "526323933:gx-chipu-takeprof-1-58228126:1778558235739:1447.0:0.06218",
+        )
+
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_trade_rows_merges_audit_and_api_manual_trades(self, mock_fetch_time_paged) -> None:
+        session_start = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
+        audit_trade = {
+            "id": 10,
+            "symbol": "CHIPUSDT",
+            "time": int((session_start + timedelta(minutes=5)).timestamp() * 1000),
+            "side": "BUY",
+            "price": "1.00",
+            "qty": "3",
+        }
+        manual_trade = {
+            "id": 11,
+            "symbol": "CHIPUSDT",
+            "time": int((session_start + timedelta(minutes=20)).timestamp() * 1000),
+            "side": "SELL",
+            "price": "1.10",
+            "qty": "2",
+            "realizedPnl": "0.2",
+        }
+        duplicate_audit_trade = dict(audit_trade)
+        duplicate_audit_trade["price"] = "999"
+        mock_fetch_time_paged.return_value = [manual_trade, duplicate_audit_trade]
+
+        with TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "chipusdt_loop_trade_audit.jsonl"
+            audit_path.write_text(json.dumps(audit_trade) + "\n", encoding="utf-8")
+
+            rows, meta = _load_or_fetch_trade_rows(
+                audit_path=audit_path,
+                symbol="CHIPUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=session_start,
+            )
+
+        self.assertEqual([item["id"] for item in rows], [10, 11])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 1)
+        self.assertEqual(meta["api_row_count"], 2)
+        self.assertEqual(meta["merged_row_count"], 2)
+        self.assertEqual(meta["deduped_row_count"], 1)
+        self.assertAlmostEqual(summarize_user_trades(rows)["gross_notional"], 5.2, places=8)
+
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_income_rows_merges_audit_and_api_funding(self, mock_fetch_time_paged) -> None:
+        session_start = datetime(2026, 5, 8, 10, 0, tzinfo=timezone.utc)
+        audit_income = {
+            "symbol": "BILLUSDT",
+            "incomeType": "FUNDING_FEE",
+            "income": "0.03",
+            "time": int((session_start + timedelta(hours=6)).timestamp() * 1000),
+            "tranId": 100,
+        }
+        api_income = {
+            "symbol": "BILLUSDT",
+            "incomeType": "FUNDING_FEE",
+            "income": "-0.02",
+            "time": int((session_start + timedelta(hours=2)).timestamp() * 1000),
+            "tranId": 99,
+        }
+        duplicate_audit_income = dict(audit_income)
+        duplicate_audit_income["income"] = "999"
+        mock_fetch_time_paged.return_value = [api_income, duplicate_audit_income]
+
+        with TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "billusdt_loop_income_audit.jsonl"
+            audit_path.write_text(json.dumps(audit_income) + "\n", encoding="utf-8")
+
+            rows, meta = _load_or_fetch_income_rows(
+                audit_path=audit_path,
+                symbol="BILLUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=session_start,
+            )
+
+        self.assertEqual([item["tranId"] for item in rows], [99, 100])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 1)
+        self.assertEqual(meta["api_row_count"], 2)
+        self.assertEqual(meta["merged_row_count"], 2)
+        self.assertEqual(meta["deduped_row_count"], 1)
+        self.assertAlmostEqual(summarize_income(rows)["funding_fee"], 0.01, places=8)
+
+    @patch("grid_optimizer.monitor.fetch_time_paged")
+    def test_load_or_fetch_trade_rows_dedupes_audit_composite_id_against_api_trade(self, mock_fetch_time_paged) -> None:
+        session_start = datetime(2026, 5, 12, 10, 0, tzinfo=timezone.utc)
+        trade_time_ms = int((session_start + timedelta(minutes=5)).timestamp() * 1000)
+        audit_trade = {
+            "id": "84866504:gx-aigensynu-entrysho-2-86848575:1778586861251:5369.0:0.03352",
+            "orderId": 84866504,
+            "clientOrderId": "gx-aigensynu-entrysho-2-86848575",
+            "symbol": "AIGENSYNUSDT",
+            "time": trade_time_ms,
+            "side": "SELL",
+            "price": 0.03352,
+            "qty": 5369.0,
+            "realizedPnl": "0",
+            "commission": "0.00003911",
+            "commissionAsset": "BNB",
+        }
+        api_trade = {
+            "id": 10324910,
+            "orderId": 84866504,
+            "symbol": "AIGENSYNUSDT",
+            "time": trade_time_ms - 611,
+            "side": "SELL",
+            "price": "0.0335200",
+            "qty": "5369",
+            "realizedPnl": "0",
+            "commission": "0.00003911",
+            "commissionAsset": "BNB",
+        }
+        later_api_trade = {
+            "id": 10324911,
+            "orderId": 84866505,
+            "symbol": "AIGENSYNUSDT",
+            "time": trade_time_ms + 1000,
+            "side": "BUY",
+            "price": "0.03351",
+            "qty": "100",
+            "realizedPnl": "0.05",
+            "commission": "0.001",
+            "commissionAsset": "USDT",
+        }
+        mock_fetch_time_paged.return_value = [api_trade, later_api_trade]
+
+        with TemporaryDirectory() as tmp:
+            audit_path = Path(tmp) / "aigensynusdt_loop_trade_audit.jsonl"
+            audit_path.write_text(json.dumps(audit_trade) + "\n", encoding="utf-8")
+
+            rows, meta = _load_or_fetch_trade_rows(
+                audit_path=audit_path,
+                symbol="AIGENSYNUSDT",
+                api_key="key",
+                api_secret="secret",
+                session_start=session_start,
+            )
+
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["id"], audit_trade["id"])
+        self.assertEqual(rows[1]["id"], later_api_trade["id"])
+        self.assertEqual(meta["source"], "audit+api")
+        self.assertEqual(meta["audit_row_count"], 1)
+        self.assertEqual(meta["api_row_count"], 2)
+        self.assertEqual(meta["merged_row_count"], 2)
+        self.assertEqual(meta["deduped_row_count"], 1)
+        self.assertAlmostEqual(
+            summarize_user_trades(rows)["gross_notional"],
+            (0.03352 * 5369) + (0.03351 * 100),
+            places=8,
+        )
 
     def test_summarize_hourly_metrics_combines_trades_income_and_candles(self) -> None:
         hour0 = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
@@ -162,6 +552,75 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(previous["hour_start"], hour0.isoformat())
         self.assertAlmostEqual(previous["gross_notional"], 21.0, places=8)
         self.assertAlmostEqual(previous["net_after_fees_and_funding"], 0.3, places=8)
+
+    def test_summarize_hourly_metrics_reports_trade_quality_breakdown(self) -> None:
+        hour0 = datetime(2026, 3, 19, 8, 0, tzinfo=timezone.utc)
+        candles = [
+            Candle(open_time=hour0, close_time=hour0 + timedelta(hours=1), open=1.0, high=1.1, low=0.95, close=1.05),
+        ]
+        trades = [
+            {
+                "orderId": 10,
+                "time": int((hour0 + timedelta(minutes=1)).timestamp() * 1000),
+                "side": "BUY",
+                "price": "1.00",
+                "qty": "600",
+                "realizedPnl": "0",
+                "commission": "0.3",
+            },
+            {
+                "orderId": 11,
+                "time": int((hour0 + timedelta(minutes=2)).timestamp() * 1000),
+                "side": "SELL",
+                "price": "1.02",
+                "qty": "600",
+                "realizedPnl": "2.5",
+                "commission": "0.3",
+            },
+            {
+                "orderId": 12,
+                "time": int((hour0 + timedelta(minutes=3)).timestamp() * 1000),
+                "side": "SELL",
+                "price": "1.01",
+                "qty": "700",
+                "realizedPnl": "-12",
+                "commission": "0.2",
+            },
+            {
+                "orderId": 13,
+                "time": int((hour0 + timedelta(minutes=4)).timestamp() * 1000),
+                "side": "BUY",
+                "price": "1.00",
+                "qty": "100",
+                "realizedPnl": "-1",
+                "commission": "0.05",
+            },
+        ]
+
+        summary = summarize_hourly_metrics(
+            trades,
+            [],
+            candles,
+            order_role_lookup={
+                "10": {"role": "entry_long"},
+                "11": {"role": "take_profit_long"},
+                "12": {"role": "hard_loss_forced_reduce_long"},
+            },
+            limit=24,
+        )
+
+        row = summary["rows"][0]
+        quality = row["trade_quality"]
+        self.assertEqual(quality["verdict"], "abnormal")
+        self.assertGreaterEqual(len(quality["reasons"]), 1)
+        self.assertEqual(quality["buy_count"], 2)
+        self.assertEqual(quality["sell_count"], 2)
+        self.assertAlmostEqual(quality["buckets"]["normal_grid"]["gross_notional"], 600.0, places=8)
+        self.assertAlmostEqual(quality["buckets"]["take_profit_recycle"]["gross_notional"], 612.0, places=8)
+        self.assertEqual(quality["buckets"]["hard_loss_forced_reduce"]["count"], 1)
+        self.assertAlmostEqual(quality["buckets"]["hard_loss_forced_reduce"]["realized_pnl"], -12.0, places=8)
+        self.assertEqual(quality["buckets"]["manual_unknown"]["count"], 1)
+        self.assertAlmostEqual(row["buy_sell_imbalance_ratio"], abs(700.0 - 1319.0) / 2019.0, places=8)
 
     def test_summarize_loop_events_marks_recent_loop_alive(self) -> None:
         now = datetime.now(timezone.utc)
@@ -363,6 +822,142 @@ class MonitorTests(unittest.TestCase):
         self.assertIsNone(_extract_futures_asset_snapshot(account_info, "ETH"))
 
     @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch(
+        "grid_optimizer.monitor._load_or_fetch_trade_rows",
+        return_value=(
+            [
+                {"id": 1, "time": 1778222400000, "side": "BUY", "price": "0.05", "qty": "100", "realizedPnl": "0", "commission": "0.01"},
+                {"id": 2, "time": 1778222460000, "side": "SELL", "price": "0.06", "qty": "50", "realizedPnl": "0.5", "commission": "0.01"},
+            ],
+            {"source": "audit+api", "row_count": 2},
+        ),
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [{"symbol": "CHIPUSDT", "positionAmt": "0", "entryPrice": "0", "breakEvenPrice": "0", "unRealizedProfit": "0"}],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "0.05"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "0.05", "ask_price": "0.051"}])
+    def test_build_monitor_snapshot_uses_merged_trade_volume_for_risk_cumulative(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_competition,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "chipusdt_loop_events.jsonl"
+            plan_path = root / "chipusdt_loop_latest_plan.json"
+            submit_path = root / "chipusdt_loop_latest_submit.json"
+            events_path.write_text(
+                json.dumps({"ts": "2026-05-08T06:00:00+00:00", "cycle": 1, "cumulative_gross_notional": 1.0}) + "\n",
+                encoding="utf-8",
+            )
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="CHIPUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={"configured": True, "is_running": False, "config": {"symbol": "CHIPUSDT"}},
+            )
+
+        self.assertAlmostEqual(snapshot["trade_summary"]["gross_notional"], 8.0, places=8)
+        self.assertAlmostEqual(snapshot["risk_controls"]["cumulative_gross_notional"], 8.0, places=8)
+        self.assertEqual(snapshot["audit"]["trade_source"]["source"], "audit+api")
+
+    @patch("grid_optimizer.monitor.build_competition_entry_volume_targets", return_value={"targets": []})
+    @patch("grid_optimizer.monitor.build_competition_displacement_volume", return_value={"rank_steps": []})
+    @patch("grid_optimizer.monitor.build_reward_volume_targets", return_value={"tiers": []})
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch(
+        "grid_optimizer.monitor.resolve_active_competition_board",
+        return_value={"source_slug": "futures_pharos", "symbol": "PHAROS", "metric_field": "grade"},
+    )
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [{"symbol": "PHAROSUSDT", "positionAmt": "0", "entryPrice": "0", "breakEvenPrice": "0", "unRealizedProfit": "0"}],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "1"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "1", "ask_price": "1"}])
+    def test_build_monitor_snapshot_uses_pharos_score_for_competition_cards(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_competition,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_income_rows,
+        mock_reward_targets,
+        mock_displacement,
+        mock_entry_targets,
+    ) -> None:
+        day0 = datetime(2026, 5, 21, 1, 0, tzinfo=timezone.utc)
+        day1 = datetime(2026, 5, 22, 1, 0, tzinfo=timezone.utc)
+        trades = [
+            {"id": 1, "time": int(day0.timestamp() * 1000), "side": "BUY", "price": "1000", "qty": "1000", "realizedPnl": "0", "commission": "0"},
+            {"id": 2, "time": int(day1.timestamp() * 1000), "side": "SELL", "price": "500", "qty": "500", "realizedPnl": "0", "commission": "0"},
+        ]
+
+        with TemporaryDirectory() as tmpdir, patch(
+            "grid_optimizer.monitor._load_or_fetch_trade_rows",
+            return_value=(trades, {"source": "audit+api", "row_count": 2}),
+        ):
+            root = Path(tmpdir)
+            events_path = root / "pharosusdt_loop_events.jsonl"
+            plan_path = root / "pharosusdt_loop_latest_plan.json"
+            submit_path = root / "pharosusdt_loop_latest_submit.json"
+            events_path.write_text("{}", encoding="utf-8")
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="PHAROSUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={"configured": True, "is_running": False, "config": {"symbol": "PHAROSUSDT"}},
+            )
+
+        self.assertAlmostEqual(snapshot["trade_summary"]["gross_notional"], 1_250_000.0, places=8)
+        self.assertAlmostEqual(snapshot["trade_summary"]["competition_current_metric"], 1500.0, places=8)
+        self.assertEqual(snapshot["trade_summary"]["competition_current_metric_label"], "每日成交量开根号积分")
+        self.assertAlmostEqual(mock_reward_targets.call_args.kwargs["current_volume"], 1500.0, places=8)
+        self.assertAlmostEqual(mock_displacement.call_args.kwargs["current_volume"], 1500.0, places=8)
+        self.assertAlmostEqual(mock_entry_targets.call_args.kwargs["current_volume"], 1500.0, places=8)
+
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
     @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))
     @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
     @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
@@ -516,6 +1111,119 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual(position["virtual_net_qty"], 0.0)
         self.assertEqual(snapshot["risk_controls"]["current_long_notional"], 0.0)
 
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", return_value=([], {"source": "test"}))
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_open_orders",
+        return_value=[
+            {
+                "orderId": 1,
+                "clientOrderId": "close-long",
+                "side": "SELL",
+                "price": "1.11",
+                "origQty": "4.5",
+                "executedQty": "1.0",
+                "reduceOnly": True,
+                "positionSide": "LONG",
+                "time": 123,
+            },
+            {
+                "orderId": 2,
+                "clientOrderId": "close-short",
+                "side": "BUY",
+                "price": "1.03",
+                "origQty": "3.0",
+                "executedQty": "0.25",
+                "reduceOnly": True,
+                "positionSide": "SHORT",
+                "time": 124,
+            },
+        ],
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": True})
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [
+                {
+                    "symbol": "DUALUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "10",
+                    "entryPrice": "1.20",
+                    "breakEvenPrice": "1.21",
+                    "unRealizedProfit": "2.5",
+                    "isolated": False,
+                    "leverage": "5",
+                },
+                {
+                    "symbol": "DUALUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "-7",
+                    "entryPrice": "1.35",
+                    "breakEvenPrice": "1.34",
+                    "unRealizedProfit": "-1.5",
+                    "isolated": False,
+                    "leverage": "5",
+                },
+            ],
+        },
+    )
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "1.10"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "1.09", "ask_price": "1.11"}])
+    def test_build_monitor_snapshot_exposes_dual_side_position_legs_and_frozen_qty(
+        self,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_klines,
+        _mock_account,
+        _mock_competition,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "dual_events.jsonl"
+            plan_path = root / "dual_plan.json"
+            submit_path = root / "dual_submit.json"
+            events_path.write_text("", encoding="utf-8")
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="DUALUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": False,
+                    "config": {"symbol": "DUALUSDT", "strategy_mode": "hedge_neutral"},
+                },
+            )
+
+        position = snapshot["position"]
+        self.assertFalse(position["one_way_mode"])
+        self.assertEqual(position["position_amt"], 3.0)
+        self.assertEqual(position["long_qty"], 10.0)
+        self.assertEqual(position["short_qty"], 7.0)
+        self.assertEqual(position["long_entry_price"], 1.20)
+        self.assertEqual(position["short_entry_price"], 1.35)
+        self.assertEqual(position["long_break_even_price"], 1.21)
+        self.assertEqual(position["short_break_even_price"], 1.34)
+        self.assertEqual(position["long_unrealized_pnl"], 2.5)
+        self.assertEqual(position["short_unrealized_pnl"], -1.5)
+        self.assertEqual(position["frozen_long_qty"], 3.5)
+        self.assertEqual(position["frozen_short_qty"], 2.75)
+
     def test_filter_rows_since_discards_older_trade_rows(self) -> None:
         floor = datetime(2026, 3, 29, 0, 0, tzinfo=timezone.utc)
         rows = [
@@ -619,6 +1327,72 @@ class MonitorTests(unittest.TestCase):
 
             with mock.patch.dict("os.environ", {"GRID_MONITOR_AUDIT_COUNT_MAX_SCAN_BYTES": "64"}):
                 self.assertIsNone(_count_monitor_audit_lines(path))
+
+    @patch("grid_optimizer.monitor._load_or_fetch_income_rows", return_value=([], {"source": "test"}))
+    @patch("grid_optimizer.monitor._load_or_fetch_trade_rows", side_effect=RuntimeError("trade refresh unavailable"))
+    @patch("grid_optimizer.monitor.fetch_futures_klines", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": False})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "multiAssetsMargin": False,
+            "availableBalance": "1000",
+            "totalWalletBalance": "1000",
+            "positions": [
+                {
+                    "symbol": "TESTUSDT",
+                    "positionAmt": "4",
+                    "entryPrice": "1.0",
+                    "breakEvenPrice": "1.0",
+                    "unRealizedProfit": "0.5",
+                    "isolated": False,
+                    "leverage": "2",
+                }
+            ],
+        },
+    )
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0", "mark_price": "1.01"}])
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "1.00", "ask_price": "1.02"}])
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value={})
+    def test_build_monitor_snapshot_keeps_position_when_trade_refresh_fails(
+        self,
+        _mock_competition,
+        _mock_book,
+        _mock_premium,
+        _mock_credentials,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_klines,
+        _mock_trade_rows,
+        _mock_income_rows,
+    ) -> None:
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "events.jsonl"
+            plan_path = root / "plan.json"
+            submit_path = root / "submit.json"
+            events_path.write_text("", encoding="utf-8")
+            plan_path.write_text("{}", encoding="utf-8")
+            submit_path.write_text("{}", encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="TESTUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": False,
+                    "config": {"symbol": "TESTUSDT", "strategy_mode": "one_way_long"},
+                },
+            )
+
+        self.assertEqual(snapshot["position"]["position_amt"], 4.0)
+        self.assertIn("trade_audit_refresh_failed: RuntimeError: trade refresh unavailable", snapshot["warnings"])
+        self.assertFalse(any(str(item).startswith("account_read_failed:") for item in snapshot["warnings"]))
 
     @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
     @patch("grid_optimizer.monitor.fetch_futures_open_orders", side_effect=AssertionError("should not fetch open orders"))
@@ -846,6 +1620,190 @@ class MonitorTests(unittest.TestCase):
         self.assertEqual({item["client_order_id"] for item in snapshot["open_orders"]}, {"keep-buy", "new-sell"})
         self.assertIn("missing_binance_api_credentials", snapshot["warnings"])
         self.assertNotIn("market_read_failed: AssertionError: should not fetch book ticker", snapshot["warnings"])
+
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", side_effect=AssertionError("should not fetch open orders"))
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", side_effect=AssertionError("should not fetch position mode"))
+    @patch("grid_optimizer.monitor.fetch_futures_account_info_v3", side_effect=AssertionError("should not fetch account info"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", side_effect=AssertionError("should not fetch premium index"))
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", side_effect=AssertionError("should not fetch book ticker"))
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value=None)
+    def test_build_monitor_snapshot_adds_frozen_inventory_back_to_dual_side_position(
+        self,
+        _mock_competition,
+        _mock_book,
+        _mock_premium,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_credentials,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "test_events.jsonl"
+            plan_path = root / "test_plan.json"
+            submit_path = root / "test_submit.json"
+            events_path.write_text(
+                json.dumps(
+                    {
+                        "ts": (now - timedelta(seconds=4)).isoformat(),
+                        "cycle": 102,
+                        "mid_price": 0.64,
+                        "error_message": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                        "dual_side_position": True,
+                        "bid_price": 0.639,
+                        "ask_price": 0.641,
+                        "mid_price": 0.64,
+                        "actual_net_qty": 243.0,
+                        "strategy_actual_net_qty": -57.0,
+                        "current_long_qty": 56.0,
+                        "current_short_qty": 113.0,
+                        "current_long_avg_price": 0.64095,
+                        "current_short_avg_price": 0.64531,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            submit_path.write_text(json.dumps({"generated_at": now.isoformat()}), encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="PHAROSUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": True,
+                    "config": {
+                        "symbol": "PHAROSUSDT",
+                        "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                    },
+                },
+            )
+
+        position = snapshot["position"]
+        self.assertEqual(position["position_amt"], 243.0)
+        self.assertEqual(position["active_long_qty"], 56.0)
+        self.assertEqual(position["active_short_qty"], 113.0)
+        self.assertEqual(position["inventory_frozen_long_qty"], 300.0)
+        self.assertEqual(position["inventory_frozen_short_qty"], 0.0)
+        self.assertEqual(position["frozen_long_qty"], 300.0)
+        self.assertEqual(position["frozen_short_qty"], 0.0)
+        self.assertEqual(position["long_qty"], 356.0)
+        self.assertEqual(position["short_qty"], 113.0)
+        self.assertAlmostEqual(snapshot["risk_controls"]["current_long_notional"], 35.84, places=8)
+        self.assertAlmostEqual(snapshot["risk_controls"]["current_short_notional"], 72.32, places=8)
+
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value=None)
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=("key", "secret"))
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", return_value=[])
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", return_value={"dualSidePosition": True})
+    @patch(
+        "grid_optimizer.monitor.fetch_futures_account_info_v3",
+        return_value={
+            "availableBalance": "1000",
+            "totalWalletBalance": "1200",
+            "multiAssetsMargin": False,
+            "positions": [
+                {
+                    "symbol": "PHAROSUSDT",
+                    "positionSide": "LONG",
+                    "positionAmt": "577",
+                    "entryPrice": "0.6385726",
+                    "breakEvenPrice": "0.6385726",
+                    "unRealizedProfit": "1.0",
+                    "isolated": False,
+                    "leverage": "5",
+                },
+                {
+                    "symbol": "PHAROSUSDT",
+                    "positionSide": "SHORT",
+                    "positionAmt": "-393",
+                    "entryPrice": "0.6397188",
+                    "breakEvenPrice": "0.6397188",
+                    "unRealizedProfit": "-0.5",
+                    "isolated": False,
+                    "leverage": "5",
+                },
+            ],
+        },
+    )
+    def test_build_monitor_snapshot_uses_exchange_legs_for_frozen_inventory_display(
+        self,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_credentials,
+        _mock_competition,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "test_events.jsonl"
+            plan_path = root / "test_plan.json"
+            submit_path = root / "test_submit.json"
+            events_path.write_text(
+                json.dumps({"ts": (now - timedelta(seconds=4)).isoformat(), "cycle": 102}),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                        "dual_side_position": True,
+                        "bid_price": 0.638,
+                        "ask_price": 0.640,
+                        "mid_price": 0.639,
+                        "actual_net_qty": 184.0,
+                        "strategy_actual_net_qty": -236.0,
+                        "current_long_qty": 157.0,
+                        "current_short_qty": 393.0,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            submit_path.write_text(json.dumps({"generated_at": now.isoformat()}), encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="PHAROSUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": True,
+                    "config": {
+                        "symbol": "PHAROSUSDT",
+                        "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                    },
+                },
+            )
+
+        position = snapshot["position"]
+        self.assertEqual(position["long_qty"], 577.0)
+        self.assertEqual(position["short_qty"], 393.0)
+        self.assertEqual(position["position_amt"], 184.0)
+        self.assertEqual(position["active_long_qty"], 157.0)
+        self.assertEqual(position["active_short_qty"], 393.0)
+        self.assertEqual(position["inventory_frozen_long_qty"], 420.0)
+        self.assertEqual(position["inventory_frozen_short_qty"], 0.0)
+        self.assertEqual(position["frozen_long_qty"], 420.0)
+        self.assertEqual(position["frozen_short_qty"], 0.0)
+        self.assertAlmostEqual(snapshot["risk_controls"]["current_long_notional"], 100.323, places=8)
+        self.assertAlmostEqual(snapshot["risk_controls"]["current_short_notional"], 251.127, places=8)
 
     @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
     @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "96.1", "ask_price": "96.3"}])
