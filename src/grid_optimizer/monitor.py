@@ -2173,6 +2173,48 @@ def _summarize_frozen_position_qty(open_orders: list[dict[str, Any]]) -> dict[st
     return {"frozen_long_qty": frozen_long_qty, "frozen_short_qty": frozen_short_qty}
 
 
+def _derive_inventory_frozen_position_qty(
+    plan_report: dict[str, Any],
+    *,
+    active_long_qty: float,
+    active_short_qty: float,
+) -> dict[str, float]:
+    frozen_long_qty = 0.0
+    frozen_short_qty = 0.0
+
+    raw_inventory = plan_report.get("frozen_inventory")
+    if isinstance(raw_inventory, dict):
+        frozen_long_qty = max(
+            _safe_float(
+                raw_inventory.get("long_qty")
+                or raw_inventory.get("frozen_long_qty")
+                or raw_inventory.get("long")
+            ),
+            0.0,
+        )
+        frozen_short_qty = max(
+            _safe_float(
+                raw_inventory.get("short_qty")
+                or raw_inventory.get("frozen_short_qty")
+                or raw_inventory.get("short")
+            ),
+            0.0,
+        )
+        if frozen_long_qty > 0 or frozen_short_qty > 0:
+            return {"frozen_long_qty": frozen_long_qty, "frozen_short_qty": frozen_short_qty}
+
+    actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
+    strategy_net_qty = _safe_float(plan_report.get("strategy_actual_net_qty"))
+    if abs(strategy_net_qty) <= 1e-12:
+        strategy_net_qty = active_long_qty - active_short_qty
+    frozen_net_qty = actual_net_qty - strategy_net_qty
+    if frozen_net_qty > 1e-12:
+        frozen_long_qty = frozen_net_qty
+    elif frozen_net_qty < -1e-12:
+        frozen_short_qty = abs(frozen_net_qty)
+    return {"frozen_long_qty": frozen_long_qty, "frozen_short_qty": frozen_short_qty}
+
+
 def _build_local_runtime_snapshot(
     *,
     runner: dict[str, Any],
@@ -2208,8 +2250,10 @@ def _build_local_runtime_snapshot(
 
     dual_side_position = _truthy(plan_report.get("dual_side_position"))
     actual_net_qty = _safe_float(plan_report.get("actual_net_qty"))
-    long_qty = max(_safe_float(plan_report.get("current_long_qty")), 0.0)
-    short_qty = max(_safe_float(plan_report.get("current_short_qty")), 0.0)
+    active_long_qty = max(_safe_float(plan_report.get("current_long_qty")), 0.0)
+    active_short_qty = max(_safe_float(plan_report.get("current_short_qty")), 0.0)
+    long_qty = active_long_qty
+    short_qty = active_short_qty
     if not dual_side_position:
         long_qty = max(actual_net_qty, 0.0)
         short_qty = max(-actual_net_qty, 0.0)
@@ -2241,7 +2285,25 @@ def _build_local_runtime_snapshot(
             continue
         seen_keys.add(dedupe_key)
         open_orders.append(normalized)
-    frozen_position = _summarize_frozen_position_qty(open_orders)
+    reduce_order_frozen_position = _summarize_frozen_position_qty(open_orders)
+    inventory_frozen_position = (
+        _derive_inventory_frozen_position_qty(
+            plan_report,
+            active_long_qty=active_long_qty,
+            active_short_qty=active_short_qty,
+        )
+        if dual_side_position
+        else {"frozen_long_qty": 0.0, "frozen_short_qty": 0.0}
+    )
+    if inventory_frozen_position["frozen_long_qty"] > 0 or inventory_frozen_position["frozen_short_qty"] > 0:
+        long_qty = active_long_qty + inventory_frozen_position["frozen_long_qty"]
+        short_qty = active_short_qty + inventory_frozen_position["frozen_short_qty"]
+    frozen_position = {
+        "frozen_long_qty": reduce_order_frozen_position["frozen_long_qty"]
+        + inventory_frozen_position["frozen_long_qty"],
+        "frozen_short_qty": reduce_order_frozen_position["frozen_short_qty"]
+        + inventory_frozen_position["frozen_short_qty"],
+    }
 
     leverage_raw = runner_config.get("leverage")
     try:
@@ -2262,6 +2324,8 @@ def _build_local_runtime_snapshot(
             "position_amt": actual_net_qty,
             "long_qty": long_qty,
             "short_qty": short_qty,
+            "active_long_qty": active_long_qty,
+            "active_short_qty": active_short_qty,
             "entry_price": entry_price,
             "break_even_price": break_even_price,
             "long_entry_price": long_avg_price,
@@ -2272,6 +2336,10 @@ def _build_local_runtime_snapshot(
             "short_unrealized_pnl": 0.0,
             "frozen_long_qty": frozen_position["frozen_long_qty"],
             "frozen_short_qty": frozen_position["frozen_short_qty"],
+            "inventory_frozen_long_qty": inventory_frozen_position["frozen_long_qty"],
+            "inventory_frozen_short_qty": inventory_frozen_position["frozen_short_qty"],
+            "reduce_order_frozen_long_qty": reduce_order_frozen_position["frozen_long_qty"],
+            "reduce_order_frozen_short_qty": reduce_order_frozen_position["frozen_short_qty"],
             "unrealized_pnl": _safe_float(plan_report.get("unrealized_pnl")),
             "isolated": str(runner_config.get("margin_type", "")).upper().strip() == "ISOLATED",
             "leverage": leverage,
@@ -2859,11 +2927,11 @@ def _build_monitor_snapshot_uncached(
             current_short_notional = _safe_float(latest_loop.get("current_short_notional"))
     else:
         current_long_notional = (
-            max(_safe_float(position.get("long_qty", position.get("position_amt"))), 0.0)
+            max(_safe_float(position.get("active_long_qty", position.get("long_qty", position.get("position_amt")))), 0.0)
             * max(_safe_float(market.get("mid_price")), 0.0)
         )
         current_short_notional = (
-            max(_safe_float(position.get("short_qty")), 0.0)
+            max(_safe_float(position.get("active_short_qty", position.get("short_qty"))), 0.0)
             * max(_safe_float(market.get("mid_price")), 0.0)
         )
     if current_long_notional <= 0 and not use_live_synthetic_position:

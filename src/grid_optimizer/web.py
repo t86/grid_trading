@@ -27154,6 +27154,10 @@ MONITOR_PAGE = """<!doctype html>
       const accountNetQty = Number(pos.position_amt || 0);
       const frozenLongQty = Number(pos.frozen_long_qty || 0);
       const frozenShortQty = Number(pos.frozen_short_qty || 0);
+      const activeLongQty = Number(pos.active_long_qty ?? accountLongQty);
+      const activeShortQty = Number(pos.active_short_qty ?? accountShortQty);
+      const inventoryFrozenLongQty = Number(pos.inventory_frozen_long_qty || 0);
+      const inventoryFrozenShortQty = Number(pos.inventory_frozen_short_qty || 0);
       const centerSource = risk.center_source || {};
       const isCustomGridCenter = String(centerSource.reason || "").startsWith("custom_grid_");
       const centerPriceText = fmtNum(centerSource.center_price || 0, 7);
@@ -27215,8 +27219,8 @@ MONITOR_PAGE = """<!doctype html>
         : (accountNetQty < 0 ? `空 ${fmtNum(Math.abs(accountNetQty), 0)}` : fmtNum(accountNetQty, 0));
       const currentPositionSubParts = accountDualSide
         ? [
-            `多仓 ${fmtNum(accountLongQty, 0)} @ ${fmtNum(pos.long_entry_price || 0, 7)} · 名义 ${fmtNum(accountLongQty * (market.mid_price || 0), 4)}`,
-            `空仓 ${fmtNum(accountShortQty, 0)} @ ${fmtNum(pos.short_entry_price || 0, 7)} · 名义 ${fmtNum(accountShortQty * (market.mid_price || 0), 4)}`,
+            `多仓 ${fmtNum(accountLongQty, 0)}${inventoryFrozenLongQty > 0 ? ` (刷量 ${fmtNum(activeLongQty, 0)} + 冻结 ${fmtNum(inventoryFrozenLongQty, 0)})` : ""} @ ${fmtNum(pos.long_entry_price || 0, 7)} · 名义 ${fmtNum(accountLongQty * (market.mid_price || 0), 4)}`,
+            `空仓 ${fmtNum(accountShortQty, 0)}${inventoryFrozenShortQty > 0 ? ` (刷量 ${fmtNum(activeShortQty, 0)} + 冻结 ${fmtNum(inventoryFrozenShortQty, 0)})` : ""} @ ${fmtNum(pos.short_entry_price || 0, 7)} · 名义 ${fmtNum(accountShortQty * (market.mid_price || 0), 4)}`,
             `${centerLabelText}`,
           ]
         : [
@@ -27348,6 +27352,8 @@ MONITOR_PAGE = """<!doctype html>
       const virtualLongQty = isSyntheticNeutral ? (pos.virtual_long_qty || pos.long_qty || 0) : (pos.long_qty || 0);
       const virtualShortQty = isSyntheticNeutral ? (pos.virtual_short_qty || pos.short_qty || 0) : (pos.short_qty || 0);
       const virtualNetQty = isSyntheticNeutral ? (pos.virtual_net_qty || pos.position_amt || 0) : (pos.position_amt || 0);
+      const activeLongQty = Number(pos.active_long_qty ?? pos.long_qty ?? 0);
+      const activeShortQty = Number(pos.active_short_qty ?? pos.short_qty ?? 0);
       const targetBands = risk.inventory_target_bands || {};
       const centerSource = risk.center_source || {};
       const isCustomGridCenter = String(centerSource.reason || "").startsWith("custom_grid_");
@@ -27363,12 +27369,16 @@ MONITOR_PAGE = """<!doctype html>
         ["净仓数量", fmtNum(virtualNetQty, 0)],
         ["Long 仓位", fmtNum(virtualLongQty, 0)],
         ["Short 仓位", fmtNum(virtualShortQty, 0)],
+        ["刷量 Long 仓位", fmtNum(activeLongQty, 0)],
+        ["刷量 Short 仓位", fmtNum(activeShortQty, 0)],
         ["Long 开仓均价", accountDualSide ? fmtNum(pos.long_entry_price || 0, 7) : "--"],
         ["Short 开仓均价", accountDualSide ? fmtNum(pos.short_entry_price || 0, 7) : "--"],
         ["Long 保本价", accountDualSide ? fmtNum(pos.long_break_even_price || 0, 7) : "--"],
         ["Short 保本价", accountDualSide ? fmtNum(pos.short_break_even_price || 0, 7) : "--"],
         ["Long 浮动盈亏", accountDualSide ? fmtMoney(pos.long_unrealized_pnl || 0) : "--"],
         ["Short 浮动盈亏", accountDualSide ? fmtMoney(pos.short_unrealized_pnl || 0) : "--"],
+        ["冻结库存 Long", fmtNum(pos.inventory_frozen_long_qty || 0, 0)],
+        ["冻结库存 Short", fmtNum(pos.inventory_frozen_short_qty || 0, 0)],
         ["冻结 Long 仓位", fmtNum(pos.frozen_long_qty || 0, 0)],
         ["冻结 Short 仓位", fmtNum(pos.frozen_short_qty || 0, 0)],
         ["交易所净仓", fmtNum(pos.position_amt || 0, 0)],

@@ -1622,6 +1622,90 @@ class MonitorTests(unittest.TestCase):
         self.assertNotIn("market_read_failed: AssertionError: should not fetch book ticker", snapshot["warnings"])
 
     @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
+    @patch("grid_optimizer.monitor.fetch_futures_open_orders", side_effect=AssertionError("should not fetch open orders"))
+    @patch("grid_optimizer.monitor.fetch_futures_position_mode", side_effect=AssertionError("should not fetch position mode"))
+    @patch("grid_optimizer.monitor.fetch_futures_account_info_v3", side_effect=AssertionError("should not fetch account info"))
+    @patch("grid_optimizer.monitor.fetch_futures_premium_index", side_effect=AssertionError("should not fetch premium index"))
+    @patch("grid_optimizer.monitor.fetch_futures_book_tickers", side_effect=AssertionError("should not fetch book ticker"))
+    @patch("grid_optimizer.monitor.resolve_active_competition_board", return_value=None)
+    def test_build_monitor_snapshot_adds_frozen_inventory_back_to_dual_side_position(
+        self,
+        _mock_competition,
+        _mock_book,
+        _mock_premium,
+        _mock_account,
+        _mock_position_mode,
+        _mock_open_orders,
+        _mock_credentials,
+    ) -> None:
+        now = datetime.now(timezone.utc)
+        with TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            events_path = root / "test_events.jsonl"
+            plan_path = root / "test_plan.json"
+            submit_path = root / "test_submit.json"
+            events_path.write_text(
+                json.dumps(
+                    {
+                        "ts": (now - timedelta(seconds=4)).isoformat(),
+                        "cycle": 102,
+                        "mid_price": 0.64,
+                        "error_message": None,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            plan_path.write_text(
+                json.dumps(
+                    {
+                        "generated_at": now.isoformat(),
+                        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                        "dual_side_position": True,
+                        "bid_price": 0.639,
+                        "ask_price": 0.641,
+                        "mid_price": 0.64,
+                        "actual_net_qty": 243.0,
+                        "strategy_actual_net_qty": -57.0,
+                        "current_long_qty": 56.0,
+                        "current_short_qty": 113.0,
+                        "current_long_avg_price": 0.64095,
+                        "current_short_avg_price": 0.64531,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            submit_path.write_text(json.dumps({"generated_at": now.isoformat()}), encoding="utf-8")
+
+            snapshot = build_monitor_snapshot(
+                symbol="PHAROSUSDT",
+                events_path=events_path,
+                plan_path=plan_path,
+                submit_report_path=submit_path,
+                runner_process={
+                    "configured": True,
+                    "is_running": True,
+                    "config": {
+                        "symbol": "PHAROSUSDT",
+                        "strategy_profile": "pharosusdt_hedge_best_quote_maker_volume_v1",
+                        "strategy_mode": "hedge_best_quote_maker_volume_v1",
+                    },
+                },
+            )
+
+        position = snapshot["position"]
+        self.assertEqual(position["position_amt"], 243.0)
+        self.assertEqual(position["active_long_qty"], 56.0)
+        self.assertEqual(position["active_short_qty"], 113.0)
+        self.assertEqual(position["inventory_frozen_long_qty"], 300.0)
+        self.assertEqual(position["inventory_frozen_short_qty"], 0.0)
+        self.assertEqual(position["frozen_long_qty"], 300.0)
+        self.assertEqual(position["frozen_short_qty"], 0.0)
+        self.assertEqual(position["long_qty"], 356.0)
+        self.assertEqual(position["short_qty"], 113.0)
+        self.assertAlmostEqual(snapshot["risk_controls"]["current_long_notional"], 35.84, places=8)
+        self.assertAlmostEqual(snapshot["risk_controls"]["current_short_notional"], 72.32, places=8)
+
+    @patch("grid_optimizer.monitor.load_binance_api_credentials", return_value=None)
     @patch("grid_optimizer.monitor.fetch_futures_book_tickers", return_value=[{"bid_price": "96.1", "ask_price": "96.3"}])
     @patch("grid_optimizer.monitor.fetch_futures_premium_index", return_value=[{"funding_rate": "0.0002", "mark_price": "96.2"}])
     def test_build_monitor_snapshot_handles_missing_creds_without_local_position_snapshot_for_synthetic_mode(
