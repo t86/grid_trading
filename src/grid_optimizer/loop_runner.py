@@ -3133,6 +3133,12 @@ def _refresh_best_quote_frozen_inventory_quantities(frozen: dict[str, Any]) -> d
     short_manual_limit_isolated_qty = min(max(_safe_float(frozen.get("short_manual_limit_isolated_qty")), 0.0), short_qty)
     pair_eligible_long_qty = max(long_qty - long_manual_limit_isolated_qty, 0.0)
     pair_eligible_short_qty = max(short_qty - short_manual_limit_isolated_qty, 0.0)
+    if long_manual_limit_isolated_qty <= 1e-12:
+        frozen.pop("long_manual_limit_price", None)
+        frozen.pop("long_manual_limit_request_id", None)
+    if short_manual_limit_isolated_qty <= 1e-12:
+        frozen.pop("short_manual_limit_price", None)
+        frozen.pop("short_manual_limit_request_id", None)
     frozen.update(
         {
             "long_lots": long_lots,
@@ -3269,6 +3275,106 @@ def sync_best_quote_frozen_pair_release(
             }
         )
         state["best_quote_frozen_inventory_pair_release"] = directive
+    return report
+
+
+def sync_best_quote_frozen_manual_fills(
+    *,
+    state: dict[str, Any],
+    observed_trade_rows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    report = {
+        "enabled": True,
+        "new_long_fill_qty": 0.0,
+        "new_short_fill_qty": 0.0,
+        "consumed_long_qty": 0.0,
+        "consumed_short_qty": 0.0,
+        "applied_fill_count": 0,
+    }
+    refs = state.get("best_quote_volume_order_refs")
+    order_refs = refs if isinstance(refs, Mapping) else {}
+    applied_fill_keys = [
+        str(item).strip()
+        for item in list(state.get("best_quote_frozen_manual_applied_fill_keys") or [])
+        if str(item).strip()
+    ]
+    applied_fill_key_set = set(applied_fill_keys)
+    frozen = dict(state.get("best_quote_frozen_inventory") or {})
+    if not frozen:
+        return report
+    manual_limit_directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
+
+    def _consume(side_key: str, qty: float, *, role: str) -> float:
+        nonlocal frozen, manual_limit_directive
+        safe_qty = max(_safe_float(qty), 0.0)
+        if safe_qty <= 1e-12:
+            return 0.0
+        lots_key = f"{side_key}_lots"
+        lots = _normalize_best_quote_volume_lots(frozen.get(lots_key))
+        lots, consumed_lots, _ = _best_quote_volume_consume_fifo(lots, safe_qty)
+        consumed_qty = sum(max(_safe_float(item.get("qty")), 0.0) for item in consumed_lots)
+        if consumed_qty <= 1e-12:
+            return 0.0
+        frozen[lots_key] = lots
+        if role.startswith("frozen_inventory_manual_limit_"):
+            isolated_key = f"{side_key}_manual_limit_isolated_qty"
+            frozen[isolated_key] = max(_safe_float(frozen.get(isolated_key)) - consumed_qty, 0.0)
+            side_directive = dict(manual_limit_directive.get(side_key) or {})
+            if side_directive:
+                remaining_request = max(_safe_float(side_directive.get("requested_qty")) - consumed_qty, 0.0)
+                if remaining_request > 1e-12 and _safe_float(frozen.get(isolated_key)) > 1e-12:
+                    side_directive["requested"] = True
+                    side_directive["requested_qty"] = remaining_request
+                    manual_limit_directive[side_key] = side_directive
+                else:
+                    manual_limit_directive.pop(side_key, None)
+                    if _safe_float(frozen.get(isolated_key)) <= 1e-12:
+                        frozen.pop(f"{side_key}_manual_limit_price", None)
+                        frozen.pop(f"{side_key}_manual_limit_request_id", None)
+        return consumed_qty
+
+    for row in [dict(item) for item in list(observed_trade_rows or []) if isinstance(item, dict)]:
+        fill_key = _best_quote_trade_fill_key(row)
+        if fill_key and fill_key in applied_fill_key_set:
+            continue
+        order_id = str(row.get("orderId") or row.get("order_id") or "").strip()
+        ref = order_refs.get(order_id) if order_id else None
+        ref = ref if isinstance(ref, Mapping) else {}
+        if str(ref.get("book") or "").lower().strip() != BQ_BOOK_FROZEN:
+            continue
+        role = str(row.get("role") or ref.get("role") or "").lower().strip()
+        if role not in {
+            "frozen_inventory_manual_reduce_long",
+            "frozen_inventory_manual_reduce_short",
+            "frozen_inventory_manual_limit_long",
+            "frozen_inventory_manual_limit_short",
+        }:
+            continue
+        qty = max(_safe_float(row.get("qty")), 0.0)
+        if qty <= 1e-12:
+            continue
+        if role.endswith("_long"):
+            consumed = _consume("long", qty, role=role)
+            report["new_long_fill_qty"] += qty
+            report["consumed_long_qty"] += consumed
+        elif role.endswith("_short"):
+            consumed = _consume("short", qty, role=role)
+            report["new_short_fill_qty"] += qty
+            report["consumed_short_qty"] += consumed
+        else:
+            continue
+        report["applied_fill_count"] += 1
+        if fill_key:
+            applied_fill_keys.append(fill_key)
+            applied_fill_key_set.add(fill_key)
+
+    if report["applied_fill_count"] > 0:
+        state["best_quote_frozen_inventory"] = _refresh_best_quote_frozen_inventory_quantities(frozen)
+        if manual_limit_directive:
+            state["best_quote_frozen_inventory_manual_limit"] = manual_limit_directive
+        else:
+            state.pop("best_quote_frozen_inventory_manual_limit", None)
+        state["best_quote_frozen_manual_applied_fill_keys"] = applied_fill_keys[-10000:]
     return report
 
 
@@ -4024,22 +4130,47 @@ def apply_best_quote_frozen_inventory_manual_limit(
 ) -> dict[str, Any]:
     directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
     ledger = dict(state.get("best_quote_frozen_inventory") or {})
+    for side_key in ("long", "short"):
+        if side_key in directive:
+            continue
+        isolated_qty = max(_safe_float(ledger.get(f"{side_key}_manual_limit_isolated_qty")), 0.0)
+        price = max(_safe_float(ledger.get(f"{side_key}_manual_limit_price")), 0.0)
+        if isolated_qty > 1e-12 and price > 0:
+            request_id = str(ledger.get(f"{side_key}_manual_limit_request_id") or "").strip()
+            if not request_id:
+                request_id = f"recovered-{side_key}-{int(time.time() * 1000)}"
+                ledger[f"{side_key}_manual_limit_request_id"] = request_id
+            directive[side_key] = {
+                "requested": True,
+                "requested_qty": isolated_qty,
+                "price": price,
+                "request_id": request_id,
+                "source": "recovered_manual_limit_isolation",
+                "recovered_from_isolated_qty": True,
+            }
     limit_report = {
         "enabled": bool(directive),
         "placed_long": False,
         "placed_short": False,
         "orders": [],
         "blocked_reasons": [],
+        "recovered_from_isolated_qty": any(
+            bool((directive.get(side_key) or {}).get("recovered_from_isolated_qty"))
+            for side_key in ("long", "short")
+            if isinstance(directive.get(side_key), dict)
+        ),
     }
     safe_min_notional = max(_safe_float(min_notional), 0.0)
 
     def _authorized(side_directive: dict[str, Any], *, side_key: str) -> bool:
         ok, reason = _frozen_inventory_directive_authorized(side_directive)
-        if not ok:
+        if not ok and not bool(side_directive.get("recovered_from_isolated_qty")):
             directive.pop(side_key, None)
             ledger[f"{side_key}_manual_limit_isolated_qty"] = 0.0
+            ledger.pop(f"{side_key}_manual_limit_price", None)
+            ledger.pop(f"{side_key}_manual_limit_request_id", None)
             limit_report["blocked_reasons"].append(f"{side_key}_{reason}")
-        return ok
+        return ok or bool(side_directive.get("recovered_from_isolated_qty"))
 
     def _build_order(*, side_key: str) -> dict[str, Any] | None:
         side_directive = dict(directive.get(side_key) or {})
@@ -4073,6 +4204,10 @@ def apply_best_quote_frozen_inventory_manual_limit(
             limit_report["blocked_reasons"].append(f"{side_key}_below_min_notional")
             return None
         ledger[isolated_key] = min(max(_safe_float(ledger.get(isolated_key)), qty), frozen_qty)
+        ledger[f"{side_key}_manual_limit_price"] = price
+        request_id = str(side_directive.get("request_id") or "").strip()
+        if request_id:
+            ledger[f"{side_key}_manual_limit_request_id"] = request_id
         return {
             "side": side,
             "price": price,
@@ -4092,13 +4227,11 @@ def apply_best_quote_frozen_inventory_manual_limit(
         plan["sell_orders"] = [long_order, *list(plan.get("sell_orders") or [])]
         limit_report["placed_long"] = True
         limit_report["orders"].append(dict(long_order))
-        directive.pop("long", None)
     short_order = _build_order(side_key="short")
     if short_order is not None:
         plan["buy_orders"] = [short_order, *list(plan.get("buy_orders") or [])]
         limit_report["placed_short"] = True
         limit_report["orders"].append(dict(short_order))
-        directive.pop("short", None)
 
     if directive:
         state["best_quote_frozen_inventory_manual_limit"] = directive
@@ -7340,8 +7473,17 @@ def _preserve_frozen_inventory_manual_limit_open_orders(
     *,
     existing_orders: list[dict[str, Any]],
     desired_orders: list[dict[str, Any]],
+    state: Mapping[str, Any] | dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     preserved = [dict(item) for item in desired_orders if isinstance(item, dict)]
+    desired_sides: set[str] = set()
+    for item in preserved:
+        if _order_role(item) == "frozen_inventory_manual_limit_long":
+            desired_sides.add("long")
+        elif _order_role(item) == "frozen_inventory_manual_limit_short":
+            desired_sides.add("short")
+    ledger = state.get("best_quote_frozen_inventory") if isinstance(state, Mapping) else None
+    ledger = ledger if isinstance(ledger, Mapping) else {}
     for order in existing_orders:
         if not isinstance(order, dict) or not _is_frozen_inventory_manual_limit_open_order(order):
             continue
@@ -7352,6 +7494,10 @@ def _preserve_frozen_inventory_manual_limit_open_orders(
         elif side == "BUY" and position_side in {"SHORT", "BOTH"}:
             side_key = "short"
         else:
+            continue
+        if side_key in desired_sides:
+            continue
+        if ledger and _safe_float(ledger.get(f"{side_key}_manual_limit_isolated_qty")) <= 1e-12:
             continue
         price = _safe_float(order.get("price"))
         qty = _safe_float(order.get("origQty", order.get("qty")))
@@ -14919,11 +15065,16 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
                 if "bestquot" in str(order.get("clientOrderId") or "").lower()
             ),
         )
+        best_quote_frozen_manual_sync = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=observed_trade_rows,
+        )
         best_quote_frozen_pair_release_sync = sync_best_quote_frozen_pair_release(
             state=state,
             observed_trade_rows=observed_trade_rows,
         )
         best_quote_maker_volume["volume_ledger"] = dict(best_quote_volume_ledger)
+        best_quote_maker_volume["frozen_manual_sync"] = dict(best_quote_frozen_manual_sync)
         best_quote_maker_volume["frozen_pair_release_sync"] = dict(best_quote_frozen_pair_release_sync)
 
     elastic_volume_config = _elastic_volume_config(effective_args)
@@ -19044,6 +19195,7 @@ def generate_plan_report(args: argparse.Namespace) -> dict[str, Any]:
     desired_orders = _preserve_frozen_inventory_manual_limit_open_orders(
         existing_orders=open_orders_for_diff,
         desired_orders=desired_orders,
+        state=state,
     )
     diff = diff_open_orders(existing_orders=open_orders_for_diff, desired_orders=desired_orders)
 

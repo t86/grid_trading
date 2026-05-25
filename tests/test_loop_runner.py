@@ -50,6 +50,7 @@ from grid_optimizer.loop_runner import (
     _cap_best_quote_reduce_orders_to_managed_inventory,
     reconcile_best_quote_volume_ledger_surplus,
     sync_best_quote_volume_ledger,
+    sync_best_quote_frozen_manual_fills,
     sync_best_quote_frozen_pair_release,
     apply_best_quote_frozen_inventory_manual_reduce,
     apply_best_quote_frozen_inventory_manual_limit,
@@ -2215,7 +2216,7 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(plan["sell_orders"][0]["qty"], 12.0)
         self.assertNotIn("best_quote_frozen_inventory_manual_reduce", state)
 
-    def test_best_quote_frozen_inventory_manual_limit_places_one_shot_post_only_order(self) -> None:
+    def test_best_quote_frozen_inventory_manual_limit_keeps_post_only_order_target(self) -> None:
         state: dict[str, object] = {
             "best_quote_frozen_inventory": {
                 "long_qty": 50.0,
@@ -2250,7 +2251,12 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(order["force_reduce_only"])
         self.assertEqual(order["time_in_force"], "GTX")
         self.assertEqual(order["frozen_inventory_request_id"], "req-limit")
-        self.assertNotIn("best_quote_frozen_inventory_manual_limit", state)
+        self.assertEqual(
+            state["best_quote_frozen_inventory_manual_limit"]["long"]["requested_qty"],
+            12.0,
+        )
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_manual_limit_price"], 1.02)
+        self.assertEqual(state["best_quote_frozen_inventory"]["long_manual_limit_request_id"], "req-limit")
 
     def test_best_quote_frozen_inventory_manual_limit_places_only_new_requested_qty(self) -> None:
         state: dict[str, object] = {
@@ -2279,6 +2285,42 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertTrue(report["placed_short"])
         self.assertEqual(plan["buy_orders"][0]["qty"], 500.0)
         self.assertEqual(state["best_quote_frozen_inventory"]["short_manual_limit_isolated_qty"], 1500.0)
+        self.assertEqual(state["best_quote_frozen_inventory_manual_limit"]["short"]["requested_qty"], 500.0)
+
+    def test_best_quote_frozen_inventory_manual_limit_recovers_lost_directive_from_isolation(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_qty": 2000.0,
+                "short_manual_limit_isolated_qty": 1000.0,
+                "short_manual_limit_price": 0.621,
+                "short_manual_limit_request_id": "req-old",
+            }
+        }
+        plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
+
+        report = apply_best_quote_frozen_inventory_manual_limit(
+            plan=plan,
+            state=state,
+            bid_price=0.622,
+            ask_price=0.623,
+            tick_size=0.0001,
+            step_size=1.0,
+            min_qty=1.0,
+            min_notional=5.0,
+            hedge_mode=True,
+        )
+
+        self.assertTrue(report["active"])
+        self.assertTrue(report["recovered_from_isolated_qty"])
+        order = plan["buy_orders"][0]
+        self.assertEqual(order["role"], "frozen_inventory_manual_limit_short")
+        self.assertEqual(order["position_side"], "SHORT")
+        self.assertEqual(order["qty"], 1000.0)
+        self.assertEqual(order["price"], 0.621)
+        self.assertEqual(order["frozen_inventory_request_id"], "req-old")
+        directive = state["best_quote_frozen_inventory_manual_limit"]["short"]
+        self.assertEqual(directive["requested_qty"], 1000.0)
+        self.assertTrue(directive["recovered_from_isolated_qty"])
 
     def test_best_quote_frozen_inventory_manual_limit_rejects_legacy_unauthorized_directive(self) -> None:
         state: dict[str, object] = {
@@ -2610,6 +2652,94 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(frozen["long_qty"], 0.0)
         self.assertEqual(frozen["short_qty"], 0.0)
         self.assertNotIn("best_quote_frozen_inventory_pair_release", state)
+
+    def test_sync_best_quote_frozen_manual_limit_deducts_frozen_lots_and_isolation(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [{"qty": 1000.0, "entry_price": 0.625}],
+                "short_manual_limit_isolated_qty": 1000.0,
+                "short_manual_limit_price": 0.621,
+                "short_manual_limit_request_id": "req-limit",
+            },
+            "best_quote_frozen_inventory_manual_limit": {
+                "short": {"requested": True, "requested_qty": 1000.0, "price": 0.621, "request_id": "req-limit"}
+            },
+            "best_quote_volume_order_refs": {
+                "123": {
+                    "book": "frozen_bq",
+                    "role": "frozen_inventory_manual_limit_short",
+                    "request_id": "req-limit",
+                }
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "orderId": "123",
+                    "id": "fill-1",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "qty": "400",
+                    "price": "0.621",
+                    "time": 123456,
+                }
+            ],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 1)
+        self.assertEqual(synced["consumed_short_qty"], 400.0)
+        frozen = state["best_quote_frozen_inventory"]
+        self.assertEqual(frozen["short_qty"], 600.0)
+        self.assertEqual(frozen["short_manual_limit_isolated_qty"], 600.0)
+        self.assertEqual(state["best_quote_frozen_inventory_manual_limit"]["short"]["requested_qty"], 600.0)
+
+        second = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[
+                {
+                    "orderId": "123",
+                    "id": "fill-1",
+                    "side": "BUY",
+                    "positionSide": "SHORT",
+                    "qty": "400",
+                    "price": "0.621",
+                    "time": 123456,
+                }
+            ],
+        )
+
+        self.assertEqual(second["applied_fill_count"], 0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["short_qty"], 600.0)
+
+    def test_sync_best_quote_frozen_manual_limit_full_fill_clears_target(self) -> None:
+        state: dict[str, object] = {
+            "best_quote_frozen_inventory": {
+                "short_lots": [{"qty": 100.0, "entry_price": 0.625}],
+                "short_manual_limit_isolated_qty": 100.0,
+                "short_manual_limit_price": 0.621,
+                "short_manual_limit_request_id": "req-limit",
+            },
+            "best_quote_frozen_inventory_manual_limit": {
+                "short": {"requested": True, "requested_qty": 100.0, "price": 0.621, "request_id": "req-limit"}
+            },
+            "best_quote_volume_order_refs": {
+                "123": {"book": "frozen_bq", "role": "frozen_inventory_manual_limit_short"}
+            },
+        }
+
+        synced = sync_best_quote_frozen_manual_fills(
+            state=state,
+            observed_trade_rows=[{"orderId": "123", "id": "fill-1", "qty": "100"}],
+        )
+
+        self.assertEqual(synced["applied_fill_count"], 1)
+        self.assertEqual(state["best_quote_frozen_inventory"]["short_qty"], 0.0)
+        self.assertEqual(state["best_quote_frozen_inventory"]["short_manual_limit_isolated_qty"], 0.0)
+        self.assertNotIn("short_manual_limit_price", state["best_quote_frozen_inventory"])
+        self.assertNotIn("short_manual_limit_request_id", state["best_quote_frozen_inventory"])
+        self.assertNotIn("best_quote_frozen_inventory_manual_limit", state)
 
     def test_best_quote_frozen_pair_release_requires_both_sides_above_min_notional(self) -> None:
         plan: dict[str, object] = {"buy_orders": [], "sell_orders": []}
@@ -4106,6 +4236,35 @@ class LoopRunnerTests(unittest.TestCase):
         self.assertEqual(desired[0]["role"], "frozen_inventory_manual_limit_short")
         self.assertEqual(desired[0]["position_side"], "SHORT")
         self.assertAlmostEqual(float(desired[0]["qty"]), 1500.0)
+
+    def test_preserve_frozen_inventory_manual_limit_open_orders_skips_side_with_desired_order(self) -> None:
+        open_orders = [
+            {
+                "clientOrderId": "gx-pharosu-frozenin-1-91969317",
+                "side": "BUY",
+                "type": "LIMIT",
+                "positionSide": "SHORT",
+                "price": "0.6290000",
+                "origQty": "1500",
+                "executedQty": "0",
+                "orderId": 46174496,
+            }
+        ]
+        desired_order = {
+            "side": "BUY",
+            "price": 0.621,
+            "qty": 1000.0,
+            "role": "frozen_inventory_manual_limit_short",
+            "position_side": "SHORT",
+        }
+
+        desired = _preserve_frozen_inventory_manual_limit_open_orders(
+            existing_orders=open_orders,
+            desired_orders=[desired_order],
+            state={"best_quote_frozen_inventory": {"short_manual_limit_isolated_qty": 1000.0}},
+        )
+
+        self.assertEqual(desired, [desired_order])
 
     def test_resolve_anti_chase_entry_guard_blocks_directional_entries(self) -> None:
         up_guard = resolve_anti_chase_entry_guard(

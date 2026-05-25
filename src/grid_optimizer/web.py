@@ -10339,15 +10339,18 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             if requested_qty <= 1e-12:
                 raise ValueError(f"frozen {side_key} qty has no unisolated balance")
             isolated_qty = existing_isolated + requested_qty
-            ledger[f"{side_key}_manual_limit_isolated_qty"] = isolated_qty
-            directive[side_key] = _new_frozen_directive(
+            directive_item = _new_frozen_directive(
                 {
                     "requested": True,
-                    "requested_qty": isolated_qty,
+                    "requested_qty": requested_qty,
                     "price": price,
                     "source": "running_status_ui",
                 }
             )
+            ledger[f"{side_key}_manual_limit_isolated_qty"] = isolated_qty
+            ledger[f"{side_key}_manual_limit_price"] = price
+            ledger[f"{side_key}_manual_limit_request_id"] = str(directive_item.get("request_id") or "")
+            directive[side_key] = directive_item
             state["best_quote_frozen_inventory_manual_limit"] = directive
         elif action in {"cancel_limit_long", "cancel_limit_short"}:
             directive = dict(state.get("best_quote_frozen_inventory_manual_limit") or {})
@@ -10358,6 +10361,8 @@ def _update_runner_frozen_inventory(payload: dict[str, Any]) -> dict[str, Any]:
             else:
                 state.pop("best_quote_frozen_inventory_manual_limit", None)
             ledger[f"{side_key}_manual_limit_isolated_qty"] = 0.0
+            ledger.pop(f"{side_key}_manual_limit_price", None)
+            ledger.pop(f"{side_key}_manual_limit_request_id", None)
         elif action == "pair_release":
             if ledger["offset_qty"] <= 1e-12:
                 raise ValueError("frozen long/short offset qty is empty")
